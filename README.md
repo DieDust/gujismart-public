@@ -33,7 +33,7 @@
 - AI：OpenAI 兼容接口
 
 ## 快速开始
-
+前往release下载最新安装包即可。
 ```bash
 npm install
 npm run dev
