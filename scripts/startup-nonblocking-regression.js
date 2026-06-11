@@ -1,0 +1,232 @@
+const assert = require('assert')
+const { readFileSync } = require('fs')
+const { join } = require('path')
+
+const root = join(__dirname, '..')
+const readSource = (...parts) => readFileSync(join(root, ...parts), 'utf8').replace(/\r\n?/g, '\n')
+const mainIndex = readSource('src', 'main', 'index.ts')
+const database = readSource('src', 'main', 'database.ts')
+const documentsIpc = readSource('src', 'main', 'ipc', 'documents.ts')
+const ocrIpc = readSource('src', 'main', 'ipc', 'ocr.ts')
+const pdfAssets = readSource('src', 'main', 'pdf-assets.ts')
+const batchProcessor = readSource('src', 'main', 'batch-processor.ts')
+const libraryView = readSource('src', 'renderer', 'src', 'views', 'LibraryView.tsx')
+const startupRecovery = readSource('src', 'main', 'startup-recovery.ts')
+const runStartupRecoveryStart = startupRecovery.indexOf('export async function runStartupRecovery')
+const firstRecoveryCheckpoint = startupRecovery.indexOf('if (await startupRecoveryCheckpoint()) return finishCanceled()', runStartupRecoveryStart)
+const recoverOcrJobs = startupRecovery.indexOf('ocr = recoverInterruptedOcrJobs()', runStartupRecoveryStart)
+const resumeDeletes = startupRecovery.indexOf('deletingDocuments = resumeInterruptedDocumentDeletes()', runStartupRecoveryStart)
+const resumeBatchQueue = startupRecovery.indexOf('resumedBatchQueue = batchProcessor.resumePendingQueueFromDatabase()', runStartupRecoveryStart)
+const finalPreResumeCheckpoint = startupRecovery.lastIndexOf('if (await startupRecoveryCheckpoint()) return finishCanceled()', resumeDeletes)
+
+assert(
+  mainIndex.includes("import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'"),
+  'Main process should use scheduled startup recovery, not await recovery before opening the window.',
+)
+assert(
+  !mainIndex.includes('await runStartupRecovery()'),
+  'Startup recovery must not be awaited on the app startup path.',
+)
+assert(
+  /ready-to-show[\s\S]{0,160}scheduleStartupRecovery\(\)/.test(mainIndex),
+  'Startup recovery should be scheduled after the window is ready to show.',
+)
+assert(
+  /ready-to-show[\s\S]{0,200}scheduleStartupMaintenance\(\)/.test(mainIndex),
+  'Startup maintenance should be scheduled after the window is ready to show.',
+)
+assert(
+  mainIndex.includes('listStoredLocalResourcePaths({ includePageImages: false })'),
+  'Startup resource allow-list should not scan all page images.',
+)
+assert(
+  /listStoredLocalResourcePaths\(options\?: \{ includePageImages\?: boolean \}\)/.test(database)
+    && database.includes('options?.includePageImages !== false'),
+  'Database resource path listing should support skipping page image paths.',
+)
+assert(
+  /documents:get[\s\S]{0,1800}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Full document reads should allow returned page image paths on demand.',
+)
+assert(
+  /documents:getLight[\s\S]{0,1800}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Light document reads should allow returned page image paths on demand.',
+)
+assert(
+  /documents:getPagesRange[\s\S]{0,900}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Paged document reads should allow returned page image paths on demand.',
+)
+assert(
+  /documents:getReadingWindow[\s\S]{0,1800}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Reading window reads should allow returned page image paths on demand.',
+)
+assert(
+  libraryView.includes("event.kind === 'startup-recovery'")
+    && libraryView.includes("loadDocuments(filter, { silent: true })"),
+  'Library view should refresh after startup recovery completes.',
+)
+assert(
+  documentsIpc.includes('saveDatabase, scheduleDatabaseSave')
+    && /function markDocumentsDeleting[\s\S]{0,650}saveDatabase\(\)/.test(documentsIpc),
+  'Document delete markers should be checkpointed immediately so startup recovery can resume deletes after a sudden quit.',
+)
+assert(
+  startupRecovery.includes('let startupRecoveryPromise: Promise<void> | null = null')
+    && startupRecovery.includes('let startupRecoveryCancelRequested = false')
+    && startupRecovery.includes('async function startupRecoveryCheckpoint()')
+    && startupRecovery.includes('export async function shutdownStartupRecovery')
+    && /export async function shutdownStartupRecovery\(\)[\s\S]{0,120}startupRecoveryCancelRequested = true[\s\S]{0,120}await startupRecoveryPromise/.test(startupRecovery)
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,500}await shutdownStartupRecovery\(\)[\s\S]{0,1200}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should ask scheduled startup recovery to stop at a safe checkpoint before closing the database.',
+)
+assert(
+  startupRecovery.includes('function createEmptyOcrRecoverySummary')
+    && runStartupRecoveryStart >= 0
+    && firstRecoveryCheckpoint > runStartupRecoveryStart
+    && recoverOcrJobs > firstRecoveryCheckpoint,
+  'Startup recovery should honor a shutdown request before mutating OCR/database recovery state.',
+)
+assert(
+  finalPreResumeCheckpoint > runStartupRecoveryStart
+    && resumeDeletes > finalPreResumeCheckpoint
+    && resumeBatchQueue > resumeDeletes,
+  'Canceled startup recovery should not launch resumed delete or batch OCR jobs during app shutdown.',
+)
+assert(
+  /export function scheduleStartupRecovery\(\)[\s\S]{0,160}startupRecoveryCancelRequested = false/.test(startupRecovery)
+    && startupRecovery.includes('canceled?: boolean')
+    && startupRecovery.includes('canceled: true'),
+  'A fresh scheduled startup recovery should clear stale cancel state and report canceled summaries explicitly.',
+)
+assert(
+  mainIndex.includes("import { shutdownOcrRuntime } from './ipc/ocr'")
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,900}await shutdownOcrRuntime\(\)[\s\S]{0,1800}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should cancel and wait for OCR work before closing the database.',
+)
+assert(
+  mainIndex.includes('shutdownDocumentDeleteRuntime')
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,2200}await shutdownDocumentDeleteRuntime\(\)[\s\S]{0,1300}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should wait briefly for active document delete jobs before closing the database.',
+)
+assert(
+  mainIndex.includes('shutdownDocumentImportRuntime')
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,900}await shutdownOcrRuntime\(\)[\s\S]{0,500}await shutdownDocumentImportRuntime\(\)[\s\S]{0,1700}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should wait briefly for active document imports before closing the database.',
+)
+assert(
+  mainIndex.includes("import { batchProcessor } from './batch-processor'")
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,1000}await shutdownOcrRuntime\(\)[\s\S]{0,500}await batchProcessor\.shutdownRuntime\(\)[\s\S]{0,1700}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should abort and wait for active batch OCR work before closing the database.',
+)
+assert(
+  mainIndex.includes('shutdownBookTranslationRuntime')
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,1300}await batchProcessor\.shutdownRuntime\(\)[\s\S]{0,500}await shutdownBookTranslationRuntime\(\)[\s\S]{0,500}await shutdownDocumentDeleteRuntime\(\)[\s\S]{0,1300}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should wait for active book translation work before delete cleanup and database close.',
+)
+assert(
+  mainIndex.includes('shutdownPdfAssetRuntime')
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,2600}await shutdownPdfAssetRuntime\(\)[\s\S]{0,900}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should wait briefly for automatic PDF asset cleanup before closing the database.',
+)
+assert(
+  /app\.on\('before-quit', \(event\) =>[\s\S]{0,500}event\.preventDefault\(\)[\s\S]{0,500}shutdownApplicationRuntime\(\)/.test(mainIndex),
+  'before-quit should wait for runtime shutdown instead of closing the database immediately.',
+)
+assert(
+  pdfAssets.includes('activeAutoCleanupPdfAssetJobs')
+    && pdfAssets.includes('export async function shutdownPdfAssetRuntime')
+    && /export function autoCleanupPdfAssetsIfEnabled[\s\S]{0,1200}activeAutoCleanupPdfAssetJobs\.add\(job\)/.test(pdfAssets)
+    && /export function autoCleanupPdfAssetsIfEnabled[\s\S]{0,1200}activeAutoCleanupPdfAssetJobs\.delete\(job\)/.test(pdfAssets),
+  'Automatic PDF asset cleanup jobs should be tracked so shutdown can wait before database close.',
+)
+assert(
+  documentsIpc.includes('activeDocumentDeleteJobs')
+    && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime')
+    && /function scheduleDocumentDeleteJob[\s\S]{0,900}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,500}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc),
+  'Document delete jobs should be tracked so shutdown can wait for active delete cleanup.',
+)
+assert(
+  documentsIpc.includes('activeDocumentImportJobs')
+    && documentsIpc.includes('export async function shutdownDocumentImportRuntime')
+    && /ipcMain\.handle\('documents:import', \([^)]*filePaths: string\[\], options\?: ImportDocumentOptions\) => trackDocumentImportJob\(async \(\) => \{/.test(documentsIpc),
+  'Document import IPC jobs should be tracked so shutdown does not close the database while an import is writing.',
+)
+assert(
+  documentsIpc.includes('export async function shutdownDocumentImportRuntime(timeoutMs = 30000)')
+    && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime(timeoutMs = 30000)')
+    && /for \(const filePath of filePaths\) \{[\s\S]{0,180}if \(documentImportShuttingDown\) break/.test(documentsIpc),
+  'Document import/delete shutdown should wait long enough for database writes to settle and stop import at file boundaries.',
+)
+assert(
+  documentsIpc.includes('activeBookTranslationJobTasks')
+    && documentsIpc.includes('let bookTranslationRuntimeShuttingDown = false')
+    && documentsIpc.includes('export async function shutdownBookTranslationRuntime(timeoutMs = 30000)')
+    && documentsIpc.includes('await waitForBookTranslationShutdown(activeJobs, timeoutMs)')
+    && documentsIpc.includes('throwIfBookTranslationShuttingDown()')
+    && documentsIpc.includes('if (bookTranslationRuntimeShuttingDown) throw new Error')
+    && /documents:translateBook[\s\S]{0,2400}activeBookTranslationJobTasks\.add\(task\)/.test(documentsIpc)
+    && /activeBookTranslationJobTasks\.add\(task\)[\s\S]{0,500}activeBookTranslationJobTasks\.delete\(task\)/.test(documentsIpc)
+    && /async function runBookTranslationJob[\s\S]{0,300}throwIfBookTranslationShuttingDown\(\)/.test(documentsIpc)
+    && documentsIpc.includes('while (!bookTranslationRuntimeShuttingDown && nextPageIndex < pendingPages.length)')
+    && documentsIpc.includes('if (isBookTranslationShutdownError(error)) return'),
+  'Book translation jobs should be tracked, stopped, and waited during shutdown instead of writing after database close.',
+)
+assert(
+  ocrIpc.includes('export async function shutdownOcrRuntime')
+    && ocrIpc.includes('activeOcrTasks.forEach((task) => task.controller.abort())')
+    && ocrIpc.includes('await waitForOcrShutdown(activeDoneTasks, timeoutMs)'),
+  'OCR runtime shutdown should abort active OCR tasks and wait briefly for their cleanup.',
+)
+assert(
+  ocrIpc.includes('done: Promise<void>')
+    && ocrIpc.includes('activeOcrTasks.set(docId, { controller, done })')
+    && ocrIpc.includes('resolveDone()'),
+  'Active OCR tasks should expose a completion promise for clean shutdown.',
+)
+assert(
+  ocrIpc.includes('function shouldPersistBatchOcrForRecovery')
+    && ocrIpc.includes("engine === 'paddle' && options?.forceFullRerun !== true")
+    && ocrIpc.includes('function createRecoverableBatchOcrItems')
+    && ocrIpc.includes('INSERT INTO batch_queue')
+    && ocrIpc.includes('saveDatabase()')
+    && ocrIpc.includes('const recoverableQueueItemIdsByDocId = persistForRecovery')
+    && ocrIpc.includes("updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
+    && ocrIpc.includes('!ocrRuntimeShuttingDown')
+    && ocrIpc.includes("result.success ? 'completed' : 'failed'"),
+  'Paddle batch OCR should persist recoverable batch_queue rows and avoid marking shutdown aborts as failed.',
+)
+assert(
+  batchProcessor.includes('async shutdownRuntime')
+    && batchProcessor.includes('this.activeControllers.forEach((controller) => controller.abort())')
+    && batchProcessor.includes('this.resetQueueItemForResume(job, docId)')
+    && batchProcessor.includes('recognizePdfAsync(pdfPath, undefined, {')
+    && batchProcessor.includes('signal: controller.signal')
+    && batchProcessor.includes("UPDATE batch_queue\n         SET status = 'pending'"),
+  'Batch processor shutdown should cancel active OCR uploads and leave the active queue item resumable.',
+)
+assert(
+  startupRecovery.includes('function markInterruptedImportForCleanup')
+    && startupRecovery.includes("SET import_status = 'deleting'")
+    && startupRecovery.includes('resumeInterruptedDocumentDeletes()'),
+  'Startup recovery should turn unrecoverable half-written imports into resumable delete cleanup jobs.',
+)
+assert(
+  startupRecovery.includes('RECOVERABLE_IMAGE_EXTENSIONS')
+    && startupRecovery.includes('INSERT INTO pages')
+    && startupRecovery.includes('thumb_path = COALESCE'),
+  'Startup recovery should repair interrupted image imports by recreating their missing page row.',
+)
+assert(
+  startupRecovery.includes('ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL')
+    && /async function removeOrphanStorageDirs\(\)[\s\S]{0,900}await yieldToEventLoop\(\)/.test(startupRecovery)
+    && !/async function removeOrphanStorageDirs\(\)[\s\S]{0,900}Promise\.all\(entries\.map/.test(startupRecovery),
+  'Startup recovery should clean orphan storage directories incrementally instead of deleting every leftover directory concurrently.',
+)
+assert(
+  documentsIpc.includes("pages.length, 'processing', 'pending', 'processing'")
+    && documentsIpc.includes("parsedEbook.sections.length,\n              'processing'")
+    && documentsIpc.includes("UPDATE documents SET ocr_status = ?, import_status = ?, error_message = NULL"),
+  'JSON and ebook imports should remain processing until all page rows are written.',
+)
+
+console.log('Startup nonblocking regression passed')

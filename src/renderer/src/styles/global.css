@@ -1,0 +1,290 @@
+/* 全局样式 — 文献管理 */
+
+/* ====== CSS 变量设计系统 ====== */
+:root {
+  /* 品牌色系：古铜金 + 墨色 */
+  --gs-gold: #C4956A;
+  --gs-gold-light: #D4AD84;
+  --gs-gold-dark: #A67B52;
+  --gs-ink: #1a1a1a;
+  --gs-ink-deep: #0a0a0a;
+  --gs-ink-light: #2a2a2a;
+  --gs-paper: #f5efe6;
+  --gs-paper-dark: #e8dfd4;
+
+  /* 状态色 */
+  --gs-success: #52c41a;
+  --gs-warning: #faad14;
+  --gs-error: #ff4d4f;
+  --gs-info: #1890ff;
+
+  /* 文本色 (暗色主题) */
+  --gs-text-primary: rgba(255, 255, 255, 0.92);
+  --gs-text-secondary: rgba(255, 255, 255, 0.65);
+  --gs-text-tertiary: rgba(255, 255, 255, 0.45);
+
+  /* 间距 */
+  --gs-spacing-xs: 4px;
+  --gs-spacing-sm: 8px;
+  --gs-spacing-md: 16px;
+  --gs-spacing-lg: 24px;
+  --gs-spacing-xl: 32px;
+
+  /* 动画 */
+  --gs-transition-fast: 0.15s ease;
+  --gs-transition-normal: 0.25s ease;
+  --gs-transition-slow: 0.4s ease;
+
+  /* 阴影 */
+  --gs-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --gs-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --gs-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+/* ====== 基础重置 ====== */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', 'Noto Serif SC', -apple-system, BlinkMacSystemFont,
+    'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--gs-ink-deep);
+  color: var(--gs-text-primary);
+}
+
+/* ====== 滚动条美化 ====== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  transition: background var(--gs-transition-fast);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* ====== 选中文本样式 ====== */
+::selection {
+  background: rgba(255, 207, 90, 0.42);
+  color: inherit;
+}
+
+/* ====== 拖拽区域样式 ====== */
+.drop-zone {
+  border: 2px dashed rgba(196, 149, 106, 0.3);
+  border-radius: 12px;
+  padding: var(--gs-spacing-xl);
+  text-align: center;
+  cursor: pointer;
+  transition: all var(--gs-transition-normal);
+  background: rgba(196, 149, 106, 0.03);
+}
+
+.drop-zone:hover,
+.drop-zone.drag-over {
+  border-color: var(--gs-gold);
+  background: rgba(196, 149, 106, 0.08);
+  box-shadow: 0 0 20px rgba(196, 149, 106, 0.1);
+}
+
+/* ====== 侧边栏标题样式 ====== */
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--gs-spacing-sm);
+  padding: var(--gs-spacing-md);
+  font-family: 'Noto Serif SC', serif;
+  font-weight: 700;
+  font-size: 18px;
+  color: var(--gs-gold);
+  letter-spacing: 2px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  user-select: none;
+}
+
+.sidebar-brand .brand-icon {
+  font-size: 24px;
+}
+
+/* ====== 页面过渡动画 ====== */
+.page-enter {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.page-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity var(--gs-transition-normal), transform var(--gs-transition-normal);
+}
+
+/* Keep long Select values from resizing filters and toolbars. */
+.ant-select {
+  min-width: 0;
+}
+
+.ant-select .ant-select-selector {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ant-select-multiple .ant-select-selection-overflow,
+.ant-select-multiple .ant-select-selection-overflow-item {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.ant-select-multiple .ant-select-selection-item {
+  min-width: 0;
+  max-width: calc(100% - 8px);
+}
+
+.ant-select .ant-select-selection-item,
+.ant-select .ant-select-selection-item-content,
+.ant-select .ant-select-selection-placeholder {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ant-select-dropdown .ant-select-item-option-content,
+.gs-select-option-ellipsis {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ====== 空状态 ====== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--gs-text-tertiary);
+  gap: var(--gs-spacing-md);
+}
+
+.empty-state-icon {
+  font-size: 64px;
+  opacity: 0.3;
+}
+
+/* ====== 状态标签 ====== */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.status-badge--pending {
+  background: rgba(250, 173, 20, 0.15);
+  color: var(--gs-warning);
+}
+
+.status-badge--processing {
+  background: rgba(24, 144, 255, 0.15);
+  color: var(--gs-info);
+}
+
+.status-badge--completed {
+  background: rgba(82, 196, 26, 0.15);
+  color: var(--gs-success);
+}
+
+.status-badge--error {
+  background: rgba(255, 77, 79, 0.15);
+  color: var(--gs-error);
+}
+
+/* ====== Glassmorphism 卡片 ====== */
+.glass-card {
+  background: rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  transition: all var(--gs-transition-normal);
+}
+
+.glass-card:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(196, 149, 106, 0.2);
+  box-shadow: var(--gs-shadow-md);
+}
+
+.gs-hit-pagination.ant-pagination,
+.gs-hit-pagination .ant-pagination-simple-pager,
+.gs-hit-pagination .ant-pagination-slash {
+  color: rgba(168, 111, 55, 0.9);
+}
+
+.gs-hit-pagination .ant-pagination-simple-pager input {
+  min-width: 34px;
+  height: 24px;
+  background: rgba(9, 6, 4, 0.96);
+  border-color: rgba(120, 74, 34, 0.62);
+  color: #c98f4a;
+  font-weight: 700;
+  box-shadow: none;
+}
+
+.gs-hit-pagination .ant-pagination-simple-pager input:hover,
+.gs-hit-pagination .ant-pagination-simple-pager input:focus {
+  border-color: rgba(184, 126, 66, 0.78);
+}
+
+.gs-hit-pagination .ant-pagination-prev,
+.gs-hit-pagination .ant-pagination-next {
+  min-width: 24px;
+  height: 24px;
+  line-height: 24px;
+}
+
+.gs-hit-pagination .ant-pagination-prev .ant-pagination-item-link,
+.gs-hit-pagination .ant-pagination-next .ant-pagination-item-link {
+  background: rgba(9, 6, 4, 0.78);
+  border-color: rgba(120, 74, 34, 0.42);
+  color: rgba(168, 111, 55, 0.92);
+}
+
+.gs-hit-pagination .ant-pagination-prev:not(.ant-pagination-disabled) .ant-pagination-item-link:hover,
+.gs-hit-pagination .ant-pagination-next:not(.ant-pagination-disabled) .ant-pagination-item-link:hover {
+  border-color: rgba(184, 126, 66, 0.72);
+  color: #c98f4a;
+}
+
+.gs-hit-pagination .ant-pagination-disabled .ant-pagination-item-link {
+  background: rgba(9, 6, 4, 0.52);
+  border-color: rgba(120, 74, 34, 0.24);
+  color: rgba(120, 74, 34, 0.54);
+}

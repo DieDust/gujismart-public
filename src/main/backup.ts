@@ -1,0 +1,469 @@
+import { dialog, shell } from 'electron'
+import { isAbsolute, join, relative, resolve } from 'path'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
+import { closeDatabase, getDataDir, queryAll, run, saveDatabase } from './database'
+import type { BackupImportResult, BackupResult, BackupSlot, BackupStatus, CompactAutoBackupResult } from '../shared/types'
+
+let autoBackupTimer: ReturnType<typeof setInterval> | null = null
+let autoBackupRunning = false
+const MIN_AUTO_BACKUP_SLOT_COUNT = 1
+const AUTO_BACKUP_SLOT_COUNT = 3
+
+interface DocumentListCsvRow {
+  title: string | null
+  author: string | null
+  dynasty: string | null
+  source: string | null
+  doc_type: string | null
+  page_count: number | null
+  ocr_status: string | null
+  proof_status: string | null
+  import_status: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+function normalizeAutoBackupSlotCount(value: unknown): number {
+  const parsed = Number.parseInt(String(value ?? AUTO_BACKUP_SLOT_COUNT), 10)
+  if (!Number.isFinite(parsed)) return AUTO_BACKUP_SLOT_COUNT
+  return Math.max(MIN_AUTO_BACKUP_SLOT_COUNT, Math.min(AUTO_BACKUP_SLOT_COUNT, parsed))
+}
+
+function copyDirRecursive(src: string, dest: string): void {
+  if (!existsSync(dest)) mkdirSync(dest, { recursive: true })
+  const entries = readdirSync(src, { withFileTypes: true })
+  for (const entry of entries) {
+    const srcPath = join(src, entry.name)
+    const destPath = join(dest, entry.name)
+    if (entry.isDirectory()) {
+      copyDirRecursive(srcPath, destPath)
+    } else {
+      copyFileSync(srcPath, destPath)
+    }
+  }
+}
+
+function getDirSize(dir: string): number {
+  if (!existsSync(dir)) return 0
+  return readdirSync(dir, { withFileTypes: true }).reduce((sum, entry) => {
+    const targetPath = join(dir, entry.name)
+    if (entry.isDirectory()) return sum + getDirSize(targetPath)
+    return sum + statSync(targetPath).size
+  }, 0)
+}
+
+function readSetting(key: string, fallback: string): string {
+  const row = queryAll<{ value: string }>('SELECT value FROM settings WHERE key = ?', [key])[0]
+  return row?.value ?? fallback
+}
+
+function writeSetting(key: string, value: string): void {
+  run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value])
+}
+
+function isPathInside(parentDir: string, targetPath: string): boolean {
+  const relativePath = relative(resolve(parentDir), resolve(targetPath))
+  return !!relativePath && !relativePath.startsWith('..') && !isAbsolute(relativePath)
+}
+
+function isSameOrInside(parentDir: string, targetPath: string): boolean {
+  return resolve(parentDir) === resolve(targetPath) || isPathInside(parentDir, targetPath)
+}
+
+function assertManagedDataChild(dataDir: string, targetPath: string): void {
+  if (!isPathInside(dataDir, targetPath)) {
+    throw new Error(`拒绝操作数据目录之外的路径：${targetPath}`)
+  }
+}
+
+function getBackupDbDir(backupDir: string): string {
+  return join(backupDir, 'db')
+}
+
+function getBackupStorageDir(backupDir: string): string {
+  return join(backupDir, 'storage')
+}
+
+function hasBackupDatabase(backupDir: string): boolean {
+  const dbDir = getBackupDbDir(backupDir)
+  return existsSync(join(dbDir, 'gujismart.db')) || existsSync(join(dbDir, 'gujismart.json'))
+}
+
+function validateBackupDirectory(backupDir: string): void {
+  if (!existsSync(backupDir)) {
+    throw new Error('备份目录不存在')
+  }
+  const dataDir = getDataDir()
+  if (resolve(backupDir) === resolve(dataDir)) {
+    throw new Error('不能把当前数据目录作为备份导入')
+  }
+  if (isSameOrInside(join(dataDir, 'db'), backupDir) || isSameOrInside(join(dataDir, 'storage'), backupDir)) {
+    throw new Error('不能从当前数据库或文献存储目录内导入备份')
+  }
+  if (!hasBackupDatabase(backupDir)) {
+    throw new Error('这不是有效的备份目录：未找到 db/gujismart.db 或 db/gujismart.json')
+  }
+}
+
+function replaceManagedDirectory(dataDir: string, directoryName: 'db' | 'storage', sourceDir: string): void {
+  const targetDir = resolve(dataDir, directoryName)
+  assertManagedDataChild(dataDir, targetDir)
+  if (existsSync(targetDir)) {
+    rmSync(targetDir, { recursive: true, force: true })
+  }
+  if (existsSync(sourceDir)) {
+    copyDirRecursive(sourceDir, targetDir)
+  } else {
+    mkdirSync(targetDir, { recursive: true })
+  }
+}
+
+function createSafetyBackupBeforeImport(dataDir: string): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const safetyBackupDir = join(dataDir, 'pre-import-backups', `before-import-${timestamp}`)
+  assertManagedDataChild(dataDir, safetyBackupDir)
+  return copyCurrentDataTo(safetyBackupDir, 'manual')
+}
+
+function getAutoBackupRoot(): string {
+  return join(getDataDir(), 'auto-backups')
+}
+
+function getSlotPath(slot: number): string {
+  return join(getAutoBackupRoot(), `slot-${slot}`)
+}
+
+function getAutoBackupSlotCount(): number {
+  const stored = readSetting('auto_backup_slot_count', String(AUTO_BACKUP_SLOT_COUNT))
+  const slotCount = normalizeAutoBackupSlotCount(stored)
+  if (String(slotCount) !== stored) {
+    writeSetting('auto_backup_slot_count', String(slotCount))
+  }
+  return slotCount
+}
+
+function getAutoBackupIncludeStorage(): boolean {
+  return readSetting('auto_backup_include_storage', 'false') === 'true'
+}
+
+function cleanupExtraAutoBackupSlots(slotCount = AUTO_BACKUP_SLOT_COUNT): void {
+  const root = resolve(getAutoBackupRoot())
+  if (!existsSync(root)) return
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const match = entry.name.match(/^slot-(\d+)$/)
+    if (!match) continue
+    const slot = Number(match[1])
+    if (!Number.isFinite(slot) || slot <= slotCount) continue
+    const target = resolve(root, entry.name)
+    if (target === root || !isPathInside(root, target)) continue
+    rmSync(target, { recursive: true, force: true })
+  }
+}
+
+function writeManifest(backupDir: string, type: 'manual' | 'auto', slot?: number, includesStorage = true): void {
+  const manifest = {
+    version: '1.0.0',
+    app: '文献管理',
+    type,
+    slot: slot ?? null,
+    includesStorage,
+    timestamp: new Date().toISOString(),
+  }
+  writeFileSync(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
+}
+
+function copyCurrentDataTo(backupDir: string, type: 'manual' | 'auto', slot?: number, options?: { includeStorage?: boolean }): string {
+  const dataDir = getDataDir()
+  saveDatabase()
+  const includeStorage = options?.includeStorage ?? true
+
+  if (existsSync(backupDir)) {
+    rmSync(backupDir, { recursive: true, force: true })
+  }
+  mkdirSync(backupDir, { recursive: true })
+
+  const dbDir = join(dataDir, 'db')
+  if (existsSync(dbDir)) {
+    copyDirRecursive(dbDir, join(backupDir, 'db'))
+  }
+
+  const storageDir = join(dataDir, 'storage')
+  if (includeStorage && existsSync(storageDir)) {
+    copyDirRecursive(storageDir, join(backupDir, 'storage'))
+  }
+
+  writeManifest(backupDir, type, slot, includeStorage)
+  return backupDir
+}
+
+export async function backupData(): Promise<string | null> {
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    title: '备份数据',
+    defaultPath: `文献管理_备份_${new Date().toISOString().slice(0, 10)}`,
+    filters: [{ name: '备份目录', extensions: ['*'] }]
+  })
+
+  if (canceled || !filePath) return null
+
+  try {
+    return copyCurrentDataTo(filePath, 'manual')
+  } catch (error) {
+    console.error('[Backup] 备份失败:', error)
+    throw new Error(`备份失败: ${(error as Error).message}`)
+  }
+}
+
+export async function importBackupData(): Promise<BackupImportResult> {
+  const { canceled, filePaths } = await dialog.showOpenDialog({
+    title: '导入备份并恢复',
+    properties: ['openDirectory']
+  })
+
+  if (canceled || filePaths.length === 0) {
+    return { success: false, canceled: true, path: null }
+  }
+
+  try {
+    const backupDir = resolve(filePaths[0])
+    validateBackupDirectory(backupDir)
+
+    const dataDir = getDataDir()
+    const safetyBackupPath = createSafetyBackupBeforeImport(dataDir)
+
+    closeDatabase()
+    replaceManagedDirectory(dataDir, 'db', getBackupDbDir(backupDir))
+    if (existsSync(getBackupStorageDir(backupDir))) {
+      replaceManagedDirectory(dataDir, 'storage', getBackupStorageDir(backupDir))
+    }
+
+    return {
+      success: true,
+      path: backupDir,
+      importedBackupPath: backupDir,
+      safetyBackupPath,
+      requiresRestart: true,
+    }
+  } catch (error) {
+    console.error('[Backup] 导入备份失败:', error)
+    throw new Error(`导入备份失败: ${(error as Error).message}`)
+  }
+}
+
+export async function restoreData(): Promise<boolean> {
+  const result = await importBackupData()
+  return result.success
+}
+
+export async function runAutoBackupNow(): Promise<BackupResult> {
+  if (autoBackupRunning) {
+    return { success: false, error: '自动备份正在进行中' }
+  }
+
+  autoBackupRunning = true
+  try {
+    const slotCount = getAutoBackupSlotCount()
+    cleanupExtraAutoBackupSlots(slotCount)
+    const currentSlot = Math.max(1, Math.min(slotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
+    const backupDir = getSlotPath(currentSlot)
+    copyCurrentDataTo(backupDir, 'auto', currentSlot, { includeStorage: getAutoBackupIncludeStorage() })
+
+    const nextSlot = currentSlot >= slotCount ? 1 : currentSlot + 1
+    const now = new Date().toISOString()
+    writeSetting('auto_backup_next_slot', String(nextSlot))
+    writeSetting('auto_backup_last_at', now)
+    saveDatabase()
+
+    return { success: true, path: backupDir }
+  } catch (error) {
+    console.error('[Backup] 自动备份失败:', error)
+    return { success: false, error: (error as Error).message }
+  } finally {
+    autoBackupRunning = false
+  }
+}
+
+export function getBackupStatus(): BackupStatus {
+  const enabled = readSetting('auto_backup_enabled', 'true') !== 'false'
+  const intervalHours = Number.parseInt(readSetting('auto_backup_interval_hours', '24'), 10) || 24
+  const slotCount = getAutoBackupSlotCount()
+  const includeStorage = getAutoBackupIncludeStorage()
+  cleanupExtraAutoBackupSlots(slotCount)
+  const nextSlot = Math.max(1, Math.min(slotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
+  const lastBackupAt = readSetting('auto_backup_last_at', '') || null
+  const nextBackupAt = enabled && lastBackupAt
+    ? new Date(new Date(lastBackupAt).getTime() + intervalHours * 60 * 60 * 1000).toISOString()
+    : null
+  const slots: BackupSlot[] = Array.from({ length: slotCount }, (_, index) => {
+    const slot = index + 1
+    const path = getSlotPath(slot)
+    const manifestPath = join(path, 'manifest.json')
+    let timestamp: string | undefined
+    let includesStorage: boolean | undefined
+    if (existsSync(manifestPath)) {
+      try {
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'))
+        timestamp = manifest.timestamp
+        includesStorage = manifest.includesStorage !== false
+      } catch {
+        timestamp = undefined
+      }
+    }
+    return {
+      slot,
+      path,
+      exists: existsSync(path),
+      timestamp,
+      includesStorage: includesStorage ?? existsSync(getBackupStorageDir(path)),
+      sizeBytes: existsSync(path) ? getDirSize(path) : 0,
+    }
+  })
+
+  return {
+    enabled,
+    intervalHours,
+    slotCount,
+    nextSlot,
+    includeStorage,
+    lastBackupAt,
+    nextBackupAt,
+    autoBackupRoot: getAutoBackupRoot(),
+    slots,
+  }
+}
+
+export function configureAutoBackup(
+  enabled: boolean,
+  intervalHours: number,
+  includeStorage = getAutoBackupIncludeStorage(),
+  slotCount = getAutoBackupSlotCount(),
+): BackupStatus {
+  const normalizedSlotCount = normalizeAutoBackupSlotCount(slotCount)
+  const nextSlot = Math.max(1, Math.min(normalizedSlotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
+  writeSetting('auto_backup_enabled', enabled ? 'true' : 'false')
+  writeSetting('auto_backup_interval_hours', String(Math.max(1, intervalHours)))
+  writeSetting('auto_backup_include_storage', includeStorage ? 'true' : 'false')
+  writeSetting('auto_backup_slot_count', String(normalizedSlotCount))
+  writeSetting('auto_backup_next_slot', String(nextSlot))
+  cleanupExtraAutoBackupSlots(normalizedSlotCount)
+  saveDatabase()
+  startAutoBackupScheduler()
+  return getBackupStatus()
+}
+
+export async function compactAutoBackups(): Promise<CompactAutoBackupResult> {
+  if (autoBackupRunning) {
+    return { success: false, beforeBytes: 0, afterBytes: 0, bytesFreed: 0, error: '自动备份正在运行中' }
+  }
+
+  const root = getAutoBackupRoot()
+  const beforeBytes = getDirSize(root)
+  try {
+    if (existsSync(root)) {
+      rmSync(root, { recursive: true, force: true })
+    }
+    mkdirSync(root, { recursive: true })
+    writeSetting('auto_backup_include_storage', 'false')
+    writeSetting('auto_backup_next_slot', '1')
+    saveDatabase()
+    const backup = await runAutoBackupNow()
+    const afterBytes = getDirSize(root)
+    return {
+      success: backup.success,
+      beforeBytes,
+      afterBytes,
+      bytesFreed: Math.max(0, beforeBytes - afterBytes),
+      backup,
+      error: backup.error,
+    }
+  } catch (error) {
+    const afterBytes = getDirSize(root)
+    return {
+      success: false,
+      beforeBytes,
+      afterBytes,
+      bytesFreed: Math.max(0, beforeBytes - afterBytes),
+      error: (error as Error).message,
+    }
+  }
+}
+
+export function startAutoBackupScheduler(): void {
+  if (autoBackupTimer) {
+    clearInterval(autoBackupTimer)
+    autoBackupTimer = null
+  }
+
+  const tick = () => {
+    const status = getBackupStatus()
+    if (!status.enabled) return
+    if (!status.lastBackupAt) {
+      writeSetting('auto_backup_last_at', new Date().toISOString())
+      saveDatabase()
+      return
+    }
+
+    const dueAt = new Date(status.lastBackupAt).getTime() + status.intervalHours * 60 * 60 * 1000
+    if (Date.now() >= dueAt) {
+      void runAutoBackupNow()
+    }
+  }
+
+  tick()
+  autoBackupTimer = setInterval(tick, 10 * 60 * 1000)
+}
+
+export function stopAutoBackupScheduler(): void {
+  if (autoBackupTimer) {
+    clearInterval(autoBackupTimer)
+    autoBackupTimer = null
+  }
+}
+
+export async function openDataDirectory(): Promise<boolean> {
+  await shell.openPath(getDataDir())
+  return true
+}
+
+export async function openAutoBackupDirectory(): Promise<boolean> {
+  const root = getAutoBackupRoot()
+  if (!existsSync(root)) mkdirSync(root, { recursive: true })
+  await shell.openPath(root)
+  return true
+}
+
+export async function exportDocumentListCsv(): Promise<string | null> {
+  const { canceled, filePath } = await dialog.showSaveDialog({
+    title: '导出文献清单',
+    defaultPath: `文献管理_文献清单_${new Date().toISOString().slice(0, 10)}.csv`,
+    filters: [{ name: 'CSV', extensions: ['csv'] }]
+  })
+
+  if (canceled || !filePath) return null
+
+  const rows = queryAll<DocumentListCsvRow>(
+    `SELECT title, author, dynasty, source, doc_type, page_count, ocr_status, proof_status, import_status, created_at, updated_at
+     FROM documents
+     ORDER BY updated_at DESC`
+  )
+  const headers = ['标题', '作者', '朝代/年份', '来源', '类型', '页数', 'OCR状态', '校对状态', '入库状态', '创建时间', '更新时间']
+  const escapeCsv = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`
+  const lines = [
+    headers.map(escapeCsv).join(','),
+    ...rows.map((row) => [
+      row.title,
+      row.author,
+      row.dynasty,
+      row.source,
+      row.doc_type,
+      row.page_count,
+      row.ocr_status,
+      row.proof_status,
+      row.import_status,
+      row.created_at,
+      row.updated_at,
+    ].map(escapeCsv).join(','))
+  ]
+  writeFileSync(filePath, '\ufeff' + lines.join('\n'), 'utf-8')
+  return filePath
+}

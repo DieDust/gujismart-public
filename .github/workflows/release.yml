@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v0.9.9'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Resolve release tag
+        id: release_meta
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $tag = '${{ inputs.tag }}'
+          } else {
+            $tag = '${{ github.ref_name }}'
+          }
+
+          if (-not $tag -or -not $tag.StartsWith('v')) {
+            throw "Release tag must look like v0.9.9, got '$tag'."
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows packages
+        run: npm run build:win
+
+      - name: Check
+        run: npm run check
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: GujiSmart-Windows-${{ steps.release_meta.outputs.tag }}
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          if (-not $tag) {
+            throw 'Release tag is required.'
+          }
+
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "GujiSmart $tag" --notes "GujiSmart Windows release. Download the Setup installer for normal installation, or the Portable package for no-install use."
+          }
+
+          $assets = Get-ChildItem -Path dist -File |
+            Where-Object { $_.Extension -eq '.exe' } |
+            ForEach-Object { $_.FullName }
+
+          if (-not $assets -or $assets.Count -eq 0) {
+            throw 'No release assets were produced.'
+          }
+
+          & gh release upload $tag @assets --clobber

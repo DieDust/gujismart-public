@@ -1,0 +1,133 @@
+{
+  "name": "gujismart",
+  "version": "0.9.9",
+  "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
+  "main": "./out/main/index.js",
+  "author": "DieDust",
+  "license": "Apache-2.0",
+  "private": false,
+  "scripts": {
+    "dev": "electron-vite dev",
+    "clean:build": "node scripts/clean-build-output.js out",
+    "clean:dist": "node scripts/clean-build-output.js dist",
+    "size:build": "node scripts/report-build-size.js",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run clean:build && electron-vite build",
+    "preview": "electron-vite preview",
+    "smoke": "node scripts/electron-smoke.js",
+    "check": "npm run typecheck && npm run check:ipc-contract && npm run check:mojibake && npm run check:opensource && npm run check:pdf-import && npm run check:pdf-page-init && npm run check:pdf-info && npm run check:library-import-queue && npm run check:ocr-progress && npm run check:ocr-upload && npm run check:ocr-result-save && npm run check:batch-processor-save && npm run check:startup-nonblocking && npm run check:database-busy && npm run test:library-ocr-status",
+    "check:ipc-contract": "node scripts/check-ipc-contract.js",
+    "check:mojibake": "node scripts/check-mojibake.js",
+    "check:opensource": "node scripts/check-opensource.js",
+    "check:pdf-import": "node scripts/pdf-import-deferred-compression-regression.js",
+    "check:pdf-page-init": "node scripts/pdf-page-init-regression.js",
+    "check:pdf-info": "node scripts/pdf-info-main-process-regression.js",
+    "check:library-import-queue": "node scripts/library-import-queue-persistence-regression.js",
+    "check:ocr-progress": "node scripts/ocr-progress-monotonic-regression.js",
+    "check:ocr-upload": "node scripts/ocr-pdf-upload-streaming-regression.js",
+    "check:ocr-result-save": "node scripts/ocr-result-save-batching-regression.js",
+    "check:batch-processor-save": "node scripts/batch-processor-save-regression.js",
+    "check:startup-nonblocking": "node scripts/startup-nonblocking-regression.js",
+    "check:database-busy": "node scripts/database-busy-retry-regression.js",
+    "test": "npm run check",
+    "test:search": "electron scripts/search-regression.js",
+    "test:metadata-tags": "electron scripts/metadata-tags-regression.js",
+    "test:ocr-recovery": "electron scripts/ocr-recovery-regression.js",
+    "test:startup-recovery": "electron scripts/startup-recovery-regression.js",
+    "test:library-ocr-status": "node scripts/library-ocr-status-reconcile-regression.js",
+    "test:ocr-pdf-resume": "node scripts/ocr-pdf-resume-regression.js",
+    "test:research": "electron scripts/research-regression.js",
+    "test:evidence-qa": "electron scripts/evidence-qa-regression.js",
+    "test:ai-ui": "node scripts/ai-markdown-citation-qa.js",
+    "test:source-structured-ocr": "node scripts/source-structured-ocr-regression.js",
+    "postinstall": "electron-builder install-app-deps",
+    "build:win": "npm run clean:dist && npm run build && electron-builder --win --publish never",
+    "build:unpack": "npm run clean:dist && npm run build && electron-builder --win --dir"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.6.0",
+    "@electron-toolkit/utils": "^3.0.0",
+    "@napi-rs/canvas": "^0.1.100",
+    "@pdf-lib/fontkit": "^1.1.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "antd": "^5.24.0",
+    "better-sqlite3": "^12.10.0",
+    "brace-expansion": "^5.0.6",
+    "epubjs": "^0.3.93",
+    "fast-xml-parser": "^5.8.0",
+    "flexsearch": "^0.7.43",
+    "jszip": "^3.10.1",
+    "marked": "^18.0.3",
+    "nanoid": "^5.1.0",
+    "opencc-js": "^1.3.1",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.10.38",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.2.0",
+    "react-window": "^2.2.7",
+    "rehype-raw": "^7.0.0",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^39.8.10",
+    "electron-builder": "^26.8.1",
+    "electron-vite": "^3.0.0",
+    "playwright": "^1.59.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  },
+  "build": {
+    "appId": "com.gujismart.app",
+    "productName": "文献管理",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "GujiSmart-${version}-Setup-${arch}.${ext}",
+      "include": "build/installer.nsh",
+      "language": "2052"
+    },
+    "portable": {
+      "artifactName": "GujiSmart-${version}-Portable-${arch}.${ext}"
+    },
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "resources/**/*",
+      "!resources/vendor/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/vendor",
+        "to": "vendor"
+      }
+    ]
+  },
+  "overrides": {
+    "@xmldom/xmldom": "^0.9.10"
+  }
+}

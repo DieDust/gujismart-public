@@ -1,0 +1,2138 @@
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode, type WheelEvent } from 'react'
+import { Button, Empty, Input, InputNumber, Popover, Segmented, Slider, Space, Switch, Tag } from 'antd'
+import {
+  CheckOutlined,
+  ColumnWidthOutlined,
+  EditOutlined,
+  MinusOutlined,
+  PlusOutlined,
+  RotateRightOutlined,
+  SaveOutlined,
+  SettingOutlined,
+  UndoOutlined,
+} from '@ant-design/icons'
+import OpenCC from 'opencc-js'
+import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
+import { renderOcrInlineText } from '../utils/ocrInlineRender'
+import {
+  buildParallelTranslationSegments,
+  isParallelTranslationDisplayReady,
+  normalizeParallelSegmentForMatch,
+} from '@shared/parallel-translation'
+import {
+  getCanonicalPageTranslationSourceText,
+  getCanonicalTranslationBlockText,
+} from '@shared/translation-source'
+import type { Document, DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResult, PageUpdatePayload } from '@shared/types'
+
+type ProofDisplayScript = 'original' | 'simplified' | 'traditional'
+type BlockRect = { left: number; top: number; width: number; height: number }
+type JsonRecord = Record<string, unknown>
+type FacsimileOcrResult = OcrRecognizeResult & JsonRecord
+type LayoutBlock = OcrRecognizeLayoutBlock & JsonRecord & {
+  words?: string
+  displayWords?: string
+  label?: string
+  block_label?: string
+  type?: string
+  block_type?: string
+  category?: string
+  class?: string
+  layout_label?: string
+  orientation?: 'vertical' | 'horizontal' | string
+  reading_order?: number
+  column_index?: number
+  line_index?: number
+  image_asset_path?: string
+  asset_path?: string
+  image_path?: string
+  __rect?: BlockRect
+  __synthetic?: boolean
+  __sourceIndex?: number
+}
+type FacsimileLayoutProfile = 'paddle' | 'vision'
+
+type TranslationBlockCoverage = {
+  blockIndex: number
+  startOffset: number
+  endOffset: number
+}
+
+type TranslationCoverageCursor = {
+  blockIndex: number
+  offset: number
+}
+
+type FacsimileTranslationOverlay = {
+  id: string
+  sourceIndexes: number[]
+  text: string
+  rect: BlockRect
+  label: string
+  orientation: 'vertical' | 'horizontal'
+}
+
+type FacsimileBlockRenderLayout = {
+  block: LayoutBlock
+  sourceIndex: number
+  rect: BlockRect
+  left: number
+  top: number
+  width: number
+  height: number
+  label: string
+  labelColor: string
+  labelName: string
+  isImage: boolean
+  tableRows: string[][]
+  orientation: 'vertical' | 'horizontal'
+  originalText: string
+  shouldRenderTable: boolean
+  displayText: string
+  fittedLayout: FittedTextLayout
+  fontSize: number
+  fittedDisplayText: string
+  searchableText: string
+  normalizedSearchableText: string
+  padding: number
+}
+
+type FacsimileTranslationRenderLayout = {
+  overlay: FacsimileTranslationOverlay
+  left: number
+  top: number
+  width: number
+  height: number
+  labelColor: string
+  displayText: string
+  fittedLayout: FittedTextLayout
+  normalizedSearchableText: string
+  sourceIndex: number
+  padding: number
+  lineHeight: number
+}
+
+interface GujiFacsimileProofreaderProps {
+  pageId: string
+  ocrResult: unknown
+  pageImageSrc?: string
+  pageProofStatus?: 'completed' | 'pending'
+  activeBoxIndex?: number
+  searchKeyword?: string
+  coordinateSourceSize?: { width?: number | null; height?: number | null }
+  translationText?: string
+  translationLoading?: boolean
+  translationSkipped?: boolean
+  translationOpen?: boolean
+  onTranslationOpenChange?: (open: boolean) => void
+  onTranslateCurrentPage?: (text: string) => void
+  onSelectBox?: (index: number) => void
+  onSave: (pageId: string, data: PageUpdatePayload) => void
+  onTextSelectionChange?: (text: string) => void
+}
+
+const FONT_FAMILY = "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif"
+const FACSIMILE_BASE_PAGE_WIDTH = 760
+const FACSIMILE_MIN_ZOOM = 0.45
+const FACSIMILE_MAX_ZOOM = 2.4
+const FACSIMILE_FONT_SCALE_STORAGE_KEY = 'gujismart.facsimileProof.fontScale'
+const FACSIMILE_FONT_SCALE_STORAGE_VERSION_KEY = 'gujismart.facsimileProof.fontScaleVersion'
+const FACSIMILE_SHOW_RULES_STORAGE_KEY = 'gujismart.facsimileProof.showRules'
+const FACSIMILE_IMAGE_UNDERLAY_MODE_STORAGE_KEY = 'gujismart.facsimileProof.imageUnderlayMode'
+const FACSIMILE_IMAGE_UNDERLAY_BLUR_STORAGE_KEY = 'gujismart.facsimileProof.imageUnderlayBlur'
+const FACSIMILE_FONT_SCALE_DEFAULT = 1.1
+const FACSIMILE_FONT_SCALE_STORAGE_VERSION = '5'
+const FACSIMILE_FONT_SCALE_MIN = 0.1
+const FACSIMILE_FONT_SCALE_MAX = 5
+const FACSIMILE_FONT_SCALE_STEP = 0.02
+const FACSIMILE_TEXT_FIT_ITERATIONS = 7
+type ImageUnderlayMode = 'auto' | 'on' | 'off'
+
+const LABEL_COLORS: Record<string, string> = {
+  doc_title: '#7b3f00',
+  paragraph_title: '#8c5a18',
+  title: '#7b3f00',
+  text: '#4a3728',
+  note: '#6f5a46',
+  abstract: '#6f5a46',
+  reference: '#6f5a46',
+  table: '#5a4634',
+  header: '#8a7662',
+  footer: '#8a7662',
+  number: '#8a7662',
+  seal: '#b42318',
+}
+
+const LABEL_NAMES: Record<string, string> = {
+  doc_title: '题名',
+  paragraph_title: '篇题',
+  title: '标题',
+  text: '正文',
+  note: '夹注',
+  abstract: '摘要',
+  reference: '参考',
+  table: '表格',
+  header: '页眉',
+  footer: '页脚',
+  number: '页码',
+  seal: '印章',
+}
+
+const toSimplified = OpenCC.Converter({ from: 'tw', to: 'cn' })
+const toTraditional = OpenCC.Converter({ from: 'cn', to: 'tw' })
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function normalizeFontScale(value: number): number {
+  if (!Number.isFinite(value)) return FACSIMILE_FONT_SCALE_DEFAULT
+  return Math.round(clamp(value, FACSIMILE_FONT_SCALE_MIN, FACSIMILE_FONT_SCALE_MAX) * 100) / 100
+}
+
+function loadPersistedFontScale(): number {
+  try {
+    const stored = window.localStorage.getItem(FACSIMILE_FONT_SCALE_STORAGE_KEY)
+    if (!stored) return FACSIMILE_FONT_SCALE_DEFAULT
+    const storedScale = normalizeFontScale(Number(stored))
+    const storedVersion = window.localStorage.getItem(FACSIMILE_FONT_SCALE_STORAGE_VERSION_KEY)
+    if (!storedVersion && Math.abs(storedScale - 1) < 0.01) return FACSIMILE_FONT_SCALE_DEFAULT
+    if (storedVersion !== FACSIMILE_FONT_SCALE_STORAGE_VERSION && storedScale < 0.85) return FACSIMILE_FONT_SCALE_DEFAULT
+    return storedScale
+  } catch {
+    return FACSIMILE_FONT_SCALE_DEFAULT
+  }
+}
+
+function loadPersistedShowRules(): boolean {
+  try {
+    const stored = window.localStorage.getItem(FACSIMILE_SHOW_RULES_STORAGE_KEY)
+    return stored == null ? true : stored !== 'false'
+  } catch {
+    return true
+  }
+}
+
+function loadPersistedImageUnderlayMode(): ImageUnderlayMode {
+  try {
+    const stored = window.localStorage.getItem(FACSIMILE_IMAGE_UNDERLAY_MODE_STORAGE_KEY)
+    return stored === 'on' || stored === 'off' || stored === 'auto' ? stored : 'auto'
+  } catch {
+    return 'auto'
+  }
+}
+
+function normalizeImageUnderlayBlur(value: number): number {
+  if (!Number.isFinite(value)) return 45
+  return Math.round(clamp(value, 0, 100))
+}
+
+function loadPersistedImageUnderlayBlur(): number {
+  try {
+    const stored = window.localStorage.getItem(FACSIMILE_IMAGE_UNDERLAY_BLUR_STORAGE_KEY)
+    return stored == null ? 45 : normalizeImageUnderlayBlur(Number(stored))
+  } catch {
+    return 45
+  }
+}
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function readRecordValue(source: unknown, key: string): unknown {
+  return isJsonRecord(source) ? source[key] : undefined
+}
+
+function firstRecordValue(source: unknown, keys: string[]): unknown {
+  for (const key of keys) {
+    const value = readRecordValue(source, key)
+    if (value !== undefined && value !== null) return value
+  }
+  return undefined
+}
+
+function primitiveText(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+function asOcrResult(value: unknown): FacsimileOcrResult {
+  const parsed = parseMaybeJson(value, {})
+  return isJsonRecord(parsed) ? parsed as FacsimileOcrResult : {}
+}
+
+function parseMaybeJson(value: unknown, fallback: unknown = null): unknown {
+  if (!value) return fallback
+  if (typeof value !== 'string') return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return fallback
+  }
+}
+
+function pointCoordinate(point: unknown, key: 'x' | 'y', tupleIndex: number): number | null {
+  if (isJsonRecord(point)) return Number(point[key])
+  if (Array.isArray(point)) return Number(point[tupleIndex])
+  return null
+}
+
+function getRect(block: unknown): BlockRect | null {
+  const loc = firstRecordValue(block, ['location', 'rect', 'points', 'block_bbox', 'bbox', 'box', 'coordinate', 'coordinate_box', 'poly', 'polygon'])
+  if (!loc) return null
+  if (isJsonRecord(loc) && (loc.left !== undefined || loc.top !== undefined)) {
+    const left = Number(loc.left)
+    const top = Number(loc.top)
+    const width = Number(loc.width)
+    const height = Number(loc.height)
+    if ([left, top, width, height].every(Number.isFinite) && width > 0 && height > 0) return { left, top, width, height }
+  }
+  if (Array.isArray(loc) && loc.length >= 4) {
+    if (typeof loc[0] === 'number') {
+      const numbers = loc.map(Number)
+      const xs = numbers.length >= 8 ? [numbers[0], numbers[2], numbers[4], numbers[6]] : [numbers[0], numbers[2]]
+      const ys = numbers.length >= 8 ? [numbers[1], numbers[3], numbers[5], numbers[7]] : [numbers[1], numbers[3]]
+      if ([...xs, ...ys].every(Number.isFinite)) {
+        const left = Math.min(...xs)
+        const top = Math.min(...ys)
+        return { left, top, width: Math.max(...xs) - left, height: Math.max(...ys) - top }
+      }
+    }
+    const xs = loc.map((point) => pointCoordinate(point, 'x', 0)).filter((value): value is number => value !== null && Number.isFinite(value))
+    const ys = loc.map((point) => pointCoordinate(point, 'y', 1)).filter((value): value is number => value !== null && Number.isFinite(value))
+    if (xs.length > 0 && ys.length > 0) {
+      const left = Math.min(...xs)
+      const top = Math.min(...ys)
+      return { left, top, width: Math.max(...xs) - left, height: Math.max(...ys) - top }
+    }
+  }
+  return null
+}
+
+function getBlockText(block: unknown): string {
+  return getCanonicalTranslationBlockText(block)
+}
+
+function getLabel(block: unknown): string {
+  return String(firstRecordValue(block, ['label', 'block_label', 'type']) || 'text').toLowerCase()
+}
+
+function getOrientationLabelText(block: unknown): string {
+  return [
+    readRecordValue(block, 'label'),
+    readRecordValue(block, 'block_label'),
+    readRecordValue(block, 'type'),
+    readRecordValue(block, 'block_type'),
+    readRecordValue(block, 'category'),
+    readRecordValue(block, 'class'),
+    readRecordValue(block, 'layout_label'),
+  ].map((value) => String(value || '').toLowerCase()).filter(Boolean).join(' ')
+}
+
+function isTitleLabel(label: string): boolean {
+  return /title|heading|题|標|卷|篇/.test(label)
+}
+
+function isNoteLabel(label: string): boolean {
+  return /note|annotation|footnote|夹注|夾注|注文|注释|註/.test(label)
+}
+
+function isDecorativeLabel(label: string): boolean {
+  return /header|footer|number|page|seal|stamp|页眉|頁眉|页脚|頁腳|页码|頁碼|印章/.test(label)
+}
+
+function isTocLabel(label: string): boolean {
+  return /^(?:toc|content|contents|catalog|table_of_contents)$/.test(label) || /目录|目錄/.test(label)
+}
+
+function isExplicitVerticalLabel(label: string): boolean {
+  return /vertical[_\s-]*text|col[_\s-]*text|column[_\s-]*text|vertical|竖排|豎排|直排|縦書き|縦組み/i.test(label)
+}
+
+function isExplicitHorizontalLabel(label: string): boolean {
+  return /horizontal[_\s-]*text|row[_\s-]*text|horizontal|横排|橫排|横書き|横組み/i.test(label)
+}
+
+function getExplicitOcrOrientation(block: unknown): 'vertical' | 'horizontal' | null {
+  const orientation = readRecordValue(block, 'orientation')
+  if (orientation === 'vertical' || orientation === 'horizontal') return orientation
+  const label = getOrientationLabelText(block)
+  if (isExplicitVerticalLabel(label)) return 'vertical'
+  if (isExplicitHorizontalLabel(label)) return 'horizontal'
+  return null
+}
+
+function isBodyTextLabel(label: string): boolean {
+  return /^(?:text|paragraph|body)$/.test(label) || /正文/.test(label)
+}
+
+function isNaturallyHorizontalLabel(label: string): boolean {
+  const normalized = String(label || '').toLowerCase().replace(/[_-]+/g, ' ')
+  return /\b(?:doc title|document title|paragraph title|title|heading|section title|abstract|reference|references|caption|figure caption|table caption|header|footer|number|page number|keyword|keywords|author|journal|date)\b/.test(normalized)
+}
+
+function isImageLabel(label: string): boolean {
+  return /^(?:image|figure|picture|chart|diagram|photo|illustration)$/i.test(label)
+    || /图片|图像|插图|示意图|图表|照片/.test(label)
+}
+
+function isRenderableTableBlock(block: unknown): boolean {
+  return isTableBlock(block) && getBlockTableRows(block).length > 0
+}
+
+function getBlockImagePath(block: unknown): string {
+  return String(firstRecordValue(block, ['image_asset_path', 'asset_path', 'image_path']) || '').trim()
+}
+
+function hasHorizontalTextSignals(block: unknown): boolean {
+  const label = getLabel(block)
+  if (isTocLabel(label)) return true
+  const text = getBlockText(block)
+  if (!text) return false
+  const compact = text.replace(/\s+/g, '')
+  const lines = text.split(/\r?\n+/).map((line) => line.trim()).filter(Boolean)
+  const asciiCount = Array.from(compact).filter((char) => /[A-Za-z0-9()[\]{}.,;:!?/"'%-]/.test(char)).length
+  const asciiRatio = asciiCount / Math.max(1, compact.length)
+  const leaderLineCount = lines.filter((line) => /[.．·•]{3,}|…{2,}/.test(line)).length
+  const pageNumberLineCount = lines.filter((line) => /(?:[.．·•…]\s*){2,}(?:[ivxlcdm]+|\d{1,4})\s*$/i.test(line) || /\s(?:[ivxlcdm]+|\d{1,4})\s*$/i.test(line)).length
+  const hasTocShape = lines.length >= 3 && (leaderLineCount >= 1 || pageNumberLineCount >= Math.min(3, lines.length))
+  if (hasTocShape) return true
+  if (asciiRatio > 0.18) return true
+  return false
+}
+
+function getVerticalScriptRatio(text: string): number {
+  const chars = Array.from(String(text || '').replace(/\s+/g, ''))
+  if (chars.length === 0) return 0
+  const verticalChars = chars.filter((char) => /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]/.test(char)).length
+  return verticalChars / chars.length
+}
+
+function isTallVerticalTextBlock(block: unknown): boolean {
+  const label = getOrientationLabelText(block)
+  if (isTocLabel(label) || isExplicitHorizontalLabel(label)) return false
+  const rect = getRect(block)
+  const text = getBlockText(block)
+  if (!rect || !text.trim()) return false
+  if (rect.height < rect.width * 1.28) return false
+  return getVerticalScriptRatio(text) >= 0.42
+}
+
+function isStrongHorizontalTextBlock(block: unknown): boolean {
+  const label = getOrientationLabelText(block)
+  if (isTocLabel(label) || isExplicitHorizontalLabel(label)) return true
+  if (isExplicitVerticalLabel(label)) return false
+  const rect = getRect(block)
+  const text = getBlockText(block)
+  if (!rect || !text.trim()) return false
+  if (isNaturallyHorizontalLabel(label) && !isTallVerticalTextBlock(block)) return true
+  const compact = text.replace(/\s+/g, '')
+  const asciiCount = Array.from(compact).filter((char) => /[A-Za-z0-9()[\]{}.,;:!?/"'%-]/.test(char)).length
+  const asciiRatio = asciiCount / Math.max(1, compact.length)
+  if (rect.width >= rect.height * 1.72) return true
+  return rect.width >= rect.height * 1.35 && (asciiRatio > 0.18 || getVerticalScriptRatio(text) < 0.32)
+}
+
+function isVerticalPage(blocks: LayoutBlock[]): boolean {
+  const meaningfulBlocks = blocks.filter((block) => {
+    const label = getLabel(block)
+    return !isRenderableTableBlock(block) && !isImageLabel(label) && !!getRect(block) && !!getBlockText(block).trim()
+  })
+  if (meaningfulBlocks.length < 3) return false
+  const verticalCount = meaningfulBlocks.filter((block) => (
+    isExplicitVerticalLabel(getOrientationLabelText(block))
+    || block.orientation === 'vertical'
+    || isTallVerticalTextBlock(block)
+  )).length
+  const horizontalCount = meaningfulBlocks.filter(isStrongHorizontalTextBlock).length
+  return verticalCount >= 3 && verticalCount / meaningfulBlocks.length >= 0.58 && horizontalCount / meaningfulBlocks.length <= 0.35
+}
+
+function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
+  if (isRenderableTableBlock(block)) return 'horizontal'
+  const explicitOrientation = getExplicitOcrOrientation(block)
+  if (explicitOrientation) return explicitOrientation
+  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
+  if (isTallVerticalTextBlock(block)) return 'vertical'
+  if (hasHorizontalTextSignals(block)) return 'horizontal'
+  const rect = getRect(block)
+  const text = getBlockText(block)
+  if (!rect) return 'vertical'
+  const asciiRatio = Array.from(text.replace(/\s+/g, '')).filter((char) => /[A-Za-z0-9()[\]{}.,;:!?/"'%-]/.test(char)).length / Math.max(1, text.length)
+  if (asciiRatio > 0.18) return 'horizontal'
+  return rect.height >= rect.width * 1.12 ? 'vertical' : 'horizontal'
+}
+
+function inferPageAwareOrientation(block: unknown, pageVerticalMode: boolean): 'vertical' | 'horizontal' {
+  if (isRenderableTableBlock(block) || isImageLabel(getLabel(block))) return 'horizontal'
+  const explicitOrientation = getExplicitOcrOrientation(block)
+  if (explicitOrientation) return explicitOrientation
+  if (!pageVerticalMode) return inferOrientation(block)
+  const label = getOrientationLabelText(block)
+  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
+  if (isTocLabel(getLabel(block))) return 'horizontal'
+  return 'vertical'
+}
+
+function normalizeBlocks(ocrResult: unknown): LayoutBlock[] {
+  const parsed = asOcrResult(ocrResult)
+  const rawBlocks = getOrderedOcrBlocks({ ocr_result: parsed })
+  const blocks = rawBlocks
+    .map((block, index): LayoutBlock | null => {
+      const label = getLabel(block)
+      const words = getBlockText(block)
+      const rect = getRect(block)
+      const isImage = isImageLabel(label) && !!rect
+      if (!words && !isImage) return null
+      return {
+        ...block,
+        words,
+        label,
+        reading_order: Number.isFinite(Number(block.reading_order)) ? Number(block.reading_order) : index,
+        orientation: inferOrientation(block),
+        __rect: rect || undefined,
+        __sourceIndex: index,
+      }
+    })
+    .filter((block): block is LayoutBlock => block !== null)
+
+  if (blocks.length === 0 && typeof parsed.text === 'string') {
+    return parsed.text
+      .split(/\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line, index): LayoutBlock => ({ words: line, label: 'text', reading_order: index, orientation: 'vertical', __sourceIndex: index }))
+  }
+
+  return blocks.sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
+}
+
+function normalizePageOrientations(blocks: LayoutBlock[]): LayoutBlock[] {
+  const pageVerticalMode = isVerticalPage(blocks)
+  return blocks.map((block) => ({ ...block, orientation: inferPageAwareOrientation(block, pageVerticalMode) }))
+}
+
+function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
+  const nextBlocks: LayoutBlock[] = []
+  blocks.forEach((block, blockIndex) => {
+    const rect = block.__rect
+    const label = getLabel(block)
+    if (
+      !rect
+      || block.orientation !== 'vertical'
+      || isRenderableTableBlock(block)
+      || isImageLabel(label)
+      || isDecorativeLabel(label)
+      || rect.width < 72
+      || rect.width < rect.height * 0.1
+    ) {
+      nextBlocks.push(block)
+      return
+    }
+
+    const columns = getVerticalColumns(getBlockText(block))
+    if (columns.length < 2) {
+      nextBlocks.push(block)
+      return
+    }
+
+    const columnWidth = rect.width / columns.length
+    if (columnWidth < 12) {
+      nextBlocks.push(block)
+      return
+    }
+
+    columns.forEach((columnText, columnIndex) => {
+      const left = rect.left + rect.width - (columnIndex + 1) * columnWidth
+      nextBlocks.push({
+        ...block,
+        words: columnText,
+        displayWords: columnText,
+        reading_order: Number(block.reading_order ?? blockIndex) + columnIndex / 100,
+        column_index: columnIndex,
+        line_index: 0,
+        __rect: {
+          left,
+          top: rect.top,
+          width: columnWidth,
+          height: rect.height,
+        },
+        __sourceIndex: getBlockSourceIndex(block, blockIndex) * 100 + columnIndex,
+      })
+    })
+  })
+  return nextBlocks.sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
+}
+
+function shouldUseImageUnderlay(blocks: LayoutBlock[], pageVerticalMode: boolean): boolean {
+  const contentBlocks = blocks.filter((block) => {
+    const label = getLabel(block)
+    return !isDecorativeLabel(label) && !isRenderableTableBlock(block) && !!block.__rect && !!getBlockText(block).trim()
+  })
+  const imageBlockCount = blocks.filter((block) => isImageLabel(getLabel(block)) || !!getBlockImagePath(block)).length
+  if (pageVerticalMode && contentBlocks.length >= 6 && imageBlockCount === 0) return false
+  if (pageVerticalMode) return imageBlockCount > 0 || contentBlocks.length < 4
+  if (contentBlocks.length < 3) return imageBlockCount > 0
+  const verticalCount = contentBlocks.filter((block) => block.orientation === 'vertical' || isTallVerticalTextBlock(block)).length
+  const verticalRatio = verticalCount / contentBlocks.length
+  const denseHorizontal = contentBlocks.length >= 8 && verticalRatio < 0.35
+  if (denseHorizontal) return false
+  if (imageBlockCount > 0 && contentBlocks.length <= 16) return true
+  return verticalRatio >= 0.55 || imageBlockCount >= 2
+}
+
+function getBlockSourceIndex(block: LayoutBlock, fallbackIndex: number): number {
+  const sourceIndex = Number(block.__sourceIndex)
+  return Number.isFinite(sourceIndex) && sourceIndex >= 0 ? sourceIndex : fallbackIndex
+}
+
+function getLayoutBounds(blocks: LayoutBlock[], coordinateSourceSize?: { width?: number | null; height?: number | null }) {
+  const explicitWidth = Number(coordinateSourceSize?.width || 0)
+  const explicitHeight = Number(coordinateSourceSize?.height || 0)
+  if (explicitWidth > 0 && explicitHeight > 0) return { width: explicitWidth, height: explicitHeight, offsetLeft: 0, offsetTop: 0 }
+  const rects = blocks.map((block) => block.__rect).filter(Boolean) as BlockRect[]
+  if (rects.length === 0) return { width: 900, height: 1280, offsetLeft: 0, offsetTop: 0 }
+  const minLeft = Math.min(...rects.map((rect) => rect.left))
+  const minTop = Math.min(...rects.map((rect) => rect.top))
+  const maxRight = Math.max(...rects.map((rect) => rect.left + rect.width))
+  const maxBottom = Math.max(...rects.map((rect) => rect.top + rect.height))
+  const padX = Math.max(24, (maxRight - minLeft) * 0.06)
+  const padY = Math.max(24, (maxBottom - minTop) * 0.05)
+  return { width: maxRight - minLeft + padX * 2, height: maxBottom - minTop + padY * 2, offsetLeft: minLeft - padX, offsetTop: minTop - padY }
+}
+
+function buildSyntheticRects(blocks: LayoutBlock[], bounds: { width: number; height: number }): LayoutBlock[] {
+  const marginX = bounds.width * 0.09
+  const marginY = bounds.height * 0.08
+  const contentHeight = bounds.height - marginY * 2
+  const columnGap = bounds.width * 0.025
+  const columnWidth = Math.max(36, Math.min(76, (bounds.width - marginX * 2) / Math.max(4, blocks.length)))
+  let cursorRight = bounds.width - marginX
+  return blocks.map((block, index) => {
+    const text = getBlockText(block)
+    const width = Math.min(bounds.width * 0.34, columnWidth * Math.max(1, Math.ceil(text.length / 42)))
+    cursorRight -= width
+    const rect = { left: Math.max(marginX, cursorRight), top: marginY, width, height: contentHeight }
+    cursorRight -= columnGap
+    return { ...block, __rect: rect, __synthetic: true, reading_order: Number.isFinite(Number(block.reading_order)) ? Number(block.reading_order) : index, orientation: 'vertical', __sourceIndex: getBlockSourceIndex(block, index) }
+  })
+}
+
+function getUnionRect(rects: BlockRect[]): BlockRect | null {
+  if (rects.length === 0) return null
+  const left = Math.min(...rects.map((rect) => rect.left))
+  const top = Math.min(...rects.map((rect) => rect.top))
+  const right = Math.max(...rects.map((rect) => rect.left + rect.width))
+  const bottom = Math.max(...rects.map((rect) => rect.top + rect.height))
+  return { left, top, width: right - left, height: bottom - top }
+}
+
+function getCoverageRect(block: LayoutBlock, coverage: TranslationBlockCoverage, pageVerticalMode: boolean): BlockRect | null {
+  const rect = block.__rect
+  if (!rect) return null
+  const compactLength = normalizeParallelSegmentForMatch(getBlockText(block)).length
+  if (compactLength <= 1) return rect
+  const startRatio = clamp(coverage.startOffset / compactLength, 0, 1)
+  const endRatio = clamp(coverage.endOffset / compactLength, startRatio, 1)
+  const spanRatio = Math.max(0.02, endRatio - startRatio)
+  const orientation = inferPageAwareOrientation(block, pageVerticalMode)
+  if (orientation === 'vertical') {
+    return {
+      left: rect.left,
+      top: rect.top + rect.height * startRatio,
+      width: rect.width,
+      height: rect.height * spanRatio,
+    }
+  }
+  return {
+    left: rect.left + rect.width * startRatio,
+    top: rect.top,
+    width: rect.width * spanRatio,
+    height: rect.height,
+  }
+}
+
+function getSegmentCoverage(
+  blockTexts: string[],
+  segmentSource: string,
+  cursor: TranslationCoverageCursor,
+): { coverage: TranslationBlockCoverage[]; nextCursor: TranslationCoverageCursor } {
+  let remaining = normalizeParallelSegmentForMatch(segmentSource)
+  if (!remaining) return { coverage: [], nextCursor: cursor }
+  const coverage: TranslationBlockCoverage[] = []
+  let nextCursor = cursor
+
+  for (let blockIndex = cursor.blockIndex; blockIndex < blockTexts.length && remaining; blockIndex += 1) {
+    const blockText = normalizeParallelSegmentForMatch(blockTexts[blockIndex])
+    if (!blockText) continue
+    let offset = blockIndex === cursor.blockIndex ? Math.max(0, cursor.offset) : 0
+    if (offset >= blockText.length) continue
+    let matchStart = -1
+    let matchEnd = offset
+    while (remaining && offset < blockText.length) {
+      const segmentRest = remaining
+      const blockRest = blockText.slice(offset)
+      if (segmentRest.startsWith(blockRest)) {
+        if (matchStart < 0) matchStart = offset
+        matchEnd = blockText.length
+        remaining = segmentRest.slice(blockRest.length)
+        offset = blockText.length
+        break
+      }
+      if (blockRest.startsWith(segmentRest)) {
+        if (matchStart < 0) matchStart = offset
+        matchEnd = offset + segmentRest.length
+        remaining = ''
+        offset = matchEnd
+        break
+      }
+      if (matchStart >= 0) break
+      offset += 1
+    }
+    if (matchStart >= 0) {
+      coverage.push({ blockIndex, startOffset: matchStart, endOffset: matchEnd })
+      nextCursor = matchEnd >= blockText.length
+        ? { blockIndex: blockIndex + 1, offset: 0 }
+        : { blockIndex, offset: matchEnd }
+    }
+  }
+
+  return remaining ? { coverage: [], nextCursor: cursor } : { coverage, nextCursor }
+}
+
+function buildFacsimileTranslationOverlays(
+  pageBlocks: LayoutBlock[],
+  pageSourceText: string,
+  translationText: string,
+): FacsimileTranslationOverlay[] {
+  if (!isParallelTranslationDisplayReady(pageSourceText, translationText)) return []
+  const blockTexts = pageBlocks.map((block) => getBlockText(block))
+  const segments = buildParallelTranslationSegments(pageSourceText, translationText)
+  const overlays: FacsimileTranslationOverlay[] = []
+  let coverageCursor: TranslationCoverageCursor = { blockIndex: 0, offset: 0 }
+  const pageVerticalMode = isVerticalPage(pageBlocks)
+
+  segments.forEach((segment, segmentIndex) => {
+    const translation = segment.translation.trim()
+    if (!translation) return
+    const result = getSegmentCoverage(blockTexts, segment.source, coverageCursor)
+    const coverage = result.coverage
+    if (coverage.length === 0) return
+    coverageCursor = result.nextCursor
+    const coveredBlocks = coverage
+      .map((item) => pageBlocks[item.blockIndex])
+      .filter((block): block is LayoutBlock => Boolean(block?.__rect))
+    const coverageRects = coverage
+      .map((item) => {
+        const block = pageBlocks[item.blockIndex]
+        return block ? getCoverageRect(block, item, pageVerticalMode) : null
+      })
+      .filter((rect): rect is BlockRect => Boolean(rect))
+    const rect = getUnionRect(coverageRects)
+    if (!rect) return
+    const firstBlock = coveredBlocks[0]
+    const labels = coveredBlocks.map((block) => getLabel(block)).filter(Boolean)
+    const label = labels.find((item) => !isDecorativeLabel(item)) || labels[0] || 'text'
+    const verticalCount = coveredBlocks.filter((block) => inferPageAwareOrientation(block, pageVerticalMode) === 'vertical').length
+    overlays.push({
+      id: segment.id || `translation-segment-${segmentIndex}`,
+      sourceIndexes: coverage.map((item) => getBlockSourceIndex(pageBlocks[item.blockIndex], item.blockIndex)),
+      text: translation,
+      rect,
+      label,
+      orientation: verticalCount >= coveredBlocks.length / 2 ? 'vertical' : (firstBlock ? inferPageAwareOrientation(firstBlock, pageVerticalMode) : 'horizontal'),
+    })
+  })
+
+  return overlays
+}
+
+function getTextLength(text: string): number {
+  return Math.max(1, Array.from(String(text || '').replace(/\s+/g, '')).length)
+}
+
+function getVerticalColumns(text: string): string[] {
+  const source = String(text || '').replace(/\r\n/g, '\n')
+  const hardLines = source.includes('\n')
+    ? source.split(/\n+/)
+    : source.split(/[ \t]+/)
+  return hardLines
+    .map((line) => line.replace(/[ \t]+/g, '').trim())
+    .filter(Boolean)
+}
+
+function getFacsimileLayoutProfile(ocrResult: unknown): FacsimileLayoutProfile {
+  const parsed = asOcrResult(ocrResult)
+  const sourceType = String(parsed.source_type || '').toLowerCase()
+  if (sourceType.includes('vision') || sourceType.includes('hybrid_ocr')) return 'vision'
+  return 'paddle'
+}
+
+function getBlockPadding(label: string, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile): number {
+  if (isImageLabel(label)) return 0
+  const base = isDecorativeLabel(label) ? 1 : isNoteLabel(label) ? 2 : 3
+  if (isTitleLabel(label)) return profile === 'vision' ? 0 : 1
+  if (orientation === 'horizontal' || profile === 'vision') return Math.max(0, base - 1)
+  return base
+}
+
+function getBlockFontWeight(label: string, profile: FacsimileLayoutProfile): number {
+  if (isTitleLabel(label)) return 650
+  return profile === 'vision' ? 560 : 540
+}
+
+function getBlockLineHeight(label: string, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile): number {
+  if (orientation === 'horizontal') return isTitleLabel(label) ? 1.08 : profile === 'vision' ? 1.18 : 1.24
+  if (isNoteLabel(label)) return 1.02
+  return profile === 'vision' ? 1.04 : 1.08
+}
+
+type FittedTextLayout = {
+  fontSize: number
+  text: string
+  overflow: boolean
+}
+
+let measureCanvasContext: CanvasRenderingContext2D | null = null
+
+function getMeasureCanvasContext(): CanvasRenderingContext2D | null {
+  if (typeof document === 'undefined') return null
+  if (measureCanvasContext) return measureCanvasContext
+  const canvas = document.createElement('canvas')
+  measureCanvasContext = canvas.getContext('2d')
+  return measureCanvasContext
+}
+
+function getMeasureFont(fontSize: number, label: string, profile: FacsimileLayoutProfile): string {
+  return `${getBlockFontWeight(label, profile)} ${fontSize}px ${FONT_FAMILY}`
+}
+
+function measureTextWidth(text: string, fontSize: number, label: string, profile: FacsimileLayoutProfile): number {
+  const value = String(text || '')
+  if (!value) return 0
+  const context = getMeasureCanvasContext()
+  if (!context) return getTextLength(value) * fontSize * (/[A-Za-z0-9]/.test(value) ? 0.62 : 0.92)
+  context.font = getMeasureFont(fontSize, label, profile)
+  return context.measureText(value).width
+}
+
+function tokenizeForLineBreak(text: string): string[] {
+  const source = String(text || '')
+  const tokens: string[] = []
+  let latinBuffer = ''
+  const flushLatin = () => {
+    if (latinBuffer) {
+      tokens.push(latinBuffer)
+      latinBuffer = ''
+    }
+  }
+  for (const char of Array.from(source)) {
+    if (/\s/.test(char)) {
+      flushLatin()
+      tokens.push(char)
+    } else if (/[A-Za-z0-9()[\]{}.,;:!?/"'%-]/.test(char)) {
+      latinBuffer += char
+    } else {
+      flushLatin()
+      tokens.push(char)
+    }
+  }
+  flushLatin()
+  return tokens
+}
+
+const LINE_START_FORBIDDEN = '，。、；：？！）》】』」’”.,;:?!%)]}…'
+const LINE_END_FORBIDDEN = '（《【『「‘“([{'
+
+function wrapParagraphToWidth(paragraph: string, maxWidth: number, fontSize: number, label: string, profile: FacsimileLayoutProfile): string[] {
+  const source = String(paragraph || '').trim()
+  if (!source) return ['']
+  const tokens = tokenizeForLineBreak(source)
+  const lines: string[] = []
+  let current = ''
+  const pushCurrent = () => {
+    const value = current.trim()
+    if (value) lines.push(value)
+    current = ''
+  }
+
+  tokens.forEach((token) => {
+    if (!token) return
+    const isWhitespace = /^\s+$/.test(token)
+    const next = isWhitespace
+      ? (current && !current.endsWith(' ') ? `${current} ` : current)
+      : `${current}${token}`
+    if (!current || measureTextWidth(next, fontSize, label, profile) <= maxWidth) {
+      current = next
+      return
+    }
+
+    const tokenFirst = Array.from(token)[0] || ''
+    if (LINE_START_FORBIDDEN.includes(tokenFirst)) {
+      current = next
+      return
+    }
+
+    const currentLast = Array.from(current).at(-1) || ''
+    if (LINE_END_FORBIDDEN.includes(currentLast)) {
+      current = next
+      return
+    }
+
+    pushCurrent()
+    if (measureTextWidth(token, fontSize, label, profile) <= maxWidth || token.length <= 1) {
+      current = isWhitespace ? '' : token
+      return
+    }
+
+    let chunk = ''
+    Array.from(token).forEach((char) => {
+      const candidate = `${chunk}${char}`
+      if (chunk && measureTextWidth(candidate, fontSize, label, profile) > maxWidth) {
+        lines.push(chunk)
+        chunk = char
+      } else {
+        chunk = candidate
+      }
+    })
+    current = chunk
+  })
+
+  pushCurrent()
+  return lines.length ? lines : ['']
+}
+
+function wrapTextToWidth(text: string, maxWidth: number, fontSize: number, label: string, profile: FacsimileLayoutProfile): string[] {
+  return String(text || '')
+    .split(/\n+/)
+    .flatMap((paragraph) => wrapParagraphToWidth(paragraph, maxWidth, fontSize, label, profile))
+}
+
+function measureTextLayout(rect: BlockRect, text: string, label: string, fontSize: number, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile): { fittedText: string; overflow: boolean } {
+  const padding = getBlockPadding(label, orientation, profile)
+  const usableWidth = Math.max(4, rect.width - padding * 2 - 2)
+  const usableHeight = Math.max(8, rect.height - padding * 2 - 2)
+  const length = getTextLength(text)
+  const lineHeight = getBlockLineHeight(label, orientation, profile)
+  if (orientation === 'horizontal') {
+    const lines = wrapTextToWidth(text, usableWidth, fontSize, label, profile)
+    return {
+      fittedText: text,
+      overflow: lines.length * fontSize * lineHeight > usableHeight + 0.5,
+    }
+  }
+  const hardColumns = getVerticalColumns(text)
+  const charsPerColumn = Math.max(1, Math.floor(usableHeight / Math.max(1, fontSize * 1.02)))
+  const columns = hardColumns.length > 1
+    ? hardColumns.length
+    : Math.max(1, Math.ceil(length / charsPerColumn))
+  const maxColumnLength = hardColumns.length > 1 ? Math.max(...hardColumns.map((column) => getTextLength(column))) : length
+  return {
+    fittedText: text,
+    overflow: columns * fontSize * lineHeight > usableWidth + 0.5
+      || maxColumnLength * fontSize * 1.02 > usableHeight + 0.5,
+  }
+}
+
+function fitTextLayout(rect: BlockRect, text: string, label: string, baseFontSize: number, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile): FittedTextLayout {
+  const targetFont = clamp(
+    baseFontSize * (isTitleLabel(label) ? 1.08 : isDecorativeLabel(label) ? 0.76 : isNoteLabel(label) ? 0.86 : 1),
+    4,
+    isTitleLabel(label) ? 34 : isDecorativeLabel(label) ? 18 : 30,
+  )
+  const targetLayout = measureTextLayout(rect, text, label, targetFont, orientation, profile)
+  if (!targetLayout.overflow) return { fontSize: targetFont, text: targetLayout.fittedText, overflow: false }
+
+  const minReadableFont = isBodyTextLabel(label)
+    ? Math.max(10, baseFontSize * 0.82)
+    : isNoteLabel(label)
+      ? Math.max(7, targetFont * 0.75)
+      : Math.max(8, targetFont * 0.85)
+  const minFont = Math.min(targetFont, minReadableFont)
+  let low = minFont
+  let high = targetFont
+  let bestLayout = measureTextLayout(rect, text, label, low, orientation, profile)
+  for (let index = 0; index < FACSIMILE_TEXT_FIT_ITERATIONS; index += 1) {
+    const mid = (low + high) / 2
+    const midLayout = measureTextLayout(rect, text, label, mid, orientation, profile)
+    if (!midLayout.overflow) {
+      bestLayout = midLayout
+      low = mid
+    } else {
+      high = mid
+    }
+  }
+  const finalFontSize = bestLayout.overflow ? minFont : low
+  const finalLayout = measureTextLayout(rect, text, label, finalFontSize, orientation, profile)
+  return { fontSize: finalFontSize, text: finalLayout.fittedText, overflow: finalLayout.overflow }
+}
+
+function measureTableLayout(rect: BlockRect, rows: string[][], fontSize: number): { overflow: boolean } {
+  const rowCount = Math.max(1, rows.length)
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  const cellWidth = Math.max(4, (rect.width - 4) / columnCount - 2)
+  const cellHeight = Math.max(4, (rect.height - 4) / rowCount - 2)
+  const overflow = rows.some((row) => row.some((cell) => (
+    wrapTextToWidth(cell, cellWidth, fontSize, 'table', 'vision').length * fontSize * 1.18 > cellHeight + 0.5
+  )))
+  return { overflow }
+}
+
+function fitTableLayout(rect: BlockRect, rows: string[][], baseFontSize: number): FittedTextLayout {
+  const targetFont = clamp(baseFontSize * 0.88, 3.5, 22)
+  const targetLayout = measureTableLayout(rect, rows, targetFont)
+  if (!targetLayout.overflow) return { fontSize: targetFont, text: '', overflow: false }
+
+  const minFont = Math.max(3, targetFont * 0.75)
+  let low = minFont
+  let high = targetFont
+  let bestOverflow = measureTableLayout(rect, rows, low).overflow
+  for (let index = 0; index < FACSIMILE_TEXT_FIT_ITERATIONS; index += 1) {
+    const mid = (low + high) / 2
+    const midOverflow = measureTableLayout(rect, rows, mid).overflow
+    if (!midOverflow) {
+      bestOverflow = false
+      low = mid
+    } else {
+      high = mid
+    }
+  }
+  return { fontSize: bestOverflow ? minFont : low, text: '', overflow: bestOverflow }
+}
+
+function getBlockBorderStyle(orientation: 'vertical' | 'horizontal', showRules: boolean): CSSProperties {
+  if (!showRules) return {}
+  if (orientation === 'vertical') return { borderLeft: '1px solid rgba(36,25,15,0.32)', borderRight: '1px solid rgba(36,25,15,0.32)' }
+  return { border: '1px solid rgba(36,25,15,0.22)' }
+}
+
+function isCjkChar(char: string): boolean {
+  return /[\u3400-\u9fff\uf900-\ufaff]/.test(char)
+}
+
+function getLastVisibleChar(value: string): string {
+  return Array.from(String(value || '').trim()).at(-1) || ''
+}
+
+function getFirstVisibleChar(value: string): string {
+  return Array.from(String(value || '').trim())[0] || ''
+}
+
+function getSoftLineJoiner(previous: string, next: string): string {
+  const left = getLastVisibleChar(previous)
+  const right = getFirstVisibleChar(next)
+  if (!left || !right) return ''
+  if (left === '-') return ''
+  if (LINE_START_FORBIDDEN.includes(right)) return ''
+  if (LINE_END_FORBIDDEN.includes(left)) return ''
+  if (isCjkChar(left) || isCjkChar(right)) return ''
+  return ' '
+}
+
+function mergeSoftLineBreaks(text: string): string {
+  return String(text || '')
+    .split(/\n{2,}/)
+    .map((paragraph) => {
+      const lines = paragraph.split(/\n+/).map((line) => line.trim()).filter(Boolean)
+      if (lines.length <= 1) return lines[0] || ''
+      return lines.reduce((merged, line) => `${merged}${getSoftLineJoiner(merged, line)}${line}`)
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+function shouldCollapseVerticalSoftBreaks(rect?: BlockRect | null): boolean {
+  if (!rect) return false
+  return rect.width < 72 || rect.width < rect.height * 0.16
+}
+
+function normalizeDisplayText(text: string, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile, label: string, rect?: BlockRect | null): string {
+  const normalized = String(text || '').replace(/\r\n/g, '\n')
+  if (orientation === 'vertical') {
+    const columns = getVerticalColumns(normalized)
+    if (shouldCollapseVerticalSoftBreaks(rect)) return columns.join('')
+    return columns.join('\n')
+  }
+  if (isTocLabel(label)) {
+    return normalized
+      .split(/\n+/)
+      .map((part) => part.replace(/[ \t]+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n')
+  }
+  return mergeSoftLineBreaks(normalized)
+    .split('\n')
+    .map((part) => part.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+}
+
+function normalizeTranslatedTextForLayout(text: string, orientation: 'vertical' | 'horizontal'): string {
+  const normalized = String(text || '')
+    .replace(/\r/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/^\s*\[?S\d{1,4}\]?\s*[:：\-、]?\s*/gmi, '')
+    .trim()
+  if (!normalized) return ''
+  const merged = mergeSoftLineBreaks(normalized)
+  if (orientation === 'vertical') {
+    return merged
+      .split(/\n+/)
+      .map((line) => line.replace(/[ \t]+/g, '').trim())
+      .filter(Boolean)
+      .join('')
+  }
+  return merged
+}
+
+function transformText(text: string, script: ProofDisplayScript): string {
+  if (script === 'simplified') return toSimplified(text)
+  if (script === 'traditional') return toTraditional(text)
+  return text
+}
+
+function normalizeSearchText(value: string): string {
+  return toSimplified(String(value || '')).toLowerCase()
+}
+
+function renderInlineAnnotations(text: string, keyPrefix: string): ReactNode[] {
+  return renderOcrInlineText(text, keyPrefix)
+}
+
+function renderFormattedText(text: string, keyword: string, highlight: boolean): ReactNode {
+  const query = String(keyword || '').trim()
+  if (!highlight || !query) return renderInlineAnnotations(text, 'text')
+  const normalizedText = normalizeSearchText(text)
+  const normalizedQuery = normalizeSearchText(query)
+  const index = normalizedText.indexOf(normalizedQuery)
+  if (index < 0) return renderInlineAnnotations(text, 'text')
+  return [
+    ...renderInlineAnnotations(text.slice(0, index), 'before'),
+    <mark key="hit" style={{ background: '#fadb14', color: 'inherit', padding: '0 2px' }}>{text.slice(index, index + query.length)}</mark>,
+    ...renderInlineAnnotations(text.slice(index + query.length), 'after'),
+  ]
+}
+
+function renderFacsimileTable(rows: string[][], keyword: string, highlight: boolean) {
+  return (
+    <table style={{ width: '100%', height: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
+      <tbody>
+        {rows.map((row, rowIndex) => (
+          <tr key={rowIndex}>
+            {row.map((cell, cellIndex) => (
+              <td key={cellIndex} style={{ border: '1px solid rgba(64,48,32,0.28)', padding: 2, verticalAlign: 'top', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal', lineHeight: 1.18, overflow: 'hidden' }}>
+                {renderFormattedText(cell, keyword, highlight && normalizeSearchText(cell).includes(normalizeSearchText(keyword)))}
+              </td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
+function getScaledRect(rect: BlockRect, bounds: { width: number; height: number; offsetLeft: number; offsetTop: number }, pagePixelWidth: number): BlockRect {
+  const scale = pagePixelWidth / Math.max(1, bounds.width)
+  return { left: (rect.left - bounds.offsetLeft) * scale, top: (rect.top - bounds.offsetTop) * scale, width: rect.width * scale, height: rect.height * scale }
+}
+
+function clampZoom(value: number): number {
+  return Math.round(clamp(value, FACSIMILE_MIN_ZOOM, FACSIMILE_MAX_ZOOM) * 100) / 100
+}
+
+function shouldIgnoreCanvasDrag(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && !!target.closest('button,input,textarea,.ant-slider,.ant-switch,[data-guji-block-index]')
+}
+
+function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofStatus: 'completed' | 'pending'): PageUpdatePayload {
+  const normalizedBlocks = blocks.map((block, index) => {
+    const { __rect, __synthetic, __sourceIndex, ...rest } = block
+    return {
+      ...rest,
+      words: getBlockText(block),
+      reading_order: Number.isFinite(Number(block.reading_order)) ? Number(block.reading_order) : index,
+      orientation: inferOrientation(block),
+      location: block.location || (__rect ? { left: __rect.left, top: __rect.top, width: __rect.width, height: __rect.height } : undefined),
+    }
+  })
+  const fullText = normalizedBlocks.map((block) => String(block.words || '').trim()).filter(Boolean).join('\n')
+  return {
+    ocr_result: { ...asOcrResult(baseOcrResult), layout_result: normalizedBlocks, words_result: normalizedBlocks.map((block) => ({ words: block.words || '' })) },
+    ocr_text: fullText,
+    proofed_text: fullText,
+    proof_status: proofStatus,
+  }
+}
+
+function FacsimileImageBlock({ assetPath, pageImageSrc, left, top, width, height }: { assetPath: string; pageImageSrc: string; left: number; top: number; width: number; height: number }) {
+  const [assetSrc, setAssetSrc] = useState('')
+  useEffect(() => {
+    let cancelled = false
+    if (!assetPath) {
+      setAssetSrc('')
+      return () => { cancelled = true }
+    }
+    void window.api.readImageAsDataURL(assetPath)
+      .then((dataUrl) => { if (!cancelled) setAssetSrc(dataUrl || '') })
+      .catch(() => { if (!cancelled) setAssetSrc('') })
+    return () => { cancelled = true }
+  }, [assetPath])
+  const src = assetSrc || pageImageSrc || ''
+  if (!src) return null
+  return (
+    <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', background: 'rgba(255,253,247,0.5)' }}>
+      {assetSrc ? (
+        <img src={assetSrc} alt="" draggable={false} style={{ width: '100%', height: '100%', objectFit: 'contain', pointerEvents: 'none', userSelect: 'none' }} />
+      ) : (
+        <img
+          src={src}
+          alt=""
+          draggable={false}
+          style={{
+            position: 'absolute',
+            left: `${-(left / Math.max(width, 0.0001)) * 100}%`,
+            top: `${-(top / Math.max(height, 0.0001)) * 100}%`,
+            width: `${10000 / Math.max(width, 0.0001)}%`,
+            height: `${10000 / Math.max(height, 0.0001)}%`,
+            pointerEvents: 'none',
+            userSelect: 'none',
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
+export function getFacsimileTranslationSourceText(ocrResult: unknown): string {
+  return getCanonicalPageTranslationSourceText({ ocr_result: ocrResult })
+}
+
+export function isFacsimileProofCandidate(doc: Partial<Document> | null | undefined, page: Partial<DocumentPage> | null | undefined, ocrResult: unknown): boolean {
+  const metadata = asOcrResult(doc?.metadata)
+  const pageOcrResult = asOcrResult(page?.ocr_result)
+  const sourceType = String(pageOcrResult.source_type || '')
+  if (metadata.file_kind === 'ebook' || metadata.file_kind === 'text' || sourceType.startsWith('ebook_')) return false
+  const blocks = normalizeBlocks(ocrResult)
+  const parsed = asOcrResult(ocrResult)
+  const pageText = String(page?.proofed_text || page?.ocr_text || parsed.text || '').trim()
+  return blocks.length > 0 || pageText.length > 0 || doc?.doc_type === '古籍'
+}
+
+export default function GujiFacsimileProofreader({
+  pageId,
+  ocrResult,
+  pageImageSrc = '',
+  pageProofStatus = 'pending',
+  activeBoxIndex = -1,
+  searchKeyword = '',
+  coordinateSourceSize,
+  translationText = '',
+  translationLoading = false,
+  translationSkipped = false,
+  translationOpen: controlledTranslationOpen,
+  onTranslationOpenChange,
+  onTranslateCurrentPage,
+  onSelectBox,
+  onSave,
+  onTextSelectionChange,
+}: GujiFacsimileProofreaderProps) {
+  const rootRef = useRef<HTMLDivElement>(null)
+  const pageFrameRef = useRef<HTMLDivElement>(null)
+  const pageRef = useRef<HTMLDivElement>(null)
+  const wheelAnchorFrameRef = useRef<number | null>(null)
+  const wheelZoomCommitTimerRef = useRef<number | null>(null)
+  const translationRequestKeyRef = useRef('')
+  const pageZoomRef = useRef(1)
+  const fitWidthRef = useRef(true)
+  const pageRotationRef = useRef(0)
+  const dragStartRef = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
+  const [blocks, setBlocks] = useState<LayoutBlock[]>([])
+  const [history, setHistory] = useState<LayoutBlock[][]>([])
+  const [historyIndex, setHistoryIndex] = useState(-1)
+  const [editingIndex, setEditingIndex] = useState(-1)
+  const [editValue, setEditValue] = useState('')
+  const [showRules, setShowRules] = useState(loadPersistedShowRules)
+  const [fontScale, setFontScale] = useState(loadPersistedFontScale)
+  const [pageZoom, setPageZoom] = useState(1)
+  const [pageRotation, setPageRotation] = useState(0)
+  const [displayScript, setDisplayScript] = useState<ProofDisplayScript>('original')
+  const [fitWidth, setFitWidth] = useState(true)
+  const [imageUnderlayMode, setImageUnderlayMode] = useState<ImageUnderlayMode>(loadPersistedImageUnderlayMode)
+  const [imageUnderlayBlur, setImageUnderlayBlur] = useState(loadPersistedImageUnderlayBlur)
+  const [internalTranslationOpen, setInternalTranslationOpen] = useState(false)
+  const [pagePixelWidth, setPagePixelWidth] = useState(0)
+  const [proofViewportSize, setProofViewportSize] = useState({ width: 0, height: 0 })
+  const [isPanning, setIsPanning] = useState(false)
+  const [fontReadyVersion, setFontReadyVersion] = useState(0)
+  const [pageImageNaturalSize, setPageImageNaturalSize] = useState<{ width: number; height: number } | null>(null)
+  const layoutProfile = useMemo(() => getFacsimileLayoutProfile(ocrResult), [ocrResult])
+  const pageSourceText = useMemo(() => blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'), [blocks])
+  const translationOpen = controlledTranslationOpen ?? internalTranslationOpen
+  const setTranslationOpen = useCallback((open: boolean) => {
+    setInternalTranslationOpen(open)
+    onTranslationOpenChange?.(open)
+  }, [onTranslationOpenChange])
+  const handleTranslationOpenChange = useCallback((checked: boolean) => {
+    setTranslationOpen(checked)
+    if (checked && pageSourceText.trim() && !translationText.trim() && !translationLoading) {
+      onTranslateCurrentPage?.(pageSourceText)
+    }
+  }, [onTranslateCurrentPage, pageSourceText, translationLoading, translationText])
+  useEffect(() => {
+    const nextBlocks = splitWideVerticalBlocks(normalizePageOrientations(normalizeBlocks(ocrResult)))
+    setBlocks(nextBlocks)
+    setHistory([nextBlocks.map((block) => ({ ...block }))])
+    setHistoryIndex(0)
+    setEditingIndex(-1)
+    setEditValue('')
+    translationRequestKeyRef.current = ''
+  }, [ocrResult, pageId])
+
+  useEffect(() => {
+    setPageZoom(1)
+    setPageRotation(0)
+    setFitWidth(true)
+    setIsPanning(false)
+    pageZoomRef.current = 1
+    pageRotationRef.current = 0
+    fitWidthRef.current = true
+    if (wheelAnchorFrameRef.current != null) {
+      window.cancelAnimationFrame(wheelAnchorFrameRef.current)
+      wheelAnchorFrameRef.current = null
+    }
+    if (wheelZoomCommitTimerRef.current != null) {
+      window.clearTimeout(wheelZoomCommitTimerRef.current)
+      wheelZoomCommitTimerRef.current = null
+    }
+    if (rootRef.current) {
+      rootRef.current.scrollLeft = 0
+      rootRef.current.scrollTop = 0
+    }
+    if (pageFrameRef.current) {
+      pageFrameRef.current.style.width = ''
+      pageFrameRef.current.style.height = ''
+    }
+    if (pageRef.current) {
+      pageRef.current.style.transform = ''
+      pageRef.current.style.transformOrigin = ''
+      pageRef.current.style.willChange = ''
+    }
+  }, [pageId])
+
+  useEffect(() => {
+    if (!translationOpen || !pageSourceText.trim() || translationLoading || translationSkipped || translationText.trim() || !onTranslateCurrentPage) return
+    const requestKey = `${pageId}:${pageSourceText.length}:${pageSourceText.slice(0, 120)}`
+    if (translationRequestKeyRef.current === requestKey) return
+    translationRequestKeyRef.current = requestKey
+    onTranslateCurrentPage(pageSourceText)
+  }, [onTranslateCurrentPage, pageId, pageSourceText, translationLoading, translationOpen, translationSkipped, translationText])
+
+  useEffect(() => {
+    setPageImageNaturalSize(null)
+    if (!pageImageSrc) return undefined
+    let cancelled = false
+    const image = new Image()
+    image.onload = () => {
+      if (cancelled) return
+      const width = image.naturalWidth || image.width
+      const height = image.naturalHeight || image.height
+      if (width > 0 && height > 0) setPageImageNaturalSize({ width, height })
+    }
+    image.src = pageImageSrc
+    return () => {
+      cancelled = true
+    }
+  }, [pageImageSrc, pageId])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(FACSIMILE_FONT_SCALE_STORAGE_KEY, String(fontScale))
+      window.localStorage.setItem(FACSIMILE_FONT_SCALE_STORAGE_VERSION_KEY, FACSIMILE_FONT_SCALE_STORAGE_VERSION)
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [fontScale])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(FACSIMILE_SHOW_RULES_STORAGE_KEY, String(showRules))
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [showRules])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(FACSIMILE_IMAGE_UNDERLAY_MODE_STORAGE_KEY, imageUnderlayMode)
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [imageUnderlayMode])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(FACSIMILE_IMAGE_UNDERLAY_BLUR_STORAGE_KEY, String(imageUnderlayBlur))
+    } catch {
+      // Ignore storage failures.
+    }
+  }, [imageUnderlayBlur])
+
+  useEffect(() => {
+    let cancelled = false
+    const fontSet = document.fonts
+    if (!fontSet?.ready) return () => { cancelled = true }
+    void fontSet.ready.then(() => {
+      if (!cancelled) setFontReadyVersion((version) => version + 1)
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => () => {
+    if (wheelAnchorFrameRef.current != null) window.cancelAnimationFrame(wheelAnchorFrameRef.current)
+    if (wheelZoomCommitTimerRef.current != null) window.clearTimeout(wheelZoomCommitTimerRef.current)
+  }, [])
+
+  useEffect(() => {
+    pageZoomRef.current = pageZoom
+  }, [pageZoom])
+
+  useEffect(() => {
+    pageRotationRef.current = pageRotation
+  }, [pageRotation])
+
+  useEffect(() => {
+    fitWidthRef.current = fitWidth
+  }, [fitWidth])
+
+  useEffect(() => {
+    if (activeBoxIndex < 0) return
+    rootRef.current?.querySelector<HTMLElement>(`[data-guji-block-index="${activeBoxIndex}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' })
+  }, [activeBoxIndex])
+
+  useLayoutEffect(() => {
+    const target = pageRef.current
+    if (!target) return undefined
+    const syncWidth = () => {
+      const nextWidth = Math.round(target.clientWidth || target.getBoundingClientRect().width)
+      setPagePixelWidth((current) => current === nextWidth ? current : nextWidth)
+    }
+    syncWidth()
+    const observer = new ResizeObserver(syncWidth)
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [blocks.length, fitWidth, pageZoom])
+
+  useLayoutEffect(() => {
+    const target = rootRef.current
+    if (!target) return undefined
+    const syncSize = () => {
+      const nextSize = { width: Math.max(0, target.clientWidth - 36), height: Math.max(0, target.clientHeight - 36) }
+      setProofViewportSize((current) => current.width === nextSize.width && current.height === nextSize.height ? current : nextSize)
+    }
+    syncSize()
+    const observer = new ResizeObserver(syncSize)
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [blocks.length])
+
+  const effectiveCoordinateSourceSize = useMemo(() => {
+    const explicitWidth = Number(coordinateSourceSize?.width || 0)
+    const explicitHeight = Number(coordinateSourceSize?.height || 0)
+    if (explicitWidth > 0 && explicitHeight > 0) return coordinateSourceSize
+    return pageImageNaturalSize || coordinateSourceSize
+  }, [coordinateSourceSize, pageImageNaturalSize])
+  const baseBounds = useMemo(() => getLayoutBounds(blocks, effectiveCoordinateSourceSize), [blocks, effectiveCoordinateSourceSize])
+  const pageBlocks = useMemo(() => blocks.some((block) => block.__rect) ? blocks : buildSyntheticRects(blocks, baseBounds), [baseBounds, blocks])
+  const pageVerticalMode = useMemo(() => isVerticalPage(pageBlocks), [pageBlocks])
+  const autoImageUnderlay = useMemo(() => shouldUseImageUnderlay(pageBlocks, pageVerticalMode), [pageBlocks, pageVerticalMode])
+  const showImageUnderlay = !!pageImageSrc && (imageUnderlayMode === 'on' || (imageUnderlayMode === 'auto' && autoImageUnderlay))
+  const bounds = useMemo(() => getLayoutBounds(pageBlocks, effectiveCoordinateSourceSize), [effectiveCoordinateSourceSize, pageBlocks])
+  const pageAspect = bounds.width / Math.max(1, bounds.height)
+  const fitPageWidth = useMemo(() => {
+    if (!fitWidth) return FACSIMILE_BASE_PAGE_WIDTH
+    const widthLimit = proofViewportSize.width > 0 ? proofViewportSize.width : 760
+    const heightLimit = proofViewportSize.height > 0 ? proofViewportSize.height * pageAspect : 760
+    return Math.round(Math.max(240, Math.min(760, widthLimit, heightLimit) * 0.95))
+  }, [fitWidth, pageAspect, proofViewportSize.height, proofViewportSize.width])
+  const pageVisualScale = fitWidth ? 1 : pageZoom
+  const visualPageWidth = Math.round(fitPageWidth * pageVisualScale)
+  const visualPageHeight = Math.round((fitPageWidth / Math.max(0.1, pageAspect)) * pageVisualScale)
+  const rotatedQuarterTurns = pageRotation % 180 !== 0
+  const visualFrameWidth = rotatedQuarterTurns ? visualPageHeight : visualPageWidth
+  const visualFrameHeight = rotatedQuarterTurns ? visualPageWidth : visualPageHeight
+  const canUndo = historyIndex > 0
+  const translationOverlays = useMemo(() => {
+    if (!translationOpen || translationLoading || translationSkipped || !translationText.trim() || !pageSourceText.trim()) return []
+    return buildFacsimileTranslationOverlays(pageBlocks, pageSourceText, translationText)
+  }, [pageBlocks, pageSourceText, translationLoading, translationOpen, translationSkipped, translationText])
+  const hasTranslationOverlay = translationOverlays.length > 0
+  const translationStatusText = translationOpen
+    ? translationLoading
+      ? '正在翻译...'
+      : translationSkipped
+        ? '本页以中文为主，已保留原文'
+        : hasTranslationOverlay
+          ? ''
+          : translationText.trim()
+            ? '正在整理版面翻译...'
+            : '等待翻译结果...'
+    : ''
+  const pageBaseFontSize = useMemo(() => {
+    const renderedWidth = pagePixelWidth || fitPageWidth || FACSIMILE_BASE_PAGE_WIDTH
+    const widthScale = renderedWidth / FACSIMILE_BASE_PAGE_WIDTH
+    const underlayScale = showImageUnderlay ? 0.72 : 1
+    return clamp(13 * widthScale * fontScale * underlayScale, 1, 80)
+  }, [fitPageWidth, fontReadyVersion, fontScale, pagePixelWidth, showImageUnderlay])
+  const normalizedSearchKeyword = useMemo(() => normalizeSearchText(searchKeyword), [searchKeyword])
+  const pageBlockLayouts = useMemo<FacsimileBlockRenderLayout[]>(() => pageBlocks.flatMap((block, index) => {
+    const rect = block.__rect
+    if (!rect) return []
+    const sourceIndex = getBlockSourceIndex(block, index)
+    const left = ((rect.left - bounds.offsetLeft) / bounds.width) * 100
+    const top = ((rect.top - bounds.offsetTop) / bounds.height) * 100
+    const width = (rect.width / bounds.width) * 100
+    const height = (rect.height / bounds.height) * 100
+    const label = getLabel(block)
+    const labelColor = LABEL_COLORS[label] || LABEL_COLORS.text
+    const labelName = LABEL_NAMES[label] || label
+    const isTable = isRenderableTableBlock(block)
+    const isImage = isImageLabel(label)
+    const tableRows = isTable ? getBlockTableRows(block) : []
+    const orientation = isTable ? 'horizontal' : inferPageAwareOrientation(block, pageVerticalMode)
+    const originalText = getBlockText(block)
+    const shouldRenderTable = isTable
+    const scaledRect = pagePixelWidth > 0 ? getScaledRect(rect, bounds, pagePixelWidth) : rect
+    const displayText = transformText(normalizeDisplayText(originalText, orientation, layoutProfile, label, scaledRect), displayScript)
+    const fittedLayout = isImage
+      ? { fontSize: pageBaseFontSize, text: displayText, overflow: false }
+      : shouldRenderTable
+        ? fitTableLayout(scaledRect, tableRows, pageBaseFontSize)
+        : fitTextLayout(scaledRect, displayText, label, pageBaseFontSize, orientation, layoutProfile)
+    const fittedDisplayText = shouldRenderTable ? displayText : fittedLayout.text
+    const searchableText = shouldRenderTable ? tableRows.flat().join('\n') : fittedDisplayText
+    const normalizedSearchableText = normalizeSearchText(searchableText)
+    const padding = isImage ? 0 : shouldRenderTable ? 1 : getBlockPadding(label, orientation, layoutProfile)
+    return [{
+      block,
+      sourceIndex,
+      rect,
+      left,
+      top,
+      width,
+      height,
+      label,
+      labelColor,
+      labelName,
+      isImage,
+      tableRows,
+      orientation,
+      originalText,
+      shouldRenderTable,
+      displayText,
+      fittedLayout,
+      fontSize: fittedLayout.fontSize,
+      fittedDisplayText,
+      searchableText,
+      normalizedSearchableText,
+      padding,
+    }]
+  }), [bounds, displayScript, layoutProfile, pageBaseFontSize, pageBlocks, pagePixelWidth, pageVerticalMode])
+  const translationOverlayLayouts = useMemo<FacsimileTranslationRenderLayout[]>(() => translationOverlays.map((overlay) => {
+    const left = ((overlay.rect.left - bounds.offsetLeft) / bounds.width) * 100
+    const top = ((overlay.rect.top - bounds.offsetTop) / bounds.height) * 100
+    const width = (overlay.rect.width / bounds.width) * 100
+    const height = (overlay.rect.height / bounds.height) * 100
+    const labelColor = LABEL_COLORS[overlay.label] || LABEL_COLORS.text
+    const scaledRect = pagePixelWidth > 0 ? getScaledRect(overlay.rect, bounds, pagePixelWidth) : overlay.rect
+    const displayText = transformText(
+      normalizeDisplayText(
+        normalizeTranslatedTextForLayout(overlay.text, overlay.orientation),
+        overlay.orientation,
+        layoutProfile,
+        overlay.label,
+        scaledRect,
+      ),
+      displayScript,
+    )
+    const fittedLayout = fitTextLayout(scaledRect, displayText, overlay.label, pageBaseFontSize, overlay.orientation, layoutProfile)
+    const normalizedSearchableText = normalizeSearchText(fittedLayout.text)
+    return {
+      overlay,
+      left,
+      top,
+      width,
+      height,
+      labelColor,
+      displayText,
+      fittedLayout,
+      normalizedSearchableText,
+      sourceIndex: overlay.sourceIndexes[0] ?? -1,
+      padding: getBlockPadding(overlay.label, overlay.orientation, layoutProfile),
+      lineHeight: getBlockLineHeight(overlay.label, overlay.orientation, layoutProfile),
+    }
+  }), [bounds, displayScript, layoutProfile, pageBaseFontSize, pagePixelWidth, translationOverlays])
+  const editingBlock = useMemo(() => (
+    editingIndex < 0 ? null : blocks.find((block, index) => getBlockSourceIndex(block, index) === editingIndex) || null
+  ), [blocks, editingIndex])
+  const editingBlockLabel = editingBlock ? (LABEL_NAMES[getLabel(editingBlock)] || getLabel(editingBlock)) : ''
+
+  const pushHistory = useCallback((nextBlocks: LayoutBlock[]) => {
+    setHistory((previous) => {
+      const base = previous.slice(0, historyIndex + 1)
+      base.push(nextBlocks.map((block) => ({ ...block })))
+      return base.slice(-50)
+    })
+    setHistoryIndex((previous) => Math.min(previous + 1, 49))
+  }, [historyIndex])
+
+  const persistBlocks = useCallback((nextBlocks: LayoutBlock[]) => {
+    onSave(pageId, buildOcrPayload(ocrResult, nextBlocks, pageProofStatus))
+  }, [ocrResult, onSave, pageId, pageProofStatus])
+
+  const commitBlocks = useCallback((nextBlocks: LayoutBlock[], nextActiveIndex?: number) => {
+    const nextPageVerticalMode = isVerticalPage(nextBlocks)
+    const normalizedBlocks = nextBlocks.map((block, index) => ({ ...block, reading_order: index, orientation: inferPageAwareOrientation(block, nextPageVerticalMode), __sourceIndex: getBlockSourceIndex(block, index) }))
+    setBlocks(normalizedBlocks)
+    pushHistory(normalizedBlocks)
+    persistBlocks(normalizedBlocks)
+    setEditingIndex(-1)
+    setEditValue('')
+    if (typeof nextActiveIndex === 'number') onSelectBox?.(nextActiveIndex)
+  }, [onSelectBox, persistBlocks, pushHistory])
+
+  const handleUndo = useCallback(() => {
+    if (!canUndo) return
+    const nextBlocks = history[historyIndex - 1].map((block) => ({ ...block }))
+    setHistoryIndex(historyIndex - 1)
+    setBlocks(nextBlocks)
+    persistBlocks(nextBlocks)
+    setEditingIndex(-1)
+    setEditValue('')
+  }, [canUndo, history, historyIndex, persistBlocks])
+
+  const handleSaveBlock = useCallback(() => {
+    if (editingIndex < 0) return
+    const nextBlocks = blocks.map((block, index) => getBlockSourceIndex(block, index) === editingIndex
+      ? { ...block, words: editValue, rows: undefined, table_rows: undefined, tableRows: undefined, cells: undefined, table_cells: undefined, tableCells: undefined, html: undefined, table_html: undefined, tableHtml: undefined, markdown: undefined, md: undefined }
+      : block)
+    commitBlocks(nextBlocks, editingIndex)
+  }, [blocks, commitBlocks, editValue, editingIndex])
+
+  const handleToggleBlockOrientation = useCallback((sourceIndex: number) => {
+    const nextBlocks = blocks.map((block, index) => {
+      if (getBlockSourceIndex(block, index) !== sourceIndex) return block
+      const currentOrientation = block.orientation === 'vertical' || block.orientation === 'horizontal'
+        ? block.orientation
+        : inferOrientation(block)
+      return {
+        ...block,
+        orientation: currentOrientation === 'vertical' ? 'horizontal' : 'vertical',
+        segmentation_source: 'manual',
+      }
+    })
+    commitBlocks(nextBlocks, sourceIndex)
+  }, [blocks, commitBlocks])
+
+  useEffect(() => {
+    if (editingIndex >= 0 && !editingBlock) {
+      setEditingIndex(-1)
+      setEditValue('')
+    }
+  }, [editingBlock, editingIndex])
+
+  const captureSelection = useCallback(() => {
+    const selected = window.getSelection()?.toString().trim() || ''
+    if (selected) onTextSelectionChange?.(selected)
+  }, [onTextSelectionChange])
+
+  const getPageTransform = useCallback((zoom: number, rotation: number) => (
+    `translate(-50%, -50%) rotate(${rotation}deg) scale(${zoom})`
+  ), [])
+
+  const applyPageZoomDom = useCallback((zoom: number) => {
+    const frame = pageFrameRef.current
+    const page = pageRef.current
+    if (!frame || !page) return
+    const layoutWidth = Math.max(1, page.clientWidth || page.getBoundingClientRect().width || fitPageWidth || FACSIMILE_BASE_PAGE_WIDTH)
+    const visualWidth = Math.round(FACSIMILE_BASE_PAGE_WIDTH * zoom)
+    const visualHeight = Math.round(visualWidth / Math.max(0.1, pageAspect))
+    const rotated = pageRotationRef.current % 180 !== 0
+    const visualScale = visualWidth / layoutWidth
+    frame.style.width = `${rotated ? visualHeight : visualWidth}px`
+    frame.style.height = `${rotated ? visualWidth : visualHeight}px`
+    page.style.transform = getPageTransform(visualScale, pageRotationRef.current)
+    page.style.transformOrigin = 'center center'
+    page.style.willChange = visualScale === 1 ? '' : 'transform'
+  }, [fitPageWidth, getPageTransform, pageAspect])
+
+  const rotatePage = useCallback(() => {
+    const nextRotation = (pageRotationRef.current + 90) % 360
+    pageRotationRef.current = nextRotation
+    setPageRotation(nextRotation)
+    if (fitWidthRef.current) return
+    applyPageZoomDom(pageZoomRef.current)
+  }, [applyPageZoomDom])
+
+  const handleCanvasWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    if (event.target instanceof HTMLElement && event.target.closest('button,input,textarea,.ant-slider,.ant-switch')) return
+    event.preventDefault()
+    const root = rootRef.current
+    const frame = pageFrameRef.current
+    const page = pageRef.current
+    if (!root || !frame || !page) return
+    const rootRect = root.getBoundingClientRect()
+    const pageRect = frame.getBoundingClientRect()
+    const anchorX = pageRect.width > 0 ? (event.clientX - pageRect.left) / pageRect.width : 0.5
+    const anchorY = pageRect.height > 0 ? (event.clientY - pageRect.top) / pageRect.height : 0.5
+    const viewportX = event.clientX - rootRect.left
+    const viewportY = event.clientY - rootRect.top
+    const baseZoom = fitWidthRef.current ? pageRect.width / FACSIMILE_BASE_PAGE_WIDTH : pageZoomRef.current
+    const nextZoom = clampZoom(baseZoom * (event.deltaY > 0 ? 0.9 : 1.1))
+    pageZoomRef.current = nextZoom
+    fitWidthRef.current = false
+    applyPageZoomDom(nextZoom)
+    if (wheelAnchorFrameRef.current != null) window.cancelAnimationFrame(wheelAnchorFrameRef.current)
+    wheelAnchorFrameRef.current = window.requestAnimationFrame(() => {
+      wheelAnchorFrameRef.current = null
+      const nextPage = pageRef.current
+      const nextFrame = pageFrameRef.current
+      const nextRoot = rootRef.current
+      if (!nextPage || !nextFrame || !nextRoot) return
+      nextRoot.scrollLeft = Math.max(0, nextFrame.offsetLeft + anchorX * nextFrame.offsetWidth - viewportX)
+      nextRoot.scrollTop = Math.max(0, nextFrame.offsetTop + anchorY * nextFrame.offsetHeight - viewportY)
+    })
+    if (wheelZoomCommitTimerRef.current != null) window.clearTimeout(wheelZoomCommitTimerRef.current)
+    wheelZoomCommitTimerRef.current = window.setTimeout(() => {
+      wheelZoomCommitTimerRef.current = null
+      setFitWidth(false)
+      setPageZoom(pageZoomRef.current)
+    }, 120)
+  }, [applyPageZoomDom])
+
+  const handleCanvasMouseDown = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || shouldIgnoreCanvasDrag(event.target)) return
+    const root = rootRef.current
+    if (!root) return
+    event.preventDefault()
+    dragStartRef.current = { x: event.clientX, y: event.clientY, scrollLeft: root.scrollLeft, scrollTop: root.scrollTop }
+    setIsPanning(true)
+  }, [])
+
+  useEffect(() => {
+    if (!isPanning) return undefined
+    const handleMove = (event: MouseEvent) => {
+      const root = rootRef.current
+      if (!root) return
+      root.scrollLeft = dragStartRef.current.scrollLeft - (event.clientX - dragStartRef.current.x)
+      root.scrollTop = dragStartRef.current.scrollTop - (event.clientY - dragStartRef.current.y)
+    }
+    const handleUp = () => setIsPanning(false)
+    document.addEventListener('mousemove', handleMove)
+    document.addEventListener('mouseup', handleUp)
+    return () => {
+      document.removeEventListener('mousemove', handleMove)
+      document.removeEventListener('mouseup', handleUp)
+    }
+  }, [isPanning])
+
+  const displaySettingsContent = (
+    <div style={{ width: 278 }}>
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>栏线</span>
+          <Switch size="small" checked={showRules} onChange={setShowRules} checkedChildren={<ColumnWidthOutlined />} unCheckedChildren={<ColumnWidthOutlined />} />
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>底图</span>
+          <Segmented
+            size="small"
+            block
+            value={imageUnderlayMode}
+            onChange={(value) => setImageUnderlayMode(value as ImageUnderlayMode)}
+            options={[
+              { value: 'auto', label: '自动' },
+              { value: 'on', label: '开启' },
+              { value: 'off', label: '关闭' },
+            ]}
+          />
+        </div>
+        {showImageUnderlay ? (
+          <div style={{ display: 'grid', gridTemplateColumns: '52px 1fr 32px', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>模糊</span>
+            <Slider
+              min={0}
+              max={100}
+              step={1}
+              value={imageUnderlayBlur}
+              onChange={(value) => setImageUnderlayBlur(normalizeImageUnderlayBlur(Number(value)))}
+              style={{ margin: 0 }}
+            />
+            <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12, textAlign: 'right' }}>{imageUnderlayBlur}</span>
+          </div>
+        ) : null}
+      </Space>
+    </div>
+  )
+
+  if (blocks.length === 0) return <Empty description="当前页面没有可还原的 OCR 版面" />
+
+  return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 8, position: 'relative' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <Space size={8} wrap>
+          <Segmented size="small" value={displayScript} onChange={(value) => setDisplayScript(value as ProofDisplayScript)} options={[{ value: 'original', label: '原文' }, { value: 'simplified', label: '简' }, { value: 'traditional', label: '繁' }]} />
+          <Space size={4}>
+            <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>字体</span>
+            <Button size="small" icon={<MinusOutlined />} disabled={fontScale <= FACSIMILE_FONT_SCALE_MIN} onClick={() => setFontScale((value) => normalizeFontScale(value - FACSIMILE_FONT_SCALE_STEP))} />
+            <InputNumber size="small" controls={false} min={Math.round(FACSIMILE_FONT_SCALE_MIN * 100)} max={Math.round(FACSIMILE_FONT_SCALE_MAX * 100)} step={1} value={Math.round(fontScale * 100)} formatter={(value) => `${value || 100}%`} parser={(value) => Number(String(value || '').replace(/[^\d.]/g, ''))} onChange={(value) => setFontScale(normalizeFontScale(Number(value || 100) / 100))} style={{ width: 76 }} />
+            <Button size="small" icon={<PlusOutlined />} disabled={fontScale >= FACSIMILE_FONT_SCALE_MAX} onClick={() => setFontScale((value) => normalizeFontScale(value + FACSIMILE_FONT_SCALE_STEP))} />
+          </Space>
+          <Switch size="small" checked={fitWidth} onChange={setFitWidth} checkedChildren="适宽" unCheckedChildren="缩放" />
+          <Button size="small" icon={<RotateRightOutlined />} onClick={rotatePage}>
+            旋转
+          </Button>
+          <Space size={6}>
+            <Switch
+              size="small"
+              data-reader-translation-toggle="true"
+              checked={translationOpen}
+              disabled={!pageSourceText.trim() && !translationOpen}
+              loading={translationLoading}
+              onChange={handleTranslationOpenChange}
+            />
+            <span style={{ color: translationOpen ? '#d6a85f' : 'var(--gs-text-secondary)', fontSize: 12 }}>翻译模式</span>
+            {translationStatusText ? (
+              <span data-facsimile-translation-status="true" style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>
+                {translationStatusText}
+              </span>
+            ) : null}
+          </Space>
+          <Popover trigger="click" placement="bottomLeft" title="显示设置" content={displaySettingsContent}>
+            <Button size="small" icon={<SettingOutlined />}>显示设置</Button>
+          </Popover>
+        </Space>
+        <Button size="small" icon={<UndoOutlined />} disabled={!canUndo} onClick={handleUndo}>撤销</Button>
+      </div>
+
+      <div
+        ref={rootRef}
+        onMouseUp={captureSelection}
+        onKeyUp={captureSelection}
+        onWheel={handleCanvasWheel}
+        onMouseDown={handleCanvasMouseDown}
+        style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#d4dbea', borderRadius: 6, padding: 18, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', cursor: isPanning ? 'grabbing' : 'grab', userSelect: isPanning ? 'none' : undefined }}
+      >
+        <div ref={pageFrameRef} style={{ width: `${visualFrameWidth}px`, height: `${visualFrameHeight}px`, position: 'relative', flexShrink: 0 }}>
+        <div ref={pageRef} style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden' }}>
+          {showImageUnderlay ? (
+            <img
+              src={pageImageSrc}
+              alt=""
+              draggable={false}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: 'fill',
+                opacity: Math.max(0.08, 0.28 - imageUnderlayBlur * 0.0016),
+                filter: `blur(${(imageUnderlayBlur / 28).toFixed(2)}px) saturate(${Math.max(0.35, 0.9 - imageUnderlayBlur * 0.004).toFixed(2)}) contrast(${Math.max(0.55, 0.95 - imageUnderlayBlur * 0.003).toFixed(2)})`,
+                pointerEvents: 'none',
+                userSelect: 'none',
+              }}
+            />
+          ) : null}
+          <div style={{ position: 'absolute', inset: '1.2%', border: showImageUnderlay ? '1px solid rgba(45,33,21,0.35)' : '1px solid #2d2115', pointerEvents: 'none' }} />
+          {translationStatusText ? (
+            <div
+              style={{
+                position: 'absolute',
+                top: '2.2%',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                zIndex: 30,
+                padding: '4px 10px',
+                borderRadius: 6,
+                background: 'rgba(36, 25, 15, 0.82)',
+                color: '#fff8e8',
+                fontSize: 12,
+                boxShadow: '0 8px 22px rgba(0,0,0,0.18)',
+                pointerEvents: 'none',
+              }}
+            >
+              {translationStatusText}
+            </div>
+          ) : null}
+          {pageBlockLayouts.map((layout) => {
+            const {
+              block,
+              sourceIndex,
+              left,
+              top,
+              width,
+              height,
+              label,
+              labelColor,
+              labelName,
+              isImage,
+              tableRows,
+              orientation,
+              originalText,
+              shouldRenderTable,
+              fittedLayout,
+              fontSize,
+              fittedDisplayText,
+              normalizedSearchableText,
+              padding,
+            } = layout
+            const shouldUseOverlayTranslation = translationOpen && hasTranslationOverlay
+            const hasOverflow = fittedLayout.overflow
+            const isActive = sourceIndex === activeBoxIndex
+            const keywordMatch = !!normalizedSearchKeyword && normalizedSearchableText.includes(normalizedSearchKeyword)
+            const isEditing = editingIndex === sourceIndex
+            const ruleBorder = shouldRenderTable ? { border: showRules ? '1px solid rgba(64,48,32,0.34)' : undefined } : getBlockBorderStyle(orientation, showRules)
+            const shouldShowOverflowHint = hasOverflow && isActive && !isEditing && !isImage
+            const shouldHideBlockContent = shouldUseOverlayTranslation && !isImage
+            const overflowInset = shouldShowOverflowHint ? 'inset 0 -16px 14px -14px rgba(180, 92, 20, 0.82)' : undefined
+            const blockBoxShadow = isActive
+              ? ['inset 0 0 0 2px #1677ff', overflowInset].filter(Boolean).join(', ')
+              : keywordMatch
+                ? ['inset 0 0 0 2px #d48806', overflowInset].filter(Boolean).join(', ')
+                : overflowInset
+            const toolbarAlignRight = left > 58
+            const toolbarEdgeStyle = toolbarAlignRight
+              ? { right: `${Math.max(0.6, 100 - left - width)}%` }
+              : { left: `${Math.max(0.6, left)}%` }
+
+            return (
+              <Fragment key={`${sourceIndex}-${block.reading_order ?? sourceIndex}`}>
+                {isActive || isEditing ? (
+                  <div
+                    style={{
+                      position: 'absolute',
+                      top: `${Math.max(0.6, top + 0.35)}%`,
+                      ...toolbarEdgeStyle,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      zIndex: 90,
+                      maxWidth: 'min(188px, calc(100% - 8px))',
+                      padding: '2px 4px',
+                      borderRadius: 6,
+                      background: 'rgba(18, 18, 18, 0.92)',
+                      boxShadow: '0 8px 22px rgba(34, 24, 14, 0.22)',
+                      border: '1px solid rgba(255, 255, 255, 0.16)',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                    }}
+                    onClick={(event) => event.stopPropagation()}
+                    onDoubleClick={(event) => event.stopPropagation()}
+                  >
+                    {!isEditing && !shouldRenderTable && !isImage ? (
+                      <Button
+                        size="small"
+                        title={orientation === 'vertical' ? '改横排' : '改竖排'}
+                        aria-label={orientation === 'vertical' ? '改横排' : '改竖排'}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          handleToggleBlockOrientation(sourceIndex)
+                        }}
+                      >
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                          <span>{orientation === 'vertical' ? '改横排' : '改竖排'}</span>
+                          <RotateRightOutlined style={{ fontSize: 12 }} />
+                        </span>
+                      </Button>
+                    ) : (
+                      <Tag color={orientation === 'vertical' ? 'purple' : 'geekblue'} style={{ marginInlineEnd: 0, flexShrink: 0 }}>{orientation === 'vertical' ? '竖排' : '横排'}</Tag>
+                    )}
+                    {!isEditing ? <Button size="small" icon={<EditOutlined />} title="编辑文字" aria-label="编辑文字" onClick={(event) => { event.stopPropagation(); setEditingIndex(sourceIndex); setEditValue(originalText); onSelectBox?.(sourceIndex) }} /> : null}
+                  </div>
+                ) : null}
+              <div
+                data-guji-block-index={sourceIndex}
+                onClick={(event) => { event.stopPropagation(); onSelectBox?.(sourceIndex) }}
+                onDoubleClick={(event) => { event.stopPropagation(); setEditingIndex(sourceIndex); setEditValue(originalText); onSelectBox?.(sourceIndex) }}
+                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: 'pointer', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4 }}
+              >
+                {false ? (
+                  <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 4, background: 'rgba(255,253,247,0.98)', borderRadius: 3 }}>
+                    <Input.TextArea value={editValue} onChange={(event) => setEditValue(event.target.value)} autoSize={false} style={{ flex: 1, height: '100%', resize: 'none', fontFamily: FONT_FAMILY, fontSize: Math.max(10, Math.min(fontSize, 32)), lineHeight: 1.5, writingMode: shouldRenderTable ? 'horizontal-tb' : orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb' }} onClick={(event) => event.stopPropagation()} />
+                    <Space size={4} style={{ justifyContent: 'flex-end', padding: '0 2px 2px' }}>
+                      <Button size="small" onClick={(event) => { event.stopPropagation(); setEditingIndex(-1) }}>取消</Button>
+                      <Button size="small" type="primary" icon={<SaveOutlined />} onClick={(event) => { event.stopPropagation(); handleSaveBlock() }}>保存</Button>
+                    </Space>
+                  </div>
+                ) : shouldHideBlockContent ? null : isImage ? (
+                  <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} left={left} top={top} width={width} height={height} />
+                ) : shouldRenderTable ? (
+                  <div style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize, lineHeight: 1.18, fontFamily: FONT_FAMILY }}>
+                    {renderFacsimileTable(tableRows, searchKeyword, isActive && keywordMatch)}
+                  </div>
+                ) : (
+                  <div style={{ width: '100%', height: '100%', writingMode: orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb', textOrientation: orientation === 'vertical' ? 'mixed' : undefined, whiteSpace: orientation === 'vertical' ? 'pre-wrap' : 'pre-wrap', wordBreak: isTocLabel(label) ? 'normal' : 'break-all', overflowWrap: isTocLabel(label) ? 'normal' : 'anywhere', lineHeight: getBlockLineHeight(label, orientation, layoutProfile), fontSize, fontWeight: getBlockFontWeight(label, layoutProfile), letterSpacing: 0, textAlign: isTitleLabel(label) ? 'center' : 'start', textIndent: orientation === 'horizontal' && isBodyTextLabel(label) ? '2em' : undefined }}>
+                    {renderFormattedText(fittedDisplayText, searchKeyword, isActive && keywordMatch)}
+                  </div>
+                )}
+                {shouldShowOverflowHint ? (
+                  <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 14, pointerEvents: 'none', background: 'linear-gradient(to bottom, rgba(255,253,247,0), rgba(255,253,247,0.92))' }} />
+                ) : null}
+              </div>
+              </Fragment>
+            )
+          })}
+          {translationOverlayLayouts.map((layout) => {
+            const {
+              overlay,
+              left,
+              top,
+              width,
+              height,
+              labelColor,
+              fittedLayout,
+              sourceIndex,
+              padding,
+              lineHeight,
+              normalizedSearchableText,
+            } = layout
+            const isActive = sourceIndex >= 0 && overlay.sourceIndexes.includes(activeBoxIndex)
+            const keywordMatch = !!normalizedSearchKeyword && normalizedSearchableText.includes(normalizedSearchKeyword)
+
+            return (
+              <div
+                key={overlay.id}
+                data-facsimile-translation-overlay="true"
+                data-translation-source-indexes={overlay.sourceIndexes.join(',')}
+                onClick={(event) => { event.stopPropagation(); if (sourceIndex >= 0) onSelectBox?.(sourceIndex) }}
+                style={{
+                  position: 'absolute',
+                  left: `${left}%`,
+                  top: `${top}%`,
+                  width: `${width}%`,
+                  height: `${height}%`,
+                  boxSizing: 'border-box',
+                  border: showRules ? '1px solid rgba(45, 33, 21, 0.18)' : undefined,
+                  boxShadow: isActive
+                    ? 'inset 0 0 0 2px #1677ff, 0 8px 18px rgba(45,33,21,0.14)'
+                    : keywordMatch
+                      ? 'inset 0 0 0 2px #d48806, 0 8px 18px rgba(45,33,21,0.12)'
+                      : '0 6px 14px rgba(45,33,21,0.08)',
+                  background: isActive
+                    ? 'rgba(235, 246, 255, 0.92)'
+                    : keywordMatch
+                      ? 'rgba(255, 248, 204, 0.92)'
+                      : 'rgba(255, 253, 247, 0.9)',
+                  color: labelColor,
+                  cursor: 'pointer',
+                  overflow: 'hidden',
+                  padding,
+                  zIndex: isActive ? 18 : keywordMatch ? 16 : 12,
+                }}
+              >
+                <div
+                  style={{
+                    width: '100%',
+                    height: '100%',
+                    writingMode: overlay.orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb',
+                    textOrientation: overlay.orientation === 'vertical' ? 'mixed' : undefined,
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: isTocLabel(overlay.label) ? 'normal' : 'break-all',
+                    overflowWrap: isTocLabel(overlay.label) ? 'normal' : 'anywhere',
+                    lineHeight,
+                    fontSize: fittedLayout.fontSize,
+                    fontWeight: getBlockFontWeight(overlay.label, layoutProfile),
+                    letterSpacing: 0,
+                    textAlign: isTitleLabel(overlay.label) ? 'center' : 'start',
+                    textIndent: overlay.orientation === 'horizontal' && isBodyTextLabel(overlay.label) ? '2em' : undefined,
+                  }}
+                >
+                  {renderFormattedText(fittedLayout.text, searchKeyword, isActive && keywordMatch)}
+                </div>
+              </div>
+            )
+          })}
+          <div style={{ position: 'absolute', right: '2%', bottom: '1.2%', color: '#8a7662', fontSize: 12, display: 'flex', alignItems: 'center', gap: 4, pointerEvents: 'none' }}>
+            <CheckOutlined />
+            {pageProofStatus === 'completed' ? '已校' : '待校'}
+          </div>
+        </div>
+        </div>
+      </div>
+      {editingBlock ? (
+        <div
+          onMouseDown={(event) => event.stopPropagation()}
+          onMouseUp={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+          onWheel={(event) => event.stopPropagation()}
+          style={{
+            position: 'absolute',
+            top: 48,
+            right: 14,
+            zIndex: 80,
+            width: 'min(460px, calc(100% - 28px))',
+            maxHeight: 'calc(100% - 70px)',
+            display: 'flex',
+            flexDirection: 'column',
+            background: '#fffdf7',
+            border: '1px solid rgba(45, 33, 21, 0.2)',
+            borderRadius: 8,
+            boxShadow: '0 18px 48px rgba(16, 12, 8, 0.28)',
+            overflow: 'hidden',
+          }}
+        >
+          <div style={{ padding: '12px 14px 10px', borderBottom: '1px solid rgba(45, 33, 21, 0.12)', display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+            <div style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <Tag color={LABEL_COLORS[getLabel(editingBlock)] || LABEL_COLORS.text} style={{ marginInlineEnd: 0 }}>{editingBlockLabel}</Tag>
+              <Tag color="blue" style={{ marginInlineEnd: 0 }}>#{editingIndex + 1}</Tag>
+              <Tag color={editingBlock.orientation === 'vertical' ? 'purple' : 'geekblue'} style={{ marginInlineEnd: 0 }}>
+                {editingBlock.orientation === 'vertical' ? '竖排' : '横排'}
+              </Tag>
+            </div>
+            <Space size={6}>
+              <Button
+                size="small"
+                onClick={() => handleToggleBlockOrientation(editingIndex)}
+              >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                  <span>{editingBlock.orientation === 'vertical' ? '改横排' : '改竖排'}</span>
+                  <RotateRightOutlined style={{ fontSize: 12 }} />
+                </span>
+              </Button>
+              <Button size="small" onClick={() => { setEditingIndex(-1); setEditValue('') }}>取消</Button>
+            </Space>
+          </div>
+          <div style={{ padding: 14, minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <Input.TextArea
+              value={editValue}
+              onChange={(event) => setEditValue(event.target.value)}
+              autoSize={false}
+              autoFocus
+              onKeyDown={(event) => {
+                if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                  event.preventDefault()
+                  handleSaveBlock()
+                }
+              }}
+              style={{
+                width: '100%',
+                height: 'min(46vh, 360px)',
+                minHeight: 180,
+                resize: 'vertical',
+                fontFamily: FONT_FAMILY,
+                fontSize: 16,
+                lineHeight: 1.7,
+                writingMode: 'horizontal-tb',
+                whiteSpace: 'pre-wrap',
+              }}
+            />
+            <Space size={8} style={{ justifyContent: 'flex-end', flexShrink: 0 }}>
+              <Button onClick={() => { setEditingIndex(-1); setEditValue('') }}>取消</Button>
+              <Button type="primary" icon={<SaveOutlined />} onClick={handleSaveBlock}>保存</Button>
+            </Space>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}

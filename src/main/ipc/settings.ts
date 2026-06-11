@@ -1,0 +1,767 @@
+﻿import { ipcMain, dialog, app } from 'electron'
+import { basename, extname, join } from 'path'
+import { queryAll, queryOne, run, saveDatabase } from '../database'
+import { exportDocument } from '../export'
+import { checkLuaTeX, checkLuatexCn, generateTeX, compileTeX } from '../typeset'
+import { readFileSync, existsSync } from 'fs'
+import type {
+  AppPathName,
+  BackupImportResult,
+  BackupResult,
+  BackupStatus,
+  CompactAutoBackupResult,
+  DocumentExportBatchError,
+  DocumentExportBatchResult,
+  DocumentExportFormat,
+  DocumentExportOptions,
+  ListModelsPayload,
+  LlmProviderProfile,
+  LlmProviderProfileState,
+  LlmProviderProfilesResult,
+  Setting,
+  SettingSetResult,
+  SettingsMap,
+  TypesetAnnotationItem,
+  TypesetCompileResult,
+  TypesetEnvironmentStatus,
+  TypesetMetadata,
+  TypesetTemplate,
+} from '../../shared/types'
+import {
+  backupData,
+  compactAutoBackups,
+  configureAutoBackup,
+  exportDocumentListCsv,
+  getBackupStatus,
+  importBackupData,
+  openAutoBackupDirectory,
+  openDataDirectory,
+  runAutoBackupNow,
+} from '../backup'
+import { assertAllowedLocalFilePath } from '../file-access'
+import { getResponseErrorMessage, isAbortError } from '../../shared/errors'
+import {
+  ensureDisabledMetadataTagBindingsCleared,
+  ensureEnabledMetadataTagBindingsRebuilt,
+  METADATA_TAG_BINDING_SETTING_KEY,
+  needsMetadataTagBindingRebuild,
+  rebuildMetadataTagBindings,
+} from '../metadata-tags'
+
+function logMetadataTagCleanup(context: string, cleanup: SettingSetResult['metadataTagCleanup']): void {
+  if (!cleanup || (cleanup.removedRelations === 0 && cleanup.keptManualRelations === 0 && cleanup.removedTags === 0)) return
+  console.log(
+    `[Settings] ${context}: removed=${cleanup.removedRelations}, keptManual=${cleanup.keptManualRelations}, removedTags=${cleanup.removedTags}`,
+  )
+}
+
+function logMetadataTagRebuild(context: string, rebuild: SettingSetResult['metadataTagRebuild']): void {
+  if (!rebuild || (rebuild.processedDocuments === 0 && rebuild.createdOrUpdatedRelations === 0)) return
+  console.log(
+    `[Settings] ${context}: processed=${rebuild.processedDocuments}, synced=${rebuild.syncedDocuments}, skipped=${rebuild.skippedDocuments}, relations=${rebuild.createdOrUpdatedRelations}`,
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseMetadata(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'string') return {}
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return isRecord(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function sanitizeFileBaseName(value: unknown): string {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const withoutExt = basename(raw, extname(raw)).trim()
+  return withoutExt
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/g, '')
+    .slice(0, 160)
+}
+
+function getExportDefaultName(docId: string, extension: string): string {
+  const doc = queryOne<{ title?: string | null; file_path?: string | null; metadata?: string | null }>(
+    'SELECT title, file_path, metadata FROM documents WHERE id = ?',
+    [docId],
+  )
+  const metadata = parseMetadata(doc?.metadata)
+  const candidates = [
+    metadata.original_file_name,
+    metadata.source_file_name,
+    doc?.file_path ? basename(doc.file_path) : '',
+    doc?.title,
+  ]
+  const baseName = candidates.map(sanitizeFileBaseName).find(Boolean) || 'document'
+  return `${baseName}.${extension}`
+}
+
+const DOCUMENT_EXPORT_EXTENSIONS: Record<string, string> = {
+  markdown: 'md',
+  'tei-xml': 'xml',
+  'page-xml': 'xml',
+  'paddle-json': 'json',
+  txt: 'txt',
+  'reading-pdf': 'pdf',
+  'layout-pdf': 'pdf',
+  'layout-searchable-pdf': 'pdf',
+}
+
+const LLM_PROFILE_SETTINGS_KEY = 'llm_provider_profiles'
+const VISION_OCR_PROFILE_SETTINGS_KEY = 'vision_ocr_provider_profiles'
+const PADDLE_OCR_MODEL_DOCS_URL = 'https://www.paddleocr.ai/latest/en/version3.x/inference_deployment/serving/paddleocr_official_api/typescript.html'
+
+function isPaddleOcrDocParsingModel(model: unknown): boolean {
+  const value = String(model || '').trim()
+  return /^PaddleOCR-VL(?:-|$)/i.test(value) || /^PP-Structure/i.test(value)
+}
+
+function normalizePaddleOcrDocParsingModelName(model: unknown): string {
+  const value = String(model || '').trim()
+  const compact = value.replace(/[.`"'\s]/g, '')
+  const vlVersionMatch = compact.match(/^(?:Model)?PaddleOCRVL(\d+)$/)
+  if (vlVersionMatch?.[1]) {
+    const digits = vlVersionMatch[1]
+    return digits.length === 1
+      ? `PaddleOCR-VL-${digits}`
+      : `PaddleOCR-VL-${digits.slice(0, -1)}.${digits.slice(-1)}`
+  }
+  const ppStructureMatch = compact.match(/^(?:Model)?PPStructureV(\d+)$/)
+  if (ppStructureMatch?.[1]) {
+    return `PP-StructureV${ppStructureMatch[1]}`
+  }
+  const aliases: Record<string, string> = {
+    PaddleOCRVL: 'PaddleOCR-VL',
+    ModelPaddleOCRVL: 'PaddleOCR-VL',
+  }
+  return aliases[compact] || value
+}
+
+interface OpenAiModelItem {
+  id?: string
+  object?: string
+  owned_by?: string
+  permission?: unknown
+}
+
+function getSettingValue(key: string): string {
+  return String(queryOne<{ value?: string | null }>('SELECT value FROM settings WHERE key = ?', [key])?.value || '')
+}
+
+function setSettingValue(key: string, value: string): void {
+  run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value])
+}
+
+function makeLlmProfileId(provider: string, baseUrl: string, model: string): string {
+  const safeProvider = String(provider || 'AI').trim() || 'AI'
+  const safeModel = String(model || 'model').trim() || 'model'
+  const base = `${safeProvider}_${safeModel}`
+    .replace(/[^\w.-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 80) || 'ai_model'
+  const signature = `${safeProvider}|${String(baseUrl || '').trim().replace(/\/+$/, '')}|${safeModel}`.toLowerCase()
+  let hash = 0
+  for (let index = 0; index < signature.length; index += 1) {
+    hash = ((hash << 5) - hash + signature.charCodeAt(index)) | 0
+  }
+  return `${base}_${Math.abs(hash).toString(36)}`
+}
+
+function makeVisionOcrProfileId(provider: string, baseUrl: string, model: string): string {
+  return makeLlmProfileId(`vision_${provider || 'OCR'}`, baseUrl, model)
+}
+
+async function fetchOpenAiCompatibleModels(baseUrl: string, apiKey: string): Promise<string[]> {
+  const normalizedBaseUrl = String(baseUrl || '').trim().replace(/\/+$/, '')
+  const token = String(apiKey || '').trim().replace(/^Bearer\s+/i, '')
+  if (!normalizedBaseUrl) throw new Error('API Base URL 不能为空')
+  if (!token) throw new Error('API Key 不能为空')
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 3_000)
+  try {
+    const response = await fetch(`${normalizedBaseUrl}/models`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: controller.signal,
+    })
+    const text = await response.text()
+    let data: Record<string, unknown> = {}
+    try {
+      const parsed: unknown = text ? JSON.parse(text) : {}
+      data = isRecord(parsed) ? parsed : {}
+    } catch {
+      data = { error: { message: text || response.statusText } }
+    }
+    if (!response.ok || data.error) {
+      throw new Error(getResponseErrorMessage(data, response.statusText || '模型列表请求失败'))
+    }
+    const items = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : []
+    const modelIds: string[] = items
+      .map((item: OpenAiModelItem | string) => typeof item === 'string' ? item : isRecord(item) ? item.id : '')
+      .map((id: unknown) => String(id || '').trim())
+      .filter((id: string) => id.length > 0)
+    return [...new Set<string>(modelIds)]
+      .sort((left, right) => left.localeCompare(right))
+  } catch (error: unknown) {
+    if (isAbortError(error)) {
+      throw new Error('模型列表请求超时，请检查 Base URL、Key 或网络')
+    }
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function fetchPaddleOcrModels(_apiKey: string): Promise<string[]> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10_000)
+  try {
+    const response = await fetch(PADDLE_OCR_MODEL_DOCS_URL, { signal: controller.signal })
+    if (!response.ok) {
+      throw new Error(`官方模型文档请求失败，状态码 ${response.status}`)
+    }
+    const text = await response.text()
+    const candidates = [
+      ...text.matchAll(/PaddleOCR-VL(?:-\d+(?:\.\d+)*)?/gi),
+      ...text.matchAll(/PP-StructureV\d+/gi),
+      ...text.matchAll(/ModelPaddleOCRVL\d*/g),
+      ...text.matchAll(/PaddleOCRVL\d*/g),
+      ...text.matchAll(/ModelPPStructureV\d+/g),
+      ...text.matchAll(/PPStructureV\d+/g),
+    ]
+      .map((match) => normalizePaddleOcrDocParsingModelName(match[0]))
+      .filter(isPaddleOcrDocParsingModel)
+    const models = [...new Set(candidates)].sort((left, right) => left.localeCompare(right))
+    if (models.length === 0) {
+      throw new Error('官方模型文档中没有解析到可用于文档解析的模型')
+    }
+    return models
+  } catch (error: unknown) {
+    if (isAbortError(error)) {
+      throw new Error('飞桨 OCR 官方模型列表请求超时，请检查网络')
+    }
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function parseLlmProviderProfiles(value: unknown): LlmProviderProfile[] {
+  if (!value || typeof value !== 'string') return []
+  try {
+    const parsed = JSON.parse(value)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .map((item) => ({
+        id: String(item?.id || item?.name || '').trim(),
+        name: String(item?.name || item?.provider || '').trim(),
+        provider: String(item?.provider || item?.name || '').trim(),
+        baseUrl: String(item?.baseUrl || '').trim().replace(/\/+$/, ''),
+        apiKey: String(item?.apiKey || ''),
+        model: String(item?.model || '').trim(),
+        updatedAt: item?.updatedAt ? String(item.updatedAt) : undefined,
+      }))
+      .filter((item) => item.id && item.name && item.baseUrl && item.model)
+  } catch {
+    return []
+  }
+}
+
+function getLlmProviderProfiles(): LlmProviderProfile[] {
+  const stored = parseLlmProviderProfiles(getSettingValue(LLM_PROFILE_SETTINGS_KEY))
+  const current = getCurrentLlmProfile()
+  if (!current.baseUrl || !current.model) return stored
+  const byId = stored.find((item) => item.id === current.id)
+  if (byId) {
+    return stored.map((item) => item.id === current.id ? { ...item, ...current, updatedAt: item.updatedAt } : item)
+  }
+  return [current, ...stored]
+}
+
+function getCurrentVisionOcrProfile(): LlmProviderProfile {
+  const provider = getSettingValue('vision_ocr_provider') || '豆包'
+  const baseUrl = (getSettingValue('vision_ocr_base_url') || 'https://ark.cn-beijing.volces.com/api/v3').replace(/\/+$/, '')
+  const model = getSettingValue('vision_ocr_model') || ''
+  return {
+    id: getSettingValue('vision_ocr_active_provider_id') || makeVisionOcrProfileId(provider, baseUrl, model),
+    name: provider,
+    provider,
+    baseUrl,
+    apiKey: getSettingValue('vision_ocr_api_key'),
+    model,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+function getVisionOcrProviderProfiles(): LlmProviderProfile[] {
+  const stored = parseLlmProviderProfiles(getSettingValue(VISION_OCR_PROFILE_SETTINGS_KEY))
+  const current = getCurrentVisionOcrProfile()
+  if (!current.baseUrl || !current.model) return stored
+  const byId = stored.find((item) => item.id === current.id)
+  if (byId) {
+    return stored.map((item) => item.id === current.id ? { ...item, ...current, updatedAt: item.updatedAt } : item)
+  }
+  return [current, ...stored]
+}
+
+function saveVisionOcrProviderProfiles(profiles: LlmProviderProfile[]): void {
+  const normalized = profiles
+    .map((item) => ({
+      ...item,
+      id: String(item.id || item.name || '').trim(),
+      name: String(item.name || item.provider || '').trim(),
+      provider: String(item.provider || item.name || '').trim(),
+      baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
+      apiKey: String(item.apiKey || ''),
+      model: String(item.model || '').trim(),
+      updatedAt: item.updatedAt || new Date().toISOString(),
+    }))
+    .filter((item) => item.id && item.name && item.baseUrl && item.model)
+  setSettingValue(VISION_OCR_PROFILE_SETTINGS_KEY, JSON.stringify(normalized))
+}
+
+function saveLlmProviderProfiles(profiles: LlmProviderProfile[]): void {
+  const normalized = profiles
+    .map((item) => ({
+      ...item,
+      id: String(item.id || item.name || '').trim(),
+      name: String(item.name || item.provider || '').trim(),
+      provider: String(item.provider || item.name || '').trim(),
+      baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
+      apiKey: String(item.apiKey || ''),
+      model: String(item.model || '').trim(),
+      updatedAt: item.updatedAt || new Date().toISOString(),
+    }))
+    .filter((item) => item.id && item.name && item.baseUrl && item.model)
+  setSettingValue(LLM_PROFILE_SETTINGS_KEY, JSON.stringify(normalized))
+}
+
+function getCurrentLlmProfile(): LlmProviderProfile {
+  const provider = getSettingValue('llm_provider') || 'DeepSeek'
+  const baseUrl = (getSettingValue('llm_base_url') || 'https://api.deepseek.com/v1').replace(/\/+$/, '')
+  const model = getSettingValue('llm_model') || 'deepseek-chat'
+  return {
+    id: getSettingValue('llm_active_provider_id') || makeLlmProfileId(provider, baseUrl, model),
+    name: provider,
+    provider,
+    baseUrl,
+    apiKey: getSettingValue('llm_api_key'),
+    model,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+function getExportExtension(format: DocumentExportFormat): string {
+  return DOCUMENT_EXPORT_EXTENSIONS[format] || format
+}
+
+function ensureUniqueExportPath(dirPath: string, fileName: string, usedPaths: Set<string>): string {
+  const ext = extname(fileName)
+  const base = ext ? fileName.slice(0, -ext.length) : fileName
+  let candidate = join(dirPath, fileName)
+  let index = 2
+  while (usedPaths.has(candidate.toLowerCase()) || existsSync(candidate)) {
+    candidate = join(dirPath, `${base}-${index}${ext}`)
+    index += 1
+  }
+  usedPaths.add(candidate.toLowerCase())
+  return candidate
+}
+
+export function registerSettingsIpc(): void {
+  ipcMain.handle('settings:get', async (_event, key: string): Promise<string | null> => {
+    const row = queryOne<Pick<Setting, 'value'>>('SELECT value FROM settings WHERE key = ?', [key])
+    return row?.value ?? null
+  })
+
+  ipcMain.handle('settings:set', async (_event, key: string, value: string): Promise<SettingSetResult> => {
+    const previousValue = key === METADATA_TAG_BINDING_SETTING_KEY ? getSettingValue(key) : ''
+    run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value])
+    let metadataTagCleanup: SettingSetResult['metadataTagCleanup'] = null
+    let metadataTagRebuild: SettingSetResult['metadataTagRebuild'] = null
+    if (key === METADATA_TAG_BINDING_SETTING_KEY) {
+      const normalizedValue = String(value).trim().toLowerCase()
+      const wasEnabled = String(previousValue).trim().toLowerCase() === 'true'
+      if (normalizedValue === 'false') {
+        metadataTagCleanup = ensureDisabledMetadataTagBindingsCleared()
+        logMetadataTagCleanup('Cleared metadata tag bindings', metadataTagCleanup)
+      } else if (normalizedValue === 'true' && (!wasEnabled || needsMetadataTagBindingRebuild())) {
+        metadataTagRebuild = await rebuildMetadataTagBindings()
+        logMetadataTagRebuild('Rebuilt metadata tag bindings', metadataTagRebuild)
+      }
+    }
+    saveDatabase()
+    return { success: true, metadataTagCleanup, metadataTagRebuild }
+  })
+
+  ipcMain.handle('settings:getAll', async (): Promise<SettingsMap> => {
+    const cleanup = ensureDisabledMetadataTagBindingsCleared()
+    logMetadataTagCleanup('Cleared stale metadata tag bindings while loading settings', cleanup)
+    const rebuild = await ensureEnabledMetadataTagBindingsRebuilt()
+    logMetadataTagRebuild('Rebuilt stale metadata tag bindings while loading settings', rebuild)
+    const rows = queryAll<Setting>('SELECT key, value FROM settings')
+    const result: SettingsMap = {}
+    for (const row of rows) {
+      result[row.key] = row.value
+    }
+    return result
+  })
+
+  ipcMain.handle('settings:listModels', async (_event, payload?: ListModelsPayload): Promise<string[]> => {
+    return fetchOpenAiCompatibleModels(String(payload?.baseUrl || ''), String(payload?.apiKey || ''))
+  })
+
+  ipcMain.handle('settings:listPaddleOcrModels', async (_event, apiKey?: string): Promise<string[]> => {
+    return fetchPaddleOcrModels(String(apiKey || getSettingValue('paddleocr_api_key') || ''))
+  })
+
+  ipcMain.handle('settings:llmProfiles:list', async (): Promise<LlmProviderProfileState> => {
+    const current = getCurrentLlmProfile()
+    return {
+      activeId: current.id,
+      current,
+      profiles: getLlmProviderProfiles(),
+    }
+  })
+
+  ipcMain.handle('settings:llmProfiles:saveCurrent', async (_event, name?: string): Promise<LlmProviderProfileState> => {
+    const current = getCurrentLlmProfile()
+    const profileName = String(name || current.name || current.provider || 'AI 服务商').trim()
+    const idBase = profileName || current.id
+    const profile: LlmProviderProfile = {
+      ...current,
+      id: makeLlmProfileId(idBase, current.baseUrl, current.model),
+      name: profileName,
+      provider: profileName,
+      updatedAt: new Date().toISOString(),
+    }
+    const profiles = getLlmProviderProfiles().filter((item) => item.id !== profile.id)
+    saveLlmProviderProfiles([profile, ...profiles])
+    setSettingValue('llm_active_provider_id', profile.id)
+    setSettingValue('llm_provider', profile.provider)
+    saveDatabase()
+    return { activeId: profile.id, current: profile, profiles: getLlmProviderProfiles() }
+  })
+
+  ipcMain.handle('settings:llmProfiles:upsert', async (_event, profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
+    const provider = String(profile?.provider || profile?.name || '').trim()
+    const baseUrl = String(profile?.baseUrl || '').trim().replace(/\/+$/, '')
+    const model = String(profile?.model || '').trim()
+    const next: LlmProviderProfile = {
+      id: String(profile?.id || '').trim() || makeLlmProfileId(provider, baseUrl, model),
+      name: String(profile?.name || profile?.provider || '').trim(),
+      provider,
+      baseUrl,
+      apiKey: String(profile?.apiKey || ''),
+      model,
+      updatedAt: new Date().toISOString(),
+    }
+    if (!next.id || !next.name || !next.baseUrl || !next.model) {
+      throw new Error('AI 服务商配置不完整')
+    }
+    const profiles = getLlmProviderProfiles().filter((item) => item.id !== next.id)
+    saveLlmProviderProfiles([next, ...profiles])
+    saveDatabase()
+    return { activeId: getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider') || next.id, profiles: getLlmProviderProfiles() }
+  })
+
+  ipcMain.handle('settings:llmProfiles:switch', async (_event, profileId: string): Promise<LlmProviderProfileState> => {
+    const id = String(profileId || '').trim()
+    const profiles = getLlmProviderProfiles()
+    const profile = profiles.find((item) => item.id === id)
+    if (!profile) throw new Error('未找到 AI 服务商配置')
+    setSettingValue('llm_active_provider_id', profile.id)
+    setSettingValue('llm_provider', profile.provider || profile.name)
+    setSettingValue('llm_base_url', profile.baseUrl)
+    setSettingValue('llm_api_key', profile.apiKey)
+    setSettingValue('llm_model', profile.model)
+    saveDatabase()
+    return { activeId: profile.id, current: profile, profiles }
+  })
+
+  ipcMain.handle('settings:llmProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
+    const id = String(profileId || '').trim()
+    const activeId = getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider')
+    if (id && id === activeId) throw new Error('不能删除当前正在使用的 AI 服务商')
+    saveLlmProviderProfiles(getLlmProviderProfiles().filter((item) => item.id !== id))
+    saveDatabase()
+    return { activeId, profiles: getLlmProviderProfiles() }
+  })
+
+  ipcMain.handle('settings:visionOcrProfiles:list', async (): Promise<LlmProviderProfileState> => {
+    const current = getCurrentVisionOcrProfile()
+    return {
+      activeId: current.id,
+      current,
+      profiles: getVisionOcrProviderProfiles(),
+    }
+  })
+
+  ipcMain.handle('settings:visionOcrProfiles:upsert', async (_event, profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
+    const provider = String(profile?.provider || profile?.name || '').trim()
+    const baseUrl = String(profile?.baseUrl || '').trim().replace(/\/+$/, '')
+    const model = String(profile?.model || '').trim()
+    const next: LlmProviderProfile = {
+      id: String(profile?.id || '').trim() || makeVisionOcrProfileId(provider, baseUrl, model),
+      name: String(profile?.name || profile?.provider || '').trim(),
+      provider,
+      baseUrl,
+      apiKey: String(profile?.apiKey || ''),
+      model,
+      updatedAt: new Date().toISOString(),
+    }
+    if (!next.id || !next.name || !next.baseUrl || !next.model) {
+      throw new Error('视觉 OCR 服务商配置不完整')
+    }
+    const profiles = getVisionOcrProviderProfiles().filter((item) => item.id !== next.id)
+    saveVisionOcrProviderProfiles([next, ...profiles])
+    saveDatabase()
+    return { activeId: getSettingValue('vision_ocr_active_provider_id') || next.id, profiles: getVisionOcrProviderProfiles() }
+  })
+
+  ipcMain.handle('settings:visionOcrProfiles:switch', async (_event, profileId: string): Promise<LlmProviderProfileState> => {
+    const id = String(profileId || '').trim()
+    const profiles = getVisionOcrProviderProfiles()
+    const profile = profiles.find((item) => item.id === id)
+    if (!profile) throw new Error('未找到视觉 OCR 服务商配置')
+    setSettingValue('vision_ocr_active_provider_id', profile.id)
+    setSettingValue('vision_ocr_provider', profile.provider || profile.name)
+    setSettingValue('vision_ocr_use_llm_config', 'false')
+    setSettingValue('vision_ocr_base_url', profile.baseUrl)
+    setSettingValue('vision_ocr_api_key', profile.apiKey)
+    setSettingValue('vision_ocr_model', profile.model)
+    saveDatabase()
+    return { activeId: profile.id, current: profile, profiles }
+  })
+
+  ipcMain.handle('settings:visionOcrProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
+    const id = String(profileId || '').trim()
+    const activeId = getSettingValue('vision_ocr_active_provider_id') || getSettingValue('vision_ocr_provider')
+    if (id && id === activeId) throw new Error('不能删除当前正在使用的视觉 OCR 服务商')
+    saveVisionOcrProviderProfiles(getVisionOcrProviderProfiles().filter((item) => item.id !== id))
+    saveDatabase()
+    return { activeId, profiles: getVisionOcrProviderProfiles() }
+  })
+}
+
+export function registerAppIpc(): void {
+  ipcMain.handle('app:getVersion', async (): Promise<string> => {
+    return app.getVersion()
+  })
+
+  ipcMain.handle('app:getPath', async (_event, name: AppPathName): Promise<string> => {
+    return app.getPath(name)
+  })
+}
+
+export function registerExportIpc(): void {
+  ipcMain.handle('documents:export', async (
+    _event,
+    docId: string,
+    format: DocumentExportFormat,
+    options?: DocumentExportOptions,
+  ): Promise<boolean> => {
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: '导出文献',
+      defaultPath: getExportDefaultName(docId, getExportExtension(format)),
+      filters: [
+        { name: format.toUpperCase(), extensions: [getExportExtension(format)] }
+      ]
+    })
+
+    if (canceled || !filePath) return false
+
+    try {
+      await exportDocument(docId, format, filePath, options)
+      return true
+    } catch (error) {
+      console.error('导出失败:', error)
+      throw new Error((error as Error).message)
+    }
+  })
+
+  ipcMain.handle('documents:exportBatch', async (_event, docIds: string[], format: DocumentExportFormat, options?: DocumentExportOptions): Promise<DocumentExportBatchResult> => {
+    const uniqueDocIds = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+    if (uniqueDocIds.length === 0) throw new Error('请先选择要导出的文献')
+
+    const { canceled, filePaths } = await dialog.showOpenDialog({
+      title: `批量导出 ${uniqueDocIds.length} 篇文献`,
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (canceled || !filePaths?.[0]) {
+      return { canceled: true, successCount: 0, failedCount: 0, directoryPath: null, errors: [] }
+    }
+
+    const directoryPath = filePaths[0]
+    const extension = getExportExtension(format)
+    const usedPaths = new Set<string>()
+    const errors: DocumentExportBatchError[] = []
+    let successCount = 0
+
+    for (const docId of uniqueDocIds) {
+      try {
+        const fileName = getExportDefaultName(docId, extension)
+        await exportDocument(docId, format, ensureUniqueExportPath(directoryPath, fileName, usedPaths), options)
+        successCount += 1
+      } catch (error) {
+        console.error(`批量导出失败: ${docId}`, error)
+        errors.push({ docId, message: (error as Error)?.message || '导出失败' })
+      }
+    }
+
+    return {
+      canceled: false,
+      successCount,
+      failedCount: errors.length,
+      directoryPath,
+      errors,
+    }
+  })
+}
+
+export function registerTypesetIpc(): void {
+  ipcMain.handle('typeset:checkEnv', async (): Promise<TypesetEnvironmentStatus> => {
+    const [luatex, luatexCn] = await Promise.all([checkLuaTeX(), checkLuatexCn()])
+    return { luatex, luatexCn }
+  })
+
+  ipcMain.handle('typeset:generateTeX', async (
+    _event,
+    annotations: TypesetAnnotationItem[],
+    template: TypesetTemplate,
+    metadata?: TypesetMetadata,
+  ): Promise<string> => {
+    return generateTeX(annotations, template, metadata)
+  })
+
+  ipcMain.handle('typeset:compile', async (_event, docId: string, texContent: string): Promise<TypesetCompileResult> => {
+    return await compileTeX(texContent, docId)
+  })
+
+  ipcMain.handle('typeset:readPdf', async (_event, pdfPath: string): Promise<ArrayBuffer | null> => {
+    const safePath = assertAllowedLocalFilePath(pdfPath)
+    if (!existsSync(safePath)) return null
+    const buffer = readFileSync(safePath)
+    return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+  })
+}
+
+export function registerFsIpc(): void {
+  ipcMain.handle('fs:readFileBuffer', async (_event, filePath: string): Promise<ArrayBuffer> => {
+    try {
+      const safePath = assertAllowedLocalFilePath(filePath)
+      const buffer = readFileSync(safePath)
+      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+    } catch (error) {
+      console.error('读取文件失败:', error)
+      throw new Error((error as Error).message)
+    }
+  })
+
+  ipcMain.handle('fs:readImageAsDataURL', async (_event, filePath: string): Promise<string> => {
+    try {
+      const safePath = assertAllowedLocalFilePath(filePath)
+      if (!existsSync(safePath)) {
+        throw new Error(`文件不存在: ${safePath}`)
+      }
+      const buffer = readFileSync(safePath)
+      const ext = safePath.split('.').pop()?.toLowerCase() || 'jpg'
+      const mimeMap: Record<string, string> = {
+        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+        gif: 'image/gif', bmp: 'image/bmp', tiff: 'image/tiff', tif: 'image/tiff',
+        webp: 'image/webp'
+      }
+      const mime = mimeMap[ext] || 'image/jpeg'
+      const base64 = buffer.toString('base64')
+      return `data:${mime};base64,${base64}`
+    } catch (error) {
+      console.error('[IPC] 读取图片失败:', error)
+      throw new Error((error as Error).message)
+    }
+  })
+}
+
+export function registerBackupIpc(): void {
+  const scheduleRestart = () => {
+    setTimeout(() => {
+      app.relaunch()
+      app.exit(0)
+    }, 500)
+  }
+
+  const handleImportBackup = async (): Promise<BackupImportResult> => {
+    try {
+      const result = await importBackupData()
+      if (result.success) {
+        scheduleRestart()
+      }
+      return result
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  }
+
+  ipcMain.handle('backup:create', async (): Promise<BackupResult> => {
+    try {
+      const path = await backupData()
+      return { success: !!path, path }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('backup:restore', handleImportBackup)
+
+  ipcMain.handle('backup:import', handleImportBackup)
+
+  ipcMain.handle('backup:getStatus', async (): Promise<BackupStatus> => {
+    return getBackupStatus()
+  })
+
+  ipcMain.handle('backup:configureAuto', async (
+    _event,
+    enabled: boolean,
+    intervalHours: number,
+    includeStorage?: boolean,
+    slotCount?: number,
+  ): Promise<BackupStatus> => {
+    return configureAutoBackup(enabled, intervalHours, includeStorage, slotCount)
+  })
+
+  ipcMain.handle('backup:compactAuto', async (): Promise<CompactAutoBackupResult> => {
+    return compactAutoBackups()
+  })
+
+  ipcMain.handle('backup:runAutoNow', async (): Promise<BackupResult> => {
+    return runAutoBackupNow()
+  })
+
+  ipcMain.handle('backup:openDataDirectory', async (): Promise<boolean> => {
+    return openDataDirectory()
+  })
+
+  ipcMain.handle('backup:openAutoBackupDirectory', async (): Promise<boolean> => {
+    return openAutoBackupDirectory()
+  })
+
+  ipcMain.handle('backup:exportDocumentList', async (): Promise<BackupResult> => {
+    try {
+      const path = await exportDocumentListCsv()
+      return { success: !!path, path }
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
+}
+
