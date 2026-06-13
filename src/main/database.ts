@@ -704,6 +704,7 @@ CREATE TABLE IF NOT EXISTS pdf_repository_index (
 const INDEX_SCHEMA_SQL = `
 CREATE INDEX IF NOT EXISTS idx_pages_doc_id ON pages(doc_id);
 CREATE INDEX IF NOT EXISTS idx_pages_doc_page_num ON pages(doc_id, page_num);
+CREATE INDEX IF NOT EXISTS idx_pages_doc_ocr_status ON pages(doc_id, ocr_status);
 CREATE INDEX IF NOT EXISTS idx_document_folders_folder_id ON document_folders(folder_id);
 CREATE INDEX IF NOT EXISTS idx_document_tags_tag_id ON document_tags(tag_id);
 CREATE INDEX IF NOT EXISTS idx_document_tags_metadata ON document_tags(doc_id, is_metadata);

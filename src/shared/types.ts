@@ -488,6 +488,7 @@ export interface DocumentListItem extends Omit<Document, 'ocr_status' | 'proof_s
   import_status: string
   metadata_status: MetadataStatus
   metadata?: string | null
+  actual_page_count?: number
   text_page_count?: number
   ocr_completed_page_count?: number
   image_page_count?: number

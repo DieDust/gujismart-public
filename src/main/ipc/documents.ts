@@ -155,6 +155,7 @@ interface DocumentFolderRelationRow {
 }
 
 interface DocumentHealthSourceRow extends Document {
+  actual_page_count?: number | null
   text_page_count?: number | null
   ocr_completed_page_count?: number | null
   image_page_count?: number | null
@@ -2349,6 +2350,7 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
     ? 'SELECT COUNT(DISTINCT d.id) as total FROM documents d'
     : `SELECT
         d.*,
+        (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id) as actual_page_count,
         ${buildDocumentTextPageCountExpression('d')} as text_page_count,
         ${buildDocumentCompletedPageCountExpression('d')} as ocr_completed_page_count,
         (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
@@ -2392,10 +2394,19 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
   }
   if (options?.ocrIncomplete) {
     conditions.push(`(
-      COALESCE(d.page_count, 0) <= 0
-      OR (
-        (SELECT COUNT(*) FROM pages p_done WHERE p_done.doc_id = d.id AND p_done.ocr_status = 'completed') < COALESCE(d.page_count, 0)
-        AND (SELECT COUNT(*) FROM pages p_text WHERE p_text.doc_id = d.id AND ${buildPageContentAvailableCondition('p_text')}) < COALESCE(d.page_count, 0)
+      NOT EXISTS (
+        SELECT 1
+        FROM pages p_any
+        WHERE p_any.doc_id = d.id
+        LIMIT 1
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM pages p_incomplete
+        WHERE p_incomplete.doc_id = d.id
+          AND COALESCE(p_incomplete.ocr_status, '') <> 'completed'
+          AND NOT (${buildPageContentAvailableCondition('p_incomplete')})
+        LIMIT 1
       )
     )`)
   } else if (options?.ocrStatus) {
@@ -2666,8 +2677,12 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
   return normalizedDocuments.map((doc) => {
     const tags = tagsByDoc.get(doc.id) || []
     const folders = foldersByDoc.get(doc.id) || []
+    const actualPageCount = Number(doc.actual_page_count || 0)
+    const storedPageCount = Number(doc.page_count || 0)
     return {
       ...doc,
+      page_count: Math.max(storedPageCount, actualPageCount),
+      actual_page_count: actualPageCount,
       tag_names: tags.map((tag) => tag.name).join('|'),
       tag_colors: tags.map((tag) => tag.color || '').join('|'),
       tag_ids: tags.map((tag) => tag.id).join('|'),
@@ -2749,7 +2764,8 @@ function addHealthIssue(
 
 function buildDocumentHealthRow(doc: DocumentHealthSourceRow): DocumentHealthRow {
   const metadata = parseDocumentMetadata(doc.metadata)
-  const pageCount = Number(doc.page_count || 0)
+  const actualPageCount = Number(doc.actual_page_count || 0)
+  const pageCount = Math.max(Number(doc.page_count || 0), actualPageCount)
   const textPageCount = Number(doc.text_page_count || 0)
   const completedPageCount = Number(doc.ocr_completed_page_count || 0)
   const imagePageCount = Number(doc.image_page_count || 0)
@@ -2820,6 +2836,7 @@ function getDocumentHealthReport(): DocumentHealthReport {
   const docs = queryAll<DocumentHealthSourceRow>(
     `SELECT
       d.*,
+      (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id) as actual_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND ${buildPageContentAvailableCondition('p')}) as text_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed') as ocr_completed_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,

@@ -286,7 +286,7 @@ function needsOcrWork(doc: DocumentItem, engine?: OcrEngine): boolean {
   if (isDocumentOcrTextComplete(doc)) return false
   if (doc.import_status === 'error' || doc.ocr_status === 'error') return true
   if (doc.ocr_status !== 'completed') return true
-  if ((engine === 'vision_model' || engine === 'hybrid') && Number(doc.page_count || 0) > Number(doc.image_page_count || 0)) return true
+  if ((engine === 'vision_model' || engine === 'hybrid') && getEffectivePageCount(doc) > Number(doc.image_page_count || 0)) return true
   return false
 }
 
@@ -295,15 +295,19 @@ function shouldShowRetryAction(doc: DocumentItem): boolean {
   if (doc.import_status === 'error' || doc.ocr_status === 'error') return true
   return doc.import_status === 'stored'
     && doc.ocr_status === 'pending'
-    && Number(doc.page_count || 0) > 0
+    && getEffectivePageCount(doc) > 0
 }
 
 function getRetryActionLabel(doc: DocumentItem): string {
   return doc.import_status === 'error' || doc.ocr_status === 'error' ? '重试处理' : '继续 OCR'
 }
 
-function isDocumentOcrTextComplete(doc: Pick<DocumentItem, 'page_count' | 'text_page_count' | 'ocr_completed_page_count'>): boolean {
-  const pageCount = Number(doc.page_count || 0)
+function getEffectivePageCount(doc: Pick<DocumentItem, 'page_count' | 'actual_page_count'>): number {
+  return Math.max(Number(doc.page_count || 0), Number(doc.actual_page_count || 0))
+}
+
+function isDocumentOcrTextComplete(doc: Pick<DocumentItem, 'page_count' | 'actual_page_count' | 'text_page_count' | 'ocr_completed_page_count'>): boolean {
+  const pageCount = getEffectivePageCount(doc)
   if (pageCount <= 0) return false
   const completedPages = Number(doc.ocr_completed_page_count || 0)
   const textPages = Number(doc.text_page_count || 0)
@@ -659,7 +663,7 @@ function hasUnknownDocumentType(doc: DocumentItem): boolean {
 }
 
 function hasZeroPages(doc: DocumentItem): boolean {
-  return Number(doc.page_count || 0) <= 0
+  return getEffectivePageCount(doc) <= 0
 }
 
 function needsTitleCleanup(doc: DocumentItem): boolean {
@@ -1553,7 +1557,7 @@ function DocumentVirtualRow({
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 8px', marginTop: 6, color: 'var(--gs-text-secondary)', fontSize: 12 }}>
               {displayAuthor ? <span>{displayAuthor}</span> : null}
               {displayDynasty ? <span>{displayDynasty}</span> : null}
-              <span>{doc.page_count} 页</span>
+              <span>{getEffectivePageCount(doc)} 页</span>
               <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0 }}>{getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).text}</Tag>
               <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0 }}>{getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).text}</Tag>
               {renderPdfAssetTag(doc)}
@@ -5924,7 +5928,7 @@ export default function LibraryView({
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 8px', marginTop: 6, color: 'var(--gs-text-secondary)', fontSize: 12 }}>
                         {displayAuthor ? <span>{displayAuthor}</span> : null}
                         {displayDynasty ? <span>{displayDynasty}</span> : null}
-                        <span>{doc.page_count} 页</span>
+                        <span>{getEffectivePageCount(doc)} 页</span>
                         <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0 }}>
                           {getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).text}
                         </Tag>
