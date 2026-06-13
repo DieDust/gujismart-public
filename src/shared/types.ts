@@ -5,6 +5,25 @@ export type ReadStatus = 'unread' | 'reading' | 'read'
 export type MetadataStatus = 'pending' | 'review' | 'confirmed' | 'auto'
 export type DocumentMetadataResult = Record<string, unknown>
 export type AppPathName = 'userData' | 'home' | 'desktop'
+export interface AppUpdateAsset {
+  name: string
+  url: string
+  size?: number
+  contentType?: string
+}
+
+export interface AppUpdateInfo {
+  currentVersion: string
+  latestVersion: string
+  hasUpdate: boolean
+  releaseUrl: string
+  releaseName?: string
+  publishedAt?: string
+  body?: string
+  assets: AppUpdateAsset[]
+  checkedAt: string
+  error?: string
+}
 export type AiLayoutMode = 'reading_layout' | (string & {})
 export type AiTaskType =
   | 'summary'

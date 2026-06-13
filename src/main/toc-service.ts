@@ -1997,16 +1997,7 @@ export function getDocumentToc(docId: string): TocItemV2[] {
     'SELECT * FROM document_toc_items WHERE doc_id = ? ORDER BY order_index ASC',
     [docId],
   )
-  if (rows.length > 0) return rows.map(fromRow)
-
-  const pages = getPages(docId)
-  if (hasTocRuleAutogenAttempt(docId) && !shouldRetryEmptyAutogenAttempt(docId, pages)) return []
-  markTocRuleAutogenAttempt(docId)
-  if (shouldSuppressTocForRegisterArchive(docId, pages)) return []
-
-  const ruleItems = buildRuleToc(docId)
-  if (isUsefulRuleToc(ruleItems)) return saveDocumentToc(docId, ruleItems, 'rule')
-  return []
+  return rows.map(fromRow)
 }
 
 export function saveDocumentToc(docId: string, items: TocItemV2[], source: TocItemSource): TocItemV2[] {
@@ -2167,7 +2158,7 @@ export async function runAiToc(docId: string): Promise<TocItemV2[]> {
   }
 
   if (lastAttempt.merged.length === 0 || lastAttempt.merged.every((item) => item.status !== 'active')) {
-    throw new Error('AI 返回了目录，但没有可绑定到页面的有效标题。请重新运行 AI 目录，或先用规则目录生成基础结构。')
+    throw new Error('AI 返回了目录，但没有可绑定到页面的有效标题。请重新运行 AI 目录，或先用生成目录建立基础结构。')
   }
   const aiSavedItems = lastAttempt.merged.map((item) => ({
     ...item,

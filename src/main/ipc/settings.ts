@@ -5,6 +5,8 @@ import { exportDocument } from '../export'
 import { checkLuaTeX, checkLuatexCn, generateTeX, compileTeX } from '../typeset'
 import { readFileSync, existsSync } from 'fs'
 import type {
+  AppUpdateAsset,
+  AppUpdateInfo,
   AppPathName,
   BackupImportResult,
   BackupResult,
@@ -48,6 +50,10 @@ import {
   rebuildMetadataTagBindings,
 } from '../metadata-tags'
 
+const PROJECT_GITHUB_REPO = 'DieDust/gujismart-public'
+const PROJECT_RELEASES_URL = `https://github.com/${PROJECT_GITHUB_REPO}/releases`
+const PROJECT_LATEST_RELEASE_API_URL = `https://api.github.com/repos/${PROJECT_GITHUB_REPO}/releases/latest`
+
 function logMetadataTagCleanup(context: string, cleanup: SettingSetResult['metadataTagCleanup']): void {
   if (!cleanup || (cleanup.removedRelations === 0 && cleanup.keptManualRelations === 0 && cleanup.removedTags === 0)) return
   console.log(
@@ -73,6 +79,100 @@ function parseMetadata(value: unknown): Record<string, unknown> {
     return isRecord(parsed) ? parsed : {}
   } catch {
     return {}
+  }
+}
+
+function getStringField(record: Record<string, unknown>, key: string): string {
+  const value = record[key]
+  return typeof value === 'string' ? value : ''
+}
+
+function getNumberField(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function parseVersionParts(value: string): [number, number, number] | null {
+  const match = String(value || '').trim().match(/^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$/i)
+  if (!match) return null
+  return [
+    Number.parseInt(match[1] || '0', 10),
+    Number.parseInt(match[2] || '0', 10),
+    Number.parseInt(match[3] || '0', 10),
+  ]
+}
+
+function compareAppVersions(left: string, right: string): number {
+  const leftParts = parseVersionParts(left)
+  const rightParts = parseVersionParts(right)
+  if (!leftParts || !rightParts) return String(left || '').localeCompare(String(right || ''), undefined, { numeric: true })
+  for (let index = 0; index < 3; index += 1) {
+    const diff = leftParts[index] - rightParts[index]
+    if (diff !== 0) return diff
+  }
+  return 0
+}
+
+function parseReleaseAssets(value: unknown): AppUpdateAsset[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter(isRecord)
+    .map((asset) => ({
+      name: getStringField(asset, 'name'),
+      url: getStringField(asset, 'browser_download_url'),
+      size: getNumberField(asset, 'size'),
+      contentType: getStringField(asset, 'content_type') || undefined,
+    }))
+    .filter((asset) => asset.name && asset.url && /\.exe$/i.test(asset.name))
+}
+
+async function checkLatestAppUpdate(): Promise<AppUpdateInfo> {
+  const currentVersion = app.getVersion()
+  const checkedAt = new Date().toISOString()
+  const fallback: AppUpdateInfo = {
+    currentVersion,
+    latestVersion: currentVersion,
+    hasUpdate: false,
+    releaseUrl: PROJECT_RELEASES_URL,
+    assets: [],
+    checkedAt,
+  }
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 12_000)
+  try {
+    const response = await fetch(PROJECT_LATEST_RELEASE_API_URL, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `GujiSmart/${currentVersion}`,
+      },
+      signal: controller.signal,
+    })
+    if (!response.ok) {
+      throw new Error(`GitHub Release 查询失败：HTTP ${response.status}`)
+    }
+    const payload: unknown = await response.json()
+    if (!isRecord(payload)) {
+      throw new Error('GitHub Release 返回内容无效')
+    }
+    const latestVersion = getStringField(payload, 'tag_name').replace(/^v/i, '') || currentVersion
+    return {
+      currentVersion,
+      latestVersion,
+      hasUpdate: compareAppVersions(latestVersion, currentVersion) > 0,
+      releaseUrl: getStringField(payload, 'html_url') || PROJECT_RELEASES_URL,
+      releaseName: getStringField(payload, 'name') || undefined,
+      publishedAt: getStringField(payload, 'published_at') || undefined,
+      body: getStringField(payload, 'body') || undefined,
+      assets: parseReleaseAssets(payload.assets),
+      checkedAt,
+    }
+  } catch (error) {
+    return {
+      ...fallback,
+      error: getResponseErrorMessage(error, '检查更新失败'),
+    }
+  } finally {
+    clearTimeout(timeout)
   }
 }
 
@@ -558,6 +658,10 @@ export function registerSettingsIpc(): void {
 export function registerAppIpc(): void {
   ipcMain.handle('app:getVersion', async (): Promise<string> => {
     return app.getVersion()
+  })
+
+  ipcMain.handle('app:checkForUpdates', async (): Promise<AppUpdateInfo> => {
+    return checkLatestAppUpdate()
   })
 
   ipcMain.handle('app:getPath', async (_event, name: AppPathName): Promise<string> => {

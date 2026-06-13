@@ -57,8 +57,9 @@ type ReaderSearchMatch = {
   globalIndex?: number
   sessionIndex?: number
 }
-type PendingSearchTarget = { anchorId: string; active?: boolean; text?: string; hitIndex?: number }
+type PendingSearchTarget = { anchorId: string; active?: boolean; text?: string; hitIndex?: number; token?: number }
 type SearchDirectoryItem = { index: number; key: string; pageLabel: string; snippet: string; active: boolean; session: boolean }
+type PageLocatorIndex = { byId: Map<string, number>; byNum: Map<number, number> }
 type ReaderNoteItem = Pick<ResearchNote, 'id' | 'doc_id' | 'page_num' | 'excerpt' | 'note' | 'kind' | 'color' | 'locator_json' | 'source_id' | 'created_at' | 'updated_at'>
 type ReaderNoteHighlight = {
   noteId: string
@@ -116,6 +117,7 @@ type ReaderElementGroup = {
   activeHit: number | null
   activeGlobalHitIndex?: number | null
   globalSearchStartIndex?: number | null
+  globalSearchHitIndexes?: number[] | null
 }
 type ReaderPageMetrics = {
   pageWidth: number
@@ -1311,15 +1313,23 @@ function locateNthSearchMatchInPage(page: ReaderSourcePage, pageIndex: number, k
 function locateSearchMatchByLocator(page: ReaderSourcePage, pageIndex: number, locator: SearchHitLocator, fallbackKeyword: string): ReaderSearchMatch {
   const keyword = locator.matchText || locator.queryTerm || fallbackKeyword
   const elements = getPageElements(page)
-  const elementIndex = Number.isFinite(Number(locator.segmentOrdinal))
-    ? Number(locator.segmentOrdinal)
-    : getElementIndexFromSearchHitSegment(locator.segmentId)
+  const locatorCharStart = Number(locator.charStart || 0)
+  const segmentOrdinal = Number(locator.segmentOrdinal)
+  const segmentOrdinalIndex = Number.isFinite(segmentOrdinal) && segmentOrdinal >= 0 ? Math.floor(segmentOrdinal) : -1
+  const segmentIdIndex = getElementIndexFromSearchHitSegment(locator.segmentId)
+  const elementIndex = [segmentOrdinalIndex, segmentIdIndex]
+    .find((candidate) => {
+      const element = elements[candidate]
+      return !!element
+        && locatorCharStart >= Number(element.charStart || 0)
+        && locatorCharStart <= Number(element.charEnd || 0)
+    }) ?? -1
   const element = elements[elementIndex]
   if (element && keyword) {
     const offsets = findSearchOccurrences(getElementSearchText(element), keyword)
     if (offsets.length > 0) {
       const occurrenceIndex = Math.max(0, Math.min(offsets.length - 1, Number(locator.occurrenceIndex || 0)))
-      const localCharStart = Math.max(0, Number(locator.charStart || 0) - Number(element.charStart || 0))
+      const localCharStart = Math.max(0, locatorCharStart - Number(element.charStart || 0))
       const nearestOffset = offsets
         .map((offset, index) => ({ offset, index, distance: Math.abs(offset - localCharStart) }))
         .sort((left, right) => left.distance - right.distance)[0]
@@ -1334,7 +1344,10 @@ function locateSearchMatchByLocator(page: ReaderSourcePage, pageIndex: number, l
       }
     }
   }
-  return locateSearchMatchInPage(page, pageIndex, keyword, locator.charStart || 0)
+  if (Number.isFinite(Number(locator.occurrenceIndex))) {
+    return locateNthSearchMatchInPage(page, pageIndex, keyword, Number(locator.occurrenceIndex), locatorCharStart)
+  }
+  return locateSearchMatchInPage(page, pageIndex, keyword, locatorCharStart)
 }
 
 function findPageIndexForLocator(sortedPages: ReaderSourcePage[], locator: SearchHitLocator | null | undefined): number {
@@ -1343,8 +1356,42 @@ function findPageIndexForLocator(sortedPages: ReaderSourcePage[], locator: Searc
     const byId = sortedPages.findIndex((page) => page.id === locator.pageId)
     if (byId >= 0) return byId
   }
-  if (Number.isFinite(Number(locator.pageIndex))) return Number(locator.pageIndex)
-  return findPageIndexByNum(sortedPages, locator.pageNum)
+  const byPageNum = findPageIndexByNum(sortedPages, locator.pageNum)
+  if (byPageNum >= 0) return byPageNum
+  const locatorPageIndex = locator.pageIndex
+  if (locatorPageIndex !== null && locatorPageIndex !== undefined && Number.isFinite(Number(locatorPageIndex))) {
+    return Number(locatorPageIndex)
+  }
+  return -1
+}
+
+function buildPageLocatorIndex(pages: ReaderSourcePage[]): PageLocatorIndex {
+  const byId = new Map<string, number>()
+  const byNum = new Map<number, number>()
+  pages.forEach((page, index) => {
+    if (page?.id && !byId.has(page.id)) byId.set(page.id, index)
+    const pageNum = Number(page?.page_num || 0)
+    if (Number.isFinite(pageNum) && pageNum > 0 && !byNum.has(pageNum)) byNum.set(pageNum, index)
+  })
+  return { byId, byNum }
+}
+
+function findPageIndexForLocatorFast(locatorIndex: PageLocatorIndex, locator: SearchHitLocator | null | undefined): number {
+  if (!locator) return -1
+  if (locator.pageId) {
+    const byId = locatorIndex.byId.get(locator.pageId)
+    if (byId !== undefined) return byId
+  }
+  const pageNum = Number(locator.pageNum)
+  if (Number.isFinite(pageNum)) {
+    const byNum = locatorIndex.byNum.get(pageNum)
+    if (byNum !== undefined) return byNum
+  }
+  const locatorPageIndex = locator.pageIndex
+  if (locatorPageIndex !== null && locatorPageIndex !== undefined && Number.isFinite(Number(locatorPageIndex))) {
+    return Number(locatorPageIndex)
+  }
+  return -1
 }
 
 function getReaderCitationPageNum(page: ReaderSourcePage | null | undefined, fallback?: number | null): number | null {
@@ -1651,7 +1698,7 @@ function highlightPlainText(
   text: string,
   keyword: string,
   activeOccurrenceIndex?: number | null,
-  globalHitStartIndex?: number | null,
+  globalHitStartIndex?: number | number[] | null,
   activeGlobalHitIndex?: number | null,
   displayScript: ReaderDisplayScript = 'original',
   highlightColor = DEFAULT_HIGHLIGHT_COLOR,
@@ -1672,8 +1719,13 @@ function highlightPlainText(
     const originalStart = sourceMap.offsets[index] ?? index
     const originalEnd = (sourceMap.offsets[index + normalizedQuery.length - 1] ?? originalStart) + 1
     if (originalStart > sourceCursor) parts.push(...renderInlineAnnotations(source.slice(sourceCursor, originalStart), `plain-${sourceCursor}`))
-    const hasGlobalHitIndex = Number.isFinite(Number(globalHitStartIndex)) && Number.isFinite(Number(activeGlobalHitIndex))
-    const globalHitIndex = Number.isFinite(Number(globalHitStartIndex)) ? Number(globalHitStartIndex) + occurrence : undefined
+    const explicitGlobalHitIndexes = Array.isArray(globalHitStartIndex) ? globalHitStartIndex : null
+    const globalHitIndex = explicitGlobalHitIndexes
+      ? explicitGlobalHitIndexes[occurrence]
+      : Number.isFinite(Number(globalHitStartIndex))
+        ? Number(globalHitStartIndex) + occurrence
+        : undefined
+    const hasGlobalHitIndex = Number.isFinite(Number(globalHitIndex)) && Number.isFinite(Number(activeGlobalHitIndex))
     const active = hasGlobalHitIndex
       ? activeGlobalHitIndex === globalHitIndex
       : activeOccurrenceIndex === occurrence
@@ -1686,9 +1738,11 @@ function highlightPlainText(
       continue
     }
     const markColor = normalizeHighlightColor(highlightColor)
-    const activeColor = markColor
-    const inactiveColor = hexToRgba(markColor, 0.72)
-    const borderColor = hexToRgba(markColor, active ? 0.7 : 0.34)
+    const activeColor = markColor.toLowerCase() === DEFAULT_HIGHLIGHT_COLOR
+      ? '#ffb020'
+      : markColor
+    const inactiveColor = hexToRgba(markColor, 0.56)
+    const borderColor = active ? 'rgba(120, 53, 15, 0.92)' : hexToRgba(markColor, 0.28)
     parts.push(
       <mark
         key={`${originalStart}-${parts.length}`}
@@ -1703,11 +1757,13 @@ function highlightPlainText(
           borderRadius: 3,
           fontWeight: active ? 700 : 600,
           position: 'relative',
-          zIndex: active ? 2 : 0,
+          zIndex: active ? 3 : 0,
           border: `1px solid ${borderColor}`,
+          outline: active ? '2px solid rgba(255, 255, 255, 0.88)' : 'none',
+          outlineOffset: 0,
           boxShadow: active
-            ? `0 0 0 1px ${hexToRgba(markColor, 0.22)}`
-            : `0 0 0 1px ${hexToRgba(markColor, 0.12)}`,
+            ? `0 0 0 3px rgba(120, 53, 15, 0.82), 0 0 0 6px ${hexToRgba(activeColor, 0.26)}`
+            : `0 0 0 1px ${hexToRgba(markColor, 0.08)}`,
           textDecoration: 'none',
         }}
       >
@@ -1941,6 +1997,9 @@ function renderReaderElementGroup(
                   const cellHits = findSearchOccurrences(cell, searchKeyword).length
                   const activeCellHit = activeHit !== null && activeHit >= tableOccurrenceCursor && activeHit < tableOccurrenceCursor + cellHits ? activeHit - tableOccurrenceCursor : null
                   const cellGlobalStartIndex = Number.isFinite(Number(group.globalSearchStartIndex)) ? Number(group.globalSearchStartIndex) + tableOccurrenceCursor : null
+                  const cellGlobalHitIndexes = Array.isArray(group.globalSearchHitIndexes)
+                    ? group.globalSearchHitIndexes.slice(tableOccurrenceCursor, tableOccurrenceCursor + cellHits)
+                    : cellGlobalStartIndex
                   tableOccurrenceCursor += cellHits
                   const cellStart = tableTextCursor
                   const cellEnd = cellStart + String(cell || '').length
@@ -1957,7 +2016,7 @@ function renderReaderElementGroup(
                   return (
                     <td key={cellIndex} style={{ border: `1px solid ${themeStyle.border}`, padding: '5px 7px', verticalAlign: 'top', whiteSpace: 'pre-wrap', overflowWrap: 'break-word', minWidth: columnCount >= 5 ? 82 : 96, fontWeight: rowIndex === 0 ? 700 : undefined }}>
                       {searchKeyword.trim()
-                        ? highlightPlainText(cell, searchKeyword, activeCellHit, cellGlobalStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
+                        ? highlightPlainText(cell, searchKeyword, activeCellHit, cellGlobalHitIndexes, group.activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
                         : renderReaderNoteHighlightedText(cell, cellNoteHighlights, displayScript, `reader-table-${anchorId}-${rowIndex}-${cellIndex}`)}
                     </td>
                   )
@@ -1973,7 +2032,7 @@ function renderReaderElementGroup(
     if (searchActiveOnly && searchKeyword.trim()) {
       return (
         <div id={anchorId} key={anchorId} data-source-anchor="true" data-reader-page-index={pageIndex} data-reader-element-index={group.index} onMouseUp={(event) => pageIndex != null && onReaderSelection?.(pageIndex, group.index, event)} style={{ margin: '0.15em 0 1.2em', textAlign: 'left', whiteSpace: 'pre-wrap' }}>
-          {highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, true)}
+          {highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchHitIndexes ?? group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, true)}
         </div>
       )
     }
@@ -1987,17 +2046,25 @@ function renderReaderElementGroup(
     const entries = element.tocEntries?.length
       ? element.tocEntries
       : element.text.split(/\n+/).map((line) => ({ title: line.trim(), pageLabel: '', level: 1, rawText: line.trim() })).filter((entry) => entry.title)
+    let tocOccurrenceCursor = 0
     return (
       <div id={anchorId} key={anchorId} data-source-anchor="true" data-reader-page-index={pageIndex} data-reader-element-index={group.index} onMouseUp={(event) => pageIndex != null && onReaderSelection?.(pageIndex, group.index, event)} style={{ margin: '0.15em 0 1.2em', textAlign: 'left' }}>
         {entries.map((entry, entryIndex) => {
           const level = Math.max(1, Math.min(4, Number(entry.level || 1)))
           const title = transformReaderDisplayText(entry.title, displayScript)
           const pageLabel = transformReaderDisplayText(entry.pageLabel, displayScript)
+          const titleHitCount = searchKeyword.trim() ? findSearchOccurrences(entry.title, searchKeyword).length : 0
+          const titleGlobalHitIndexes = Array.isArray(group.globalSearchHitIndexes)
+            ? group.globalSearchHitIndexes.slice(tocOccurrenceCursor, tocOccurrenceCursor + titleHitCount)
+            : Number.isFinite(Number(group.globalSearchStartIndex))
+              ? Number(group.globalSearchStartIndex) + tocOccurrenceCursor
+              : null
+          tocOccurrenceCursor += titleHitCount
           return (
             <div key={`${entry.title}-${entry.pageLabel}-${entryIndex}`} style={{ display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0, paddingLeft: (level - 1) * 22, margin: level === 1 ? '0.55em 0 0.28em' : '0.2em 0', fontWeight: level === 1 ? 700 : 500, lineHeight: 1.65 }}>
               <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
                 {searchKeyword.trim()
-                  ? highlightPlainText(entry.title, searchKeyword, null, null, group.activeGlobalHitIndex, displayScript, highlightColor)
+                  ? highlightPlainText(entry.title, searchKeyword, null, titleGlobalHitIndexes, group.activeGlobalHitIndex, displayScript, highlightColor)
                   : renderInlineAnnotations(title, `reader-toc-${anchorId}-${entryIndex}`, 'original')}
               </span>
               <span aria-hidden="true" style={{ flex: 1, minWidth: 18, borderBottom: `1px dotted ${theme === 'dark' ? 'rgba(232,226,216,0.45)' : 'rgba(80,57,34,0.42)'}`, transform: 'translateY(-0.18em)' }} />
@@ -2016,7 +2083,7 @@ function renderReaderElementGroup(
       {pendingTocTarget?.anchorId === anchorId
         ? renderTocAnchoredText(displayText, pendingTocTarget, displayScript)
         : searchKeyword.trim()
-          ? highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
+          ? highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchHitIndexes ?? group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
           : noteHighlights.length
             ? renderReaderNoteHighlightedText(element.text, noteHighlights, displayScript, `reader-note-${anchorId}`)
             : renderInlineAnnotations(displayText, `reader-${anchorId}`, displayScript)}
@@ -2038,14 +2105,14 @@ function renderFootnoteGroup(
   if (footnoteElementGroups.length === 0) return null
   return (
     <section aria-label="footnotes" style={{ marginTop: '2.2em', paddingTop: '0.72em', borderTop: `1px solid ${theme === 'dark' ? 'rgba(216,211,200,0.32)' : 'rgba(94,68,42,0.34)'}`, color: theme === 'dark' ? 'rgba(216,211,200,0.78)' : 'rgba(72,51,31,0.78)', fontSize: '0.78em', lineHeight: 1.55, textAlign: 'left' }}>
-      {footnoteElementGroups.map(({ element, index, anchorId, activeHit, globalSearchStartIndex, activeGlobalHitIndex }) => {
+      {footnoteElementGroups.map(({ element, index, anchorId, activeHit, globalSearchStartIndex, globalSearchHitIndexes, activeGlobalHitIndex }) => {
         const noteHighlights = pageIndex == null || searchKeyword.trim() ? [] : noteHighlightsByElement.get(`${pageIndex}:${index}`) || []
         return (
           <p id={anchorId} key={anchorId} data-source-anchor="true" data-reader-page-index={pageIndex} data-reader-element-index={index} style={{ margin: '0 0 0.45em', paddingLeft: '1.4em', textIndent: '-1.4em', overflowWrap: 'break-word' }}>
             {pendingTocTarget?.anchorId === anchorId
               ? renderTocAnchoredText(element.text, pendingTocTarget, displayScript)
               : searchKeyword.trim()
-                ? highlightPlainText(element.text, searchKeyword, activeHit, globalSearchStartIndex, activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
+                ? highlightPlainText(element.text, searchKeyword, activeHit, globalSearchHitIndexes ?? globalSearchStartIndex, activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
                 : noteHighlights.length
                   ? renderReaderNoteHighlightedText(element.text, noteHighlights, displayScript, `reader-footnote-note-${anchorId}`)
                   : renderInlineAnnotations(element.text, `reader-footnote-${anchorId}`, displayScript)}
@@ -2131,17 +2198,31 @@ function SourcePageSpread({
           const aiText = aiLayoutEnabled && pageId ? String(aiLayoutByPageId?.[pageId] || '').trim() : ''
           const elements = getDisplayPageElements(page, aiText)
           const elementGroups: ReaderElementGroup[] = elements.map((element, index) => {
-            const activeElementByChar = activeSearchHit?.pageIndex === pageIndex && activeSearchHit.charIndex >= element.charStart && activeSearchHit.charIndex <= element.charEnd
+            const activeHitElementIndex = Number(activeSearchHit?.elementIndex)
+            const hasActiveHitElementIndex = Number.isFinite(activeHitElementIndex) && activeHitElementIndex >= 0
+            const activeElementByChar = !hasActiveHitElementIndex
+              && activeSearchHit?.pageIndex === pageIndex
+              && activeSearchHit.charIndex >= element.charStart
+              && activeSearchHit.charIndex <= element.charEnd
             const activeElementByIndex = activeSearchHit?.pageIndex === pageIndex && activeSearchHit.elementIndex === index
             const elementMatches = searchMatchesByElement.get(`${pageIndex}:${index}`) || []
-            const firstElementMatch = elementMatches.find((match) => Number.isFinite(Number(match.globalIndex)))
-            const globalSearchStartIndex = firstElementMatch
-              ? Number(firstElementMatch.globalIndex) - firstElementMatch.occurrenceIndex
+            const orderedElementMatches = elementMatches
+              .slice()
+              .sort((left, right) => left.occurrenceIndex - right.occurrenceIndex || left.charIndex - right.charIndex || Number(left.globalIndex ?? 0) - Number(right.globalIndex ?? 0))
+            const globalMatchIndexes = orderedElementMatches
+              .map((match) => Number(match.globalIndex))
+              .filter((value) => Number.isFinite(value))
+            const globalSearchStartIndex = globalMatchIndexes.length
+              ? Math.min(...globalMatchIndexes)
               : null
             const activeGlobalIndex = Number.isFinite(Number(activeSearchHit?.globalIndex)) ? Number(activeSearchHit?.globalIndex) : null
             const activeByGlobalIndex = activeGlobalIndex !== null
-            const activeOccurrenceIndex = activeByGlobalIndex && globalSearchStartIndex !== null && activeGlobalIndex !== null
-              ? activeGlobalIndex - globalSearchStartIndex
+            const activeOccurrenceByGlobalIndex = activeGlobalIndex !== null
+              ? orderedElementMatches
+                .findIndex((match) => Number(match.globalIndex) === activeGlobalIndex)
+              : -1
+            const activeOccurrenceIndex = activeByGlobalIndex
+              ? activeOccurrenceByGlobalIndex >= 0 ? activeOccurrenceByGlobalIndex : null
               : activeElementByChar || activeElementByIndex
                 ? activeSearchHit?.occurrenceIndex ?? 0
                 : null
@@ -2152,6 +2233,7 @@ function SourcePageSpread({
               activeHit: activeOccurrenceIndex,
               activeGlobalHitIndex: activeGlobalIndex,
               globalSearchStartIndex,
+              globalSearchHitIndexes: globalMatchIndexes.length ? globalMatchIndexes : null,
             }
           })
           const bodyElementGroups = elementGroups.filter((item) => !isFootnoteElement(item.element))
@@ -2287,11 +2369,18 @@ export default function SourcePageReader({
   const pageInputRef = useRef<InputRef | null>(null)
   const pendingAnchorRef = useRef<string | null>(null)
   const pendingSearchTargetRef = useRef<PendingSearchTarget | null>(null)
+  const searchNavigationTokenRef = useRef(0)
+  const localSearchCursorRef = useRef(-1)
+  const sessionSearchCursorRef = useRef(-1)
+  const appliedIndexedSearchKeyRef = useRef('')
   const activeTocJumpKeyRef = useRef('')
   const tocJumpSuppressUntilRef = useRef(0)
   const aiLayoutInFlightRef = useRef<Set<string>>(new Set())
   const aiLayoutGenerationRef = useRef(0)
   const handledBookTranslationRequestRef = useRef(0)
+  const indexedSearchRequestRef = useRef(0)
+  const emittedLocalSearchKeywordRef = useRef('')
+  const localSearchEditedRef = useRef(false)
   const [readerViewportHeight, setReaderViewportHeight] = useState(720)
   const [readerViewportWidth, setReaderViewportWidth] = useState(1100)
   const readerPageMetrics = useMemo(
@@ -2307,6 +2396,8 @@ export default function SourcePageReader({
   )
   const pageCount = sortedPages.length
   const safeIndex = Math.max(0, Math.min(pageCount - 1, currentPageIndex || 0))
+  const sortedPagesRef = useRef<ReaderSourcePage[]>([])
+  const safeIndexRef = useRef(0)
   const activePage = sortedPages[safeIndex]
   const activeText = getPageText(activePage)
   const visiblePageIndices = useMemo(() => {
@@ -2317,6 +2408,11 @@ export default function SourcePageReader({
   }, [pageCount, safeIndex, viewMode])
   const visiblePageKey = visiblePageIndices.join('|')
   const visiblePages = useMemo(() => visiblePageIndices.map((index) => sortedPages[index]), [sortedPages, visiblePageIndices])
+  const pageLocatorIndex = useMemo(() => buildPageLocatorIndex(sortedPages), [sortedPages])
+  useEffect(() => {
+    sortedPagesRef.current = sortedPages
+    safeIndexRef.current = safeIndex
+  }, [safeIndex, sortedPages])
   const translationPageIndex = safeIndex
   const translationPage = sortedPages[translationPageIndex] || activePage
   const translationPageId = translationPage?.id
@@ -2355,15 +2451,17 @@ export default function SourcePageReader({
     shouldHideUnresolvedToc ? toc.filter((item) => item.status !== 'unresolved') : toc
   ), [shouldHideUnresolvedToc, toc])
   const hiddenUnresolvedTocCount = toc.length - visibleToc.length
-  const tocBusy = tocLoading || ruleTocLoading || aiTocLoading || tocResolveState.running
+  const tocBusy = ruleTocLoading || aiTocLoading || tocResolveState.running
   const tocBusyTitle = aiTocLoading
     ? '正在整理目录'
-    : ruleTocLoading || tocLoading
-      ? '正在创建目录'
-      : '正在匹配目录'
+    : ruleTocLoading
+      ? '正在生成目录'
+      : tocLoading
+        ? '正在读取目录'
+        : '正在匹配目录'
   const tocBusyHint = tocResolveState.running
     ? `正在精准匹配目录锚点 ${tocResolveState.resolved}/${tocResolveState.total}`
-    : '正在读取或生成目录，长文献可能会短暂卡顿。'
+    : '正在读取目录或执行手动生成，长文献可能会短暂卡顿。'
   const effectiveHighlightColor = normalizeHighlightColor(readerHighlightColor || highlightColor)
   const readerNoteHighlightsByElement = useMemo(
     () => buildReaderNoteHighlightsByElement(readerNotes, sortedPages),
@@ -2381,13 +2479,79 @@ export default function SourcePageReader({
   }, [safeIndex, sortedPages, viewMode])
 
   useEffect(() => {
-    setLocalSearchInput(searchKeyword || '')
+    localSearchEditedRef.current = localSearchEdited
+  }, [localSearchEdited])
+
+  useEffect(() => {
+    const nextSearchKeyword = searchKeyword || ''
+    const isLocalSearchEcho = localSearchEditedRef.current && emittedLocalSearchKeywordRef.current === nextSearchKeyword
+    setLocalSearchInput(nextSearchKeyword)
+    if (isLocalSearchEcho) {
+      if (nextSearchKeyword.trim()) setDismissedSearchSessionKey('')
+      return
+    }
     setSearchCursor(-1)
     setSessionSearchCursor(-1)
+    localSearchCursorRef.current = -1
+    sessionSearchCursorRef.current = -1
     setLocalSearchEdited(false)
+    localSearchEditedRef.current = false
+    emittedLocalSearchKeywordRef.current = ''
     setLocalSearchSession(null)
+    indexedSearchRequestRef.current += 1
     if (searchKeyword.trim()) setDismissedSearchSessionKey('')
   }, [searchKeyword])
+
+  useEffect(() => {
+    const query = localSearchInput.trim()
+    const docId = document?.id
+    if (!localSearchEdited || !docId || !query) return
+    const requestId = ++indexedSearchRequestRef.current
+    setLocalSearchSession((previous) => {
+      if (previous?.query === query && previous.status === 'searching') return previous
+      return { query, hits: [], activeHitIndex: -1, status: 'searching' }
+    })
+    const timer = window.setTimeout(() => {
+      window.api.getDocumentSearchHits(docId, query, { limit: 20000, resultMode: 'all' })
+        .then((session) => {
+          if (indexedSearchRequestRef.current !== requestId) return
+          const hits = Array.isArray(session?.hits) ? session.hits : []
+          const latestPages = sortedPagesRef.current
+          const latestLocatorIndex = buildPageLocatorIndex(latestPages)
+          const latestSafeIndex = safeIndexRef.current
+          const currentPageIndex = hits.findIndex((hit) => findPageIndexForLocatorFast(latestLocatorIndex, hit.locator) === latestSafeIndex)
+          const activeHitIndex = currentPageIndex >= 0
+            ? currentPageIndex
+            : Number(session?.activeHitIndex) >= 0
+              ? Math.min(hits.length - 1, Number(session.activeHitIndex))
+              : hits.length > 0
+                ? 0
+                : -1
+          localSearchCursorRef.current = -1
+          sessionSearchCursorRef.current = activeHitIndex
+          setSearchCursor(-1)
+          setSessionSearchCursor(activeHitIndex)
+          setLocalSearchSession({
+            query,
+            hits,
+            activeHitIndex,
+            status: session?.status === 'error' ? 'error' : 'ready',
+          })
+        })
+        .catch((error: unknown) => {
+          if (indexedSearchRequestRef.current !== requestId) return
+          console.error('Failed to load source reader search hits', error)
+          localSearchCursorRef.current = -1
+          sessionSearchCursorRef.current = -1
+          setSearchCursor(-1)
+          setSessionSearchCursor(-1)
+          setLocalSearchSession({ query, hits: [], activeHitIndex: -1, status: 'error' })
+        })
+    }, 180)
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [document?.id, localSearchEdited, localSearchInput])
 
   useEffect(() => {
     if (localSearchInput.trim()) {
@@ -2550,48 +2714,15 @@ export default function SourcePageReader({
     const directMap = buildDirectTocPageIndexMap(sortedPages, toc)
     const unresolved = toc.filter((item) => (directMap.get(getTocItemKey(item)) ?? -1) < 0 && item.status !== 'disabled')
     setTocPageIndexMap(directMap)
-    const shouldAutoScanAnchors = sortedPages.length <= TOC_AUTO_ANCHOR_SCAN_MAX_PAGES
     setTocResolveState({
       resolved: 0,
-      total: shouldAutoScanAnchors ? unresolved.length : 0,
-      running: shouldAutoScanAnchors && unresolved.length > 0,
+      total: 0,
+      running: false,
       unresolved: unresolved.length,
     })
 
-    if (!unresolved.length || !shouldAutoScanAnchors) return () => {
-      cancelled = true
-    }
-
-    const pageTextCache = new Map<number, TocPageScan>()
-    const workingMap = new Map(directMap)
-    let cursor = 0
-    let resolved = 0
-    let unresolvedCount = unresolved.length
-    let timer: number | null = null
-
-    const runBatch = () => {
-      if (cancelled) return
-      const startedAt = performance.now()
-      while (cursor < unresolved.length && performance.now() - startedAt < 24) {
-        const item = unresolved[cursor]
-        const itemKey = getTocItemKey(item)
-        const pageIndex = resolveTocItemByFullScan(sortedPages, item, pageTextCache)
-        workingMap.set(itemKey, pageIndex)
-        if (pageIndex >= 0) unresolvedCount -= 1
-        cursor += 1
-        resolved += 1
-      }
-      setTocPageIndexMap(new Map(workingMap))
-      setTocResolveState({ resolved, total: unresolved.length, running: cursor < unresolved.length, unresolved: unresolvedCount })
-      if (cursor < unresolved.length) {
-        timer = window.setTimeout(runBatch, 40)
-      }
-    }
-
-    timer = window.setTimeout(runBatch, 80)
     return () => {
       cancelled = true
-      if (timer !== null) window.clearTimeout(timer)
     }
   }, [sortedPages, toc, tocPageIndexVersion])
 
@@ -2729,6 +2860,10 @@ export default function SourcePageReader({
     }
   }, [aiLayoutByPageId, aiLayoutCandidatePages, aiLayoutEnabled, aiLayoutErrors, document?.id])
 
+  const effectiveSessionHits = effectiveSearchSession?.hits || []
+  const hasIncomingLocatorSession = !localSearchEdited && effectiveSessionHits.length > 0
+  const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === localSearchInput.trim() && effectiveSessionHits.length > 0
+  const hasFullLocalSearchPages = !isEbook && Array.isArray(searchPages) && searchPages.length >= sortedPages.length
   const searchSourcePages = useMemo(() => {
     if (!isEbook && Array.isArray(searchPages) && searchPages.length >= sortedPages.length) {
       return [...searchPages].sort((left, right) => Number(left?.page_num || 0) - Number(right?.page_num || 0))
@@ -2739,16 +2874,35 @@ export default function SourcePageReader({
   const allSearchMatches = useMemo(() => {
     const keyword = localSearchInput.trim()
     if (!keyword) return []
+    if (localSearchEdited || hasMatchingSearchSession || !hasFullLocalSearchPages) return []
     return readerSearchHitsToMatches(searchSourcePages, keyword, document?.id)
-  }, [document?.id, localSearchInput, searchSourcePages])
+  }, [document?.id, hasFullLocalSearchPages, hasMatchingSearchSession, localSearchEdited, localSearchInput, searchSourcePages])
 
-  const effectiveSessionHits = effectiveSearchSession?.hits || []
-  const hasIncomingLocatorSession = !localSearchEdited && effectiveSessionHits.length > 0
   const hasReaderNavigation = allSearchMatches.length > 0 && !hasIncomingLocatorSession
-  const hasSessionNavigation = hasIncomingLocatorSession
+  const hasSessionNavigation = hasMatchingSearchSession
+  const sessionHitIndexesByPage = useMemo(() => {
+    const map = new Map<number, number[]>()
+    if (!hasSessionNavigation) return map
+    effectiveSessionHits.forEach((hit, index) => {
+      const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
+      if (pageIndex < 0) return
+      const list = map.get(pageIndex)
+      if (list) list.push(index)
+      else map.set(pageIndex, [index])
+    })
+    return map
+  }, [effectiveSessionHits, hasSessionNavigation, pageLocatorIndex])
+  const searchIndexLoading = Boolean(localSearchInput.trim())
+    && effectiveSearchSession?.query?.trim() === localSearchInput.trim()
+    && effectiveSearchSession.status === 'searching'
+  const currentPageSessionHitIndex = hasSessionNavigation
+    ? sessionHitIndexesByPage.get(safeIndex)?.[0] ?? -1
+    : -1
   const effectiveSessionHitIndex = hasSessionNavigation
     ? sessionSearchCursor >= 0 && sessionSearchCursor < effectiveSessionHits.length
       ? sessionSearchCursor
+      : currentPageSessionHitIndex >= 0
+        ? currentPageSessionHitIndex
       : effectiveSearchSession && effectiveSearchSession.activeHitIndex >= 0
         ? Math.min(effectiveSessionHits.length - 1, effectiveSearchSession.activeHitIndex)
         : 0
@@ -2758,23 +2912,59 @@ export default function SourcePageReader({
     if (!effectiveSearchSession?.hits?.length || effectiveSessionHitIndex < 0) return null
     const hit = effectiveSearchSession.hits[effectiveSessionHitIndex]
     if (!hit?.locator) return null
-    const pageIndex = findPageIndexForLocator(sortedPages, hit.locator)
+    const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
     if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
     const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || localSearchInput)
     return { ...match, globalIndex: effectiveSessionHitIndex, sessionIndex: effectiveSessionHitIndex }
   }, [effectiveSearchSession, effectiveSessionHitIndex, localSearchInput, sortedPages])
+  const sessionLocalSearchIndex = useMemo(() => {
+    if (!sessionActiveHit || !allSearchMatches.length) return -1
+    return allSearchMatches
+      .map((hit, index) => ({
+        index,
+        distance: hit.pageIndex === sessionActiveHit.pageIndex
+          ? Math.abs(Number(hit.charIndex || 0) - Number(sessionActiveHit.charIndex || 0))
+          : Number.MAX_SAFE_INTEGER,
+      }))
+      .filter((item) => item.distance < Number.MAX_SAFE_INTEGER)
+      .sort((left, right) => left.distance - right.distance || left.index - right.index)[0]?.index ?? -1
+  }, [allSearchMatches, sessionActiveHit])
 
   const searchMatches = useMemo(() => {
-    if (hasSessionNavigation && sessionActiveHit) return [sessionActiveHit]
-    if (!allSearchMatches.length) return []
     const pageIndices = new Set<number>([
       ...visiblePageIndices,
       Math.max(0, safeIndex - 1),
       safeIndex,
       Math.min(pageCount - 1, safeIndex + 1),
     ])
-    return allSearchMatches.filter((match) => pageIndices.has(match.pageIndex))
-  }, [allSearchMatches, hasSessionNavigation, pageCount, safeIndex, sessionActiveHit, visiblePageIndices])
+    const visibleLocalMatches = allSearchMatches.filter((match) => pageIndices.has(match.pageIndex))
+    if (hasSessionNavigation) {
+      const sessionIndexes = Array.from(pageIndices)
+        .flatMap((pageIndex) => sessionHitIndexesByPage.get(pageIndex) || [])
+      if (effectiveSessionHitIndex >= 0 && !sessionIndexes.includes(effectiveSessionHitIndex)) {
+        sessionIndexes.push(effectiveSessionHitIndex)
+      }
+      const visibleSessionMatches = sessionIndexes
+        .map((index) => {
+          const hit = effectiveSessionHits[index]
+          if (!hit?.locator) return null
+          const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
+          if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
+          const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || localSearchInput)
+          return { ...match, globalIndex: index, sessionIndex: index }
+        })
+        .filter(Boolean) as ReaderSearchMatch[]
+      if (!sessionActiveHit) return visibleSessionMatches
+      const hasActive = visibleSessionMatches.some((match) => (
+        match.pageIndex === sessionActiveHit.pageIndex
+        && match.elementIndex === sessionActiveHit.elementIndex
+        && Math.abs(Number(match.charIndex || 0) - Number(sessionActiveHit.charIndex || 0)) <= 2
+      ))
+      return hasActive ? visibleSessionMatches : [...visibleSessionMatches, sessionActiveHit]
+    }
+    if (!allSearchMatches.length) return []
+    return visibleLocalMatches
+  }, [allSearchMatches, effectiveSessionHitIndex, effectiveSessionHits, hasSessionNavigation, localSearchInput, pageCount, pageLocatorIndex, safeIndex, sessionActiveHit, sessionHitIndexesByPage, sortedPages, visiblePageIndices])
 
   const hasMatchingSessionCursor = effectiveSearchSession?.query?.trim() === localSearchInput.trim()
   const shouldAnchorSearchAtFirstHit = !!localSearchInput.trim() && !hasSessionNavigation && allSearchMatches.length > 0 && searchCursor < 0
@@ -2782,7 +2972,9 @@ export default function SourcePageReader({
   const sessionCursorLocalIndex = hasMatchingSessionCursor && !hasSessionNavigation && sessionSearchCursor >= 0
     ? searchMatches.findIndex((hit) => hit.sessionIndex === sessionSearchCursor)
     : -1
-  const activeSearchHit = hasSessionNavigation
+  const activeSearchHit = hasIncomingLocatorSession && sessionLocalSearchIndex >= 0
+    ? allSearchMatches[sessionLocalSearchIndex]
+    : hasSessionNavigation
     ? sessionActiveHit
     : (searchCursor >= 0 ? allSearchMatches[searchCursor] : shouldAnchorSearchAtFirstHit ? allSearchMatches[0] || null : sessionCursorLocalIndex >= 0 ? searchMatches[sessionCursorLocalIndex] : activeLocalHitIndex >= 0 ? searchMatches[activeLocalHitIndex] : allSearchMatches[0] || null)
   const renderedActiveSearchHit = Number.isFinite(Number(activeSearchHit?.globalIndex))
@@ -2801,10 +2993,35 @@ export default function SourcePageReader({
           ? Number(activeSearchHit?.globalIndex)
           : -1
       : -1
-  const searchDirectoryItems = useMemo<SearchDirectoryItem[]>(() => {
-    if (!localSearchInput.trim()) return []
+  const searchCounterText = searchIndexLoading
+    ? '检索中'
+    : totalSearchHitCount
+      ? `${Math.max(0, visibleSearchHitIndex) + 1}/${totalSearchHitCount}`
+      : '0/0'
+  const canNavigateSearchHits = totalSearchHitCount > 0 && !searchIndexLoading
+
+  useEffect(() => {
+    localSearchCursorRef.current = searchCursor
+  }, [searchCursor])
+
+  useEffect(() => {
+    sessionSearchCursorRef.current = effectiveSessionHitIndex
+  }, [effectiveSessionHitIndex])
+
+  const searchDirectoryItemCount = localSearchInput.trim()
+    ? hasSessionNavigation || effectiveSearchSession?.hits?.length
+      ? effectiveSearchSession?.hits?.length || 0
+      : allSearchMatches.length
+    : 0
+  const searchResultTotalPages = Math.max(1, Math.ceil(searchDirectoryItemCount / READER_SEARCH_RESULT_PAGE_SIZE))
+  const searchResultPageSafe = Math.max(1, Math.min(searchResultPage, searchResultTotalPages))
+  const visibleSearchDirectoryItems = useMemo<SearchDirectoryItem[]>(() => {
+    if (!localSearchInput.trim() || searchDirectoryItemCount <= 0) return []
+    const start = (searchResultPageSafe - 1) * READER_SEARCH_RESULT_PAGE_SIZE
+    const end = Math.min(searchDirectoryItemCount, start + READER_SEARCH_RESULT_PAGE_SIZE)
     if (!hasSessionNavigation && allSearchMatches.length) {
-      return allSearchMatches.map((hit, index) => {
+      return allSearchMatches.slice(start, end).map((hit, offset) => {
+        const index = start + offset
         const page = searchSourcePages[hit.pageIndex] || sortedPages[hit.pageIndex]
         const element = page ? getPageElements(page)[hit.elementIndex] : null
         const pageNum = page?.page_num || hit.pageIndex + 1
@@ -2820,9 +3037,10 @@ export default function SourcePageReader({
         }
       })
     }
-    if (!effectiveSearchSession?.hits?.length) return []
-    return effectiveSearchSession.hits.map((hit, index) => {
-      const pageIndex = findPageIndexForLocator(sortedPages, hit.locator)
+    const hits = effectiveSearchSession?.hits || []
+    return hits.slice(start, end).map((hit, offset) => {
+      const index = start + offset
+      const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
       const page = pageIndex >= 0 ? sortedPages[pageIndex] : null
       const pageNum = hit.locator.pageNum || page?.page_num || (hit.locator.pageIndex ?? -1) + 1
       const pageText = getPageText(page)
@@ -2835,13 +3053,7 @@ export default function SourcePageReader({
         session: true,
       }
     })
-  }, [allSearchMatches, effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, localSearchInput, searchSourcePages, sortedPages, visibleSearchHitIndex])
-  const searchResultTotalPages = Math.max(1, Math.ceil(searchDirectoryItems.length / READER_SEARCH_RESULT_PAGE_SIZE))
-  const searchResultPageSafe = Math.max(1, Math.min(searchResultPage, searchResultTotalPages))
-  const visibleSearchDirectoryItems = searchDirectoryItems.slice(
-    (searchResultPageSafe - 1) * READER_SEARCH_RESULT_PAGE_SIZE,
-    searchResultPageSafe * READER_SEARCH_RESULT_PAGE_SIZE,
-  )
+  }, [allSearchMatches, effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, localSearchInput, pageLocatorIndex, searchDirectoryItemCount, searchResultPageSafe, searchSourcePages, sortedPages, visibleSearchHitIndex])
   const [readerScrollVersion, setReaderScrollVersion] = useState(0)
   const readerScrollVersionRef = useRef(0)
   const refreshReaderPosition = () => {
@@ -2975,11 +3187,20 @@ export default function SourcePageReader({
     onPageIndexChange(Math.max(0, Math.min(pageCount - 1, nextIndex)))
   }
 
-  const scrollToPendingAnchor = (delay = 0) => {
+  const nextSearchNavigationToken = () => {
+    searchNavigationTokenRef.current += 1
+    return searchNavigationTokenRef.current
+  }
+
+  const isSearchNavigationCurrent = (token?: number) => !token || token === searchNavigationTokenRef.current
+
+  const scrollToPendingAnchor = (delay = 0, token?: number) => {
     const pendingSearchTarget = pendingSearchTargetRef.current
     const anchorId = pendingSearchTarget?.anchorId || pendingAnchorRef.current
+    const expectedToken = token ?? pendingSearchTarget?.token
     if (!anchorId) return
     window.setTimeout(() => {
+      if (!isSearchNavigationCurrent(expectedToken)) return
       const anchor = document?.id ? window.document.getElementById(anchorId) : null
       const activeMark = pendingSearchTarget?.active
         ? Number.isFinite(Number(pendingSearchTarget.hitIndex))
@@ -2997,16 +3218,25 @@ export default function SourcePageReader({
       if (target && scroller) {
         const targetRect = (target as HTMLElement).getBoundingClientRect()
         const scrollerRect = scroller.getBoundingClientRect()
-        scroller.scrollTo({
-          top: scroller.scrollTop + targetRect.top - scrollerRect.top - (scroller.clientHeight * 0.42),
-          behavior: pendingSearchTarget?.active ? 'auto' : 'smooth',
-        })
+        const comfortableTop = scrollerRect.top + scroller.clientHeight * 0.18
+        const comfortableBottom = scrollerRect.top + scroller.clientHeight * 0.78
+        const needsScroll = targetRect.top < comfortableTop || targetRect.bottom > comfortableBottom
+        if (needsScroll) {
+          scroller.scrollTo({
+            top: scroller.scrollTop + targetRect.top - scrollerRect.top - (scroller.clientHeight * 0.42),
+            behavior: pendingSearchTarget?.active ? 'auto' : 'smooth',
+          })
+        }
       } else {
         target?.scrollIntoView({ block: 'center', behavior: pendingSearchTarget?.active ? 'auto' : 'smooth' })
       }
-      refreshReaderPosition()
-      window.setTimeout(refreshReaderPosition, 260)
-      pendingSearchTargetRef.current = null
+      if (!pendingSearchTarget?.active) {
+        refreshReaderPosition()
+        window.setTimeout(() => {
+          if (isSearchNavigationCurrent(expectedToken)) refreshReaderPosition()
+        }, 260)
+      }
+      if (isSearchNavigationCurrent(expectedToken)) pendingSearchTargetRef.current = null
       if (pendingSearchTarget?.text) setPendingTocTarget(null)
       pendingAnchorRef.current = null
     }, delay)
@@ -3060,27 +3290,32 @@ export default function SourcePageReader({
     jumpToIndex(pageIndex >= 0 ? pageIndex : value - 1)
   }
 
-  const activateReaderSearchHit = (hit: ReaderSearchMatch, cursorIndex: number) => {
+  const activateReaderSearchHit = (hit: ReaderSearchMatch, cursorIndex: number, token = nextSearchNavigationToken()) => {
+    localSearchCursorRef.current = cursorIndex
+    sessionSearchCursorRef.current = -1
     setSearchCursor(cursorIndex)
     setSessionSearchCursor(-1)
     pendingSearchTargetRef.current = {
       anchorId: sortedPages[hit.pageIndex] ? getElementAnchorId(sortedPages[hit.pageIndex], hit.pageIndex, hit.elementIndex) : '',
       active: true,
       hitIndex: hit.globalIndex ?? cursorIndex,
+      token,
     }
     if (hit.pageIndex === safeIndex || visiblePageIndices.includes(hit.pageIndex)) {
-      scrollToPendingAnchor(0)
+      scrollToPendingAnchor(0, token)
     } else {
       jumpToIndex(hit.pageIndex)
     }
   }
 
-  const activateSessionSearchHit = (sessionIndex: number, sessionOverride?: SearchSessionState | null) => {
+  const activateSessionSearchHit = (sessionIndex: number, sessionOverride?: SearchSessionState | null, token = nextSearchNavigationToken()) => {
     const session = sessionOverride || effectiveSearchSession
     if (!session?.hits?.length) return false
     const boundedIndex = (sessionIndex + session.hits.length) % session.hits.length
     const hit = session.hits[boundedIndex]
-    const pageIndex = findPageIndexForLocator(sortedPages, hit?.locator)
+    const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit?.locator)
+    sessionSearchCursorRef.current = boundedIndex
+    localSearchCursorRef.current = -1
     setSessionSearchCursor(boundedIndex)
     setSearchCursor(-1)
     if (pageIndex >= 0) {
@@ -3089,33 +3324,50 @@ export default function SourcePageReader({
         anchorId: getElementAnchorId(sortedPages[pageIndex], pageIndex, anchorHit.elementIndex),
         active: true,
         hitIndex: boundedIndex,
+        token,
       }
-      const tocKey = findTocKeyForPageIndex(pageIndex)
+      const shouldSyncToc = tocOpen && readerSidebarTab === 'toc'
+      const tocKey = shouldSyncToc ? findTocKeyForPageIndex(pageIndex) : ''
       if (tocKey) {
+        const previousTocKey = activeTocJumpKeyRef.current
         activeTocJumpKeyRef.current = tocKey
         tocJumpSuppressUntilRef.current = performance.now() + 900
-        setActiveTocJumpKey(tocKey)
+        if (previousTocKey !== tocKey) setActiveTocJumpKey(tocKey)
       }
-      if (pageIndex === safeIndex || visiblePageIndices.includes(pageIndex)) scrollToPendingAnchor(0)
+      if (pageIndex === safeIndex || visiblePageIndices.includes(pageIndex)) scrollToPendingAnchor(0, token)
       else jumpToIndex(pageIndex)
-      window.setTimeout(refreshReaderPosition, 120)
-      window.setTimeout(() => {
-        if (activeTocJumpKeyRef.current === tocKey) {
-          activeTocJumpKeyRef.current = ''
-          setActiveTocJumpKey('')
-        }
-        refreshReaderPosition()
-      }, 520)
+      if (tocKey) {
+        window.setTimeout(() => {
+          if (!isSearchNavigationCurrent(token)) return
+          if (activeTocJumpKeyRef.current === tocKey) {
+            activeTocJumpKeyRef.current = ''
+            setActiveTocJumpKey('')
+          }
+        }, 360)
+      }
     }
     return pageIndex >= 0
   }
+
+  useLayoutEffect(() => {
+    if (!localSearchEdited || !hasSessionNavigation || searchIndexLoading || !effectiveSearchSession?.hits?.length) return
+    const targetIndex = effectiveSessionHitIndex >= 0 ? effectiveSessionHitIndex : 0
+    const targetHit = effectiveSearchSession.hits[targetIndex]
+    const applyKey = `${effectiveSearchSession.query}:${effectiveSearchSession.hits.length}:${targetIndex}:${targetHit?.id || ''}`
+    if (appliedIndexedSearchKeyRef.current === applyKey) return
+    appliedIndexedSearchKeyRef.current = applyKey
+    activateSessionSearchHit(targetIndex, effectiveSearchSession)
+  }, [effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, localSearchEdited, searchIndexLoading])
 
   const clearReaderSearchStateForNotes = () => {
     setLocalSearchEdited(true)
     setLocalSearchInput('')
     setSearchCursor(-1)
     setSessionSearchCursor(-1)
+    localSearchCursorRef.current = -1
+    sessionSearchCursorRef.current = -1
     setLocalSearchSession(null)
+    appliedIndexedSearchKeyRef.current = ''
     setSearchResultPage(1)
     if (incomingSearchSessionKey) setDismissedSearchSessionKey(incomingSearchSessionKey)
     onSearchKeywordChange?.('')
@@ -3124,7 +3376,7 @@ export default function SourcePageReader({
   const resolveReaderNoteAnchor = (note: ReaderNoteItem): { pageIndex: number; elementIndex: number; anchorId: string } | null => {
     const locator = getReaderNoteLocator(note)
     if (!locator) return null
-    const pageIndex = findPageIndexForLocator(sortedPages, locator)
+    const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, locator)
     if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
     const page = sortedPages[pageIndex]
     const elements = getPageElements(page)
@@ -3230,40 +3482,46 @@ export default function SourcePageReader({
 
   useLayoutEffect(() => {
     if (!localSearchInput.trim() || hasSessionNavigation || searchCursor >= 0 || !allSearchMatches.length) return
-    activateReaderSearchHit(allSearchMatches[0], 0)
-  }, [allSearchMatches, hasSessionNavigation, localSearchInput, searchCursor])
+    const targetIndex = sessionLocalSearchIndex >= 0 ? sessionLocalSearchIndex : 0
+    activateReaderSearchHit(allSearchMatches[targetIndex], targetIndex)
+  }, [allSearchMatches, hasSessionNavigation, localSearchInput, searchCursor, sessionLocalSearchIndex])
 
   const jumpToSearchHit = (direction: 1 | -1) => {
+    const token = nextSearchNavigationToken()
     if (hasSessionNavigation && effectiveSessionHits.length) {
-      const current = effectiveSessionHitIndex >= 0 ? effectiveSessionHitIndex : direction > 0 ? -1 : 0
-      activateSessionSearchHit(current + direction)
+      const current = sessionSearchCursorRef.current >= 0 ? sessionSearchCursorRef.current : effectiveSessionHitIndex >= 0 ? effectiveSessionHitIndex : direction > 0 ? -1 : 0
+      activateSessionSearchHit(current + direction, undefined, token)
       return
     }
     if (allSearchMatches.length) {
-      const current = searchCursor >= 0
+      const current = localSearchCursorRef.current >= 0
+        ? localSearchCursorRef.current
+        : searchCursor >= 0
         ? searchCursor
         : Number.isFinite(Number(activeSearchHit?.globalIndex))
           ? Number(activeSearchHit?.globalIndex)
           : 0
       const next = (current + direction + allSearchMatches.length) % allSearchMatches.length
       const hit = allSearchMatches[next]
-      activateReaderSearchHit(hit, next)
+      activateReaderSearchHit(hit, next, token)
       return
     }
     if (effectiveSessionHits.length) {
-      const current = sessionSearchCursor >= 0
+      const current = sessionSearchCursorRef.current >= 0
+        ? sessionSearchCursorRef.current
+        : sessionSearchCursor >= 0
         ? sessionSearchCursor
         : effectiveSearchSession && effectiveSearchSession.activeHitIndex >= 0
           ? effectiveSearchSession.activeHitIndex
           : 0
-      activateSessionSearchHit(current + direction)
+      activateSessionSearchHit(current + direction, undefined, token)
       return
     }
     if (searchMatches.length) {
-      const current = searchCursor >= 0 ? searchCursor : Math.max(0, activeLocalHitIndex)
+      const current = localSearchCursorRef.current >= 0 ? localSearchCursorRef.current : searchCursor >= 0 ? searchCursor : Math.max(0, activeLocalHitIndex)
       const next = (current + direction + searchMatches.length) % searchMatches.length
       const hit = searchMatches[next]
-      activateReaderSearchHit(hit, next)
+      activateReaderSearchHit(hit, next, token)
       return
     }
   }
@@ -3553,23 +3811,23 @@ export default function SourcePageReader({
     if (!document?.id || ruleTocLoading) return
     setRuleTocLoading(true)
     message.loading({
-      content: '正在生成规则目录，长文献可能会短暂卡顿；识别完成后会恢复。',
+      content: '正在生成目录，长文献可能会短暂卡顿；识别完成后会恢复。',
       key: 'rule-toc-rebuild',
       duration: 0,
     })
     try {
       const nextItems = normalizeTocItems(await window.api.rebuildRuleToc(document.id))
       if (!nextItems.length) {
-        message.warning({ content: '规则目录暂时没有识别出可用条目', key: 'rule-toc-rebuild', duration: 4 })
+        message.warning({ content: '生成目录暂时没有识别出可用条目', key: 'rule-toc-rebuild', duration: 4 })
         return
       }
       setToc(nextItems)
       setTocDraft(toTocDraftItems(nextItems))
       onDocumentMetadataChange?.({ ...parseMetadata(document), toc_v2_updated_at: new Date().toISOString() })
-      message.success({ content: `规则目录已更新，共 ${nextItems.length} 条`, key: 'rule-toc-rebuild', duration: 4 })
+      message.success({ content: `生成目录已更新，共 ${nextItems.length} 条`, key: 'rule-toc-rebuild', duration: 4 })
     } catch (error: unknown) {
       console.error(error)
-      message.error({ content: getErrorMessage(error, '规则目录更新失败'), key: 'rule-toc-rebuild', duration: 5 })
+      message.error({ content: getErrorMessage(error, '生成目录更新失败'), key: 'rule-toc-rebuild', duration: 5 })
     } finally {
       setRuleTocLoading(false)
     }
@@ -3762,7 +4020,7 @@ export default function SourcePageReader({
         </div>
       )
     }
-    if (!searchDirectoryItems.length) {
+    if (!searchDirectoryItemCount) {
       return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无命中" />
     }
     return (
@@ -3807,7 +4065,7 @@ export default function SourcePageReader({
             </button>
           ))}
         </Space>
-        {searchDirectoryItems.length > READER_SEARCH_RESULT_PAGE_SIZE ? (
+        {searchDirectoryItemCount > READER_SEARCH_RESULT_PAGE_SIZE ? (
           <div
             style={{
               display: 'flex',
@@ -3825,7 +4083,7 @@ export default function SourcePageReader({
               simple
               current={searchResultPageSafe}
               pageSize={READER_SEARCH_RESULT_PAGE_SIZE}
-              total={searchDirectoryItems.length}
+              total={searchDirectoryItemCount}
               showSizeChanger={false}
               onChange={(page) => setSearchResultPage(page)}
             />
@@ -3848,7 +4106,7 @@ export default function SourcePageReader({
             {
               value: 'search',
               label: localSearchInput.trim()
-                ? `检索结果${searchDirectoryItems.length ? ` ${searchDirectoryItems.length}` : ''}`
+                ? `检索结果${searchDirectoryItemCount ? ` ${searchDirectoryItemCount}` : ''}`
                 : `摘录${readerNotes.length ? ` ${readerNotes.length}` : ''}`,
             },
           ]}
@@ -3869,7 +4127,7 @@ export default function SourcePageReader({
           </Space>
         ) : (
           <Space size={4}>
-            <Button size="small" icon={<ReloadOutlined />} loading={ruleTocLoading} onClick={() => void handleRuleTocRebuild()}>规则</Button>
+            <Button size="small" icon={<ReloadOutlined />} loading={ruleTocLoading} onClick={() => void handleRuleTocRebuild()}>生成目录</Button>
             <Button size="small" icon={<RobotOutlined />} loading={aiTocLoading} onClick={() => void handleAiTocOrganize()}>AI</Button>
             <Button size="small" icon={<EditOutlined />} onClick={() => setTocEditMode(true)}>编辑</Button>
           </Space>
@@ -4112,10 +4370,33 @@ export default function SourcePageReader({
               </Button>
             </>
           ) : null}
-          <Input data-reader-search-input="true" size="small" prefix={<SearchOutlined />} allowClear value={localSearchInput} onChange={(event) => { setLocalSearchEdited(true); setLocalSearchInput(event.target.value); setSearchCursor(-1); setSessionSearchCursor(-1); setLocalSearchSession(null); setReaderHighlightColor(''); onSearchKeywordChange?.(event.target.value) }} placeholder="页内检索" style={{ width: 170 }} />
-          <Button size="small" title="上一处页内命中" icon={<LeftOutlined />} disabled={!totalSearchHitCount} onClick={() => jumpToSearchHit(-1)} />
-          <Text data-reader-search-counter="true" style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{totalSearchHitCount ? `${Math.max(0, visibleSearchHitIndex) + 1}/${totalSearchHitCount}` : '0/0'}</Text>
-          <Button size="small" title="下一处页内命中" icon={<RightOutlined />} data-reader-search-next="true" disabled={!totalSearchHitCount} onClick={() => jumpToSearchHit(1)} />
+          <Input
+            data-reader-search-input="true"
+            size="small"
+            prefix={<SearchOutlined />}
+            allowClear
+            value={localSearchInput}
+            onChange={(event) => {
+              const nextKeyword = event.target.value
+              const trimmed = nextKeyword.trim()
+              emittedLocalSearchKeywordRef.current = nextKeyword
+              localSearchEditedRef.current = true
+              setLocalSearchEdited(true)
+              setLocalSearchInput(nextKeyword)
+              localSearchCursorRef.current = -1
+              sessionSearchCursorRef.current = -1
+              setSearchCursor(-1)
+              setSessionSearchCursor(-1)
+              setLocalSearchSession(trimmed ? { query: trimmed, hits: [], activeHitIndex: -1, status: 'searching' } : null)
+              setReaderHighlightColor('')
+              onSearchKeywordChange?.(nextKeyword)
+            }}
+            placeholder="页内检索"
+            style={{ width: 170 }}
+          />
+          <Button size="small" title="上一处页内命中" icon={<LeftOutlined />} disabled={!canNavigateSearchHits} onClick={() => jumpToSearchHit(-1)} />
+          <Text data-reader-search-counter="true" style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{searchCounterText}</Text>
+          <Button size="small" title="下一处页内命中" icon={<RightOutlined />} data-reader-search-next="true" disabled={!canNavigateSearchHits} onClick={() => jumpToSearchHit(1)} />
           <Popover trigger="click" placement="bottomRight" content={displaySettingsPanel}>
             <Button size="small" icon={<SettingOutlined />}>显示设置</Button>
           </Popover>
@@ -4165,7 +4446,7 @@ export default function SourcePageReader({
                   onClose={() => setTranslationOpen(false)}
                 />
               ) : (
-                <SourcePageSpread rowPages={visiblePages} pageIndices={visiblePageIndices} pageCount={pageCount} pageMetrics={readerPageMetrics} adaptivePages={isEbook} fontSize={fontSize} lineHeight={lineHeight} theme={theme} searchKeyword={renderedSearchKeyword} activeSearchHit={renderedActiveSearchHit} searchMatches={searchMatches} pendingTocTarget={pendingTocTarget} aiLayoutEnabled={aiLayoutEnabled} aiLayoutByPageId={aiLayoutByPageId} aiLayoutLoading={aiLayoutLoading} aiLayoutErrors={aiLayoutErrors} highlightColor={effectiveHighlightColor} noteHighlightsByElement={readerNoteHighlightsByElement} onSelectedTextChange={onSelectedTextChange} onReaderSelection={updateReaderSelection} displayScript={displayScript} searchActiveOnly={hasSessionNavigation} />
+                <SourcePageSpread rowPages={visiblePages} pageIndices={visiblePageIndices} pageCount={pageCount} pageMetrics={readerPageMetrics} adaptivePages={isEbook} fontSize={fontSize} lineHeight={lineHeight} theme={theme} searchKeyword={renderedSearchKeyword} activeSearchHit={renderedActiveSearchHit} searchMatches={searchMatches} pendingTocTarget={pendingTocTarget} aiLayoutEnabled={aiLayoutEnabled} aiLayoutByPageId={aiLayoutByPageId} aiLayoutLoading={aiLayoutLoading} aiLayoutErrors={aiLayoutErrors} highlightColor={effectiveHighlightColor} noteHighlightsByElement={readerNoteHighlightsByElement} onSelectedTextChange={onSelectedTextChange} onReaderSelection={updateReaderSelection} displayScript={displayScript} searchActiveOnly={false} />
               )}
             </div>
           ) : (

@@ -54,6 +54,7 @@ function createWindow(): void {
     minWidth: 1024,
     minHeight: 700,
     show: false,
+    backgroundColor: '#0a0a0a',
     autoHideMenuBar: true,
     title: '文献管理',
     webPreferences: {
@@ -64,12 +65,91 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow?.show()
-    if (mainWindow) batchProcessor.setMainWindow(mainWindow)
+  let windowShownInitialized = false
+  let windowShowFallbackTimer: NodeJS.Timeout | null = null
+  const showWindowIfNeeded = (win: BrowserWindow): void => {
+    if (!win.isVisible()) {
+      win.show()
+      win.focus()
+    }
+  }
+  const showMainWindowFallback = (reason: string): void => {
+    const win = mainWindow
+    if (!win || win.isDestroyed()) return
+    if (windowShownInitialized) return
+    windowShownInitialized = true
+    if (windowShowFallbackTimer) {
+      clearTimeout(windowShowFallbackTimer)
+      windowShowFallbackTimer = null
+    }
+    console.log(`[Main] Showing main window via ${reason}`)
+    showWindowIfNeeded(win)
+    batchProcessor.setMainWindow(win)
     scheduleStartupRecovery()
     scheduleStartupMaintenance()
+  }
+
+  mainWindow.on('ready-to-show', () => {
+    if (!mainWindow || mainWindow.isDestroyed() || windowShownInitialized) return
+    scheduleStartupRecovery()
+    scheduleStartupMaintenance()
+    windowShownInitialized = true
+    if (windowShowFallbackTimer) {
+      clearTimeout(windowShowFallbackTimer)
+      windowShowFallbackTimer = null
+    }
+    console.log('[Main] Showing main window via ready-to-show')
+    const win = mainWindow
+    showWindowIfNeeded(win)
+    batchProcessor.setMainWindow(win)
   })
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log(`[Main] Renderer finished loading: ${mainWindow?.webContents.getURL() || ''}`)
+    showMainWindowFallback('did-finish-load')
+  })
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[Main] Failed to load renderer (${errorCode}): ${errorDescription} ${validatedURL}`)
+    showMainWindowFallback('did-fail-load')
+  })
+
+  mainWindow.webContents.on('console-message', (details) => {
+    console.log(`[Renderer:${details.level}] ${details.message} (${details.sourceId}:${details.lineNumber})`)
+  })
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error(`[Main] Renderer process gone: reason=${details.reason}; exitCode=${details.exitCode}`)
+  })
+
+  const windowShowFallbackDelayMs = is.dev ? 12000 : 8000
+  windowShowFallbackTimer = setTimeout(() => {
+    showMainWindowFallback(`startup fallback after ${windowShowFallbackDelayMs}ms`)
+  }, windowShowFallbackDelayMs)
+  windowShowFallbackTimer.unref?.()
+
+  setTimeout(() => {
+    const win = mainWindow
+    if (!win || win.isDestroyed()) return
+    win.webContents.executeJavaScript(`
+      (() => {
+        const root = document.getElementById('root')
+        return {
+          url: location.href,
+          title: document.title,
+          rootTextLength: root?.textContent?.trim().length || 0,
+          rootHtmlLength: root?.innerHTML?.length || 0,
+          bodyTextLength: document.body?.textContent?.trim().length || 0,
+        }
+      })()
+    `).then((state) => {
+      if (!state?.rootTextLength && !state?.rootHtmlLength) {
+        console.warn(`[Main] Renderer root is still empty after startup: ${JSON.stringify(state)}`)
+      }
+    }).catch((error) => {
+      console.warn('[Main] Failed to inspect renderer startup state', error)
+    })
+  }, is.dev ? 6000 : 10000).unref?.()
 
   mainWindow.on('close', (event) => {
     if (quitConfirmed || process.env.GUJISMART_SMOKE === '1') return

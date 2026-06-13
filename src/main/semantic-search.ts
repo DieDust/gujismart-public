@@ -12,7 +12,6 @@ import {
   BACKGROUND_REINDEX_DRAIN_PAUSE_MS,
   BACKGROUND_REINDEX_NGRAM_WRITE_BATCH_SIZE,
   BACKGROUND_REINDEX_PAGE_BATCH_SIZE,
-  BACKGROUND_REINDEX_SEGMENT_FTS_BATCH_SIZE,
   BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE,
   BACKGROUND_REINDEX_TASK_ID,
   BACKGROUND_REINDEX_TIME_SLICE_MS,
@@ -114,6 +113,8 @@ interface OcrBlockPoint {
 interface OcrBlockLocation {
   top?: number | string | null
   left?: number | string | null
+  width?: number | string | null
+  height?: number | string | null
 }
 
 interface OcrBlock {
@@ -127,6 +128,12 @@ interface OcrBlock {
   reading_order?: number | string | null
   location?: OcrBlockLocation | OcrBlockPoint[] | null
   points?: OcrBlockPoint[] | null
+  rect?: OcrBlockLocation | null
+  bbox?: OcrBlockLocation | OcrBlockPoint[] | null
+  box?: OcrBlockLocation | OcrBlockPoint[] | null
+  block_bbox?: OcrBlockLocation | OcrBlockPoint[] | null
+  coordinate?: OcrBlockLocation | OcrBlockPoint[] | null
+  coordinate_box?: OcrBlockLocation | OcrBlockPoint[] | null
   needs_enhancement?: boolean
 }
 
@@ -137,6 +144,7 @@ interface OcrResultPayload {
     title?: string | null
   } | null
   layout_result?: OcrBlock[]
+  raw_layout_result?: OcrBlock[]
   layout_blocks?: OcrBlock[]
   words_result?: OcrBlock[]
 }
@@ -566,8 +574,12 @@ function getBlockLabel(block: OcrBlock): string {
   return String(block?.label || block?.type || block?.block_type || block?.category || '').toLowerCase()
 }
 
+function getBlockLocation(block: OcrBlock): OcrBlock['location'] {
+  return block?.location || block?.rect || block?.points || block?.block_bbox || block?.bbox || block?.box || block?.coordinate || block?.coordinate_box || null
+}
+
 function getBlockPoint(block: OcrBlock): { top: number; left: number } {
-  const loc = block?.location || block?.points
+  const loc = getBlockLocation(block)
   if (Array.isArray(loc)) {
     if (loc.length > 0) {
       const xs = loc.map((point) => Number(point?.x)).filter(Number.isFinite)
@@ -586,6 +598,46 @@ function getBlockPoint(block: OcrBlock): { top: number; left: number } {
     }
   }
   return { top: Number.MAX_SAFE_INTEGER, left: Number.MAX_SAFE_INTEGER }
+}
+
+function blockHasCoordinates(block: OcrBlock): boolean {
+  const point = getBlockPoint(block)
+  return Number.isFinite(point.top) && Number.isFinite(point.left) && point.top < Number.MAX_SAFE_INTEGER && point.left < Number.MAX_SAFE_INTEGER
+}
+
+function compactBlockTextLength(blocks: OcrBlock[]): number {
+  return blocks.reduce((sum, block) => sum + getBlockText(block).replace(/\s+/g, '').length, 0)
+}
+
+function shouldPreferRawLayoutBlocks(layoutBlocks: OcrBlock[], rawLayoutBlocks: OcrBlock[]): boolean {
+  if (rawLayoutBlocks.length === 0 || rawLayoutBlocks.length <= layoutBlocks.length) return false
+  const layoutTextLength = compactBlockTextLength(layoutBlocks)
+  const rawTextLength = compactBlockTextLength(rawLayoutBlocks)
+  if (rawTextLength < 80 || rawTextLength < layoutTextLength * 1.35 || rawTextLength - layoutTextLength < 40) return false
+  return rawLayoutBlocks.filter(blockHasCoordinates).length >= layoutBlocks.filter(blockHasCoordinates).length
+}
+
+function suppressOverrepresentedLines(text: string): string {
+  const lines = String(text || '').replace(/\r/g, '\n').split(/\n+/).map((line) => line.trim()).filter(Boolean)
+  if (lines.length < 24) return String(text || '').trim()
+  const normalizedLines = lines.map((line) => line.replace(/\s+/g, '').trim())
+  const totals = new Map<string, number>()
+  normalizedLines.forEach((line) => {
+    if (line.length >= 4) totals.set(line, (totals.get(line) || 0) + 1)
+  })
+  const repeatedLines = [...totals.entries()].filter(([, count]) => count >= 4)
+  if (repeatedLines.length === 0) return lines.join('\n')
+  const repeatedTotal = repeatedLines.reduce((sum, [, count]) => sum + count, 0)
+  if (repeatedTotal < lines.length * 0.35) return lines.join('\n')
+  const seen = new Map<string, number>()
+  return lines.filter((_line, index) => {
+    const normalized = normalizedLines[index]
+    const total = totals.get(normalized) || 0
+    if (normalized.length < 4 || total < 4) return true
+    const count = seen.get(normalized) || 0
+    seen.set(normalized, count + 1)
+    return count < 1
+  }).join('\n')
 }
 
 function getOrderedOcrBlocks(page: SearchPageRow): OcrBlock[] {
@@ -607,8 +659,10 @@ function loadPageOcrResultForSearch(page: SearchPageRow): SearchPageRow {
 }
 
 function getOrderedOcrBlocksFromPayload(parsed: OcrResultPayload | null): OcrBlock[] {
-  const blocks = Array.isArray(parsed?.layout_result) && parsed.layout_result.length > 0
-    ? parsed.layout_result
+  const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
+  const rawLayoutBlocks = Array.isArray(parsed?.raw_layout_result) ? parsed.raw_layout_result : []
+  const blocks = layoutBlocks.length > 0
+    ? shouldPreferRawLayoutBlocks(layoutBlocks, rawLayoutBlocks) ? rawLayoutBlocks : layoutBlocks
     : Array.isArray(parsed?.layout_blocks) && parsed.layout_blocks.length > 0
       ? parsed.layout_blocks
       : Array.isArray(parsed?.words_result)
@@ -660,13 +714,13 @@ function getIndexablePageText(page: SearchPageRow): string {
   const parsed = shouldLoadBlocks ? parseMaybeJson<OcrResultPayload>(pageWithOcrResult?.ocr_result) : null
   const blocks = parsed ? getOrderedOcrBlocksFromPayload(parsed) : []
   if (blocks.length > 0 && shouldPreferOcrBlocksForSearch(page, blocks, parsed)) {
-    const blockText = blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n')
+    const blockText = suppressOverrepresentedLines(blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'))
     if (blockText.trim()) return blockText.trim()
   }
 
-  if (ocrText) return ocrText
+  if (ocrText) return suppressOverrepresentedLines(ocrText)
 
-  return blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n').trim()
+  return suppressOverrepresentedLines(blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n')).trim()
 }
 
 function hashText(value: string): string {
@@ -1013,14 +1067,18 @@ function loadIndexablePagesForDocument(docId: string, limit?: number, offset = 0
   return queryAll<SearchPageRow>(sql, params)
 }
 
-type SearchIndexStorageTable = 'search_segments_fts' | 'search_ngram_index' | 'search_index_segments'
+type SearchIndexStagingTable = 'search_ngram_index_staging' | 'search_index_segments_staging'
 
-async function deleteRowsByDocIdInBackground(tableName: SearchIndexStorageTable, docId: string, sliceStartedAt: number): Promise<number> {
+function createSearchIndexStagingJobId(docId: string): string {
+  return `${docId}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+}
+
+async function deleteRowsByJobIdInBackground(tableName: SearchIndexStagingTable, jobId: string, sliceStartedAt: number): Promise<number> {
   let nextSliceStartedAt = sliceStartedAt
   while (true) {
     const rows = queryAll<{ rowid: number }>(
-      `SELECT rowid FROM ${tableName} WHERE doc_id = ? LIMIT ?`,
-      [docId, BACKGROUND_REINDEX_DELETE_BATCH_SIZE],
+      `SELECT rowid FROM ${tableName} WHERE job_id = ? LIMIT ?`,
+      [jobId, BACKGROUND_REINDEX_DELETE_BATCH_SIZE],
     )
     if (rows.length === 0) break
     const rowIds = rows.map((row) => Number(row.rowid)).filter(Number.isFinite)
@@ -1031,10 +1089,10 @@ async function deleteRowsByDocIdInBackground(tableName: SearchIndexStorageTable,
   return nextSliceStartedAt
 }
 
-async function deleteSearchIndexForDocumentInBackground(docId: string, sliceStartedAt: number): Promise<number> {
-  let nextSliceStartedAt = await deleteRowsByDocIdInBackground('search_segments_fts', docId, sliceStartedAt)
-  nextSliceStartedAt = await deleteRowsByDocIdInBackground('search_ngram_index', docId, nextSliceStartedAt)
-  return deleteRowsByDocIdInBackground('search_index_segments', docId, nextSliceStartedAt)
+async function cleanupSearchIndexStagingRows(jobId: string, sliceStartedAt = Date.now()): Promise<number> {
+  let nextSliceStartedAt = await deleteRowsByJobIdInBackground('search_ngram_index_staging', jobId, sliceStartedAt)
+  nextSliceStartedAt = await deleteRowsByJobIdInBackground('search_index_segments_staging', jobId, nextSliceStartedAt)
+  return nextSliceStartedAt
 }
 
 function splitSearchIndexText(text: string): SearchIndexTextPart[] {
@@ -1105,12 +1163,13 @@ function buildSearchIndexSegmentDrafts(docId: string, page: SearchPageRow, index
   })
 }
 
-function insertSearchIndexSegmentDraft(docId: string, segment: SearchIndexSegmentDraft, now: string): void {
+function insertSearchIndexSegmentDraftIntoStaging(jobId: string, docId: string, segment: SearchIndexSegmentDraft, now: string): void {
   run(
-    `INSERT INTO search_index_segments (
-      segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO search_index_segments_staging (
+      job_id, segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      jobId,
       segment.segmentId,
       docId,
       segment.pageId,
@@ -1129,82 +1188,92 @@ function insertSearchIndexSegmentDraft(docId: string, segment: SearchIndexSegmen
   )
 }
 
-function upsertSearchNgramRows(
+function upsertSearchNgramStagingRows(
+  jobId: string,
   docId: string,
   segmentId: string,
   grams: Array<{ gram: string; positions: number[]; hitCount: number }>,
 ): void {
   grams.forEach(({ gram, positions, hitCount }) => {
     run(
-      `INSERT INTO search_ngram_index (gram, segment_id, doc_id, positions, hit_count)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(gram, segment_id) DO UPDATE SET
+      `INSERT INTO search_ngram_index_staging (job_id, gram, segment_id, doc_id, positions, hit_count)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(job_id, gram, segment_id) DO UPDATE SET
          positions = excluded.positions,
          hit_count = excluded.hit_count,
          doc_id = excluded.doc_id`,
-      [gram, segmentId, docId, JSON.stringify(positions), hitCount],
+      [jobId, gram, segmentId, docId, JSON.stringify(positions), hitCount],
     )
   })
 }
 
-async function insertSearchNgramsForSegmentInBackground(docId: string, segment: SearchIndexSegmentDraft, sliceStartedAt: number): Promise<number> {
+async function insertSearchNgramsForStagedSegmentInBackground(jobId: string, docId: string, segment: SearchIndexSegmentDraft, sliceStartedAt: number): Promise<number> {
   const grams = getSearchNgrams(segment.normalizedText, 3, SEARCH_NGRAM_MAX_POSITIONS_STORED)
   let nextSliceStartedAt = sliceStartedAt
   for (let index = 0; index < grams.length; index += BACKGROUND_REINDEX_NGRAM_WRITE_BATCH_SIZE) {
     const chunk = grams.slice(index, index + BACKGROUND_REINDEX_NGRAM_WRITE_BATCH_SIZE)
     transaction(() => {
-      upsertSearchNgramRows(docId, segment.segmentId, chunk)
+      upsertSearchNgramStagingRows(jobId, docId, segment.segmentId, chunk)
     })
     nextSliceStartedAt = await yieldAfterSearchIndexSlice(nextSliceStartedAt)
   }
   return nextSliceStartedAt
 }
 
-async function refreshSearchSegmentsFtsForDocumentInChunks(docId: string): Promise<void> {
-  if (!isFtsAvailable()) return
-  let sliceStartedAt = await deleteRowsByDocIdInBackground('search_segments_fts', docId, Date.now())
-  let lastRowId = 0
-  while (true) {
-    const rows = queryAll<{
-      rowid: number
-      segment_id: string
-      doc_id: string
-      page_id: string | null
-      page_num: number | null
-      title: string | null
-      normalized_text: string | null
-      text: string | null
-    }>(
-      `SELECT rowid, segment_id, doc_id, page_id, page_num, title, normalized_text, text
-       FROM search_index_segments
-       WHERE doc_id = ?
-         AND rowid > ?
-         AND TRIM(COALESCE(normalized_text, text, '')) != ''
-       ORDER BY rowid ASC
-       LIMIT ?`,
-      [docId, lastRowId, BACKGROUND_REINDEX_SEGMENT_FTS_BATCH_SIZE],
+function commitStagedSearchIndexForDocument(
+  jobId: string,
+  docId: string,
+  sourceHash: string,
+  segmentCount: number,
+  now: string,
+): void {
+  transaction(() => {
+    if (isFtsAvailable()) {
+      run('DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
+    }
+    run('DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
+    run('DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
+    run(
+      `INSERT INTO search_index_segments (
+        segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
+      )
+       SELECT segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
+       FROM search_index_segments_staging
+       WHERE job_id = ?
+       ORDER BY ordinal ASC`,
+      [jobId],
     )
-    if (rows.length === 0) break
-    transaction(() => {
-      rows.forEach((row) => {
-        run(
-          `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            row.rowid,
-            row.segment_id,
-            row.doc_id,
-            row.page_id,
-            row.page_num,
-            row.title || '',
-            row.normalized_text || row.text || '',
-          ],
-        )
-      })
-    })
-    lastRowId = Number(rows[rows.length - 1]?.rowid || lastRowId)
-    sliceStartedAt = await yieldAfterSearchIndexSlice(sliceStartedAt)
-  }
+    run(
+      `INSERT INTO search_ngram_index (gram, segment_id, doc_id, positions, hit_count)
+       SELECT gram, segment_id, doc_id, positions, hit_count
+       FROM search_ngram_index_staging
+       WHERE job_id = ?`,
+      [jobId],
+    )
+    if (isFtsAvailable()) {
+      run(
+        `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
+         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
+    }
+    run(
+      `INSERT INTO search_index_status (doc_id, status, source_hash, segment_count, error_message, indexed_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(doc_id) DO UPDATE SET
+         status = excluded.status,
+         source_hash = excluded.source_hash,
+         segment_count = excluded.segment_count,
+         error_message = excluded.error_message,
+         indexed_at = excluded.indexed_at,
+         updated_at = excluded.updated_at`,
+      [docId, 'ready', sourceHash, segmentCount, null, now, now],
+    )
+    run('DELETE FROM search_ngram_index_staging WHERE job_id = ?', [jobId])
+    run('DELETE FROM search_index_segments_staging WHERE job_id = ?', [jobId])
+  })
 }
 
 async function reindexDocumentInBackground(docId: string, totalCount: number, completedCount: number): Promise<SearchReindexDocumentResult> {
@@ -1217,6 +1286,7 @@ async function reindexDocumentInBackground(docId: string, totalCount: number, co
   }
 
   const now = new Date().toISOString()
+  const stagingJobId = createSearchIndexStagingJobId(docId)
   try {
     updateSearchIndexStatus(docId, 'processing')
     emitSearchIndexTaskStatus({
@@ -1232,7 +1302,7 @@ async function reindexDocumentInBackground(docId: string, totalCount: number, co
     const segmentHashes: string[] = []
     let segmentCount = 0
     let processedPages = 0
-    let sliceStartedAt = await deleteSearchIndexForDocumentInBackground(docId, Date.now())
+    let sliceStartedAt = await cleanupSearchIndexStagingRows(stagingJobId, Date.now())
     for (let offset = 0; ; offset += BACKGROUND_REINDEX_PAGE_BATCH_SIZE) {
       const pages = loadIndexablePagesForDocument(docId, BACKGROUND_REINDEX_PAGE_BATCH_SIZE, offset)
       if (pages.length === 0) break
@@ -1240,12 +1310,12 @@ async function reindexDocumentInBackground(docId: string, totalCount: number, co
       for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex += BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE) {
         const segmentChunk = segments.slice(segmentIndex, segmentIndex + BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE)
         transaction(() => {
-          segmentChunk.forEach((segment) => insertSearchIndexSegmentDraft(docId, segment, now))
+          segmentChunk.forEach((segment) => insertSearchIndexSegmentDraftIntoStaging(stagingJobId, docId, segment, now))
         })
         segmentChunk.forEach((segment) => segmentHashes.push(segment.textHash))
         segmentCount += segmentChunk.length
         for (const segment of segmentChunk) {
-          sliceStartedAt = await insertSearchNgramsForSegmentInBackground(docId, segment, sliceStartedAt)
+          sliceStartedAt = await insertSearchNgramsForStagedSegmentInBackground(stagingJobId, docId, segment, sliceStartedAt)
         }
         sliceStartedAt = await yieldAfterSearchIndexSlice(sliceStartedAt)
       }
@@ -1261,20 +1331,19 @@ async function reindexDocumentInBackground(docId: string, totalCount: number, co
       sliceStartedAt = await yieldAfterSearchIndexSlice(sliceStartedAt)
     }
 
-    await refreshSearchSegmentsFtsForDocumentInChunks(docId)
     const readyAt = new Date().toISOString()
     const sourceHash = versionedSourceHash(segmentHashes)
-    updateSearchIndexStatus(docId, 'ready', {
-      sourceHash,
-      segmentCount,
-      errorMessage: null,
-      indexedAt: readyAt,
-    })
+    commitStagedSearchIndexForDocument(stagingJobId, docId, sourceHash, segmentCount, readyAt)
     scheduleDatabaseSave()
     markSearchIndexDirty()
     return { docId, status: 'ready', segmentCount }
   } catch (error: unknown) {
     const errorMessage = getErrorMessage(error)
+    try {
+      await cleanupSearchIndexStagingRows(stagingJobId)
+    } catch (cleanupError) {
+      console.warn('[Search] Failed to clean staged search index rows', cleanupError)
+    }
     updateSearchIndexStatus(docId, 'error', { errorMessage })
     scheduleDatabaseSave()
     return { docId, status: 'error', segmentCount: 0, error: errorMessage }
@@ -1471,9 +1540,9 @@ function loadPageSegmentsForDocument(docId: string): SearchSegmentRow[] {
   })
 }
 
-function insertSearchNgramsForSegment(segment: { segmentId: string; docId: string; normalizedText: string }) {
+function insertSearchNgramsForStagedSegment(jobId: string, segment: { segmentId: string; docId: string; normalizedText: string }) {
   const grams = getSearchNgrams(segment.normalizedText, 3, SEARCH_NGRAM_MAX_POSITIONS_STORED)
-  upsertSearchNgramRows(segment.docId, segment.segmentId, grams)
+  upsertSearchNgramStagingRows(jobId, segment.docId, segment.segmentId, grams)
 }
 
 export function reindexDocument(docId: string): SearchReindexDocumentResult {
@@ -1486,37 +1555,28 @@ export function reindexDocument(docId: string): SearchReindexDocumentResult {
   }
 
   const now = new Date().toISOString()
+  const stagingJobId = createSearchIndexStagingJobId(docId)
   try {
     const pages = loadIndexablePagesForDocument(docId)
     const segments = pages.flatMap((page, index) => buildSearchIndexSegmentDrafts(docId, page, index))
 
     const sourceHash = versionedSourceHash(segments.map((segment) => segment.textHash))
     transaction(() => {
-      run('DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
-      run('DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
+      run('DELETE FROM search_ngram_index_staging WHERE job_id = ?', [stagingJobId])
+      run('DELETE FROM search_index_segments_staging WHERE job_id = ?', [stagingJobId])
       segments.forEach((segment) => {
-        insertSearchIndexSegmentDraft(docId, segment, now)
-        insertSearchNgramsForSegment({ segmentId: segment.segmentId, docId, normalizedText: segment.normalizedText })
+        insertSearchIndexSegmentDraftIntoStaging(stagingJobId, docId, segment, now)
+        insertSearchNgramsForStagedSegment(stagingJobId, { segmentId: segment.segmentId, docId, normalizedText: segment.normalizedText })
       })
-      run(
-        `INSERT INTO search_index_status (doc_id, status, source_hash, segment_count, error_message, indexed_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(doc_id) DO UPDATE SET
-           status = excluded.status,
-           source_hash = excluded.source_hash,
-           segment_count = excluded.segment_count,
-           error_message = excluded.error_message,
-           indexed_at = excluded.indexed_at,
-           updated_at = excluded.updated_at`,
-        [docId, 'ready', sourceHash, segments.length, null, now, now],
-      )
     })
-    refreshSearchSegmentsFtsForDocument(docId)
+    commitStagedSearchIndexForDocument(stagingJobId, docId, sourceHash, segments.length, now)
     saveDatabase()
     markSearchIndexDirty()
     return { docId, status: 'ready', segmentCount: segments.length }
   } catch (error: unknown) {
     const errorMessage = getErrorMessage(error)
+    run('DELETE FROM search_ngram_index_staging WHERE job_id = ?', [stagingJobId])
+    run('DELETE FROM search_index_segments_staging WHERE job_id = ?', [stagingJobId])
     run(
       `INSERT INTO search_index_status (doc_id, status, source_hash, segment_count, error_message, indexed_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2475,6 +2535,10 @@ function createSearchHit(
   snippetText?: string,
 ): SearchHit {
   const pageNum = row.page_num ? Number(row.page_num) : null
+  const ordinal = Number(row.ordinal)
+  const pageIndex = Number.isFinite(ordinal) && !String(row.segment_id || '').includes(':page-fallback:')
+    ? Math.max(0, Math.floor(ordinal / 1000))
+    : null
   const originalRange = normalizedRangeToOriginal(row, hit)
   const sourceStart = getSegmentSourceStart(row)
   const locator: SearchHitLocator = {
@@ -2482,7 +2546,7 @@ function createSearchHit(
     segmentId: row.segment_id,
     pageId: row.page_id || null,
     pageNum,
-    pageIndex: pageNum ? pageNum - 1 : null,
+    pageIndex,
     href: row.href || null,
     segmentOrdinal: Number(row.ordinal || 0),
     charStart: sourceStart + originalRange.start,

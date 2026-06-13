@@ -488,60 +488,61 @@ function getLocatorPageNum(locator?: SearchHitLocator | null): number {
   if (!locator) return -1
   const pageNum = Number(locator.pageNum)
   if (Number.isFinite(pageNum) && pageNum > 0) return pageNum
-  const pageIndex = Number(locator.pageIndex)
-  if (Number.isFinite(pageIndex) && pageIndex >= 0) return pageIndex + 1
   return -1
+}
+
+function getLocatorPageIndex(locator?: SearchHitLocator | null): number {
+  const rawValue = locator?.pageIndex
+  if (rawValue === null || rawValue === undefined) return -1
+  const pageIndex = Number(rawValue)
+  return Number.isFinite(pageIndex) && pageIndex >= 0 ? Math.floor(pageIndex) : -1
 }
 
 function findTextHitIndexByLocator(hits: TextSearchHit[], locator?: SearchHitLocator | null): number {
   if (!hits.length || !locator) return -1
+  const targetPageIndex = getLocatorPageIndex(locator)
   const targetPageNum = getLocatorPageNum(locator)
-  if (targetPageNum >= 0) {
-    const samePageHits = hits.filter((hit) => hit.sourcePageNum === targetPageNum)
-    if (samePageHits.length > 0) {
-      const occurrenceIndex = Math.max(0, Number(locator.occurrenceIndex || 0))
-      const occurrenceHit = samePageHits[Math.min(samePageHits.length - 1, occurrenceIndex)]
-      if (occurrenceHit) return occurrenceHit.globalIndex
-      const targetChar = Math.max(0, Number(locator.charStart || 0))
-      const byChar = samePageHits
-        .map((hit) => ({ hit, distance: Math.abs(Number(hit.charIndex || 0) - targetChar) }))
-        .sort((left, right) => left.distance - right.distance)[0]?.hit
-      if (byChar) return byChar.globalIndex
-      return samePageHits[0].globalIndex
-    }
+  const samePageHits = hits.filter((hit) => {
+    if (targetPageIndex >= 0) return hit.pageIndex === targetPageIndex
+    if (targetPageNum >= 0) return hit.sourcePageNum === targetPageNum
+    return false
+  })
+  if (samePageHits.length > 0) {
+    const targetChar = Math.max(0, Number(locator.charStart || 0))
+    const byChar = samePageHits
+      .map((hit) => ({ hit, distance: Math.abs(Number(hit.charIndex || 0) - targetChar) }))
+      .sort((left, right) => left.distance - right.distance)[0]?.hit
+    if (byChar) return byChar.globalIndex
+    const occurrenceIndex = Math.max(0, Number(locator.occurrenceIndex || 0))
+    const occurrenceHit = samePageHits[Math.min(samePageHits.length - 1, occurrenceIndex)]
+    if (occurrenceHit) return occurrenceHit.globalIndex
+    return samePageHits[0].globalIndex
   }
   return -1
 }
 
 function findTextPageIndexByLocator(textPages: TextPage[], locator?: SearchHitLocator | null): number {
   if (!textPages.length || !locator) return -1
-  const targetPageNum = getLocatorPageNum(locator)
-  if (targetPageNum >= 0) {
-    const pageIndex = textPages.findIndex((page) => Number(page.sourcePageNum) === targetPageNum)
-    if (pageIndex >= 0) return pageIndex
+  const pageId = String(locator.pageId || '')
+  if (pageId) {
+    const pageIdIndex = textPages.findIndex((page) => String(page.id || '') === pageId)
+    if (pageIdIndex >= 0) return pageIdIndex
+  }
+  const targetPageIndex = getLocatorPageIndex(locator)
+  if (targetPageIndex >= 0 && targetPageIndex < textPages.length) {
+    return targetPageIndex
   }
   const href = String(locator.href || '')
   if (href) {
     const hrefIndex = textPages.findIndex((page) => sameHrefPath(page.href || '', href))
     if (hrefIndex >= 0) return hrefIndex
   }
+  const targetPageNum = getLocatorPageNum(locator)
+  if (targetPageNum >= 0) {
+    const pageNumIndex = textPages.findIndex((page) => Number(page.sourcePageNum) === targetPageNum)
+    if (pageNumIndex >= 0) return pageNumIndex
+  }
   return -1
-}
-
-function findSessionIndexForLocalTextHit(session: SearchSessionState | undefined, hit: TextSearchHit | null | undefined): number {
-  if (!session?.hits?.length || !hit) return -1
-  const samePageSessionHits = session.hits
-    .map((sessionHit, index) => ({ sessionHit, index }))
-    .filter(({ sessionHit }) => getLocatorPageNum(sessionHit.locator) === hit.sourcePageNum)
-  if (!samePageSessionHits.length) return -1
-
-  const byOccurrence = samePageSessionHits.find(({ sessionHit }) => Number(sessionHit.locator?.occurrenceIndex || 0) === hit.occurrenceIndex)
-  if (byOccurrence) return byOccurrence.index
-
-  const byChar = samePageSessionHits
-    .map(({ sessionHit, index }) => ({ index, distance: Math.abs(Number(sessionHit.locator?.charStart || 0) - hit.charIndex) }))
-    .sort((left, right) => left.distance - right.distance)[0]
-  return byChar?.index ?? -1
 }
 
 function findInitialTextSearchIndex(hits: TextSearchHit[], locator?: SearchHitLocator | null, searchSession?: SearchSessionState): number {
@@ -645,6 +646,59 @@ function getSearchSessionStateKey(session?: SearchSessionState | null): string {
     .map((hit, index) => `${index}:${hit.id}:${hit.locator?.pageId || ''}:${hit.locator?.href || ''}:${hit.locator?.pageNum || ''}:${hit.locator?.pageIndex ?? ''}:${hit.locator?.segmentOrdinal ?? ''}:${hit.locator?.charStart ?? ''}:${hit.locator?.queryTerm || hit.locator?.matchText || ''}`)
     .join('|')
   return `${session.query || ''}:${session.activeHitIndex}:${session.status}:${hitKeys}`
+}
+
+function getSearchLocatorKey(locator?: SearchHitLocator | null): string {
+  if (!locator) return ''
+  return [
+    locator.docId || '',
+    locator.segmentId || '',
+    locator.pageId || '',
+    locator.pageNum ?? '',
+    locator.pageIndex ?? '',
+    locator.normalizedCharStart ?? '',
+    locator.charStart ?? '',
+    locator.occurrenceIndex ?? '',
+    locator.queryTerm || locator.matchText || '',
+  ].join('|')
+}
+
+function doSearchLocatorsMatch(left?: SearchHitLocator | null, right?: SearchHitLocator | null): boolean {
+  if (!left || !right) return false
+  if (left.docId && right.docId && left.docId !== right.docId) return false
+  if (left.segmentId && right.segmentId && left.segmentId === right.segmentId) {
+    const leftNormalized = Number(left.normalizedCharStart)
+    const rightNormalized = Number(right.normalizedCharStart)
+    if (Number.isFinite(leftNormalized) && Number.isFinite(rightNormalized) && Math.abs(leftNormalized - rightNormalized) <= 2) return true
+    const leftChar = Number(left.charStart)
+    const rightChar = Number(right.charStart)
+    if (Number.isFinite(leftChar) && Number.isFinite(rightChar) && Math.abs(leftChar - rightChar) <= 2) return true
+    return Number(left.occurrenceIndex) === Number(right.occurrenceIndex)
+  }
+  if (left.pageId && right.pageId && String(left.pageId) !== String(right.pageId)) return false
+  const leftPageIndex = getLocatorPageIndex(left)
+  const rightPageIndex = getLocatorPageIndex(right)
+  if (leftPageIndex >= 0 && rightPageIndex >= 0 && leftPageIndex !== rightPageIndex) return false
+  const leftPageNum = getLocatorPageNum(left)
+  const rightPageNum = getLocatorPageNum(right)
+  if (leftPageNum >= 0 && rightPageNum >= 0 && leftPageNum !== rightPageNum) return false
+  const leftNormalized = Number(left.normalizedCharStart)
+  const rightNormalized = Number(right.normalizedCharStart)
+  if (Number.isFinite(leftNormalized) && Number.isFinite(rightNormalized)) return Math.abs(leftNormalized - rightNormalized) <= 2
+  const leftChar = Number(left.charStart)
+  const rightChar = Number(right.charStart)
+  if (Number.isFinite(leftChar) && Number.isFinite(rightChar)) return Math.abs(leftChar - rightChar) <= 2
+  return Number(left.occurrenceIndex) === Number(right.occurrenceIndex)
+}
+
+function findSessionHitIndexByLocator(session: SearchSessionState | undefined, locator?: SearchHitLocator | null): number {
+  if (!session?.hits?.length || !locator) return -1
+  return session.hits.findIndex((hit) => doSearchLocatorsMatch(hit.locator, locator))
+}
+
+function findSessionHitIndexByPage(sessionHits: SearchSessionState['hits'], textPages: TextPage[], pageIndex: number): number {
+  if (!sessionHits.length || pageIndex < 0) return -1
+  return sessionHits.findIndex((hit) => findTextPageIndexByLocator(textPages, hit.locator) === pageIndex)
 }
 
 function findNormalizedRanges(source: string, query: string): Array<{ start: number; end: number }> {
@@ -957,6 +1011,9 @@ function highlightText(
       hit = lower.indexOf(needle, normalizedCursor)
       continue
     }
+    const activeColor = markColor.toLowerCase() === DEFAULT_HIGHLIGHT_COLOR
+      ? '#ffb020'
+      : markColor
     nodes.push(
         <mark
         key={`${hit}-${index}`}
@@ -964,13 +1021,19 @@ function highlightText(
         data-search-hit-index={displayIndex}
         data-search-active={active ? 'true' : undefined}
         style={{
-          background: active ? markColor : hexToRgba(markColor, 0.72),
+          background: active ? activeColor : hexToRgba(markColor, 0.56),
           color: getHighlightTextColor(markColor),
           padding: '0 2px',
           borderRadius: 3,
           fontWeight: 700,
-          border: `1px solid ${hexToRgba(markColor, active ? 0.7 : 0.34)}`,
-          boxShadow: active ? `0 0 0 1px ${hexToRgba(markColor, 0.22)}` : 'none',
+          position: 'relative',
+          zIndex: active ? 3 : 0,
+          border: `1px solid ${active ? 'rgba(120, 53, 15, 0.92)' : hexToRgba(markColor, 0.28)}`,
+          outline: active ? '2px solid rgba(255, 255, 255, 0.88)' : 'none',
+          outlineOffset: 0,
+          boxShadow: active
+            ? `0 0 0 3px rgba(120, 53, 15, 0.82), 0 0 0 6px ${hexToRgba(activeColor, 0.26)}`
+            : `0 0 0 1px ${hexToRgba(markColor, 0.08)}`,
         }}
       >
         {text.slice(originalStart, originalEnd)}
@@ -1367,6 +1430,7 @@ export default function EbookReader({
   const handledBookTranslationRequestRef = useRef(0)
   const epubHighlightedCfiRef = useRef<string[]>([])
   const textPagesRef = useRef<TextPage[]>([])
+  const appliedIncomingLocatorKeyRef = useRef('')
   const [tocOpen, setTocOpen] = useState(true)
   const [viewMode, setViewMode] = useState<ViewMode>('spread')
   const [fontSize, setFontSize] = useState(17)
@@ -1408,15 +1472,6 @@ export default function EbookReader({
   const textHits = useMemo(() => findTextMatches(textPages, effectiveTextSearchQuery), [effectiveTextSearchQuery, textPages])
   const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === effectiveTextSearchQuery.trim()
   const sessionTextHits = !isEpub && hasMatchingSearchSession ? effectiveSearchSession?.hits || [] : []
-  const sessionIndexByLocalTextHit = useMemo(() => {
-    if (!sessionTextHits.length) return new Map<number, number>()
-    const map = new Map<number, number>()
-    textHits.forEach((hit) => {
-      const sessionIndex = findSessionIndexForLocalTextHit(effectiveSearchSession, hit)
-      if (sessionIndex >= 0) map.set(hit.globalIndex, sessionIndex)
-    })
-    return map
-  }, [effectiveSearchSession, sessionTextHits.length, textHits])
   const activeSessionHitIndex = sessionTextHits.length
     ? searchCursor >= 0 && searchCursor < sessionTextHits.length
       ? searchCursor
@@ -1491,9 +1546,9 @@ export default function EbookReader({
     () => buildReaderNoteHighlightsByPage(readerNotes, textPages),
     [readerNotes, textPages],
   )
-  const tocBusy = loading
-  const tocBusyTitle = isEpub ? '正在读取 EPUB 与目录' : '正在创建目录'
-  const tocBusyHint = isEpub ? '正在加载 EPUB 内容和章节目录。' : '正在读取或生成目录，长文献可能会短暂卡顿。'
+  const tocBusy = isEpub && loading
+  const tocBusyTitle = isEpub ? '正在读取 EPUB 与目录' : '正在读取目录'
+  const tocBusyHint = isEpub ? '正在加载 EPUB 内容和章节目录。' : '正在读取已保存目录。'
   const searchActiveOnly = Boolean(localSearchSession)
   const epubSearchLabel = epubSearchLoading
     ? '检索中'
@@ -1581,9 +1636,10 @@ export default function EbookReader({
   useEffect(() => {
     const docId = document.id
     if (isEpub || !docId) return
+    if (effectiveTextSearchQuery.trim() && (hasMatchingSearchSession || locator)) return
     const next = Math.max(0, Math.min(textPages.length - 1, currentPageIndex || 0))
     setTextPageIndex(next)
-  }, [currentPageIndex, isEpub, textPages.length])
+  }, [currentPageIndex, document.id, effectiveTextSearchQuery, hasMatchingSearchSession, isEpub, locator, textPages.length])
 
   useEffect(() => {
     setActiveParallelSegmentId('')
@@ -1593,24 +1649,71 @@ export default function EbookReader({
     if (isEpub || !document.id) return
     if (!effectiveTextSearchQuery.trim() || !textHits.length) return
     if (hasMatchingSearchSession && sessionTextHits.length) return
+    const locatorKey = getSearchLocatorKey(locator)
+    if (locatorKey && appliedIncomingLocatorKeyRef.current !== locatorKey) {
+      const locatorIndex = findTextHitIndexByLocator(textHits, locator)
+      if (locatorIndex >= 0) {
+        appliedIncomingLocatorKeyRef.current = locatorKey
+        setSearchCursor(locatorIndex)
+        const targetPageIndex = textHits[locatorIndex]?.pageIndex ?? findTextPageIndexByLocator(textPages, locator)
+        if (Number.isFinite(targetPageIndex) && targetPageIndex >= 0) setTextPageIndex(targetPageIndex)
+        return
+      }
+    }
     if (searchCursor >= 0) return
-    const initialIndex = findInitialTextSearchIndex(textHits, locator, effectiveSearchSession)
+    const currentPageHitIndex = textHits.findIndex((hit) => hit.pageIndex === Math.max(0, currentPageIndex || 0))
+    const currentPageKey = `page:${document.id}:${effectiveTextSearchQuery}:${Math.max(0, currentPageIndex || 0)}`
+    if (currentPageHitIndex >= 0 && appliedIncomingLocatorKeyRef.current !== currentPageKey) {
+      appliedIncomingLocatorKeyRef.current = currentPageKey
+      setSearchCursor(currentPageHitIndex)
+      const targetPageIndex = textHits[currentPageHitIndex]?.pageIndex ?? Math.max(0, currentPageIndex || 0)
+      if (Number.isFinite(targetPageIndex) && targetPageIndex >= 0) setTextPageIndex(targetPageIndex)
+      return
+    }
+    const locatorHitIndex = locator ? findTextHitIndexByLocator(textHits, locator) : -1
+    const initialIndex = locatorHitIndex >= 0
+      ? locatorHitIndex
+      : currentPageHitIndex >= 0
+        ? currentPageHitIndex
+        : findInitialTextSearchIndex(textHits, locator, effectiveSearchSession)
     if (initialIndex >= 0) {
       setSearchCursor(initialIndex)
       const targetPageIndex = textHits[initialIndex]?.pageIndex ?? 0
       if (Number.isFinite(targetPageIndex)) setTextPageIndex(targetPageIndex)
     }
-  }, [effectiveSearchSession, effectiveTextSearchQuery, hasMatchingSearchSession, isEpub, locator, searchCursor, sessionTextHits.length, textHits])
+  }, [currentPageIndex, effectiveSearchSession, effectiveTextSearchQuery, hasMatchingSearchSession, isEpub, locator, searchCursor, sessionTextHits.length, textHits, textPages])
 
   useEffect(() => {
     if (isEpub || !hasMatchingSearchSession || !sessionTextHits.length) return
+    const locatorKey = getSearchLocatorKey(locator)
+    const locatorIndex = findSessionHitIndexByLocator(effectiveSearchSession, locator)
+    if (locatorKey && locatorIndex >= 0 && appliedIncomingLocatorKeyRef.current !== locatorKey) {
+      appliedIncomingLocatorKeyRef.current = locatorKey
+      setSearchCursor(locatorIndex)
+      const targetPageIndex = findTextPageIndexByLocator(textPages, sessionTextHits[locatorIndex]?.locator || locator)
+      if (targetPageIndex >= 0) setTextPageIndex(targetPageIndex)
+      return
+    }
     if (searchCursor >= 0 && searchCursor < sessionTextHits.length) return
-    const initialIndex = effectiveSearchSession?.activeHitIndex >= 0 ? effectiveSearchSession.activeHitIndex : 0
+    const currentPageSessionIndex = findSessionHitIndexByPage(sessionTextHits, textPages, Math.max(0, currentPageIndex || 0))
+    const currentPageSessionKey = `session-page:${document.id}:${effectiveTextSearchQuery}:${Math.max(0, currentPageIndex || 0)}`
+    if (currentPageSessionIndex >= 0 && appliedIncomingLocatorKeyRef.current !== currentPageSessionKey) {
+      appliedIncomingLocatorKeyRef.current = currentPageSessionKey
+      setSearchCursor(currentPageSessionIndex)
+      const targetPageIndex = findTextPageIndexByLocator(textPages, sessionTextHits[currentPageSessionIndex]?.locator || locator)
+      if (targetPageIndex >= 0) setTextPageIndex(targetPageIndex)
+      return
+    }
+    const initialIndex = locatorIndex >= 0
+      ? locatorIndex
+      : currentPageSessionIndex >= 0
+        ? currentPageSessionIndex
+      : effectiveSearchSession?.activeHitIndex >= 0 ? effectiveSearchSession.activeHitIndex : 0
     const boundedIndex = Math.max(0, Math.min(sessionTextHits.length - 1, initialIndex))
     setSearchCursor(boundedIndex)
-    const targetPageIndex = findTextPageIndexByLocator(textPages, locator || sessionTextHits[boundedIndex]?.locator)
+    const targetPageIndex = findTextPageIndexByLocator(textPages, sessionTextHits[boundedIndex]?.locator || locator)
     if (targetPageIndex >= 0) setTextPageIndex(targetPageIndex)
-  }, [effectiveSearchSession?.activeHitIndex, hasMatchingSearchSession, isEpub, locator, searchCursor, sessionTextHits, textPages])
+  }, [currentPageIndex, effectiveSearchSession?.activeHitIndex, hasMatchingSearchSession, isEpub, locator, searchCursor, sessionTextHits, textPages])
 
   useEffect(() => {
     const docId = document.id
@@ -1728,17 +1831,17 @@ export default function EbookReader({
             styleNode.textContent = `
               .gujismart-epub-search-hit {
                 fill: #ffe58f;
-                fill-opacity: 0.42;
+                fill-opacity: 0.34;
                 stroke: rgba(189, 138, 42, 0.12);
                 stroke-width: 0.8;
                 vector-effect: non-scaling-stroke;
                 mix-blend-mode: normal;
               }
               .gujismart-epub-search-active {
-                fill: #ffd438;
-                fill-opacity: 0.5;
-                stroke: rgba(117, 72, 0, 0.26);
-                stroke-width: 0.9;
+                fill: #ffb020;
+                fill-opacity: 0.68;
+                stroke: rgba(120, 53, 15, 0.9);
+                stroke-width: 2.2;
                 vector-effect: non-scaling-stroke;
                 mix-blend-mode: normal;
               }
@@ -2761,7 +2864,7 @@ export default function EbookReader({
               if (!page) return null
               const pageIndex = visibleTextPageIndices[offset] ?? textPageIndex + offset
               const pageHitStartIndex = textHits.filter((hit) => hit.pageIndex < pageIndex).length
-              const activePageHitIndex = activeTextHit && activeTextHit.pageIndex === pageIndex ? activeTextSearchIndex : -1
+              const activePageHitIndex = activeTextHit && activeTextHit.pageIndex === pageIndex ? activeTextHit.globalIndex : -1
               const noteHighlights = effectiveTextSearchQuery.trim() ? [] : readerNoteHighlightsByPage.get(pageIndex) || []
               const isCurrent = pageIndex === textPageIndex
               return (
@@ -2796,7 +2899,7 @@ export default function EbookReader({
                   </div>
                   <div>
                     {page.text
-                      ? renderTextContent(page.text, effectiveTextSearchQuery, activePageHitIndex, pageHitStartIndex, sessionIndexByLocalTextHit, displayScript, effectiveHighlightColor, searchActiveOnly, noteHighlights)
+                      ? renderTextContent(page.text, effectiveTextSearchQuery, activePageHitIndex, pageHitStartIndex, undefined, displayScript, effectiveHighlightColor, searchActiveOnly, noteHighlights)
                       : <Text style={{ color: themed.muted }}>暂无文本</Text>}
                   </div>
                 </article>

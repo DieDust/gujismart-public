@@ -828,7 +828,10 @@ function getLayoutAwareBlocks(page: OcrTextPage): OcrTextBlock[] {
   const parsed = asOcrResult(page.ocr_result)
   if (!parsed) return []
   const layoutBlocks = asBlockArray(parsed.layout_result)
-  if (layoutBlocks.length > 0) return layoutBlocks
+  const rawLayoutBlocks = asBlockArray(parsed.raw_layout_result)
+  if (layoutBlocks.length > 0) {
+    return shouldPreferRawLayoutBlocks(layoutBlocks, rawLayoutBlocks) ? rawLayoutBlocks : layoutBlocks
+  }
   const layoutBoxes = firstBlockArray(
     getPathValue(parsed, ['layout_det_res', 'boxes']),
     getPathValue(parsed, ['res', 'layout_det_res', 'boxes']),
@@ -841,6 +844,27 @@ function getLayoutAwareBlocks(page: OcrTextPage): OcrTextBlock[] {
   )
   if (parsingBlocks.length > 0) return parsingBlocks
   return []
+}
+
+function compactBlockTextLength(blocks: OcrTextBlock[]): number {
+  return blocks
+    .map((block) => getBlockText(block).replace(/\s+/g, ''))
+    .reduce((sum, text) => sum + text.length, 0)
+}
+
+function blockCoordinateCount(blocks: OcrTextBlock[]): number {
+  return blocks.filter((block) => !!getBlockRect(block)).length
+}
+
+function shouldPreferRawLayoutBlocks(layoutBlocks: OcrTextBlock[], rawLayoutBlocks: OcrTextBlock[]): boolean {
+  if (rawLayoutBlocks.length === 0) return false
+  if (rawLayoutBlocks.length <= layoutBlocks.length) return false
+  const layoutTextLength = compactBlockTextLength(layoutBlocks)
+  const rawTextLength = compactBlockTextLength(rawLayoutBlocks)
+  if (rawTextLength < 80) return false
+  const rawHasMoreText = rawTextLength >= layoutTextLength * 1.35 && rawTextLength - layoutTextLength >= 40
+  if (!rawHasMoreText) return false
+  return blockCoordinateCount(rawLayoutBlocks) >= blockCoordinateCount(layoutBlocks)
 }
 
 function recognizedTextBlocksFrom(source: unknown): OcrTextBlock[] {
@@ -1049,6 +1073,29 @@ function suppressRepeatedShortLines(lines: string[]): string[] {
   })
 }
 
+function suppressOverrepresentedLines(lines: string[]): string[] {
+  if (lines.length < 24) return lines
+  const normalizedLines = lines.map((line) => line.replace(/\s+/g, '').trim())
+  const totals = new Map<string, number>()
+  normalizedLines.forEach((line) => {
+    if (line.length >= 4) totals.set(line, (totals.get(line) || 0) + 1)
+  })
+  const repeatedLines = [...totals.entries()].filter(([, count]) => count >= 4)
+  if (repeatedLines.length === 0) return lines
+  const repeatedTotal = repeatedLines.reduce((sum, [, count]) => sum + count, 0)
+  if (repeatedTotal < lines.length * 0.35) return lines
+
+  const seen = new Map<string, number>()
+  return lines.filter((_line, index) => {
+    const normalized = normalizedLines[index]
+    const total = totals.get(normalized) || 0
+    if (normalized.length < 4 || total < 4) return true
+    const count = seen.get(normalized) || 0
+    seen.set(normalized, count + 1)
+    return count < 1
+  })
+}
+
 function isStructuralLine(line: string): boolean {
   if (line.length <= 2) return false
   if (/^#{1,6}\s+/.test(line)) return true
@@ -1085,13 +1132,13 @@ function joinLines(left: string, right: string): string {
 
 export function normalizeOcrTextForReading(value: string): string {
   const source = String(value || '').replace(/\r/g, '\n').replace(/\u000c/g, '\n')
-  const lines = suppressRepeatedShortLines(
+  const lines = suppressOverrepresentedLines(suppressRepeatedShortLines(
     source
       .split(/\n+/)
       .map(normalizeLine)
       .map(normalizeRepetitiveOcrLine)
       .filter((line) => !isNoiseLine(line)),
-  )
+  ))
 
   if (isLikelyBlankText(lines.join(''))) return ''
 

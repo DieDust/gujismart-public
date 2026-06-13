@@ -301,6 +301,98 @@ function clampPageIndex(index: number, pageCount: number) {
   return Math.max(0, Math.min(pageCount - 1, index))
 }
 
+function getFinitePageIndex(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null
+  const next = Number(value)
+  return Number.isFinite(next) && next >= 0 ? Math.floor(next) : null
+}
+
+function resolveLocatorPageIndex(
+  pages: Array<Pick<DocumentViewPage, 'id' | 'page_num'>>,
+  locator: SearchHitLocator | null | undefined,
+  fallbackIndex = 0,
+): number {
+  if (pages.length === 0) return Math.max(0, getFinitePageIndex(locator?.pageIndex) ?? fallbackIndex)
+  if (locator?.pageId) {
+    const byId = pages.findIndex((page) => String(page.id) === String(locator.pageId))
+    if (byId >= 0) return byId
+  }
+  const pageNum = Number(locator?.pageNum)
+  if (Number.isFinite(pageNum) && pageNum > 0) {
+    const byPageNum = pages.findIndex((page) => Number(page.page_num) === pageNum)
+    if (byPageNum >= 0) return byPageNum
+  }
+  return clampPageIndex(getFinitePageIndex(locator?.pageIndex) ?? fallbackIndex, pages.length)
+}
+
+function getSearchLocatorKey(locator: SearchHitLocator | null | undefined, keyword = ''): string {
+  if (!locator) return ''
+  return [
+    locator.segmentId || '',
+    locator.pageId || '',
+    locator.pageNum ?? '',
+    locator.pageIndex ?? '',
+    locator.charStart ?? '',
+    locator.charEnd ?? '',
+    locator.queryTerm || keyword,
+  ].join('|')
+}
+
+function doSearchLocatorsMatch(left: SearchHitLocator | null | undefined, right: SearchHitLocator | null | undefined): boolean {
+  if (!left || !right) return false
+  if (left.docId && right.docId && left.docId !== right.docId) return false
+  if (left.segmentId && right.segmentId && left.segmentId === right.segmentId) {
+    const leftNormalized = Number(left.normalizedCharStart)
+    const rightNormalized = Number(right.normalizedCharStart)
+    if (Number.isFinite(leftNormalized) && Number.isFinite(rightNormalized) && Math.abs(leftNormalized - rightNormalized) <= 2) return true
+    const leftChar = Number(left.charStart)
+    const rightChar = Number(right.charStart)
+    if (Number.isFinite(leftChar) && Number.isFinite(rightChar) && Math.abs(leftChar - rightChar) <= 2) return true
+    return Number(left.occurrenceIndex) === Number(right.occurrenceIndex)
+  }
+  if (left.pageId && right.pageId && String(left.pageId) !== String(right.pageId)) return false
+  const leftPageIndex = getFinitePageIndex(left.pageIndex)
+  const rightPageIndex = getFinitePageIndex(right.pageIndex)
+  if (leftPageIndex !== null && rightPageIndex !== null && leftPageIndex !== rightPageIndex) return false
+  const leftPageNum = Number(left.pageNum)
+  const rightPageNum = Number(right.pageNum)
+  if (Number.isFinite(leftPageNum) && Number.isFinite(rightPageNum) && leftPageNum > 0 && rightPageNum > 0 && leftPageNum !== rightPageNum) return false
+  const leftNormalized = Number(left.normalizedCharStart)
+  const rightNormalized = Number(right.normalizedCharStart)
+  if (Number.isFinite(leftNormalized) && Number.isFinite(rightNormalized)) return Math.abs(leftNormalized - rightNormalized) <= 2
+  const leftChar = Number(left.charStart)
+  const rightChar = Number(right.charStart)
+  if (Number.isFinite(leftChar) && Number.isFinite(rightChar)) return Math.abs(leftChar - rightChar) <= 2
+  return Number(left.occurrenceIndex) === Number(right.occurrenceIndex)
+}
+
+function alignSearchSessionToLocator(session: SearchSessionState | undefined, locator: SearchHitLocator | null | undefined): SearchSessionState | undefined {
+  if (!session?.hits?.length || !locator) return session
+  const index = session.hits.findIndex((hit) => doSearchLocatorsMatch(hit.locator, locator))
+  if (index < 0 || index === session.activeHitIndex) return session
+  return { ...session, activeHitIndex: index }
+}
+
+function findSearchMatchIndexForLocator(
+  matches: SearchMatch[],
+  pages: Array<Pick<DocumentViewPage, 'id' | 'page_num'>>,
+  locator: SearchHitLocator | null | undefined,
+  fallbackIndex = 0,
+): number {
+  if (!locator || matches.length === 0) return -1
+  const targetPageIndex = resolveLocatorPageIndex(pages, locator, fallbackIndex)
+  const samePage = matches
+    .map((match, index) => ({
+      index,
+      distance: Math.abs(Number(match.charIndex || 0) - Number(locator.charStart || 0)),
+      occurrenceDistance: Math.abs(Number(match.locator?.occurrenceIndex ?? index) - Number(locator.occurrenceIndex || 0)),
+      match,
+    }))
+    .filter(({ match }) => match.pageIndex === targetPageIndex)
+    .sort((left, right) => left.distance - right.distance || left.occurrenceDistance - right.occurrenceDistance || left.index - right.index)
+  return samePage[0]?.index ?? -1
+}
+
 function isOcrEngine(value: unknown): value is OcrEngine {
   return value === 'paddle' || value === 'vision_model' || value === 'hybrid'
 }
@@ -700,11 +792,19 @@ function highlightTextNode(
           data-search-hit-index={hitIndex}
           data-search-active={active ? 'true' : undefined}
           style={{
-            background: active ? '#ffd438' : '#ffe58f',
+            background: active ? '#ffb020' : 'rgba(255, 229, 143, 0.56)',
             color: '#1f1608',
             padding: '0 2px',
-            borderRadius: 2,
+            borderRadius: 3,
             fontWeight: 700,
+            position: 'relative',
+            zIndex: active ? 3 : 0,
+            border: active ? '1px solid rgba(120, 53, 15, 0.92)' : '1px solid rgba(189, 138, 42, 0.28)',
+            outline: active ? '2px solid rgba(255, 255, 255, 0.88)' : 'none',
+            outlineOffset: 0,
+            boxShadow: active
+              ? '0 0 0 3px rgba(120, 53, 15, 0.82), 0 0 0 6px rgba(255, 176, 32, 0.26)'
+              : '0 0 0 1px rgba(189, 138, 42, 0.08)',
           }}
         >
           {part}
@@ -933,6 +1033,7 @@ export default function DocumentView({
   const [floatPanelOpen, setFloatPanelOpen] = useState(false)
   const [localSearchKeyword, setLocalSearchKeyword] = useState(searchKeyword)
   const [readerSearchPages, setReaderSearchPages] = useState<DocumentPage[]>([])
+  const [readerFullSearchRequested, setReaderFullSearchRequested] = useState(false)
   const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
   const [documentSearchSession, setDocumentSearchSession] = useState<SearchSessionState | undefined>(searchSession)
   const [searchFocused, setSearchFocused] = useState(false)
@@ -1009,12 +1110,14 @@ export default function DocumentView({
   const pageImageCacheRef = useRef<Map<string, string>>(new Map())
   const readerVisiblePageIndexRef = useRef(initialPageIndex)
   const readerStateLoadedRef = useRef(false)
+  const documentModeTouchedRef = useRef(false)
   const readerSaveTimerRef = useRef<number | null>(null)
   const latestReaderStateRef = useRef<ReaderStateSavePayload>({})
   const searchRequestIdRef = useRef(0)
   const searchPagesRequestIdRef = useRef(0)
   const incomingSearchSessionKeyRef = useRef('')
   const searchAutoNavigationKeyRef = useRef('')
+  const appliedInitialSearchLocatorKeyRef = useRef('')
   const temporaryNavigationRef = useRef(false)
   const pageRangeRequestRef = useRef(0)
   const activeDocumentIdRef = useRef(documentId)
@@ -1032,7 +1135,7 @@ export default function DocumentView({
       onOpenDocument?.(target)
       return
     }
-    const targetPageIndex = Math.max(0, target.locator?.pageIndex ?? target.pageIndex ?? ((target.locator?.pageNum || 1) - 1))
+    const targetPageIndex = resolveLocatorPageIndex(sortedPagesRef.current, target.locator, target.pageIndex ?? initialPageIndex)
     const keyword = target.keyword || target.highlightExcerpt || target.locator?.queryTerm || target.excerpt?.slice(0, 40) || ''
     temporaryNavigationRef.current = true
     setDocumentMode('read')
@@ -1043,7 +1146,7 @@ export default function DocumentView({
     setCurrentPageIndex(targetPageIndex)
     setReaderPageIndex(targetPageIndex)
     if (target.revealToc) setReaderTocOpen(true)
-  }, [documentId, onOpenDocument])
+  }, [documentId, initialPageIndex, onOpenDocument])
   const activeTranslationGlossaryProjectId = translationGlossaryProjectId || null
   const translationGlossaryCacheSignature = `${activeTranslationGlossaryProjectId || 'global'}:${translationGlossarySignature || 'none'}`
   const getTranslationSourceHash = useCallback((pageId: string, sourceText: string) => (
@@ -1235,7 +1338,12 @@ export default function DocumentView({
     }
   }, [clearReaderTranslationRuntime])
 
-  const locatorHits = documentSearchSession?.query === effectiveSearchKeyword ? (documentSearchSession.hits || []) : []
+  const shouldPreferLocalSearchMatches = sourceId === 'search' || sourceId === 'fulltext' || sourceId === 'semantic' || sourceId === 'ai_search'
+  const locatorHits = !shouldPreferLocalSearchMatches && documentSearchSession?.query === effectiveSearchKeyword ? (documentSearchSession.hits || []) : []
+  const readerDocumentSearchSession = useMemo(
+    () => alignSearchSessionToLocator(documentSearchSession, locator),
+    [documentSearchSession, locator],
+  )
   const sortedPages = useMemo(
     () => (doc?.id === documentId && doc.pages
       ? doc.pages
@@ -1455,7 +1563,7 @@ export default function DocumentView({
       return locatorHits
         .map((hit, hitIndex) => {
           const locator = hit.locator
-          const pageIndex = clampPageIndex(locator.pageIndex ?? ((locator.pageNum || 1) - 1), sortedPages.length)
+          const pageIndex = resolveLocatorPageIndex(sortedPages, locator)
           const box = findBoxForLocator(sortedPages[pageIndex], locator, effectiveSearchKeyword)
           return {
             pageIndex,
@@ -1590,8 +1698,12 @@ export default function DocumentView({
     try {
       const data = await window.api.getDocumentLight(targetDocId)
       if (activeDocumentIdRef.current !== targetDocId) return
-      setDoc(normalizeDocumentDetail(data, targetDocId))
-      const targetIndex = locator?.pageIndex ?? (locator?.pageNum ? locator.pageNum - 1 : initialPageIndex)
+      const normalizedDoc = normalizeDocumentDetail(data, targetDocId)
+      if (!normalizedDoc) {
+        throw new Error('Document detail is empty')
+      }
+      setDoc(normalizedDoc)
+      const targetIndex = resolveLocatorPageIndex(normalizedDoc.pages || [], locator, initialPageIndex)
       void loadPagesAround(targetIndex, 4)
     } catch (error) {
       console.error(error)
@@ -1958,6 +2070,7 @@ export default function DocumentView({
     setLoading(true)
     setDoc(null)
     setReaderSearchPages([])
+    setReaderFullSearchRequested(false)
     setImageDataUrl('')
     setNextImageDataUrl('')
     setSharedViewport(undefined)
@@ -1969,8 +2082,10 @@ export default function DocumentView({
     clearReaderTranslationRuntime()
     hasInitializedPageRef.current = false
     readerStateLoadedRef.current = false
-    setCurrentPageIndex(0)
-    setReaderPageIndex(0)
+    documentModeTouchedRef.current = false
+    const initialTargetPageIndex = Math.max(0, getFinitePageIndex(locator?.pageIndex) ?? initialPageIndex)
+    setCurrentPageIndex(initialTargetPageIndex)
+    setReaderPageIndex(initialTargetPageIndex)
     setDocumentMode('read')
     setProofViewMode('text')
     setProofViewTouched(false)
@@ -1985,6 +2100,7 @@ export default function DocumentView({
     }
     searchRequestIdRef.current += 1
     incomingSearchSessionKeyRef.current = ''
+    appliedInitialSearchLocatorKeyRef.current = ''
     temporaryNavigationRef.current = !!(sourceId || locator || searchSession?.hits?.length || searchKeyword || highlightExcerpt)
     setDocumentSearchSession(searchSession)
     setCurrentMatchIndex(searchSession?.activeHitIndex ?? -1)
@@ -2003,12 +2119,11 @@ export default function DocumentView({
     const maxIndex = doc.pages ? doc.pages.length - 1 : 0
     if (!hasInitializedPageRef.current) {
       hasInitializedPageRef.current = true
-      const locatorPageIndex = locator?.pageIndex ?? (locator?.pageNum ? locator.pageNum - 1 : undefined)
-      setCurrentPageIndex(Math.min(locatorPageIndex ?? initialPageIndex, maxIndex))
+      setCurrentPageIndex(resolveLocatorPageIndex(sortedPages, locator, initialPageIndex))
       return
     }
     setCurrentPageIndex((value) => Math.min(value, maxIndex))
-  }, [doc, documentMode, initialPageIndex, isEbookDocument, locator])
+  }, [doc, documentMode, initialPageIndex, isEbookDocument, locator, sortedPages])
 
   useEffect(() => {
     const query = effectiveSearchKeyword.trim()
@@ -2020,7 +2135,10 @@ export default function DocumentView({
       setActiveBoxIndex(-1)
       return
     }
-    if (searchSession?.query === query) {
+    const shouldRefreshFocusedIncomingSession = shouldUseSourcePageReader
+      && Boolean(sourceId || locator)
+      && (searchSession?.hits?.length || 0) <= 1
+    if (searchSession?.query === query && !shouldRefreshFocusedIncomingSession) {
       const incomingKey = `${documentId}:${query}:${searchSession.hits?.length || 0}:${searchSession.hits?.[0]?.id || ''}`
       if (incomingSearchSessionKeyRef.current !== incomingKey) {
         incomingSearchSessionKeyRef.current = incomingKey
@@ -2030,7 +2148,20 @@ export default function DocumentView({
       }
       return
     }
-    if (documentSearchSession?.query === query && documentSearchSession.status !== 'searching') return
+    const shouldRefreshCurrentFocusedSession = shouldUseSourcePageReader
+      && Boolean(sourceId || locator)
+      && documentSearchSession?.query === query
+      && (documentSearchSession.hits?.length || 0) <= 1
+    if (documentSearchSession?.query === query && documentSearchSession.status !== 'searching' && !shouldRefreshCurrentFocusedSession) return
+    if (shouldPreferLocalSearchMatches && locator && !shouldUseSourcePageReader) {
+      setDocumentSearchSession({
+        query,
+        hits: [],
+        activeHitIndex: -1,
+        status: 'ready',
+      })
+      return
+    }
 
     setDocumentSearchSession((previous) => ({
       query,
@@ -2064,7 +2195,7 @@ export default function DocumentView({
     return () => {
       window.clearTimeout(timer)
     }
-  }, [documentId, documentSearchSession?.query, documentSearchSession?.status, effectiveSearchKeyword, locator, searchSession])
+  }, [documentId, documentSearchSession?.query, documentSearchSession?.status, effectiveSearchKeyword, locator, searchSession, shouldPreferLocalSearchMatches, shouldUseSourcePageReader, sourceId])
 
   useEffect(() => {
     if (effectiveSearchKeyword.trim()) {
@@ -2084,6 +2215,10 @@ export default function DocumentView({
       setReaderSearchPages([])
       return
     }
+    if (!readerFullSearchRequested && (sourceId || locator || searchSession?.hits?.length)) {
+      setReaderSearchPages([])
+      return
+    }
     if (readerSearchPages.length >= pageCount && readerSearchPages.some((page) => String(page?.proofed_text || page?.ocr_text || '').trim())) return
     void window.api.getDocumentSearchPages(documentId)
       .then((pages) => {
@@ -2098,7 +2233,7 @@ export default function DocumentView({
         console.error('Failed to load reader search pages', error)
         setReaderSearchPages([])
       })
-  }, [documentId, localSearchKeyword, pageCount, readerSearchPages.length, shouldUseSourcePageReader])
+  }, [documentId, localSearchKeyword, locator, pageCount, readerFullSearchRequested, readerSearchPages.length, searchSession?.hits?.length, shouldUseSourcePageReader, sourceId])
 
   useEffect(() => {
     if (!doc || readerStateLoadedRef.current || searchKeyword) return
@@ -2118,11 +2253,12 @@ export default function DocumentView({
       if (state.font_size) setReaderFontSize(state.font_size)
       if (state.line_height) setReaderLineHeight(state.line_height)
       if (state.theme === 'paper' || state.theme === 'sepia' || state.theme === 'dark') setReaderTheme(state.theme)
-      if (state.view_mode === 'single') setDocumentMode('read')
+      const canRestoreDocumentMode = !documentModeTouchedRef.current
+      if (canRestoreDocumentMode && state.view_mode === 'single') setDocumentMode('read')
       const savedLocationKey = String(state.location_key || '')
       setInitialReaderLocationKey(savedLocationKey)
 
-      if (state.document_mode === 'proof' && !isEbookDocumentRef.current) {
+      if (canRestoreDocumentMode && state.document_mode === 'proof' && !isEbookDocumentRef.current) {
         setDocumentMode('proof')
         if (state.proof_view_mode === 'facsimile' || state.proof_view_mode === 'text') {
           setProofViewMode(state.proof_view_mode)
@@ -2220,6 +2356,25 @@ export default function DocumentView({
     setCurrentMatchIndex(-1)
     searchAutoNavigationKeyRef.current = ''
   }, [effectiveSearchKeyword])
+
+  useEffect(() => {
+    if (!locator || !effectiveSearchKeyword.trim()) return
+    const locatorKey = getSearchLocatorKey(locator, effectiveSearchKeyword)
+    if (!locatorKey || appliedInitialSearchLocatorKeyRef.current === locatorKey) return
+    const matches = shouldUseTextReaderMode ? textReaderMatches : searchMatches
+    const targetIndex = findSearchMatchIndexForLocator(matches, sortedPages, locator, initialPageIndex)
+    if (targetIndex < 0) return
+    appliedInitialSearchLocatorKeyRef.current = locatorKey
+    const targetMatch = matches[targetIndex]
+    setCurrentMatchIndex(targetIndex)
+    setReaderSearchResultPage(Math.floor(targetIndex / READER_SEARCH_RESULT_PAGE_SIZE) + 1)
+    setActiveBoxIndex(targetMatch.boxIndex)
+    if (shouldUseTextReaderMode) {
+      setReaderPageIndex(targetMatch.pageIndex)
+    } else if (targetMatch.pageIndex !== currentPageIndex) {
+      setCurrentPageIndex(targetMatch.pageIndex)
+    }
+  }, [currentPageIndex, effectiveSearchKeyword, initialPageIndex, locator, searchMatches, shouldUseTextReaderMode, sortedPages, textReaderMatches])
 
   useEffect(() => {
     if (documentMode !== 'proof') return
@@ -2905,6 +3060,7 @@ export default function DocumentView({
 
   const switchDocumentMode = async (nextMode: DocumentMode) => {
     if (nextMode === documentMode) return
+    documentModeTouchedRef.current = true
     const activeSearchMatch = currentMatchIndex >= 0
       ? (shouldUseTextReaderMode ? textReaderMatches[currentMatchIndex] : searchMatches[currentMatchIndex])
       : null
@@ -4195,7 +4351,7 @@ export default function DocumentView({
               sourceLabel={sourceLabel}
               initialLocationKey={initialReaderLocationKey}
               locator={locator}
-              searchSession={documentSearchSession}
+              searchSession={readerDocumentSearchSession}
               pageTranslations={readerPageTranslations}
               translatingPageIds={translatingPageIds}
               skippedTranslationPageIds={skippedTranslationPageIds}
@@ -4215,6 +4371,7 @@ export default function DocumentView({
                 void loadPagesAround(nextIndex, 5)
               }}
               onSearchKeywordChange={(keyword) => {
+                setReaderFullSearchRequested(true)
                 setLocalSearchKeyword(keyword)
                 setCurrentMatchIndex(-1)
                 setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle' })
@@ -4264,7 +4421,7 @@ export default function DocumentView({
             searchKeyword={localSearchKeyword}
             highlightColor={highlightColor}
             sourceLabel={sourceLabel}
-            searchSession={documentSearchSession}
+            searchSession={readerDocumentSearchSession}
             pageTranslations={sourceReaderPageTranslations}
             translatingPageIds={translatingPageIds}
             skippedTranslationPageIds={skippedTranslationPageIds}
@@ -4386,7 +4543,10 @@ export default function DocumentView({
                 placeholder="搜索正文"
                 prefix={<SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />}
                 value={localSearchKeyword}
-                onChange={(event) => setLocalSearchKeyword(event.target.value)}
+                onChange={(event) => {
+                  setReaderFullSearchRequested(true)
+                  setLocalSearchKeyword(event.target.value)
+                }}
                 onFocus={() => setSearchFocused(true)}
                 onBlur={() => setSearchFocused(false)}
                 onPressEnter={handleSearchNext}
@@ -4669,7 +4829,10 @@ export default function DocumentView({
                 placeholder="搜索本页文本"
                 prefix={<SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />}
                 value={localSearchKeyword}
-                onChange={(event) => setLocalSearchKeyword(event.target.value)}
+                onChange={(event) => {
+                  setReaderFullSearchRequested(true)
+                  setLocalSearchKeyword(event.target.value)
+                }}
                 onFocus={() => setSearchFocused(true)}
                 onBlur={() => setSearchFocused(false)}
                 allowClear

@@ -36,6 +36,7 @@ import type {
   BookTranslationStartResult,
   ActiveTranslationGlossaryPayload,
   AppPathName,
+  AppUpdateInfo,
   CitationGenerateOptions,
   CitationStyle,
   CitationStyleDraft,
@@ -568,6 +569,8 @@ const api = {
 
   getVersion: (): Promise<string> =>
     ipcRenderer.invoke('app:getVersion'),
+  checkForUpdates: (): Promise<AppUpdateInfo> =>
+    ipcRenderer.invoke('app:checkForUpdates'),
   getPath: (name: AppPathName): Promise<string> =>
     ipcRenderer.invoke('app:getPath', name),
 

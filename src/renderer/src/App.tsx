@@ -25,7 +25,7 @@ import WelcomeView from './views/WelcomeView'
 import { useFolderStore } from './stores/useFolderStore'
 import { useOnboardingStore } from './stores/useOnboardingStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
-import type { LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget } from '@shared/types'
+import type { AppUpdateInfo, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
 import './styles/app.css'
 
@@ -56,6 +56,10 @@ function ViewLoadingFallback() {
       <Spin />
     </div>
   )
+}
+
+function getUpdateNoticeStorageKey(info: AppUpdateInfo): string {
+  return `gujismart:update-notice:${info.latestVersion}`
 }
 
 export default function App() {
@@ -114,6 +118,30 @@ export default function App() {
         useFolderStore.getState().setFolders(items)
       })
       .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    window.api.checkForUpdates()
+      .then((info) => {
+        if (cancelled || !info.hasUpdate || !info.latestVersion) return
+        const storageKey = getUpdateNoticeStorageKey(info)
+        if (window.localStorage.getItem(storageKey) === 'true') return
+        window.localStorage.setItem(storageKey, 'true')
+        Modal.confirm({
+          title: `发现新版本 ${info.latestVersion}`,
+          content: `当前版本 ${info.currentVersion}，可以前往 GitHub Release 下载新版安装包或便携版。`,
+          okText: '查看下载',
+          cancelText: '稍后',
+          onOk: () => {
+            window.open(info.releaseUrl, '_blank', 'noopener,noreferrer')
+          },
+        })
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   useEffect(() => {

@@ -13,6 +13,9 @@ async function run() {
   const samplePath = path.join(userDataDir, 'source-structured-ocr-regression.json')
   const layoutOnlyText = 'structured OCR layout-only reader marker'
   const tableCellText = 'structured OCR table cell marker'
+  const rawLayoutOnlyText = 'structured OCR raw-layout recovered marker'
+  const rawLayoutMissingText = 'structured OCR raw-layout missing line marker'
+  const repeatedOcrLine = 'structured OCR repeated line marker'
   const htmlTableHeader = '学習科目'
   const htmlTableBody = '国民科'
   const htmlTableTail = '算数'
@@ -41,6 +44,43 @@ async function run() {
           html: `<table><tr><td>${htmlTableHeader}</td><td>第一学年</td><td>第二学年</td><td>第三学年</td><td>第四学年</td></tr><tr><td>${htmlTableBody}</td><td>13</td><td>14</td><td>15</td><td>17</td></tr><tr><td>${htmlTableTail}</td><td>6</td><td>6</td><td>6</td><td>6</td></tr><tr><td>体育</td><td rowspan="2">3</td><td rowspan="2">3</td><td rowspan="2">3</td><td rowspan="2">3</td></tr><tr><td>音楽</td></tr></table>`,
           table_html: `<table><tr><td>${htmlTableHeader}</td><td>第一学年</td><td>第二学年</td><td>第三学年</td><td>第四学年</td></tr><tr><td>${htmlTableBody}</td><td>13</td><td>14</td><td>15</td><td>17</td></tr><tr><td>${htmlTableTail}</td><td>6</td><td>6</td><td>6</td><td>6</td></tr><tr><td>体育</td><td rowspan="2">3</td><td rowspan="2">3</td><td rowspan="2">3</td><td rowspan="2">3</td></tr><tr><td>音楽</td></tr></table>`,
           location: { left: 80, top: 380, width: 620, height: 180 },
+        },
+      ],
+    },
+    {
+      page_num: 2,
+      layout_result: [
+        {
+          label: 'text',
+          words: 'short incomplete layout marker',
+          location: { left: 420, top: 100, width: 24, height: 120 },
+        },
+      ],
+      raw_layout_result: [
+        {
+          label: 'vertical_text',
+          words: rawLayoutOnlyText,
+          location: { left: 420, top: 100, width: 24, height: 180 },
+        },
+        {
+          label: 'vertical_text',
+          words: rawLayoutMissingText,
+          location: { left: 380, top: 100, width: 24, height: 180 },
+        },
+        {
+          label: 'vertical_text',
+          words: 'structured OCR raw-layout filler alpha beta gamma delta epsilon zeta',
+          location: { left: 340, top: 100, width: 24, height: 180 },
+        },
+      ],
+    },
+    {
+      page_num: 3,
+      layout_result: [
+        {
+          label: 'text',
+          words: Array.from({ length: 32 }, () => repeatedOcrLine).join('\n'),
+          location: { left: 80, top: 120, width: 520, height: 320 },
         },
       ],
     }],
@@ -126,6 +166,29 @@ async function run() {
     assert(restoredTable?.rows >= 5, `Expected restored HTML table rows, saw ${JSON.stringify(tableState)}`)
     assert(restoredTable?.firstRowCells === 5, `Expected restored HTML table columns, saw ${JSON.stringify(tableState)}`)
     assert(restoredTable?.lastRowCells === 5, `Expected rowspan-expanded final row columns, saw ${JSON.stringify(tableState)}`)
+
+    await win.evaluate((id) => window.__smokeOpenDocument({ docId: id, pageIndex: 1 }), docId)
+    await win.waitForFunction((marker) => (document.querySelector('main')?.textContent || '').includes(marker), rawLayoutMissingText, { timeout: 12000 })
+    const rawLayoutState = await win.evaluate(() => ({
+      text: (document.querySelector('main')?.textContent || '').replace(/\s+/g, ' ').trim(),
+      anchorCount: document.querySelectorAll('[data-source-anchor="true"]').length,
+    }))
+    assert(rawLayoutState.text.includes(rawLayoutOnlyText), `Expected raw layout text in reader, saw ${JSON.stringify(rawLayoutState)}`)
+    assert(rawLayoutState.text.includes(rawLayoutMissingText), `Expected raw-only missing text in reader, saw ${JSON.stringify(rawLayoutState)}`)
+
+    await win.evaluate((id) => window.__smokeOpenDocument({ docId: id, pageIndex: 2 }), docId)
+    await win.waitForFunction((marker) => (document.querySelector('main')?.textContent || '').includes(marker), repeatedOcrLine, { timeout: 12000 })
+    const repeatedState = await win.evaluate((marker) => {
+      const text = (document.querySelector('main')?.textContent || '').replace(/\s+/g, ' ').trim()
+      const anchorText = Array.from(document.querySelectorAll('[data-source-anchor="true"]'))
+        .map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim())
+        .join('\n')
+      return {
+        text,
+        occurrences: anchorText.split(marker).length - 1,
+      }
+    }, repeatedOcrLine)
+    assert(repeatedState.occurrences === 1, `Expected repeated OCR line to render once, saw ${JSON.stringify(repeatedState)}`)
 
     console.log('Source structured OCR regression passed.')
   } finally {

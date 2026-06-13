@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Alert, Button, Card, Empty, Input, List, Modal, Pagination, Select, Space, Spin, Switch, Tag, Typography, message, type InputRef } from 'antd'
 import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutlined, RobotOutlined, SaveOutlined, SearchOutlined, StarOutlined } from '@ant-design/icons'
 import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
@@ -22,6 +22,7 @@ import type {
   SearchHitLocator,
   SearchOptions,
   SearchResult as FlatSearchResult,
+  SearchSessionState,
   Tag as SharedTag,
 } from '@shared/types'
 
@@ -75,6 +76,12 @@ interface SearchDocumentHitPageState {
   loading: boolean
   payload?: SearchDocumentHitPage
   error?: string
+}
+
+interface PendingSearchScrollRestore {
+  scrollTop: number
+  anchorDocId?: string
+  anchorTop?: number
 }
 
 const SEARCH_HISTORY_STORAGE_KEY = 'gujismart.search.history.v1'
@@ -483,6 +490,38 @@ async function applyViewerHitCounts(
   }
 }
 
+function buildFocusedSearchSession(query: string, hit?: SearchHit | null): SearchSessionState | undefined {
+  if (!hit) return undefined
+  return {
+    query,
+    hits: [hit],
+    activeHitIndex: 0,
+    status: 'ready',
+  }
+}
+
+function getReliableLocatorPageIndex(locator: SearchHitLocator | null | undefined): number | undefined {
+  const rawValue = locator?.pageIndex
+  if (rawValue === null || rawValue === undefined) return undefined
+  const value = Number(rawValue)
+  return Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
+}
+
+function buildSearchHitFromFlatResult(item: FlatSearchResult, query: string, fallbackKeyword: string): SearchHit | undefined {
+  if (!item.locator) return undefined
+  const matchText = item.locator.matchText || item.matched_query || fallbackKeyword || query
+  return {
+    id: item.locator.segmentId || `${item.doc_id}:${item.page_num || 0}:${item.occurrence_index ?? 0}`,
+    locator: {
+      ...item.locator,
+      matchText,
+      queryTerm: item.locator.queryTerm || item.matched_query || fallbackKeyword || query,
+    },
+    snippet: String(item.snippet || ''),
+    score: Number(item.rank || 0),
+  }
+}
+
 export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryAi }: SearchViewProps) {
   const {
     keyword,
@@ -529,6 +568,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const [documentHitPages, setDocumentHitPages] = useState<Record<string, SearchDocumentHitPageState>>({})
   const [shortcuts, setShortcuts] = useState<ShortcutMap | null>(null)
   const searchInputRef = useRef<InputRef>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const pendingScrollRestoreRef = useRef<PendingSearchScrollRestore | null>(null)
 
   const filterSignature = useMemo(() => JSON.stringify({ filters: compactFilterOptions(filters), sort: searchSort, contextMode }), [filters, searchSort, contextMode])
   const selectedDocIds = filters.docIds || []
@@ -584,6 +625,61 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   )
   const hasSearchSnapshot = !!groupedResponse || results.length > 0
   const searchConditionsChanged = hasSearchSnapshot && !!executedSearchSignature && pendingSearchSignature !== executedSearchSignature
+
+  const getSearchAnchorTop = (element: HTMLElement, container: HTMLElement) => {
+    const elementRect = element.getBoundingClientRect()
+    const containerRect = container.getBoundingClientRect()
+    return elementRect.top - containerRect.top + container.scrollTop
+  }
+
+  const findSearchDocHitPanel = (docId: string) => {
+    const container = scrollContainerRef.current
+    if (!container) return null
+    return Array.from(container.querySelectorAll<HTMLElement>('[data-search-doc-id]'))
+      .find((element) => element.dataset.searchDocId === docId) || null
+  }
+
+  const blurActiveSearchControl = () => {
+    const active = document.activeElement
+    if (active instanceof HTMLElement) active.blur()
+  }
+
+  const rememberSearchScrollPosition = (anchorDocId?: string) => {
+    const container = scrollContainerRef.current
+    if (!container) return
+    const anchor = anchorDocId ? findSearchDocHitPanel(anchorDocId) : null
+    pendingScrollRestoreRef.current = {
+      scrollTop: container.scrollTop,
+      anchorDocId,
+      anchorTop: anchor ? getSearchAnchorTop(anchor, container) : undefined,
+    }
+    blurActiveSearchControl()
+  }
+
+  useLayoutEffect(() => {
+    const pending = pendingScrollRestoreRef.current
+    if (loading || pending === null) return
+    if (pending.anchorDocId && documentHitPages[pending.anchorDocId]?.loading) return
+    const restore = pending
+    pendingScrollRestoreRef.current = null
+    const applyRestore = () => {
+      const container = scrollContainerRef.current
+      if (!container) return
+      if (restore.anchorDocId && restore.anchorTop !== undefined) {
+        const anchor = findSearchDocHitPanel(restore.anchorDocId)
+        if (anchor) {
+          const nextTop = getSearchAnchorTop(anchor, container)
+          container.scrollTop += nextTop - restore.anchorTop
+          return
+        }
+      }
+      container.scrollTop = restore.scrollTop
+    }
+    window.requestAnimationFrame(() => {
+      applyRestore()
+      window.requestAnimationFrame(applyRestore)
+    })
+  }, [documentHitPages, expandedHitDocId, groupedResponse, loading, results])
 
   const updateSearchHistory = (updater: (entries: SearchHistoryEntry[]) => SearchHistoryEntry[]) => {
     setSearchHistory((previous) => {
@@ -1082,6 +1178,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       message.info('检索条件已变化，请先点击搜索')
       return
     }
+    rememberSearchScrollPosition()
     void handleSearch(activeKeyword, filters, 'fulltext', page)
   }
 
@@ -1090,11 +1187,12 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     const activeKeyword = (keyword || inputValue || activeHit?.locator.queryTerm || '').trim()
     onSelectDoc?.({
       docId: group.docId,
-      pageIndex: activeHit?.locator.pageIndex ?? 0,
+      pageIndex: getReliableLocatorPageIndex(activeHit?.locator),
       keyword: activeKeyword || activeHit?.locator.queryTerm || inputValue,
       excerpt: activeHit ? stripSnippetMarkers(activeHit.snippet).slice(0, 120) : undefined,
       sourceId: 'search',
       locator: activeHit?.locator,
+      searchSession: buildFocusedSearchSession(activeKeyword || activeHit?.locator.queryTerm || inputValue, activeHit),
     })
   }
 
@@ -1143,6 +1241,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const handleToggleDocumentHits = (event: React.MouseEvent, group: SearchDocumentGroup) => {
     event.stopPropagation()
+    rememberSearchScrollPosition(group.docId)
     if (expandedHitDocId === group.docId) {
       setExpandedHitDocId('')
       return
@@ -1237,7 +1336,10 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               pageSize={payload.pageSize}
               total={payload.totalHits}
               showSizeChanger={false}
-              onChange={(page) => void loadGroupedDocumentHitPage(group, page)}
+              onChange={(page) => {
+                rememberSearchScrollPosition(group.docId)
+                void loadGroupedDocumentHitPage(group, page)
+              }}
             />
           </div>
         ) : null}
@@ -1253,7 +1355,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     && !searchConditionsChanged
 
   return (
-    <div style={{ padding: '24px 32px', height: '100%', overflow: 'auto' }}>
+    <div ref={scrollContainerRef} style={{ padding: '24px 32px', height: '100%', overflow: 'auto' }}>
       <Title level={3} style={{ color: 'var(--gs-gold)', marginTop: 0 }}>文献检索</Title>
 
       <Space.Compact style={{ width: '100%', maxWidth: 980, marginBottom: 12 }}>
@@ -1733,6 +1835,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             const hitTerms = getResultHitTerms(item, baseHighlightKeywords)
             const highlightTerms = inputHighlightKeywords
             const jumpKeyword = getJumpKeyword(item, inputValue, hitTerms)
+            const activeKeyword = (keyword || inputValue || item.locator?.queryTerm || jumpKeyword).trim()
+            const focusedHit = buildSearchHitFromFlatResult(item, activeKeyword, jumpKeyword)
             return (
               <Card
                 size={'small'}
@@ -1740,11 +1844,12 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                 style={{ marginBottom: 10, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}
                 onClick={() => onSelectDoc?.({
                   docId: item.doc_id,
-                  pageIndex: item.locator?.pageIndex ?? (item.page_num ? item.page_num - 1 : 0),
-                  keyword: (keyword || inputValue || item.locator?.queryTerm || jumpKeyword).trim(),
+                  pageIndex: getReliableLocatorPageIndex(item.locator),
+                  keyword: activeKeyword,
                   excerpt: stripSnippetMarkers(String(item.snippet || '')).slice(0, 120),
                   sourceId: item.hit_field || 'search',
                   locator: item.locator,
+                  searchSession: buildFocusedSearchSession(activeKeyword, focusedHit),
                 })}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>

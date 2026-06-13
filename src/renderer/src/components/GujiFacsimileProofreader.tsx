@@ -1242,6 +1242,7 @@ export default function GujiFacsimileProofreader({
   const pageRef = useRef<HTMLDivElement>(null)
   const wheelAnchorFrameRef = useRef<number | null>(null)
   const wheelZoomCommitTimerRef = useRef<number | null>(null)
+  const pageRecenterFrameRef = useRef<number | null>(null)
   const translationRequestKeyRef = useRef('')
   const pageZoomRef = useRef(1)
   const fitWidthRef = useRef(true)
@@ -1273,6 +1274,18 @@ export default function GujiFacsimileProofreader({
     setInternalTranslationOpen(open)
     onTranslationOpenChange?.(open)
   }, [onTranslationOpenChange])
+  const schedulePageRecenter = useCallback(() => {
+    if (pageRecenterFrameRef.current != null) {
+      window.cancelAnimationFrame(pageRecenterFrameRef.current)
+    }
+    pageRecenterFrameRef.current = window.requestAnimationFrame(() => {
+      pageRecenterFrameRef.current = null
+      const root = rootRef.current
+      if (!root) return
+      root.scrollLeft = Math.max(0, Math.round((root.scrollWidth - root.clientWidth) / 2))
+      root.scrollTop = 0
+    })
+  }, [])
   const handleTranslationOpenChange = useCallback((checked: boolean) => {
     setTranslationOpen(checked)
     if (checked && pageSourceText.trim() && !translationText.trim() && !translationLoading) {
@@ -1290,13 +1303,7 @@ export default function GujiFacsimileProofreader({
   }, [ocrResult, pageId])
 
   useEffect(() => {
-    setPageZoom(1)
-    setPageRotation(0)
-    setFitWidth(true)
     setIsPanning(false)
-    pageZoomRef.current = 1
-    pageRotationRef.current = 0
-    fitWidthRef.current = true
     if (wheelAnchorFrameRef.current != null) {
       window.cancelAnimationFrame(wheelAnchorFrameRef.current)
       wheelAnchorFrameRef.current = null
@@ -1305,20 +1312,8 @@ export default function GujiFacsimileProofreader({
       window.clearTimeout(wheelZoomCommitTimerRef.current)
       wheelZoomCommitTimerRef.current = null
     }
-    if (rootRef.current) {
-      rootRef.current.scrollLeft = 0
-      rootRef.current.scrollTop = 0
-    }
-    if (pageFrameRef.current) {
-      pageFrameRef.current.style.width = ''
-      pageFrameRef.current.style.height = ''
-    }
-    if (pageRef.current) {
-      pageRef.current.style.transform = ''
-      pageRef.current.style.transformOrigin = ''
-      pageRef.current.style.willChange = ''
-    }
-  }, [pageId])
+    schedulePageRecenter()
+  }, [pageId, schedulePageRecenter])
 
   useEffect(() => {
     if (!translationOpen || !pageSourceText.trim() || translationLoading || translationSkipped || translationText.trim() || !onTranslateCurrentPage) return
@@ -1391,6 +1386,7 @@ export default function GujiFacsimileProofreader({
   useEffect(() => () => {
     if (wheelAnchorFrameRef.current != null) window.cancelAnimationFrame(wheelAnchorFrameRef.current)
     if (wheelZoomCommitTimerRef.current != null) window.clearTimeout(wheelZoomCommitTimerRef.current)
+    if (pageRecenterFrameRef.current != null) window.cancelAnimationFrame(pageRecenterFrameRef.current)
   }, [])
 
   useEffect(() => {
@@ -1462,6 +1458,25 @@ export default function GujiFacsimileProofreader({
   const visualFrameWidth = rotatedQuarterTurns ? visualPageHeight : visualPageWidth
   const visualFrameHeight = rotatedQuarterTurns ? visualPageWidth : visualPageHeight
   const canUndo = historyIndex > 0
+  const getPageTransform = useCallback((zoom: number, rotation: number) => (
+    `translate(-50%, -50%) rotate(${rotation}deg) scale(${zoom})`
+  ), [])
+
+  useLayoutEffect(() => {
+    const frame = pageFrameRef.current
+    const page = pageRef.current
+    if (!frame || !page) return
+    frame.style.width = `${visualFrameWidth}px`
+    frame.style.height = `${visualFrameHeight}px`
+    page.style.transform = getPageTransform(pageVisualScale, pageRotation)
+    page.style.transformOrigin = 'center center'
+    page.style.willChange = pageVisualScale === 1 && pageRotation === 0 ? '' : 'transform'
+  }, [getPageTransform, pageRotation, pageVisualScale, visualFrameHeight, visualFrameWidth])
+
+  useLayoutEffect(() => {
+    schedulePageRecenter()
+  }, [pageId, pageImageNaturalSize?.height, pageImageNaturalSize?.width, schedulePageRecenter])
+
   const translationOverlays = useMemo(() => {
     if (!translationOpen || translationLoading || translationSkipped || !translationText.trim() || !pageSourceText.trim()) return []
     return buildFacsimileTranslationOverlays(pageBlocks, pageSourceText, translationText)
@@ -1645,10 +1660,6 @@ export default function GujiFacsimileProofreader({
     const selected = window.getSelection()?.toString().trim() || ''
     if (selected) onTextSelectionChange?.(selected)
   }, [onTextSelectionChange])
-
-  const getPageTransform = useCallback((zoom: number, rotation: number) => (
-    `translate(-50%, -50%) rotate(${rotation}deg) scale(${zoom})`
-  ), [])
 
   const applyPageZoomDom = useCallback((zoom: number) => {
     const frame = pageFrameRef.current

@@ -643,6 +643,35 @@ CREATE TABLE IF NOT EXISTS search_ngram_index (
   FOREIGN KEY (segment_id) REFERENCES search_index_segments(segment_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS search_index_segments_staging (
+  job_id TEXT NOT NULL,
+  segment_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  page_id TEXT,
+  page_num INTEGER,
+  source_kind TEXT DEFAULT 'page',
+  href TEXT,
+  title TEXT,
+  ordinal INTEGER DEFAULT 0,
+  source_start INTEGER DEFAULT 0,
+  text TEXT DEFAULT '',
+  normalized_text TEXT DEFAULT '',
+  offset_map TEXT DEFAULT '',
+  text_hash TEXT DEFAULT '',
+  updated_at TEXT,
+  PRIMARY KEY (job_id, segment_id)
+);
+
+CREATE TABLE IF NOT EXISTS search_ngram_index_staging (
+  job_id TEXT NOT NULL,
+  gram TEXT NOT NULL,
+  segment_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  positions TEXT NOT NULL,
+  hit_count INTEGER DEFAULT 0,
+  PRIMARY KEY (job_id, gram, segment_id)
+);
+
 CREATE TABLE IF NOT EXISTS search_index_status (
   doc_id TEXT PRIMARY KEY,
   status TEXT DEFAULT 'pending',
@@ -715,6 +744,8 @@ CREATE INDEX IF NOT EXISTS idx_search_segments_page_num ON search_index_segments
 CREATE INDEX IF NOT EXISTS idx_search_ngram_doc_id ON search_ngram_index(doc_id);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_segment ON search_ngram_index(segment_id);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_hit_count ON search_ngram_index(gram, hit_count);
+CREATE INDEX IF NOT EXISTS idx_search_segments_staging_doc ON search_index_segments_staging(job_id, doc_id);
+CREATE INDEX IF NOT EXISTS idx_search_ngram_staging_doc ON search_ngram_index_staging(job_id, doc_id);
 CREATE INDEX IF NOT EXISTS idx_search_index_status_updated_at ON search_index_status(updated_at);
 CREATE INDEX IF NOT EXISTS idx_ai_document_summaries_updated_at ON ai_document_summaries(updated_at);
 CREATE INDEX IF NOT EXISTS idx_pdf_repository_index_sha256 ON pdf_repository_index(sha256);
@@ -1024,6 +1055,12 @@ function cleanupOrphanRows(sqlite: NativeDatabase): void {
   }
   if (hasTable(sqlite, 'search_index_status') && hasTable(sqlite, 'documents')) {
     statements.push('DELETE FROM search_index_status WHERE doc_id NOT IN (SELECT id FROM documents)')
+  }
+  if (hasTable(sqlite, 'search_ngram_index_staging')) {
+    statements.push('DELETE FROM search_ngram_index_staging')
+  }
+  if (hasTable(sqlite, 'search_index_segments_staging')) {
+    statements.push('DELETE FROM search_index_segments_staging')
   }
   if (hasTable(sqlite, 'document_toc_items') && hasTable(sqlite, 'documents')) {
     statements.push('DELETE FROM document_toc_items WHERE doc_id NOT IN (SELECT id FROM documents)')

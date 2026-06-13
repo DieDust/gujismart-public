@@ -1,4 +1,4 @@
-export const SEARCH_INDEX_VERSION = 'segments-v8-background-sliced'
+export const SEARCH_INDEX_VERSION = 'segments-v9-ocr-dedupe'
 export const BACKGROUND_REINDEX_PAGE_BATCH_SIZE = 4
 export const BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE = 4
 export const BACKGROUND_REINDEX_SEGMENT_FTS_BATCH_SIZE = 80

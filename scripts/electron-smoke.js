@@ -51,6 +51,43 @@ async function verifyMainText(window, expectedText) {
   expectContains(text, expectedText, 'main content')
 }
 
+async function assertActiveSearchHighlightIsVisuallyDistinct(window, label) {
+  const state = await window.evaluate(() => {
+    const activeMarks = Array.from(document.querySelectorAll('mark[data-search-active="true"]'))
+    const active = activeMarks[0]
+    const inactive = Array.from(document.querySelectorAll('mark[data-search-hit-index]'))
+      .find((mark) => mark.getAttribute('data-search-active') !== 'true')
+    const activeStyle = active ? getComputedStyle(active) : null
+    const inactiveStyle = inactive ? getComputedStyle(inactive) : null
+    return {
+      activeCount: activeMarks.length,
+      activeText: active?.textContent || '',
+      activeBackground: activeStyle?.backgroundColor || '',
+      activeBorderColor: activeStyle?.borderColor || '',
+      activeBoxShadow: activeStyle?.boxShadow || '',
+      activeOutlineStyle: activeStyle?.outlineStyle || '',
+      activeOutlineWidth: activeStyle?.outlineWidth || '',
+      inactivePresent: !!inactive,
+      inactiveBackground: inactiveStyle?.backgroundColor || '',
+      inactiveBorderColor: inactiveStyle?.borderColor || '',
+      inactiveBoxShadow: inactiveStyle?.boxShadow || '',
+      inactiveOutlineStyle: inactiveStyle?.outlineStyle || '',
+      counter: document.querySelector('[data-reader-search-counter="true"]')?.textContent || '',
+    }
+  })
+  const activeOutlineWidth = Number.parseFloat(state.activeOutlineWidth || '0') || 0
+  const hasActiveRing = state.activeBoxShadow !== 'none'
+    || (state.activeOutlineStyle !== 'none' && activeOutlineWidth > 0)
+  const differsFromInactive = !state.inactivePresent
+    || state.activeBackground !== state.inactiveBackground
+    || state.activeBorderColor !== state.inactiveBorderColor
+    || state.activeBoxShadow !== state.inactiveBoxShadow
+    || state.activeOutlineStyle !== state.inactiveOutlineStyle
+  if (state.activeCount !== 1 || !hasActiveRing || !differsFromInactive) {
+    throw new Error(`Expected active search highlight to be visually distinct at ${label}, saw ${JSON.stringify(state)}`)
+  }
+}
+
 async function verifyCitationStyles(window) {
   const payload = await window.evaluate(async () => {
     const styles = await window.api.listCitationStyles()
@@ -439,6 +476,7 @@ async function verifySearchReaderRoundTrip(window, userDataDir) {
       && document.querySelectorAll('mark[data-search-active="true"]').length === 1
       && /\/\d+/.test(counter)
   }, null, { timeout: 5000 })
+  await assertActiveSearchHighlightIsVisuallyDistinct(window, 'search reader roundtrip')
 }
 
 async function verifySearchDocumentHitDirectory(window, userDataDir) {
@@ -643,6 +681,7 @@ async function verifyReaderSearchStaysWithinVisibleSpread(window, userDataDir) {
     const channels = String(background || '').match(/\d+(?:\.\d+)?/g)?.map(Number) || []
     const [red, green, blue] = channels
     return red === 255 && (
+      (green === 176 && blue === 32) ||
       (green === 212 && blue === 56) ||
       (green === 224 && blue === 102) ||
       (green === 229 && blue === 143)
@@ -658,6 +697,7 @@ async function verifyReaderSearchStaysWithinVisibleSpread(window, userDataDir) {
   if (!isExpectedSearchHighlightBackground(beforeSearchState.activeBackground)) {
     throw new Error(`Expected active hit to use selected color before next, saw ${JSON.stringify(beforeSearchState)}`)
   }
+  await assertActiveSearchHighlightIsVisuallyDistinct(window, 'visible spread before next')
 
   const nextSearchButton = window.locator('button[data-reader-search-next="true"]').first()
   const getNavigationEpoch = async () => window.locator('[data-search-navigation-epoch]').first().getAttribute('data-search-navigation-epoch').then((value) => Number(value || 0)).catch(() => 0)
@@ -694,6 +734,7 @@ async function verifyReaderSearchStaysWithinVisibleSpread(window, userDataDir) {
   if (!isExpectedSearchHighlightBackground(afterSearchState.activeBackground)) {
     throw new Error(`Expected active hit to use selected color after next, saw ${JSON.stringify(afterSearchState)}`)
   }
+  await assertActiveSearchHighlightIsVisuallyDistinct(window, 'visible spread after next')
 
   previousEpoch = await getNavigationEpoch()
   await nextSearchButton.click()
@@ -855,6 +896,7 @@ async function verifyReaderSearchHasSingleActiveHighlight(window, userDataDir) {
     }))
     throw new Error(`Expected exactly one active highlight after entering body hits, saw ${state.activeCount}; debug=${JSON.stringify(debug)}`)
   }
+  await assertActiveSearchHighlightIsVisuallyDistinct(window, 'many active initial')
 
   for (let i = 0; i < 6; i += 1) {
     await nextSearchButton.click()
@@ -864,7 +906,38 @@ async function verifyReaderSearchHasSingleActiveHighlight(window, userDataDir) {
       const activeIndexes = await window.evaluate(() => Array.from(document.querySelectorAll('mark[data-search-active="true"]')).map((node) => node.getAttribute('data-search-hit-index')))
       throw new Error(`Expected exactly one active highlight after next ${i + 1}, saw ${state.activeCount}: ${activeIndexes.join(',')}; counter=${state.counter}`)
     }
+    await assertActiveSearchHighlightIsVisuallyDistinct(window, `many active next ${i + 1}`)
   }
+
+  const parseCounter = (counter) => {
+    const match = String(counter || '').match(/(\d+)\s*\/\s*(\d+)/)
+    return match ? { index: Number(match[1]), total: Number(match[2]) } : { index: 0, total: 0 }
+  }
+  const beforeRapid = parseCounter(state.counter)
+  const rapidClicks = 12
+  await window.evaluate(async (clickCount) => {
+    const button = document.querySelector('button[data-reader-search-next="true"]')
+    if (!(button instanceof HTMLButtonElement)) throw new Error('Missing reader search next button')
+    for (let index = 0; index < clickCount; index += 1) {
+      button.click()
+      await new Promise((resolve) => window.setTimeout(resolve, 16))
+    }
+  }, rapidClicks)
+  const expectedRapidIndex = ((beforeRapid.index - 1 + rapidClicks) % beforeRapid.total) + 1
+  await window.waitForFunction((expected) => {
+    const counter = document.querySelector('[data-reader-search-counter="true"]')?.textContent || ''
+    const match = counter.match(/(\d+)\s*\/\s*(\d+)/)
+    const activeMarks = document.querySelectorAll('mark[data-search-active="true"]')
+    return !!match && Number(match[1]) === expected && activeMarks.length === 1
+  }, expectedRapidIndex, { timeout: 4000 }).catch(async (error) => {
+    const debug = await getActiveState()
+    throw new Error(`Expected rapid search-next clicks to reach ${expectedRapidIndex} from ${JSON.stringify(beforeRapid)}, saw ${JSON.stringify(debug)}; ${error.message}`)
+  })
+  state = await getActiveState()
+  if (parseCounter(state.counter).index !== expectedRapidIndex || state.activeCount !== 1) {
+    throw new Error(`Expected rapid search-next clicks to coalesce at ${expectedRapidIndex}, saw ${JSON.stringify(state)}`)
+  }
+  await assertActiveSearchHighlightIsVisuallyDistinct(window, 'many active rapid next')
 }
 
 async function verifyReaderSearchKeepsActiveVisibleAcrossManyPageFlips(window, userDataDir) {

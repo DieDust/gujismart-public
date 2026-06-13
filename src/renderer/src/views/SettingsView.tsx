@@ -1,4 +1,4 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from 'react'
 import { Form, Input, Select, Card, Button, Typography, message, Switch, Slider, InputNumber, Alert, Space, Tag, Popconfirm, List, AutoComplete, Modal, Tooltip } from 'antd'
 import {
   BookOutlined,
@@ -22,9 +22,34 @@ import {
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type BackupStatus, type LlmProviderProfile, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type LlmProviderProfile, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
+
+type SettingsSectionKey =
+  | 'automation'
+  | 'shortcuts'
+  | 'pdfRepository'
+  | 'batch'
+  | 'data'
+  | 'paddleOcr'
+  | 'visionOcr'
+  | 'ai'
+  | 'glossary'
+  | 'about'
+
+const SETTINGS_SECTIONS: Array<{ key: SettingsSectionKey; label: string; icon: ReactNode }> = [
+  { key: 'automation', label: '自动化', icon: <ThunderboltOutlined /> },
+  { key: 'shortcuts', label: '快捷键', icon: <KeyOutlined /> },
+  { key: 'pdfRepository', label: 'PDF 原件仓库', icon: <FolderOpenOutlined /> },
+  { key: 'batch', label: '批量处理', icon: <SettingOutlined /> },
+  { key: 'data', label: '数据管理', icon: <DatabaseOutlined /> },
+  { key: 'paddleOcr', label: 'PaddleOCR 接口', icon: <ApiOutlined /> },
+  { key: 'visionOcr', label: '视觉模型 OCR', icon: <ApiOutlined /> },
+  { key: 'ai', label: 'AI 模型接口', icon: <ApiOutlined /> },
+  { key: 'glossary', label: '翻译术语表', icon: <BookOutlined /> },
+  { key: 'about', label: '关于与版权', icon: <GithubOutlined /> },
+]
 
 const PRESET_ENDPOINTS = [
   { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', models: ['deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
@@ -195,6 +220,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const loadingSettingsRef = useRef(true)
   const dirtyRef = useRef(false)
   const [saving, setSaving] = useState(false)
+  const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionKey>('automation')
   const [autoOcr, setAutoOcr] = useState(true)
   const [autoAi, setAutoAi] = useState(true)
   const [autoDeletePdfAssets, setAutoDeletePdfAssets] = useState(false)
@@ -228,6 +254,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [llmModelsLoading, setLlmModelsLoading] = useState(false)
   const [visionModelsLoading, setVisionModelsLoading] = useState(false)
   const [appVersion, setAppVersion] = useState('')
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null)
+  const [checkingUpdate, setCheckingUpdate] = useState(false)
   const [researchProjects, setResearchProjects] = useState<ResearchProject[]>([])
   const [glossaryScope, setGlossaryScope] = useState<TranslationGlossaryScope>('global')
   const [glossaryProjectId, setGlossaryProjectId] = useState('')
@@ -363,6 +391,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
     void loadSettings()
   }, [form, setSettingsDirty, syncAutoBackupDraft])
+
+  const handleCheckForUpdates = useCallback(async () => {
+    setCheckingUpdate(true)
+    try {
+      const info = await window.api.checkForUpdates()
+      setUpdateInfo(info)
+      if (info.error) {
+        message.warning(info.error)
+      } else if (info.hasUpdate) {
+        message.success(`发现新版本 ${info.latestVersion}`)
+      } else {
+        message.success('当前已是最新版本')
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '检查更新失败'))
+    } finally {
+      setCheckingUpdate(false)
+    }
+  }, [])
 
   const loadGlossaryTerms = useCallback(async () => {
     if (glossaryScope === 'project' && !glossaryProjectId) {
@@ -995,7 +1042,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       </Title>
 
       <Form form={form} layout="vertical" onFinish={() => void handleSave()} onFieldsChange={markSettingsDirty}>
-        <div className="settings-section">
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label="设置分类">
+            {SETTINGS_SECTIONS.map((section) => (
+              <button
+                key={section.key}
+                type="button"
+                className={`settings-nav-item${activeSettingsSection === section.key ? ' active' : ''}`}
+                aria-current={activeSettingsSection === section.key ? 'page' : undefined}
+                onClick={() => setActiveSettingsSection(section.key)}
+              >
+                {section.icon}
+                <span>{section.label}</span>
+              </button>
+            ))}
+          </nav>
+          <div className="settings-content">
+        <section className="settings-section" hidden={activeSettingsSection !== 'automation'}>
           <div className="settings-section-title">
             <ThunderboltOutlined /> 自动化
           </div>
@@ -1048,9 +1111,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               />
             </div>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'shortcuts'}>
           <div className="settings-section-title">
             <KeyOutlined /> 快捷键
           </div>
@@ -1086,9 +1149,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               可写 Ctrl+F、Alt+A、Esc、ArrowLeft。阅读器里上下方向键固定用于滚动正文，输入框内保留系统默认编辑快捷键。
             </Text>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'pdfRepository'}>
           <div className="settings-section-title">
             <FolderOpenOutlined /> PDF 原件仓库
           </div>
@@ -1152,9 +1215,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               )}
             </Space>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'batch'}>
           <div className="settings-section-title">
             <SettingOutlined /> 批量处理
           </div>
@@ -1176,9 +1239,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <Text type="secondary" style={{ fontSize: 12 }}>处理失败后会自动重试，适合网络不稳定时使用。</Text>
             </div>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'data'}>
           <div className="settings-section-title">
             <DatabaseOutlined /> 数据管理
           </div>
@@ -1335,9 +1398,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </Space>
             </div>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'paddleOcr'}>
           <div className="settings-section-title">
             <ApiOutlined /> PaddleOCR 接口
           </div>
@@ -1392,9 +1455,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <InputNumber min={50} max={95} style={{ width: 140 }} />
             </Form.Item>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'visionOcr'}>
           <div className="settings-section-title">
             <ApiOutlined /> 视觉模型 OCR
           </div>
@@ -1536,9 +1599,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </Space>
             </Card>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'ai'}>
           <div className="settings-section-title">
             <ApiOutlined /> AI 模型接口
           </div>
@@ -1639,9 +1702,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </Space>
             </Card>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'glossary'}>
           <div className="settings-section-title">
             <BookOutlined /> 翻译术语表
           </div>
@@ -1732,9 +1795,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               />
             </Space>
           </Card>
-        </div>
+        </section>
 
-        <div className="settings-section">
+        <section className="settings-section" hidden={activeSettingsSection !== 'about'}>
           <div className="settings-section-title">
             <GithubOutlined /> 关于与版权
           </div>
@@ -1767,7 +1830,33 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   <Text style={{ color: 'var(--gs-text-primary)' }}>Apache-2.0</Text>
                 </div>
               </div>
+              {updateInfo ? (
+                <Alert
+                  type={updateInfo.error ? 'warning' : updateInfo.hasUpdate ? 'success' : 'info'}
+                  showIcon
+                  message={updateInfo.error ? '暂时无法检查更新' : updateInfo.hasUpdate ? `发现新版本 ${updateInfo.latestVersion}` : '当前已是最新版本'}
+                  description={
+                    updateInfo.error
+                      ? updateInfo.error
+                      : updateInfo.hasUpdate
+                        ? `当前版本 ${updateInfo.currentVersion}，最新版本 ${updateInfo.latestVersion}。可以前往 GitHub Release 下载新版安装包或便携版。`
+                        : `当前版本 ${updateInfo.currentVersion}，GitHub Release 最新版本 ${updateInfo.latestVersion}。`
+                  }
+                  action={updateInfo.hasUpdate ? (
+                    <Button size="small" icon={<DownloadOutlined />} href={updateInfo.releaseUrl} target="_blank" rel="noreferrer">
+                      查看下载
+                    </Button>
+                  ) : undefined}
+                />
+              ) : null}
               <Space wrap>
+                <Button
+                  icon={<ReloadOutlined />}
+                  loading={checkingUpdate}
+                  onClick={() => void handleCheckForUpdates()}
+                >
+                  检查更新
+                </Button>
                 <Button
                   icon={<GithubOutlined />}
                   href={PROJECT_GITHUB_URL}
@@ -1785,13 +1874,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </Text>
             </Space>
           </Card>
-        </div>
+        </section>
 
         <Form.Item>
           <Button type="primary" icon={<SaveOutlined />} loading={saving} size="large" block onClick={() => void handleSave()}>
             保存设置
           </Button>
         </Form.Item>
+          </div>
+        </div>
       </Form>
       <Modal
         title={editingGlossaryTerm ? '编辑术语' : '新增术语'}
