@@ -75,6 +75,10 @@ docs/            使用文档和截图素材
 
 架构边界、IPC 合同和命名规则见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。脚本分类见 [docs/SCRIPTS.md](docs/SCRIPTS.md)。后续整理方向见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
+## 更新日志
+
+版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 开源协作
 
 欢迎提交 issue 和 pull request。开始前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。提交 PR 前至少运行：
