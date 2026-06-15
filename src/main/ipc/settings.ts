@@ -738,6 +738,11 @@ export function registerAppIpc(): void {
   ipcMain.handle('app:getPath', async (_event, name: AppPathName): Promise<string> => {
     return app.getPath(name)
   })
+
+  ipcMain.handle('app:quit', async (): Promise<boolean> => {
+    app.quit()
+    return true
+  })
 }
 
 export function registerExportIpc(): void {

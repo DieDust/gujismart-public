@@ -13,9 +13,17 @@ function assertIncludes(source, needle, label) {
   }
 }
 
+function assertNotIncludes(source, needle, label) {
+  if (source.includes(needle)) {
+    throw new Error(`${label}: should not include ${needle}`)
+  }
+}
+
 const sourcePageReader = read('src/renderer/src/components/SourcePageReader.tsx')
 const ocrText = read('src/renderer/src/utils/ocrText.ts')
 const ocrMain = read('src/main/ocr.ts')
+const documentView = read('src/renderer/src/views/DocumentView.tsx')
+const ocrPageImages = read('src/renderer/src/utils/ocrPageImages.ts')
 
 assertIncludes(sourcePageReader, 'mergeAiLayoutElementsWithSourceStructure', 'AI reading layout should merge source structure')
 assertIncludes(sourcePageReader, "const sourceImages = sourceElements.filter((element) => element.type === 'image')", 'AI reading layout should detect source image elements')
@@ -43,6 +51,14 @@ assertIncludes(ocrMain, 'function getLayoutBlockImagePath', 'OCR post-processing
 assertIncludes(ocrMain, 'function isRenderableOcrImagePath', 'OCR post-processing should distinguish resolved image assets from unresolved relative OCR paths')
 assertIncludes(ocrMain, 'const overlappingImageBox = regionBoxes.find((box) => (', 'OCR post-processing should match markdown images to existing layout image blocks')
 assertIncludes(ocrMain, 'overlappingImageBox.image_asset_path = imagePath', 'OCR post-processing should enrich overlapping image layout blocks with resolved markdown image URLs')
+
+assertIncludes(documentView, "if (engine === 'vision_model') return '大模型 OCR'", 'document view should label vision-model OCR consistently as large-model OCR')
+assertIncludes(documentView, 'const messageKey = `page-image-${page.id}`', 'current-page image cache repair should use a stable message key')
+assertIncludes(documentView, 'pageNums: [page.page_num],', 'current-page image cache repair should repair only the current page')
+assertNotIncludes(documentView, "pageNums: [page.page_num],\n      engine: 'vision_model'", 'current-page image cache repair should not pretend to run vision-model OCR')
+assertIncludes(documentView, 'message.destroy(messageKey)', 'page image cache repair should close its loading toast after success or failure')
+assertIncludes(ocrPageImages, "const progressLabel = engineLabel ? `${engineLabel}页图` : '页图缓存'", 'page image cache repair should use a neutral default progress label')
+assertIncludes(ocrPageImages, '正在补齐${progressLabel}', 'page image repair progress should not default to OCR-specific wording')
 
 const preload = read('src/preload/index.ts')
 const settingsIpc = read('src/main/ipc/settings.ts')

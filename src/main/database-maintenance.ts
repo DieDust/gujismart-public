@@ -3,6 +3,8 @@ import { existsSync, statSync, writeFileSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import type {
   DatabaseMaintenanceResult,
+  DatabaseRequiredMaintenance,
+  DatabaseRequiredMaintenanceReason,
   DatabaseSearchIndexStorageStat,
   DatabaseStorageDiagnostics,
   DatabaseTableStorageStat,
@@ -242,7 +244,7 @@ function getSearchIndexStorage(): DatabaseSearchIndexStorageStat {
   }
 }
 
-function buildWarnings(diagnostics: Omit<DatabaseStorageDiagnostics, 'warnings'>): string[] {
+function buildWarnings(diagnostics: Omit<DatabaseStorageDiagnostics, 'warnings' | 'requiredMaintenance'>): string[] {
   const warnings: string[] = []
   if (diagnostics.freelistBytes > diagnostics.databaseBytes * 0.15) {
     warnings.push('数据库存在较多空闲页，压缩后可能释放明显磁盘空间。')
@@ -254,6 +256,31 @@ function buildWarnings(diagnostics: Omit<DatabaseStorageDiagnostics, 'warnings'>
     warnings.push('检索索引位置数据较大，可能是数据库膨胀的主要来源。')
   }
   return warnings
+}
+
+function buildRequiredMaintenance(diagnostics: Omit<DatabaseStorageDiagnostics, 'warnings' | 'requiredMaintenance'>): DatabaseRequiredMaintenance {
+  const reasons: DatabaseRequiredMaintenanceReason[] = []
+  if (diagnostics.searchIndex.ngramRows > 0) reasons.push('legacy-ngram-index')
+  if (diagnostics.searchIndex.singleCharNgramRows > 0) reasons.push('legacy-single-char-ngram')
+  if (diagnostics.searchIndex.ngramPositionsBytes > 0) reasons.push('legacy-ngram-positions')
+
+  if (reasons.length === 0) {
+    return {
+      required: false,
+      reasons: [],
+      title: '',
+      message: '',
+      actionLabel: '',
+    }
+  }
+
+  return {
+    required: true,
+    reasons,
+    title: '需要升级文献库数据库',
+    message: '检测到旧版搜索索引仍保存在当前数据库中。继续使用会占用大量空间，并可能影响新版检索与维护任务。请先按指引完成升级；升级不会删除文献、OCR 文本或 PDF 原文。',
+    actionLabel: '开始升级数据库',
+  }
 }
 
 export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
@@ -275,7 +302,11 @@ export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
     tables: getSafeTables(),
     searchIndex: getSearchIndexStorage(),
   }
-  return { ...base, warnings: buildWarnings(base) }
+  return {
+    ...base,
+    warnings: buildWarnings(base),
+    requiredMaintenance: buildRequiredMaintenance(base),
+  }
 }
 
 export async function exportDatabaseStorageDiagnostics(): Promise<DatabaseMaintenanceResult> {

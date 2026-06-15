@@ -411,7 +411,7 @@ function getFacsimileExportOptions(format: DocumentExportFormat): DocumentExport
 }
 
 function getOcrEngineLabel(engine: string): string {
-  if (engine === 'vision_model') return '视觉 OCR'
+  if (engine === 'vision_model') return '大模型 OCR'
   if (engine === 'hybrid') return '混合 OCR'
   return '飞桨 OCR'
 }
@@ -2534,22 +2534,25 @@ export default function DocumentView({
     if (!doc?.id || !page.page_num) {
       return false
     }
-    const result = await ensureOcrPageImages(doc, {
-      pageNums: [page.page_num],
-      engine: 'vision_model',
-      messageKey: `page-image-${page.id}`,
-      getEngineLabel: getOcrEngineLabel,
-      onProgress: (content, key) => message.loading({ content, key: key || `page-image-${page.id}`, duration: 0 }),
-      onPageCached: async (pageNum, imagePath, dataUrl) => {
-        if (pageNum !== page.page_num) return
-        putLimitedPageImageCache(pageImageCacheRef.current, getPageImageCacheKey(page, doc.id, documentId), dataUrl)
-        await window.api.updatePage(page.id, { image_path: imagePath })
-      },
-    })
-    if (result.cachedPageNums.includes(page.page_num)) return true
-    const latestDoc = await window.api.getDocument(doc.id).catch(() => null)
-    const latestPage = latestDoc?.pages?.find((item) => item.id === page.id || Number(item.page_num || 0) === page.page_num)
-    return result.ready && await isReadablePageImagePath(latestPage?.image_path || page.image_path)
+    const messageKey = `page-image-${page.id}`
+    try {
+      const result = await ensureOcrPageImages(doc, {
+        pageNums: [page.page_num],
+        messageKey,
+        onProgress: (content, key) => message.loading({ content, key: key || messageKey, duration: 0 }),
+        onPageCached: async (pageNum, imagePath, dataUrl) => {
+          if (pageNum !== page.page_num) return
+          putLimitedPageImageCache(pageImageCacheRef.current, getPageImageCacheKey(page, doc.id, documentId), dataUrl)
+          await window.api.updatePage(page.id, { image_path: imagePath })
+        },
+      })
+      if (result.cachedPageNums.includes(page.page_num)) return true
+      const latestDoc = await window.api.getDocument(doc.id).catch(() => null)
+      const latestPage = latestDoc?.pages?.find((item) => item.id === page.id || Number(item.page_num || 0) === page.page_num)
+      return result.ready && await isReadablePageImagePath(latestPage?.image_path || page.image_path)
+    } finally {
+      message.destroy(messageKey)
+    }
   }, [doc, documentId])
 
   useEffect(() => {
@@ -2881,12 +2884,17 @@ export default function DocumentView({
       const storedEngine = parseMaybeJson(doc.metadata)?.ocr_engine
       const targetEngine = isOcrEngine(storedEngine) ? storedEngine : undefined
       if (targetEngine === 'vision_model' || targetEngine === 'hybrid') {
-        await ensureOcrPageImages(doc, {
-          engine: targetEngine,
-          messageKey: `document-ocr-${doc.id}`,
-          getEngineLabel: getOcrEngineLabel,
-          onProgress: (content, key) => message.loading({ content, key: key || `document-ocr-${doc.id}`, duration: 0 }),
-        })
+        const messageKey = `document-ocr-${doc.id}`
+        try {
+          await ensureOcrPageImages(doc, {
+            engine: targetEngine,
+            messageKey,
+            getEngineLabel: getOcrEngineLabel,
+            onProgress: (content, key) => message.loading({ content, key: key || messageKey, duration: 0 }),
+          })
+        } finally {
+          message.destroy(messageKey)
+        }
       }
       const count = await window.api.batchOcr([doc.id], targetEngine ? { engine: targetEngine } : undefined)
       if (count > 0) {

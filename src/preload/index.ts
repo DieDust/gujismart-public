@@ -596,6 +596,8 @@ const api = {
     ipcRenderer.invoke('app:checkForUpdates'),
   getPath: (name: AppPathName): Promise<string> =>
     ipcRenderer.invoke('app:getPath', name),
+  quitApp: (): Promise<boolean> =>
+    ipcRenderer.invoke('app:quit'),
 
   typesetCheckEnv: (): Promise<TypesetEnvironmentStatus> =>
     ipcRenderer.invoke('typeset:checkEnv'),

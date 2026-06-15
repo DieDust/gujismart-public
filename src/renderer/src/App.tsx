@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import { lazy, Suspense } from 'react'
-import { Badge, Button, Input, Layout, Menu, Modal, Spin, Tooltip, message } from 'antd'
+import { Alert, Badge, Button, Input, Layout, Menu, Modal, Progress, Spin, Tooltip, message } from 'antd'
 import {
   BookOutlined,
   CloseOutlined,
@@ -25,7 +25,7 @@ import WelcomeView from './views/WelcomeView'
 import { useFolderStore } from './stores/useFolderStore'
 import { useOnboardingStore } from './stores/useOnboardingStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
-import type { AppUpdateInfo, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
+import type { AppUpdateInfo, BackgroundTaskProgressEvent, DatabaseStorageDiagnostics, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
 import './styles/app.css'
 
@@ -89,6 +89,24 @@ function hasAiConfig(settings: SettingsMap): boolean {
     && hasConfiguredText(settings.llm_model)
 }
 
+function formatDatabaseUpgradeCount(value: unknown): string {
+  const parsed = Number(value || 0)
+  return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)).toLocaleString() : '0'
+}
+
+function formatDatabaseUpgradeBytes(value: unknown): string {
+  const bytes = Number(value || 0)
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let current = bytes
+  let index = 0
+  while (current >= 1024 && index < units.length - 1) {
+    current /= 1024
+    index += 1
+  }
+  return `${current >= 10 || index === 0 ? current.toFixed(0) : current.toFixed(1)} ${units[index]}`
+}
+
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewKey>('welcome')
   const [currentDocId, setCurrentDocId] = useState<string | null>(null)
@@ -115,6 +133,10 @@ export default function App() {
   const [libraryAiScopeLabel, setLibraryAiScopeLabel] = useState('')
   const [libraryAiInitialTab, setLibraryAiInitialTab] = useState<LibraryAiTab>('qa')
   const [settingsDirty, setSettingsDirty] = useState(false)
+  const [databaseUpgradeDiagnostics, setDatabaseUpgradeDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
+  const [databaseUpgradeVisible, setDatabaseUpgradeVisible] = useState(false)
+  const [databaseUpgradeBusy, setDatabaseUpgradeBusy] = useState(false)
+  const [databaseUpgradeProgress, setDatabaseUpgradeProgress] = useState<BackgroundTaskProgressEvent | null>(null)
   const onboardingVisible = useOnboardingStore((state) => state.visible)
   const showGlobalHeader = !currentDocId && currentView !== 'library'
 
@@ -201,6 +223,35 @@ export default function App() {
     void evaluateOnboarding()
     return () => {
       cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const evaluateDatabaseUpgrade = async () => {
+      try {
+        const diagnostics = await window.api.getDatabaseStorageDiagnostics()
+        if (cancelled) return
+        setDatabaseUpgradeDiagnostics(diagnostics)
+        setDatabaseUpgradeVisible(Boolean(diagnostics.requiredMaintenance?.required))
+      } catch (error) {
+        console.warn('Failed to evaluate database upgrade state', error)
+      }
+    }
+
+    void evaluateDatabaseUpgrade()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    const unsubscribe = window.api.onBackgroundTaskStatusChanged((event) => {
+      if (event.kind !== 'database-maintenance') return
+      setDatabaseUpgradeProgress(event)
+    })
+    return () => {
+      unsubscribe()
     }
   }, [])
 
@@ -543,6 +594,34 @@ export default function App() {
     document.body.style.cursor = `${dir}-resize`
   }
 
+  const handleRequiredDatabaseUpgrade = async () => {
+    setDatabaseUpgradeBusy(true)
+    setDatabaseUpgradeProgress(null)
+    try {
+      const result = await window.api.rebuildLightweightSearchIndex()
+      const diagnostics = await window.api.getDatabaseStorageDiagnostics()
+      setDatabaseUpgradeDiagnostics(diagnostics)
+      if (!result.success) {
+        message.error(result.error || result.message || '数据库升级失败')
+        return
+      }
+      if (diagnostics.requiredMaintenance?.required) {
+        message.warning('旧索引仍未清理完成，请稍后再次点击升级，或进入设置页查看数据库空间管理进度。')
+        return
+      }
+      setDatabaseUpgradeVisible(false)
+      message.success(result.message || '数据库升级任务已提交')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error || '数据库升级失败'))
+    } finally {
+      setDatabaseUpgradeBusy(false)
+    }
+  }
+
+  const handleQuitForDatabaseUpgrade = () => {
+    void window.api.quitApp()
+  }
+
   const renderView = () => {
     if (currentDocId) {
       return (
@@ -630,6 +709,9 @@ export default function App() {
     }
   }
 
+  const requiredMaintenance = databaseUpgradeDiagnostics?.requiredMaintenance
+  const databaseUpgradeProgressPercent = Math.max(0, Math.min(100, Math.round(Number(databaseUpgradeProgress?.progress || 0) * 100)))
+
   return (
     <Layout className="app-layout">
       <Sider
@@ -715,6 +797,53 @@ export default function App() {
           </Suspense>
         </Content>
       </Layout>
+
+      <Modal
+        open={databaseUpgradeVisible}
+        title={requiredMaintenance?.title || '需要升级文献库数据库'}
+        closable={false}
+        maskClosable={false}
+        keyboard={false}
+        width={620}
+        footer={[
+          <Button key="quit" danger onClick={handleQuitForDatabaseUpgrade} disabled={databaseUpgradeBusy}>
+            退出软件
+          </Button>,
+          <Button key="upgrade" type="primary" loading={databaseUpgradeBusy} onClick={() => void handleRequiredDatabaseUpgrade()}>
+            {requiredMaintenance?.actionLabel || '开始升级数据库'}
+          </Button>,
+        ]}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message="当前文献库需要完成数据库升级后再继续使用"
+          description={requiredMaintenance?.message || '检测到旧版搜索索引仍保存在当前数据库中，请先完成升级。'}
+          style={{ marginBottom: 12 }}
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8, marginBottom: 12 }}>
+          <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>旧 ngram 行数</div>
+            <strong>{formatDatabaseUpgradeCount(databaseUpgradeDiagnostics?.searchIndex.ngramRows)}</strong>
+          </div>
+          <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>旧单字索引</div>
+            <strong>{formatDatabaseUpgradeCount(databaseUpgradeDiagnostics?.searchIndex.singleCharNgramRows)}</strong>
+          </div>
+          <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>旧位置数据</div>
+            <strong>{formatDatabaseUpgradeBytes(databaseUpgradeDiagnostics?.searchIndex.ngramPositionsBytes)}</strong>
+          </div>
+        </div>
+        {databaseUpgradeProgress && (databaseUpgradeProgress.status === 'processing' || databaseUpgradeProgress.status === 'queued') ? (
+          <div style={{ marginTop: 8 }}>
+            <Progress percent={databaseUpgradeProgressPercent} status="active" />
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>
+              {databaseUpgradeProgress.message || '正在分批清理旧搜索索引'}
+            </div>
+          </div>
+        ) : null}
+      </Modal>
 
       {onboardingVisible ? (
         <Suspense fallback={null}>

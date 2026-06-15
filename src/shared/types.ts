@@ -43,6 +43,19 @@ export interface DatabaseSearchIndexStorageStat {
   searchSegmentsTrigramRows: number
 }
 
+export type DatabaseRequiredMaintenanceReason =
+  | 'legacy-ngram-index'
+  | 'legacy-single-char-ngram'
+  | 'legacy-ngram-positions'
+
+export interface DatabaseRequiredMaintenance {
+  required: boolean
+  reasons: DatabaseRequiredMaintenanceReason[]
+  title: string
+  message: string
+  actionLabel: string
+}
+
 export interface DatabaseStorageDiagnostics {
   databasePath: string
   databaseBytes: number
@@ -57,6 +70,7 @@ export interface DatabaseStorageDiagnostics {
   tables: DatabaseTableStorageStat[]
   searchIndex: DatabaseSearchIndexStorageStat
   warnings: string[]
+  requiredMaintenance: DatabaseRequiredMaintenance
 }
 
 export interface DatabaseMaintenanceResult {
