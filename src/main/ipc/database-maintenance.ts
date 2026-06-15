@@ -9,6 +9,10 @@ import {
 } from '../database-maintenance'
 import { queueAllDocumentsReindex } from '../semantic-search'
 
+function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics): boolean {
+  return Boolean(diagnostics.requiredMaintenance?.required)
+}
+
 export function registerDatabaseMaintenanceIpc(): void {
   ipcMain.handle('database:getStorageDiagnostics', async (): Promise<DatabaseStorageDiagnostics> => {
     return getDatabaseStorageDiagnostics()
@@ -31,6 +35,18 @@ export function registerDatabaseMaintenanceIpc(): void {
   })
 
   ipcMain.handle('search:rebuildLightweightIndex', async (): Promise<DatabaseMaintenanceResult> => {
+    const diagnostics = getDatabaseStorageDiagnostics()
+    if (!hasLegacySearchIndexMaintenance(diagnostics)) {
+      return {
+        success: true,
+        message: '旧搜索索引已经清理完成，无需再次瘦身或重建索引。',
+        beforeBytes: diagnostics.databaseBytes,
+        afterBytes: diagnostics.databaseBytes,
+        deletedRows: 0,
+        updatedRows: 0,
+      }
+    }
+
     const cleaned = await clearLegacySearchNgramIndex()
     const queued = queueAllDocumentsReindex()
     return {

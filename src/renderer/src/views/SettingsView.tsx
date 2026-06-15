@@ -157,6 +157,11 @@ function formatCount(value?: number): string {
   return Math.max(0, Number(value || 0)).toLocaleString()
 }
 
+function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics | null): boolean {
+  if (!diagnostics) return true
+  return Boolean(diagnostics.requiredMaintenance?.required)
+}
+
 function normalizeAutoBackupIntervalDraft(value: unknown): number {
   const parsed = Number.parseInt(String(value ?? 24), 10)
   if (!Number.isFinite(parsed)) return 24
@@ -1053,6 +1058,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   }
 
   const handleOptimizeLegacyDatabase = async () => {
+    if (!hasLegacySearchIndexMaintenance(databaseDiagnostics)) {
+      message.info({ content: '旧搜索索引已经清理完成，无需再次瘦身。', key: 'database-maintenance', duration: 4 })
+      setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+      return
+    }
     setDatabaseMaintenanceBusy(true)
     setDatabaseMaintenanceProgress(null)
     message.loading({ content: '正在清理旧搜索索引并提交轻量索引重建任务，窗口不会被完整压缩阻塞，请稍候...', key: 'database-maintenance', duration: 0 })
@@ -1417,12 +1427,21 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
               <Space wrap>
                 <Popconfirm
-                  title="会分批清理体积很大的 ngram 候选索引，并提交轻量 trigram FTS 索引重建任务；不删除文献、OCR 文本、PDF 原文。搜索会回到真实文本核验，准确性不受影响。为避免长时间未响应，本步骤不会自动压缩数据库；索引重建完成后可在空闲时单独点击“压缩数据库”释放磁盘空间。"
+                  title={hasLegacySearchIndexMaintenance(databaseDiagnostics)
+                    ? '会分批清理体积很大的 ngram 候选索引，并提交轻量 trigram FTS 索引重建任务；不删除文献、OCR 文本、PDF 原文。搜索会回到真实文本核验，准确性不受影响。为避免长时间未响应，本步骤不会自动压缩数据库；索引重建完成后可在空闲时单独点击“压缩数据库”释放磁盘空间。'
+                    : '旧搜索索引已经清理完成，无需再次瘦身。'}
                   okText="开始优化"
                   cancelText="取消"
+                  disabled={!hasLegacySearchIndexMaintenance(databaseDiagnostics) || databaseMaintenanceBusy}
                   onConfirm={() => void handleOptimizeLegacyDatabase()}
                 >
-                  <Button type="primary" icon={<DatabaseOutlined />} loading={databaseMaintenanceBusy}>
+                  <Button
+                    type="primary"
+                    icon={<DatabaseOutlined />}
+                    loading={databaseMaintenanceBusy}
+                    disabled={!hasLegacySearchIndexMaintenance(databaseDiagnostics)}
+                    title={hasLegacySearchIndexMaintenance(databaseDiagnostics) ? undefined : '旧搜索索引已经清理完成，无需再次瘦身'}
+                  >
                     一键瘦身搜索索引
                   </Button>
                 </Popconfirm>
