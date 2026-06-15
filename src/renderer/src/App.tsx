@@ -33,6 +33,7 @@ const { Sider, Content, Header } = Layout
 
 type ViewKey = 'welcome' | 'library' | 'settings' | 'dashboard' | 'search' | 'citation' | 'tags' | 'research' | 'excerpts'
 type MenuItem = Required<MenuProps>['items'][number]
+type DatabaseUpgradePhase = 'idle' | 'cleanup' | 'compact'
 type LibraryDroppedImportRequest = {
   id: number
   paths: string[]
@@ -65,6 +66,7 @@ function getUpdateNoticeStorageKey(info: AppUpdateInfo): string {
 const ONBOARDING_STEP_KEYS = ['welcome', 'paddle_ocr', 'ai_model', 'vision_ocr', 'finish']
 const ONBOARDING_SETTINGS_LOAD_TIMEOUT_MS = 3000
 const ONBOARDING_SETTINGS_TIMEOUT = Symbol('onboarding-settings-timeout')
+const DATABASE_UPGRADE_UI_SETTLE_MS = 50
 
 function hasConfiguredText(value: unknown): boolean {
   return String(value || '').trim().length > 0
@@ -107,6 +109,17 @@ function formatDatabaseUpgradeBytes(value: unknown): string {
   return `${current >= 10 || index === 0 ? current.toFixed(0) : current.toFixed(1)} ${units[index]}`
 }
 
+function formatDatabaseUpgradeSavedBytes(before?: number, after?: number): string {
+  const saved = Number(before || 0) - Number(after || 0)
+  return saved > 0 ? `，已释放 ${formatDatabaseUpgradeBytes(saved)}` : ''
+}
+
+function waitForDatabaseUpgradeUi(): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, DATABASE_UPGRADE_UI_SETTLE_MS)
+  })
+}
+
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewKey>('welcome')
   const [currentDocId, setCurrentDocId] = useState<string | null>(null)
@@ -136,6 +149,7 @@ export default function App() {
   const [databaseUpgradeDiagnostics, setDatabaseUpgradeDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
   const [databaseUpgradeVisible, setDatabaseUpgradeVisible] = useState(false)
   const [databaseUpgradeBusy, setDatabaseUpgradeBusy] = useState(false)
+  const [databaseUpgradePhase, setDatabaseUpgradePhase] = useState<DatabaseUpgradePhase>('idle')
   const [databaseUpgradeProgress, setDatabaseUpgradeProgress] = useState<BackgroundTaskProgressEvent | null>(null)
   const onboardingVisible = useOnboardingStore((state) => state.visible)
   const showGlobalHeader = !currentDocId && currentView !== 'library'
@@ -596,25 +610,39 @@ export default function App() {
 
   const handleRequiredDatabaseUpgrade = async () => {
     setDatabaseUpgradeBusy(true)
+    setDatabaseUpgradePhase('cleanup')
     setDatabaseUpgradeProgress(null)
     try {
-      const result = await window.api.rebuildLightweightSearchIndex()
-      const diagnostics = await window.api.getDatabaseStorageDiagnostics()
-      setDatabaseUpgradeDiagnostics(diagnostics)
-      if (!result.success) {
-        message.error(result.error || result.message || '数据库升级失败')
+      const rebuildResult = await window.api.rebuildLightweightSearchIndex()
+      if (!rebuildResult.success) {
+        message.error(rebuildResult.error || rebuildResult.message || '数据库升级失败')
         return
       }
-      if (diagnostics.requiredMaintenance?.required) {
+
+      const cleanupDiagnostics = await window.api.getDatabaseStorageDiagnostics()
+      setDatabaseUpgradeDiagnostics(cleanupDiagnostics)
+      if (cleanupDiagnostics.requiredMaintenance?.required) {
         message.warning('旧索引仍未清理完成，请稍后再次点击升级，或进入设置页查看数据库空间管理进度。')
         return
       }
+
+      setDatabaseUpgradePhase('compact')
+      await waitForDatabaseUpgradeUi()
+      const compactResult = await window.api.compactDatabase()
+      const diagnostics = await window.api.getDatabaseStorageDiagnostics()
+      setDatabaseUpgradeDiagnostics(diagnostics)
+      if (!compactResult.success) {
+        message.error(compactResult.error || compactResult.message || '数据库压缩失败，请确认磁盘空间充足后重试。')
+        return
+      }
+
       setDatabaseUpgradeVisible(false)
-      message.success(result.message || '数据库升级任务已提交')
+      message.success(`数据库升级并压缩完成${formatDatabaseUpgradeSavedBytes(compactResult.beforeBytes, compactResult.afterBytes)}。搜索索引会在后台继续更新。`)
     } catch (error) {
-      message.error(error instanceof Error ? error.message : String(error || '数据库升级失败'))
+      message.error(error instanceof Error ? error.message : String(error || '数据库升级并压缩失败'))
     } finally {
       setDatabaseUpgradeBusy(false)
+      setDatabaseUpgradePhase('idle')
     }
   }
 
@@ -711,6 +739,9 @@ export default function App() {
 
   const requiredMaintenance = databaseUpgradeDiagnostics?.requiredMaintenance
   const databaseUpgradeProgressPercent = Math.max(0, Math.min(100, Math.round(Number(databaseUpgradeProgress?.progress || 0) * 100)))
+  const databaseUpgradeDescription = requiredMaintenance?.required
+    ? requiredMaintenance.message
+    : '旧版搜索索引已清理，仍需要完成数据库压缩后再继续使用。压缩失败时可以重试，或退出软件后稍后再打开。'
 
   return (
     <Layout className="app-layout">
@@ -810,7 +841,7 @@ export default function App() {
             退出软件
           </Button>,
           <Button key="upgrade" type="primary" loading={databaseUpgradeBusy} onClick={() => void handleRequiredDatabaseUpgrade()}>
-            {requiredMaintenance?.actionLabel || '开始升级数据库'}
+            {requiredMaintenance?.actionLabel || '升级并压缩数据库'}
           </Button>,
         ]}
       >
@@ -818,7 +849,7 @@ export default function App() {
           type="warning"
           showIcon
           message="当前文献库需要完成数据库升级后再继续使用"
-          description={requiredMaintenance?.message || '检测到旧版搜索索引仍保存在当前数据库中，请先完成升级。'}
+          description={databaseUpgradeDescription}
           style={{ marginBottom: 12 }}
         />
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8, marginBottom: 12 }}>
@@ -842,6 +873,15 @@ export default function App() {
               {databaseUpgradeProgress.message || '正在分批清理旧搜索索引'}
             </div>
           </div>
+        ) : null}
+        {databaseUpgradeBusy && databaseUpgradePhase === 'compact' ? (
+          <Alert
+            type="info"
+            showIcon
+            message="正在压缩数据库，请不要关闭软件"
+            description="正在把清理旧索引后留下的空闲页真正释放到磁盘。大数据库可能需要较长时间，期间界面可能短暂无响应。"
+            style={{ marginTop: 12 }}
+          />
         ) : null}
       </Modal>
 

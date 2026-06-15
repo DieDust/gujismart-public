@@ -277,9 +277,9 @@ function buildRequiredMaintenance(diagnostics: Omit<DatabaseStorageDiagnostics, 
   return {
     required: true,
     reasons,
-    title: '需要升级文献库数据库',
-    message: '检测到旧版搜索索引仍保存在当前数据库中。继续使用会占用大量空间，并可能影响新版检索与维护任务。请先按指引完成升级；升级不会删除文献、OCR 文本或 PDF 原文。',
-    actionLabel: '开始升级数据库',
+    title: '需要升级并压缩文献库数据库',
+    message: '检测到旧版搜索索引仍保存在当前数据库中。继续使用会占用大量空间，并可能影响新版检索与维护任务。请先完成旧索引清理、轻量索引升级和数据库压缩；本流程不会删除文献、OCR 文本或 PDF 原文。',
+    actionLabel: '升级并压缩数据库',
   }
 }
 
