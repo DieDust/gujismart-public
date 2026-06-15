@@ -34,6 +34,8 @@ import type {
   BookTranslationOptions,
   BookTranslationProgressEvent,
   BookTranslationStartResult,
+  DatabaseMaintenanceResult,
+  DatabaseStorageDiagnostics,
   ActiveTranslationGlossaryPayload,
   AppPathName,
   AppUpdateInfo,
@@ -79,6 +81,7 @@ import type {
   LibraryAiScope,
   LibraryAiScopePreview,
   LibraryAiSearchResponse,
+  LibraryStateCache,
   ListDocumentOptions,
   ListModelsPayload,
   LlmProviderProfile,
@@ -162,6 +165,8 @@ const api = {
     ipcRenderer.invoke('fs:readFileBuffer', filePath),
   readImageAsDataURL: (filePath: string): Promise<string> =>
     ipcRenderer.invoke('fs:readImageAsDataURL', filePath),
+  readRemoteImageAsDataURL: (imageUrl: string): Promise<string> =>
+    ipcRenderer.invoke('fs:readRemoteImageAsDataURL', imageUrl),
   saveDocumentPages: (docId: string, base64Images: string[]): Promise<boolean> =>
     ipcRenderer.invoke('documents:savePages', docId, base64Images),
   appendDocumentPages: (docId: string, pages: DocumentAppendPagePayload[], options?: DocumentAppendPagesOptions): Promise<boolean> =>
@@ -205,6 +210,12 @@ const api = {
 
   getDocumentHealthReport: (options?: DocumentHealthReportOptions): Promise<DocumentHealthReport> =>
     ipcRenderer.invoke('documents:getHealthReport', options),
+  getLibraryStateCache: (): Promise<LibraryStateCache> =>
+    ipcRenderer.invoke('library:getStateCache'),
+  refreshLibraryStateCache: (): Promise<LibraryStateCache> =>
+    ipcRenderer.invoke('library:refreshStateCache'),
+  markLibraryStateCacheDirty: (): Promise<LibraryStateCache> =>
+    ipcRenderer.invoke('library:markStateCacheDirty'),
 
   getDocument: (id: string): Promise<DocumentDetail | null> =>
     ipcRenderer.invoke('documents:get', id),
@@ -408,6 +419,8 @@ const api = {
     ipcRenderer.invoke('search:reindexDocument', docId),
   reindexAllSearch: (): Promise<SearchReindexAllResult> =>
     ipcRenderer.invoke('search:reindexAll'),
+  rebuildLightweightSearchIndex: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('search:rebuildLightweightIndex'),
   getSearchIndexStatus: (docId?: string): Promise<SearchIndexStatus[]> =>
     ipcRenderer.invoke('search:getIndexStatus', docId),
   semanticSearch: (keyword: string, options?: SearchOptions): Promise<SearchResult[]> =>
@@ -566,6 +579,16 @@ const api = {
   openDataDirectory: (): Promise<boolean> => ipcRenderer.invoke('backup:openDataDirectory'),
   openAutoBackupDirectory: (): Promise<boolean> => ipcRenderer.invoke('backup:openAutoBackupDirectory'),
   exportDocumentList: (): Promise<BackupResult> => ipcRenderer.invoke('backup:exportDocumentList'),
+  getDatabaseStorageDiagnostics: (): Promise<DatabaseStorageDiagnostics> =>
+    ipcRenderer.invoke('database:getStorageDiagnostics'),
+  exportDatabaseStorageDiagnostics: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:exportStorageDiagnostics'),
+  compactDatabase: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:compact'),
+  clearLegacySearchIndex: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:clearLegacySearchIndex'),
+  optimizeLegacyDatabase: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:optimizeLegacyDatabase'),
 
   getVersion: (): Promise<string> =>
     ipcRenderer.invoke('app:getVersion'),

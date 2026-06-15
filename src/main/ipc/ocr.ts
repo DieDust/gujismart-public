@@ -5,6 +5,8 @@ import { autoExtractAndApply } from '../ai'
 import { clearPageSearchIndexForDocuments, queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { autoCleanupPdfAssetsIfEnabled, restorePdfAssetForDocument } from '../pdf-assets'
 import {
+  findSuspiciousRepeatedOcrText,
+  formatSuspiciousRepeatedOcrTextIssue,
   getOcrDocumentConcurrency,
   type OcrPageRecord,
   type OcrPageResult,
@@ -66,6 +68,7 @@ interface ActiveOcrTask {
 
 interface OcrProcessOptions {
   signal?: AbortSignal
+  pageConcurrency?: number
 }
 
 interface SavePageOcrResultsOptions {
@@ -556,17 +559,6 @@ function getNumericSetting(key: string, fallback: number, min: number, max: numb
   return Math.max(min, Math.min(max, Math.round(parsed)))
 }
 
-function getOcrImageUploadSettingsText(): string {
-  const maxImageSide = getNumericSetting('ocr_max_image_side', 2200, 800, 4096)
-  const jpegQuality = getNumericSetting('ocr_jpeg_quality', 82, 50, 95)
-  return `最长边 ${maxImageSide}px，JPEG 质量 ${jpegQuality}，上传超时 ${getOcrUploadTimeoutText()}`
-}
-
-function getOcrUploadTimeoutText(): string {
-  const uploadTimeoutSeconds = getNumericSetting('ocr_upload_timeout_seconds', 3600, 0, 86400)
-  return uploadTimeoutSeconds <= 0 ? '不限制' : `${uploadTimeoutSeconds} 秒`
-}
-
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B'
   if (value < 1024) return `${Math.round(value)} B`
@@ -618,7 +610,7 @@ function throwIfOcrCanceled(signal?: AbortSignal): void {
 
 function isPdfChunkStructureError(error: unknown): boolean {
   const message = String((error as Error)?.message || error || '')
-  return /PDFDict|pdf-lib|copyPages|PDF 第 \d+ 页结构异常|instance of undefined/i.test(message)
+  return /PDFDict|pdf-lib|copyPages|qpdf 不可用|无法安全处理 PDF 分片|无法安全分片|PDF chunking failed|PDF 第 \d+ 页结构异常|instance of undefined/i.test(message)
 }
 
 function hasReadablePageImage(page: Pick<OcrPageRow, 'image_path'>): boolean {
@@ -737,6 +729,16 @@ async function postProcessPdfOcrResultsBatched(
           error: getMissingResultError?.(item) || `PaddleOCR async result missing for page ${item.sourcePageIndex + 1}`,
         } satisfies OcrPageResult
       }
+      const repeatedIssue = findSuspiciousRepeatedOcrText(result)
+      if (repeatedIssue) {
+        return {
+          pageId: item.page.id,
+          result: null,
+          text: '',
+          status: 'error',
+          error: formatSuspiciousRepeatedOcrTextIssue(repeatedIssue),
+        } satisfies OcrPageResult
+      }
 
       return {
         pageId: item.page.id,
@@ -841,6 +843,10 @@ function upsertPageOcrVersion(
 
 function updatePageOcrState(pageId: string, result: OcrRecognizeResult, engine: OcrEngine = 'paddle'): void {
   const page = queryOne<Pick<DocumentPage, 'doc_id'>>('SELECT doc_id FROM pages WHERE id = ?', [pageId])
+  const repeatedIssue = findSuspiciousRepeatedOcrText(result)
+  if (repeatedIssue) {
+    throw new Error(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))
+  }
   const text = getOcrResultText(result)
   run(
     'UPDATE pages SET ocr_result = ?, ocr_text = ?, proofed_text = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
@@ -1238,8 +1244,23 @@ function markDocumentTocDirty(docId: string): void {
   clearDocumentTocAutogenAttempt(docId)
 }
 
+function guardRepeatedOcrPageResult(pageResult: OcrPageResult): OcrPageResult {
+  if (pageResult.status !== 'completed') return pageResult
+  const repeatedIssue = findSuspiciousRepeatedOcrText(pageResult.result || pageResult.text)
+  if (!repeatedIssue) return pageResult
+  const message = formatSuspiciousRepeatedOcrTextIssue(repeatedIssue)
+  return {
+    pageId: pageResult.pageId,
+    result: null,
+    text: '',
+    status: 'error',
+    error: message,
+  }
+}
+
 function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'paddle', options: SavePageOcrResultsOptions = {}): string[] {
   if (pageResults.length === 0) return []
+  const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)
   const startedAt = Date.now()
   const changedPageIds: string[] = []
   const changedDocIds = new Set<string>()
@@ -1248,8 +1269,8 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
   const versionWrites: OcrVersionWrite[] = []
 
   transaction(() => {
-    pageSnapshots = getPageSnapshotsForOcrSave(pageResults.map((pageResult) => pageResult.pageId))
-    for (const pageResult of pageResults) {
+    pageSnapshots = getPageSnapshotsForOcrSave(guardedPageResults.map((pageResult) => pageResult.pageId))
+    for (const pageResult of guardedPageResults) {
       const existingPage = pageSnapshots.get(pageResult.pageId)
       const hasProofedText = String(existingPage?.proofed_text || '').trim().length > 0
       const hasExistingCompletedText = String(existingPage?.ocr_status || '') === 'completed'
@@ -1336,7 +1357,7 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
       scheduleDatabaseSave()
     }
   }
-  logSlowOcrStep(`save ${pageResults.length} OCR page result(s), changed ${changedPageIds.length}`, startedAt)
+  logSlowOcrStep(`save ${guardedPageResults.length} OCR page result(s), changed ${changedPageIds.length}`, startedAt)
   return changedPageIds
 }
 
@@ -1553,7 +1574,7 @@ async function processDocumentOcr(
           errorMessage: payload.error,
           message: `混合 OCR 第 1 步：传统 OCR 底稿 ${combinedPages}/${totalPages} 页`,
         })
-      }, { signal })
+      }, { signal, concurrency: processOptions.pageConcurrency })
       const failedBasePages = baseResults.filter((item) => item.status === 'error')
       if (failedBasePages.length > 0) {
         pageResults = baseResults
@@ -1674,6 +1695,18 @@ async function processDocumentOcr(
           .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0)
         : undefined
       const fallbackPageCount = Math.max(getDocTotalPages(), pages.length, Number(doc.page_count || 0) || 0)
+      const willPreferWholePdfUpload = fallbackPageCount > 0
+      emitOcrStatus(event, {
+        docId,
+        status: 'processing',
+        phase: 'ocr',
+        progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
+        completedPages: completedBefore,
+        totalPages: fallbackPageCount || getDocTotalPages(),
+        message: willPreferWholePdfUpload
+          ? `准备上传 PDF：${formatBytes(sourcePdfBytes)} / ${fallbackPageCount} 页`
+          : `准备上传 PDF：${formatBytes(sourcePdfBytes)}`,
+      })
       let asyncResults: unknown[] | null = null
       try {
         asyncResults = await recognizePdfAsync(pdfPath, (payload) => {
@@ -1688,31 +1721,65 @@ async function processDocumentOcr(
           lastAsyncDisplayedPageCount = finishedPages
           const docFraction = totalPages > 0 ? Math.min(0.95, finishedPages / totalPages) : 0
           const isPreparing = String(payload.status || payload.state || '').toLowerCase() === 'preparing'
+          const isUploading = String(payload.status || payload.state || '').toLowerCase() === 'uploading'
+          const isWaitingForServerQueue = String(payload.status || payload.state || '').toLowerCase() === 'queued'
           const isWholePdfFallback = Boolean(payload.fallbackWholePdf)
           const isFullFileUpload = Boolean(payload.fullFileUpload)
           const isAwaitingAsyncResult = totalPages > 0 && finishedPages >= totalPages
+          const hasServerProgress = newlyFinishedPages > 0 || Number(payload.progress || 0) > 0
+          const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''
+          const asyncProgressMessage = isUploading && isFullFileUpload
+            ? `正在上传 PDF：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
+            : isUploading
+            ? `正在上传 PDF 分片：第 ${payload.chunkIndex || 1}/${payload.totalChunks || 1} 片`
+            : !hasServerProgress && finishedPages === 0 && isFullFileUpload && !isPreparing && !isWaitingForServerQueue
+            ? `PDF 已提交，等待处理：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
+            : !hasServerProgress && finishedPages === 0 && !isPreparing && !isWaitingForServerQueue
+            ? `PDF 分片已提交，等待处理：第 ${payload.chunkIndex || 1}/${payload.totalChunks || 1} 片`
+            : ''
+          const uploadModeMessage = isFullFileUpload
+            ? isUploading
+              ? `正在上传 PDF：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
+              : isWaitingForServerQueue
+                ? `PDF 已提交，等待处理：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
+                : isAwaitingAsyncResult
+                  ? `OCR 结果保存中：${finishedPages}/${totalPages} 页`
+                  : !hasServerProgress && finishedPages === 0 && !isPreparing
+                    ? `PDF 已提交，等待处理：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
+                    : `OCR 处理中：${finishedPages}/${totalPages} 页`
+            : payload.chunkIndex && payload.totalChunks
+              ? isUploading
+                ? `正在上传 PDF 分片：第 ${payload.chunkIndex}/${payload.totalChunks} 片`
+                : isPreparing
+                  ? `正在准备 PDF 分片：第 ${payload.chunkIndex}/${payload.totalChunks} 片`
+                  : isWaitingForServerQueue
+                    ? `PDF 分片已提交，等待处理：第 ${payload.chunkIndex}/${payload.totalChunks} 片`
+                    : `OCR 处理中：${finishedPages}/${totalPages} 页`
+              : ''
           emitOcrStatus(event, {
             docId,
             status: 'processing',
-            phase: isAwaitingAsyncResult ? 'saving' : 'ocr',
+            phase: isWaitingForServerQueue ? 'queued' : isAwaitingAsyncResult ? 'saving' : 'ocr',
             progress: getDocProgress(getCompleted(), totalDocs, isAwaitingAsyncResult ? 0.97 : docFraction),
             completedPages: finishedPages,
             totalPages,
-            message: isWholePdfFallback && isPreparing
-              ? `PDF 分片失败，正在尝试整本上传（原文件 ${formatBytes(sourcePdfBytes)}，会只保存需要重试的页面）`
+            message: fallbackRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue
+              ? `排队中：${finishedPages}/${totalPages} 页`
+              : isWholePdfFallback && isPreparing
+              ? `正在重新提交 PDF：${formatBytes(sourcePdfBytes)}`
               : isWholePdfFallback
-              ? `整本 PDF OCR 识别中：${finishedPages}/${totalPages} 页（正在恢复未完成页面）`
+              ? `OCR 处理中：${finishedPages}/${totalPages} 页`
               : isFullFileUpload && isPreparing
-              ? `正在上传整本 PDF（原文件 ${formatBytes(sourcePdfBytes)}，会只保存需要识别的页面）`
+              ? `正在上传 PDF：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
               : isAwaitingAsyncResult
-              ? `PaddleOCR 已处理完 ${finishedPages}/${totalPages} 页，正在等待结果文件并写入文库`
+              ? `OCR 结果保存中：${finishedPages}/${totalPages} 页`
               : isFullFileUpload
-              ? `整本 PDF OCR 识别中：${finishedPages}/${totalPages} 页（只保存需要识别的页面）`
+              ? `OCR 处理中：${finishedPages}/${totalPages} 页`
               : isPreparing && payload.chunkIndex && payload.totalChunks
-              ? `正在准备 PDF 分片：第 ${payload.chunkIndex}/${payload.totalChunks} 片（${payload.chunkStartPage}-${payload.chunkEndPage} 页，原文件 ${formatBytes(sourcePdfBytes)}，上传超时设置 ${getOcrUploadTimeoutText()}）`
+              ? `正在准备 PDF 分片：第 ${payload.chunkIndex}/${payload.totalChunks} 片`
               : payload.chunkIndex && payload.totalChunks
-              ? `OCR 识别中：${finishedPages}/${totalPages} 页（第 ${payload.chunkIndex}/${payload.totalChunks} 片）`
-              : `OCR 识别中：${finishedPages}/${totalPages} 页`,
+              ? `OCR 处理中：${finishedPages}/${totalPages} 页`
+              : `OCR 识别中：${finishedPages}/${totalPages} 页`),
           })
         }, {
           signal,
@@ -1766,7 +1833,6 @@ async function processDocumentOcr(
         pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
         completedBefore = resumeExisting ? getCompletedOcrPageCount(pages) : 0
         if (!isPdfChunkStructureError(error) || !canFallbackToImageOcr(pagesForOcr)) throw error
-        const imageUploadSettingsText = getOcrImageUploadSettingsText()
         emitOcrStatus(event, {
           docId,
           status: 'processing',
@@ -1774,7 +1840,7 @@ async function processDocumentOcr(
           progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
           completedPages: completedBefore,
           totalPages: getDocTotalPages(),
-          message: `PDF 分片失败，已自动改用逐页图片 OCR（上传设置：${imageUploadSettingsText}）`,
+          message: `OCR 处理中：${completedBefore}/${getDocTotalPages()} 页`,
           errorMessage: (error as Error)?.message || String(error),
         })
         pageResults = await recognizePages(pagesForOcr, ocrOptions, (payload) => {
@@ -1799,9 +1865,9 @@ async function processDocumentOcr(
             totalPages,
             pageNum: payload.pageNum,
             errorMessage: payload.error,
-            message: `逐页图片 OCR 中：${combinedPages}/${totalPages} 页（上传设置：${imageUploadSettingsText}）`,
+            message: `OCR 处理中：${combinedPages}/${totalPages} 页`,
           })
-        }, { signal })
+        }, { signal, concurrency: processOptions.pageConcurrency })
       }
 
       if (asyncResults) {
@@ -1836,7 +1902,6 @@ async function processDocumentOcr(
       if (missingImagePage) {
         throw new Error(`第 ${missingImagePage.page_num || ''} 页缺少可读取页图，且当前文献没有可用 PDF 原文，无法继续 OCR。请确认该文献所在数据库包含 PDF/页图资源，或把原 PDF 加入“PDF 原件仓库”后重试。`)
       }
-      const imageUploadSettingsText = getOcrImageUploadSettingsText()
       pageResults = await recognizePages(pagesForOcr, ocrOptions, (payload) => {
         throwIfOcrCanceled(signal)
         const combinedPages = getCombinedPageCount(payload.completedPages)
@@ -1859,9 +1924,9 @@ async function processDocumentOcr(
           totalPages,
           pageNum: payload.pageNum,
           errorMessage: payload.error,
-          message: `OCR 识别中：${combinedPages}/${totalPages} 页（上传设置：${imageUploadSettingsText}）`,
+          message: `OCR 识别中：${combinedPages}/${totalPages} 页`,
         })
-      }, { signal })
+      }, { signal, concurrency: processOptions.pageConcurrency })
     }
 
     throwIfOcrCanceled(signal)
@@ -2161,7 +2226,7 @@ export function registerOcrIpc(): void {
             progress: completedCount / Math.max(queuedDocIds.length, 1),
             completedPages: 0,
             totalPages: Number(doc?.page_count || 0) || undefined,
-            message: `OCR 识别中，当前并发 ${documentConcurrency} 篇`,
+            message: 'OCR 识别中',
           })
           const result = await processDocumentOcr(
             event,

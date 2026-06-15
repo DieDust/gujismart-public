@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from 'react'
-import { Form, Input, Select, Card, Button, Typography, message, Switch, Slider, InputNumber, Alert, Space, Tag, Popconfirm, List, AutoComplete, Modal, Tooltip } from 'antd'
+import { Form, Input, Select, Card, Button, Typography, message, Switch, Slider, InputNumber, Alert, Space, Tag, Popconfirm, List, AutoComplete, Modal, Tooltip, Progress } from 'antd'
 import {
   BookOutlined,
   KeyOutlined,
@@ -22,7 +22,7 @@ import {
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type LlmProviderProfile, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
 
@@ -153,6 +153,10 @@ function formatBytes(value?: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
+function formatCount(value?: number): string {
+  return Math.max(0, Number(value || 0)).toLocaleString()
+}
+
 function normalizeAutoBackupIntervalDraft(value: unknown): number {
   const parsed = Number.parseInt(String(value ?? 24), 10)
   if (!Number.isFinite(parsed)) return 24
@@ -233,6 +237,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [retryCount, setRetryCount] = useState(3)
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null)
   const [backupBusy, setBackupBusy] = useState(false)
+  const [databaseDiagnostics, setDatabaseDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
+  const [databaseMaintenanceBusy, setDatabaseMaintenanceBusy] = useState(false)
+  const [databaseMaintenanceProgress, setDatabaseMaintenanceProgress] = useState<BackgroundTaskProgressEvent | null>(null)
   const [autoBackupEnabled, setAutoBackupEnabled] = useState(true)
   const [autoBackupInterval, setAutoBackupInterval] = useState(24)
   const [autoBackupIncludeStorage, setAutoBackupIncludeStorage] = useState(false)
@@ -391,6 +398,26 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
     void loadSettings()
   }, [form, setSettingsDirty, syncAutoBackupDraft])
+
+  useEffect(() => {
+    const unsubscribe = window.api.onBackgroundTaskStatusChanged((event) => {
+      if (event.kind !== 'database-maintenance') return
+      setDatabaseMaintenanceProgress(event)
+      if (event.status === 'queued' || event.status === 'processing') {
+        setDatabaseMaintenanceBusy(true)
+        return
+      }
+      setDatabaseMaintenanceBusy(false)
+      if (event.status === 'completed') {
+        void window.api.getDatabaseStorageDiagnostics()
+          .then((diagnostics) => setDatabaseDiagnostics(diagnostics))
+          .catch((error) => console.warn('刷新数据库诊断失败:', error))
+      }
+    })
+    return () => {
+      unsubscribe()
+    }
+  }, [])
 
   const handleCheckForUpdates = useCallback(async () => {
     setCheckingUpdate(true)
@@ -982,6 +1009,66 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  const refreshDatabaseDiagnostics = async () => {
+    setDatabaseMaintenanceBusy(true)
+    try {
+      setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+    } catch (error) {
+      message.error(getErrorMessage(error, '读取数据库诊断失败'))
+    } finally {
+      setDatabaseMaintenanceBusy(false)
+    }
+  }
+
+  const handleExportDatabaseDiagnostics = async () => {
+    setDatabaseMaintenanceBusy(true)
+    try {
+      const result = await window.api.exportDatabaseStorageDiagnostics()
+      if (result.success) {
+        message.success(result.path ? `诊断报告已导出：${result.path}` : result.message)
+      } else if (result.error) {
+        message.error(result.error)
+      }
+    } finally {
+      setDatabaseMaintenanceBusy(false)
+    }
+  }
+
+  const handleCompactDatabase = async () => {
+    setDatabaseMaintenanceBusy(true)
+    setDatabaseMaintenanceProgress(null)
+    message.loading({ content: '正在压缩数据库，大库可能需要较长时间，请不要关闭软件...', key: 'database-maintenance', duration: 0 })
+    try {
+      const result = await window.api.compactDatabase()
+      if (result.success) {
+        const freedBytes = Math.max(0, Number(result.beforeBytes || 0) - Number(result.afterBytes || 0))
+        message.success({ content: `${result.message}，释放 ${formatBytes(freedBytes)}`, key: 'database-maintenance', duration: 8 })
+      } else {
+        message.error({ content: result.error || result.message, key: 'database-maintenance', duration: 8 })
+      }
+      setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+    } finally {
+      setDatabaseMaintenanceBusy(false)
+    }
+  }
+
+  const handleOptimizeLegacyDatabase = async () => {
+    setDatabaseMaintenanceBusy(true)
+    setDatabaseMaintenanceProgress(null)
+    message.loading({ content: '正在清理旧搜索索引并提交轻量索引重建任务，窗口不会被完整压缩阻塞，请稍候...', key: 'database-maintenance', duration: 0 })
+    try {
+      const result = await window.api.rebuildLightweightSearchIndex()
+      if (result.success) {
+        message.success({ content: result.message, key: 'database-maintenance', duration: 10 })
+      } else {
+        message.error({ content: result.error || result.message, key: 'database-maintenance', duration: 8 })
+      }
+      setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+    } finally {
+      setDatabaseMaintenanceBusy(false)
+    }
+  }
+
   const refreshPdfRepositoryStatus = async () => {
     setPdfRepositoryStatus(await window.api.listPdfRepositories())
   }
@@ -1253,6 +1340,107 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               message="备份会保留数据库、OCR 文本、标签和配置"
               description="自动备份默认不包含原文 PDF/EPUB，完整迁移请使用导出完整备份。"
             />
+
+            <Card size="small" style={{ marginBottom: 16, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 12 }}>
+                <div>
+                  <Text strong style={{ color: 'var(--gs-text-primary)' }}>数据库空间管理</Text>
+                  <br />
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    诊断报告只包含表行数、文件大小和索引统计，不会导出正文、标题、文件路径或密钥。
+                  </Text>
+                </div>
+                <Button size="small" icon={<ReloadOutlined />} loading={databaseMaintenanceBusy} onClick={() => void refreshDatabaseDiagnostics()}>
+                  刷新
+                </Button>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 8, marginBottom: 12 }}>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>数据库</Text>
+                  <br />
+                  <Text strong>{formatBytes(databaseDiagnostics?.databaseBytes)}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>可压缩空闲页</Text>
+                  <br />
+                  <Text strong>{formatBytes(databaseDiagnostics?.freelistBytes)}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>ngram 行数</Text>
+                  <br />
+                  <Text strong>{(databaseDiagnostics?.searchIndex.ngramRows || 0).toLocaleString()}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>旧单字索引</Text>
+                  <br />
+                  <Text strong>{(databaseDiagnostics?.searchIndex.singleCharNgramRows || 0).toLocaleString()}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>trigram FTS</Text>
+                  <br />
+                  <Text strong>{(databaseDiagnostics?.searchIndex.searchSegmentsTrigramRows || 0).toLocaleString()}</Text>
+                </div>
+              </div>
+
+              {databaseDiagnostics?.warnings.length ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message={databaseDiagnostics.warnings.join('；')}
+                />
+              ) : null}
+
+              {databaseMaintenanceProgress ? (
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(214,168,95,0.08)', border: '1px solid rgba(214,168,95,0.24)', marginBottom: 12 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 6 }}>
+                    <Text strong style={{ color: 'var(--gs-text-primary)' }}>
+                      {databaseMaintenanceProgress.status === 'completed' ? '数据库优化完成' : '数据库优化进行中'}
+                    </Text>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {formatCount(databaseMaintenanceProgress.completedCount)} / {formatCount(databaseMaintenanceProgress.totalCount)}
+                    </Text>
+                  </div>
+                  <Progress
+                    percent={Math.max(0, Math.min(100, Math.round(Number(databaseMaintenanceProgress.progress || 0) * 100)))}
+                    size="small"
+                    status={databaseMaintenanceProgress.status === 'error' ? 'exception' : databaseMaintenanceProgress.status === 'completed' ? 'success' : 'active'}
+                  />
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {databaseMaintenanceProgress.errorMessage
+                      ? `优化失败：${databaseMaintenanceProgress.errorMessage}`
+                      : databaseMaintenanceProgress.message || '正在分批处理搜索索引'}
+                  </Text>
+                </div>
+              ) : null}
+
+              <Space wrap>
+                <Popconfirm
+                  title="会分批清理体积很大的 ngram 候选索引，并提交轻量 trigram FTS 索引重建任务；不删除文献、OCR 文本、PDF 原文。搜索会回到真实文本核验，准确性不受影响。为避免长时间未响应，本步骤不会自动压缩数据库；索引重建完成后可在空闲时单独点击“压缩数据库”释放磁盘空间。"
+                  okText="开始优化"
+                  cancelText="取消"
+                  onConfirm={() => void handleOptimizeLegacyDatabase()}
+                >
+                  <Button type="primary" icon={<DatabaseOutlined />} loading={databaseMaintenanceBusy}>
+                    一键瘦身搜索索引
+                  </Button>
+                </Popconfirm>
+                <Button icon={<ExportOutlined />} loading={databaseMaintenanceBusy} onClick={() => void handleExportDatabaseDiagnostics()}>
+                  导出诊断报告
+                </Button>
+                <Popconfirm
+                  title="压缩数据库可能需要较长时间和额外临时空间，过程中请不要强制退出软件。"
+                  okText="压缩"
+                  cancelText="取消"
+                  onConfirm={() => void handleCompactDatabase()}
+                >
+                  <Button icon={<DatabaseOutlined />} loading={databaseMaintenanceBusy}>
+                    压缩数据库
+                  </Button>
+                </Popconfirm>
+              </Space>
+            </Card>
 
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 220px', gap: 16, alignItems: 'start' }}>
               <div>

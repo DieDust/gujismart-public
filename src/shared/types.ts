@@ -24,6 +24,75 @@ export interface AppUpdateInfo {
   checkedAt: string
   error?: string
 }
+
+export interface DatabaseTableStorageStat {
+  tableName: string
+  rowCount: number
+  estimatedBytes?: number
+}
+
+export interface DatabaseSearchIndexStorageStat {
+  ngramRows: number
+  singleCharNgramRows: number
+  ngramPositionsBytes: number
+  segmentRows: number
+  segmentTextBytes: number
+  segmentOffsetMapBytes: number
+  pagesFtsRows: number
+  searchSegmentsFtsRows: number
+  searchSegmentsTrigramRows: number
+}
+
+export interface DatabaseStorageDiagnostics {
+  databasePath: string
+  databaseBytes: number
+  walBytes: number
+  shmBytes: number
+  pageSize: number
+  pageCount: number
+  freelistCount: number
+  freelistBytes: number
+  checkedAt: string
+  searchIndexVersion: string
+  tables: DatabaseTableStorageStat[]
+  searchIndex: DatabaseSearchIndexStorageStat
+  warnings: string[]
+}
+
+export interface DatabaseMaintenanceResult {
+  success: boolean
+  message: string
+  beforeBytes?: number
+  afterBytes?: number
+  deletedRows?: number
+  updatedRows?: number
+  path?: string
+  error?: string
+}
+
+export type LibrarySmartViewCountKey =
+  | 'all'
+  | 'missingMetadata'
+  | 'unrecognized'
+  | 'suspiciousTitle'
+  | 'unknownType'
+  | 'favorite'
+  | 'unread'
+  | 'proofed'
+  | 'unproofed'
+  | 'metadataPending'
+  | 'unstored'
+
+export type LibrarySmartViewCounts = Record<LibrarySmartViewCountKey, number>
+
+export interface LibraryStateCache {
+  smartViewCounts: LibrarySmartViewCounts
+  unfiledDocumentTotal: number
+  folderDocumentCounts: Record<string, number>
+  tagDocumentCounts: Record<string, number>
+  dirty: boolean
+  updatedAt: string | null
+}
 export type AiLayoutMode = 'reading_layout' | (string & {})
 export type AiTaskType =
   | 'summary'
@@ -547,7 +616,7 @@ export interface TaskProgressEvent {
   message: string
 }
 
-export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery'
+export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance'
 export type BackgroundTaskStatus = 'queued' | 'processing' | 'completed' | 'error'
 
 export interface BackgroundTaskProgressEvent {
@@ -824,6 +893,7 @@ export interface Folder {
   sort_order: number
   created_at: string
   updated_at: string
+  document_count?: number
 }
 
 export interface FolderCreatePayload {
@@ -1825,7 +1895,7 @@ export const IMPORT_STATUS_MAP: Record<ImportStatus, { color: string; text: stri
 }
 
 export const OCR_STATUS_MAP: Record<OcrStatus, { color: string; text: string }> = {
-  pending: { color: 'default', text: '待识别' },
+  pending: { color: 'default', text: '待 OCR' },
   queued: { color: 'warning', text: '排队中' },
   processing: { color: 'processing', text: '识别中' },
   completed: { color: 'success', text: '已识别' },

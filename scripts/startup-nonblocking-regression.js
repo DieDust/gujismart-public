@@ -12,6 +12,13 @@ const pdfAssets = readSource('src', 'main', 'pdf-assets.ts')
 const batchProcessor = readSource('src', 'main', 'batch-processor.ts')
 const libraryView = readSource('src', 'renderer', 'src', 'views', 'LibraryView.tsx')
 const startupRecovery = readSource('src', 'main', 'startup-recovery.ts')
+const metadataReclassifier = readSource('src', 'main', 'metadata-reclassifier.ts')
+const initDatabaseStart = database.indexOf('export async function initDatabase(): Promise<void>')
+const initDatabaseEnd = database.indexOf('export function runDeferredStartupDatabaseMaintenance', initDatabaseStart)
+const initDatabaseBody = initDatabaseStart >= 0 && initDatabaseEnd > initDatabaseStart
+  ? database.slice(initDatabaseStart, initDatabaseEnd)
+  : ''
+const existingDatabaseStartupPath = initDatabaseBody.replace(/if \(!existed\) \{[\s\S]*?\n  \}/, '')
 const runStartupRecoveryStart = startupRecovery.indexOf('export async function runStartupRecovery')
 const firstRecoveryCheckpoint = startupRecovery.indexOf('if (await startupRecoveryCheckpoint()) return finishCanceled()', runStartupRecoveryStart)
 const recoverOcrJobs = startupRecovery.indexOf('ocr = recoverInterruptedOcrJobs()', runStartupRecoveryStart)
@@ -36,8 +43,58 @@ assert(
   'Startup maintenance should be scheduled after the window is ready to show.',
 )
 assert(
+  mainIndex.includes('function installConsolePipeGuards()')
+    && mainIndex.includes("String((error as { code?: unknown }).code) === 'EPIPE'")
+    && mainIndex.includes("process.stdout?.on('error', ignoreBrokenPipe)")
+    && mainIndex.includes("process.stderr?.on('error', ignoreBrokenPipe)"),
+  'Main-process logging should ignore broken stdout/stderr pipes so packaged apps do not show EPIPE error dialogs.',
+)
+assert(
+  /if \(is\.dev \|\| process\.env\.GUJISMART_SMOKE === '1'\) \{[\s\S]{0,180}mainWindow\.webContents\.on\('console-message'/.test(mainIndex),
+  'Renderer console forwarding should be limited to dev and smoke runs so packaged apps do not spam broken stdout pipes.',
+)
+assert(
   mainIndex.includes('listStoredLocalResourcePaths({ includePageImages: false })'),
   'Startup resource allow-list should not scan all page images.',
+)
+assert(
+  mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 15_000')
+    && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex),
+  'Startup resource allow-list preloading should be delayed so large libraries do not block the first window.',
+)
+assert(
+  database.includes('export function runDeferredStartupDatabaseMaintenance')
+    && !/export async function initDatabase\(\): Promise<void> \{[\s\S]{0,900}ensureFtsSeeded\(db\)/.test(database)
+    && !/export async function initDatabase\(\): Promise<void> \{[\s\S]{0,1200}cleanupOrphanRows\(db\)/.test(database)
+    && !existingDatabaseStartupPath.includes('ensureIndexes(db)')
+    && !/export async function initDatabase\(\): Promise<void> \{[\s\S]{0,900}stripLegacyTocMetadata\(db\)/.test(database)
+    && !/function migrateExistingSchema\(sqlite[\s\S]{0,2600}updateTagUsageCounts\(sqlite\)/.test(database)
+    && mainIndex.includes('runDeferredStartupDatabaseMaintenance()'),
+  'Indexes, FTS seeding, orphan cleanup, and full-table data normalization should run as delayed maintenance instead of blocking database startup.',
+)
+assert(
+  database.includes("legacy_toc_metadata_stripped")
+    && /if \(stripped\?\.value === '1' && tocRuleVersionSynced\) return/.test(database),
+  'Legacy TOC metadata cleanup should skip full-document metadata scans after it has completed once.',
+)
+assert(
+  database.includes('tableHasMoreRowsThan')
+    && database.includes('export function isLargeLibraryForAutomaticMaintenance')
+    && !/function isLargeLibraryForAutomaticMaintenance\(sqlite[\s\S]{0,260}COUNT\(\*\)/.test(database)
+    && database.includes('startup_database_maintenance_skipped_large_library_at'),
+  'Large-library startup maintenance guard should use bounded probes and skip automatic maintenance for very large libraries.',
+)
+assert(
+  mainIndex.includes('isLargeLibraryForAutomaticMaintenance')
+    && /if \(isLargeLibraryForAutomaticMaintenance\(\)\) \{[\s\S]{0,260}Skipping automatic metadata tag reconciliation/.test(mainIndex),
+  'Startup metadata tag reconciliation should be skipped for large libraries instead of doing full-library counts or rebuilds.',
+)
+assert(
+  metadataReclassifier.includes('STARTUP_RECLASSIFY_CANDIDATE_LIMIT')
+    && /ORDER BY d\.updated_at DESC, d\.created_at DESC\s+LIMIT \?/.test(metadataReclassifier)
+    && metadataReclassifier.includes('STARTUP_RECLASSIFY_CANDIDATE_LIMIT + 1')
+    && metadataReclassifier.includes('startup_skipped_large_library_at'),
+  'Startup metadata reclassification should use a bounded candidate query and skip automatic AI work for large libraries.',
 )
 assert(
   /listStoredLocalResourcePaths\(options\?: \{ includePageImages\?: boolean \}\)/.test(database)

@@ -7,6 +7,7 @@ const RECLASSIFY_VERSION = '0.6-history-doc-type-ai-reclassify-2026-05-19'
 const LEGACY_DOC_TYPE_NAMES = ['论文', '期刊', '学术论文', '图书', '书籍', '古籍']
 const DEFAULT_RECLASSIFY_CONCURRENCY = 3
 const MAX_RECLASSIFY_CONCURRENCY = 6
+const STARTUP_RECLASSIFY_CANDIDATE_LIMIT = 200
 
 type ReclassifyCandidate = {
   id: string
@@ -63,8 +64,9 @@ function getReclassifyCandidates(): ReclassifyCandidate[] {
          OR d.doc_type IN (${legacyPlaceholders})
          OR t.name IN (${legacyPlaceholders})
        )
-     ORDER BY d.updated_at DESC, d.created_at DESC`,
-    [...LEGACY_DOC_TYPE_NAMES, ...LEGACY_DOC_TYPE_NAMES],
+     ORDER BY d.updated_at DESC, d.created_at DESC
+     LIMIT ?`,
+    [...LEGACY_DOC_TYPE_NAMES, ...LEGACY_DOC_TYPE_NAMES, STARTUP_RECLASSIFY_CANDIDATE_LIMIT + 1],
   )
 }
 
@@ -79,6 +81,12 @@ export function scheduleStartupMetadataReclassification(): void {
   if (candidates.length === 0) {
     run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [RECLASSIFY_VERSION, 'completed'])
     saveDatabase()
+    return
+  }
+  if (candidates.length > STARTUP_RECLASSIFY_CANDIDATE_LIMIT) {
+    run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [`${RECLASSIFY_VERSION}:startup_skipped_large_library_at`, new Date().toISOString()])
+    saveDatabase()
+    console.log(`[MetadataReclassifier] Startup AI reclassification skipped because more than ${STARTUP_RECLASSIFY_CANDIDATE_LIMIT} legacy documents need review.`)
     return
   }
 

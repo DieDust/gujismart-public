@@ -16,6 +16,7 @@ function sliceBetween(source, startMarker, endMarker, label) {
 const root = path.join(__dirname, '..')
 const databaseSource = fs.readFileSync(path.join(root, 'src', 'main', 'database.ts'), 'utf8')
 const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
+const libraryCacheSource = fs.readFileSync(path.join(root, 'src', 'main', 'library-state-cache.ts'), 'utf8')
 
 assert(
   databaseSource.includes('CREATE INDEX IF NOT EXISTS idx_pages_doc_ocr_status ON pages(doc_id, ocr_status);'),
@@ -48,6 +49,19 @@ assert(
 assert(
   !/SELECT\s+COUNT\(\*\)\s+FROM\s+pages\s+p_(done|text)/i.test(incompleteFilterBlock),
   'ocrIncomplete filter should not count completed/text pages per candidate document; it becomes too expensive at page size 100.',
+)
+
+const lightweightCacheBlock = sliceBetween(
+  libraryCacheSource,
+  'function buildLightweightCache',
+  'export function refreshLibraryStateCache',
+  'library sidebar lightweight cache',
+)
+
+assert(
+  lightweightCacheBlock.includes('activeDocumentWhere(buildOcrIncompleteCondition())')
+    && !lightweightCacheBlock.includes("COALESCE(d.ocr_status, 'pending') <> 'completed' OR COALESCE(d.page_count, 0) = 0"),
+  'dirty sidebar cache should use the same OCR incomplete condition as the document list instead of over-counting legacy pending documents with OCR text.',
 )
 
 assert(

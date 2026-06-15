@@ -630,10 +630,61 @@ function sourceTableIsPreserved(aiElements: ReadablePageElement[], sourceTable: 
   })
 }
 
-function mergeAiLayoutElementsWithSourceTables(page: ReaderSourcePage, aiElements: ReadablePageElement[]): ReadablePageElement[] {
+function renumberReadableElements(elements: ReadablePageElement[]): ReadablePageElement[] {
+  let cursor = 0
+  return elements.map((element) => {
+    const charStart = cursor
+    const textLength = String(element.text || '').length
+    cursor += textLength + 2
+    return {
+      ...element,
+      charStart,
+      charEnd: element.type === 'image' ? charStart : charStart + textLength,
+    }
+  })
+}
+
+function insertSourceElementBySourceOrder(
+  target: ReadablePageElement[],
+  sourceElements: ReadablePageElement[],
+  sourceAnchor: ReadablePageElement,
+  sourceElement: ReadablePageElement,
+): void {
+  const sourceIndex = sourceElements.indexOf(sourceAnchor)
+  const previousText = [...sourceElements.slice(0, sourceIndex)].reverse()
+    .find((element) => element.type !== 'table' && element.type !== 'image' && element.text.trim())?.text || ''
+  const previousKey = normalizeTableMatchText(previousText).slice(-48)
+  const insertAfter = previousKey
+    ? target.findIndex((element) => normalizeTableMatchText(element.text).includes(previousKey))
+    : -1
+  if (insertAfter >= 0) {
+    let insertIndex = insertAfter + 1
+    while (insertIndex < target.length && (target[insertIndex].type === 'table' || target[insertIndex].type === 'image')) {
+      insertIndex += 1
+    }
+    target.splice(insertIndex, 0, sourceElement)
+    return
+  }
+
+  const nextText = sourceElements.slice(sourceIndex + 1)
+    .find((element) => element.type !== 'table' && element.type !== 'image' && element.text.trim())?.text || ''
+  const nextKey = normalizeTableMatchText(nextText).slice(0, 48)
+  const insertBefore = nextKey
+    ? target.findIndex((element) => normalizeTableMatchText(element.text).includes(nextKey))
+    : -1
+  if (insertBefore >= 0) {
+    target.splice(insertBefore, 0, sourceElement)
+    return
+  }
+
+  target.push(sourceElement)
+}
+
+function mergeAiLayoutElementsWithSourceStructure(page: ReaderSourcePage, aiElements: ReadablePageElement[]): ReadablePageElement[] {
   const sourceElements = getPageElements(page)
   const sourceTables = sourceElements.filter((element) => element.type === 'table' && element.rows?.length)
-  if (sourceTables.length === 0) return aiElements
+  const sourceImages = sourceElements.filter((element) => element.type === 'image')
+  if (sourceTables.length === 0 && sourceImages.length === 0) return aiElements
 
   const next = [...aiElements]
   for (const sourceTable of sourceTables) {
@@ -654,31 +705,23 @@ function mergeAiLayoutElementsWithSourceTables(page: ReaderSourcePage, aiElement
       continue
     }
 
-    const sourceIndex = sourceElements.indexOf(sourceTable)
-    const previousText = [...sourceElements.slice(0, sourceIndex)].reverse().find((element) => element.type !== 'table' && element.text.trim())?.text || ''
-    const previousKey = normalizeTableMatchText(previousText).slice(-48)
-    const insertAfter = previousKey
-      ? next.findIndex((element) => normalizeTableMatchText(element.text).includes(previousKey))
-      : -1
-    if (insertAfter >= 0) next.splice(insertAfter + 1, 0, tableElement)
-    else next.push(tableElement)
+    insertSourceElementBySourceOrder(next, sourceElements, sourceTable, tableElement)
   }
-  let cursor = 0
-  return next.map((element) => {
-    const charStart = cursor
-    const textLength = String(element.text || '').length
-    cursor += textLength + 2
-    return {
-      ...element,
-      charStart,
-      charEnd: charStart + textLength,
+
+  for (const sourceImage of sourceImages) {
+    const imageElement: ReadablePageElement = {
+      ...sourceImage,
+      label: sourceImage.label || 'source_image',
     }
-  })
+    insertSourceElementBySourceOrder(next, sourceElements, sourceImage, imageElement)
+  }
+
+  return renumberReadableElements(next)
 }
 
 function getDisplayPageElements(page: ReaderSourcePage, aiText: string): ReadablePageElement[] {
   if (!aiText) return getPageElements(page)
-  return mergeAiLayoutElementsWithSourceTables(page, aiLayoutTextToElements(aiText))
+  return mergeAiLayoutElementsWithSourceStructure(page, aiLayoutTextToElements(aiText))
 }
 
 function getPageTitle(page: ReaderSourcePage, pageIndex: number): string {
@@ -720,7 +763,10 @@ function getReaderPageImageDataUrl(imagePath: string): Promise<string> {
   if (cached) return Promise.resolve(cached)
   const pending = readerImageDataUrlPromises.get(imagePath)
   if (pending) return pending
-  const promise = window.api.readImageAsDataURL(imagePath)
+  const loadImage = /^https:\/\//i.test(imagePath)
+    ? window.api.readRemoteImageAsDataURL(imagePath)
+    : window.api.readImageAsDataURL(imagePath)
+  const promise = loadImage
     .then((dataUrl) => {
       readerImageDataUrlPromises.delete(imagePath)
       if (dataUrl) {
@@ -1833,35 +1879,113 @@ function ReaderCroppedImage({
   displayScript?: ReaderDisplayScript
 }) {
   const [src, setSrc] = useState('')
+  const [usingDirectImage, setUsingDirectImage] = useState(false)
   const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null)
   const rect = element.rect
   const sourceSize = getPageSourceSize(page) || naturalSize
   const directImagePath = String(element.imagePath || '').trim()
-  const imagePath = directImagePath || String(page?.image_path || '')
+  const pageImagePath = String(page?.image_path || '').trim()
 
   useEffect(() => {
     let cancelled = false
     setNaturalSize(null)
-    if (!imagePath) {
+    setUsingDirectImage(false)
+
+    const usePageImage = () => {
+      if (!pageImagePath) {
+        setSrc('')
+        return
+      }
+      const cachedPage = readerImageDataUrlCache.get(pageImagePath)
+      if (cachedPage) {
+        setSrc(cachedPage)
+        setUsingDirectImage(false)
+        return
+      }
+      void getReaderPageImageDataUrl(pageImagePath)
+        .then((dataUrl) => {
+          if (!cancelled) {
+            setSrc(dataUrl || '')
+            setUsingDirectImage(false)
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setSrc('')
+        })
+    }
+
+    if (/^(?:data:|blob:)/i.test(directImagePath)) {
+      setSrc(directImagePath)
+      setUsingDirectImage(true)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    if (/^https:\/\//i.test(directImagePath)) {
+      const cachedDirect = readerImageDataUrlCache.get(directImagePath)
+      if (cachedDirect) {
+        setSrc(cachedDirect)
+        setUsingDirectImage(true)
+        return () => {
+          cancelled = true
+        }
+      }
+      void getReaderPageImageDataUrl(directImagePath)
+        .then((dataUrl) => {
+          if (!cancelled && dataUrl) {
+            setSrc(dataUrl)
+            setUsingDirectImage(true)
+            return
+          }
+          if (!cancelled) usePageImage()
+        })
+        .catch(() => {
+          if (!cancelled) usePageImage()
+        })
+      return () => {
+        cancelled = true
+      }
+    }
+
+    const isLocalDirectImage = directImagePath && !/^(?:imgs?|images?)\//i.test(directImagePath)
+    if (!isLocalDirectImage) {
+      usePageImage()
+      return () => {
+        cancelled = true
+      }
+    }
+
+    const cachedDirect = readerImageDataUrlCache.get(directImagePath)
+    if (cachedDirect) {
+      setSrc(cachedDirect)
+      setUsingDirectImage(true)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    if (!directImagePath && !pageImagePath) {
       setSrc('')
       return undefined
     }
-    const cached = readerImageDataUrlCache.get(imagePath)
-    if (cached) {
-      setSrc(cached)
-      return undefined
-    }
-    void getReaderPageImageDataUrl(imagePath)
+
+    void getReaderPageImageDataUrl(directImagePath)
       .then((dataUrl) => {
-        if (!cancelled) setSrc(dataUrl || '')
+        if (!cancelled && dataUrl) {
+          setSrc(dataUrl)
+          setUsingDirectImage(true)
+          return
+        }
+        if (!cancelled) usePageImage()
       })
       .catch(() => {
-        if (!cancelled) setSrc('')
+        if (!cancelled) usePageImage()
       })
     return () => {
       cancelled = true
     }
-  }, [imagePath])
+  }, [directImagePath, pageImagePath])
 
   const fallbackSize = rect ? {
     width: Math.max(1, rect.left + rect.width),
@@ -1897,7 +2021,7 @@ function ReaderCroppedImage({
           background: theme === 'dark' ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.44)',
         }}
       >
-        {src && directImagePath ? (
+        {src && usingDirectImage ? (
           <img
             src={src}
             alt={caption || '文献图片'}

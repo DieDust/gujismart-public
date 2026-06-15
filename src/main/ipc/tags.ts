@@ -3,6 +3,7 @@ import { nanoid } from 'nanoid'
 import { queryAll, queryOne, refreshTagUsage, run, saveDatabase, transaction } from '../database'
 import { clearMetadataTagBindings } from '../metadata-tags'
 import type { BulkAssociationResult, MetadataTagBindingCleanupResult, Tag, TagCreatePayload, TagUpdatePayload } from '../../shared/types'
+import { markLibraryStateCacheDirty } from '../library-state-cache'
 
 function normalizeTagName(name: string): string {
   return name.trim().toLowerCase()
@@ -34,6 +35,7 @@ export function registerTagIpc(): void {
       [id, name, data.color || '#1890ff', data.parent_id || null, data.source || 'manual', data.confidence ?? null, 0, normalizedName, now, now]
     )
     saveDatabase()
+    markLibraryStateCacheDirty()
     return queryOne<Tag>('SELECT * FROM tags WHERE id = ?', [id])
   })
 
@@ -73,6 +75,7 @@ export function registerTagIpc(): void {
     params.push(id)
     run(`UPDATE tags SET ${sets.join(', ')} WHERE id = ?`, params)
     saveDatabase()
+    markLibraryStateCacheDirty()
     return queryOne<Tag>('SELECT * FROM tags WHERE id = ?', [id])
   })
 
@@ -82,6 +85,8 @@ export function registerTagIpc(): void {
       run('DELETE FROM tags WHERE id = ?', [id])
     })
     refreshTagUsage()
+    saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 
@@ -100,6 +105,8 @@ export function registerTagIpc(): void {
       [docId, tagId, now, now],
     )
     refreshTagUsage()
+    saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 
@@ -128,16 +135,22 @@ export function registerTagIpc(): void {
       }
     })
     refreshTagUsage()
+    saveDatabase()
+    markLibraryStateCacheDirty()
     return { count: uniqueDocIds.length * uniqueTagIds.length }
   })
 
   ipcMain.handle('tags:removeDocument', async (_event, docId: string, tagId: string): Promise<boolean> => {
     run('DELETE FROM document_tags WHERE doc_id = ? AND tag_id = ?', [docId, tagId])
     refreshTagUsage()
+    saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 
   ipcMain.handle('tags:clearMetadataBindings', async (): Promise<MetadataTagBindingCleanupResult> => {
-    return clearMetadataTagBindings()
+    const result = clearMetadataTagBindings()
+    markLibraryStateCacheDirty()
+    return result
   })
 }

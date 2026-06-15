@@ -21,7 +21,7 @@ export function registerOnboardingIpc(): void {
   })
 
   ipcMain.handle('onboarding:isCompleted', async (): Promise<boolean> => {
-    const steps = ['api_key', 'api_guide', 'citation_format']
+    const steps = ['welcome', 'paddle_ocr', 'ai_model', 'vision_ocr', 'finish']
     for (const step of steps) {
       const row = queryOne<Pick<OnboardingStep, 'completed'>>('SELECT completed FROM onboarding_progress WHERE step_key = ?', [step])
       if (!row || row.completed !== 1) return false

@@ -5,6 +5,7 @@ type JsonRecord = Record<string, unknown>
 type OcrTextBlock = OcrRecognizeLayoutBlock & JsonRecord
 type OcrTextResult = OcrRecognizeResult & JsonRecord
 type Rect = { left: number; top: number; width: number; height: number }
+type MarkdownImageBlock = { rect: Rect; src: string; alt: string }
 type OcrTextPage = Omit<Partial<DocumentPage>, 'ocr_result'> & {
   doc_type?: string | null
   title?: string | null
@@ -466,10 +467,105 @@ function isLayoutImageLabel(label: string): boolean {
     || /图片|图像|插图|示意图|图表|照片/.test(normalized)
 }
 
+function parseMarkdownImageBlocks(markdownText: string): MarkdownImageBlock[] {
+  const text = String(markdownText || '')
+  if (!text) return []
+  const blocks: MarkdownImageBlock[] = []
+  const patterns = [
+    /<img\b[^>]*\bsrc=(["'])(.*?)\1[^>]*\balt=(["'])(.*?)\3[^>]*>/gi,
+    /<img\b[^>]*\balt=(["'])(.*?)\1[^>]*\bsrc=(["'])(.*?)\3[^>]*>/gi,
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+  ]
+  patterns.forEach((pattern, patternIndex) => {
+    for (const match of text.matchAll(pattern)) {
+      const src = patternIndex === 1 ? String(match[4] || '') : String(match[2] || '')
+      const alt = patternIndex === 1 ? String(match[2] || '') : String(match[4] || match[1] || '')
+      const coordinateMatch = src.match(/(?:image[_-]?box|box)[_-](\d+)[_-](\d+)[_-](\d+)[_-](\d+)/i)
+      if (!coordinateMatch) continue
+      const left = Number(coordinateMatch[1])
+      const top = Number(coordinateMatch[2])
+      const right = Number(coordinateMatch[3])
+      const bottom = Number(coordinateMatch[4])
+      if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) continue
+      blocks.push({ src, alt, rect: { left, top, width: right - left, height: bottom - top } })
+    }
+  })
+  return blocks
+}
+
+function getMarkdownTextAndImages(parsed: OcrTextResult | null): { text: string; images: JsonRecord } {
+  const markdown = parsed?.markdown
+  if (typeof markdown === 'string') return { text: markdown, images: {} }
+  if (markdown && typeof markdown === 'object' && !Array.isArray(markdown)) {
+    const record = markdown as JsonRecord
+    return {
+      text: typeof record.text === 'string' ? record.text : '',
+      images: record.images && typeof record.images === 'object' && !Array.isArray(record.images) ? record.images as JsonRecord : {},
+    }
+  }
+  return { text: '', images: {} }
+}
+
+function resolveMarkdownImageSrc(src: string, images: JsonRecord): string {
+  const value = String(src || '').trim()
+  if (!value) return ''
+  const mapped = images[value]
+  return typeof mapped === 'string' && mapped.trim() ? mapped.trim() : value
+}
+
+function getBlockImagePath(block: OcrTextBlock): string {
+  return String(block?.image_asset_path || block?.asset_path || block?.image_path || '').trim()
+}
+
+function isRenderableImagePath(value: string): boolean {
+  const path = String(value || '').trim()
+  return Boolean(path) && !/^(?:imgs?|images?)\//i.test(path)
+}
+
+function rectOverlapRatio(left: Rect, right: Rect): number {
+  const x1 = Math.max(left.left, right.left)
+  const y1 = Math.max(left.top, right.top)
+  const x2 = Math.min(left.left + left.width, right.left + right.width)
+  const y2 = Math.min(left.top + left.height, right.top + right.height)
+  const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+  const minArea = Math.min(Math.max(1, left.width * left.height), Math.max(1, right.width * right.height))
+  return intersection / minArea
+}
+
 function isLayoutDecorativeLabel(label: string): boolean {
   const normalized = normalizeLayoutLabel(label)
   return /^(?:header|footer|page number|number|header image|footer image|watermark|stamp|seal|barcode|qrcode)$/.test(normalized)
     || /页眉|页脚|页码|页号|印章|水印|版权/.test(normalized)
+}
+
+function hasPositiveBlockOrder(block: OcrTextBlock): boolean {
+  const order = Number(block?.block_order)
+  return Number.isFinite(order) && order > 0
+}
+
+function shouldPreferPositiveBlockOrder(blocks: OcrTextBlock[]): boolean {
+  const contentBlocks = blocks.filter((block) => !isLayoutDecorativeLabel(getBlockLabel(block)))
+  if (contentBlocks.length === 0) return false
+  const orderedCount = contentBlocks.filter(hasPositiveBlockOrder).length
+  return orderedCount >= Math.max(2, Math.ceil(contentBlocks.length * 0.6))
+}
+
+function compareByPositiveBlockOrder(left: OcrTextBlock, right: OcrTextBlock): number {
+  const leftOrder = Number(left?.block_order)
+  const rightOrder = Number(right?.block_order)
+  const leftHasOrder = Number.isFinite(leftOrder) && leftOrder > 0
+  const rightHasOrder = Number.isFinite(rightOrder) && rightOrder > 0
+  if (leftHasOrder !== rightHasOrder) return leftHasOrder ? -1 : 1
+  if (leftHasOrder && rightHasOrder) return leftOrder - rightOrder
+  const leftReadingOrder = Number(left?.reading_order)
+  const rightReadingOrder = Number(right?.reading_order)
+  if (Number.isFinite(leftReadingOrder) || Number.isFinite(rightReadingOrder)) {
+    return (Number.isFinite(leftReadingOrder) ? leftReadingOrder : Number.MAX_SAFE_INTEGER)
+      - (Number.isFinite(rightReadingOrder) ? rightReadingOrder : Number.MAX_SAFE_INTEGER)
+  }
+  const leftPoint = getBlockPoint(left)
+  const rightPoint = getBlockPoint(right)
+  return leftPoint.top - rightPoint.top || leftPoint.left - rightPoint.left
 }
 
 function parseArabicPageNumber(value: string): number | null {
@@ -827,22 +923,71 @@ function getLayoutBlockType(block: unknown, text: string): 'heading' | 'paragrap
 function getLayoutAwareBlocks(page: OcrTextPage): OcrTextBlock[] {
   const parsed = asOcrResult(page.ocr_result)
   if (!parsed) return []
+  const withMarkdownImages = (blocks: OcrTextBlock[]): OcrTextBlock[] => {
+    const markdown = getMarkdownTextAndImages(parsed)
+    const markdownText = markdown.text || String(page.ocr_text || '')
+    const markdownImageBlocks = parseMarkdownImageBlocks(markdownText)
+    const enrichedBlocks = blocks.map((block) => {
+      if (!isLayoutImageLabel(getBlockLabel(block)) || isRenderableImagePath(getBlockImagePath(block))) return block
+      const rect = getBlockRect(block)
+      if (!rect) return block
+      const markdownImage = markdownImageBlocks.find((imageBlock) => rectOverlapRatio(rect, imageBlock.rect) >= 0.6)
+      if (!markdownImage) return block
+      const imagePath = resolveMarkdownImageSrc(markdownImage.src, markdown.images)
+      if (!isRenderableImagePath(imagePath)) return block
+      return {
+        ...block,
+        words: getBlockText(block) || markdownImage.alt || 'image',
+        image_path: imagePath,
+        image_asset_path: imagePath,
+        asset_path: imagePath,
+      }
+    })
+    const imageBlocks = markdownImageBlocks
+      .filter((imageBlock) => !enrichedBlocks.some((block) => (
+        isLayoutImageLabel(getBlockLabel(block))
+        && isRenderableImagePath(getBlockImagePath(block))
+        && getBlockRect(block)
+        && rectOverlapRatio(getBlockRect(block) as Rect, imageBlock.rect) >= 0.6
+      )))
+      .map((imageBlock, index): OcrTextBlock => {
+        const followingBlock = enrichedBlocks
+          .filter((block) => {
+            const rect = getBlockRect(block)
+            return rect && !isLayoutDecorativeLabel(getBlockLabel(block)) && rect.top >= imageBlock.rect.top + imageBlock.rect.height - Math.max(12, imageBlock.rect.height * 0.08)
+          })
+          .sort((left, right) => Number(getBlockRect(left)?.top || 0) - Number(getBlockRect(right)?.top || 0))[0]
+        const readingOrder = followingBlock && Number.isFinite(Number(followingBlock.reading_order))
+          ? Number(followingBlock.reading_order) - 0.5
+          : blocks.length + index + 0.5
+        return {
+          words: imageBlock.alt || 'image',
+          label: 'image',
+          reading_order: readingOrder,
+          location: imageBlock.rect,
+          image_path: resolveMarkdownImageSrc(imageBlock.src, markdown.images),
+          image_asset_path: resolveMarkdownImageSrc(imageBlock.src, markdown.images),
+          asset_path: resolveMarkdownImageSrc(imageBlock.src, markdown.images),
+        } as OcrTextBlock
+      })
+    return [...enrichedBlocks, ...imageBlocks]
+  }
   const layoutBlocks = asBlockArray(parsed.layout_result)
   const rawLayoutBlocks = asBlockArray(parsed.raw_layout_result)
   if (layoutBlocks.length > 0) {
-    return shouldPreferRawLayoutBlocks(layoutBlocks, rawLayoutBlocks) ? rawLayoutBlocks : layoutBlocks
+    return withMarkdownImages(shouldPreferRawLayoutBlocks(layoutBlocks, rawLayoutBlocks) ? rawLayoutBlocks : layoutBlocks)
   }
   const layoutBoxes = firstBlockArray(
     getPathValue(parsed, ['layout_det_res', 'boxes']),
     getPathValue(parsed, ['res', 'layout_det_res', 'boxes']),
     parsed.boxes,
   )
-  if (layoutBoxes.length > 0) return layoutBoxes
+  if (layoutBoxes.length > 0) return withMarkdownImages(layoutBoxes)
   const parsingBlocks = firstBlockArray(
     parsed.parsing_res_list,
     getPathValue(parsed, ['prunedResult', 'parsing_res_list']),
   )
-  if (parsingBlocks.length > 0) return parsingBlocks
+  if (parsingBlocks.length > 0) return withMarkdownImages(parsingBlocks)
   return []
 }
 
@@ -914,6 +1059,10 @@ export function getOrderedOcrBlocks(page: OcrTextPage): OcrTextBlock[] {
   const blocks = getOcrTextBlocks(page)
 
   if (blocks.length === 0) return []
+
+  if (shouldPreferPositiveBlockOrder(blocks)) {
+    return [...blocks].sort(compareByPositiveBlockOrder)
+  }
 
   return [...blocks].sort((left, right) => {
     const leftOrder = Number(left?.reading_order)

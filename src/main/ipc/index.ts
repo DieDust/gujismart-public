@@ -11,6 +11,8 @@ import { registerOnboardingIpc } from './onboarding'
 import { registerResearchIpc } from './research'
 import { registerTocIpc } from './toc'
 import { registerGlossaryIpc } from './glossary'
+import { registerLibraryIpc } from './library'
+import { registerDatabaseMaintenanceIpc } from './database-maintenance'
 
 export function registerAllIpcHandlers(): void {
   registerDocumentIpc()
@@ -31,6 +33,8 @@ export function registerAllIpcHandlers(): void {
   registerResearchIpc()
   registerTocIpc()
   registerGlossaryIpc()
+  registerLibraryIpc()
+  registerDatabaseMaintenanceIpc()
 
   console.log('[IPC] All handlers registered')
 }

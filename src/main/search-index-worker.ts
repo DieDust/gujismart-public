@@ -11,7 +11,9 @@ import {
   SEARCH_INDEX_SEGMENT_MAX_CHARS,
   SEARCH_INDEX_SEGMENT_OVERLAP_CHARS,
   SEARCH_INDEX_VERSION,
+  SEARCH_NGRAM_INDEX_ENABLED,
   SEARCH_NGRAM_MAX_POSITIONS_STORED,
+  SEARCH_TRIGRAM_FTS_ENABLED,
 } from './search-index-constants'
 import { normalizeChineseSearchText } from './text-normalization'
 import type { SearchIndexWorkerProgress, SearchIndexWorkerTask } from './search-index-worker-client'
@@ -205,13 +207,14 @@ function transaction(sqlite: NativeDatabase, fn: () => void): void {
   }
 }
 
-function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAvailable: boolean } {
+function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAvailable: boolean; trigramFtsAvailable: boolean } {
   const sqlite = new Database(dbFilePath)
   sqlite.pragma('foreign_keys = ON')
   sqlite.pragma('journal_mode = WAL')
   sqlite.pragma('synchronous = NORMAL')
   sqlite.pragma(`busy_timeout = ${WORKER_DATABASE_BUSY_TIMEOUT_MS}`)
   let ftsAvailable = false
+  let trigramFtsAvailable = false
   try {
     sqlite.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_fts USING fts5(
@@ -226,6 +229,23 @@ function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAv
     ftsAvailable = true
   } catch {
     ftsAvailable = false
+  }
+  if (ftsAvailable && SEARCH_TRIGRAM_FTS_ENABLED) {
+    try {
+      sqlite.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_trigram USING fts5(
+          segment_id UNINDEXED,
+          doc_id UNINDEXED,
+          page_id UNINDEXED,
+          page_num UNINDEXED,
+          normalized_text,
+          tokenize='trigram'
+        );
+      `)
+      trigramFtsAvailable = true
+    } catch {
+      trigramFtsAvailable = false
+    }
   }
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS search_index_segments_staging (
@@ -260,7 +280,7 @@ function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAv
     CREATE INDEX IF NOT EXISTS idx_search_segments_staging_doc ON search_index_segments_staging(job_id, doc_id);
     CREATE INDEX IF NOT EXISTS idx_search_ngram_staging_doc ON search_ngram_index_staging(job_id, doc_id);
   `)
-  return { sqlite, ftsAvailable }
+  return { sqlite, ftsAvailable, trigramFtsAvailable }
 }
 
 function createSearchIndexStagingJobId(docId: string): string {
@@ -456,16 +476,17 @@ function hashText(value: string): string {
 }
 
 function getSearchNgrams(text: string, maxGramSize = 3, maxStoredPositions = Number.POSITIVE_INFINITY): Array<{ gram: string; positions: number[]; hitCount: number }> {
+  if (!SEARCH_NGRAM_INDEX_ENABLED) return []
   const normalized = normalizeSearchText(text)
   const byGram = new Map<string, { positions: number[]; hitCount: number }>()
   for (let index = 0; index < normalized.length; index += 1) {
-    for (let size = 1; size <= maxGramSize; size += 1) {
+    for (let size = 2; size <= maxGramSize; size += 1) {
       if (index + size > normalized.length) break
       const gram = normalized.slice(index, index + size)
       if (!gram.trim() || /\s/.test(gram)) continue
       const item = byGram.get(gram) || { positions: [], hitCount: 0 }
       item.hitCount += 1
-      if (item.positions.length < maxStoredPositions) item.positions.push(index)
+      if (maxStoredPositions > 0 && item.positions.length < maxStoredPositions) item.positions.push(index)
       byGram.set(gram, item)
     }
   }
@@ -735,10 +756,14 @@ function commitStagedSearchIndexForDocument(
   segmentCount: number,
   now: string,
   ftsAvailable: boolean,
+  trigramFtsAvailable: boolean,
 ): void {
   transaction(sqlite, () => {
     if (ftsAvailable) {
       runOn(sqlite, 'DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
+    }
+    if (trigramFtsAvailable) {
+      runOn(sqlite, 'DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
     }
     runOn(sqlite, 'DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
     runOn(sqlite, 'DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
@@ -771,6 +796,16 @@ function commitStagedSearchIndexForDocument(
         [docId],
       )
     }
+    if (trigramFtsAvailable) {
+      runOn(
+        sqlite,
+        `INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
+         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
+    }
     runOn(
       sqlite,
       `INSERT INTO search_index_status (doc_id, status, source_hash, segment_count, error_message, indexed_at, updated_at)
@@ -790,7 +825,7 @@ function commitStagedSearchIndexForDocument(
 }
 
 async function reindexDocument(task: SearchIndexWorkerTask): Promise<SearchReindexDocumentResult> {
-  const { sqlite, ftsAvailable } = openWorkerDatabase(task.dbFilePath)
+  const { sqlite, ftsAvailable, trigramFtsAvailable } = openWorkerDatabase(task.dbFilePath)
   const { docId, totalCount, completedCount } = task
   let stagingJobId = ''
   try {
@@ -847,7 +882,7 @@ async function reindexDocument(task: SearchIndexWorkerTask): Promise<SearchReind
 
     const readyAt = new Date().toISOString()
     const sourceHash = versionedSourceHash(segmentHashes)
-    commitStagedSearchIndexForDocument(sqlite, stagingJobId, docId, sourceHash, segmentCount, readyAt, ftsAvailable)
+    commitStagedSearchIndexForDocument(sqlite, stagingJobId, docId, sourceHash, segmentCount, readyAt, ftsAvailable, trigramFtsAvailable)
     return { docId, status: 'ready', segmentCount }
   } catch (error: unknown) {
     const errorMessage = getErrorMessage(error)

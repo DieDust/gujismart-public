@@ -32,7 +32,48 @@ function getLibraryCardText() {
     .join('\n')
 }
 
+async function waitForLibrarySearchInput(window) {
+  await window.waitForFunction(() => {
+    return Boolean(document.querySelector('input[data-library-search-input="true"]'))
+  }, null, { timeout: 8000 })
+}
+
+async function openLibraryView(window) {
+  await clickMenu(window, LABELS.library)
+  try {
+    await waitForLibrarySearchInput(window)
+  } catch {
+    await window.evaluate((label) => {
+      const item = Array.from(document.querySelectorAll('.ant-menu-item, .ant-menu-submenu-title'))
+        .find((node) => (node.textContent || '').trim() === label)
+      if (item instanceof HTMLElement) item.click()
+    }, LABELS.library)
+    await window.waitForTimeout(1000)
+    await waitForLibrarySearchInput(window)
+  }
+}
+
+async function setLibrarySearchValue(window, value) {
+  await window.evaluate((nextValue) => {
+    const input = document.querySelector('input[data-library-search-input="true"]')
+    if (!(input instanceof HTMLInputElement)) throw new Error('Missing library search input')
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+    if (!setter) throw new Error('Missing native input value setter')
+    setter.call(input, nextValue)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  }, value)
+}
+
+async function submitLibrarySearch(window) {
+  await window.evaluate(() => {
+    const button = document.querySelector('button[data-library-search-submit="true"]')
+    if (!(button instanceof HTMLButtonElement)) throw new Error('Missing library search submit button')
+    button.click()
+  })
+}
+
 async function clickMenu(window, label) {
+  await dismissBlockingModal(window)
   const items = window.locator('.ant-menu-item, .ant-menu-submenu-title')
   const index = await items.evaluateAll((nodes, target) => {
     return nodes.findIndex((node) => (node.textContent || '').trim() === target)
@@ -44,6 +85,25 @@ async function clickMenu(window, label) {
 
   await items.nth(index).click()
   await window.waitForTimeout(700)
+}
+
+async function dismissBlockingModal(window) {
+  const dismissed = await window.evaluate(() => {
+    const wraps = Array.from(document.querySelectorAll('.ant-modal-wrap'))
+    for (const wrap of wraps) {
+      const style = window.getComputedStyle(wrap)
+      if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') continue
+      const target = wrap.querySelector('.ant-modal-close')
+      if (target instanceof HTMLElement) {
+        target.click()
+        return true
+      }
+    }
+    return false
+  })
+  if (dismissed) {
+    await window.waitForTimeout(500)
+  }
 }
 
 async function verifyMainText(window, expectedText) {
@@ -163,8 +223,8 @@ async function verifyLibrarySearchSubmit(window, userDataDir) {
 
   const [hitDoc, missDoc] = importResults
   await window.evaluate(async ({ hitId, missId, hit, miss }) => {
-    await window.api.updateDocument(hitId, { title: hit })
-    await window.api.updateDocument(missId, { title: miss })
+    await window.api.updateDocument(hitId, { title: hit, import_status: 'processed', ocr_status: 'completed' })
+    await window.api.updateDocument(missId, { title: miss, import_status: 'processed', ocr_status: 'completed' })
   }, { hitId: hitDoc.id, missId: missDoc.id, hit: hitTitle, miss: missTitle })
 
   const scopeState = await window.evaluate(async ({ hitId, missId }) => {
@@ -203,21 +263,31 @@ async function verifyLibrarySearchSubmit(window, userDataDir) {
   }
 
   await clickMenu(window, LABELS.library)
-  await window.waitForSelector('input[data-library-search-input="true"]', { timeout: 8000 })
-  await window.waitForFunction(({ hit, miss }) => {
-    const text = Array.from(document.querySelectorAll('[data-library-document-card="true"]')).map((node) => node.textContent || '').join('\n')
-    return text.includes(hit) && text.includes(miss)
-  }, { hit: hitTitle, miss: missTitle }, { timeout: 8000 })
+  await waitForLibrarySearchInput(window)
+  await setLibrarySearchValue(window, '')
+  await submitLibrarySearch(window)
+  try {
+    await window.waitForFunction(({ hit, miss }) => {
+      const text = Array.from(document.querySelectorAll('[data-library-document-card="true"]')).map((node) => node.textContent || '').join('\n')
+      return text.includes(hit) && text.includes(miss)
+    }, { hit: hitTitle, miss: missTitle }, { timeout: 8000 })
+  } catch (error) {
+    const debugState = await window.evaluate(() => ({
+      mainText: (document.querySelector('main')?.textContent || '').slice(0, 1000),
+      cardText: Array.from(document.querySelectorAll('[data-library-document-card="true"]')).map((node) => node.textContent || '').join('\n').slice(0, 1000),
+      searchInput: document.querySelector('input[data-library-search-input="true"]')?.getAttribute('value') || '',
+    }))
+    throw new Error(`Expected smoke documents to appear in library view. ${JSON.stringify(debugState)}. ${(error && error.message) || error}`)
+  }
 
-  const searchInput = window.locator('input[data-library-search-input="true"]').first()
-  await searchInput.fill('hit-alpha')
+  await setLibrarySearchValue(window, 'hit-alpha')
   await window.waitForTimeout(600)
   const preSubmitText = await window.evaluate(getLibraryCardText)
   if (!preSubmitText.includes(hitTitle) || !preSubmitText.includes(missTitle)) {
     throw new Error('Expected library search input to wait for explicit submit before filtering')
   }
 
-  await searchInput.press('Enter')
+  await submitLibrarySearch(window)
   try {
     await window.waitForFunction(({ hit, miss }) => {
       const text = Array.from(document.querySelectorAll('[data-library-document-card="true"]')).map((node) => node.textContent || '').join('\n')
@@ -235,11 +305,17 @@ async function verifyLibrarySearchSubmit(window, userDataDir) {
         text: text.slice(0, 1000),
         directTitles: direct.items.map((item) => item.title),
         directTotal: direct.total,
+        loadingText: document.querySelector('.empty-state')?.textContent || '',
+        emptyText: document.querySelector('.ant-empty')?.textContent || '',
+        mainText: document.querySelector('main')?.textContent?.slice(0, 1000) || '',
+        cardCount: document.querySelectorAll('[data-library-document-card="true"]').length,
+        listRows: document.querySelectorAll('[role="row"], [aria-rowindex]').length,
       }
     }, { hit: hitTitle, miss: missTitle })
     throw new Error(`Expected Enter to submit library search; state=${JSON.stringify(state)}; cause=${error.message}`)
   }
 
+  const searchInput = window.locator('input[data-library-search-input="true"]').first()
   await searchInput.fill('')
   await window.locator('button[data-library-search-submit="true"]').first().click()
   await window.waitForFunction(({ hit, miss }) => {
@@ -319,7 +395,7 @@ async function verifyLibraryIncrementalLoading(window, userDataDir) {
   }
 
   await clickMenu(window, LABELS.library)
-  await window.waitForSelector('input[data-library-search-input="true"]', { timeout: 8000 })
+  await waitForLibrarySearchInput(window)
   await window.waitForFunction(() => !document.querySelector('[data-library-health-panel="true"]'), undefined, { timeout: 8000 })
   const searchInput = window.locator('input[data-library-search-input="true"]').first()
   await searchInput.fill(prefix)

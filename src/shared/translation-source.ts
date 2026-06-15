@@ -481,6 +481,36 @@ function getBlockRect(block: unknown): Rect | null {
   return { left: point.left, top: point.top, width: size.width, height: size.height }
 }
 
+function hasPositiveBlockOrder(block: TranslationBlock): boolean {
+  const order = Number(block?.block_order)
+  return Number.isFinite(order) && order > 0
+}
+
+function shouldPreferPositiveBlockOrder(blocks: TranslationBlock[]): boolean {
+  const contentBlocks = blocks.filter((block) => !isDecorativeLabel(getBlockLabel(block)))
+  if (contentBlocks.length === 0) return false
+  const orderedCount = contentBlocks.filter(hasPositiveBlockOrder).length
+  return orderedCount >= Math.max(2, Math.ceil(contentBlocks.length * 0.6))
+}
+
+function compareByPositiveBlockOrder(left: TranslationBlock, right: TranslationBlock): number {
+  const leftOrder = Number(left?.block_order)
+  const rightOrder = Number(right?.block_order)
+  const leftHasOrder = Number.isFinite(leftOrder) && leftOrder > 0
+  const rightHasOrder = Number.isFinite(rightOrder) && rightOrder > 0
+  if (leftHasOrder !== rightHasOrder) return leftHasOrder ? -1 : 1
+  if (leftHasOrder && rightHasOrder) return leftOrder - rightOrder
+  const leftReadingOrder = Number(left?.reading_order)
+  const rightReadingOrder = Number(right?.reading_order)
+  if (Number.isFinite(leftReadingOrder) || Number.isFinite(rightReadingOrder)) {
+    return (Number.isFinite(leftReadingOrder) ? leftReadingOrder : Number.MAX_SAFE_INTEGER)
+      - (Number.isFinite(rightReadingOrder) ? rightReadingOrder : Number.MAX_SAFE_INTEGER)
+  }
+  const leftPoint = getBlockPoint(left)
+  const rightPoint = getBlockPoint(right)
+  return leftPoint.top - rightPoint.top || leftPoint.left - rightPoint.left
+}
+
 function hasBlockCoordinates(block: unknown): boolean {
   return Boolean(getRawBlockLocation(block))
 }
@@ -557,6 +587,9 @@ function getOcrBlocks(ocrResult: unknown): TranslationBlock[] {
 
 function getOrderedTranslationBlocks(ocrResult: unknown): TranslationBlock[] {
   const blocks = getOcrBlocks(ocrResult)
+  if (shouldPreferPositiveBlockOrder(blocks)) {
+    return [...blocks].sort(compareByPositiveBlockOrder)
+  }
   return [...blocks].sort((left, right) => {
     const leftOrder = Number(left?.reading_order)
     const rightOrder = Number(right?.reading_order)
@@ -652,13 +685,32 @@ function isTallVerticalTextBlock(block: unknown): boolean {
   return getVerticalScriptRatio(text) >= 0.42
 }
 
+function hasModernHorizontalParagraphShape(block: unknown): boolean {
+  const label = getOrientationLabelText(block)
+  if (!/^(?:text|paragraph|body)$/.test(label)) return false
+  const rect = getBlockRect(block)
+  const text = getCanonicalTranslationBlockText(block)
+  if (!rect || !text.trim()) return false
+  const compact = text.replace(/\s+/g, '')
+  const punctuationCount = Array.from(compact).filter((char) => /[，。；：！？、“”‘’（）《》,.!?;:]/.test(char)).length
+  return compact.length >= 80
+    && rect.width >= 160
+    && punctuationCount / Math.max(1, compact.length) >= 0.035
+}
+
 function isStrongHorizontalTextBlock(block: unknown): boolean {
   const label = getOrientationLabelText(block)
   if (isTocLabel(label) || isExplicitHorizontalLabel(label)) return true
+  if (hasModernHorizontalParagraphShape(block)) return true
   if (isExplicitVerticalLabel(label)) return false
   const rect = getBlockRect(block)
   const text = getCanonicalTranslationBlockText(block)
   if (!rect || !text.trim()) return false
+  if (/^(?:text|paragraph|body)$/.test(label)) {
+    const paragraphCompact = text.replace(/\s+/g, '')
+    const punctuationCount = Array.from(paragraphCompact).filter((char) => /[，。；：！？、“”‘’（）《》,.!?;:]/.test(char)).length
+    if (paragraphCompact.length >= 80 && rect.width >= 160 && punctuationCount / Math.max(1, paragraphCompact.length) >= 0.045) return true
+  }
   if (isNaturallyHorizontalLabel(label) && !isTallVerticalTextBlock(block)) return true
   const compact = text.replace(/\s+/g, '')
   const asciiCount = Array.from(compact).filter((char) => /[A-Za-z0-9()[\]{}.,;:!?/"'%-]/.test(char)).length
@@ -684,9 +736,9 @@ function isVerticalPage(blocks: CanonicalTranslationBlock[]): boolean {
 
 function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
   if (isTableBlock(block)) return 'horizontal'
+  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   const explicitOrientation = getExplicitOcrOrientation(block)
   if (explicitOrientation) return explicitOrientation
-  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   if (isTallVerticalTextBlock(block)) return 'vertical'
   if (hasHorizontalTextSignals(block)) return 'horizontal'
   const rect = getBlockRect(block)
@@ -727,7 +779,7 @@ function normalizeInitialTranslationBlocks(ocrResult: unknown): CanonicalTransla
         ...block,
         words,
         label,
-        reading_order: Number.isFinite(Number(block.reading_order)) ? Number(block.reading_order) : index,
+        reading_order: index,
         orientation: inferOrientation(block),
         __rect: rect || undefined,
         __sourceIndex: index,
@@ -749,7 +801,7 @@ function normalizeInitialTranslationBlocks(ocrResult: unknown): CanonicalTransla
       }))
   }
 
-  return blocks.sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
+  return blocks
 }
 
 function normalizePageOrientations(blocks: CanonicalTranslationBlock[]): CanonicalTranslationBlock[] {

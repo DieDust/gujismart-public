@@ -16,6 +16,7 @@ function sliceBetween(source, startMarker, endMarker, label) {
 const root = path.join(__dirname, '..')
 const ocrSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr.ts'), 'utf8')
 const ocrIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
+const librarySource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
 const uploadBlobHelper = sliceBetween(
   ocrSource,
   'async function createPdfUploadBlob',
@@ -92,13 +93,97 @@ assert(
   'submitAsyncPdfJob should use the upload Blob helper',
 )
 assert(
-  submitAsyncPdfJobBody.includes("formData.append('file', fileBlob, basename(filePath))"),
-  'submitAsyncPdfJob should append the file-backed Blob to FormData',
+  ocrSource.includes('function getSafeOcrUploadFilename')
+    && submitAsyncPdfJobBody.includes("formData.append('file', fileBlob, getSafeOcrUploadFilename(filePath))")
+    && !submitAsyncPdfJobBody.includes("formData.append('file', fileBlob, basename(filePath))"),
+  'submitAsyncPdfJob should upload PDFs with an ASCII-safe filename so PaddleOCR jobs do not stall on CJK filenames.',
+)
+assert(
+  !submitAsyncPdfJobBody.includes("formData.append('optionalPayload'")
+    && !ocrSource.includes('function getAsyncPdfOptionalPayload'),
+  'submitAsyncPdfJob should not force-disable PaddleOCR orientation, unwarping, or chart recognition for async PDF OCR.',
+)
+assert(
+  submitAsyncPdfJobBody.includes("formData.append('pageRanges', submitOptions.pageRanges)")
+    && createPdfChunkFromPlanBody.includes('const pageRanges = isFullPageSelection ? undefined : toQpdfPageRange(sourcePageIndexes)')
+    && createPdfChunkFromPlanBody.includes('pageRanges,')
+    && recognizePdfAsyncBody.includes('}, { pageRanges: chunk.pageRanges })'),
+  'Async PDF OCR should use official pageRanges for partial resume instead of asking PaddleOCR to parse the whole PDF again.',
+)
+assert(
+  ocrSource.includes('const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 1')
+    && ocrSource.includes('const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 1')
+    && ocrSource.includes('const asyncSubmitLimit = createLimiter(MAX_DOC_CONCURRENCY)')
+    && !ocrSource.includes('asyncPdfJobLimit'),
+  'Async PDF OCR should respect the configured document batch concurrency while keeping per-document chunk concurrency conservative.',
+)
+assert(
+  ocrSource.includes('const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 240')
+    && ocrSource.includes('function isAsyncOcrQueueBusyError')
+    && ocrSource.includes('提交队列已满')
+    && submitAsyncPdfJobBody.includes('const queueBusy = isAsyncOcrQueueBusyError(failure)')
+    && submitAsyncPdfJobBody.includes('maxAttempts = Math.max(maxAttempts, ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS)')
+    && submitAsyncPdfJobBody.includes('? Math.min(60000, 15000 * attempt)')
+    && ocrSource.includes('if (isAsyncOcrQueueBusyError(failure)) return false'),
+  'Async PDF OCR should wait and retry when PaddleOCR reports a full submission queue instead of marking documents failed.',
+)
+assert(
+  !ocrIpcSource.includes('SMALL_PDF_IMAGE_OCR_PAGE_LIMIT')
+    && !ocrIpcSource.includes('workPageCount <= SMALL_PDF_IMAGE_OCR_PAGE_LIMIT')
+    && ocrIpcSource.includes('if (!shouldUseAsyncPdfOcr(pdfPath, Math.max(pageCount, pages.length, pagesForOcr.length))) return false')
+    && ocrIpcSource.indexOf('if (!shouldUseAsyncPdfOcr(pdfPath, Math.max(pageCount, pages.length, pagesForOcr.length))) return false') < ocrIpcSource.indexOf('if (pages.length === 0) return true'),
+  'Usable PDFs should prefer async PDF OCR; readable page images are only a fallback path, not a reason to bypass PDF upload.',
 )
 assert(
   ocrSource.includes('const PDF_LIB_CHUNK_PLAN_MAX_FILE_SIZE = ASYNC_PDF_MAX_FILE_SIZE')
     && ocrSource.includes('function shouldAvoidPdfLibChunkPlanFallback'),
   'PDF chunk planning should have an explicit size guard for pdf-lib fallback',
+)
+assert(
+  createPdfChunkPlanBody.includes('const fallbackTotalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)')
+    && createPdfChunkPlanBody.includes('forceChunking = false')
+    && createPdfChunkPlanBody.includes('!forceChunking')
+    && createPdfChunkPlanBody.includes('canAttemptWholePdfUpload(stats.size, fallbackTotalPages)')
+    && createPdfChunkPlanBody.includes('canAttemptWholePdfUpload(stats.size, totalPages)')
+    && createPdfChunkPlanBody.includes('fullFileUpload: true')
+    && createPdfChunkPlanBody.indexOf('const fallbackTotalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)') < createPdfChunkPlanBody.indexOf('let totalPages = isQpdfPdfChunkingEnabled()'),
+  'PDFs with a known page count should prefer full-file async upload instead of preemptively chunking by local 50MB/1000-page guards.',
+)
+assert(
+  recognizePdfAsyncBody.includes("status: 'uploading'")
+    && recognizePdfAsyncBody.includes("state: 'uploading'")
+    && recognizePdfAsyncBody.indexOf("status: 'uploading'") < recognizePdfAsyncBody.indexOf('const jobId = await submitAsyncPdfJob'),
+  'Async PDF OCR should emit an uploading phase before the fetch upload blocks on the network.',
+)
+assert(
+  ocrIpcSource.includes('const asyncProgressMessage = isUploading && isFullFileUpload')
+    && ocrIpcSource.includes('const uploadModeMessage = isFullFileUpload')
+    && ocrIpcSource.includes('准备上传 PDF')
+    && ocrIpcSource.includes('PDF 已提交，等待处理')
+    && ocrIpcSource.includes('OCR 处理中')
+    && !ocrIpcSource.includes('不是本地逐页上传')
+    && !ocrIpcSource.includes('当前文档并发')
+    && !ocrIpcSource.includes('服务端处理中')
+    && !ocrIpcSource.includes('正在上传整本 PDF 到飞桨')
+    && !ocrIpcSource.includes('逐页图片 OCR')
+    && !ocrIpcSource.includes('上传设置')
+    && !ocrIpcSource.includes('getOcrImageUploadSettingsText')
+    && ocrIpcSource.includes("const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''")
+    && ocrIpcSource.includes('message: fallbackRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue'),
+  'OCR IPC progress should use concise user-facing upload/server messages instead of debug explanations.',
+)
+assert(
+  ocrSource.includes('function shouldRetryWholePdfUploadWithChunking')
+    && recognizePdfAsyncBody.includes('let retriedWholePdfUploadWithChunks = false')
+    && recognizePdfAsyncBody.includes('shouldRetryWholePdfUploadWithChunking(error, plan)')
+    && recognizePdfAsyncBody.includes('createPdfChunkPlan(filePath, options?.targetPageNums, signal, options?.fallbackPageCount, true)'),
+  'Async PDF OCR should retry with chunking only after a whole-PDF upload is actually rejected.',
+)
+assert(
+  librarySource.includes("if (info.phase === 'saving') return info.message || '正在保存 OCR 结果'")
+    && librarySource.includes('if (info.message) return info.message')
+    && librarySource.indexOf('if (info.message) return info.message') < librarySource.indexOf("return `OCR 识别中：${info.completedPages}/${info.totalPages} 页`"),
+  'Library OCR progress text should prefer explicit upload/server messages over the generic 0/N page label.',
 )
 assert(
   ocrSource.includes('const ASYNC_PDF_HEAVY_TARGET_CHUNK_SIZE = 32 * 1024 * 1024')

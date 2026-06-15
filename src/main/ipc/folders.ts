@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid'
 import { join, extname } from 'path'
 import { existsSync, readdirSync, statSync } from 'fs'
 import type { BulkAssociationResult, Document, Folder, FolderCreatePayload, FolderImportFile, FolderUpdatePayload } from '../../shared/types'
+import { markLibraryStateCacheDirty } from '../library-state-cache'
 
 const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
   '.pdf',
@@ -150,7 +151,14 @@ function collectSupportedFolderFiles(dirPath: string): FolderImportFile[] {
 
 export function registerFolderIpc(): void {
   ipcMain.handle('folders:list', async (): Promise<Folder[]> => {
-    return queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order, created_at')
+    return queryAll<Folder>(
+      `SELECT f.*,
+        COUNT(DISTINCT df.doc_id) AS document_count
+       FROM folders f
+       LEFT JOIN document_folders df ON df.folder_id = f.id
+       GROUP BY f.id
+       ORDER BY f.sort_order, f.created_at`,
+    )
   })
 
   ipcMain.handle('folders:get', async (_event, id: string): Promise<Folder | null> => {
@@ -176,6 +184,7 @@ export function registerFolderIpc(): void {
       [id, name, parentId, data.external_path || null, data.icon || 'folder', data.color || null, sortOrder, now, now]
     )
     saveDatabase()
+    markLibraryStateCacheDirty()
 
     return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [id])
   })
@@ -221,6 +230,7 @@ export function registerFolderIpc(): void {
 
     run(`UPDATE folders SET ${sets.join(', ')} WHERE id = ?`, params)
     saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 
@@ -236,12 +246,14 @@ export function registerFolderIpc(): void {
       run('DELETE FROM folders WHERE id = ?', [folderId])
     })
     saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 
   ipcMain.handle('folders:addDocument', async (_event, docId: string, folderId: string): Promise<boolean> => {
     run('INSERT OR IGNORE INTO document_folders (doc_id, folder_id) VALUES (?, ?)', [docId, folderId])
     saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 
@@ -259,12 +271,14 @@ export function registerFolderIpc(): void {
       }
     })
     saveDatabase()
+    markLibraryStateCacheDirty()
     return { count: uniqueDocIds.length }
   })
 
   ipcMain.handle('folders:removeDocument', async (_event, docId: string, folderId: string): Promise<boolean> => {
     run('DELETE FROM document_folders WHERE doc_id = ? AND folder_id = ?', [docId, folderId])
     saveDatabase()
+    markLibraryStateCacheDirty()
     return true
   })
 

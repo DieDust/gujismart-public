@@ -25,7 +25,7 @@ import WelcomeView from './views/WelcomeView'
 import { useFolderStore } from './stores/useFolderStore'
 import { useOnboardingStore } from './stores/useOnboardingStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
-import type { AppUpdateInfo, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget } from '@shared/types'
+import type { AppUpdateInfo, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
 import './styles/app.css'
 
@@ -60,6 +60,33 @@ function ViewLoadingFallback() {
 
 function getUpdateNoticeStorageKey(info: AppUpdateInfo): string {
   return `gujismart:update-notice:${info.latestVersion}`
+}
+
+const ONBOARDING_STEP_KEYS = ['welcome', 'paddle_ocr', 'ai_model', 'vision_ocr', 'finish']
+const ONBOARDING_SETTINGS_LOAD_TIMEOUT_MS = 3000
+const ONBOARDING_SETTINGS_TIMEOUT = Symbol('onboarding-settings-timeout')
+
+function hasConfiguredText(value: unknown): boolean {
+  return String(value || '').trim().length > 0
+}
+
+function getSettingsForOnboardingCheck(): Promise<SettingsMap | typeof ONBOARDING_SETTINGS_TIMEOUT> {
+  return Promise.race([
+    window.api.getAllSettings(),
+    new Promise<typeof ONBOARDING_SETTINGS_TIMEOUT>((resolve) => {
+      window.setTimeout(() => resolve(ONBOARDING_SETTINGS_TIMEOUT), ONBOARDING_SETTINGS_LOAD_TIMEOUT_MS)
+    }),
+  ])
+}
+
+function hasPaddleOcrConfig(settings: SettingsMap): boolean {
+  return hasConfiguredText(settings.paddleocr_api_key)
+}
+
+function hasAiConfig(settings: SettingsMap): boolean {
+  return hasConfiguredText(settings.llm_api_key)
+    && hasConfiguredText(settings.llm_base_url)
+    && hasConfiguredText(settings.llm_model)
 }
 
 export default function App() {
@@ -139,6 +166,39 @@ export default function App() {
         })
       })
       .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const evaluateOnboarding = async () => {
+      try {
+        const [completed, settings] = await Promise.all([
+          window.api.isOnboardingCompleted(),
+          getSettingsForOnboardingCheck(),
+        ])
+        if (cancelled || completed) return
+        if (settings === ONBOARDING_SETTINGS_TIMEOUT) return
+
+        const hasCoreConfig = hasPaddleOcrConfig(settings) && hasAiConfig(settings)
+        const store = useOnboardingStore.getState()
+        if (hasCoreConfig) {
+          store.completeSteps(ONBOARDING_STEP_KEYS)
+          for (const stepKey of ONBOARDING_STEP_KEYS) {
+            await window.api.completeOnboardingStep(stepKey)
+          }
+          return
+        }
+
+        store.open(0)
+      } catch (error) {
+        console.error('Failed to evaluate onboarding state', error)
+      }
+    }
+
+    void evaluateOnboarding()
     return () => {
       cancelled = true
     }
@@ -347,6 +407,27 @@ export default function App() {
       setLibraryImportRequest((value) => value + 1)
     })
   }
+
+  useEffect(() => {
+    const handleOnboardingAction = (event: Event) => {
+      const detail = (event as CustomEvent<{ action?: string }>).detail
+      if (detail?.action === 'open-library-import') {
+        void handleImport()
+        return
+      }
+      if (detail?.action === 'open-settings') {
+        runWithSettingsLeaveGuard(() => {
+          setCurrentDocId(null)
+          setInitialPageIndex(0)
+          setSearchKeyword('')
+          setCurrentView('settings')
+        })
+      }
+    }
+
+    window.addEventListener('gujismart:onboarding-action', handleOnboardingAction)
+    return () => window.removeEventListener('gujismart:onboarding-action', handleOnboardingAction)
+  }, [handleImport, runWithSettingsLeaveGuard])
 
   const handleDroppedImport = (paths: string[]) => {
     runWithSettingsLeaveGuard(() => {
@@ -617,7 +698,7 @@ export default function App() {
                 <Button
                   type="text"
                   icon={<QuestionCircleOutlined />}
-                  onClick={() => useOnboardingStore.getState().setVisible(true)}
+                  onClick={() => useOnboardingStore.getState().open(0)}
                   style={{ color: 'var(--gs-text-secondary)' }}
                 />
               </Tooltip>

@@ -56,7 +56,7 @@ import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSetti
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
 import { getErrorMessage } from '@shared/errors'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -78,6 +78,7 @@ const LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT = 1000
 const LARGE_PDF_PREVIEW_IDLE_DELAY_MS = 30_000
 const AUTO_OCR_PDF_PREVIEW_IDLE_DELAY_MS = 60_000
 const PDF_PREVIEW_LIST_REFRESH_BATCH_SIZE = 10
+const VIRTUAL_LIST_MIN_DOCUMENTS = 8
 const IMPORT_LIST_REFRESH_DEBOUNCE_MS = 350
 const UNFILED_FOLDER_ID = '__gujismart_unfiled__'
 const UNFILED_FOLDER_NAME = '未分类'
@@ -117,11 +118,105 @@ const BACKGROUND_OCR_FINALIZE_MESSAGE_KEY = 'background-ocr-finalize'
 const BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY = 'background-startup-recovery'
 const HEALTH_REPORT_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_REFRESH_DEBOUNCE_MS = 600
+const SMART_COUNTS_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_BUSY_RETRY_DELAYS_MS = [800, 1600, 3200]
+const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 12_000
+
+type SmartViewCountKey =
+  | 'all'
+  | 'missingMetadata'
+  | 'unrecognized'
+  | 'suspiciousTitle'
+  | 'unknownType'
+  | 'favorite'
+  | 'unread'
+  | 'proofed'
+  | 'unproofed'
+  | 'metadataPending'
+  | 'unstored'
+
+const EMPTY_SMART_VIEW_COUNTS: Record<SmartViewCountKey, number> = {
+  all: 0,
+  missingMetadata: 0,
+  unrecognized: 0,
+  suspiciousTitle: 0,
+  unknownType: 0,
+  favorite: 0,
+  unread: 0,
+  proofed: 0,
+  unproofed: 0,
+  metadataPending: 0,
+  unstored: 0,
+}
+
+interface LibraryWarmCache {
+  scopeKey: string
+  documents: DocumentItem[]
+  folders: Folder[]
+  tags: TagItem[]
+  smartViewCounts: Record<SmartViewCountKey, number>
+  healthReport: DocumentHealthReport | null
+  documentTotal: number
+  unfiledDocumentTotal: number
+  listOffset: number
+  listHasMore: boolean
+}
+
+let libraryWarmCache: LibraryWarmCache | null = null
+
+function getFallbackLibraryWarmCache(scopeKey: string): LibraryWarmCache {
+  return {
+    scopeKey,
+    documents: [],
+    folders: [],
+    tags: [],
+    smartViewCounts: { ...EMPTY_SMART_VIEW_COUNTS },
+    healthReport: null,
+    documentTotal: 0,
+    unfiledDocumentTotal: 0,
+    listOffset: 0,
+    listHasMore: false,
+  }
+}
+
+function patchLibraryWarmCache(scopeKey: string, patch: Partial<Omit<LibraryWarmCache, 'scopeKey'>>): void {
+  const base = libraryWarmCache?.scopeKey === scopeKey
+    ? libraryWarmCache
+    : getFallbackLibraryWarmCache(scopeKey)
+  libraryWarmCache = { ...base, ...patch, scopeKey }
+}
+
+function applyLibraryStateCacheToFolders(folders: Folder[], cache?: LibraryStateCache | null): Folder[] {
+  if (!cache) return folders
+  return folders.map((folder) => ({
+    ...folder,
+    document_count: Number(cache.folderDocumentCounts[folder.id] ?? folder.document_count ?? 0),
+  }))
+}
+
+function applyLibraryStateCacheToTags(tags: TagItem[], cache?: LibraryStateCache | null): TagItem[] {
+  if (!cache) return tags
+  return tags.map((tag) => ({
+    ...tag,
+    usage_count: Number(cache.tagDocumentCounts[tag.id] ?? tag.usage_count ?? 0),
+  }))
+}
 
 function isTransientDatabaseBusyError(error: unknown): boolean {
   const message = getErrorMessage(error, '').toLowerCase()
   return /database is locked|database is busy|sqlite_busy|sqlite_locked|busy timeout/.test(message)
+}
+
+function withLibraryRequestTimeout<T>(promise: Promise<T>, timeoutMs = LIBRARY_LIST_REQUEST_TIMEOUT_MS): Promise<T> {
+  let timer: number | null = null
+  const timeout = new Promise<T>((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error('文献列表加载超时，主进程可能无响应。请重启软件后再试。'))
+    }, timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) window.clearTimeout(timer)
+  })
 }
 
 function parseLibrarySortValue(value: LibrarySortValue): Pick<ListDocumentOptions, 'sortKey' | 'sortDirection'> {
@@ -156,6 +251,22 @@ function getStoredLibraryPageSize(): LibraryPageSize {
   } catch {
     return DEFAULT_LIBRARY_PAGE_SIZE
   }
+}
+
+function buildLibraryListScopeKey(input: {
+  filter: LibraryFilter
+  searchKey: string
+  searchFields: LibraryDocumentSearchField[]
+  sort: LibrarySortValue
+  pageSize: LibraryPageSize
+}): string {
+  return JSON.stringify({
+    filter: input.filter,
+    searchKey: input.searchKey.trim(),
+    searchFields: input.searchFields,
+    sort: input.sort,
+    pageSize: input.pageSize,
+  })
 }
 
 function getLibrarySearchFieldsLabel(fields: LibraryDocumentSearchField[]): string {
@@ -807,6 +918,7 @@ function getOcrProgressText(info: OcrProgressInfo): string {
   }
 
   if (info.phase === 'saving') return info.message || '正在保存 OCR 结果'
+  if (info.message) return info.message
   if (info.completedPages !== undefined && info.totalPages) {
     return `OCR 识别中：${info.completedPages}/${info.totalPages} 页`
   }
@@ -1113,8 +1225,8 @@ function getFilterTitle(filter: LibraryFilter, folders: FolderItem[], tags: TagI
   if (filter.type === 'favorite') return '\u661f\u6807\u6587\u732e'
   if (filter.type === 'readStatus') return READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '\u9605\u8bfb\u72b6\u6001'
   if (filter.type === 'metadataStatus') return METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '\u5143\u6570\u636e\u72b6\u6001'
-  if (filter.type === 'ocrIncomplete') return '未识别文献'
-  if (filter.type === 'ocrStatus') return filter.value === 'pending' ? '未识别文献' : getStatusMeta(OCR_STATUS_MAP, filter.value).text
+  if (filter.type === 'ocrIncomplete') return 'OCR 未完成文献'
+  if (filter.type === 'ocrStatus') return filter.value === 'pending' ? 'OCR 未完成文献' : getStatusMeta(OCR_STATUS_MAP, filter.value).text
   if (filter.type === 'proofStatus') {
     return filter.value === 'completed' ? '\u5df2\u6821\u5bf9' : '\u672a\u6821\u5bf9'
   }
@@ -1142,8 +1254,8 @@ function getFilterChipLabel(filter: LibraryFilter, folders: FolderItem[], tags: 
   if (filter.type === 'favorite') return '\u661f\u6807\u6587\u732e'
   if (filter.type === 'readStatus') return `阅读状态 / ${READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '未读'}`
   if (filter.type === 'metadataStatus') return `元数据 / ${METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '待确认'}`
-  if (filter.type === 'ocrIncomplete') return 'OCR / 未识别'
-  if (filter.type === 'ocrStatus') return `OCR / ${filter.value === 'pending' ? '未识别' : getStatusMeta(OCR_STATUS_MAP, filter.value).text}`
+  if (filter.type === 'ocrIncomplete') return 'OCR / 未完成'
+  if (filter.type === 'ocrStatus') return `OCR / ${filter.value === 'pending' ? '未完成' : getStatusMeta(OCR_STATUS_MAP, filter.value).text}`
   if (filter.type === 'proofStatus') {
     return filter.value === 'completed' ? '\u5df2\u6821\u5bf9' : '\u672a\u6821\u5bf9'
   }
@@ -1742,6 +1854,8 @@ export default function LibraryView({
   const [importOcrEngine, setImportOcrEngine] = useState<OcrEngine>('paddle')
   const [libraryInitialLoadDone, setLibraryInitialLoadDone] = useState(false)
   const [documentTotal, setDocumentTotal] = useState(0)
+  const [unfiledDocumentTotal, setUnfiledDocumentTotal] = useState(0)
+  const [smartViewCounts, setSmartViewCounts] = useState<Record<SmartViewCountKey, number>>(EMPTY_SMART_VIEW_COUNTS)
   const [listLoadingMore, setListLoadingMore] = useState(false)
   const [listHasMore, setListHasMore] = useState(false)
   const [searchInput, setSearchInput] = useState(searchKey)
@@ -1758,14 +1872,17 @@ export default function LibraryView({
   const lastDroppedImportRequestRef = useRef(0)
   const lastInitialFilterRef = useRef<LibraryFilter | null>(null)
   const listRequestSeqRef = useRef(0)
+  const visibleListLoadingRequestRef = useRef(0)
   const listOffsetRef = useRef(0)
   const listLoadingMoreRef = useRef(false)
   const listHasMoreRef = useRef(false)
   const libraryListScopeRef = useRef('')
   const metadataRefreshTimerRef = useRef<number | null>(null)
   const baseDataRefreshTimerRef = useRef<number | null>(null)
+  const smartCountsRefreshTimerRef = useRef<number | null>(null)
   const baseDataBusyRetryCountRef = useRef(0)
   const documentsRef = useRef<DocumentItem[]>([])
+  const hasHydratedWarmCacheRef = useRef(false)
   const activeOcrToastKeysRef = useRef<Set<string>>(new Set())
   const ocrProgressByDocRef = useRef<Record<string, OcrProgressInfo>>({})
   const ocrStatusBufferRef = useRef<Map<string, OcrProgressEvent>>(new Map())
@@ -1804,9 +1921,48 @@ export default function LibraryView({
     stackHeight: 0
   })
 
+  const currentLibraryScopeKey = useMemo(() => buildLibraryListScopeKey({
+    filter,
+    searchKey,
+    searchFields: librarySearchFields,
+    sort: librarySort,
+    pageSize: libraryPageSize,
+  }), [filter, libraryPageSize, librarySearchFields, librarySort, searchKey])
+
   useEffect(() => {
     documentsRef.current = documents
   }, [documents])
+
+  useEffect(() => {
+    if (hasHydratedWarmCacheRef.current || !libraryWarmCache) return
+    if (libraryWarmCache.scopeKey !== currentLibraryScopeKey) return
+    hasHydratedWarmCacheRef.current = true
+    setDocuments(libraryWarmCache.documents)
+    documentsRef.current = libraryWarmCache.documents
+    setFolders(libraryWarmCache.folders)
+    setTags(libraryWarmCache.tags)
+    setSmartViewCounts(libraryWarmCache.smartViewCounts)
+    setHealthReport(libraryWarmCache.healthReport)
+    setDocumentTotal(libraryWarmCache.documentTotal)
+    setUnfiledDocumentTotal(libraryWarmCache.unfiledDocumentTotal)
+    listOffsetRef.current = libraryWarmCache.listOffset
+    listHasMoreRef.current = libraryWarmCache.listHasMore
+    setListHasMore(libraryWarmCache.listHasMore)
+    libraryListScopeRef.current = libraryWarmCache.scopeKey
+    setLibraryInitialLoadDone(true)
+    visibleListLoadingRequestRef.current = 0
+    setLoading(false)
+  }, [currentLibraryScopeKey, setDocuments, setFolders, setLoading])
+
+  useEffect(() => {
+    if (!libraryWarmCache || libraryWarmCache.scopeKey !== currentLibraryScopeKey) return
+    libraryWarmCache = {
+      ...libraryWarmCache,
+      documents,
+      listOffset: listOffsetRef.current,
+      listHasMore: listHasMoreRef.current,
+    }
+  }, [currentLibraryScopeKey, documents])
 
   useEffect(() => {
     ocrProgressByDocRef.current = ocrProgressByDoc
@@ -1931,13 +2087,27 @@ export default function LibraryView({
 
   const loadBaseData = useCallback(async () => {
     try {
-      const [folderItems, tagItems] = await Promise.all([
+      const [folderItems, tagItems, stateCache] = await Promise.all([
         window.api.listFolders(),
-        window.api.listTags()
+        window.api.listTags(),
+        window.api.getLibraryStateCache(),
       ])
+      const foldersWithCounts = applyLibraryStateCacheToFolders(folderItems, stateCache)
+      const tagsWithCounts = applyLibraryStateCacheToTags(tagItems as TagItem[], stateCache)
       baseDataBusyRetryCountRef.current = 0
-      setFolders(folderItems)
-      setTags(tagItems)
+      setFolders(foldersWithCounts)
+      setTags(tagsWithCounts)
+      setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
+      setSmartViewCounts(stateCache.smartViewCounts)
+      patchLibraryWarmCache(currentLibraryScopeKey, {
+        documents: documentsRef.current,
+        folders: foldersWithCounts,
+        tags: tagsWithCounts,
+        smartViewCounts: stateCache.smartViewCounts,
+        unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
+        listOffset: listOffsetRef.current,
+        listHasMore: listHasMoreRef.current,
+      })
     } catch (error) {
       console.error(error)
       if (isTransientDatabaseBusyError(error)) {
@@ -1954,7 +2124,40 @@ export default function LibraryView({
       }
       message.error({ content: '加载目录和标签失败', key: 'library-base-data-load', duration: 4 })
     }
-  }, [setFolders])
+  }, [currentLibraryScopeKey, setFolders])
+
+  const loadSmartViewCounts = useCallback(async (options?: { refresh?: boolean }) => {
+    try {
+      const stateCache = options?.refresh
+        ? await window.api.refreshLibraryStateCache()
+        : await window.api.getLibraryStateCache()
+      setSmartViewCounts(stateCache.smartViewCounts)
+      setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
+      const nextFolders = applyLibraryStateCacheToFolders(folders, stateCache)
+      const nextTags = applyLibraryStateCacheToTags(tags, stateCache)
+      setFolders(nextFolders)
+      setTags(nextTags)
+      patchLibraryWarmCache(currentLibraryScopeKey, {
+        smartViewCounts: stateCache.smartViewCounts,
+        unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
+        folders: nextFolders,
+        tags: nextTags,
+      })
+    } catch (error) {
+      console.warn('[LibraryView] Failed to load smart view counts', error)
+    }
+  }, [currentLibraryScopeKey, folders, setFolders, tags])
+
+  const scheduleSmartViewCountsRefresh = useCallback((delayMs = SMART_COUNTS_REFRESH_DEBOUNCE_MS) => {
+    if (smartCountsRefreshTimerRef.current) {
+      window.clearTimeout(smartCountsRefreshTimerRef.current)
+    }
+
+    smartCountsRefreshTimerRef.current = window.setTimeout(() => {
+      smartCountsRefreshTimerRef.current = null
+      void loadSmartViewCounts()
+    }, delayMs)
+  }, [loadSmartViewCounts])
 
   const scheduleBaseDataRefresh = useCallback((delayMs = BASE_DATA_REFRESH_DEBOUNCE_MS) => {
     if (baseDataRefreshTimerRef.current) {
@@ -1971,14 +2174,16 @@ export default function LibraryView({
     try {
       if (!options?.silent) setHealthLoading(true)
       const report = await window.api.getDocumentHealthReport({ refresh: options?.refresh })
-      setHealthReport(sanitizeHealthReport(report as DocumentHealthReport))
+      const nextReport = sanitizeHealthReport(report as DocumentHealthReport)
+      setHealthReport(nextReport)
+      patchLibraryWarmCache(currentLibraryScopeKey, { healthReport: nextReport })
     } catch (error) {
       console.error(error)
       if (!options?.silent) message.error('加载文献健康检查失败')
     } finally {
       if (!options?.silent) setHealthLoading(false)
     }
-  }, [])
+  }, [currentLibraryScopeKey])
 
   const scheduleHealthReportRefresh = useCallback((delayMs = HEALTH_REPORT_REFRESH_DEBOUNCE_MS) => {
     if (healthPanelCollapsed) return
@@ -1992,9 +2197,9 @@ export default function LibraryView({
     }, delayMs)
   }, [healthPanelCollapsed, loadHealthReport])
 
-  const buildListOptions = useCallback((activeFilter = filter, paging?: { limit?: number; offset?: number }): ListDocumentOptions => {
+  const buildListOptions = useCallback((activeFilter = filter, paging?: { limit?: number; offset?: number; search?: string }): ListDocumentOptions => {
     const options: ListDocumentOptions = {}
-    const keyword = searchKey.trim()
+    const keyword = (paging?.search ?? searchKey).trim()
     const sortOptions = parseLibrarySortValue(librarySort)
     if (keyword) {
       options.search = keyword
@@ -2033,7 +2238,7 @@ export default function LibraryView({
     return options
   }, [filter, folders, librarySearchFields, librarySort, searchKey])
 
-  const loadDocuments = useCallback(async (activeFilter = filter, options?: { silent?: boolean; reset?: boolean; append?: boolean }) => {
+  const loadDocuments = useCallback(async (activeFilter = filter, options?: { silent?: boolean; reset?: boolean; append?: boolean; search?: string }) => {
     const append = !!options?.append
     if (append && (listLoadingMoreRef.current || !listHasMoreRef.current)) return
 
@@ -2052,14 +2257,18 @@ export default function LibraryView({
     } else {
       listLoadingMoreRef.current = false
       setListLoadingMore(false)
-      if (!options?.silent) setLoading(true)
+      if (!options?.silent) {
+        visibleListLoadingRequestRef.current = requestId
+        setLoading(true)
+      }
     }
 
     try {
-      const page = await window.api.listDocumentsPage(buildListOptions(activeFilter, {
+      const page = await withLibraryRequestTimeout(window.api.listDocumentsPage(buildListOptions(activeFilter, {
         limit,
         offset,
-      }))
+        search: options?.search,
+      })))
       if (requestId !== listRequestSeqRef.current) return
 
       const nextItems = applySmartFilterDocuments(page.items, activeFilter)
@@ -2086,32 +2295,42 @@ export default function LibraryView({
         return changed ? next : current
       })
       setDocumentTotal(page.total)
+      patchLibraryWarmCache(buildLibraryListScopeKey({
+          filter: activeFilter,
+          searchKey: options?.search ?? searchKey,
+          searchFields: librarySearchFields,
+          sort: librarySort,
+          pageSize: libraryPageSize,
+        }), {
+        documents: nextDocs,
+        documentTotal: page.total,
+        listOffset: nextOffset,
+        listHasMore: listHasMoreRef.current,
+      })
       if (!append) setLibraryInitialLoadDone(true)
     } catch (error) {
       console.error(error)
-      message.error('\u52a0\u8f7d\u6587\u732e\u5217\u8868\u5931\u8d25')
+      message.error(getErrorMessage(error, '加载文献列表失败'))
     } finally {
       if (append) {
         listLoadingMoreRef.current = false
         setListLoadingMore(false)
-      } else if (requestId === listRequestSeqRef.current) {
-        if (!options?.silent) setLoading(false)
+      } else if (visibleListLoadingRequestRef.current === requestId) {
+        visibleListLoadingRequestRef.current = 0
+        setLoading(false)
       }
     }
-  }, [buildListOptions, filter, libraryPageSize, setDocuments, setLoading])
+  }, [buildListOptions, filter, libraryPageSize, librarySearchFields, librarySort, searchKey, setDocuments, setLoading])
 
   const submitLibrarySearch = useCallback((value = searchInput) => {
     const keyword = value.trim()
     setSearchInput(keyword)
-    if (keyword === searchKey.trim()) {
-      listOffsetRef.current = 0
-      listHasMoreRef.current = false
-      setListHasMore(false)
-      void loadDocuments(filter, { reset: true })
-      return
-    }
+    listOffsetRef.current = 0
+    listHasMoreRef.current = false
+    setListHasMore(false)
     setSearchKey(keyword)
-  }, [filter, loadDocuments, searchInput, searchKey, setSearchKey])
+    void loadDocuments(filter, { reset: true, search: keyword })
+  }, [filter, loadDocuments, searchInput, setSearchKey])
 
   const loadMoreDocuments = useCallback(() => {
     if (loading || listLoadingMoreRef.current || !listHasMoreRef.current) return
@@ -2316,6 +2535,15 @@ export default function LibraryView({
 
   useEffect(() => {
     void loadBaseData()
+  }, [loadBaseData])
+
+  useEffect(() => {
+    return () => {
+      if (smartCountsRefreshTimerRef.current) {
+        window.clearTimeout(smartCountsRefreshTimerRef.current)
+        smartCountsRefreshTimerRef.current = null
+      }
+    }
   }, [])
 
   useEffect(() => {
@@ -2400,6 +2628,7 @@ export default function LibraryView({
             duration: 3,
           })
           scheduleHealthReportRefresh()
+          scheduleSmartViewCountsRefresh()
           return
         }
 
@@ -2410,6 +2639,7 @@ export default function LibraryView({
             duration: 6,
           })
           scheduleHealthReportRefresh()
+          scheduleSmartViewCountsRefresh()
         }
         return
       }
@@ -2661,13 +2891,7 @@ export default function LibraryView({
   }, [searchKey])
 
   useEffect(() => {
-    const scopeKey = JSON.stringify({
-      filter,
-      searchKey: searchKey.trim(),
-      searchFields: librarySearchFields,
-      sort: librarySort,
-      pageSize: libraryPageSize,
-    })
+    const scopeKey = currentLibraryScopeKey
     const shouldResetList = libraryListScopeRef.current !== scopeKey
     libraryListScopeRef.current = scopeKey
     if (shouldResetList) {
@@ -2677,17 +2901,9 @@ export default function LibraryView({
       clearSelection()
       libraryContentRef.current?.scrollTo({ top: 0 })
     }
-    void loadDocuments(filter, { reset: shouldResetList })
-  }, [clearSelection, filter, libraryPageSize, librarySearchFields, librarySort, loadDocuments, searchKey])
-
-  useEffect(() => {
-    const handleWindowFocus = () => {
-      void loadDocuments(filter, { silent: true })
-    }
-
-    window.addEventListener('focus', handleWindowFocus)
-    return () => window.removeEventListener('focus', handleWindowFocus)
-  }, [filter, loadDocuments])
+    const canWarmRefresh = libraryWarmCache?.scopeKey === scopeKey && libraryWarmCache.documents.length > 0
+    void loadDocuments(filter, { reset: shouldResetList, silent: canWarmRefresh })
+  }, [clearSelection, currentLibraryScopeKey, filter, loadDocuments])
 
   useEffect(() => {
     const handleMouseMove = (event: globalThis.MouseEvent) => {
@@ -2736,20 +2952,43 @@ export default function LibraryView({
   }, [])
 
   const smartFilters = useMemo(() => {
-    const countRowsWithIssues = (types: string[]) => healthReport?.rows.filter((row) => row.issues.some((issue) => types.includes(issue.type))).length || 0
-    const missingMetadataCount = countRowsWithIssues(['missing_author', 'missing_year', 'missing_identifier', 'missing_publisher', 'missing_source'])
     return [
-      { key: 'all', label: `全部文献${healthReport ? ` ${healthReport.stats.totalDocuments || 0}` : ''}`, filter: { type: 'all' as const } },
-      { key: 'missing-metadata', label: `缺元数据 ${missingMetadataCount}`, filter: { type: 'healthMissingMetadata' as const } },
-      { key: 'unrecognized', label: `未识别${healthReport ? ` ${healthReport.stats.incompleteOcr || 0}` : ''}`, filter: { type: 'ocrIncomplete' as const } },
-      { key: 'suspicious-title', label: `题名疑似导入名 ${healthReport?.stats.suspiciousTitle || 0}`, filter: { type: 'healthSuspiciousTitle' as const } },
-      { key: 'unknown-type', label: `待分类 ${healthReport?.stats.unknownType || 0}`, filter: { type: 'healthUnknownType' as const } },
-      { key: 'favorite', label: '星标', filter: { type: 'favorite' as const } },
-      { key: 'unread', label: '未读', filter: { type: 'readStatus' as const, value: 'unread' } },
-      { key: 'proofed', label: '已校对', filter: { type: 'proofStatus' as const, value: 'completed' } },
-      { key: 'unproofed', label: '未校对', filter: { type: 'proofStatus' as const, value: 'pending' } },
-      { key: 'metadata-pending', label: '未确认元数据', filter: { type: 'metadataPending' as const } },
-      { key: 'unstored', label: '未入库', filter: { type: 'importStatus' as const, value: 'unstored' } }
+      { key: 'all', label: `全部文献 ${smartViewCounts.all}`, filter: { type: 'all' as const } },
+      { key: 'missing-metadata', label: `缺元数据 ${smartViewCounts.missingMetadata}`, filter: { type: 'healthMissingMetadata' as const } },
+      { key: 'unrecognized', label: `OCR 未完成 ${smartViewCounts.unrecognized}`, filter: { type: 'ocrIncomplete' as const } },
+      { key: 'suspicious-title', label: `题名疑似导入名 ${smartViewCounts.suspiciousTitle}`, filter: { type: 'healthSuspiciousTitle' as const } },
+      { key: 'unknown-type', label: `待分类 ${smartViewCounts.unknownType}`, filter: { type: 'healthUnknownType' as const } },
+      { key: 'favorite', label: `星标 ${smartViewCounts.favorite}`, filter: { type: 'favorite' as const } },
+      { key: 'unread', label: `未读 ${smartViewCounts.unread}`, filter: { type: 'readStatus' as const, value: 'unread' } },
+      { key: 'proofed', label: `已校对 ${smartViewCounts.proofed}`, filter: { type: 'proofStatus' as const, value: 'completed' } },
+      { key: 'unproofed', label: `未校对 ${smartViewCounts.unproofed}`, filter: { type: 'proofStatus' as const, value: 'pending' } },
+      { key: 'metadata-pending', label: `未确认元数据 ${smartViewCounts.metadataPending}`, filter: { type: 'metadataPending' as const } },
+      { key: 'unstored', label: `未入库 ${smartViewCounts.unstored}`, filter: { type: 'importStatus' as const, value: 'unstored' } }
+    ]
+  }, [smartViewCounts])
+
+  const healthMetricItems = useMemo(() => {
+    const countRowsWithIssues = (types: string[]) => healthReport?.rows.filter((row) => row.issues.some((issue) => types.includes(issue.type))).length || 0
+    const getStat = (key: string, fallback: number): number => {
+      const value = Number(healthReport?.stats?.[key])
+      return Number.isFinite(value) ? value : fallback
+    }
+    return [
+      {
+        label: '缺元数据',
+        value: healthReport ? countRowsWithIssues(['missing_metadata', 'missing_author', 'missing_year', 'missing_identifier', 'missing_publisher', 'missing_source']) : 0,
+        filter: { type: 'healthMissingMetadata' as const },
+      },
+      {
+        label: '题名疑似导入名',
+        value: healthReport ? getStat('suspiciousTitle', countRowsWithIssues(['suspicious_title', 'title_cleanup'])) : 0,
+        filter: { type: 'healthSuspiciousTitle' as const },
+      },
+      {
+        label: '待分类',
+        value: healthReport ? getStat('unknownType', countRowsWithIssues(['unknown_type', 'title_cleanup'])) : 0,
+        filter: { type: 'healthUnknownType' as const },
+      },
     ]
   }, [healthReport])
 
@@ -3484,22 +3723,31 @@ export default function LibraryView({
     let successCount = 0
     let shouldRefreshAfterBatches = false
 
+    if (engine === 'paddle') {
+      message.loading({
+        content: getOcrBatchProgressMessage(getOcrEngineLabel(engine), 1, Math.max(1, batches.length), ocrBatchSize, documentConcurrency),
+        key: messageKey,
+        duration: 0,
+      })
+      successCount = await window.api.batchOcr(uniqueDocIds, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })
+      scheduleImportListRefresh()
+      cancelScheduledImportListRefresh()
+      await loadDocuments(filter, { silent: true })
+      return successCount
+    }
+
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
       const batch = batches[batchIndex]
       const preparedBatch: string[] = []
       for (let docIndex = 0; docIndex < batch.length; docIndex += 1) {
         const docId = batch[docIndex]
         try {
-          if (engine === 'paddle') {
-            preparedBatch.push(docId)
-          } else {
-            const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {
-              fileIndex: batchIndex * ocrBatchSize + docIndex,
-              totalFiles: uniqueDocIds.length,
-              engine,
-            })
-            if (ready) preparedBatch.push(docId)
-          }
+          const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {
+            fileIndex: batchIndex * ocrBatchSize + docIndex,
+            totalFiles: uniqueDocIds.length,
+            engine,
+          })
+          if (ready) preparedBatch.push(docId)
         } catch (error) {
           const reason = getErrorMessage(error, '未知错误')
           console.warn('[Library] OCR 前补齐 PDF 页图失败', docId, error)
@@ -5131,6 +5379,9 @@ export default function LibraryView({
                               <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
                                 {UNFILED_FOLDER_NAME}
                               </span>
+                              <span style={{ color: active ? 'rgba(255,255,255,0.82)' : 'var(--gs-text-tertiary)', fontSize: 12, flexShrink: 0 }}>
+                                {unfiledDocumentTotal}
+                              </span>
                             </div>
                           )
                         })()}
@@ -5220,6 +5471,9 @@ export default function LibraryView({
                                 <FolderOpenOutlined style={{ flexShrink: 0 }} />
                                 <span style={{ minWidth: 0, flex: 1, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
                                   {item.name}
+                                </span>
+                                <span style={{ color: active ? 'rgba(255,255,255,0.82)' : 'var(--gs-text-tertiary)', fontSize: 12, flexShrink: 0 }}>
+                                  {Number(item.document_count || 0)}
                                 </span>
                               </div>
                             </Dropdown>
@@ -5563,11 +5817,7 @@ export default function LibraryView({
             </div>
 
             <div className="library-health-metrics">
-              {[
-                { label: '缺元数据', value: healthReport ? healthReport.rows.filter((row) => row.issues.some((issue) => ['missing_author', 'missing_year', 'missing_identifier', 'missing_publisher', 'missing_source'].includes(issue.type))).length : 0, filter: { type: 'healthMissingMetadata' as const } },
-                { label: '题名疑似导入名', value: healthReport?.stats.suspiciousTitle || 0, filter: { type: 'healthSuspiciousTitle' as const } },
-                { label: '待分类', value: healthReport?.stats.unknownType || 0, filter: { type: 'healthUnknownType' as const } },
-              ].map((item) => (
+              {healthMetricItems.map((item) => (
                 <button
                   key={item.label}
                   type="button"
@@ -5628,6 +5878,19 @@ export default function LibraryView({
             <div className="empty-state"><Spin size="large" /></div>
           ) : documents.length === 0 ? (
             <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有文献，把 PDF、图片或文件夹拖到这里开始导入" />
+          ) : viewMode === 'list' && documents.length < VIRTUAL_LIST_MIN_DOCUMENTS ? (
+            <div style={{ width: '100%', paddingTop: 4 }}>
+              {documents.map((doc, index) => (
+                <DocumentVirtualRow
+                  key={doc.id}
+                  index={index}
+                  style={{ height: getDocumentListRowHeight(doc, listCardContext), position: 'relative' }}
+                  ariaAttributes={{}}
+                  documents={documents}
+                  context={listCardContext}
+                />
+              ))}
+            </div>
           ) : viewMode === 'list' ? (
             <List<DocumentVirtualRowProps>
               rowCount={documents.length}

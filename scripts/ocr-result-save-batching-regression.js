@@ -131,9 +131,17 @@ assert(
 assert(
   ocrIpcSource.includes('function getPageSnapshotsForOcrSave')
     && ocrIpcSource.includes('SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_result, ocr_status')
-    && savePageOcrResultsBody.includes('pageSnapshots = getPageSnapshotsForOcrSave(pageResults.map((pageResult) => pageResult.pageId))')
+    && savePageOcrResultsBody.includes('const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)')
+    && savePageOcrResultsBody.includes('pageSnapshots = getPageSnapshotsForOcrSave(guardedPageResults.map((pageResult) => pageResult.pageId))')
     && savePageOcrResultsBody.includes('const existingPage = pageSnapshots.get(pageResult.pageId)'),
   'savePageOcrResults should prefetch page save snapshots once per save batch.',
+)
+assert(
+  ocrIpcSource.includes('function guardRepeatedOcrPageResult')
+    && ocrIpcSource.includes('findSuspiciousRepeatedOcrText(pageResult.result || pageResult.text)')
+    && ocrIpcSource.includes('formatSuspiciousRepeatedOcrTextIssue(repeatedIssue)')
+    && savePageOcrResultsBody.indexOf('const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)') < savePageOcrResultsBody.indexOf('transaction(() => {'),
+  'savePageOcrResults should guard suspicious repeated OCR text before writing page rows.',
 )
 assert(
   !savePageOcrResultsBody.includes("queryOne<{")

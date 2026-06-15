@@ -10,7 +10,7 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, queryAll, queryOne, refreshTagUsageForTags, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshTagUsageForTags, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { normalizePageResult } from '../ocr'
@@ -34,6 +34,7 @@ import {
 } from '../pdf-assets'
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
+import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { normalizeHistoryDocType } from '../../shared/history-citation'
 import { getErrorMessage } from '../../shared/errors'
 import {
@@ -283,7 +284,10 @@ async function deleteRowsByDocIdsAsync(tableName: string, docIds: string[]): Pro
 async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
   if (!isFtsAvailable()) return
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
-    for (const tableName of ['pages_fts', 'search_segments_fts']) {
+    const tableNames = isSearchTrigramFtsAvailable()
+      ? ['pages_fts', 'search_segments_fts', 'search_segments_trigram']
+      : ['pages_fts', 'search_segments_fts']
+    for (const tableName of tableNames) {
       while (true) {
         const rows = queryAll<{ rowid: number }>(
           `SELECT rowid FROM ${tableName} WHERE doc_id IN (${placeholders}) LIMIT ?`,
@@ -2355,7 +2359,7 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
         ${buildDocumentCompletedPageCountExpression('d')} as ocr_completed_page_count,
         (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
         (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
-        (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count
+        0 as search_segment_count
       FROM documents d`
 
   const params: unknown[] = []
@@ -2697,15 +2701,26 @@ function listDocumentPage(options?: ListDocumentOptions): DocumentListPage {
   const safeLimit = Math.max(1, Math.min(100, Math.round(Number(options?.limit || 10))))
   const safeOffset = Math.max(0, Math.round(Number(options?.offset || 0)))
   const normalizedOptions = { ...options, limit: safeLimit, offset: safeOffset }
-  const { sql, params } = buildDocumentListQuery(normalizedOptions)
-  const countQuery = buildDocumentListQuery(normalizedOptions, true)
-  const items = attachDocumentRelations(queryAll<DocumentListItem>(sql, params))
-  const totalRow = queryOne<{ total: number }>(countQuery.sql, countQuery.params)
-  return {
-    items,
-    total: Number(totalRow?.total || 0),
-    limit: safeLimit,
-    offset: safeOffset,
+  const startedAt = Date.now()
+  try {
+    const { sql, params } = buildDocumentListQuery(normalizedOptions)
+    const countQuery = buildDocumentListQuery(normalizedOptions, true)
+    const rawItems = queryAll<DocumentListItem>(sql, params)
+    const items = attachDocumentRelations(rawItems)
+    const totalRow = queryOne<{ total: number }>(countQuery.sql, countQuery.params)
+    return {
+      items,
+      total: Number(totalRow?.total || 0),
+      limit: safeLimit,
+      offset: safeOffset,
+    }
+  } catch (error) {
+    console.error('[Documents] listPage failed', {
+      options: normalizedOptions,
+      elapsedMs: Date.now() - startedAt,
+      error: getErrorMessage(error, String(error)),
+    })
+    throw error
   }
 }
 
@@ -2958,6 +2973,7 @@ function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): Document
           ['completed', 'processed', now, ...chunkIds],
         )
       })
+      markLibraryStateCacheDirty()
       scheduleDatabaseSave()
     } catch (error) {
       console.warn('[Documents] Failed to persist normalized OCR status; using page-derived status for this list response', error)
@@ -3536,6 +3552,7 @@ export function registerDocumentIpc(): void {
       notifySearchContentChanged()
     }
     scheduleDatabaseSave()
+    markLibraryStateCacheDirty()
     return results
   }))
 
@@ -3821,6 +3838,7 @@ export function registerDocumentIpc(): void {
       })
     }
     scheduleDatabaseSave()
+    markLibraryStateCacheDirty()
     return true
   })
 
@@ -3833,18 +3851,21 @@ export function registerDocumentIpc(): void {
       [isFavorite ? 1 : 0, isFavorite ? new Date().toISOString() : null, new Date().toISOString(), id]
     )
     scheduleDatabaseSave()
+    markLibraryStateCacheDirty()
     return true
   })
 
   ipcMain.handle('documents:setReadStatus', async (_event, id: string, readStatus: ReadStatus): Promise<boolean> => {
     run('UPDATE documents SET read_status = ?, updated_at = ? WHERE id = ?', [readStatus, new Date().toISOString(), id])
     scheduleDatabaseSave()
+    markLibraryStateCacheDirty()
     return true
   })
 
   ipcMain.handle('documents:setRating', async (_event, id: string, rating: number | null) => {
     run('UPDATE documents SET rating = ?, updated_at = ? WHERE id = ?', [rating, new Date().toISOString(), id])
     scheduleDatabaseSave()
+    markLibraryStateCacheDirty()
     return true
   })
 
@@ -4193,6 +4214,7 @@ export function registerDocumentIpc(): void {
       const cleanupTasks = getDeleteCleanupTasks(docs.filter((doc) => submittedDocSet.has(doc.id)))
       const tagIds = getAffectedTagIdsForDelete(submittedIds)
       markDocumentsDeleting(submittedIds)
+      markLibraryStateCacheDirty()
       scheduleDocumentDeleteJob(submittedIds, cleanupTasks, tagIds)
     }
 
@@ -4216,6 +4238,7 @@ export function registerDocumentIpc(): void {
     }
 
     clearPageSearchIndexForDocuments([docId])
+    markLibraryStateCacheDirty()
     run('DELETE FROM pages WHERE doc_id = ?', [docId])
 
     const now = new Date().toISOString()

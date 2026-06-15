@@ -1,5 +1,6 @@
 ﻿import { ipcMain, dialog, app } from 'electron'
 import { basename, extname, join } from 'path'
+import { net } from 'electron'
 import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { exportDocument } from '../export'
 import { checkLuaTeX, checkLuatexCn, generateTeX, compileTeX } from '../typeset'
@@ -53,6 +54,43 @@ import {
 const PROJECT_GITHUB_REPO = 'DieDust/gujismart-public'
 const PROJECT_RELEASES_URL = `https://github.com/${PROJECT_GITHUB_REPO}/releases`
 const PROJECT_LATEST_RELEASE_API_URL = `https://api.github.com/repos/${PROJECT_GITHUB_REPO}/releases/latest`
+const REMOTE_IMAGE_MAX_BYTES = 15 * 1024 * 1024
+
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  tiff: 'image/tiff',
+  tif: 'image/tiff',
+  webp: 'image/webp',
+}
+
+function assertAllowedRemoteImageUrl(value: string): URL {
+  const url = new URL(String(value || '').trim())
+  if (url.protocol !== 'https:') {
+    throw new Error('仅支持 HTTPS 图片地址')
+  }
+  const hostname = url.hostname.toLowerCase()
+  if (hostname !== 'pplines-online.bj.bcebos.com' && !hostname.endsWith('.bcebos.com')) {
+    throw new Error(`不支持的远程图片域名: ${hostname}`)
+  }
+  return url
+}
+
+function getImageMimeFromPath(pathOrUrl: string, fallback = 'image/jpeg'): string {
+  const ext = pathOrUrl.split('?')[0].split('#')[0].split('.').pop()?.toLowerCase() || ''
+  return IMAGE_MIME_BY_EXT[ext] || fallback
+}
+
+function getRemoteImageMime(url: URL, contentType: string | null): string {
+  const normalizedContentType = String(contentType || '').split(';')[0].trim().toLowerCase()
+  if (normalizedContentType.startsWith('image/')) return normalizedContentType
+  const mime = getImageMimeFromPath(url.pathname, '')
+  if (mime) return mime
+  throw new Error(`远程资源不是可识别的图片: ${normalizedContentType || 'unknown'}`)
+}
 
 function logMetadataTagCleanup(context: string, cleanup: SettingSetResult['metadataTagCleanup']): void {
   if (!cleanup || (cleanup.removedRelations === 0 && cleanup.keptManualRelations === 0 && cleanup.removedTags === 0)) return
@@ -244,6 +282,43 @@ function normalizePaddleOcrDocParsingModelName(model: unknown): string {
   return aliases[compact] || value
 }
 
+function getPaddleOcrModelSortKey(model: string): { familyRank: number; versionParts: number[]; name: string } {
+  const value = String(model || '').trim()
+  const paddleMatch = value.match(/^PaddleOCR-VL(?:-(\d+(?:\.\d+)*))?$/i)
+  if (paddleMatch) {
+    return {
+      familyRank: 0,
+      versionParts: String(paddleMatch[1] || '0').split('.').map((part) => Number(part) || 0),
+      name: value,
+    }
+  }
+  const ppStructureMatch = value.match(/^PP-StructureV(\d+(?:\.\d+)*)$/i)
+  if (ppStructureMatch) {
+    return {
+      familyRank: 1,
+      versionParts: String(ppStructureMatch[1] || '0').split('.').map((part) => Number(part) || 0),
+      name: value,
+    }
+  }
+  return {
+    familyRank: 2,
+    versionParts: [0],
+    name: value,
+  }
+}
+
+function comparePaddleOcrModelsNewestFirst(left: string, right: string): number {
+  const leftKey = getPaddleOcrModelSortKey(left)
+  const rightKey = getPaddleOcrModelSortKey(right)
+  if (leftKey.familyRank !== rightKey.familyRank) return leftKey.familyRank - rightKey.familyRank
+  const length = Math.max(leftKey.versionParts.length, rightKey.versionParts.length)
+  for (let index = 0; index < length; index += 1) {
+    const delta = (rightKey.versionParts[index] || 0) - (leftKey.versionParts[index] || 0)
+    if (delta !== 0) return delta
+  }
+  return leftKey.name.localeCompare(rightKey.name)
+}
+
 interface OpenAiModelItem {
   id?: string
   object?: string
@@ -342,7 +417,7 @@ async function fetchPaddleOcrModels(_apiKey: string): Promise<string[]> {
     ]
       .map((match) => normalizePaddleOcrDocParsingModelName(match[0]))
       .filter(isPaddleOcrDocParsingModel)
-    const models = [...new Set(candidates)].sort((left, right) => left.localeCompare(right))
+    const models = [...new Set(candidates)].sort(comparePaddleOcrModelsNewestFirst)
     if (models.length === 0) {
       throw new Error('官方模型文档中没有解析到可用于文档解析的模型')
     }
@@ -506,10 +581,6 @@ export function registerSettingsIpc(): void {
   })
 
   ipcMain.handle('settings:getAll', async (): Promise<SettingsMap> => {
-    const cleanup = ensureDisabledMetadataTagBindingsCleared()
-    logMetadataTagCleanup('Cleared stale metadata tag bindings while loading settings', cleanup)
-    const rebuild = await ensureEnabledMetadataTagBindingsRebuilt()
-    logMetadataTagRebuild('Rebuilt stale metadata tag bindings while loading settings', rebuild)
     const rows = queryAll<Setting>('SELECT key, value FROM settings')
     const result: SettingsMap = {}
     for (const row of rows) {
@@ -780,17 +851,35 @@ export function registerFsIpc(): void {
         throw new Error(`文件不存在: ${safePath}`)
       }
       const buffer = readFileSync(safePath)
-      const ext = safePath.split('.').pop()?.toLowerCase() || 'jpg'
-      const mimeMap: Record<string, string> = {
-        jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
-        gif: 'image/gif', bmp: 'image/bmp', tiff: 'image/tiff', tif: 'image/tiff',
-        webp: 'image/webp'
-      }
-      const mime = mimeMap[ext] || 'image/jpeg'
+      const mime = getImageMimeFromPath(safePath)
       const base64 = buffer.toString('base64')
       return `data:${mime};base64,${base64}`
     } catch (error) {
       console.error('[IPC] 读取图片失败:', error)
+      throw new Error((error as Error).message)
+    }
+  })
+
+  ipcMain.handle('fs:readRemoteImageAsDataURL', async (_event, imageUrl: string): Promise<string> => {
+    try {
+      const url = assertAllowedRemoteImageUrl(imageUrl)
+      const response = await net.fetch(url.toString())
+      if (!response.ok) {
+        throw new Error(`远程图片读取失败: HTTP ${response.status}`)
+      }
+      const mime = getRemoteImageMime(url, response.headers.get('content-type'))
+      const contentLength = Number(response.headers.get('content-length') || 0)
+      if (Number.isFinite(contentLength) && contentLength > REMOTE_IMAGE_MAX_BYTES) {
+        throw new Error(`远程图片过大: ${Math.ceil(contentLength / 1024 / 1024)}MB`)
+      }
+      const arrayBuffer = await response.arrayBuffer()
+      if (arrayBuffer.byteLength > REMOTE_IMAGE_MAX_BYTES) {
+        throw new Error(`远程图片过大: ${Math.ceil(arrayBuffer.byteLength / 1024 / 1024)}MB`)
+      }
+      const buffer = Buffer.from(arrayBuffer)
+      return `data:${mime};base64,${buffer.toString('base64')}`
+    } catch (error) {
+      console.error('[IPC] 读取远程图片失败:', error)
       throw new Error((error as Error).message)
     }
   })

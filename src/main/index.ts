@@ -1,7 +1,7 @@
 ﻿import { app, BrowserWindow, dialog, net, protocol, shell } from 'electron'
 import { join } from 'path'
 import { is } from '@electron-toolkit/utils'
-import { closeDatabase, initDatabase, listStoredLocalResourcePaths, resolveProfileDir } from './database'
+import { closeDatabase, initDatabase, isLargeLibraryForAutomaticMaintenance, listStoredLocalResourcePaths, resolveProfileDir, runDeferredStartupDatabaseMaintenance } from './database'
 import { registerAllIpcHandlers } from './ipc'
 import { existsSync, mkdirSync } from 'fs'
 import { startAutoBackupScheduler, stopAutoBackupScheduler } from './backup'
@@ -22,6 +22,43 @@ let quitPromptOpen = false
 let runtimeShutdownStarted = false
 let runtimeShutdownPromise: Promise<void> | null = null
 let startupMaintenanceScheduled = false
+const STARTUP_MAINTENANCE_DELAY_MS = 15_000
+
+type ConsoleMethodName = 'log' | 'info' | 'warn' | 'error' | 'debug'
+
+function isBrokenPipeError(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && String((error as { code?: unknown }).code) === 'EPIPE'
+}
+
+function installConsolePipeGuards(): void {
+  const methods: ConsoleMethodName[] = ['log', 'info', 'warn', 'error', 'debug']
+  for (const method of methods) {
+    const original = console[method].bind(console) as (...data: unknown[]) => void
+    Object.defineProperty(console, method, {
+      configurable: true,
+      writable: true,
+      value: (...data: unknown[]) => {
+        try {
+          original(...data)
+        } catch (error) {
+          if (!isBrokenPipeError(error)) throw error
+        }
+      },
+    })
+  }
+
+  const ignoreBrokenPipe = (error: unknown) => {
+    if (isBrokenPipeError(error)) return
+    throw error
+  }
+  process.stdout?.on('error', ignoreBrokenPipe)
+  process.stderr?.on('error', ignoreBrokenPipe)
+}
+
+installConsolePipeGuards()
 
 const profileRoot = is.dev
   ? join(process.cwd(), 'data', 'profile')
@@ -114,9 +151,11 @@ function createWindow(): void {
     showMainWindowFallback('did-fail-load')
   })
 
-  mainWindow.webContents.on('console-message', (details) => {
-    console.log(`[Renderer:${details.level}] ${details.message} (${details.sourceId}:${details.lineNumber})`)
-  })
+  if (is.dev || process.env.GUJISMART_SMOKE === '1') {
+    mainWindow.webContents.on('console-message', (details) => {
+      console.log(`[Renderer:${details.level}] ${details.message} (${details.sourceId}:${details.lineNumber})`)
+    })
+  }
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error(`[Main] Renderer process gone: reason=${details.reason}; exitCode=${details.exitCode}`)
@@ -234,37 +273,38 @@ async function shutdownApplicationRuntime(): Promise<void> {
 function scheduleStartupMaintenance(): void {
   if (startupMaintenanceScheduled) return
   startupMaintenanceScheduled = true
-  setImmediate(() => {
+  setTimeout(() => {
     void (async () => {
       try {
-        const cleanup = ensureDisabledMetadataTagBindingsCleared()
-        if (cleanup && (cleanup.removedRelations > 0 || cleanup.keptManualRelations > 0 || cleanup.removedTags > 0)) {
-          console.log(
-            `[Main] Cleared stale metadata tag bindings: removed=${cleanup.removedRelations}, keptManual=${cleanup.keptManualRelations}, removedTags=${cleanup.removedTags}`,
-          )
-        }
-        const rebuild = await ensureEnabledMetadataTagBindingsRebuilt()
-        if (rebuild && (rebuild.syncedDocuments > 0 || rebuild.createdOrUpdatedRelations > 0)) {
-          console.log(
-            `[Main] Rebuilt metadata tag bindings: processed=${rebuild.processedDocuments}, synced=${rebuild.syncedDocuments}, skipped=${rebuild.skippedDocuments}, relations=${rebuild.createdOrUpdatedRelations}`,
-          )
+        runDeferredStartupDatabaseMaintenance()
+      } catch (error) {
+        console.warn('[Main] Failed to run deferred database maintenance', error)
+      }
+
+      try {
+        if (isLargeLibraryForAutomaticMaintenance()) {
+          console.log('[Main] Skipping automatic metadata tag reconciliation during startup because the library is large.')
+        } else {
+          const cleanup = ensureDisabledMetadataTagBindingsCleared()
+          if (cleanup && (cleanup.removedRelations > 0 || cleanup.keptManualRelations > 0 || cleanup.removedTags > 0)) {
+            console.log(
+              `[Main] Cleared stale metadata tag bindings: removed=${cleanup.removedRelations}, keptManual=${cleanup.keptManualRelations}, removedTags=${cleanup.removedTags}`,
+            )
+          }
+          const rebuild = await ensureEnabledMetadataTagBindingsRebuilt()
+          if (rebuild && (rebuild.syncedDocuments > 0 || rebuild.createdOrUpdatedRelations > 0)) {
+            console.log(
+              `[Main] Rebuilt metadata tag bindings: processed=${rebuild.processedDocuments}, synced=${rebuild.syncedDocuments}, skipped=${rebuild.skippedDocuments}, relations=${rebuild.createdOrUpdatedRelations}`,
+            )
+          }
         }
       } catch (error) {
         console.warn('[Main] Failed to reconcile metadata tag bindings', error)
       }
 
-      try {
-        const result = backfillLibraryFileFingerprints()
-        if (result.updatedCount > 0) {
-          console.log(`[Main] Backfilled file fingerprints for ${result.updatedCount}/${result.scannedCount} library documents`)
-        }
-      } catch (error) {
-        console.warn('[Main] Failed to backfill library file fingerprints', error)
-      }
-
       scheduleStartupMetadataReclassification()
     })()
-  })
+  }, STARTUP_MAINTENANCE_DELAY_MS).unref?.()
 }
 
 protocol.registerSchemesAsPrivileged([
@@ -291,7 +331,13 @@ app.whenReady()
     await initDatabase()
     registerAllIpcHandlers()
     createWindow()
-    allowFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
+    setTimeout(() => {
+      try {
+        allowFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
+      } catch (error) {
+        console.warn('[Main] Failed to preload stored local resource paths', error)
+      }
+    }, STARTUP_MAINTENANCE_DELAY_MS).unref?.()
     startAutoBackupScheduler()
 
     app.on('activate', () => {

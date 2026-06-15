@@ -106,7 +106,9 @@ async function run() {
     assert.strictEqual(simplifiedResponse.totalDocuments, 2)
 
     const ngramCount = database.queryOne('SELECT COUNT(*) as count FROM search_ngram_index')?.count || 0
-    assert.ok(ngramCount > 0, 'Expected n-gram index rows to be created during reindex')
+    assert.strictEqual(ngramCount, 0, 'Expected FTS verified search mode to avoid persistent n-gram rows')
+    const trigramCount = database.queryOne('SELECT COUNT(*) as count FROM search_segments_trigram')?.count || 0
+    assert.ok(trigramCount > 0, 'Expected compact trigram FTS rows to be populated for long-query search speed')
 
     const legacyReadyDocId = 'legacy_ready_doc'
     database.run(
@@ -200,6 +202,30 @@ async function run() {
       [legacySegmentDocId, modernSegmentDocId].sort(),
     )
 
+    const missingTrigramDocId = 'missing_trigram_doc'
+    const presentTrigramDocId = 'present_trigram_doc'
+    for (const [docId, title] of [[missingTrigramDocId, 'Missing trigram coverage'], [presentTrigramDocId, 'Present trigram coverage']]) {
+      database.run(
+        `INSERT INTO documents (
+          id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
+          ocr_status, proof_status, import_status, metadata_status, metadata, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [docId, title, null, null, null, 'test', null, null, 1, 'completed', 'pending', 'processed', 'pending', '{}', now, now],
+      )
+      database.run(
+        'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [`${docId}_page`, docId, 1, null, 'partial-trigram-token appears once', null, 'completed', 'pending', now],
+      )
+      search.reindexDocument(docId)
+    }
+    database.run('DELETE FROM search_segments_trigram WHERE doc_id = ?', [missingTrigramDocId])
+    const partialTrigramResponse = search.querySearchV2('partial-trigram-token', { docIds: [missingTrigramDocId, presentTrigramDocId], limit: 80 })
+    assert.deepStrictEqual(
+      partialTrigramResponse.groups.map((group) => group.docId).sort(),
+      [missingTrigramDocId, presentTrigramDocId].sort(),
+      'Expected missing trigram coverage to fall back to verified text scan without dropping hits',
+    )
+
     const singleCharDocId = 'single_char_doc'
     database.run(
       `INSERT INTO documents (
@@ -219,8 +245,8 @@ async function run() {
     const singleReindex = search.reindexDocument(singleCharDocId)
     assert.strictEqual(singleReindex.status, 'ready')
     const singlePosting = database.queryOne('SELECT COUNT(*) as count, SUM(hit_count) as hits FROM search_ngram_index WHERE doc_id = ? AND gram = ?', [singleCharDocId, '\u77f3'])
-    assert.strictEqual(singlePosting?.count, 1)
-    assert.strictEqual(singlePosting?.hits, 3)
+    assert.strictEqual(singlePosting?.count, 0)
+    assert.strictEqual(singlePosting?.hits, null)
     const singleResponse = search.querySearchV2('\u77f3', { docIds: [singleCharDocId], limit: 80, exhaustive: true })
     assert.strictEqual(singleResponse.totalDocuments, 1)
     assert.strictEqual(singleResponse.totalHits, 3)

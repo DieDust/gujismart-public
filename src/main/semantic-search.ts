@@ -2,7 +2,7 @@
 import { nanoid } from 'nanoid'
 import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
-import { getDatabaseFilePath, isFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
+import { getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import { normalizeChineseSearchText, normalizeWhitespace } from './text-normalization'
 import { getErrorMessage } from '../shared/errors'
 import { emitBackgroundTaskStatus } from './background-tasks'
@@ -17,8 +17,11 @@ import {
   BACKGROUND_REINDEX_TIME_SLICE_MS,
   SEARCH_INDEX_SEGMENT_MAX_CHARS,
   SEARCH_INDEX_SEGMENT_OVERLAP_CHARS,
+  SEARCH_NGRAM_INDEX_ENABLED,
   SEARCH_INDEX_VERSION,
   SEARCH_NGRAM_MAX_POSITIONS_STORED,
+  SEARCH_TRIGRAM_FTS_ENABLED,
+  SEARCH_TRIGRAM_MIN_QUERY_LENGTH,
 } from './search-index-constants'
 import { isSearchIndexWorkerAvailable, runSearchIndexWorkerTask } from './search-index-worker-client'
 import type {
@@ -92,6 +95,7 @@ interface SearchIndexSegmentStats {
   segmentCount: number
   pageCount: number
   ftsCount: number
+  trigramFtsCount: number
   minHash: string
   maxHash: string
   indexedAt: string | null
@@ -270,6 +274,7 @@ const INDEXABLE_PAGE_BASE_SELECT = `
 const searchResponseCache = new Map<string, { createdAt: number; response: SearchGroupedResponse }>()
 const searchFilterDocIdsCache = new Map<string, { createdAt: number; docIds: string[] | undefined }>()
 const postingRowsCache = new Map<string, { createdAt: number; rows: SearchHitRow[] }>()
+const trigramCoverageCache = new Map<string, { createdAt: number; missingDocIds: string[] }>()
 const queuedReindexDocIds = new Set<string>()
 let reindexTimer: NodeJS.Timeout | null = null
 let reindexWorkerRunning = false
@@ -472,6 +477,7 @@ function markSearchIndexDirty(): void {
   searchResponseCache.clear()
   searchFilterDocIdsCache.clear()
   postingRowsCache.clear()
+  trigramCoverageCache.clear()
 }
 
 export function isSearchIndexReindexQueuedInMemory(docId: string): boolean {
@@ -728,16 +734,17 @@ function hashText(value: string): string {
 }
 
 function getSearchNgrams(text: string, maxGramSize = 3, maxStoredPositions = Number.POSITIVE_INFINITY): Array<{ gram: string; positions: number[]; hitCount: number }> {
+  if (!SEARCH_NGRAM_INDEX_ENABLED) return []
   const normalized = normalizeSearchText(text)
   const byGram = new Map<string, { positions: number[]; hitCount: number }>()
   for (let index = 0; index < normalized.length; index += 1) {
-    for (let size = 1; size <= maxGramSize; size += 1) {
+    for (let size = 2; size <= maxGramSize; size += 1) {
       if (index + size > normalized.length) break
       const gram = normalized.slice(index, index + size)
       if (!gram.trim() || /\s/.test(gram)) continue
       const item = byGram.get(gram) || { positions: [], hitCount: 0 }
       item.hitCount += 1
-      if (item.positions.length < maxStoredPositions) item.positions.push(index)
+      if (maxStoredPositions > 0 && item.positions.length < maxStoredPositions) item.positions.push(index)
       byGram.set(gram, item)
     }
   }
@@ -745,6 +752,7 @@ function getSearchNgrams(text: string, maxGramSize = 3, maxStoredPositions = Num
 }
 
 function chooseQueryGram(query: string): string {
+  if (!SEARCH_NGRAM_INDEX_ENABLED) return ''
   const normalized = normalizeSearchText(query).trim()
   if (!normalized) return ''
   if (normalized.length <= 3) return normalized
@@ -772,8 +780,10 @@ function chooseQueryGram(query: string): string {
 }
 
 function chooseQueryNgramCandidates(query: string): string[] {
+  if (!SEARCH_NGRAM_INDEX_ENABLED) return []
   const normalized = normalizeSearchText(query).trim()
   if (!normalized) return []
+  if (normalized.length < 2) return []
   if (normalized.length <= 3) return [normalized]
   return [chooseQueryGram(normalized)].filter(Boolean)
 }
@@ -813,10 +823,19 @@ function getSearchIndexSegmentStats(docId: string): SearchIndexSegmentStats {
     )
     ftsCount = Number(ftsStats?.count || 0)
   }
+  let trigramFtsCount = 0
+  if (isSearchTrigramFtsAvailable()) {
+    const trigramStats = queryOne<{ count?: number | null }>(
+      'SELECT COUNT(*) as count FROM search_segments_trigram WHERE doc_id = ?',
+      [docId],
+    )
+    trigramFtsCount = Number(trigramStats?.count || 0)
+  }
   return {
     segmentCount: Number(segmentStats?.segmentCount || 0),
     pageCount: Number(segmentStats?.pageCount || 0),
     ftsCount,
+    trigramFtsCount,
     minHash: String(segmentStats?.minHash || ''),
     maxHash: String(segmentStats?.maxHash || ''),
     indexedAt: segmentStats?.indexedAt || null,
@@ -943,7 +962,13 @@ function restoreSearchIndexStatusFromSegments(docId: string, stats: SearchIndexS
        updated_at = excluded.updated_at`,
     [docId, 'ready', sourceHash, stats.segmentCount, null, stats.indexedAt || now, now],
   )
-  if (isFtsAvailable() && stats.ftsCount < stats.segmentCount) {
+  if (
+    isFtsAvailable()
+    && (
+      stats.ftsCount < stats.segmentCount
+      || (isSearchTrigramFtsAvailable() && stats.trigramFtsCount < stats.segmentCount)
+    )
+  ) {
     refreshSearchSegmentsFtsForDocument(docId)
   }
   scheduleDatabaseSave()
@@ -1231,6 +1256,9 @@ function commitStagedSearchIndexForDocument(
     if (isFtsAvailable()) {
       run('DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
     }
+    if (isSearchTrigramFtsAvailable()) {
+      run('DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
+    }
     run('DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
     run('DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
     run(
@@ -1254,6 +1282,15 @@ function commitStagedSearchIndexForDocument(
       run(
         `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
          SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
+    }
+    if (isSearchTrigramFtsAvailable()) {
+      run(
+        `INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
+         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
          FROM search_index_segments
          WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
         [docId],
@@ -1676,6 +1713,24 @@ function ensureManagedTextDocumentsIndexed(docIds?: string[]): string[] {
 }
 
 function staleSearchIndexSqlCondition(alias = 'sis'): string {
+  const trigramMissingCondition = isSearchTrigramFtsAvailable()
+    ? `OR (
+      EXISTS (
+        SELECT 1
+        FROM search_index_segments sidx
+        WHERE sidx.doc_id = d.id
+          AND TRIM(COALESCE(sidx.normalized_text, sidx.text, '')) <> ''
+        LIMIT 1
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM search_index_segments sidx_tri
+        INNER JOIN search_segments_trigram tri ON tri.rowid = sidx_tri.rowid
+        WHERE sidx_tri.doc_id = d.id
+        LIMIT 1
+      )
+    )`
+    : ''
   return `(
     ${alias}.doc_id IS NULL
     OR (
@@ -1692,6 +1747,7 @@ function staleSearchIndexSqlCondition(alias = 'sis'): string {
         AND TRIM(COALESCE(sidx.normalized_text, sidx.text, '')) <> ''
       LIMIT 1
     )
+    ${trigramMissingCondition}
   )`
 }
 
@@ -2111,6 +2167,104 @@ function shouldSupplementFtsWithScan(keyword: string, ftsRows: SearchHitRow[], l
   return !(enoughRows || enoughDocuments)
 }
 
+function isTrigramSearchEligible(keyword: string): boolean {
+  return SEARCH_TRIGRAM_FTS_ENABLED
+    && isSearchTrigramFtsAvailable()
+    && normalizeSearchText(keyword).replace(/\s+/g, '').length >= SEARCH_TRIGRAM_MIN_QUERY_LENGTH
+}
+
+function quoteFtsPhrase(term: string): string {
+  const safe = term.trim().replace(/"/g, '""')
+  return safe ? `"${safe}"` : ''
+}
+
+function getTrigramFtsTerms(keyword: string): string[] {
+  const normalized = normalizeSearchText(keyword).trim()
+  const expanded = getKeywordTerms(normalized)
+    .flatMap((term) => {
+      const searchTerm = normalizeSearchText(term).trim()
+      const compactTerm = searchTerm.replace(/\s+/g, '')
+      return [searchTerm, compactTerm, ...searchTerm.split(/\s+/)]
+    })
+    .map((term) => term.trim())
+    .filter((term) => term.length >= SEARCH_TRIGRAM_MIN_QUERY_LENGTH)
+  return [...new Set(expanded)].slice(0, 8)
+}
+
+function buildTrigramFtsQuery(keyword: string): string {
+  return getTrigramFtsTerms(keyword).map(quoteFtsPhrase).filter(Boolean).join(' OR ')
+}
+
+function hasSearchSegmentsTrigramRows(docIds?: string[]): boolean {
+  if (!isSearchTrigramFtsAvailable()) return false
+  const uniqueDocIds = uniqueIds(docIds || [])
+  if (uniqueDocIds.length === 0) {
+    return !!queryOne<{ found?: number }>('SELECT 1 as found FROM search_segments_trigram LIMIT 1')?.found
+  }
+  for (const chunk of chunkValues(uniqueDocIds)) {
+    const placeholders = buildInClause(chunk)
+    const row = queryOne<{ found?: number }>(
+      `SELECT 1 as found
+       FROM search_index_segments s
+       INNER JOIN search_segments_trigram tri ON tri.rowid = s.rowid
+       WHERE s.doc_id IN (${placeholders})
+       LIMIT 1`,
+      chunk,
+    )
+    if (row?.found) return true
+  }
+  return false
+}
+
+function findSegmentDocIdsWithoutTrigram(docIds?: string[]): string[] {
+  if (!isSearchTrigramFtsAvailable()) return []
+  const activeDocIds = Array.isArray(docIds) && docIds.length > 0 ? resolveActiveDocumentIds(docIds) : undefined
+  if (Array.isArray(docIds) && docIds.length > 0 && (!activeDocIds || activeDocIds.length === 0)) return []
+  const cacheKey = stableStringify({ type: 'trigram-coverage', docIds: uniqueIds(activeDocIds || []) })
+  const cached = trigramCoverageCache.get(cacheKey)
+  if (cached && Date.now() - cached.createdAt < SEARCH_FILTER_CACHE_TTL_MS) {
+    return [...cached.missingDocIds]
+  }
+  const rows = new Set<string>()
+
+  const collectRows = (chunk?: string[]) => {
+    const params: string[] = []
+    let sql = `SELECT DISTINCT s.doc_id
+      FROM search_index_segments s
+      INNER JOIN documents d ON d.id = s.doc_id
+      WHERE ${activeDocumentCondition('d')}
+        AND TRIM(COALESCE(s.normalized_text, s.text, '')) <> ''
+        AND NOT EXISTS (
+          SELECT 1
+          FROM search_segments_trigram tri
+          WHERE tri.rowid = s.rowid
+          LIMIT 1
+        )`
+    if (chunk && chunk.length > 0) {
+      sql += ` AND s.doc_id IN (${buildInClause(chunk)})`
+      params.push(...chunk)
+    }
+    queryAll<{ doc_id: string }>(sql, params).forEach((row) => {
+      if (row.doc_id) rows.add(row.doc_id)
+    })
+  }
+
+  if (activeDocIds && activeDocIds.length > 0) {
+    chunkValues(activeDocIds).forEach((chunk) => collectRows(chunk))
+  } else {
+    collectRows()
+  }
+
+  const missingDocIds = [...rows]
+  trigramCoverageCache.set(cacheKey, { createdAt: Date.now(), missingDocIds })
+  if (trigramCoverageCache.size > 40) {
+    const oldestKey = [...trigramCoverageCache.entries()]
+      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
+    if (oldestKey) trigramCoverageCache.delete(oldestKey)
+  }
+  return missingDocIds
+}
+
 function rowKey(row: Pick<SearchSegmentRow, 'segment_id'>): string {
   return row.segment_id
 }
@@ -2121,8 +2275,18 @@ function mergeSearchRows(primaryRows: SearchHitRow[], supplementalRows: SearchHi
     rowsBySegment.set(rowKey(row), row)
   }
   for (const row of supplementalRows) {
-    if (!rowsBySegment.has(rowKey(row))) {
-      rowsBySegment.set(rowKey(row), row)
+    const key = rowKey(row)
+    const existing = rowsBySegment.get(key)
+    if (!existing) {
+      rowsBySegment.set(key, row)
+    } else if ((!existing.text && !existing.normalized_text) && (row.text || row.normalized_text)) {
+      rowsBySegment.set(key, {
+        ...existing,
+        text: row.text,
+        normalized_text: row.normalized_text,
+        offset_map: row.offset_map,
+        rank: Math.min(Number(existing.rank || 999), Number(row.rank || 999)),
+      })
     }
   }
   return [...rowsBySegment.values()].sort((left, right) => (
@@ -2219,6 +2383,35 @@ function runSegmentFtsSearch(keyword: string, limit: number, docIds?: string[]):
   }
 }
 
+function runSegmentTrigramSearch(keyword: string, docIds?: string[]): SearchHitRow[] {
+  if (!isTrigramSearchEligible(keyword)) return []
+  const query = buildTrigramFtsQuery(keyword)
+  if (!query) return []
+  try {
+    const activeDocIds = Array.isArray(docIds) && docIds.length > 0 ? resolveActiveDocumentIds(docIds) : undefined
+    if (Array.isArray(docIds) && docIds.length > 0 && (!activeDocIds || activeDocIds.length === 0)) return []
+    const params: Array<string | number> = [query]
+    let sql = `SELECT s.segment_id, s.doc_id, s.page_id, s.page_num, s.source_kind, s.href, s.title, s.ordinal, s.source_start, s.text, s.normalized_text, s.offset_map,
+        bm25(search_segments_trigram) as rank
+      FROM search_segments_trigram
+      INNER JOIN search_index_segments s ON s.rowid = search_segments_trigram.rowid
+      INNER JOIN documents d ON d.id = s.doc_id
+      WHERE search_segments_trigram MATCH ?
+        AND ${activeDocumentCondition('d')}`
+
+    if (activeDocIds && activeDocIds.length > 0) {
+      sql += ` AND s.doc_id IN (${buildInClause(activeDocIds)})`
+      params.push(...activeDocIds)
+    }
+
+    sql += ' ORDER BY rank ASC, s.doc_id ASC, COALESCE(s.page_num, 0) ASC, s.ordinal ASC'
+    return queryAll<SearchHitRow>(sql, params)
+  } catch (error) {
+    console.warn('[Search] segment trigram FTS query failed, falling back to verified scan', error)
+    return []
+  }
+}
+
 function runSegmentScanSearch(keyword: string, limit: number, docIds?: string[]): SearchHitRow[] {
   const activeDocIds = Array.isArray(docIds) && docIds.length > 0 ? resolveActiveDocumentIds(docIds) : undefined
   if (Array.isArray(docIds) && docIds.length > 0 && (!activeDocIds || activeDocIds.length === 0)) return []
@@ -2247,24 +2440,25 @@ function runSegmentScanSearch(keyword: string, limit: number, docIds?: string[])
 
   sql += ' ORDER BY s.doc_id ASC, COALESCE(s.page_num, 0) ASC, s.ordinal ASC'
   const normalizedKeyword = normalizeSearchText(keyword).trim()
-  if (normalizedKeyword.length > 3) {
+  if (SEARCH_NGRAM_INDEX_ENABLED && normalizedKeyword.length > 3) {
     sql += ' LIMIT ?'
     params.push(Math.max(limit * 8, 800))
   }
   return queryAll<SearchHitRow>(sql, params)
 }
 
-function runSegmentTargetedScanSearch(keyword: string, limit: number, docIds: string[]): SearchHitRow[] {
+function runSegmentTargetedScanSearch(keyword: string, limit: number, docIds: string[], capResults = true): SearchHitRow[] {
   const uniqueDocIds = uniqueIds(docIds)
   if (uniqueDocIds.length === 0) return []
   const chunks = chunkValues(uniqueDocIds)
   const perChunkLimit = Math.max(limit * 4, 200)
+  const maxRows = Math.max(limit * 8, 800)
   const rows: SearchHitRow[] = []
   for (const chunk of chunks) {
     rows.push(...runSegmentScanSearch(keyword, perChunkLimit, chunk))
-    if (rows.length >= Math.max(limit * 8, 800)) break
+    if (capResults && rows.length >= maxRows) break
   }
-  return rows.slice(0, Math.max(limit * 8, 800))
+  return capResults ? rows.slice(0, maxRows) : rows
 }
 
 function findLegacySegmentDocIdsWithoutNgrams(docIds?: string[], limit = SEARCH_LEGACY_SEGMENT_SCAN_DOC_LIMIT): string[] {
@@ -2963,28 +3157,43 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
   const staleDocIds = checkSearchIndexForScope(scopedDocIds)
   const needsCandidateText = (options?.resultMode || 'preview') === 'all' || normalizedQuery.length > 3
   const ngramRows = runSegmentNgramSearch(normalizedQuery, limit, scopedDocIds, exhaustive, needsCandidateText)
+  const trigramEligible = isTrigramSearchEligible(normalizedQuery)
+  const trigramHasRowsForScope = trigramEligible && hasSearchSegmentsTrigramRows(scopedDocIds)
+  const missingTrigramDocIds = trigramEligible ? findSegmentDocIdsWithoutTrigram(scopedDocIds) : []
+  const trigramRows = trigramHasRowsForScope
+    ? runSegmentTrigramSearch(normalizedQuery, scopedDocIds)
+    : []
   const ftsRows = isFtsAvailable()
     ? runSegmentFtsSearch(normalizedQuery, limit, scopedDocIds)
     : []
-  const legacySegmentDocIds = findLegacySegmentDocIdsWithoutNgrams(
-    scopedDocIds,
-    scopedDocIds && scopedDocIds.length > 0
-      ? Math.min(Math.max(scopedDocIds.length, 1), SEARCH_LEGACY_SEGMENT_SCAN_DOC_LIMIT)
-      : SEARCH_LEGACY_SEGMENT_SCAN_DOC_LIMIT,
-  )
-  const needsScan = legacySegmentDocIds.length > 0
-    || (ngramRows.length === 0 && (!isFtsAvailable() || shouldSupplementFtsWithScan(normalizedQuery, ftsRows, limit)))
+  const legacySegmentDocIds = SEARCH_NGRAM_INDEX_ENABLED
+    ? findLegacySegmentDocIdsWithoutNgrams(
+        scopedDocIds,
+        scopedDocIds && scopedDocIds.length > 0
+          ? Math.min(Math.max(scopedDocIds.length, 1), SEARCH_LEGACY_SEGMENT_SCAN_DOC_LIMIT)
+          : SEARCH_LEGACY_SEGMENT_SCAN_DOC_LIMIT,
+      )
+    : []
+  const scopedScanAllowed = !!scopedDocIds && scopedDocIds.length <= 800
+  const needsScan = normalizedQuery.length < SEARCH_TRIGRAM_MIN_QUERY_LENGTH
+    || scopedScanAllowed
+    || legacySegmentDocIds.length > 0
+    || missingTrigramDocIds.length > 0
+    || (!SEARCH_NGRAM_INDEX_ENABLED && (!trigramEligible || !trigramHasRowsForScope))
+    || ((!trigramEligible || !trigramHasRowsForScope) && trigramRows.length === 0 && ngramRows.length === 0 && (!isFtsAvailable() || shouldSupplementFtsWithScan(normalizedQuery, ftsRows, limit)))
   const scanRows = needsScan
     ? legacySegmentDocIds.length > 0
       ? runSegmentTargetedScanSearch(normalizedQuery, limit, legacySegmentDocIds)
+      : missingTrigramDocIds.length > 0
+      ? runSegmentTargetedScanSearch(normalizedQuery, limit, missingTrigramDocIds, false)
       : scopedDocIds && scopedDocIds.length > 800
       ? runSegmentTargetedScanSearch(normalizedQuery, limit, scopedDocIds)
       : runSegmentScanSearch(normalizedQuery, limit, scopedDocIds)
     : []
-  const exactRows = normalizedQuery.length > 3
+  const exactRows = (normalizedQuery.length > 3 || !!scopedDocIds) && (!trigramEligible || !trigramHasRowsForScope || scopedScanAllowed)
     ? runSegmentExactPhraseSearch(normalizedQuery, scopedDocIds)
     : []
-  const indexedRows = mergeSearchRows(mergeSearchRows(mergeSearchRows(ngramRows, ftsRows), scanRows), exactRows)
+  const indexedRows = mergeSearchRows(mergeSearchRows(mergeSearchRows(mergeSearchRows(trigramRows, ngramRows), ftsRows), scanRows), exactRows)
   const indexedDocIds = new Set(indexedRows.map((row) => row.doc_id))
   const managedTextFallbackDocIds = scopedDocIds
     ? []
@@ -3027,10 +3236,12 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
       cached: false,
       elapsedMs: Date.now() - startedAt,
       candidateSegments: matchedRows.length,
+      trigramSegments: trigramRows.length,
       ngramSegments: ngramRows.length,
       ftsSegments: ftsRows.length,
       scanSegments: scanRows.length,
       legacySegmentDocuments: legacySegmentDocIds.length,
+      missingTrigramDocuments: missingTrigramDocIds.length,
       totalDocuments: result.totalDocuments,
       totalHits: result.totalHits,
       previewHits: result.groups.reduce((sum, group) => sum + group.hits.length, 0),

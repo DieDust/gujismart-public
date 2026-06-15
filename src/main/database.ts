@@ -15,9 +15,13 @@ let db: NativeDatabase | null = null
 let dbFilePath = ''
 let cachedDataDir = ''
 let ftsAvailable = false
+let searchTrigramFtsAvailable = false
 const TOC_RULE_ENGINE_VERSION = '2026-06-05-ocr-structure-v7'
 const DATABASE_CHECKPOINT_MIN_INTERVAL_MS = 2000
 const DATABASE_CHECKPOINT_DEFER_MS = 800
+const STARTUP_DATABASE_MAINTENANCE_INTERVAL_MS = 24 * 60 * 60 * 1000
+const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT = 100_000
+const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_SEGMENT_LIMIT = 500_000
 let deferredDatabaseSaveTimer: ReturnType<typeof setTimeout> | null = null
 let lastDatabaseCheckpointAt = 0
 const DATABASE_BUSY_TIMEOUT_MS = 250
@@ -226,6 +230,10 @@ export function isFtsAvailable(): boolean {
   return ftsAvailable
 }
 
+export function isSearchTrigramFtsAvailable(): boolean {
+  return searchTrigramFtsAvailable
+}
+
 function runOn(sqlite: NativeDatabase, sql: string, params?: unknown[]): void {
   runWithBusyRetry(() => {
     if (params) {
@@ -295,9 +303,6 @@ CREATE TABLE IF NOT EXISTS page_ocr_versions (
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
   FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_page_ocr_versions_page_engine ON page_ocr_versions(page_id, engine);
-CREATE INDEX IF NOT EXISTS idx_page_ocr_versions_doc ON page_ocr_versions(doc_id, page_num);
 
 CREATE TABLE IF NOT EXISTS folders (
   id TEXT PRIMARY KEY,
@@ -683,6 +688,13 @@ CREATE TABLE IF NOT EXISTS search_index_status (
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS library_state_cache (
+  cache_key TEXT PRIMARY KEY,
+  cache_json TEXT NOT NULL,
+  dirty INTEGER DEFAULT 0,
+  updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS ai_document_summaries (
   doc_id TEXT PRIMARY KEY,
   source_hash TEXT NOT NULL,
@@ -702,6 +714,8 @@ CREATE TABLE IF NOT EXISTS pdf_repository_index (
 `
 
 const INDEX_SCHEMA_SQL = `
+CREATE UNIQUE INDEX IF NOT EXISTS idx_page_ocr_versions_page_engine ON page_ocr_versions(page_id, engine);
+CREATE INDEX IF NOT EXISTS idx_page_ocr_versions_doc ON page_ocr_versions(doc_id, page_num);
 CREATE INDEX IF NOT EXISTS idx_pages_doc_id ON pages(doc_id);
 CREATE INDEX IF NOT EXISTS idx_pages_doc_page_num ON pages(doc_id, page_num);
 CREATE INDEX IF NOT EXISTS idx_pages_doc_ocr_status ON pages(doc_id, ocr_status);
@@ -828,6 +842,8 @@ function addColumnIfMissing(sqlite: NativeDatabase, tableName: string, columnSql
 }
 
 function ensureFts(sqlite: NativeDatabase): void {
+  ftsAvailable = false
+  searchTrigramFtsAvailable = false
   try {
     sqlite.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
@@ -852,6 +868,24 @@ function ensureFts(sqlite: NativeDatabase): void {
     ftsAvailable = false
     console.warn('[Database] FTS5 unavailable, search will use fallback indexing', error)
   }
+
+  if (!ftsAvailable) return
+  try {
+    sqlite.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_trigram USING fts5(
+        segment_id UNINDEXED,
+        doc_id UNINDEXED,
+        page_id UNINDEXED,
+        page_num UNINDEXED,
+        normalized_text,
+        tokenize='trigram'
+      );
+    `)
+    searchTrigramFtsAvailable = true
+  } catch (error) {
+    searchTrigramFtsAvailable = false
+    console.warn('[Database] FTS5 trigram unavailable, long CJK search will use verified scan fallback', error)
+  }
 }
 
 function ensureIndexes(sqlite: NativeDatabase): void {
@@ -875,6 +909,16 @@ function rebuildFts(sqlite: NativeDatabase): void {
     FROM search_index_segments
     WHERE TRIM(COALESCE(normalized_text, text, '')) != ''
   `)
+
+  if (searchTrigramFtsAvailable) {
+    sqlite.exec('DELETE FROM search_segments_trigram')
+    sqlite.exec(`
+      INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
+      SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+      FROM search_index_segments
+      WHERE TRIM(COALESCE(normalized_text, text, '')) != ''
+    `)
+  }
 }
 
 function getFtsPageCount(sqlite: NativeDatabase): number {
@@ -900,11 +944,66 @@ function getSearchablePageCount(sqlite: NativeDatabase): number {
   }
 }
 
+function getSearchSegmentCount(sqlite: NativeDatabase): number {
+  try {
+    const row = sqlite.prepare(`
+      SELECT COUNT(*) as cnt
+      FROM search_index_segments
+      WHERE TRIM(COALESCE(normalized_text, text, '')) != ''
+    `).get() as { cnt?: number } | undefined
+    return Number(row?.cnt || 0)
+  } catch {
+    return 0
+  }
+}
+
+function getSearchSegmentsFtsCount(sqlite: NativeDatabase): number {
+  if (!ftsAvailable) return 0
+  try {
+    const row = sqlite.prepare('SELECT COUNT(*) as cnt FROM search_segments_fts').get() as { cnt?: number } | undefined
+    return Number(row?.cnt || 0)
+  } catch {
+    return 0
+  }
+}
+
+function getSearchSegmentsTrigramCount(sqlite: NativeDatabase): number {
+  if (!searchTrigramFtsAvailable) return 0
+  try {
+    const row = sqlite.prepare('SELECT COUNT(*) as cnt FROM search_segments_trigram').get() as { cnt?: number } | undefined
+    return Number(row?.cnt || 0)
+  } catch {
+    return 0
+  }
+}
+
 function ensureFtsSeeded(sqlite: NativeDatabase): void {
   if (!ftsAvailable) return
-  if (getFtsPageCount(sqlite) !== getSearchablePageCount(sqlite)) {
+  const segmentCount = getSearchSegmentCount(sqlite)
+  const segmentFtsCount = getSearchSegmentsFtsCount(sqlite)
+  const trigramCount = getSearchSegmentsTrigramCount(sqlite)
+  if (
+    getFtsPageCount(sqlite) !== getSearchablePageCount(sqlite)
+    || segmentFtsCount < segmentCount
+    || (searchTrigramFtsAvailable && trigramCount < segmentCount)
+  ) {
     rebuildFts(sqlite)
   }
+}
+
+function tableHasMoreRowsThan(sqlite: NativeDatabase, tableName: string, limit: number): boolean {
+  if (!hasTable(sqlite, tableName)) return false
+  try {
+    const row = sqlite.prepare(`SELECT 1 as exists_row FROM ${tableName} LIMIT 1 OFFSET ?`).get(limit) as { exists_row?: number } | undefined
+    return row?.exists_row === 1
+  } catch {
+    return false
+  }
+}
+
+export function isLargeLibraryForAutomaticMaintenance(sqlite: NativeDatabase = getDatabase()): boolean {
+  return tableHasMoreRowsThan(sqlite, 'pages', LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT)
+    || tableHasMoreRowsThan(sqlite, 'search_index_segments', LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_SEGMENT_LIMIT)
 }
 
 function normalizeTagName(name: string): string {
@@ -1063,6 +1162,9 @@ function cleanupOrphanRows(sqlite: NativeDatabase): void {
   if (hasTable(sqlite, 'search_index_segments_staging')) {
     statements.push('DELETE FROM search_index_segments_staging')
   }
+  if (hasTable(sqlite, 'search_segments_trigram') && hasTable(sqlite, 'documents')) {
+    statements.push('DELETE FROM search_segments_trigram WHERE doc_id NOT IN (SELECT id FROM documents)')
+  }
   if (hasTable(sqlite, 'document_toc_items') && hasTable(sqlite, 'documents')) {
     statements.push('DELETE FROM document_toc_items WHERE doc_id NOT IN (SELECT id FROM documents)')
   }
@@ -1095,14 +1197,18 @@ function parseJsonRecord(value: string): Record<string, unknown> | null {
 
 function stripLegacyTocMetadata(sqlite: NativeDatabase): void {
   if (!hasTable(sqlite, 'documents')) return
+  let tocRuleVersionSynced = true
   if (hasTable(sqlite, 'document_toc_items')) {
     sqlite.prepare("DELETE FROM document_toc_items WHERE COALESCE(source, '') = 'legacy'").run()
     const ruleVersion = sqlite.prepare("SELECT value FROM settings WHERE key = 'toc_rule_engine_version'").get() as { value?: string } | undefined
     if (ruleVersion?.value !== TOC_RULE_ENGINE_VERSION) {
+      tocRuleVersionSynced = false
       sqlite.prepare("DELETE FROM document_toc_items WHERE COALESCE(source, 'rule') = 'rule'").run()
       sqlite.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run('toc_rule_engine_version', TOC_RULE_ENGINE_VERSION)
     }
   }
+  const stripped = sqlite.prepare("SELECT value FROM settings WHERE key = 'legacy_toc_metadata_stripped'").get() as { value?: string } | undefined
+  if (stripped?.value === '1' && tocRuleVersionSynced) return
   const rows = sqlite.prepare('SELECT id, metadata FROM documents WHERE metadata IS NOT NULL AND metadata != ?').all('{}') as Array<{ id: string; metadata?: string | null }>
   const update = sqlite.prepare('UPDATE documents SET metadata = ?, updated_at = ? WHERE id = ?')
   const now = new Date().toISOString()
@@ -1188,10 +1294,6 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
       FOREIGN KEY (glossary_id) REFERENCES translation_glossaries(id) ON DELETE CASCADE
     );
   `)
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_translation_glossaries_scope ON translation_glossaries(scope, project_id)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_translation_terms_glossary ON translation_glossary_terms(glossary_id, enabled)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_translation_terms_source ON translation_glossary_terms(source_term)')
-
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS ai_chat_sessions (
       id TEXT PRIMARY KEY,
@@ -1315,9 +1417,6 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'page_ocr_versions', "label TEXT", 'label')
   addColumnIfMissing(sqlite, 'page_ocr_versions', "status TEXT DEFAULT 'completed'", 'status')
   addColumnIfMissing(sqlite, 'page_ocr_versions', 'is_active INTEGER DEFAULT 0', 'is_active')
-  sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_page_ocr_versions_page_engine ON page_ocr_versions(page_id, engine)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_page_ocr_versions_doc ON page_ocr_versions(doc_id, page_num)')
-
   addColumnIfMissing(sqlite, 'search_index_segments', "offset_map TEXT DEFAULT ''", 'offset_map')
   addColumnIfMissing(sqlite, 'search_index_segments', 'source_start INTEGER DEFAULT 0', 'source_start')
 
@@ -1337,14 +1436,9 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
       indexed_at TEXT
     )
   `)
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_pdf_repository_index_sha256 ON pdf_repository_index(sha256)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_research_notes_outline_id ON research_notes(outline_id)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_research_notes_source_hash ON research_notes(doc_id, source_hash)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_research_outline_project_order ON research_outline_items(project_id, sort_order)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_citation_templates_style_id ON citation_templates(style_id)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_citation_templates_style_type ON citation_templates(style_id, format_type)')
-  sqlite.exec('CREATE INDEX IF NOT EXISTS idx_document_tags_metadata ON document_tags(doc_id, is_metadata)')
+}
 
+function normalizeExistingData(sqlite: NativeDatabase): void {
   sqlite.exec("UPDATE documents SET read_status = 'unread' WHERE read_status IS NULL OR read_status = ''")
   sqlite.exec("UPDATE documents SET metadata_status = CASE WHEN metadata IS NOT NULL AND metadata != '{}' THEN 'auto' ELSE 'pending' END WHERE metadata_status IS NULL OR metadata_status = ''")
   sqlite.exec('UPDATE documents SET is_favorite = 0 WHERE is_favorite IS NULL')
@@ -1359,7 +1453,6 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   sqlite.exec("UPDATE research_notes SET citation_text = '' WHERE citation_text IS NULL")
   sqlite.exec("UPDATE research_notes SET source_hash = '' WHERE source_hash IS NULL")
   sqlite.exec('UPDATE research_notes SET sort_order = COALESCE(sort_order, 0)')
-
   updateTagUsageCounts(sqlite)
 }
 
@@ -1629,25 +1722,42 @@ export async function initDatabase(): Promise<void> {
   db.pragma('foreign_keys = ON')
   db.exec(TABLE_SCHEMA_SQL)
   migrateExistingSchema(db)
-  stripLegacyTocMetadata(db)
-  ensureIndexes(db)
 
   if (!existed) {
     migrateFromJson(jsonDbPath, db)
     migrateExistingSchema(db)
-    stripLegacyTocMetadata(db)
     ensureIndexes(db)
   }
 
   ensureFts(db)
-  if (ftsAvailable) {
-    ensureFtsSeeded(db)
-  }
 
   seedDefaultData(db)
-  cleanupOrphanRows(db)
   saveDatabase()
   console.log('[Database] Initialization complete')
+}
+
+export function runDeferredStartupDatabaseMaintenance(): void {
+  const database = getDatabase()
+  const lastRun = queryOne<{ value?: string | null }>(
+    "SELECT value FROM settings WHERE key = 'startup_database_maintenance_last_at'",
+  )?.value
+  const lastRunAt = lastRun ? Date.parse(lastRun) : 0
+  if (Number.isFinite(lastRunAt) && Date.now() - lastRunAt < STARTUP_DATABASE_MAINTENANCE_INTERVAL_MS) return
+  if (isLargeLibraryForAutomaticMaintenance(database)) {
+    run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['startup_database_maintenance_skipped_large_library_at', new Date().toISOString()])
+    scheduleDatabaseSave()
+    return
+  }
+
+  normalizeExistingData(database)
+  stripLegacyTocMetadata(database)
+  ensureIndexes(database)
+  if (ftsAvailable) {
+    ensureFtsSeeded(database)
+  }
+  cleanupOrphanRows(database)
+  run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['startup_database_maintenance_last_at', new Date().toISOString()])
+  saveDatabase()
 }
 
 export function rebuildSearchTables(): void {
@@ -1662,6 +1772,9 @@ export function refreshSearchSegmentsFtsForDocument(docId: string): void {
   if (!ftsAvailable || !docId) return
   const database = getDatabase()
   runOn(database, 'DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
+  if (searchTrigramFtsAvailable) {
+    runOn(database, 'DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
+  }
   runOn(database,
     `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
      SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
@@ -1669,6 +1782,15 @@ export function refreshSearchSegmentsFtsForDocument(docId: string): void {
      WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
     [docId]
   )
+  if (searchTrigramFtsAvailable) {
+    runOn(database,
+      `INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
+       SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [docId]
+    )
+  }
 }
 
 export function refreshSearchIndexForPages(pageIds: string[]): void {

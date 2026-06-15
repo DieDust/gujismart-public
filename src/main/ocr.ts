@@ -60,6 +60,13 @@ interface LayoutBlockResult {
   dedupe_fallback_key?: string
 }
 
+interface MarkdownImageBlock {
+  location: LayoutLocation
+  src: string
+  alt: string
+  index: number
+}
+
 export interface OcrPageResult {
   pageId: string
   result: OcrResultPayload | null
@@ -77,6 +84,16 @@ export interface OcrPageProgressPayload {
   error?: string
   result?: OcrResultPayload | null
   text?: string
+}
+
+export interface OcrRepeatedTextIssue {
+  source: string
+  unit: string
+  repeatCount: number
+  repeatChars: number
+  compactLength: number
+  ratio: number
+  sample: string
 }
 
 export class OcrAbortError extends Error {
@@ -123,12 +140,13 @@ const ASYNC_OCR_ENDPOINT = 'https://paddleocr.aistudio-app.com/api/v2/ocr/jobs'
 export type AsyncOcrModel = 'PaddleOCR-VL-1.6' | 'PaddleOCR-VL-1.5' | 'PP-StructureV3' | (string & {})
 const DEFAULT_ASYNC_OCR_MODEL: AsyncOcrModel = 'PaddleOCR-VL-1.6'
 const DEFAULT_OCR_CONCURRENCY = 6
-const MAX_OCR_CONCURRENCY = 8
+const MAX_OCR_CONCURRENCY = 32
 const DEFAULT_DOC_CONCURRENCY = 3
 export const MAX_DOC_CONCURRENCY = 20
-const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 4
-const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 8
+const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 1
+const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 1
 const MAX_RETRY_ATTEMPTS = 4
+const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 240
 const DEFAULT_OCR_UPLOAD_TIMEOUT_SECONDS = 3600
 const MAX_OCR_UPLOAD_TIMEOUT_SECONDS = 86400
 const DEFAULT_OCR_MAX_IMAGE_SIDE = 2200
@@ -147,6 +165,9 @@ const ASYNC_RESULT_READY_GRACE_MS = 10 * 60 * 1000
 const ASYNC_JOB_STALLED_TIMEOUT_MS = 10 * 60 * 1000
 const ASYNC_RESULT_PARSE_YIELD_LINE_INTERVAL = 100
 const ASYNC_RESULT_NORMALIZE_CHUNK_SIZE = 50
+const OCR_REPEATED_TEXT_SCAN_LIMIT = 60_000
+const OCR_REPEATED_TEXT_MAX_UNIT_LENGTH = 18
+const OCR_REPEATED_TEXT_MIN_COMPACT_LENGTH = 1_200
 const QPDF_CHUNK_TIMEOUT_MS = 120 * 1000
 const QPDF_HEAVY_CHUNK_TIMEOUT_MS = 240 * 1000
 const QPDF_PAGE_COUNT_TIMEOUT_MS = 30 * 1000
@@ -259,7 +280,7 @@ function createLimiter(concurrency: number) {
   }
 }
 
-const asyncSubmitLimit = createLimiter(8)
+const asyncSubmitLimit = createLimiter(MAX_DOC_CONCURRENCY)
 const asyncPollLimit = createLimiter(16)
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
 
@@ -315,6 +336,12 @@ function getNumericSettingInRange(key: string, fallback: number, min: number, ma
 
 export function getOcrConcurrency(): number {
   return getNumericSetting('ocr_concurrency', DEFAULT_OCR_CONCURRENCY, MAX_OCR_CONCURRENCY)
+}
+
+function normalizeOcrPageConcurrency(value: unknown, fallback = DEFAULT_OCR_CONCURRENCY): number {
+  const parsed = Number(value ?? fallback)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.max(1, Math.min(MAX_OCR_CONCURRENCY, Math.round(parsed)))
 }
 
 export function normalizeOcrDocumentConcurrency(value: unknown, fallback = DEFAULT_DOC_CONCURRENCY): number {
@@ -407,12 +434,23 @@ function getAsyncPdfWorkerCount(plan: PdfChunkPlan): number {
 }
 
 function isRetryableFailure(status?: number, code?: number | string): boolean {
-  if (status === 429 || status === 500 || status === 503 || status === 504) return true
+  if (status === 408 || status === 409 || status === 425 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504) return true
   const codeText = String(code || '')
-  return codeText === '10010' || codeText === '12002' || codeText === '429' || codeText === '500' || codeText === '503' || codeText === '504'
+  return codeText === '10010' || codeText === '12002' || codeText === '408' || codeText === '409' || codeText === '425' || codeText === '429' || codeText === '500' || codeText === '502' || codeText === '503' || codeText === '504'
+}
+
+function isAsyncOcrQueueBusyError(error: Error & { status?: number; code?: number | string }): boolean {
+  const message = String(error.message || '').toLowerCase()
+  return (
+    error.status === 429
+    || String(error.code || '') === '429'
+    || /queue|busy|rate.?limit|too many|throttle|capacity/.test(message)
+    || /队列|排队|繁忙|稍后|限流|频繁|并发|提交队列已满/.test(message)
+  )
 }
 
 function isRetryableNetworkFailure(error: Error & { status?: number; code?: number | string }): boolean {
+  if (isAsyncOcrQueueBusyError(error)) return true
   if (isRetryableFailure(error.status, error.code)) return true
   const message = String(error.message || '').toLowerCase()
   return /fetch|network|socket|econn|etimedout|eai_again|aborted|timeout|超时|网络/.test(message)
@@ -421,9 +459,10 @@ function isRetryableNetworkFailure(error: Error & { status?: number; code?: numb
 function isAsyncPdfUploadUnsupportedError(error: unknown): boolean {
   if (isOcrAbortError(error)) return false
   const failure = error as Error & { status?: number }
-  if (failure.status === 400 || failure.status === 404 || failure.status === 415 || failure.status === 422) return true
+  if (isAsyncOcrQueueBusyError(failure)) return false
+  if (failure.status === 400 || failure.status === 404 || failure.status === 413 || failure.status === 415 || failure.status === 422) return true
   const message = String(failure?.message || error || '').toLowerCase()
-  return /async pdf|pdf job|job upload|unsupported.*pdf|status(?: code)? 4(?:00|04|15|22)|状态码 4(?:00|04|15|22)/i.test(message)
+  return /async pdf|pdf job|job upload|unsupported.*pdf|file too large|too many pages|payload too large|status(?: code)? 4(?:00|04|13|15|22)|状态码 4(?:00|04|13|15|22)/i.test(message)
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -572,6 +611,18 @@ function isNaturallyHorizontalLabel(label: string): boolean {
     || /标题|题名|篇题|摘要|关键词|作者|页眉|页脚|页码|参考/.test(normalized)
 }
 
+function hasModernHorizontalParagraphSignals(box: { location?: { width: number; height: number }; words?: string; label?: string }): boolean {
+  const label = String(box.label || '').toLowerCase()
+  if (!/^(?:text|paragraph|body)$/.test(label)) return false
+  const rect = box.location
+  const text = String(box.words || '').trim()
+  const compact = text.replace(/\s+/g, '')
+  if (!rect || compact.length < 80) return false
+  if (rect.width < 160) return false
+  const punctuationCount = Array.from(compact).filter((char) => /[，。；：！？、“”‘’（）《》,.!?;:]/.test(char)).length
+  return punctuationCount / Math.max(1, compact.length) >= 0.045
+}
+
 function inferOrientation(box: { location?: { width: number; height: number }; words?: string; label?: string }): 'vertical' | 'horizontal' {
   const label = String(box.label || '').toLowerCase()
   const width = box.location?.width || 0
@@ -579,6 +630,7 @@ function inferOrientation(box: { location?: { width: number; height: number }; w
   const stronglyVerticalShape = width > 0 && height >= width * 1.8
   const stronglyHorizontalShape = width > 0 && height > 0 && width >= height * 1.72
   const explicitOrientation = readRecordValue(box, 'orientation')
+  if (hasModernHorizontalParagraphSignals(box)) return 'horizontal'
   if (explicitOrientation === 'vertical' || explicitOrientation === 'horizontal') return explicitOrientation
   if (/vertical[_\s-]*text|col[_\s-]*text|column[_\s-]*text|vertical|竖排|豎排|直排|縦書き|縦組み/i.test(label)) return 'vertical'
   if (/horizontal[_\s-]*text|row[_\s-]*text|horizontal|横排|橫排|横書き|横組み/i.test(label)) return 'horizontal'
@@ -587,7 +639,17 @@ function inferOrientation(box: { location?: { width: number; height: number }; w
   return height >= width * 1.2 ? 'vertical' : 'horizontal'
 }
 
-function annotateReadingOrder<T extends { location: { left: number; top: number; width: number; height: number }; score?: number; slot_count?: number; segmentation_source?: LayoutBlockResult['segmentation_source'] }>(boxes: T[]): Array<T & {
+function annotateReadingOrder<T extends {
+  location: { left: number; top: number; width: number; height: number }
+  score?: number
+  slot_count?: number
+  segmentation_source?: LayoutBlockResult['segmentation_source']
+  block_order?: number
+  reading_order?: number
+  column_index?: number
+  line_index?: number
+  label?: string
+}>(boxes: T[]): Array<T & {
   reading_order: number
   column_index: number
   line_index: number
@@ -600,6 +662,40 @@ function annotateReadingOrder<T extends { location: { left: number; top: number;
   mask_polygon: Array<{ x: number; y: number }>
 }> {
   if (boxes.length === 0) return []
+
+  const sourceOrderCandidates = boxes.filter((box) => !isDecorativeOcrLabel(box.label))
+  const hasStableSourceOrder = sourceOrderCandidates
+    .filter((box) => Number.isFinite(Number(box.block_order)) && Number(box.block_order) > 0)
+    .length >= Math.max(2, Math.ceil(Math.max(1, sourceOrderCandidates.length) * 0.6))
+  if (hasStableSourceOrder) {
+    return boxes
+      .map((box, index) => ({ box, index }))
+      .sort((left, right) => {
+        const leftOrder = Number(left.box.block_order)
+        const rightOrder = Number(right.box.block_order)
+        const leftHasContentOrder = Number.isFinite(leftOrder) && leftOrder > 0
+        const rightHasContentOrder = Number.isFinite(rightOrder) && rightOrder > 0
+        if (leftHasContentOrder !== rightHasContentOrder) return leftHasContentOrder ? -1 : 1
+        if (leftHasContentOrder && rightHasContentOrder) return leftOrder - rightOrder || left.index - right.index
+        return left.index - right.index
+      })
+      .map(({ box }, index) => {
+        const orientation = inferOrientation(box)
+        return {
+          ...(box as T),
+          reading_order: index,
+          column_index: Number.isFinite(Number(box.column_index)) ? Number(box.column_index) : 0,
+          line_index: Number.isFinite(Number(box.line_index)) ? Number(box.line_index) : index,
+          orientation,
+          confidence: typeof box.score === 'number' ? box.score : 1,
+          is_guji_candidate: orientation === 'vertical',
+          segmentation_source: box.segmentation_source || 'ocr',
+          slot_count: Number.isFinite(box.slot_count) ? Number(box.slot_count) : Math.max(1, Math.round((box.location.height || 0) / Math.max(12, box.location.width || 1))),
+          baseline: null,
+          mask_polygon: createMaskPolygon(box.location),
+        }
+      })
+  }
 
   const avgWidth = boxes.reduce((sum, box) => sum + box.location.width, 0) / boxes.length
   const threshold = Math.max(20, avgWidth * 0.65)
@@ -1035,6 +1131,128 @@ function normalizeOcrInlineText(value: string): string {
     .trim()
 }
 
+interface OcrRepeatedTextCandidate {
+  source: string
+  text: string
+}
+
+function compactOcrRepeatedTextScanValue(value: string): string {
+  return normalizeOcrInlineText(value)
+    .replace(/\s+/g, '')
+    .slice(0, OCR_REPEATED_TEXT_SCAN_LIMIT)
+}
+
+function addOcrRepeatedTextCandidate(candidates: OcrRepeatedTextCandidate[], source: string, value: unknown): void {
+  const text = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    ? String(value).trim()
+    : ''
+  if (text) candidates.push({ source, text })
+}
+
+function getMarkdownCandidateText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!isJsonRecord(value)) return ''
+  return rawPrimitiveText(readRecordValue(value, 'text'))
+}
+
+function getOcrRepeatedTextCandidates(value: unknown): OcrRepeatedTextCandidate[] {
+  const candidates: OcrRepeatedTextCandidate[] = []
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    addOcrRepeatedTextCandidate(candidates, 'text', value)
+    return candidates
+  }
+  if (!isJsonRecord(value)) return candidates
+
+  addOcrRepeatedTextCandidate(candidates, 'text', readRecordValue(value, 'text'))
+  addOcrRepeatedTextCandidate(candidates, 'markdown.text', getMarkdownCandidateText(readRecordValue(value, 'markdown')))
+
+  const wordsResult = asRecordArray(readRecordValue(value, 'words_result'))
+  const wordsText = wordsResult.map((item) => rawPrimitiveText(readRecordValue(item, 'words'))).filter(Boolean).join('\n')
+  addOcrRepeatedTextCandidate(candidates, 'words_result', wordsText)
+
+  const layoutResult = asRecordArray(readRecordValue(value, 'layout_result'))
+  const layoutText = layoutResult.map((item) => rawPrimitiveText(readRecordValue(item, 'words'))).filter(Boolean).join('\n')
+  addOcrRepeatedTextCandidate(candidates, 'layout_result.words', layoutText)
+  layoutResult.forEach((item, index) => {
+    addOcrRepeatedTextCandidate(candidates, `layout_result[${index}].words`, readRecordValue(item, 'words'))
+    addOcrRepeatedTextCandidate(candidates, `layout_result[${index}].raw_words`, readRecordValue(item, 'raw_words'))
+    addOcrRepeatedTextCandidate(candidates, `layout_result[${index}].table_html`, readRecordValue(item, 'table_html') || readRecordValue(item, 'html'))
+  })
+
+  return candidates
+}
+
+function isSuspiciousRepeatedTextIssue(issue: OcrRepeatedTextIssue): boolean {
+  if (issue.compactLength < OCR_REPEATED_TEXT_MIN_COMPACT_LENGTH) return false
+  if (issue.repeatChars >= 1_800 && issue.repeatCount >= 120 && issue.ratio >= 0.35) return true
+  if (issue.unit.length <= 2 && issue.repeatChars >= 1_200 && issue.repeatCount >= 500 && issue.ratio >= 0.35) return true
+  return issue.repeatChars >= 3_600 && issue.repeatCount >= 80 && issue.ratio >= 0.25
+}
+
+function findRepeatedTextIssueInCandidate(candidate: OcrRepeatedTextCandidate): OcrRepeatedTextIssue | null {
+  const compact = compactOcrRepeatedTextScanValue(candidate.text)
+  if (compact.length < OCR_REPEATED_TEXT_MIN_COMPACT_LENGTH) return null
+  let bestUnit = ''
+  let bestCount = 0
+  let bestChars = 0
+  let bestStart = 0
+
+  for (let unitLength = 1; unitLength <= OCR_REPEATED_TEXT_MAX_UNIT_LENGTH; unitLength += 1) {
+    let index = 0
+    while (index + unitLength * 3 <= compact.length) {
+      const unit = compact.slice(index, index + unitLength)
+      if (!unit.trim()) {
+        index += 1
+        continue
+      }
+      let cursor = index + unitLength
+      let repeatCount = 1
+      while (cursor + unitLength <= compact.length && compact.slice(cursor, cursor + unitLength) === unit) {
+        repeatCount += 1
+        cursor += unitLength
+      }
+      const repeatChars = repeatCount * unitLength
+      if (repeatCount >= 3 && repeatChars > bestChars) {
+        bestUnit = unit
+        bestCount = repeatCount
+        bestChars = repeatChars
+        bestStart = index
+      }
+      index = repeatCount >= 3 ? Math.max(cursor, index + 1) : index + 1
+    }
+  }
+
+  if (!bestUnit) return null
+  const issue: OcrRepeatedTextIssue = {
+    source: candidate.source,
+    unit: bestUnit,
+    repeatCount: bestCount,
+    repeatChars: bestChars,
+    compactLength: compact.length,
+    ratio: bestChars / Math.max(1, compact.length),
+    sample: compact.slice(bestStart, Math.min(compact.length, bestStart + 120)),
+  }
+  return isSuspiciousRepeatedTextIssue(issue) ? issue : null
+}
+
+export function findSuspiciousRepeatedOcrText(value: unknown): OcrRepeatedTextIssue | null {
+  let bestIssue: OcrRepeatedTextIssue | null = null
+  for (const candidate of getOcrRepeatedTextCandidates(value)) {
+    const issue = findRepeatedTextIssueInCandidate(candidate)
+    if (!issue) continue
+    if (!bestIssue || issue.repeatChars > bestIssue.repeatChars) {
+      bestIssue = issue
+    }
+  }
+  return bestIssue
+}
+
+export function formatSuspiciousRepeatedOcrTextIssue(issue: OcrRepeatedTextIssue): string {
+  const unit = issue.unit.length > 24 ? `${issue.unit.slice(0, 24)}...` : issue.unit
+  const ratio = Math.round(issue.ratio * 100)
+  return `OCR 结果疑似重复生成：“${unit}”连续出现 ${issue.repeatCount} 次，占该页文本约 ${ratio}%。本页结果未写入正文，请重新 OCR 该页或切换 OCR 模型后再试。`
+}
+
 function getRawOcrBlockText(block: unknown): string {
   return String(
     firstRecordValue(block, ['raw_words', 'raw_text', 'words', 'word', 'text', 'block_content', 'content', 'transcription'])
@@ -1088,9 +1306,71 @@ function isTableLabel(label: unknown): boolean {
   return /table|表格|excel|sheet/i.test(String(label || ''))
 }
 
+function isImageLabel(label: unknown): boolean {
+  return /^(?:image|figure|picture|chart|diagram|photo|illustration)$/i.test(String(label || ''))
+}
+
+function isDecorativeOcrLabel(label: unknown): boolean {
+  return /header|footer|number|page/i.test(String(label || ''))
+}
+
+function parseMarkdownImageBlocks(markdownText: string): MarkdownImageBlock[] {
+  const text = String(markdownText || '')
+  if (!text) return []
+  const blocks: MarkdownImageBlock[] = []
+  const patterns = [
+    /<img\b[^>]*\bsrc=(["'])(.*?)\1[^>]*\balt=(["'])(.*?)\3[^>]*>/gi,
+    /<img\b[^>]*\balt=(["'])(.*?)\1[^>]*\bsrc=(["'])(.*?)\3[^>]*>/gi,
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+  ]
+  patterns.forEach((pattern, patternIndex) => {
+    for (const match of text.matchAll(pattern)) {
+      const src = patternIndex === 1 ? String(match[4] || '') : String(match[2] || '')
+      const alt = patternIndex === 1 ? String(match[2] || '') : String(match[4] || match[1] || '')
+      const coordinateMatch = src.match(/(?:image[_-]?box|box)[_-](\d+)[_-](\d+)[_-](\d+)[_-](\d+)/i)
+      if (!coordinateMatch) continue
+      const left = Number(coordinateMatch[1])
+      const top = Number(coordinateMatch[2])
+      const right = Number(coordinateMatch[3])
+      const bottom = Number(coordinateMatch[4])
+      if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) continue
+      blocks.push({
+        src: src.trim(),
+        alt: alt.trim(),
+        index: match.index ?? 0,
+        location: {
+          left,
+          top,
+          width: right - left,
+          height: bottom - top,
+        },
+      })
+    }
+  })
+  return blocks
+}
+
+function resolveMarkdownImageSrc(src: string, markdownValue: unknown): string {
+  const value = String(src || '').trim()
+  if (!value) return ''
+  const images = readRecordValue(markdownValue, 'images')
+  const mapped = readRecordValue(images, value)
+  return typeof mapped === 'string' && mapped.trim() ? mapped.trim() : value
+}
+
+function getLayoutBlockImagePath(block: LayoutBlockResult): string {
+  return String(block?.image_asset_path || block?.asset_path || block?.image_path || '').trim()
+}
+
+function isRenderableOcrImagePath(value: string): boolean {
+  const path = String(value || '').trim()
+  return Boolean(path) && !/^(?:imgs?|images?)\//i.test(path)
+}
+
 function isDedupeCandidateBlock(block: LayoutBlockResult): boolean {
   if (!block?.location) return false
   if (isTableLabel(block.label)) return false
+  if (isImageLabel(block.label)) return false
   const compact = getOcrDedupeText(block)
   if (compact.length < 18) return false
   const orientation = inferOrientation(block)
@@ -1518,6 +1798,7 @@ export function normalizePageResult(layoutPage: unknown): OcrResultPayload {
       const label = tableData.rows.length > 0 || isTableLabel(rawLabel) ? 'table' : rawLabel
       const preferredText = getPreferredOcrBlockText(box).trim()
       const rawText = getRawOcrBlockText(box).trim()
+      const blockOrder = finiteNumber(firstRecordValue(box, ['block_order', 'reading_order']))
       regionBoxes.push({
         words: tableData.rows.length > 0 ? tableRowsToText(tableData.rows) : preferredText,
         raw_words: tableData.rows.length > 0 ? undefined : rawText,
@@ -1530,6 +1811,8 @@ export function normalizePageResult(layoutPage: unknown): OcrResultPayload {
         html: tableData.html,
         table_html: tableData.html,
         markdown: tableData.markdown,
+        reading_order: blockOrder ?? undefined,
+        block_order: blockOrder ?? undefined,
         score: finiteNumber(readRecordValue(box, 'score')) ?? undefined,
       })
     }
@@ -1609,7 +1892,46 @@ export function normalizePageResult(layoutPage: unknown): OcrResultPayload {
     }
   }
 
-  const orderedBoxes = annotateReadingOrder(regionBoxes.filter((box) => box.words || isTableLabel(box.label)))
+  const markdownImageBlocks = parseMarkdownImageBlocks(markdownText)
+  for (const imageBlock of markdownImageBlocks) {
+    const imagePath = resolveMarkdownImageSrc(imageBlock.src, markdownValue)
+    const overlappingImageBox = regionBoxes.find((box) => (
+      isImageLabel(box.label)
+      && rectOverlapRatio(box.location, imageBlock.location) >= 0.6
+    ))
+    if (overlappingImageBox) {
+      if (!isRenderableOcrImagePath(getLayoutBlockImagePath(overlappingImageBox)) && isRenderableOcrImagePath(imagePath)) {
+        overlappingImageBox.words = getOcrBlockText(overlappingImageBox) || imageBlock.alt || 'image'
+        overlappingImageBox.raw_words = overlappingImageBox.words
+        overlappingImageBox.image_path = imagePath
+        overlappingImageBox.asset_path = imagePath
+        overlappingImageBox.image_asset_path = imagePath
+      }
+      continue
+    }
+    const imageBottom = imageBlock.location.top + imageBlock.location.height
+    const followingBlock = regionBoxes
+      .filter((box) => !isDecorativeOcrLabel(box.label) && Number.isFinite(Number(box.block_order)))
+      .filter((box) => box.location.top >= imageBottom - Math.max(12, imageBlock.location.height * 0.08))
+      .sort((left, right) => left.location.top - right.location.top || Number(left.block_order) - Number(right.block_order))[0]
+    const maxBlockOrder = regionBoxes.reduce((max, box) => Number.isFinite(Number(box.block_order)) ? Math.max(max, Number(box.block_order)) : max, 0)
+    const imageBlockOrder = followingBlock && Number(followingBlock.block_order) > 0
+      ? Number(followingBlock.block_order) - 0.5
+      : maxBlockOrder + 0.5
+    regionBoxes.push({
+      words: imageBlock.alt || 'image',
+      raw_words: imageBlock.alt || 'image',
+      location: imageBlock.location,
+      label: 'image',
+      image_path: imagePath,
+      asset_path: imagePath,
+      image_asset_path: imagePath,
+      block_order: imageBlockOrder,
+      segmentation_source: 'ocr',
+    })
+  }
+
+  const orderedBoxes = annotateReadingOrder(regionBoxes.filter((box) => box.words || isTableLabel(box.label) || isImageLabel(box.label)))
   const orderedDedupe = getDedupeTextBlocks(orderedBoxes)
   const textBoxes = orderedDedupe.textBlocks
 
@@ -1642,6 +1964,7 @@ interface SyncRecognitionOptions {
 
 interface OcrRuntimeOptions {
   signal?: AbortSignal
+  concurrency?: number
 }
 
 async function requestSyncRecognition(base64Image: string, options: SyncRecognitionOptions = {}): Promise<OcrResultPayload> {
@@ -1736,7 +2059,8 @@ export async function recognizePages(
   runtimeOptions: OcrRuntimeOptions = {},
 ): Promise<OcrPageResult[]> {
   const resolvedOptions = resolveOcrOptions(options)
-  const limit = createLimiter(getOcrConcurrency())
+  const pageConcurrency = normalizeOcrPageConcurrency(runtimeOptions.concurrency, getOcrConcurrency())
+  const limit = createLimiter(Math.min(pageConcurrency, getOcrConcurrency()))
   const totalPages = pages.length
   let completedPages = 0
 
@@ -1778,6 +2102,18 @@ export async function recognizePages(
           : await recognizeImage(imageBuffer.toString('base64'), runtimeOptions)
         const result = await postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions, runtimeOptions)
         const text = result.words_result?.map((item) => item.words || '').join('\n') || ''
+        const repeatedIssue = findSuspiciousRepeatedOcrText(result)
+        if (repeatedIssue) {
+          const message = formatSuspiciousRepeatedOcrTextIssue(repeatedIssue)
+          reportProgress(page, 'error', message)
+          return {
+            pageId: page.id,
+            result: null,
+            text: '',
+            status: 'error',
+            error: message,
+          }
+        }
         reportProgress(page, 'completed', undefined, result, text)
         return {
           pageId: page.id,
@@ -1814,6 +2150,7 @@ interface PdfChunk {
   pageCount: number
   sourcePageIndexes: number[]
   resultPageIndexes?: number[]
+  pageRanges?: string
   uploadPageCount?: number
   totalChunks?: number
   fallbackWholePdf?: boolean
@@ -1855,6 +2192,10 @@ interface RecognizePdfAsyncOptions {
   signal?: AbortSignal
   targetPageNums?: number[]
   fallbackPageCount?: number
+}
+
+interface AsyncPdfSubmitOptions {
+  pageRanges?: string
 }
 
 function getAsyncAuthHeaders(): Record<string, string> {
@@ -1938,6 +2279,28 @@ function getFallbackPdfPageCount(targetPageNums?: number[], fallbackPageCount = 
     .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0))
   const fallbackTotal = Math.floor(Number(fallbackPageCount || 0))
   return Math.max(0, targetMaxPage, Number.isFinite(fallbackTotal) ? fallbackTotal : 0)
+}
+
+function supportsFileBackedPdfUpload(): boolean {
+  return typeof openAsBlob === 'function'
+}
+
+function canAttemptWholePdfUpload(sourceSize: number, totalPages: number): boolean {
+  if (totalPages <= 0) return false
+  return supportsFileBackedPdfUpload() || sourceSize <= ASYNC_PDF_MAX_FILE_SIZE
+}
+
+function isLocalWholePdfUploadUnavailableError(error: unknown): boolean {
+  const message = String((error as Error)?.message || error || '').toLowerCase()
+  return message.includes('low-memory pdf upload')
+    || message.includes('低内存 pdf')
+    || message.includes('不支持低内存 pdf')
+}
+
+function shouldRetryWholePdfUploadWithChunking(error: unknown, plan: PdfChunkPlan): boolean {
+  if (!plan.directFilePath || !(plan.fullFileUpload || plan.wholePdfFallback)) return false
+  if (isOcrAbortError(error)) return false
+  return isAsyncPdfUploadUnsupportedError(error) || isLocalWholePdfUploadUnavailableError(error)
 }
 
 function shouldAvoidPdfLibChunkPlanFallback(sourceSize: number): boolean {
@@ -2102,10 +2465,30 @@ async function ensurePlanSourcePdfLoaded(plan: PdfChunkPlan, signal?: AbortSigna
   return plan.sourcePdf
 }
 
-async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], signal?: AbortSignal, fallbackPageCount = 0): Promise<PdfChunkPlan> {
+async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], signal?: AbortSignal, fallbackPageCount = 0, forceChunking = false): Promise<PdfChunkPlan> {
   throwIfAborted(signal)
   const stats = await stat(filePath)
   throwIfAborted(signal)
+  const fallbackTotalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)
+  if (
+    !forceChunking
+    && canAttemptWholePdfUpload(stats.size, fallbackTotalPages)
+  ) {
+    const targetPageIndexes = normalizeTargetPageIndexes(fallbackTotalPages, targetPageNums)
+    return {
+      sourcePdf: null,
+      sourcePath: filePath,
+      totalPages: fallbackTotalPages,
+      targetPageIndexes,
+      sourceSize: stats.size,
+      estimatedPagesPerChunk: fallbackTotalPages,
+      estimatedTotalChunks: targetPageIndexes.length > 0 ? 1 : 0,
+      tempRoot: null,
+      directFilePath: filePath,
+      fullFileUpload: true,
+      qpdfEnabled: false,
+    }
+  }
   let sourcePdf: PDFDocument | null = null
   let totalPages = isQpdfPdfChunkingEnabled() ? await getQpdfPageCount(filePath, signal) || 0 : 0
   const qpdfEnabled = totalPages > 0
@@ -2138,6 +2521,9 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
     }
   }
   if (largePdfWithoutQpdf) {
+    if (forceChunking) {
+      throw new Error('整本 PDF 上传被服务端拒绝，当前环境无法安全处理 PDF 分片。请稍后重试，或重新导入该 PDF 后再试。')
+    }
     totalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)
     const targetPageIndexes = normalizeTargetPageIndexes(totalPages, targetPageNums)
     const fallbackReason = 'qpdf page count unavailable for a large PDF; skipped pdf-lib full-file load to avoid blocking the app'
@@ -2175,8 +2561,8 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
   }
 
   if (
-    stats.size <= ASYNC_PDF_MAX_FILE_SIZE
-    && totalPages <= ASYNC_PDF_MAX_PAGES_PER_JOB
+    !forceChunking
+    && canAttemptWholePdfUpload(stats.size, totalPages)
   ) {
     return {
       sourcePdf,
@@ -2233,16 +2619,24 @@ async function createPdfChunkFromPlan(plan: PdfChunkPlan, targetCursor: number, 
   }
 
   if (plan.directFilePath) {
-    const resultPageIndexes = plan.fullFileUpload || plan.wholePdfFallback
-      ? Array.from({ length: plan.totalPages }, (_, index) => index)
+    const allPageIndexes = Array.from({ length: plan.totalPages }, (_, index) => index)
+    const sourcePageIndexes = plan.targetPageIndexes
+    const isFullPageSelection = sourcePageIndexes.length === allPageIndexes.length
+      && sourcePageIndexes.every((pageIndex, index) => pageIndex === index)
+    const pageRanges = isFullPageSelection ? undefined : toQpdfPageRange(sourcePageIndexes)
+    const resultPageIndexes = pageRanges
+      ? sourcePageIndexes
+      : plan.fullFileUpload || plan.wholePdfFallback
+      ? allPageIndexes
       : undefined
     return {
       filePath: plan.directFilePath,
-      startPageIndex: plan.targetPageIndexes[0] ?? 0,
-      pageCount: plan.targetPageIndexes.length,
-      sourcePageIndexes: plan.targetPageIndexes,
+      startPageIndex: sourcePageIndexes[0] ?? 0,
+      pageCount: sourcePageIndexes.length,
+      sourcePageIndexes,
       resultPageIndexes,
-      uploadPageCount: resultPageIndexes ? plan.totalPages : undefined,
+      pageRanges,
+      uploadPageCount: resultPageIndexes ? (pageRanges ? sourcePageIndexes.length : plan.totalPages) : undefined,
       totalChunks: resultPageIndexes ? 1 : undefined,
       fallbackWholePdf: plan.wholePdfFallback,
       fallbackReason: plan.fallbackReason,
@@ -2392,19 +2786,43 @@ async function createPdfUploadBlob(filePath: string): Promise<Blob> {
   return new Blob([fileBuffer], { type: 'application/pdf' })
 }
 
-async function submitAsyncPdfJob(filePath: string, model: AsyncOcrModel, signal?: AbortSignal): Promise<string> {
+function getSafeOcrUploadFilename(filePath: string): string {
+  const rawBase = basename(filePath || 'document.pdf')
+  const rawExt = extname(rawBase).toLowerCase()
+  const extension = rawExt === '.pdf' ? '.pdf' : '.pdf'
+  const rawStem = rawExt ? rawBase.slice(0, -rawExt.length) : rawBase
+  const safeStem = rawStem
+    .normalize('NFKD')
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[_.\-\s]+|[_.\-\s]+$/g, '')
+    .slice(0, 80)
+  return `${safeStem || 'gujismart-document'}${extension}`
+}
+
+async function submitAsyncPdfJob(
+  filePath: string,
+  model: AsyncOcrModel,
+  signal?: AbortSignal,
+  onQueueBusy?: (payload: { attempt: number; waitMs: number; errorMessage: string }) => void,
+  submitOptions: AsyncPdfSubmitOptions = {},
+): Promise<string> {
   return asyncSubmitLimit(async () => {
     let attempt = 0
     let lastError: Error | null = null
     throwIfAborted(signal)
     const fileBlob = await createPdfUploadBlob(filePath)
+    let maxAttempts = MAX_RETRY_ATTEMPTS
 
-    while (attempt < MAX_RETRY_ATTEMPTS) {
+    while (attempt < maxAttempts) {
       throwIfAborted(signal)
       try {
         const formData = new FormData()
         formData.append('model', model)
-        formData.append('file', fileBlob, basename(filePath))
+        if (submitOptions.pageRanges) {
+          formData.append('pageRanges', submitOptions.pageRanges)
+        }
+        formData.append('file', fileBlob, getSafeOcrUploadFilename(filePath))
 
         const response = await fetchWithTimeout(ASYNC_OCR_ENDPOINT, {
           method: 'POST',
@@ -2450,12 +2868,21 @@ async function submitAsyncPdfJob(filePath: string, model: AsyncOcrModel, signal?
         const failure = error as Error & { status?: number; code?: number | string }
         lastError = failure
         attempt += 1
-        if (attempt >= MAX_RETRY_ATTEMPTS || !isRetryableNetworkFailure(failure)) {
+        const queueBusy = isAsyncOcrQueueBusyError(failure)
+        if (queueBusy) {
+          maxAttempts = Math.max(maxAttempts, ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS)
+        }
+        if (attempt >= maxAttempts || !isRetryableNetworkFailure(failure)) {
           break
         }
-        const waitMs = String(failure.code || '') === '10010'
+        const waitMs = queueBusy
+          ? Math.min(60000, 15000 * attempt)
+          : String(failure.code || '') === '10010'
           ? Math.min(60000, 5000 * 2 ** (attempt - 1))
           : Math.min(20000, 1200 * 2 ** (attempt - 1))
+        if (queueBusy) {
+          onQueueBusy?.({ attempt, waitMs, errorMessage: failure.message || 'PaddleOCR submission queue is full' })
+        }
         await sleep(waitMs, signal)
       }
     }
@@ -2729,7 +3156,10 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
   const model = normalizeAsyncOcrModel(options?.model || getAsyncOcrModel())
   const signal = options?.signal
   throwIfAborted(signal)
-  const plan = await createPdfChunkPlan(filePath, options?.targetPageNums, signal, options?.fallbackPageCount)
+  let plan = await createPdfChunkPlan(filePath, options?.targetPageNums, signal, options?.fallbackPageCount)
+  let retriedWholePdfUploadWithChunks = false
+
+  while (true) {
   const totalPages = plan.totalPages
   const collectChunkResults = options?.collectChunkResults !== false
   const chunkResults: Array<Array<OcrResultPayload | null>> = []
@@ -2820,7 +3250,39 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
         progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages)
       })
 
-      const jobId = await submitAsyncPdfJob(chunk.filePath, model, signal)
+      onProgress?.({
+        status: 'uploading',
+        state: 'uploading',
+        chunkIndex: chunkIndex + 1,
+        totalChunks,
+        chunkStartPage,
+        chunkEndPage,
+        completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+        totalPages,
+        fallbackWholePdf: chunk.fallbackWholePdf,
+        fallbackReason: chunk.fallbackReason,
+        fullFileUpload: chunk.fullFileUpload,
+        uploadPageCount: chunk.uploadPageCount,
+        progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+      })
+      const jobId = await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
+        onProgress?.({
+          status: 'queued',
+          state: 'queued',
+          errorMessage: queuePayload.errorMessage,
+          chunkIndex: chunkIndex + 1,
+          totalChunks,
+          chunkStartPage,
+          chunkEndPage,
+          completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+          totalPages,
+          fallbackWholePdf: chunk.fallbackWholePdf,
+          fallbackReason: chunk.fallbackReason,
+          fullFileUpload: chunk.fullFileUpload,
+          uploadPageCount: chunk.uploadPageCount,
+          progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+        })
+      }, { pageRanges: chunk.pageRanges })
       const jsonUrl = await waitForAsyncPdfResult(jobId, (payload) => {
         const chunkCompleted = getChunkCompletedPages(chunk, payload)
         const chunkTotal = getTotalPages(payload, chunk.uploadPageCount || chunk.pageCount)
@@ -2877,14 +3339,36 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
     }
   }
 
+  let retryPlan: PdfChunkPlan | null = null
   try {
     const workerCount = getAsyncPdfWorkerCount(plan)
     await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  } catch (error) {
+    if (!retriedWholePdfUploadWithChunks && shouldRetryWholePdfUploadWithChunking(error, plan)) {
+      retriedWholePdfUploadWithChunks = true
+      onProgress?.({
+        status: 'preparing',
+        state: 'preparing',
+        completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+        totalPages,
+        progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+        fallbackReason: '整本 PDF 上传失败，正在重新提交 PDF',
+      })
+      retryPlan = await createPdfChunkPlan(filePath, options?.targetPageNums, signal, options?.fallbackPageCount, true)
+    } else {
+      throw error
+    }
   } finally {
     await cleanupPdfChunkPlan(plan)
   }
 
+  if (retryPlan) {
+    plan = retryPlan
+    continue
+  }
+
   return collectChunkResults ? chunkResults.flat() : []
+  }
 }
 
 export async function recognizeTraditional(base64Image: string, options: OcrRuntimeOptions = {}): Promise<OcrResultPayload> {

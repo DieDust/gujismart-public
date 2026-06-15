@@ -50,6 +50,11 @@ type LayoutBlock = OcrRecognizeLayoutBlock & JsonRecord & {
   __synthetic?: boolean
   __sourceIndex?: number
 }
+type MarkdownImageBlock = {
+  location: BlockRect
+  src: string
+  alt: string
+}
 type FacsimileLayoutProfile = 'paddle' | 'vision'
 
 type TranslationBlockCoverage = {
@@ -76,6 +81,7 @@ type FacsimileBlockRenderLayout = {
   block: LayoutBlock
   sourceIndex: number
   rect: BlockRect
+  cropBounds: { width: number; height: number; offsetLeft: number; offsetTop: number }
   left: number
   top: number
   width: number
@@ -385,6 +391,62 @@ function getBlockImagePath(block: unknown): string {
   return String(firstRecordValue(block, ['image_asset_path', 'asset_path', 'image_path']) || '').trim()
 }
 
+function parseMarkdownImageBlocks(markdownText: string): MarkdownImageBlock[] {
+  const text = String(markdownText || '')
+  if (!text) return []
+  const blocks: MarkdownImageBlock[] = []
+  const patterns = [
+    /<img\b[^>]*\bsrc=(["'])(.*?)\1[^>]*\balt=(["'])(.*?)\3[^>]*>/gi,
+    /<img\b[^>]*\balt=(["'])(.*?)\1[^>]*\bsrc=(["'])(.*?)\3[^>]*>/gi,
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+  ]
+  patterns.forEach((pattern, patternIndex) => {
+    for (const match of text.matchAll(pattern)) {
+      const src = patternIndex === 1 ? String(match[4] || '') : String(match[2] || '')
+      const alt = patternIndex === 1 ? String(match[2] || '') : String(match[4] || match[1] || '')
+      const coordinateMatch = src.match(/(?:image[_-]?box|box)[_-](\d+)[_-](\d+)[_-](\d+)[_-](\d+)/i)
+      if (!coordinateMatch) continue
+      const left = Number(coordinateMatch[1])
+      const top = Number(coordinateMatch[2])
+      const right = Number(coordinateMatch[3])
+      const bottom = Number(coordinateMatch[4])
+      if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) continue
+      blocks.push({ src, alt, location: { left, top, width: right - left, height: bottom - top } })
+    }
+  })
+  return blocks
+}
+
+function getMarkdownTextAndImages(parsed: FacsimileOcrResult): { text: string; images: JsonRecord } {
+  const markdown = parsed.markdown
+  if (typeof markdown === 'string') return { text: markdown, images: {} }
+  if (markdown && typeof markdown === 'object' && !Array.isArray(markdown)) {
+    const record = markdown as JsonRecord
+    return {
+      text: typeof record.text === 'string' ? record.text : '',
+      images: record.images && typeof record.images === 'object' && !Array.isArray(record.images) ? record.images as JsonRecord : {},
+    }
+  }
+  return { text: '', images: {} }
+}
+
+function resolveMarkdownImageSrc(src: string, images: JsonRecord): string {
+  const value = String(src || '').trim()
+  if (!value) return ''
+  const mapped = images[value]
+  return typeof mapped === 'string' && mapped.trim() ? mapped.trim() : value
+}
+
+function rectOverlapRatio(left: BlockRect, right: BlockRect): number {
+  const x1 = Math.max(left.left, right.left)
+  const y1 = Math.max(left.top, right.top)
+  const x2 = Math.min(left.left + left.width, right.left + right.width)
+  const y2 = Math.min(left.top + left.height, right.top + right.height)
+  const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+  const minArea = Math.min(Math.max(1, left.width * left.height), Math.max(1, right.width * right.height))
+  return intersection / minArea
+}
+
 function hasHorizontalTextSignals(block: unknown): boolean {
   const label = getLabel(block)
   if (isTocLabel(label)) return true
@@ -419,13 +481,32 @@ function isTallVerticalTextBlock(block: unknown): boolean {
   return getVerticalScriptRatio(text) >= 0.42
 }
 
+function hasModernHorizontalParagraphShape(block: unknown): boolean {
+  const label = getOrientationLabelText(block)
+  if (!/^(?:text|paragraph|body)$/.test(label)) return false
+  const rect = getRect(block)
+  const text = getBlockText(block)
+  if (!rect || !text.trim()) return false
+  const compact = text.replace(/\s+/g, '')
+  const punctuationCount = Array.from(compact).filter((char) => /[，。；：！？、“”‘’（）《》,.!?;:]/.test(char)).length
+  return compact.length >= 80
+    && rect.width >= 160
+    && punctuationCount / Math.max(1, compact.length) >= 0.035
+}
+
 function isStrongHorizontalTextBlock(block: unknown): boolean {
   const label = getOrientationLabelText(block)
   if (isTocLabel(label) || isExplicitHorizontalLabel(label)) return true
+  if (hasModernHorizontalParagraphShape(block)) return true
   if (isExplicitVerticalLabel(label)) return false
   const rect = getRect(block)
   const text = getBlockText(block)
   if (!rect || !text.trim()) return false
+  if (/^(?:text|paragraph|body)$/.test(label)) {
+    const compact = text.replace(/\s+/g, '')
+    const punctuationCount = Array.from(compact).filter((char) => /[，。；：！？、“”‘’（）《》,.!?;:]/.test(char)).length
+    if (compact.length >= 80 && rect.width >= 160 && punctuationCount / Math.max(1, compact.length) >= 0.045) return true
+  }
   if (isNaturallyHorizontalLabel(label) && !isTallVerticalTextBlock(block)) return true
   const compact = text.replace(/\s+/g, '')
   const asciiCount = Array.from(compact).filter((char) => /[A-Za-z0-9()[\]{}.,;:!?/"'%-]/.test(char)).length
@@ -451,9 +532,9 @@ function isVerticalPage(blocks: LayoutBlock[]): boolean {
 
 function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
   if (isRenderableTableBlock(block)) return 'horizontal'
+  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   const explicitOrientation = getExplicitOcrOrientation(block)
   if (explicitOrientation) return explicitOrientation
-  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   if (isTallVerticalTextBlock(block)) return 'vertical'
   if (hasHorizontalTextSignals(block)) return 'horizontal'
   const rect = getRect(block)
@@ -466,12 +547,11 @@ function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
 
 function inferPageAwareOrientation(block: unknown, pageVerticalMode: boolean): 'vertical' | 'horizontal' {
   if (isRenderableTableBlock(block) || isImageLabel(getLabel(block))) return 'horizontal'
-  const explicitOrientation = getExplicitOcrOrientation(block)
-  if (explicitOrientation) return explicitOrientation
   if (!pageVerticalMode) return inferOrientation(block)
-  const label = getOrientationLabelText(block)
   if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   if (isTocLabel(getLabel(block))) return 'horizontal'
+  const explicitOrientation = getExplicitOcrOrientation(block)
+  if (explicitOrientation) return explicitOrientation
   return 'vertical'
 }
 
@@ -489,7 +569,7 @@ function normalizeBlocks(ocrResult: unknown): LayoutBlock[] {
         ...block,
         words,
         label,
-        reading_order: Number.isFinite(Number(block.reading_order)) ? Number(block.reading_order) : index,
+        reading_order: index,
         orientation: inferOrientation(block),
         __rect: rect || undefined,
         __sourceIndex: index,
@@ -497,15 +577,40 @@ function normalizeBlocks(ocrResult: unknown): LayoutBlock[] {
     })
     .filter((block): block is LayoutBlock => block !== null)
 
-  if (blocks.length === 0 && typeof parsed.text === 'string') {
-    return parsed.text
+  const markdown = getMarkdownTextAndImages(parsed)
+  const markdownText = markdown.text
+  const fallbackText = typeof parsed.text === 'string' ? parsed.text : ''
+  if (blocks.length === 0 && fallbackText) {
+    return fallbackText
       .split(/\n+/)
       .map((line) => line.trim())
       .filter(Boolean)
       .map((line, index): LayoutBlock => ({ words: line, label: 'text', reading_order: index, orientation: 'vertical', __sourceIndex: index }))
   }
 
-  return blocks.sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
+  const imageBlocks = parseMarkdownImageBlocks(markdownText)
+    .filter((imageBlock) => !blocks.some((block) => isImageLabel(getLabel(block)) && block.__rect && rectOverlapRatio(block.__rect, imageBlock.location) >= 0.6))
+    .map((imageBlock, index): LayoutBlock => {
+      const followingBlock = blocks
+        .filter((block) => block.__rect && !isDecorativeLabel(getLabel(block)) && block.__rect.top >= imageBlock.location.top + imageBlock.location.height - Math.max(12, imageBlock.location.height * 0.08))
+        .sort((left, right) => Number(left.__rect?.top || 0) - Number(right.__rect?.top || 0) || Number(left.reading_order || 0) - Number(right.reading_order || 0))[0]
+      const readingOrder = followingBlock && Number.isFinite(Number(followingBlock.reading_order))
+        ? Number(followingBlock.reading_order) - 0.5
+        : blocks.length + index + 0.5
+      return {
+        words: imageBlock.alt || 'image',
+        label: 'image',
+        reading_order: readingOrder,
+        orientation: 'horizontal',
+        image_asset_path: resolveMarkdownImageSrc(imageBlock.src, markdown.images),
+        asset_path: resolveMarkdownImageSrc(imageBlock.src, markdown.images),
+        image_path: resolveMarkdownImageSrc(imageBlock.src, markdown.images),
+        __rect: imageBlock.location,
+        __sourceIndex: blocks.length + index,
+      }
+    })
+
+  return [...blocks, ...imageBlocks].sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
 }
 
 function normalizePageOrientations(blocks: LayoutBlock[]): LayoutBlock[] {
@@ -1151,7 +1256,7 @@ function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofSta
     return {
       ...rest,
       words: getBlockText(block),
-      reading_order: Number.isFinite(Number(block.reading_order)) ? Number(block.reading_order) : index,
+      reading_order: index,
       orientation: inferOrientation(block),
       location: block.location || (__rect ? { left: __rect.left, top: __rect.top, width: __rect.width, height: __rect.height } : undefined),
     }
@@ -1165,21 +1270,37 @@ function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofSta
   }
 }
 
-function FacsimileImageBlock({ assetPath, pageImageSrc, left, top, width, height }: { assetPath: string; pageImageSrc: string; left: number; top: number; width: number; height: number }) {
+function FacsimileImageBlock({
+  assetPath,
+  pageImageSrc,
+  rect,
+  bounds,
+}: {
+  assetPath: string
+  pageImageSrc: string
+  rect: BlockRect
+  bounds: { width: number; height: number; offsetLeft: number; offsetTop: number }
+}) {
   const [assetSrc, setAssetSrc] = useState('')
   useEffect(() => {
     let cancelled = false
-    if (!assetPath) {
+    const normalizedAssetPath = String(assetPath || '').trim()
+    const isLocalImageAsset = normalizedAssetPath && !/^(?:https?:|data:|blob:)/i.test(normalizedAssetPath) && !/^(?:imgs?|images?)\//i.test(normalizedAssetPath)
+    if (!isLocalImageAsset) {
       setAssetSrc('')
       return () => { cancelled = true }
     }
-    void window.api.readImageAsDataURL(assetPath)
+    void window.api.readImageAsDataURL(normalizedAssetPath)
       .then((dataUrl) => { if (!cancelled) setAssetSrc(dataUrl || '') })
       .catch(() => { if (!cancelled) setAssetSrc('') })
     return () => { cancelled = true }
   }, [assetPath])
   const src = assetSrc || pageImageSrc || ''
   if (!src) return null
+  const imageLeft = rect.left - bounds.offsetLeft
+  const imageTop = rect.top - bounds.offsetTop
+  const imageWidth = bounds.width
+  const imageHeight = bounds.height
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', background: 'rgba(255,253,247,0.5)' }}>
       {assetSrc ? (
@@ -1191,10 +1312,10 @@ function FacsimileImageBlock({ assetPath, pageImageSrc, left, top, width, height
           draggable={false}
           style={{
             position: 'absolute',
-            left: `${-(left / Math.max(width, 0.0001)) * 100}%`,
-            top: `${-(top / Math.max(height, 0.0001)) * 100}%`,
-            width: `${10000 / Math.max(width, 0.0001)}%`,
-            height: `${10000 / Math.max(height, 0.0001)}%`,
+            left: `${-(imageLeft / Math.max(rect.width, 1)) * 100}%`,
+            top: `${-(imageTop / Math.max(rect.height, 1)) * 100}%`,
+            width: `${(imageWidth / Math.max(rect.width, 1)) * 100}%`,
+            height: `${(imageHeight / Math.max(rect.height, 1)) * 100}%`,
             pointerEvents: 'none',
             userSelect: 'none',
           }}
@@ -1532,6 +1653,7 @@ export default function GujiFacsimileProofreader({
       block,
       sourceIndex,
       rect,
+      cropBounds: bounds,
       left,
       top,
       width,
@@ -1879,6 +2001,7 @@ export default function GujiFacsimileProofreader({
             const {
               block,
               sourceIndex,
+              rect,
               left,
               top,
               width,
@@ -1896,6 +2019,7 @@ export default function GujiFacsimileProofreader({
               fittedDisplayText,
               normalizedSearchableText,
               padding,
+              cropBounds,
             } = layout
             const shouldUseOverlayTranslation = translationOpen && hasTranslationOverlay
             const hasOverflow = fittedLayout.overflow
@@ -1976,7 +2100,7 @@ export default function GujiFacsimileProofreader({
                     </Space>
                   </div>
                 ) : shouldHideBlockContent ? null : isImage ? (
-                  <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} left={left} top={top} width={width} height={height} />
+                  <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} rect={rect} bounds={cropBounds} />
                 ) : shouldRenderTable ? (
                   <div style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize, lineHeight: 1.18, fontFamily: FONT_FAMILY }}>
                     {renderFacsimileTable(tableRows, searchKeyword, isActive && keywordMatch)}
