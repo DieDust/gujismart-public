@@ -33,12 +33,18 @@ export default defineConfig({
     root: resolve(__dirname, 'src/renderer'),
     plugins: [react()],
     build: {
+      target: 'esnext',
       outDir: 'out/renderer',
       emptyOutDir: true,
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/renderer/index.html')
         }
+      }
+    },
+    optimizeDeps: {
+      esbuildOptions: {
+        target: 'esnext'
       }
     },
     resolve: {

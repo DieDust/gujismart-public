@@ -1,0 +1,159 @@
+{
+  "documents": [
+    {
+      "id": "accuracy_doc_alpha",
+      "title": "检索精确性样本甲",
+      "author": "GujiSmart QA",
+      "docType": "test-fixture",
+      "pages": [
+        {
+          "id": "accuracy_page_alpha_1",
+          "pageNum": 1,
+          "text": "春山有石，石边有泉。石门开处，行人记石。经世致用之学，由此发端。经世致用四字，反复见于札记。"
+        },
+        {
+          "id": "accuracy_page_alpha_2",
+          "pageNum": 2,
+          "text": "校勘札记写道：经世致用不是空言，而是读书与行事互相印证。"
+        }
+      ]
+    },
+    {
+      "id": "accuracy_doc_beta",
+      "title": "检索精确性样本乙",
+      "author": "GujiSmart QA",
+      "docType": "test-fixture",
+      "pages": [
+        {
+          "id": "accuracy_page_beta_1",
+          "pageNum": 1,
+          "text": "水路旁有桥，桥下泊船。桥边人说民生，桥畔又见商旅。经世之论在此转为制度。"
+        },
+        {
+          "id": "accuracy_page_beta_2",
+          "pageNum": 2,
+          "text": "这一段用于短语测试：明月照江城，明月照江城，江城仍在。"
+        }
+      ]
+    },
+    {
+      "id": "accuracy_doc_gamma",
+      "title": "检索精确性样本丙",
+      "author": "GujiSmart QA",
+      "docType": "test-fixture",
+      "pages": [
+        {
+          "id": "accuracy_page_gamma_1",
+          "pageNum": 1,
+          "text": "第一段说明材料来源。\n\n第二段完整测试如下：史料互证需要同时检查版本、年代与传抄线索，只有把目录、正文和注释放在一起，才能减少误读。史料互证需要反复核对。"
+        }
+      ]
+    },
+    {
+      "id": "accuracy_doc_delta",
+      "title": "检索精确性样本丁",
+      "author": "GujiSmart QA",
+      "docType": "test-fixture",
+      "pages": [
+        {
+          "id": "accuracy_page_delta_1",
+          "pageNum": 1,
+          "text": "无关页只用于确认检索不会把没有目标词的文献误算进去。"
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "single-character",
+      "query": "石",
+      "expectedTotalDocuments": 1,
+      "expectedTotalHits": 4,
+      "expectedHitsByDoc": {
+        "accuracy_doc_alpha": 4
+      }
+    },
+    {
+      "name": "single-character-across-documents",
+      "query": "经",
+      "expectedTotalDocuments": 2,
+      "expectedTotalHits": 4,
+      "expectedHitsByDoc": {
+        "accuracy_doc_alpha": 3,
+        "accuracy_doc_beta": 1
+      }
+    },
+    {
+      "name": "single-character-repeated-page",
+      "query": "桥",
+      "expectedTotalDocuments": 1,
+      "expectedTotalHits": 4,
+      "expectedHitsByDoc": {
+        "accuracy_doc_beta": 4
+      }
+    },
+    {
+      "name": "single-character-adjacent-phrases",
+      "query": "城",
+      "expectedTotalDocuments": 1,
+      "expectedTotalHits": 3,
+      "expectedHitsByDoc": {
+        "accuracy_doc_beta": 3
+      }
+    },
+    {
+      "name": "single-character-cross-page-and-paragraph",
+      "query": "证",
+      "expectedTotalDocuments": 2,
+      "expectedTotalHits": 3,
+      "expectedHitsByDoc": {
+        "accuracy_doc_alpha": 1,
+        "accuracy_doc_gamma": 2
+      }
+    },
+    {
+      "name": "single-character-no-false-positive",
+      "query": "寺",
+      "expectedTotalDocuments": 0,
+      "expectedTotalHits": 0,
+      "expectedHitsByDoc": {}
+    },
+    {
+      "name": "two-character",
+      "query": "经世",
+      "expectedTotalDocuments": 2,
+      "expectedTotalHits": 4,
+      "expectedHitsByDoc": {
+        "accuracy_doc_alpha": 3,
+        "accuracy_doc_beta": 1
+      }
+    },
+    {
+      "name": "three-character",
+      "query": "经世致",
+      "expectedTotalDocuments": 1,
+      "expectedTotalHits": 3,
+      "expectedHitsByDoc": {
+        "accuracy_doc_alpha": 3
+      }
+    },
+    {
+      "name": "sentence",
+      "query": "史料互证需要同时检查版本、年代与传抄线索",
+      "expectedTotalDocuments": 1,
+      "expectedTotalHits": 1,
+      "expectedHitsByDoc": {
+        "accuracy_doc_gamma": 1
+      }
+    },
+    {
+      "name": "paragraph",
+      "query": "史料互证需要同时检查版本、年代与传抄线索，只有把目录、正文和注释放在一起，才能减少误读。",
+      "expectedTotalDocuments": 1,
+      "expectedTotalHits": 1,
+      "expectedHitsByDoc": {
+        "accuracy_doc_gamma": 1
+      }
+    }
+  ]
+}
