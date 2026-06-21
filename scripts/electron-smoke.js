@@ -1543,6 +1543,7 @@ async function verifyReaderNormalizesInlineMathMarkers(window, userDataDir) {
 
 async function run() {
   const userDataDir = path.join(os.tmpdir(), 'gujismart-smoke-' + Date.now())
+  const smokeProfileDir = path.join(os.tmpdir(), 'gujismart-smoke-profile-' + Date.now())
   const smokeDbDir = path.join(os.tmpdir(), 'gujismart-smoke-db-' + Date.now())
   const app = await electron.launch({
     args: [
@@ -1554,7 +1555,8 @@ async function run() {
     env: {
       ...process.env,
       GUJISMART_SMOKE: '1',
-      GUJISMART_DATA_DIR: smokeDbDir
+      GUJISMART_DATA_DIR: smokeDbDir,
+      GUJISMART_PROFILE_DIR: smokeProfileDir
     }
   })
 

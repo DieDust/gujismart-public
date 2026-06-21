@@ -85,6 +85,7 @@ interface PendingSearchScrollRestore {
 }
 
 const SEARCH_HISTORY_STORAGE_KEY = 'gujismart.search.history.v1'
+const SEARCH_RETURN_STATE_STORAGE_KEY = 'gujismart.search.return-state.v1'
 const DEFAULT_SEARCH_GROUP_LIMIT = 120
 const SEARCH_PAGE_SIZE = 10
 const SEARCH_DOCUMENT_HIT_PAGE_SIZE = 10
@@ -96,6 +97,14 @@ const SEARCH_HIGHLIGHT_STYLE = {
   padding: '0 3px',
   borderRadius: 2,
   fontWeight: 700,
+}
+
+interface SearchReturnState {
+  searchSignature: string
+  expandedHitDocId: string
+  documentHitPages: Record<string, SearchDocumentHitPageState>
+  scrollTop: number
+  savedAt: string
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -147,6 +156,48 @@ function loadSearchHistory(): SearchHistoryEntry[] {
 
 function saveSearchHistory(entries: SearchHistoryEntry[]) {
   window.localStorage.setItem(SEARCH_HISTORY_STORAGE_KEY, JSON.stringify(entries.slice(0, 30)))
+}
+
+function loadSearchReturnState(): SearchReturnState | null {
+  try {
+    const raw = window.sessionStorage.getItem(SEARCH_RETURN_STATE_STORAGE_KEY)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    if (!isRecord(parsed)) return null
+    const searchSignature = typeof parsed.searchSignature === 'string' ? parsed.searchSignature : ''
+    if (!searchSignature) return null
+    const expandedHitDocId = typeof parsed.expandedHitDocId === 'string' ? parsed.expandedHitDocId : ''
+    const scrollTop = Number(parsed.scrollTop || 0)
+    const documentHitPages = isRecord(parsed.documentHitPages)
+      ? Object.fromEntries(Object.entries(parsed.documentHitPages).map(([docId, value]) => {
+        const state = isRecord(value) ? value : {}
+        const payload = isRecord(state.payload) ? state.payload as unknown as SearchDocumentHitPage : undefined
+        return [docId, {
+          page: Math.max(1, Number(state.page || payload?.page || 1)),
+          loading: false,
+          payload,
+          error: typeof state.error === 'string' ? state.error : undefined,
+        }]
+      }))
+      : {}
+    return {
+      searchSignature,
+      expandedHitDocId,
+      documentHitPages,
+      scrollTop: Number.isFinite(scrollTop) ? Math.max(0, scrollTop) : 0,
+      savedAt: typeof parsed.savedAt === 'string' ? parsed.savedAt : '',
+    }
+  } catch {
+    return null
+  }
+}
+
+function clearSearchReturnState(): void {
+  window.sessionStorage.removeItem(SEARCH_RETURN_STATE_STORAGE_KEY)
+}
+
+function saveSearchReturnState(state: SearchReturnState): void {
+  window.sessionStorage.setItem(SEARCH_RETURN_STATE_STORAGE_KEY, JSON.stringify(state))
 }
 
 function normalizeSnippetInlineToken(value: string): string {
@@ -570,6 +621,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const searchInputRef = useRef<InputRef>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const pendingScrollRestoreRef = useRef<PendingSearchScrollRestore | null>(null)
+  const returnStateRestoredRef = useRef(false)
 
   const filterSignature = useMemo(() => JSON.stringify({ filters: compactFilterOptions(filters), sort: searchSort, contextMode }), [filters, searchSort, contextMode])
   const selectedDocIds = filters.docIds || []
@@ -656,6 +708,27 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     blurActiveSearchControl()
   }
 
+  const persistCurrentSearchReturnState = () => {
+    const searchSignature = executedSearchSignature || buildSearchSignature(keyword || inputValue, filters, searchMode, searchSort, contextMode)
+    if (!searchSignature || (!groupedResponse && results.length === 0)) return
+    const sanitizedDocumentHitPages = Object.fromEntries(Object.entries(documentHitPages).map(([docId, state]) => [
+      docId,
+      {
+        page: state.payload?.page || state.page || 1,
+        loading: false,
+        payload: state.payload,
+        error: state.error,
+      },
+    ]))
+    saveSearchReturnState({
+      searchSignature,
+      expandedHitDocId,
+      documentHitPages: sanitizedDocumentHitPages,
+      scrollTop: scrollContainerRef.current?.scrollTop || 0,
+      savedAt: new Date().toISOString(),
+    })
+  }
+
   useLayoutEffect(() => {
     const pending = pendingScrollRestoreRef.current
     if (loading || pending === null) return
@@ -680,6 +753,25 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       window.requestAnimationFrame(applyRestore)
     })
   }, [documentHitPages, expandedHitDocId, groupedResponse, loading, results])
+
+  useEffect(() => {
+    if (returnStateRestoredRef.current || loading || (!groupedResponse && results.length === 0)) return
+    const savedState = loadSearchReturnState()
+    if (!savedState) {
+      returnStateRestoredRef.current = true
+      return
+    }
+    const activeSignature = executedSearchSignature || buildSearchSignature(keyword || inputValue, filters, searchMode, searchSort, contextMode)
+    if (savedState.searchSignature !== activeSignature) {
+      clearSearchReturnState()
+      returnStateRestoredRef.current = true
+      return
+    }
+    setExpandedHitDocId(savedState.expandedHitDocId)
+    setDocumentHitPages(savedState.documentHitPages)
+    pendingScrollRestoreRef.current = { scrollTop: savedState.scrollTop, anchorDocId: savedState.expandedHitDocId || undefined }
+    returnStateRestoredRef.current = true
+  }, [executedSearchSignature, filters, groupedResponse, inputValue, keyword, loading, results.length, searchMode, searchSort, contextMode])
 
   const updateSearchHistory = (updater: (entries: SearchHistoryEntry[]) => SearchHistoryEntry[]) => {
     setSearchHistory((previous) => {
@@ -833,6 +925,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     setLoading(true)
     setExpandedHitDocId('')
     setDocumentHitPages({})
+    clearSearchReturnState()
     addHistory(activeKeyword)
 
     try {
@@ -924,6 +1017,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     setSearchPage(entry.groupedResponse?.page || 1)
     setExpandedHitDocId('')
     setDocumentHitPages({})
+    clearSearchReturnState()
     replaceFilters(entry.filters)
     setAiSearchState(entry.aiSearchState)
     const restoredGrouped = entry.groupedResponse || (entry.results?.length ? groupFlatResults(entry.results, entry.keyword, entry.aiSearchState?.warnings || []) : null)
@@ -1003,6 +1097,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       setSearchPage(restoredGrouped?.page || 1)
       setExpandedHitDocId('')
       setDocumentHitPages({})
+      clearSearchReturnState()
       setExecutedSearchSignature(buildSearchSignature(restoredKeyword, restoredFilters, restoredMode, restoredSort, restoredContextMode))
       await loadSavedSearches()
       message.success(savedPayload?.cacheHit ? '已从缓存恢复检索结果' : '文献库已变化，已重新检索并刷新缓存')
@@ -1185,6 +1280,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const openGroupedDocument = (group: SearchDocumentGroup, hit?: SearchHit) => {
     const activeHit = hit || group.hits[0]
     const activeKeyword = (keyword || inputValue || activeHit?.locator.queryTerm || '').trim()
+    persistCurrentSearchReturnState()
     onSelectDoc?.({
       docId: group.docId,
       pageIndex: getReliableLocatorPageIndex(activeHit?.locator),
@@ -1842,15 +1938,18 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                 size={'small'}
                 hoverable
                 style={{ marginBottom: 10, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}
-                onClick={() => onSelectDoc?.({
-                  docId: item.doc_id,
-                  pageIndex: getReliableLocatorPageIndex(item.locator),
-                  keyword: activeKeyword,
-                  excerpt: stripSnippetMarkers(String(item.snippet || '')).slice(0, 120),
-                  sourceId: item.hit_field || 'search',
-                  locator: item.locator,
-                  searchSession: buildFocusedSearchSession(activeKeyword, focusedHit),
-                })}
+                onClick={() => {
+                  persistCurrentSearchReturnState()
+                  onSelectDoc?.({
+                    docId: item.doc_id,
+                    pageIndex: getReliableLocatorPageIndex(item.locator),
+                    keyword: activeKeyword,
+                    excerpt: stripSnippetMarkers(String(item.snippet || '')).slice(0, 120),
+                    sourceId: item.hit_field || 'search',
+                    locator: item.locator,
+                    searchSession: buildFocusedSearchSession(activeKeyword, focusedHit),
+                  })
+                }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
                   <div style={{ flex: 1, minWidth: 0 }}>

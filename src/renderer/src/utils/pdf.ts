@@ -79,7 +79,8 @@ function buildPdfLoadParams(source: PdfLoadSource): DocumentInitParameters {
 function toLocalResourceUrl(filePath: unknown): string {
   const normalized = normalizePdfFilePath(filePath).replace(/\\/g, '/')
   const pathname = normalized.startsWith('/') ? normalized : `/${normalized}`
-  return `local-resource://${encodeURI(pathname)}`
+  const encodedPathname = encodeURI(pathname).replace(/#/g, '%23').replace(/\?/g, '%3F')
+  return `local-resource://${encodedPathname}`
 }
 
 function normalizePdfCacheKey(filePath: unknown): string {
@@ -94,10 +95,8 @@ async function getCachedPdfDocument(filePath: unknown): Promise<PDFDocumentProxy
     return cached.promise
   }
 
-  const promise = (async () => {
-    const loadingTask = pdfjsLib.getDocument(buildPdfLoadParams({ url: toLocalResourceUrl(cacheKey) }))
-    return withTimeout(loadingTask.promise, 30000, 'PDF 页面加载超时，请确认文件未损坏后重试。')
-  })()
+  const loadingTask = pdfjsLib.getDocument(buildPdfLoadParams({ url: toLocalResourceUrl(cacheKey) }))
+  const promise = withTimeout(loadingTask.promise, 30000, 'PDF 页面加载超时，请确认文件未损坏后重试。')
 
   pdfDocumentCache.set(cacheKey, { promise, lastUsed: Date.now() })
 

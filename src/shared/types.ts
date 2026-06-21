@@ -31,6 +31,25 @@ export interface DatabaseTableStorageStat {
   estimatedBytes?: number
 }
 
+export type DatabaseStorageLayerKind = 'metadata' | 'document-text' | 'external-payload' | 'search-index' | 'cache' | 'runtime'
+
+export interface DatabaseStorageLayerStat {
+  kind: DatabaseStorageLayerKind
+  label: string
+  rowCount: number
+  estimatedBytes: number
+}
+
+export interface DatabaseExternalPayloadStorageStat {
+  fileCount: number
+  referencedFileCount: number
+  missingReferencedFileCount: number
+  orphanedFileCount: number
+  bytes: number
+  estimatedOrphanedBytes: number
+  estimatedMissingReferencedBytes: number
+}
+
 export interface DatabaseSearchIndexStorageStat {
   ngramRows: number
   singleCharNgramRows: number
@@ -41,12 +60,16 @@ export interface DatabaseSearchIndexStorageStat {
   pagesFtsRows: number
   searchSegmentsFtsRows: number
   searchSegmentsTrigramRows: number
+  enterpriseSearchMigrationRecommended: boolean
 }
 
 export type DatabaseRequiredMaintenanceReason =
   | 'legacy-ngram-index'
   | 'legacy-single-char-ngram'
   | 'legacy-ngram-positions'
+  | 'legacy-cache-version'
+  | 'inline-page-payloads'
+  | 'enterprise-search-index'
 
 export interface DatabaseRequiredMaintenance {
   required: boolean
@@ -54,6 +77,30 @@ export interface DatabaseRequiredMaintenance {
   title: string
   message: string
   actionLabel: string
+}
+
+export type DatabaseMaintenanceStage =
+  | 'idle'
+  | 'diagnose'
+  | 'cleanup-legacy-index'
+  | 'externalize-page-payloads'
+  | 'queue-lightweight-index'
+  | 'compact'
+  | 'verify'
+  | 'completed'
+  | 'failed'
+
+export interface DatabaseMaintenanceState {
+  stage: DatabaseMaintenanceStage
+  canResume: boolean
+  lastStartedAt: string | null
+  lastCompletedAt: string | null
+  lastError: string | null
+  oldIndexRowsRemaining: number
+  legacyIndexPresent: boolean
+  lightweightIndexQueued: boolean
+  compactionRecommended: boolean
+  migrationVersion: string
 }
 
 export interface DatabaseStorageDiagnostics {
@@ -67,10 +114,14 @@ export interface DatabaseStorageDiagnostics {
   freelistBytes: number
   checkedAt: string
   searchIndexVersion: string
+  storageModelVersion: string
   tables: DatabaseTableStorageStat[]
+  storageLayers: DatabaseStorageLayerStat[]
+  externalPayloads: DatabaseExternalPayloadStorageStat
   searchIndex: DatabaseSearchIndexStorageStat
   warnings: string[]
   requiredMaintenance: DatabaseRequiredMaintenance
+  maintenanceState: DatabaseMaintenanceState
 }
 
 export interface DatabaseMaintenanceResult {
@@ -105,6 +156,9 @@ export interface LibraryStateCache {
   folderDocumentCounts: Record<string, number>
   tagDocumentCounts: Record<string, number>
   dirty: boolean
+  version: string
+  source: 'cache' | 'snapshot' | 'recalculated'
+  lastCalibratedAt: string | null
   updatedAt: string | null
 }
 export type AiLayoutMode = 'reading_layout' | (string & {})
@@ -164,6 +218,12 @@ export type OcrSecondPass = 'none' | 'local_segmentation' | 'cloud_column_ocr'
 export type SearchExportFormat = 'txt' | 'markdown' | 'csv' | 'json'
 export type CitationMode = 'auto' | 'simple' | 'template'
 export type ResearchKnowledgeKind = 'quote' | 'summary' | 'comment' | 'idea'
+export type AiResearchFieldType = 'text' | 'number' | 'date' | 'place' | 'person' | 'category' | 'quote' | (string & {})
+export type AiResearchTaskStatus = 'draft' | 'running' | 'completed' | 'error' | (string & {})
+export type AiResearchStepStatus = 'pending' | 'running' | 'completed' | 'error' | (string & {})
+export type AiResearchRecordStatus = 'pending' | 'confirmed' | 'excluded' | (string & {})
+export type AiResearchTaskKind = 'statistical' | 'extraction' | 'synthesis' | 'mixed' | (string & {})
+export type AiResearchRunPhase = 'planning' | 'counting' | 'faceting' | 'narrowing' | 'packing' | 'extracting' | 'reporting' | (string & {})
 export type TypesetAnnotationType = 'body' | 'jiaZhu' | 'cePi' | 'meiPi' | 'jiaoZhu' | 'title' | 'chapter' | 'seal'
 export type TypesetTemplate = '四库全书' | '四库全书彩色' | '红楼梦甲戌本'
 
@@ -575,6 +635,7 @@ export interface DocumentListItem extends Omit<Document, 'ocr_status' | 'proof_s
   text_page_count?: number
   ocr_completed_page_count?: number
   image_page_count?: number
+  pdf_asset_state?: 'available' | 'text_only' | 'unknown' | string
   research_note_count?: number
   search_segment_count?: number
   tag_names?: string
@@ -723,6 +784,9 @@ export interface Page {
   ocr_text: string | null
   ocr_result: string | null
   proofed_text: string | null
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
+  proofed_text_ref?: string | null
   ocr_status: OcrStatus
   proof_status: ProofStatus
   created_at: string
@@ -771,6 +835,7 @@ export interface AiLayoutCacheItem {
   mode: AiLayoutMode
   source_hash: string
   result_text: string
+  result_text_ref?: string | null
   status: 'ready' | 'error' | string
   error_message: string | null
   model: string | null
@@ -788,6 +853,8 @@ export interface PageTranslationCacheItem {
   source_hash: string
   source_text: string
   translation_text: string
+  source_text_ref?: string | null
+  translation_text_ref?: string | null
   skipped: number
   status: PageTranslationCacheStatus
   error_message?: string | null
@@ -1286,6 +1353,8 @@ export interface ResearchProject {
   document_count?: number
   note_count?: number
   output_count?: number
+  outline_count?: number
+  ai_dataset_count?: number
 }
 
 export type ResearchProjectStatus = 'active' | 'archived'
@@ -1345,7 +1414,7 @@ export interface ResearchNote {
   source_available?: number
 }
 
-export type ResearchNoteSourceType = 'manual' | 'search' | 'ai'
+export type ResearchNoteSourceType = 'manual' | 'search' | 'ai' | 'ai_research'
 
 export interface ResearchNotePayload {
   project_id?: string | null
@@ -1385,6 +1454,15 @@ export interface ResearchOutput {
   title: string
   content: string
   created_at: string
+  sourceDatasetId?: string | null
+}
+
+export interface ResearchOutputPayload {
+  project_id: string
+  output_type: AiSynthesisTemplate
+  title: string
+  content: string
+  source_dataset_id?: string | null
 }
 
 export interface ResearchDashboardStats {
@@ -1542,13 +1620,14 @@ export type LibraryAiScope =
   | { type: 'folders'; folderIds: string[] }
   | { type: 'documents'; docIds: string[] }
 
-export type LibraryAiTab = 'qa' | 'analysis'
+export type LibraryAiTab = 'qa' | 'analysis' | 'research'
 
 export interface LibraryAiOpenPayload {
   question?: string
   scope?: LibraryAiScope
   scopeLabel?: string
   initialTab?: LibraryAiTab
+  researchProjectId?: string | null
 }
 
 export interface LibraryAiScopePreview {
@@ -1592,6 +1671,265 @@ export interface AiChatTurn {
   expandedQueries?: string[]
   evidenceClusters?: EvidenceQaCluster[]
   warnings?: string[]
+  researchTaskId?: string
+  datasetId?: string
+}
+
+export interface AiResearchFieldSchema {
+  key: string
+  label: string
+  type: AiResearchFieldType
+  description?: string
+  required?: boolean
+}
+
+export interface AiResearchPlan {
+  title: string
+  goal: string
+  kind?: AiResearchTaskKind
+  fields: AiResearchFieldSchema[]
+  suggestedQueries: string[]
+  notes?: string
+}
+
+export interface AiResearchPlanPayload {
+  goal: string
+  scope: LibraryAiScope
+  projectId?: string | null
+}
+
+export interface AiResearchCreateTaskPayload extends AiResearchPlanPayload {
+  title?: string
+  kind?: AiResearchTaskKind
+  fields: AiResearchFieldSchema[]
+  suggestedQueries?: string[]
+}
+
+export interface AiResearchTask {
+  id: string
+  project_id: string | null
+  title: string
+  goal: string
+  kind: AiResearchTaskKind
+  scope_json: string
+  field_schema_json: string
+  suggested_queries_json: string
+  status: AiResearchTaskStatus
+  error_message: string
+  dataset_id: string | null
+  created_at: string
+  updated_at: string
+  fieldSchema?: AiResearchFieldSchema[]
+  suggestedQueries?: string[]
+  record_count?: number
+}
+
+export interface AiResearchRetrievalPlan {
+  taskId?: string | null
+  projectId?: string | null
+  goal: string
+  scope: LibraryAiScope
+  kind: AiResearchTaskKind
+  queries: string[]
+  coreQueries?: string[]
+  excludeQueries: string[]
+  maxRounds: number
+  queriesPerRound: number
+  highFrequencyHitThreshold: number
+  highFrequencyDocThreshold: number
+  evidenceBudget: number
+  perQueryEvidenceLimit: number
+  perDocumentPageLimit: number
+  perPageSnippetLimit: number
+}
+
+export interface AiResearchFacetBucket {
+  key: string
+  label: string
+  count: number
+}
+
+export interface AiResearchQueryFacets {
+  docTypes: AiResearchFacetBucket[]
+  years: AiResearchFacetBucket[]
+  folders: AiResearchFacetBucket[]
+  tags: AiResearchFacetBucket[]
+  cooccurringTerms: AiResearchFacetBucket[]
+}
+
+export interface AiResearchQueryStat {
+  query: string
+  terms: string[]
+  round: number
+  hitCount: number
+  documentCount: number
+  pageCount: number
+  segmentCount: number
+  highFrequency: boolean
+  facets: AiResearchQueryFacets
+}
+
+export interface AiResearchEvidenceLocalStats {
+  documentCount: number
+  pageCount: number
+  hitCount: number
+  highFrequency: boolean
+  cooccurringTerms: string[]
+}
+
+export interface AiResearchRetrievalRound {
+  round: number
+  queries: string[]
+  generatedQueries: string[]
+  highFrequencyQueries: string[]
+  message: string
+}
+
+export interface AiResearchRetrievalStats {
+  taskId?: string | null
+  runId?: string | null
+  plan: AiResearchRetrievalPlan
+  queryStats: AiResearchQueryStat[]
+  rounds: AiResearchRetrievalRound[]
+  totalHitCount: number
+  totalDocumentCount: number
+  totalPageCount: number
+  readableSegmentCount: number
+  highFrequencyTriggered: boolean
+  cooccurringTerms: AiResearchFacetBucket[]
+  createdAt: string
+}
+
+export interface AiResearchEvidenceItem {
+  id: string
+  query: string
+  doc_id: string
+  doc_title: string
+  doc_type: string
+  page_num: number
+  snippet: string
+  score: number
+  matched_query: string
+  localStats?: AiResearchEvidenceLocalStats
+  locator?: SearchHitLocator
+}
+
+export interface AiResearchEvidencePack {
+  taskId?: string | null
+  runId?: string | null
+  evidence: AiResearchEvidenceItem[]
+  totalEvidenceCount: number
+  truncated: boolean
+  createdAt: string
+  statsSummary: {
+    totalHitCount: number
+    totalDocumentCount: number
+    totalPageCount: number
+  }
+}
+
+export interface AiResearchRetrievalPreviewPayload {
+  goal: string
+  scope: LibraryAiScope
+  projectId?: string | null
+  fields?: AiResearchFieldSchema[]
+  suggestedQueries?: string[]
+  kind?: AiResearchTaskKind
+}
+
+export interface AiResearchRetrievalRunResult {
+  stats: AiResearchRetrievalStats
+  evidencePack: AiResearchEvidencePack
+}
+
+export interface AiResearchRunProgressEvent {
+  taskId: string
+  phase: AiResearchRunPhase
+  round?: number
+  maxRounds?: number
+  currentQuery?: string
+  message: string
+  hitCount?: number
+  documentCount?: number
+  pageCount?: number
+  evidenceCount?: number
+  progress: number
+}
+
+export interface AiResearchTaskStep {
+  id: string
+  task_id: string
+  step_key: string
+  title: string
+  status: AiResearchStepStatus
+  message: string
+  progress: number
+  created_at: string
+  updated_at: string
+}
+
+export interface AiResearchDataset {
+  id: string
+  task_id: string
+  project_id: string | null
+  name: string
+  description: string
+  field_schema_json: string
+  created_at: string
+  updated_at: string
+  fieldSchema?: AiResearchFieldSchema[]
+  record_count?: number
+}
+
+export interface AiResearchRecord {
+  id: string
+  dataset_id: string
+  task_id: string
+  project_id: string | null
+  doc_id: string
+  doc_title?: string
+  page_num: number | null
+  excerpt: string
+  locator_json: string
+  source_hash: string
+  values_json: string
+  confidence: number
+  status: AiResearchRecordStatus
+  note: string
+  created_at: string
+  updated_at: string
+  values?: Record<string, string>
+}
+
+export interface AiResearchRunResult {
+  task: AiResearchTask
+  dataset: AiResearchDataset
+  records: AiResearchRecord[]
+  retrievalStats?: AiResearchRetrievalStats
+  evidencePack?: AiResearchEvidencePack
+}
+
+export interface AiResearchRecordUpdatePayload {
+  values?: Record<string, string>
+  status?: AiResearchRecordStatus
+  note?: string
+}
+
+export interface AiResearchRecordListOptions {
+  limit?: number
+  offset?: number
+}
+
+export interface AiResearchReportPayload {
+  datasetId: string
+  templateType?: AiSynthesisTemplate
+  customPrompt?: string
+}
+
+export interface AiResearchExportResult {
+  format: 'csv' | 'markdown' | 'json'
+  content: string
+  recordCount: number
 }
 
 export interface AiTaskOptions {
@@ -1682,16 +2020,20 @@ export interface SearchGroupedResponse {
   totalHits: number
   groups: SearchDocumentGroup[]
   warnings: string[]
+  status?: SearchQueryStatus
   page?: number
   pageSize?: number
   totalPages?: number
 }
+
+export type SearchQueryStatus = 'preview' | 'candidate' | 'verifying' | 'scanning' | 'complete'
 
 export interface SearchSessionState {
   query: string
   hits: SearchHit[]
   activeHitIndex: number
   status: 'idle' | 'searching' | 'ready' | 'empty' | 'error'
+  phase?: SearchQueryStatus
 }
 
 export interface SearchDocumentHitPage {
@@ -1776,6 +2118,7 @@ export interface SearchOptions {
   contextMode?: 'short' | 'standard' | 'long'
   exhaustive?: boolean
   resultMode?: 'preview' | 'all'
+  autoReindex?: boolean
   format?: SearchExportFormat
   citationMode?: CitationMode
   citationStyleId?: string

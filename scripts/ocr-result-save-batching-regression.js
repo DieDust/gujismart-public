@@ -130,11 +130,12 @@ assert(
 )
 assert(
   ocrIpcSource.includes('function getPageSnapshotsForOcrSave')
-    && ocrIpcSource.includes('SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_result, ocr_status')
+    && ocrIpcSource.includes('SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, ocr_status')
+    && ocrIpcSource.includes('hydratePagePayloadRows(rows)')
     && savePageOcrResultsBody.includes('const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)')
     && savePageOcrResultsBody.includes('pageSnapshots = getPageSnapshotsForOcrSave(guardedPageResults.map((pageResult) => pageResult.pageId))')
     && savePageOcrResultsBody.includes('const existingPage = pageSnapshots.get(pageResult.pageId)'),
-  'savePageOcrResults should prefetch page save snapshots once per save batch.',
+  'savePageOcrResults should prefetch and hydrate page save snapshots once per save batch.',
 )
 assert(
   ocrIpcSource.includes('function guardRepeatedOcrPageResult')

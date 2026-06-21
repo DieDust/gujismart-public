@@ -10,12 +10,14 @@ import {
   BACKGROUND_REINDEX_TIME_SLICE_MS,
   SEARCH_INDEX_SEGMENT_MAX_CHARS,
   SEARCH_INDEX_SEGMENT_OVERLAP_CHARS,
+  SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS,
   SEARCH_INDEX_VERSION,
   SEARCH_NGRAM_INDEX_ENABLED,
   SEARCH_NGRAM_MAX_POSITIONS_STORED,
   SEARCH_TRIGRAM_FTS_ENABLED,
 } from './search-index-constants'
 import { normalizeChineseSearchText } from './text-normalization'
+import { readPagePayloadValue, setPayloadDataDir } from './page-payload-files'
 import type { SearchIndexWorkerProgress, SearchIndexWorkerTask } from './search-index-worker-client'
 import type { SearchReindexDocumentResult } from '../shared/types'
 
@@ -75,6 +77,9 @@ interface SearchPageRow {
   proofed_text?: string | null
   ocr_text?: string | null
   ocr_result?: unknown
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
+  proofed_text_ref?: string | null
   has_ocr_result?: number | null
   text?: string | null
   doc_type?: string | null
@@ -130,10 +135,13 @@ const INDEXABLE_PAGE_BASE_SELECT = `
     p.doc_id,
     p.page_num,
     p.proofed_text,
+    p.proofed_text_ref,
     p.ocr_text,
+    p.ocr_text_ref,
     COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '') as text,
     NULL as ocr_result,
-    CASE WHEN p.ocr_result IS NOT NULL AND p.ocr_result <> '' THEN 1 ELSE 0 END as has_ocr_result,
+    p.ocr_result_ref,
+    CASE WHEN (p.ocr_result IS NOT NULL AND p.ocr_result <> '') OR COALESCE(p.ocr_result_ref, '') <> '' THEN 1 ELSE 0 END as has_ocr_result,
     d.doc_type,
     d.title,
     d.file_path
@@ -207,7 +215,24 @@ function transaction(sqlite: NativeDatabase, fn: () => void): void {
   }
 }
 
-function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAvailable: boolean; trigramFtsAvailable: boolean } {
+function getTableCreateSql(sqlite: NativeDatabase, tableName: string): string {
+  try {
+    const row = sqlite.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName) as { sql?: string } | undefined
+    return String(row?.sql || '')
+  } catch {
+    return ''
+  }
+}
+
+function dropFtsTableIfNotExternalContent(sqlite: NativeDatabase, tableName: string): boolean {
+  const createSql = getTableCreateSql(sqlite, tableName).toLowerCase()
+  if (!createSql) return false
+  if (createSql.includes("content='search_index_segments'") || createSql.includes('content="search_index_segments"')) return false
+  sqlite.exec(`DROP TABLE IF EXISTS ${tableName}`)
+  return true
+}
+
+function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAvailable: boolean; trigramFtsAvailable: boolean; recreatedSearchSegmentsFts: boolean } {
   const sqlite = new Database(dbFilePath)
   sqlite.pragma('foreign_keys = ON')
   sqlite.pragma('journal_mode = WAL')
@@ -215,15 +240,15 @@ function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAv
   sqlite.pragma(`busy_timeout = ${WORKER_DATABASE_BUSY_TIMEOUT_MS}`)
   let ftsAvailable = false
   let trigramFtsAvailable = false
+  let recreatedSearchSegmentsFts = false
   try {
+    recreatedSearchSegmentsFts = dropFtsTableIfNotExternalContent(sqlite, 'search_segments_fts') || recreatedSearchSegmentsFts
     sqlite.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_fts USING fts5(
-        segment_id UNINDEXED,
-        doc_id UNINDEXED,
-        page_id UNINDEXED,
-        page_num UNINDEXED,
         title,
-        normalized_text
+        normalized_text,
+        content='search_index_segments',
+        content_rowid='rowid'
       );
     `)
     ftsAvailable = true
@@ -232,19 +257,28 @@ function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAv
   }
   if (ftsAvailable && SEARCH_TRIGRAM_FTS_ENABLED) {
     try {
+      recreatedSearchSegmentsFts = dropFtsTableIfNotExternalContent(sqlite, 'search_segments_trigram') || recreatedSearchSegmentsFts
       sqlite.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_trigram USING fts5(
-          segment_id UNINDEXED,
-          doc_id UNINDEXED,
-          page_id UNINDEXED,
-          page_num UNINDEXED,
           normalized_text,
+          content='search_index_segments',
+          content_rowid='rowid',
           tokenize='trigram'
         );
       `)
       trigramFtsAvailable = true
     } catch {
       trigramFtsAvailable = false
+    }
+  }
+  if (recreatedSearchSegmentsFts) {
+    try {
+      runOn(sqlite, "INSERT INTO search_segments_fts(search_segments_fts) VALUES('rebuild')")
+      if (trigramFtsAvailable) {
+        runOn(sqlite, "INSERT INTO search_segments_trigram(search_segments_trigram) VALUES('rebuild')")
+      }
+    } catch {
+      // A worker can still rebuild the current document below; startup maintenance handles full rebuilds.
     }
   }
   sqlite.exec(`
@@ -280,7 +314,7 @@ function openWorkerDatabase(dbFilePath: string): { sqlite: NativeDatabase; ftsAv
     CREATE INDEX IF NOT EXISTS idx_search_segments_staging_doc ON search_index_segments_staging(job_id, doc_id);
     CREATE INDEX IF NOT EXISTS idx_search_ngram_staging_doc ON search_ngram_index_staging(job_id, doc_id);
   `)
-  return { sqlite, ftsAvailable, trigramFtsAvailable }
+  return { sqlite, ftsAvailable, trigramFtsAvailable, recreatedSearchSegmentsFts }
 }
 
 function createSearchIndexStagingJobId(docId: string): string {
@@ -417,17 +451,19 @@ function getOrderedOcrBlocksFromPayload(parsed: OcrResultPayload | null): OcrBlo
 }
 
 function pageHasLazyOcrResult(page: SearchPageRow): boolean {
-  return !!page?.ocr_result || Number(page?.has_ocr_result || 0) > 0
+  return !!page?.ocr_result || !!page?.ocr_result_ref || Number(page?.has_ocr_result || 0) > 0
 }
 
 function loadPageOcrResultForSearch(sqlite: NativeDatabase, page: SearchPageRow): SearchPageRow {
   if (page.ocr_result || !page.id || !pageHasLazyOcrResult(page)) return page
-  const row = queryOne<{ ocr_result?: string | null }>(
+  const row = queryOne<{ ocr_result?: string | null; ocr_result_ref?: string | null }>(
     sqlite,
-    'SELECT ocr_result FROM pages WHERE id = ?',
+    'SELECT ocr_result, ocr_result_ref FROM pages WHERE id = ?',
     [page.id],
   )
-  return row?.ocr_result ? { ...page, ocr_result: row.ocr_result } : page
+  if (!row) return page
+  const external = readPagePayloadValue(row.ocr_result_ref)
+  return external || row.ocr_result ? { ...page, ...row, ocr_result: external || row.ocr_result } : page
 }
 
 function isManagedTextSearchPage(page: SearchPageRow): boolean {
@@ -437,7 +473,7 @@ function isManagedTextSearchPage(page: SearchPageRow): boolean {
 
 function shouldConsiderOcrBlocksForSearch(page: SearchPageRow): boolean {
   if (!pageHasLazyOcrResult(page)) return false
-  if (!String(page?.proofed_text || page?.ocr_text || '').trim()) return true
+  if (!String(getHydratedPageTextField(page, 'proofed_text') || getHydratedPageTextField(page, 'ocr_text') || '').trim()) return true
   if (isManagedTextSearchPage(page)) return true
   const docText = `${page?.doc_type || ''} ${page?.title || ''}`
   return /报纸|newspaper|古籍|地方志|hybrid|vision_model_ocr|ocr_layout/i.test(docText)
@@ -448,16 +484,24 @@ function shouldPreferOcrBlocksForSearch(page: SearchPageRow, blocks: OcrBlock[],
   const sourceType = String(parsed?.source_type || '')
   const docText = `${page?.doc_type || ''} ${page?.title || ''} ${sourceType}`
   if (/报纸|newspaper|古籍|地方志|hybrid|vision_model_ocr|ocr_layout/i.test(docText)) return true
-  const ocrText = String(page?.ocr_text || '').trim()
+  const ocrText = String(getHydratedPageTextField(page, 'ocr_text') || '').trim()
   const blockText = blocks.map(getBlockText).filter(Boolean).join('')
   return blockText.length >= 80 && ocrText.length > blockText.length * 0.7
 }
 
+function getHydratedPageTextField(page: SearchPageRow, field: 'proofed_text' | 'ocr_text'): string {
+  const inline = String(page?.[field] || '')
+  if (inline.trim()) return inline
+  const ref = String(page?.[`${field}_ref`] || '')
+  if (!ref) return ''
+  return readPagePayloadValue(ref) || ''
+}
+
 function getIndexablePageText(sqlite: NativeDatabase, page: SearchPageRow): string {
-  const proofed = String(page?.proofed_text || '').trim()
+  const proofed = String(getHydratedPageTextField(page, 'proofed_text') || '').trim()
   if (proofed) return proofed
 
-  const ocrText = String(page?.ocr_text || '').trim()
+  const ocrText = String(getHydratedPageTextField(page, 'ocr_text') || '').trim()
   const shouldLoadBlocks = shouldConsiderOcrBlocksForSearch(page) && (!!page.ocr_result || !ocrText)
   const pageWithOcrResult = shouldLoadBlocks ? loadPageOcrResultForSearch(sqlite, page) : page
   const parsed = shouldLoadBlocks ? parseMaybeJson<OcrResultPayload>(pageWithOcrResult?.ocr_result) : null
@@ -553,7 +597,9 @@ function getIndexablePagesWhereClause(): string {
     AND ${activeDocumentCondition('d')}
     AND (
       TRIM(COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '')) <> ''
+      OR COALESCE(p.proofed_text_ref, p.ocr_text_ref, '') <> ''
       OR (${INDEXABLE_PAGE_OCR_RESULT_CONDITION} AND p.ocr_result IS NOT NULL AND p.ocr_result <> '')
+      OR (${INDEXABLE_PAGE_OCR_RESULT_CONDITION} AND COALESCE(p.ocr_result_ref, '') <> '')
     )`
 }
 
@@ -757,13 +803,28 @@ function commitStagedSearchIndexForDocument(
   now: string,
   ftsAvailable: boolean,
   trigramFtsAvailable: boolean,
+  skipFtsDelete = false,
 ): void {
   transaction(sqlite, () => {
-    if (ftsAvailable) {
-      runOn(sqlite, 'DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
+    if (ftsAvailable && !skipFtsDelete) {
+      runOn(
+        sqlite,
+        `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+         SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
     }
-    if (trigramFtsAvailable) {
-      runOn(sqlite, 'DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
+    if (trigramFtsAvailable && !skipFtsDelete) {
+      runOn(
+        sqlite,
+        `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+         SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
     }
     runOn(sqlite, 'DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
     runOn(sqlite, 'DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
@@ -772,7 +833,16 @@ function commitStagedSearchIndexForDocument(
       `INSERT INTO search_index_segments (
         segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
       )
-       SELECT segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
+       SELECT segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start,
+              CASE
+                WHEN length(COALESCE(text, '')) > ${SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS}
+                THEN substr(text, 1, ${SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS})
+                ELSE text
+              END,
+              normalized_text,
+              '',
+              text_hash,
+              updated_at
        FROM search_index_segments_staging
        WHERE job_id = ?
        ORDER BY ordinal ASC`,
@@ -789,8 +859,8 @@ function commitStagedSearchIndexForDocument(
     if (ftsAvailable) {
       runOn(
         sqlite,
-        `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
-         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+        `INSERT INTO search_segments_fts (rowid, title, normalized_text)
+         SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
          FROM search_index_segments
          WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
         [docId],
@@ -799,8 +869,8 @@ function commitStagedSearchIndexForDocument(
     if (trigramFtsAvailable) {
       runOn(
         sqlite,
-        `INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
-         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+        `INSERT INTO search_segments_trigram (rowid, normalized_text)
+         SELECT rowid, COALESCE(normalized_text, text, '')
          FROM search_index_segments
          WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
         [docId],
@@ -825,7 +895,10 @@ function commitStagedSearchIndexForDocument(
 }
 
 async function reindexDocument(task: SearchIndexWorkerTask): Promise<SearchReindexDocumentResult> {
-  const { sqlite, ftsAvailable, trigramFtsAvailable } = openWorkerDatabase(task.dbFilePath)
+  if (task.dataDir) {
+    setPayloadDataDir(task.dataDir)
+  }
+  const { sqlite, ftsAvailable, trigramFtsAvailable, recreatedSearchSegmentsFts } = openWorkerDatabase(task.dbFilePath)
   const { docId, totalCount, completedCount } = task
   let stagingJobId = ''
   try {
@@ -882,7 +955,7 @@ async function reindexDocument(task: SearchIndexWorkerTask): Promise<SearchReind
 
     const readyAt = new Date().toISOString()
     const sourceHash = versionedSourceHash(segmentHashes)
-    commitStagedSearchIndexForDocument(sqlite, stagingJobId, docId, sourceHash, segmentCount, readyAt, ftsAvailable, trigramFtsAvailable)
+    commitStagedSearchIndexForDocument(sqlite, stagingJobId, docId, sourceHash, segmentCount, readyAt, ftsAvailable, trigramFtsAvailable, recreatedSearchSegmentsFts)
     return { docId, status: 'ready', segmentCount }
   } catch (error: unknown) {
     const errorMessage = getErrorMessage(error)

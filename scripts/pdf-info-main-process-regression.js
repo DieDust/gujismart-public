@@ -40,6 +40,18 @@ assert(
   'renderer should build local-resource URLs for file-path PDF rendering',
 )
 assert(
+  rendererPdfSource.includes("encodeURI(pathname).replace(/#/g, '%23').replace(/\\?/g, '%3F')"),
+  'renderer local-resource URLs should encode fragment/query separators without encoding Windows drive colons',
+)
+assert(
+  !rendererPdfSource.includes('local-resource://${encodeURI(pathname)}'),
+  'renderer local-resource URLs should not use encodeURI for whole paths',
+)
+assert(
+  !rendererPdfSource.includes('encodeURIComponent(part)'),
+  'renderer local-resource URLs should not encode Windows drive colons in path segments',
+)
+assert(
   getCachedPdfDocumentBody.includes('url: toLocalResourceUrl(cacheKey)'),
   'renderer cached PDF previews should load file paths through local-resource URLs',
 )

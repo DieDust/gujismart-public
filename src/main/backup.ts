@@ -1,6 +1,7 @@
 import { dialog, shell } from 'electron'
-import { isAbsolute, join, relative, resolve } from 'path'
+import { isAbsolute, join, normalize, relative, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
+import Database from 'better-sqlite3'
 import { closeDatabase, getDataDir, queryAll, run, saveDatabase } from './database'
 import type { BackupImportResult, BackupResult, BackupSlot, BackupStatus, CompactAutoBackupResult } from '../shared/types'
 
@@ -84,9 +85,79 @@ function getBackupStorageDir(backupDir: string): string {
   return join(backupDir, 'storage')
 }
 
+function getStoragePagePayloadsDir(storageDir: string): string {
+  return join(storageDir, 'page-payloads')
+}
+
 function hasBackupDatabase(backupDir: string): boolean {
   const dbDir = getBackupDbDir(backupDir)
   return existsSync(join(dbDir, 'gujismart.db')) || existsSync(join(dbDir, 'gujismart.json'))
+}
+
+function collectBackupExternalPayloadRefs(backupDir: string): Set<string> {
+  const dbPath = join(getBackupDbDir(backupDir), 'gujismart.db')
+  const refs = new Set<string>()
+  if (!existsSync(dbPath)) return refs
+  let sqlite: Database.Database | null = null
+  try {
+    sqlite = new Database(dbPath, { readonly: true, fileMustExist: true })
+    const tables = sqlite.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name?: string }>
+    const tableNames = new Set(tables.map((table) => String(table.name || '')))
+    const checks: Array<{ table: string; columns: string[] }> = [
+      { table: 'pages', columns: ['ocr_text_ref', 'ocr_result_ref', 'proofed_text_ref'] },
+      { table: 'page_ocr_versions', columns: ['ocr_text_ref', 'ocr_result_ref'] },
+      { table: 'page_ai_layout_cache', columns: ['result_text_ref'] },
+      { table: 'page_translation_cache', columns: ['source_text_ref', 'translation_text_ref'] },
+    ]
+    for (const check of checks) {
+      if (!tableNames.has(check.table)) continue
+      const columns = sqlite.prepare(`PRAGMA table_info(${check.table})`).all() as Array<{ name?: string }>
+      const columnNames = new Set(columns.map((column) => String(column.name || '')))
+      const existingColumns = check.columns.filter((column) => columnNames.has(column))
+      if (existingColumns.length === 0) continue
+      const predicate = existingColumns.map((column) => `COALESCE(${column}, '') <> ''`).join(' OR ')
+      const rows = sqlite.prepare(`SELECT ${existingColumns.join(', ')} FROM ${check.table} WHERE ${predicate}`).all() as Array<Record<string, unknown>>
+      for (const row of rows) {
+        for (const column of existingColumns) {
+          const ref = typeof row[column] === 'string' ? String(row[column]) : ''
+          if (ref.startsWith('page-payload:')) refs.add(ref)
+        }
+      }
+    }
+    return refs
+  } finally {
+    sqlite?.close()
+  }
+}
+
+function backupSqliteHasExternalPayloadRefs(backupDir: string): boolean {
+  return collectBackupExternalPayloadRefs(backupDir).size > 0
+}
+
+function resolveBackupPayloadRefPath(payloadRoot: string, ref: string): string | null {
+  const relativePath = ref.replace(/^page-payload:v\d+:/, '')
+  if (!relativePath || relativePath === ref || relativePath.includes('..')) return null
+  const root = normalize(payloadRoot)
+  const target = normalize(join(root, ...relativePath.split('/')))
+  if (!target.toLowerCase().startsWith(root.toLowerCase())) return null
+  return target
+}
+
+function validateBackupPayloadCompleteness(backupDir: string): void {
+  const refs = collectBackupExternalPayloadRefs(backupDir)
+  if (refs.size === 0) return
+  const payloadRoot = getStoragePagePayloadsDir(getBackupStorageDir(backupDir))
+  if (!existsSync(payloadRoot)) {
+    throw new Error('备份不完整：数据库引用了外置 OCR 大字段，但备份目录缺少 storage/page-payloads。请导入完整备份，否则版式还原、OCR 结果、检索和导出可能缺失。')
+  }
+  let missing = 0
+  for (const ref of refs) {
+    const payloadPath = resolveBackupPayloadRefPath(payloadRoot, ref)
+    if (!payloadPath || !existsSync(payloadPath)) missing += 1
+  }
+  if (missing > 0) {
+    throw new Error(`备份不完整：数据库引用了 ${refs.size.toLocaleString()} 个外置 OCR 大字段，其中 ${missing.toLocaleString()} 个文件缺失。请导入完整备份，否则版式还原、OCR 结果、检索和导出可能缺失。`)
+  }
 }
 
 function validateBackupDirectory(backupDir: string): void {
@@ -103,6 +174,7 @@ function validateBackupDirectory(backupDir: string): void {
   if (!hasBackupDatabase(backupDir)) {
     throw new Error('这不是有效的备份目录：未找到 db/gujismart.db 或 db/gujismart.json')
   }
+  validateBackupPayloadCompleteness(backupDir)
 }
 
 function replaceManagedDirectory(dataDir: string, directoryName: 'db' | 'storage', sourceDir: string): void {
@@ -143,7 +215,23 @@ function getAutoBackupSlotCount(): number {
 }
 
 function getAutoBackupIncludeStorage(): boolean {
-  return readSetting('auto_backup_include_storage', 'false') === 'true'
+  return readSetting('auto_backup_include_storage', 'true') !== 'false'
+}
+
+function copyStorageForBackup(dataDir: string, backupDir: string, includeFullStorage: boolean): void {
+  const sourceStorageDir = join(dataDir, 'storage')
+  if (!existsSync(sourceStorageDir)) return
+
+  const targetStorageDir = join(backupDir, 'storage')
+  if (includeFullStorage) {
+    copyDirRecursive(sourceStorageDir, targetStorageDir)
+    return
+  }
+
+  const sourcePayloadDir = getStoragePagePayloadsDir(sourceStorageDir)
+  if (existsSync(sourcePayloadDir)) {
+    copyDirRecursive(sourcePayloadDir, getStoragePagePayloadsDir(targetStorageDir))
+  }
 }
 
 function cleanupExtraAutoBackupSlots(slotCount = AUTO_BACKUP_SLOT_COUNT): void {
@@ -168,6 +256,7 @@ function writeManifest(backupDir: string, type: 'manual' | 'auto', slot?: number
     type,
     slot: slot ?? null,
     includesStorage,
+    includesPagePayloads: existsSync(getStoragePagePayloadsDir(getBackupStorageDir(backupDir))),
     timestamp: new Date().toISOString(),
   }
   writeFileSync(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
@@ -188,10 +277,7 @@ function copyCurrentDataTo(backupDir: string, type: 'manual' | 'auto', slot?: nu
     copyDirRecursive(dbDir, join(backupDir, 'db'))
   }
 
-  const storageDir = join(dataDir, 'storage')
-  if (includeStorage && existsSync(storageDir)) {
-    copyDirRecursive(storageDir, join(backupDir, 'storage'))
-  }
+  copyStorageForBackup(dataDir, backupDir, includeStorage)
 
   writeManifest(backupDir, type, slot, includeStorage)
   return backupDir
@@ -233,9 +319,7 @@ export async function importBackupData(): Promise<BackupImportResult> {
 
     closeDatabase()
     replaceManagedDirectory(dataDir, 'db', getBackupDbDir(backupDir))
-    if (existsSync(getBackupStorageDir(backupDir))) {
-      replaceManagedDirectory(dataDir, 'storage', getBackupStorageDir(backupDir))
-    }
+    replaceManagedDirectory(dataDir, 'storage', getBackupStorageDir(backupDir))
 
     return {
       success: true,
@@ -335,7 +419,7 @@ export function getBackupStatus(): BackupStatus {
 export function configureAutoBackup(
   enabled: boolean,
   intervalHours: number,
-  includeStorage = getAutoBackupIncludeStorage(),
+  includeStorage = true,
   slotCount = getAutoBackupSlotCount(),
 ): BackupStatus {
   const normalizedSlotCount = normalizeAutoBackupSlotCount(slotCount)
@@ -363,7 +447,7 @@ export async function compactAutoBackups(): Promise<CompactAutoBackupResult> {
       rmSync(root, { recursive: true, force: true })
     }
     mkdirSync(root, { recursive: true })
-    writeSetting('auto_backup_include_storage', 'false')
+    writeSetting('auto_backup_include_storage', 'true')
     writeSetting('auto_backup_next_slot', '1')
     saveDatabase()
     const backup = await runAutoBackupNow()

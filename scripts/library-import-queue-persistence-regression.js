@@ -40,6 +40,12 @@ const handleBatchOcrBody = sliceBetween(
   'const confirmBatchForceRerunOcr =',
   'Manual batch OCR handler',
 )
+const confirmBatchForceRerunOcrBody = sliceBetween(
+  librarySource,
+  'const confirmBatchForceRerunOcr =',
+  'const handleBatchMetadataExtract =',
+  'Batch force OCR rerun handler',
+)
 const handleRetryDocumentBody = sliceBetween(
   librarySource,
   'const handleRetryDocument = async',
@@ -218,6 +224,11 @@ assert(
   handleForceRerunDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], engine, `rerun-ocr-${doc.id}`, { forceFullRerun: true })')
     && !handleForceRerunDocumentBody.includes("message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: `rerun-ocr-${doc.id}`, duration: 5 })\n          }\n          await loadDocuments(filter, { silent: true })"),
   'Single document full OCR rerun success path should not await an extra list reload after runOcrInConfiguredBatches.',
+)
+assert(
+  !handleForceRerunDocumentBody.includes('Modal.confirm(')
+    && !confirmBatchForceRerunOcrBody.includes('Modal.confirm('),
+  'Full OCR rerun should not block the library with a modal confirmation.',
 )
 assert(
   handleRetryFailedDocumentsBody.includes("const successCount = await runOcrInConfiguredBatches(failedDocs.map((doc) => doc.id), 'paddle', 'retry-failed')")

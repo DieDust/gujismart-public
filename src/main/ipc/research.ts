@@ -16,6 +16,7 @@ import type {
   ResearchOutlinePayload,
   ResearchOutlineUpdatePayload,
   ResearchOutput,
+  ResearchOutputPayload,
   ResearchProject,
   ResearchProjectExportOptions,
   ResearchProjectExportResult,
@@ -521,7 +522,9 @@ export function registerResearchIpc(): void {
       `SELECT rp.*,
         (SELECT COUNT(*) FROM research_project_documents rpd WHERE rpd.project_id = rp.id) as document_count,
         (SELECT COUNT(*) FROM research_notes rn WHERE rn.project_id = rp.id) as note_count,
-        (SELECT COUNT(*) FROM research_outputs ro WHERE ro.project_id = rp.id) as output_count
+        (SELECT COUNT(*) FROM research_outputs ro WHERE ro.project_id = rp.id) as output_count,
+        (SELECT COUNT(*) FROM research_outline_items roi WHERE roi.project_id = rp.id) as outline_count,
+        (SELECT COUNT(*) FROM ai_research_datasets ard WHERE ard.project_id = rp.id) as ai_dataset_count
        FROM research_projects rp
        ORDER BY rp.updated_at DESC`,
     )
@@ -845,8 +848,47 @@ export function registerResearchIpc(): void {
     )
   })
 
+  ipcMain.handle('research:createOutput', async (_event, payload: ResearchOutputPayload): Promise<ResearchOutput> => {
+    const projectId = String(payload.project_id || '').trim()
+    const title = String(payload.title || '').trim()
+    const content = String(payload.content || '').trim()
+    if (!projectId) throw new Error('请选择要保存到的研究专题')
+    if (!title) throw new Error('请输入 AI 产出标题')
+    if (!content) throw new Error('AI 产出内容为空，无法保存')
+    const project = queryOne<ProjectRow>('SELECT * FROM research_projects WHERE id = ?', [projectId])
+    if (!project) throw new Error('研究专题不存在')
+    const id = nanoid()
+    run(
+      'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, projectId, payload.output_type, title, content, payload.source_dataset_id || null, new Date().toISOString()],
+    )
+    saveDatabase()
+    return requireQueryResult(
+      queryOne<ResearchOutput>('SELECT * FROM research_outputs WHERE id = ?', [id]),
+      'Created research output was not found',
+    )
+  })
+
   ipcMain.handle('research:listOutputs', async (_event, projectId: string): Promise<ResearchOutput[]> => {
-    return queryAll<ResearchOutput>('SELECT * FROM research_outputs WHERE project_id = ? ORDER BY created_at DESC', [projectId])
+    return queryAll<ResearchOutput>(
+      `SELECT
+        id,
+        project_id,
+        output_type,
+        title,
+        substr(content, 1, 900) as content,
+        created_at,
+        source_dataset_id
+       FROM research_outputs
+       WHERE project_id = ?
+       ORDER BY created_at DESC`,
+      [projectId],
+    )
+  })
+
+  ipcMain.handle('research:getOutputContent', async (_event, outputId: string): Promise<string> => {
+    const row = queryOne<{ content: string }>('SELECT content FROM research_outputs WHERE id = ?', [outputId])
+    return row?.content || ''
   })
 
   ipcMain.handle('research:exportReferences', async (

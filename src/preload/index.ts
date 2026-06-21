@@ -10,6 +10,22 @@ import type {
   AiQuestionResponse,
   AiResult,
   AiPlannedSearchResponse,
+  AiResearchCreateTaskPayload,
+  AiResearchDataset,
+  AiResearchExportResult,
+  AiResearchPlan,
+  AiResearchPlanPayload,
+  AiResearchRecord,
+  AiResearchRecordListOptions,
+  AiResearchRecordUpdatePayload,
+  AiResearchReportPayload,
+  AiResearchRetrievalPreviewPayload,
+  AiResearchRetrievalRunResult,
+  AiResearchRetrievalStats,
+  AiResearchEvidencePack,
+  AiResearchRunResult,
+  AiResearchTask,
+  AiResearchTaskStep,
   AiStreamStartResult,
   AiStreamEvent,
   AiSummaryPayload,
@@ -115,6 +131,7 @@ import type {
   ResearchOutlinePayload,
   ResearchOutlineUpdatePayload,
   ResearchOutput,
+  ResearchOutputPayload,
   ResearchProject,
   ResearchReferenceExportFormat,
   ResearchProjectExportOptions,
@@ -345,6 +362,38 @@ const api = {
     ipcRenderer.invoke('ai:chatSessions:getTurnsPage', sessionId, beforeCreatedAt, limit),
   deleteAiChatSession: (sessionId: string): Promise<boolean> =>
     ipcRenderer.invoke('ai:chatSessions:delete', sessionId),
+  planAiResearchTask: (payload: AiResearchPlanPayload): Promise<AiResearchPlan> =>
+    ipcRenderer.invoke('aiResearch:planTask', payload),
+  createAiResearchTask: (payload: AiResearchCreateTaskPayload): Promise<AiResearchTask> =>
+    ipcRenderer.invoke('aiResearch:createTask', payload),
+  runAiResearchTask: (taskId: string): Promise<AiResearchRunResult> =>
+    ipcRenderer.invoke('aiResearch:runTask', taskId),
+  previewAiResearchRetrieval: (payload: AiResearchRetrievalPreviewPayload): Promise<AiResearchRetrievalStats> =>
+    ipcRenderer.invoke('aiResearch:previewRetrieval', payload),
+  runAiResearchRetrieval: (taskId: string): Promise<AiResearchRetrievalRunResult> =>
+    ipcRenderer.invoke('aiResearch:runRetrieval', taskId),
+  getAiResearchRetrievalStats: (taskId: string): Promise<AiResearchRetrievalStats | null> =>
+    ipcRenderer.invoke('aiResearch:getRetrievalStats', taskId),
+  getAiResearchEvidencePack: (taskId: string): Promise<AiResearchEvidencePack | null> =>
+    ipcRenderer.invoke('aiResearch:getEvidencePack', taskId),
+  listAiResearchTasks: (projectId?: string | null): Promise<AiResearchTask[]> =>
+    ipcRenderer.invoke('aiResearch:listTasks', projectId),
+  getAiResearchTask: (taskId: string): Promise<AiResearchTask> =>
+    ipcRenderer.invoke('aiResearch:getTask', taskId),
+  listAiResearchTaskSteps: (taskId: string): Promise<AiResearchTaskStep[]> =>
+    ipcRenderer.invoke('aiResearch:listTaskSteps', taskId),
+  listAiResearchDatasets: (projectId?: string | null): Promise<AiResearchDataset[]> =>
+    ipcRenderer.invoke('aiResearch:listDatasets', projectId),
+  listAiResearchRecords: (datasetId: string, options?: AiResearchRecordListOptions): Promise<AiResearchRecord[]> =>
+    ipcRenderer.invoke('aiResearch:listRecords', datasetId, options),
+  updateAiResearchRecord: (recordId: string, payload: AiResearchRecordUpdatePayload): Promise<AiResearchRecord> =>
+    ipcRenderer.invoke('aiResearch:updateRecord', recordId, payload),
+  excludeAiResearchRecord: (recordId: string): Promise<AiResearchRecord> =>
+    ipcRenderer.invoke('aiResearch:excludeRecord', recordId),
+  generateAiResearchReport: (payload: AiResearchReportPayload): Promise<{ content: string; outputId: string | null }> =>
+    ipcRenderer.invoke('aiResearch:generateReport', payload),
+  exportAiResearchDataset: (datasetId: string, format?: 'csv' | 'markdown' | 'json'): Promise<AiResearchExportResult> =>
+    ipcRenderer.invoke('aiResearch:exportDataset', datasetId, format),
 
   listFolders: (): Promise<Folder[]> => ipcRenderer.invoke('folders:list'),
   getFolder: (id: string): Promise<Folder | null> => ipcRenderer.invoke('folders:get', id),
@@ -507,8 +556,12 @@ const api = {
   deleteResearchNote: (id: string): Promise<boolean> => ipcRenderer.invoke('research:deleteNote', id),
   synthesizeResearchProject: (projectId: string, templateType: AiSynthesisTemplate, customPrompt?: string, citationStyleId?: string): Promise<ResearchOutput> =>
     ipcRenderer.invoke('research:synthesizeProject', projectId, templateType, customPrompt, citationStyleId),
+  createResearchOutput: (payload: ResearchOutputPayload): Promise<ResearchOutput> =>
+    ipcRenderer.invoke('research:createOutput', payload),
   listResearchOutputs: (projectId: string): Promise<ResearchOutput[]> =>
     ipcRenderer.invoke('research:listOutputs', projectId),
+  getResearchOutputContent: (outputId: string): Promise<string> =>
+    ipcRenderer.invoke('research:getOutputContent', outputId),
   exportResearchReferences: (projectId: string, format: ResearchReferenceExportFormat, citationStyleId?: string): Promise<string> =>
     ipcRenderer.invoke('research:exportReferences', projectId, format, citationStyleId),
   exportResearchProject: (projectId: string, options: ResearchProjectExportOptions): Promise<ResearchProjectExportResult> =>
@@ -589,6 +642,10 @@ const api = {
     ipcRenderer.invoke('database:clearLegacySearchIndex'),
   optimizeLegacyDatabase: (): Promise<DatabaseMaintenanceResult> =>
     ipcRenderer.invoke('database:optimizeLegacyDatabase'),
+  externalizePagePayloads: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:externalizePagePayloads'),
+  cleanupExternalPayloads: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:cleanupExternalPayloads'),
 
   getVersion: (): Promise<string> =>
     ipcRenderer.invoke('app:getVersion'),

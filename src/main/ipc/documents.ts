@@ -1,6 +1,7 @@
 ﻿import { ipcMain, dialog } from 'electron'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
+import { nativeImage } from 'electron'
 import { nanoid } from 'nanoid'
 import { basename, dirname, extname, join } from 'path'
 import { posix as posixPath } from 'path'
@@ -22,6 +23,7 @@ import {
   addPdfRepositoryPath,
   annotateDocumentFileFingerprint,
   annotatePdfMetadata,
+  autoCleanupPdfAssetsIfEnabled,
   cleanupCompletedPdfAssetsAsync,
   cleanupPdfAssetsAsync,
   copyFileWithFingerprintAsync,
@@ -35,6 +37,8 @@ import {
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { resolveFolderAndDescendantIds } from '../folder-scope'
+import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { normalizeHistoryDocType } from '../../shared/history-citation'
 import { getErrorMessage } from '../../shared/errors'
 import {
@@ -139,6 +143,9 @@ interface PageOcrMetaRow {
   proofed_text?: string | null
   ocr_text?: string | null
   ocr_result?: unknown
+  proofed_text_ref?: string | null
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
 }
 
 interface DocumentTagRelationRow {
@@ -173,6 +180,9 @@ interface BookTranslationPageRow {
   ocr_text: string | null
   proofed_text: string | null
   ocr_result?: string | null
+  ocr_text_ref?: string | null
+  proofed_text_ref?: string | null
+  ocr_result_ref?: string | null
 }
 
 interface BookTranslationPageWorkItem extends BookTranslationPageRow {
@@ -189,6 +199,8 @@ interface BookTranslationCacheRow {
   source_hash: string
   source_text?: string | null
   translation_text: string | null
+  source_text_ref?: string | null
+  translation_text_ref?: string | null
   status: PageTranslationCacheItem['status']
   skipped?: number | null
   error_message?: string | null
@@ -673,6 +685,16 @@ function dataUrlToBuffer(dataUrl: string): Buffer {
   return Buffer.from(String(dataUrl || '').replace(/^data:image\/\w+;base64,/, ''), 'base64')
 }
 
+function assertValidPageImageBuffer(buffer: Buffer): void {
+  if (!buffer.byteLength) {
+    throw new Error('页面图片缓存为空，请重新生成页面预览')
+  }
+  const image = nativeImage.createFromBuffer(buffer)
+  if (image.isEmpty()) {
+    throw new Error('页面图片缓存无效，请重新生成页面预览')
+  }
+}
+
 interface ParsedEbook {
   manifest: EbookManifest
   sections: EbookTextSection[]
@@ -859,13 +881,17 @@ function saveBookTranslationCache(
   const nextErrorMessage = nextStatus === 'error' && status === 'ready'
     ? TRANSLATION_ALIGNMENT_ERROR_MESSAGE
     : errorMessage
+  const preparedSourceText = preparePagePayloadUpdate(docId, page.id, 'source_text', sourceText)
+  const preparedTranslationText = preparePagePayloadUpdate(docId, page.id, 'translation_text', translationText)
   run(
     `INSERT INTO page_translation_cache (
-      id, doc_id, page_id, page_num, source_hash, source_text, translation_text, skipped, status, error_message, model, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, doc_id, page_id, page_num, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message, model, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(page_id, source_hash) DO UPDATE SET
       source_text = excluded.source_text,
+      source_text_ref = excluded.source_text_ref,
       translation_text = excluded.translation_text,
+      translation_text_ref = excluded.translation_text_ref,
       skipped = excluded.skipped,
       status = excluded.status,
       error_message = excluded.error_message,
@@ -877,8 +903,10 @@ function saveBookTranslationCache(
       page.id,
       Number(page.page_num || 0),
       sourceHash,
-      sourceText,
-      translationText,
+      preparedSourceText.value,
+      preparedSourceText.ref,
+      preparedTranslationText.value,
+      preparedTranslationText.ref,
       skipped ? 1 : 0,
       nextStatus,
       nextErrorMessage,
@@ -922,14 +950,15 @@ function getBookTranslationCacheByHashes(pageId: string, hashes: string[], sourc
   if (!pageId || uniqueHashes.length === 0) return null
   const placeholders = uniqueHashes.map(() => '?').join(', ')
   const rows = queryAll<BookTranslationCacheRow>(
-    `SELECT id, page_id, source_hash, source_text, translation_text, skipped, status, error_message
+    `SELECT id, page_id, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message
      FROM page_translation_cache
      WHERE page_id = ? AND source_hash IN (${placeholders})
      ORDER BY updated_at DESC`,
     [pageId, ...uniqueHashes],
   )
+  const hydratedRows = hydratePagePayloadRows(rows)
   for (const hash of uniqueHashes) {
-    const ready = rows.find((row) => (
+    const ready = hydratedRows.find((row) => (
       row.source_hash === hash
       && row.status === 'ready'
       && String(row.translation_text || '').trim()
@@ -938,8 +967,8 @@ function getBookTranslationCacheByHashes(pageId: string, hashes: string[], sourc
     if (!isInvalidReadyTranslationCache(ready as PageTranslationCacheItem)) return ready
     if (ready.id) markTranslationCacheRowsAsAlignmentError([{ id: ready.id }])
   }
-  const compatibleRows = queryAll<BookTranslationCacheRow>(
-    `SELECT id, page_id, source_hash, source_text, translation_text, skipped, status, error_message
+  const compatibleRows = hydratePagePayloadRows(queryAll<BookTranslationCacheRow>(
+    `SELECT id, page_id, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message
      FROM page_translation_cache
      WHERE page_id = ?
        AND status = 'ready'
@@ -947,7 +976,7 @@ function getBookTranslationCacheByHashes(pageId: string, hashes: string[], sourc
        AND TRIM(translation_text) <> ''
      ORDER BY updated_at DESC`,
     [pageId],
-  )
+  ))
   const normalizedSourceText = normalizeTranslationSourceText(sourceText)
   for (const row of compatibleRows) {
     if (uniqueHashes.includes(String(row.source_hash || ''))) continue
@@ -1045,7 +1074,7 @@ async function runBookTranslationJob(docId: string, jobId: string, options: Book
     return
   }
 
-  const rawPages = queryAll<BookTranslationPageRow>('SELECT id, doc_id, page_num, ocr_text, proofed_text, ocr_result FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])
+  const rawPages = hydratePagePayloadRows(queryAll<BookTranslationPageRow>('SELECT id, doc_id, page_num, ocr_text, ocr_text_ref, proofed_text, proofed_text_ref, ocr_result, ocr_result_ref FROM pages WHERE doc_id = ? ORDER BY page_num', [docId]))
   const pages = rawPages
     .map((page, sourceIndex) => {
       const sourceText = getBookTranslationSourceText(page)
@@ -2294,7 +2323,8 @@ function buildDocumentCompletedPageCountExpression(alias = 'd'): string {
 }
 
 function buildPageContentAvailableCondition(alias = 'p'): string {
-  return `TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''`
+  return `(TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''
+    OR COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, ${alias}.ocr_result_ref, '') <> '')`
 }
 
 function buildDocumentOcrCompleteCondition(alias = 'd'): string {
@@ -2350,6 +2380,11 @@ function getLibrarySearchFields(options?: ListDocumentOptions): LibraryDocumentS
 }
 
 function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false): { sql: string; params: unknown[] } {
+  const requestedFolderIds = [
+    ...(options?.folderId ? [options.folderId] : []),
+    ...(Array.isArray(options?.folderIds) ? options.folderIds : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean)
+  const scopedFolderIds = resolveFolderAndDescendantIds(requestedFolderIds)
   let sql = forCount
     ? 'SELECT COUNT(DISTINCT d.id) as total FROM documents d'
     : `SELECT
@@ -2365,16 +2400,12 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
   const params: unknown[] = []
   const conditions: string[] = []
 
-  if (options?.folderId) {
-    sql += ' INNER JOIN document_folders df ON d.id = df.doc_id'
-    conditions.push('df.folder_id = ?')
-    params.push(options.folderId)
-  }
-
-  if (Array.isArray(options?.folderIds) && options.folderIds.length > 0) {
-    sql += ' INNER JOIN document_folders df_multi ON d.id = df_multi.doc_id'
-    conditions.push(`df_multi.folder_id IN (${options.folderIds.map(() => '?').join(', ')})`)
-    params.push(...options.folderIds)
+  if (requestedFolderIds.length > 0 && scopedFolderIds.length === 0) {
+    conditions.push('1 = 0')
+  } else if (scopedFolderIds.length > 0) {
+    sql += ' INNER JOIN document_folders df_scope ON d.id = df_scope.doc_id'
+    conditions.push(`df_scope.folder_id IN (${scopedFolderIds.map(() => '?').join(', ')})`)
+    params.push(...scopedFolderIds)
   }
   if (options?.unfiledOnly) {
     conditions.push('NOT EXISTS (SELECT 1 FROM document_folders df_unfiled WHERE df_unfiled.doc_id = d.id)')
@@ -2641,6 +2672,100 @@ function parseDocumentMetadata(raw: unknown): JsonRecord {
   }
 }
 
+type VerifiedPdfAssetState = 'available' | 'text_only' | 'unknown'
+
+function isReadableLocalAssetPath(filePath: unknown): boolean {
+  const normalized = String(filePath || '').trim()
+  if (!normalized || /^(?:https?|data):/i.test(normalized)) return false
+  try {
+    if (!existsSync(normalized)) return false
+    const fileStat = statSync(normalized)
+    return fileStat.isFile() && fileStat.size > 0
+  } catch {
+    return false
+  }
+}
+
+function isReadableSourcePdf(doc: Pick<Document, 'file_path'>): boolean {
+  const filePath = String(doc.file_path || '').trim()
+  return extname(filePath).toLowerCase() === '.pdf' && isReadableLocalAssetPath(filePath)
+}
+
+function hasReadablePageImageForDocument(docId: string, imagePageCount: number): boolean {
+  if (imagePageCount <= 0) return false
+  const rows = queryAll<{ image_path: string | null }>(
+    `SELECT image_path
+     FROM pages
+     WHERE doc_id = ?
+       AND image_path IS NOT NULL
+       AND TRIM(image_path) <> ''
+     ORDER BY page_num ASC
+     LIMIT 24`,
+    [docId],
+  )
+  return rows.some((row) => isReadableLocalAssetPath(row.image_path))
+}
+
+function getVerifiedPdfAssetInfo(
+  doc: Pick<Document, 'id' | 'file_path'> & { metadata?: string | null; image_page_count?: number | null; ocr_status?: string | null },
+  metadata = parseDocumentMetadata(doc.metadata),
+): { state: VerifiedPdfAssetState; imagePageCount: number; metadata: string } {
+  const rawImagePageCount = Number(doc.image_page_count || 0)
+  const hasReadableImage = hasReadablePageImageForDocument(String(doc.id), rawImagePageCount)
+  const explicitState = String(metadata.pdf_asset_state || '').trim()
+  const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
+  const autoCleanupEnabled = queryOne<{ value: string | null }>("SELECT value FROM settings WHERE key = 'auto_delete_pdf_assets_after_ocr'")?.value === 'true'
+  const autoCleanupShouldHideAssets = autoCleanupEnabled && String(doc.ocr_status || '') === 'completed'
+  let state: VerifiedPdfAssetState = 'unknown'
+
+  if (autoCleanupShouldHideAssets) {
+    autoCleanupPdfAssetsIfEnabled(String(doc.id))
+    state = 'text_only'
+  } else if (isReadableSourcePdf(doc) || hasReadableImage) {
+    state = 'available'
+  } else if (explicitState === 'text_only' || explicitState === 'available' || hasPdfFingerprint || rawImagePageCount > 0) {
+    state = 'text_only'
+  }
+
+  return {
+    state,
+    imagePageCount: state === 'available' && hasReadableImage ? rawImagePageCount : 0,
+    metadata: JSON.stringify({ ...metadata, pdf_asset_state: state }),
+  }
+}
+
+function normalizeDocumentSourceAssetsForRead<T extends { image_path?: string | null }>(
+  doc: Pick<Document, 'id' | 'file_path'> & { metadata?: string | null; ocr_status?: string | null },
+  pages: T[],
+): void {
+  let readableImagePageCount = 0
+  for (const page of pages) {
+    if (!page.image_path) continue
+    if (isReadableLocalAssetPath(page.image_path)) {
+      readableImagePageCount += 1
+    } else {
+      page.image_path = null
+    }
+  }
+  const metadata = parseDocumentMetadata(doc.metadata)
+  const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
+  const explicitState = String(metadata.pdf_asset_state || '').trim()
+  const autoCleanupEnabled = queryOne<{ value: string | null }>("SELECT value FROM settings WHERE key = 'auto_delete_pdf_assets_after_ocr'")?.value === 'true'
+  const autoCleanupShouldHideAssets = autoCleanupEnabled && String(doc.ocr_status || '') === 'completed'
+  if (autoCleanupShouldHideAssets) {
+    autoCleanupPdfAssetsIfEnabled(String(doc.id))
+    for (const page of pages) page.image_path = null
+  }
+  const state: VerifiedPdfAssetState = autoCleanupShouldHideAssets
+    ? 'text_only'
+    : isReadableSourcePdf(doc) || readableImagePageCount > 0
+    ? 'available'
+    : explicitState === 'available' || explicitState === 'text_only' || hasPdfFingerprint
+      ? 'text_only'
+      : 'unknown'
+  doc.metadata = JSON.stringify({ ...metadata, pdf_asset_state: state })
+}
+
 function attachDocumentRelations(documents: DocumentListItem[]): DocumentListItem[] {
   if (documents.length === 0) return documents
   const docIds = documents.map((doc) => doc.id).filter(Boolean)
@@ -2683,10 +2808,14 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
     const folders = foldersByDoc.get(doc.id) || []
     const actualPageCount = Number(doc.actual_page_count || 0)
     const storedPageCount = Number(doc.page_count || 0)
+    const pdfAssetInfo = getVerifiedPdfAssetInfo(doc)
     return {
       ...doc,
       page_count: Math.max(storedPageCount, actualPageCount),
       actual_page_count: actualPageCount,
+      image_page_count: pdfAssetInfo.imagePageCount,
+      pdf_asset_state: pdfAssetInfo.state,
+      metadata: pdfAssetInfo.metadata,
       tag_names: tags.map((tag) => tag.name).join('|'),
       tag_colors: tags.map((tag) => tag.color || '').join('|'),
       tag_ids: tags.map((tag) => tag.id).join('|'),
@@ -2759,10 +2888,10 @@ function getPdfSizeBytes(doc: DocumentHealthSourceRow, metadata: JsonRecord): nu
 }
 
 function getHealthPdfAssetState(doc: DocumentHealthSourceRow, metadata: JsonRecord): string {
+  const imagePageCount = Number(doc.image_page_count || 0)
+  if (isReadableSourcePdf(doc) || imagePageCount > 0) return 'available'
   const explicitState = String(metadata.pdf_asset_state || '').trim()
-  if (explicitState) return explicitState
-  const filePath = typeof doc.file_path === 'string' ? doc.file_path : ''
-  if (filePath && extname(filePath).toLowerCase() === '.pdf' && existsSync(filePath)) return 'available'
+  if (explicitState === 'text_only' || explicitState === 'available') return 'text_only'
   if (metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count) return 'text_only'
   return 'unknown'
 }
@@ -2783,11 +2912,12 @@ function buildDocumentHealthRow(doc: DocumentHealthSourceRow): DocumentHealthRow
   const pageCount = Math.max(Number(doc.page_count || 0), actualPageCount)
   const textPageCount = Number(doc.text_page_count || 0)
   const completedPageCount = Number(doc.ocr_completed_page_count || 0)
-  const imagePageCount = Number(doc.image_page_count || 0)
+  const pdfAssetInfo = getVerifiedPdfAssetInfo(doc, metadata)
+  const imagePageCount = pdfAssetInfo.imagePageCount
   const researchNoteCount = Number(doc.research_note_count || 0)
   const searchSegmentCount = Number(doc.search_segment_count || 0)
   const pdfSizeBytes = getPdfSizeBytes(doc, metadata)
-  const pdfAssetState = getHealthPdfAssetState(doc, metadata)
+  const pdfAssetState = getHealthPdfAssetState({ ...doc, image_page_count: imagePageCount }, metadata)
   const ocrStatus = pageCount > 0 && (completedPageCount >= pageCount || textPageCount >= pageCount)
     ? 'completed'
     : String(doc.ocr_status || 'pending')
@@ -3576,7 +3706,7 @@ export function registerDocumentIpc(): void {
     run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?', [new Date().toISOString(), id])
     await ensureDeferredPdfPageRecordsReadyForRead(doc)
 
-    const pages = queryAll<DocumentPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [id])
+    const pages = hydratePagePayloadRows(queryAll<DocumentPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [id]))
     const tags = queryAll<Tag>('SELECT t.* FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? ORDER BY t.usage_count DESC, t.name ASC', [id])
     const folders = queryAll<Folder>('SELECT f.* FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? ORDER BY f.sort_order ASC, f.name ASC', [id])
 
@@ -3592,6 +3722,7 @@ export function registerDocumentIpc(): void {
       }
       Object.assign(page, parsePageOcrMeta(page))
     }
+    normalizeDocumentSourceAssetsForRead(doc, pages)
 
     return {
       ...doc,
@@ -3618,8 +3749,10 @@ export function registerDocumentIpc(): void {
         ocr_status,
         proof_status,
         created_at,
-        CASE WHEN TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> '' THEN 1 ELSE 0 END as has_text,
-        CASE WHEN ocr_result IS NOT NULL AND TRIM(ocr_result) <> '' THEN 1 ELSE 0 END as has_ocr_result
+        CASE WHEN TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> ''
+               OR COALESCE(proofed_text_ref, ocr_text_ref, '') <> '' THEN 1 ELSE 0 END as has_text,
+        CASE WHEN (ocr_result IS NOT NULL AND TRIM(ocr_result) <> '')
+               OR COALESCE(ocr_result_ref, '') <> '' THEN 1 ELSE 0 END as has_ocr_result
       FROM pages
       WHERE doc_id = ?
       ORDER BY page_num
@@ -3639,6 +3772,7 @@ export function registerDocumentIpc(): void {
       }
       page.__light = true
     }
+    normalizeDocumentSourceAssetsForRead(doc, pages)
 
     return {
       ...doc,
@@ -3696,10 +3830,10 @@ export function registerDocumentIpc(): void {
   ipcMain.handle('documents:getPagesRange', async (_event, docId: string, startPageNum: number, endPageNum: number): Promise<DocumentPage[]> => {
     const safeStart = Math.max(1, Number(startPageNum) || 1)
     const safeEnd = Math.max(safeStart, Number(endPageNum) || safeStart)
-    const pages = queryAll<DocumentPage>(
+    const pages = hydratePagePayloadRows(queryAll<DocumentPage>(
       'SELECT * FROM pages WHERE doc_id = ? AND page_num BETWEEN ? AND ? ORDER BY page_num',
       [docId, safeStart, safeEnd],
-    )
+    ))
     const storageDir = join(getDataDir(), 'storage')
     for (const page of pages) {
       if (page.image_path) {
@@ -3712,14 +3846,17 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:getSearchPages', async (_event, docId: string): Promise<DocumentPage[]> => {
-    const pages = queryAll<DocumentSearchPageRow>(
+    const pages = hydratePagePayloadRows(queryAll<DocumentSearchPageRow>(
       `SELECT
         id,
         doc_id,
         page_num,
         ocr_result,
+        ocr_result_ref,
         ocr_text,
+        ocr_text_ref,
         proofed_text,
+        proofed_text_ref,
         ocr_status,
         proof_status,
         created_at
@@ -3727,7 +3864,7 @@ export function registerDocumentIpc(): void {
       WHERE doc_id = ?
       ORDER BY page_num`,
       [docId],
-    )
+    ))
     return pages.map((page) => ({
       ...page,
       ...parsePageOcrMeta(page),
@@ -3746,10 +3883,10 @@ export function registerDocumentIpc(): void {
     const safeRadius = Math.max(0, Math.min(20, Math.round(Number(radius ?? 2))))
     const startPageNum = Math.max(1, safeIndex + 1 - safeRadius)
     const endPageNum = Math.max(startPageNum, Math.min(Math.max(1, pageCount), safeIndex + 1 + safeRadius))
-    const pages = queryAll<DocumentPage>(
+    const pages = hydratePagePayloadRows(queryAll<DocumentPage>(
       'SELECT * FROM pages WHERE doc_id = ? AND page_num BETWEEN ? AND ? ORDER BY page_num',
       [docId, startPageNum, endPageNum],
-    )
+    ))
     const storageDir = join(getDataDir(), 'storage')
     if (doc.file_path) doc.file_path = migratePath(doc.file_path, storageDir)
     if (doc.thumb_path) doc.thumb_path = migratePath(doc.thumb_path, storageDir)
@@ -3941,15 +4078,15 @@ export function registerDocumentIpc(): void {
     const uniquePageIds = [...new Set((pageIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
     if (!docId || uniquePageIds.length === 0) return []
     const placeholders = uniquePageIds.map(() => '?').join(', ')
-    return queryAll<AiLayoutCacheItem>(
-      `SELECT id, doc_id, page_id, page_num, mode, source_hash, result_text, status, error_message, model, created_at, updated_at
+    return hydratePagePayloadRows(queryAll<AiLayoutCacheItem>(
+      `SELECT id, doc_id, page_id, page_num, mode, source_hash, result_text, result_text_ref, status, error_message, model, created_at, updated_at
        FROM page_ai_layout_cache
        WHERE doc_id = ?
          AND mode = ?
          AND page_id IN (${placeholders})
        ORDER BY page_num ASC, updated_at DESC`,
       [docId, mode, ...uniquePageIds],
-    )
+    ))
   })
 
   const AI_LAYOUT_INPUT_LIMIT = 1600
@@ -4044,14 +4181,15 @@ export function registerDocumentIpc(): void {
     const normalizedText = String(text || '').trim()
     const normalizedHash = String(sourceHash || '').trim()
     if (!normalizedText || !normalizedHash) throw new Error('缺少可排版文本')
-    const cached = queryOne<AiLayoutCacheItem>(
-      `SELECT id, doc_id, page_id, page_num, mode, source_hash, result_text, status, error_message, model, created_at, updated_at
+    const cachedRaw = queryOne<AiLayoutCacheItem>(
+      `SELECT id, doc_id, page_id, page_num, mode, source_hash, result_text, result_text_ref, status, error_message, model, created_at, updated_at
        FROM page_ai_layout_cache
        WHERE page_id = ? AND mode = ? AND source_hash = ? AND status = 'ready'
        ORDER BY updated_at DESC
        LIMIT 1`,
       [pageId, mode, normalizedHash],
     )
+    const cached = cachedRaw ? hydratePagePayloadRow(cachedRaw) : null
     if (cached?.result_text) return cached
 
     const now = new Date().toISOString()
@@ -4065,25 +4203,28 @@ export function registerDocumentIpc(): void {
             const aiText = await runAiTask('layout_reading_page', input, { mode, pageNum: page.page_num, ...profile })
             return [aiText.trim(), remainder].filter(Boolean).join('\n\n')
           })()
+      const preparedResultText = preparePagePayloadUpdate(docId, pageId, 'result_text', resultText)
       run(
         `INSERT INTO page_ai_layout_cache (
-          id, doc_id, page_id, page_num, mode, source_hash, result_text, status, error_message, model, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, doc_id, page_id, page_num, mode, source_hash, result_text, result_text_ref, status, error_message, model, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(page_id, mode, source_hash) DO UPDATE SET
           result_text = excluded.result_text,
+          result_text_ref = excluded.result_text_ref,
           status = excluded.status,
           error_message = excluded.error_message,
           model = excluded.model,
           updated_at = excluded.updated_at`,
-        [id, docId, pageId, Number(page.page_num || 0), mode, normalizedHash, resultText, 'ready', null, 'default', now, now],
+        [id, docId, pageId, Number(page.page_num || 0), mode, normalizedHash, preparedResultText.value, preparedResultText.ref, 'ready', null, 'default', now, now],
       )
       scheduleDatabaseSave()
-      return queryOne<AiLayoutCacheItem>(
-        `SELECT id, doc_id, page_id, page_num, mode, source_hash, result_text, status, error_message, model, created_at, updated_at
+      const saved = queryOne<AiLayoutCacheItem>(
+        `SELECT id, doc_id, page_id, page_num, mode, source_hash, result_text, result_text_ref, status, error_message, model, created_at, updated_at
          FROM page_ai_layout_cache
          WHERE page_id = ? AND mode = ? AND source_hash = ?`,
         [pageId, mode, normalizedHash],
       )
+      return saved ? hydratePagePayloadRow(saved) : null
     } catch (error: unknown) {
       run(
         `INSERT INTO page_ai_layout_cache (
@@ -4105,21 +4246,22 @@ export function registerDocumentIpc(): void {
     if (!docId || uniquePageIds.length === 0) return []
     const placeholders = uniquePageIds.map(() => '?').join(', ')
     const rows = queryAll<PageTranslationCacheItem>(
-      `SELECT id, doc_id, page_id, page_num, source_hash, source_text, translation_text, skipped, status, error_message, model, created_at, updated_at
+      `SELECT id, doc_id, page_id, page_num, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message, model, created_at, updated_at
        FROM page_translation_cache
        WHERE doc_id = ?
          AND page_id IN (${placeholders})
        ORDER BY page_num ASC, updated_at DESC`,
       [docId, ...uniquePageIds],
     )
-    const invalidReadyRows = rows.filter(isInvalidReadyTranslationCache)
+    const hydratedRows = hydratePagePayloadRows(rows)
+    const invalidReadyRows = hydratedRows.filter(isInvalidReadyTranslationCache)
     if (invalidReadyRows.length > 0) {
       markTranslationCacheRowsAsAlignmentError(invalidReadyRows)
-      return rows.map((row) => invalidReadyRows.some((invalidRow) => invalidRow.id === row.id)
+      return hydratedRows.map((row) => invalidReadyRows.some((invalidRow) => invalidRow.id === row.id)
         ? { ...row, status: 'error', error_message: TRANSLATION_ALIGNMENT_ERROR_MESSAGE }
         : row)
     }
-    return rows
+    return hydratedRows
   })
 
   ipcMain.handle('reader:saveTranslationCache', async (_event, docId: string, pageId: string, payload: PageTranslationCachePayload = {}): Promise<PageTranslationCacheItem | null> => {
@@ -4141,13 +4283,17 @@ export function registerDocumentIpc(): void {
     const nextErrorMessage = nextStatus === 'error' && requestedStatus === 'ready'
       ? TRANSLATION_ALIGNMENT_ERROR_MESSAGE
       : payload?.errorMessage || payload?.error_message || null
+    const preparedSourceText = preparePagePayloadUpdate(docId, pageId, 'source_text', sourceText)
+    const preparedTranslationText = preparePagePayloadUpdate(docId, pageId, 'translation_text', translationText)
     run(
       `INSERT INTO page_translation_cache (
-        id, doc_id, page_id, page_num, source_hash, source_text, translation_text, skipped, status, error_message, model, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, doc_id, page_id, page_num, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message, model, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(page_id, source_hash) DO UPDATE SET
         source_text = excluded.source_text,
+        source_text_ref = excluded.source_text_ref,
         translation_text = excluded.translation_text,
+        translation_text_ref = excluded.translation_text_ref,
         skipped = excluded.skipped,
         status = excluded.status,
         error_message = excluded.error_message,
@@ -4159,8 +4305,10 @@ export function registerDocumentIpc(): void {
         pageId,
         Number(page.page_num || 0),
         sourceHash,
-        sourceText,
-        translationText,
+        preparedSourceText.value,
+        preparedSourceText.ref,
+        preparedTranslationText.value,
+        preparedTranslationText.ref,
         payload?.skipped ? 1 : 0,
         nextStatus,
         nextErrorMessage,
@@ -4170,12 +4318,13 @@ export function registerDocumentIpc(): void {
       ],
     )
     scheduleDatabaseSave()
-    return queryOne<PageTranslationCacheItem>(
-      `SELECT id, doc_id, page_id, page_num, source_hash, source_text, translation_text, skipped, status, error_message, model, created_at, updated_at
+    const saved = queryOne<PageTranslationCacheItem>(
+      `SELECT id, doc_id, page_id, page_num, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message, model, created_at, updated_at
        FROM page_translation_cache
        WHERE page_id = ? AND source_hash = ?`,
       [pageId, sourceHash],
     )
+    return saved ? hydratePagePayloadRow(saved) : null
   })
 
   ipcMain.handle('documents:delete', async (_event, id: string) => {
@@ -4405,8 +4554,15 @@ export function registerDocumentIpc(): void {
       mkdirSync(storageDir, { recursive: true })
     }
 
+    const imageBuffer = dataUrlToBuffer(dataUrl)
+    assertValidPageImageBuffer(imageBuffer)
+
     const destPath = join(storageDir, `page_${safePageNum}.jpg`)
-    await writeFile(destPath, dataUrlToBuffer(dataUrl))
+    await writeFile(destPath, imageBuffer)
+    const writtenStat = await stat(destPath)
+    if (!writtenStat.isFile() || writtenStat.size <= 0) {
+      throw new Error('页面图片缓存写入失败，请重试')
+    }
     allowFileAccessPath(destPath)
 
     const existing = queryOne<{ id: string }>('SELECT id FROM pages WHERE doc_id = ? AND page_num = ? ORDER BY created_at LIMIT 1', [docId, safePageNum])
@@ -4479,11 +4635,14 @@ export function registerDocumentIpc(): void {
 
     for (const field of allowedFields) {
       if (!(field in data)) continue
-      sets.push(`${field} = ?`)
-      let value = data[field]
-      if (field === 'ocr_result' && typeof value !== 'string') {
-        value = JSON.stringify(value)
+      const value = data[field]
+      if (field === 'ocr_text' || field === 'ocr_result' || field === 'proofed_text') {
+        const prepared = preparePagePayloadUpdate(page.doc_id, pageId, field, value)
+        sets.push(`${field} = ?`, `${field}_ref = ?`)
+        params.push(prepared.value, prepared.ref)
+        continue
       }
+      sets.push(`${field} = ?`)
       params.push(value)
     }
 
@@ -4502,7 +4661,8 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('pages:resetOcr', async (_event, pageId: string) => {
-    const page = queryOne<DocumentPage>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const rawPage = queryOne<DocumentPage>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const page = rawPage ? hydratePagePayloadRow(rawPage) : null
     if (!page) return false
 
     let ocrResult: (OcrRecognizeResult & JsonRecord) | null = parseJsonRecord(page.ocr_result) as (OcrRecognizeResult & JsonRecord) | null
@@ -4521,9 +4681,14 @@ export function registerDocumentIpc(): void {
       ocrText = ocrResult.words_result.map((item) => textValue(isJsonRecord(item) ? item.words : '')).join('\n')
     }
 
-    run('UPDATE pages SET ocr_result = ?, ocr_text = ?, proofed_text = ?, proof_status = ? WHERE id = ?', [
-      JSON.stringify(ocrResult),
-      ocrText,
+    const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', ocrResult)
+    const nextOcrText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', ocrText)
+    run('UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, proofed_text = ?, proofed_text_ref = ?, proof_status = ? WHERE id = ?', [
+      nextOcrResult.value,
+      nextOcrResult.ref,
+      nextOcrText.value,
+      nextOcrText.ref,
+      null,
       null,
       'pending',
       pageId,
@@ -4547,7 +4712,8 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('pages:switchOcrVersion', async (_event, pageId: string, engine: string) => {
-    const page = queryOne<DocumentPage>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const rawPage = queryOne<DocumentPage>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const page = rawPage ? hydratePagePayloadRow(rawPage) : null
     if (!page) throw new Error('页面不存在')
     const version = queryOne<PageOcrVersionDetailRow>(
       'SELECT * FROM page_ocr_versions WHERE page_id = ? AND engine = ? AND status = ?',
@@ -4557,9 +4723,12 @@ export function registerDocumentIpc(): void {
 
     run('UPDATE page_ocr_versions SET is_active = 0 WHERE page_id = ?', [pageId])
     run('UPDATE page_ocr_versions SET is_active = 1, updated_at = ? WHERE id = ?', [new Date().toISOString(), version.id])
+    const hydratedVersion = hydratePagePayloadRow(version)
+    const nextOcrText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', hydratedVersion.ocr_text || '')
+    const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', hydratedVersion.ocr_result || null)
     run(
-      'UPDATE pages SET ocr_text = ?, ocr_result = ?, proofed_text = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
-      [version.ocr_text || '', version.ocr_result || null, null, 'completed', 'pending', pageId],
+      'UPDATE pages SET ocr_text = ?, ocr_text_ref = ?, ocr_result = ?, ocr_result_ref = ?, proofed_text = ?, proofed_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
+      [nextOcrText.value, nextOcrText.ref, nextOcrResult.value, nextOcrResult.ref, null, null, 'completed', 'pending', pageId],
     )
     const doc = queryOne<DocumentMetadataRow>('SELECT metadata FROM documents WHERE id = ?', [page.doc_id])
     const metadata = (() => {

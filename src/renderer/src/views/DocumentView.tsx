@@ -39,6 +39,7 @@ import {
 import { releaseCachedPdfDocument, renderPdfFilePageToImage } from '../utils/pdf'
 import { ensurePdfPageImagesForOcr as ensureOcrPageImages, isReadablePageImagePath } from '../utils/ocrPageImages'
 import { extractPageText, getCitationPageNumber, getOcrBlockText, getOrderedOcrBlocks, getReadablePageElements, getReadablePageText, normalizeOcrTextForReading } from '../utils/ocrText'
+import { clampAiButtonPosition, clampFloatingPanelState, getDefaultFloatingPanelState } from '../utils/floatingViewport'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { resolveDocumentCitation } from '../utils/citations'
 import { findSearchOccurrences, uniqueSearchTerms } from '../utils/searchHitCount'
@@ -336,6 +337,31 @@ function getSearchLocatorKey(locator: SearchHitLocator | null | undefined, keywo
     locator.charEnd ?? '',
     locator.queryTerm || keyword,
   ].join('|')
+}
+
+function getDocumentOpenContextKey(
+  documentId: string,
+  locator: SearchHitLocator | null | undefined,
+  initialPageIndex = 0,
+  searchKeyword = '',
+  sourceId = '',
+  highlightExcerpt = '',
+  revealToc = false,
+  searchSession?: SearchSessionState,
+): string {
+  return [
+    documentId,
+    getSearchLocatorKey(locator, searchKeyword),
+    initialPageIndex,
+    searchKeyword,
+    sourceId,
+    highlightExcerpt,
+    revealToc ? 'toc' : '',
+    searchSession?.query || '',
+    searchSession?.activeHitIndex ?? '',
+    searchSession?.hits?.[0]?.id || '',
+    searchSession?.hits?.length || 0,
+  ].join('::')
 }
 
 function doSearchLocatorsMatch(left: SearchHitLocator | null | undefined, right: SearchHitLocator | null | undefined): boolean {
@@ -1017,6 +1043,7 @@ export default function DocumentView({
   onBack,
   onOpenDocument,
 }: DocumentViewProps) {
+  const openContextKey = getDocumentOpenContextKey(documentId, locator, initialPageIndex, searchKeyword, sourceId, highlightExcerpt, revealToc, searchSession)
   const [doc, setDoc] = useState<DocumentViewDocument | null>(null)
   const [loading, setLoading] = useState(true)
   const [ocrProcessing, setOcrProcessing] = useState(false)
@@ -1111,6 +1138,7 @@ export default function DocumentView({
   const readerVisiblePageIndexRef = useRef(initialPageIndex)
   const readerStateLoadedRef = useRef(false)
   const documentModeTouchedRef = useRef(false)
+  const documentModeSwitchSerialRef = useRef(0)
   const readerSaveTimerRef = useRef<number | null>(null)
   const latestReaderStateRef = useRef<ReaderStateSavePayload>({})
   const searchRequestIdRef = useRef(0)
@@ -1587,7 +1615,17 @@ export default function DocumentView({
     if (!effectiveSearchKeyword.trim()) return []
     const matches: SearchMatch[] = []
     const pagesToSearch: Array<{ page: DocumentViewPage; pageIndex: number }> = documentMode === 'proof'
-      ? (currentPage ? [{ page: currentPage, pageIndex: currentPageIndex }] : [])
+      ? (readerSearchPages.length > 0
+        ? readerSearchPages.map((page, fallbackIndex) => {
+          const sortedIndex = sortedPages.findIndex((item) => String(item.id) === String(page.id))
+          return {
+            page,
+            pageIndex: sortedIndex >= 0
+              ? sortedIndex
+              : clampPageIndex(Number(page.page_num || fallbackIndex + 1) - 1, pageCount),
+          }
+        })
+        : (currentPage ? [{ page: currentPage, pageIndex: currentPageIndex }] : []))
       : sortedPages.map((page, pageIndex) => ({ page, pageIndex }))
 
     pagesToSearch.forEach(({ page, pageIndex }) => {
@@ -1636,7 +1674,17 @@ export default function DocumentView({
       || left.boxIndex - right.boxIndex
       || left.charIndex - right.charIndex
     ))
-  }, [currentPage, currentPageIndex, documentMode, effectiveSearchKeyword, locatorHits, shouldPreferSourcePageReader, sortedPages])
+  }, [currentPage, currentPageIndex, documentMode, effectiveSearchKeyword, locatorHits, pageCount, readerSearchPages, shouldPreferSourcePageReader, sortedPages])
+  const activeProofSearchHitOrdinal = useMemo(() => {
+    if (documentMode !== 'proof') return -1
+    if (currentMatchIndex < 0 || currentMatchIndex >= searchMatches.length) return -1
+    const selectedMatch = searchMatches[currentMatchIndex]
+    if (!selectedMatch || selectedMatch.pageIndex !== currentPageIndex || selectedMatch.boxIndex < 0) return -1
+    return searchMatches
+      .slice(0, currentMatchIndex)
+      .filter((match) => match.pageIndex === selectedMatch.pageIndex && match.boxIndex === selectedMatch.boxIndex)
+      .length
+  }, [currentMatchIndex, currentPageIndex, documentMode, searchMatches])
 
   const mergeDocumentPages = useCallback((nextPages: DocumentPage[], targetDocId = documentId) => {
     if (!Array.isArray(nextPages) || nextPages.length === 0) return
@@ -1725,6 +1773,18 @@ export default function DocumentView({
         console.error('Failed to save reader state', error)
       })
     }, 450)
+  }, [documentId])
+
+  const saveReaderStateNow = useCallback((state: ReaderStateSavePayload) => {
+    if (temporaryNavigationRef.current) return
+    if (readerSaveTimerRef.current) {
+      window.clearTimeout(readerSaveTimerRef.current)
+      readerSaveTimerRef.current = null
+    }
+    latestReaderStateRef.current = { ...latestReaderStateRef.current, ...state }
+    void window.api.saveReaderState(documentId, latestReaderStateRef.current).catch((error: unknown) => {
+      console.error('Failed to save reader state', error)
+    })
   }, [documentId])
 
   const buildPageReaderState = useCallback((pageIndex: number): ReaderStateSavePayload | null => {
@@ -2067,6 +2127,8 @@ export default function DocumentView({
 
   useLayoutEffect(() => {
     activeDocumentIdRef.current = documentId
+    documentModeSwitchSerialRef.current += 1
+    const targetDocId = documentId
     setLoading(true)
     setDoc(null)
     setReaderSearchPages([])
@@ -2107,8 +2169,25 @@ export default function DocumentView({
     if (revealToc) {
       setReaderTocOpen(true)
     }
-    void loadDocument()
-  }, [clearReaderTranslationRuntime, documentId, highlightExcerpt, loadDocument, locator, revealToc, searchKeyword, searchSession, sourceId])
+    void (async () => {
+      try {
+        const data = await window.api.getDocumentLight(targetDocId)
+        if (activeDocumentIdRef.current !== targetDocId) return
+        const normalizedDoc = normalizeDocumentDetail(data, targetDocId)
+        if (!normalizedDoc) {
+          throw new Error('Document detail is empty')
+        }
+        setDoc(normalizedDoc)
+        const targetIndex = resolveLocatorPageIndex(normalizedDoc.pages || [], locator, initialPageIndex)
+        void loadPagesAround(targetIndex, 4)
+      } catch (error) {
+        console.error(error)
+        message.error('加载文献详情失败')
+      } finally {
+        if (activeDocumentIdRef.current === targetDocId) setLoading(false)
+      }
+    })()
+  }, [openContextKey])
 
   useEffect(() => {
     if (!doc) return
@@ -2211,11 +2290,12 @@ export default function DocumentView({
   useEffect(() => {
     const query = localSearchKeyword.trim()
     const requestId = ++searchPagesRequestIdRef.current
-    if (!documentId || !query || !shouldUseSourcePageReader) {
+    const shouldLoadSearchPages = shouldUseSourcePageReader || documentMode === 'proof'
+    if (!documentId || !query || !shouldLoadSearchPages) {
       setReaderSearchPages([])
       return
     }
-    if (!readerFullSearchRequested && (sourceId || locator || searchSession?.hits?.length)) {
+    if (shouldUseSourcePageReader && !readerFullSearchRequested && (sourceId || locator || searchSession?.hits?.length)) {
       setReaderSearchPages([])
       return
     }
@@ -2233,7 +2313,7 @@ export default function DocumentView({
         console.error('Failed to load reader search pages', error)
         setReaderSearchPages([])
       })
-  }, [documentId, localSearchKeyword, locator, pageCount, readerFullSearchRequested, readerSearchPages.length, searchSession?.hits?.length, shouldUseSourcePageReader, sourceId])
+  }, [documentId, documentMode, localSearchKeyword, locator, pageCount, readerFullSearchRequested, readerSearchPages.length, searchSession?.hits?.length, shouldUseSourcePageReader, sourceId])
 
   useEffect(() => {
     if (!doc || readerStateLoadedRef.current || searchKeyword) return
@@ -2379,7 +2459,11 @@ export default function DocumentView({
   useEffect(() => {
     if (documentMode !== 'proof') return
     if (!effectiveSearchKeyword.trim() || searchMatches.length === 0) return
-    const selectedIndex = currentMatchIndex >= 0 && currentMatchIndex < searchMatches.length ? currentMatchIndex : 0
+    if (pageCount > 1 && readerSearchPages.length === 0) return
+    const firstMatchAtOrAfterCurrentPage = searchMatches.findIndex((match) => match.pageIndex >= currentPageIndex)
+    const selectedIndex = currentMatchIndex >= 0 && currentMatchIndex < searchMatches.length
+      ? currentMatchIndex
+      : firstMatchAtOrAfterCurrentPage >= 0 ? firstMatchAtOrAfterCurrentPage : 0
     const selectedMatch = searchMatches[selectedIndex]
     if (!selectedMatch) return
     if (selectedMatch.pageIndex !== currentPageIndex) {
@@ -2393,6 +2477,7 @@ export default function DocumentView({
       if (searchAutoNavigationKeyRef.current !== navigationKey) {
         searchAutoNavigationKeyRef.current = navigationKey
         setCurrentPageIndex(selectedMatch.pageIndex)
+        void loadPagesAround(selectedMatch.pageIndex, 5)
       }
       return
     }
@@ -2403,7 +2488,7 @@ export default function DocumentView({
         ? { ...previous, activeHitIndex: selectedMatch.hitIndex ?? selectedIndex }
         : previous)
     }
-  }, [currentMatchIndex, currentPageIndex, documentMode, effectiveSearchKeyword, searchMatches])
+  }, [currentMatchIndex, currentPageIndex, documentMode, effectiveSearchKeyword, loadPagesAround, pageCount, readerSearchPages.length, searchMatches])
 
   useEffect(() => {
     setPageInput(String(Math.max(1, currentPageIndex + 1)))
@@ -2517,6 +2602,17 @@ export default function DocumentView({
     if (doc?.file_path && String(doc.file_path).toLowerCase().endsWith('.pdf') && page.page_num) {
       const rendered = await renderPdfFilePageToImage(doc.file_path, page.page_num)
       putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
+      if (options?.updateDoc !== false && doc?.id && page.id) {
+        const imagePath = await window.api.cachePageImage(doc.id, page.page_num, rendered.dataUrl)
+        await window.api.updatePage(page.id, { image_path: imagePath })
+        setDoc((previous) => {
+          if (!previous?.pages) return previous
+          return {
+            ...previous,
+            pages: previous.pages.map((item) => item.id === page.id ? { ...item, image_path: imagePath } : item),
+          }
+        })
+      }
       return rendered.dataUrl
     }
 
@@ -2675,8 +2771,7 @@ export default function DocumentView({
   }, [currentPage, currentPageIndex, doc, loadPageImage, shouldUseManagedTextReader, shouldUseProofLayout, sortedPages])
 
   useEffect(() => {
-    panelState.current.x = window.innerWidth - 420 - 24
-    panelState.current.y = 80
+    panelState.current = getDefaultFloatingPanelState()
     if (floatingPanelRef.current) {
       floatingPanelRef.current.style.transform = `translate(${panelState.current.x}px, ${panelState.current.y}px)`
       floatingPanelRef.current.style.width = `${panelState.current.w}px`
@@ -2699,6 +2794,18 @@ export default function DocumentView({
       pendingPanelStyleRef.current = next
       if (panelFrameRef.current == null) panelFrameRef.current = window.requestAnimationFrame(flushPanelStyle)
     }
+    const applyPanelState = (next: { x: number; y: number; w: number; h: number }) => {
+      const clamped = clampFloatingPanelState(next)
+      panelState.current = clamped
+      schedulePanelStyle(clamped)
+    }
+    const applyButtonPosition = (next: { x: number; y: number }, scale = false) => {
+      const clamped = clampAiButtonPosition(next)
+      btnPosRef.current = clamped
+      if (aiButtonRef.current) {
+        aiButtonRef.current.style.transform = `translate(${clamped.x}px, ${clamped.y}px)${scale ? ' scale(1.05)' : ''}`
+      }
+    }
     const handlePanelMouseMove = (event: MouseEvent) => {
       if (!floatingPanelRef.current) return
 
@@ -2707,9 +2814,7 @@ export default function DocumentView({
         const dy = event.clientY - interactStart.current.mouseY
         const newX = interactStart.current.panelX + dx
         const newY = interactStart.current.panelY + dy
-        panelState.current.x = newX
-        panelState.current.y = newY
-        schedulePanelStyle({ x: newX, y: newY })
+        applyPanelState({ ...panelState.current, x: newX, y: newY })
       } else if (resizingPanel.current) {
         const dx = event.clientX - interactStart.current.mouseX
         const dy = event.clientY - interactStart.current.mouseY
@@ -2733,8 +2838,7 @@ export default function DocumentView({
           }
         }
 
-        panelState.current = { x: panelX, y: panelY, w: panelW, h: panelH }
-        schedulePanelStyle({ x: panelX, y: panelY, w: panelW, h: panelH })
+        applyPanelState({ x: panelX, y: panelY, w: panelW, h: panelH })
       }
 
       if (btnDragState.current.isDragging && aiButtonRef.current) {
@@ -2743,8 +2847,7 @@ export default function DocumentView({
         const dy = event.clientY - btnDragState.current.startY
         const newX = btnDragState.current.btnX + dx
         const newY = btnDragState.current.btnY + dy
-        btnPosRef.current = { x: newX, y: newY }
-        aiButtonRef.current.style.transform = `translate(${newX}px, ${newY}px) scale(1.05)`
+        applyButtonPosition({ x: newX, y: newY }, true)
       }
     }
 
@@ -2762,10 +2865,8 @@ export default function DocumentView({
 
       if (btnDragState.current.isDragging) {
         btnDragState.current.isDragging = false
-        if (aiButtonRef.current) {
-          aiButtonRef.current.style.transition = ''
-          aiButtonRef.current.style.transform = `translate(${btnPosRef.current.x}px, ${btnPosRef.current.y}px)`
-        }
+        if (aiButtonRef.current) aiButtonRef.current.style.transition = ''
+        applyButtonPosition(btnPosRef.current)
         document.body.style.cursor = ''
         setTimeout(() => {
           btnDragState.current.moved = false
@@ -2773,13 +2874,20 @@ export default function DocumentView({
       }
     }
 
+    const handleViewportResize = () => {
+      applyPanelState(panelState.current)
+      applyButtonPosition(btnPosRef.current)
+    }
+
     document.addEventListener('mousemove', handlePanelMouseMove)
     document.addEventListener('mouseup', handlePanelMouseUp)
+    window.addEventListener('resize', handleViewportResize)
     return () => {
       if (panelFrameRef.current != null) window.cancelAnimationFrame(panelFrameRef.current)
       pendingPanelStyleRef.current = null
       document.removeEventListener('mousemove', handlePanelMouseMove)
       document.removeEventListener('mouseup', handlePanelMouseUp)
+      window.removeEventListener('resize', handleViewportResize)
     }
   }, [])
 
@@ -2858,6 +2966,7 @@ export default function DocumentView({
       setReaderPageIndex(match.pageIndex)
     } else if (match.pageIndex !== currentPageIndex) {
       setCurrentPageIndex(match.pageIndex)
+      void loadPagesAround(match.pageIndex, 5)
     }
     setActiveBoxIndex(match.boxIndex)
   }
@@ -3035,14 +3144,47 @@ export default function DocumentView({
     }
   }
 
-  const handleRestorePdfAsset = async (manualPath?: string) => {
+  const cacheRestoredPdfCurrentPage = async (
+    sourceFilePath?: string | null,
+    targetPage: DocumentViewPage | undefined = currentPage,
+  ): Promise<boolean> => {
+    if (!doc?.id || !targetPage?.page_num) return false
+    const messageKey = `restore-pdf-page-${doc.id}-${targetPage.page_num}`
+    try {
+      const result = await ensureOcrPageImages(doc, {
+        pageNums: [targetPage.page_num],
+        sourceFilePath,
+        messageKey,
+        onProgress: (content, key) => message.loading({ content, key: key || messageKey, duration: 0 }),
+        onPageCached: async (pageNum, imagePath, dataUrl) => {
+          if (pageNum !== targetPage.page_num) return
+          putLimitedPageImageCache(pageImageCacheRef.current, getPageImageCacheKey(targetPage, doc.id, documentId), dataUrl)
+          if (targetPage.id) {
+            await window.api.updatePage(targetPage.id, { image_path: imagePath })
+          }
+          if (targetPage.id === currentPage?.id || targetPage.page_num === currentPage?.page_num) {
+            setImageDataUrl(dataUrl)
+          }
+        },
+      })
+      return result.ready && (
+        result.cachedPageNums.includes(targetPage.page_num)
+        || await isReadablePageImagePath(targetPage.image_path)
+      )
+    } finally {
+      message.destroy(messageKey)
+    }
+  }
+
+  const handleRestorePdfAsset = async (manualPath?: string, targetPage: DocumentViewPage | undefined = currentPage) => {
     if (!doc?.id) return false
     setRestoringPdf(true)
     try {
       const result = await window.api.restorePdfForDocument(doc.id, manualPath)
       if (result?.restored) {
-        message.success('PDF 原图已补回，可以继续原图校对')
-        await refreshDocumentKeepPage(currentPage?.id)
+        const pageReady = await cacheRestoredPdfCurrentPage(result.path, targetPage)
+        message.success(pageReady ? 'PDF 原图已补回，当前页预览已恢复' : 'PDF 原图已补回，可以继续原图校对')
+        await refreshDocumentKeepPage(targetPage?.id || currentPage?.id)
         return true
       }
       message.warning(result?.error || '未能补回 PDF 原图')
@@ -3069,6 +3211,11 @@ export default function DocumentView({
   const switchDocumentMode = async (nextMode: DocumentMode) => {
     if (nextMode === documentMode) return
     documentModeTouchedRef.current = true
+    const switchSerial = ++documentModeSwitchSerialRef.current
+    if (readerSaveTimerRef.current) {
+      window.clearTimeout(readerSaveTimerRef.current)
+      readerSaveTimerRef.current = null
+    }
     const activeSearchMatch = currentMatchIndex >= 0
       ? (shouldUseTextReaderMode ? textReaderMatches[currentMatchIndex] : searchMatches[currentMatchIndex])
       : null
@@ -3079,12 +3226,14 @@ export default function DocumentView({
       pageCount,
     )
     if (nextMode === 'proof' && isTextOnlyPdf) {
-      const restored = await handleRestorePdfAsset()
+      const restored = await handleRestorePdfAsset(undefined, sortedPages[syncedPageIndex] || currentPage)
+      if (documentModeSwitchSerialRef.current !== switchSerial) return
       if (!restored) {
         message.warning('Unable to restore original PDF automatically')
         return
       }
     }
+    if (documentModeSwitchSerialRef.current !== switchSerial) return
     setCurrentPageIndex(syncedPageIndex)
     if (nextMode === 'proof' && activeSearchMatch) {
       setActiveBoxIndex(activeSearchMatch.boxIndex)
@@ -3105,7 +3254,7 @@ export default function DocumentView({
     const nextState = nextMode === 'proof'
       ? buildProofReaderState(syncedPageIndex)
       : buildPageReaderState(syncedPageIndex)
-    if (nextState && readerStateReady) saveReaderStateSoon(nextState)
+    if (nextState && readerStateReady) saveReaderStateNow(nextState)
   }
 
   const handleRerunCurrentPageOcr = async () => {
@@ -4877,6 +5026,7 @@ export default function DocumentView({
                 pageImageSrc={imageDataUrl}
                 pageProofStatus={currentPageProofStatus}
                 activeBoxIndex={activeBoxIndex}
+                activeSearchHitOrdinal={activeProofSearchHitOrdinal}
                 searchKeyword={effectiveSearchKeyword}
                 coordinateSourceSize={coordinateSourceSize}
                 translationText={currentFacsimileTranslationText}

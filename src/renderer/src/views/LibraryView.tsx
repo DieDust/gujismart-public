@@ -187,7 +187,7 @@ function patchLibraryWarmCache(scopeKey: string, patch: Partial<Omit<LibraryWarm
 }
 
 function applyLibraryStateCacheToFolders(folders: Folder[], cache?: LibraryStateCache | null): Folder[] {
-  if (!cache) return folders
+  if (!cache || cache.dirty) return folders
   return folders.map((folder) => ({
     ...folder,
     document_count: Number(cache.folderDocumentCounts[folder.id] ?? folder.document_count ?? 0),
@@ -195,7 +195,7 @@ function applyLibraryStateCacheToFolders(folders: Folder[], cache?: LibraryState
 }
 
 function applyLibraryStateCacheToTags(tags: TagItem[], cache?: LibraryStateCache | null): TagItem[] {
-  if (!cache) return tags
+  if (!cache || cache.dirty) return tags
   return tags.map((tag) => ({
     ...tag,
     usage_count: Number(cache.tagDocumentCounts[tag.id] ?? tag.usage_count ?? 0),
@@ -737,10 +737,11 @@ function parseDocMetadata(doc: Pick<DocumentItem, 'metadata'>): DocumentMetadata
 }
 
 function getPdfAssetState(doc: DocumentItem): 'available' | 'text_only' | 'unknown' {
+  const verifiedState = String(doc.pdf_asset_state || '').trim()
+  if (verifiedState === 'available' || verifiedState === 'text_only' || verifiedState === 'unknown') return verifiedState
   const metadata = parseDocMetadata(doc)
   const state = String(metadata.pdf_asset_state || '').trim()
   if (state === 'available' || state === 'text_only') return state
-  if ((doc.file_path || '').toLowerCase().endsWith('.pdf')) return 'available'
   if (metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count) return 'text_only'
   return 'unknown'
 }
@@ -828,7 +829,7 @@ function getPdfAssetTagMeta(doc: DocumentItem): { text: string; color: string; t
     return { text: '有原文', color: 'green', title: '软件目录中保留了 PDF 原文件或可用原图' }
   }
   if (state === 'text_only') {
-    return { text: '仅文本', color: 'orange', title: '本地 PDF 原文件/页图已清理，可从原件仓库补回' }
+    return { text: '仅文本', color: 'orange', title: '本地 PDF 原文件或页图不可读，可从原件仓库或手动选择 PDF 补回' }
   }
   return { text: '原文未知', color: 'default', title: '未记录 PDF 原文件状态' }
 }
@@ -1146,6 +1147,23 @@ function renderDocumentHealthTags(doc: DocumentItem) {
       </Tag>
     </Tooltip>
   ))
+}
+
+function renderTagSummaryPopover(items: Array<import('react').ReactNode>, overflowLabel: string) {
+  if (items.length === 0) return null
+  return (
+    <Popover
+      trigger="click"
+      title="更多"
+      content={(
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 280 }}>
+          {items}
+        </div>
+      )}
+    >
+      <Tag style={{ margin: 0, cursor: 'pointer', flexShrink: 0 }}>{overflowLabel}</Tag>
+    </Popover>
+  )
 }
 
 function getTagKind(tag: { color?: string | null; source?: string | null }): TagSemanticKind {
@@ -2344,7 +2362,10 @@ export default function LibraryView({
 
     importListRefreshTimerRef.current = window.setTimeout(() => {
       importListRefreshTimerRef.current = null
-      void loadDocuments(filter, { silent: true })
+      listOffsetRef.current = 0
+      listHasMoreRef.current = false
+      setListHasMore(false)
+      void loadDocuments(filter, { reset: true, silent: true })
     }, delayMs)
   }, [filter, loadDocuments])
 
@@ -2475,6 +2496,7 @@ export default function LibraryView({
             return rest
           })
         }, data.errorMessage ? 30000 : 1200)
+        scheduleImportListRefresh()
       }
 
       if (data.phase === 'ai' && data.aiStatus === 'completed') {
@@ -2531,7 +2553,7 @@ export default function LibraryView({
     if (events.some(isImmediateOcrProgressEvent)) {
       scheduleHealthReportRefresh()
     }
-  }, [scheduleBaseDataRefresh, scheduleHealthReportRefresh, updateDocumentsInList])
+  }, [scheduleBaseDataRefresh, scheduleHealthReportRefresh, scheduleImportListRefresh, updateDocumentsInList])
 
   useEffect(() => {
     void loadBaseData()
@@ -4633,14 +4655,12 @@ export default function LibraryView({
       return
     }
 
-    Modal.confirm({
-      title: '重新 OCR 所选文献',
-      content: `将用${getOcrEngineLabel(engine)}覆盖 ${targetCount} 篇文献的整本 OCR 结果，已校对文本也会清空。`,
-      okText: '重新 OCR',
-      cancelText: '取消',
-      okButtonProps: { danger: true },
-      onOk: () => handleBatchOcr(engine, { forceFullRerun: true }),
+    message.info({
+      content: `已开始用${getOcrEngineLabel(engine)}重新 OCR ${targetCount} 篇文献，会覆盖整本 OCR 结果并清空已校对文本。`,
+      key: 'batch-ocr-rerun-start',
+      duration: 4,
     })
+    void handleBatchOcr(engine, { forceFullRerun: true })
   }
 
   const handleBatchMetadataExtract = async () => {
@@ -4760,38 +4780,29 @@ export default function LibraryView({
   }
 
   const handleForceRerunDocument = async (doc: DocumentItem, engine: OcrEngine) => {
-    Modal.confirm({
-      title: '重新 OCR 整本文献',
-      content: `将用${getOcrEngineLabel(engine)}覆盖“${doc.title || '未命名文献'}”的整本 OCR 结果，已校对文本也会清空。`,
-      okText: '重新 OCR',
-      cancelText: '取消',
-      okButtonProps: { danger: true },
-      onOk: async () => {
-        const hasConfig = await hasOcrEngineConfig(engine)
-        if (!hasConfig) {
-          message.warning(engine === 'vision_model'
-            ? '请先在设置页配置视觉模型 OCR 的端点、API Key 和模型 ID。'
-            : engine === 'hybrid'
-            ? '混合 OCR 需要同时配置 PaddleOCR Token 和视觉模型 OCR。'
-            : '请先在设置页配置 PaddleOCR API Token。')
-          return
-        }
+    const hasConfig = await hasOcrEngineConfig(engine)
+    if (!hasConfig) {
+      message.warning(engine === 'vision_model'
+        ? '请先在设置页配置视觉模型 OCR 的端点、API Key 和模型 ID。'
+        : engine === 'hybrid'
+        ? '混合 OCR 需要同时配置 PaddleOCR Token 和视觉模型 OCR。'
+        : '请先在设置页配置 PaddleOCR API Token。')
+      return
+    }
 
-        message.loading({ content: `正在用${getOcrEngineLabel(engine)}重新 OCR“${doc.title || '未命名文献'}”…`, key: `rerun-ocr-${doc.id}`, duration: 0 })
-        try {
-          const successCount = await runOcrInConfiguredBatches([doc.id], engine, `rerun-ocr-${doc.id}`, { forceFullRerun: true })
-          if (successCount > 0) {
-            message.success({ content: '整本文献已重新 OCR', key: `rerun-ocr-${doc.id}` })
-          } else {
-            message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: `rerun-ocr-${doc.id}`, duration: 5 })
-          }
-        } catch (error) {
-          console.error(error)
-          message.error({ content: `重新 OCR 失败：${(error as Error)?.message || '未知错误'}`, key: `rerun-ocr-${doc.id}`, duration: 6 })
-          await loadDocuments(filter, { silent: true })
-        }
-      },
-    })
+    message.loading({ content: `正在用${getOcrEngineLabel(engine)}重新 OCR“${doc.title || '未命名文献'}”…`, key: `rerun-ocr-${doc.id}`, duration: 0 })
+    try {
+      const successCount = await runOcrInConfiguredBatches([doc.id], engine, `rerun-ocr-${doc.id}`, { forceFullRerun: true })
+      if (successCount > 0) {
+        message.success({ content: '整本文献已重新 OCR', key: `rerun-ocr-${doc.id}` })
+      } else {
+        message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: `rerun-ocr-${doc.id}`, duration: 5 })
+      }
+    } catch (error) {
+      console.error(error)
+      message.error({ content: `重新 OCR 失败：${(error as Error)?.message || '未知错误'}`, key: `rerun-ocr-${doc.id}`, duration: 6 })
+      await loadDocuments(filter, { silent: true })
+    }
   }
 
   const handleRetryFailedDocuments = async () => {
@@ -5867,9 +5878,12 @@ export default function LibraryView({
           style={viewMode === 'grid'
             ? {
                 display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
+                gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 340px))',
                 gap: 12,
-                padding: 12,
+                padding: 14,
+                justifyContent: 'start',
+                alignContent: 'start',
+                alignItems: 'start',
                 overflow: 'auto'
               }
             : undefined}
@@ -5926,9 +5940,17 @@ export default function LibraryView({
                 source: docTagSources[index]
               }))).filter((tagItem) => !!getDisplayTagText(tagItem.name))
               const availableFolders = folderItems.filter((item) => !docFolderIds.includes(item.id))
-              const visibleTagCount = viewMode === 'grid' ? 4 : 6
+              const visibleTagCount = viewMode === 'grid'
+                ? (docFolderNames.length > 0 ? 1 : 2)
+                : 6
               const visibleTags = orderedDocTags.slice(0, visibleTagCount)
               const hiddenTags = orderedDocTags.slice(visibleTagCount)
+              const visibleFolderEntries = viewMode === 'grid'
+                ? docFolderNames.slice(0, 1)
+                : docFolderNames
+              const hiddenFolderEntries = viewMode === 'grid'
+                ? docFolderNames.slice(1)
+                : []
               const displayAuthor = getDisplayMetadataText(doc.author)
               const displayDynasty = getDisplayMetadataText(doc.dynasty)
               const progressInfo = ocrProgressByDoc[doc.id]
@@ -6114,13 +6136,14 @@ export default function LibraryView({
                     style={{
                       display: 'flex',
                       flexDirection: 'column',
-                      padding: 14,
+                      padding: 12,
                       border: '1px solid rgba(255,255,255,0.08)',
                       borderRadius: 8,
                       background: isSelected ? 'rgba(24, 144, 255, 0.15)' : 'rgba(255,255,255,0.03)',
                       cursor: 'pointer',
                       transition: 'background 0.15s ease',
-                      minHeight: 188
+                      minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) ? 176 : 140,
+                      overflow: 'hidden'
                     }}
                     onMouseEnter={(event) => {
                       if (!isSelected) {
@@ -6132,91 +6155,193 @@ export default function LibraryView({
                         event.currentTarget.style.background = 'rgba(255,255,255,0.03)'
                       }
                     }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-                    {batchMode ? (
-                      <div
-                        style={{
-                          width: 18,
-                          height: 18,
-                          borderRadius: 4,
-                          border: isSelected ? '2px solid #1890ff' : '2px solid rgba(255,255,255,0.3)',
-                          background: isSelected ? '#1890ff' : 'transparent',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          marginTop: 2,
-                          flexShrink: 0
-                        }}
-                      >
-                        {isSelected ? <span style={{ color: '#fff', fontSize: 11 }}>✓</span> : null}
-                      </div>
-                    ) : null}
-
-                    <div
-                      style={{
-                        width: 34,
-                        height: 34,
-                        borderRadius: 8,
-                        background: 'rgba(255,255,255,0.06)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontSize: 16,
-                        fontWeight: 600,
-                        flexShrink: 0
-                      }}
                     >
-                      {getDocIcon(doc.doc_type)}
-                    </div>
-
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                      {batchMode ? (
                         <div
                           style={{
-                            flex: 1,
-                            minWidth: 0,
-                            fontSize: 14,
-                            fontWeight: 600,
-                            color: 'var(--gs-text-primary)',
-                            whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis'
+                            width: 18,
+                            height: 18,
+                            borderRadius: 4,
+                            border: isSelected ? '2px solid #1890ff' : '2px solid rgba(255,255,255,0.3)',
+                            background: isSelected ? '#1890ff' : 'transparent',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            flexShrink: 0
                           }}
                         >
-                          {doc.title || '未命名文献'}
+                          {isSelected ? <span style={{ color: '#fff', fontSize: 11 }}>✓</span> : null}
                         </div>
+                      ) : null}
+                      <div
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          fontSize: 14,
+                          fontWeight: 600,
+                          color: 'var(--gs-text-primary)',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis'
+                        }}
+                      >
+                        {doc.title || '未命名文献'}
                       </div>
+                    </div>
 
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 8px', marginTop: 6, color: 'var(--gs-text-secondary)', fontSize: 12 }}>
-                        {displayAuthor ? <span>{displayAuthor}</span> : null}
-                        {displayDynasty ? <span>{displayDynasty}</span> : null}
-                        <span>{getEffectivePageCount(doc)} 页</span>
-                        <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0 }}>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 8, minWidth: 0 }}>
+                        <span
+                          style={{
+                            minWidth: 0,
+                            maxWidth: '100%',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                            color: 'var(--gs-text-secondary)',
+                            fontSize: 12,
+                            lineHeight: '22px',
+                            flex: '1 1 100%',
+                          }}
+                        >
+                          {[displayAuthor, displayDynasty, `${getEffectivePageCount(doc)} 页`].filter(Boolean).join(' · ')}
+                        </span>
+                        <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
                           {getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).text}
                         </Tag>
-                        <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0 }}>
+                        <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
                           {getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).text}
                         </Tag>
-                        {renderPdfAssetTag(doc)}
-                        {renderDocumentHealthTags(doc)}
-                        <Tag color={READ_STATUS_MAP[doc.read_status]?.color || 'default'} style={{ margin: 0 }}>
-                          {READ_STATUS_MAP[doc.read_status]?.text || doc.read_status}
-                        </Tag>
-                        <Tag color={METADATA_STATUS_MAP[doc.metadata_status]?.color || 'default'} style={{ margin: 0 }}>
-                          {METADATA_STATUS_MAP[doc.metadata_status]?.text || doc.metadata_status}
-                        </Tag>
-                        {typeof doc.rating === 'number' && doc.rating > 0 ? (
-                          <Tag color="gold" style={{ margin: 0 }}>{renderRatingStars(doc.rating)}</Tag>
+                        {!batchMode ? (
+                          <div
+                            data-library-document-action="true"
+                            style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'flex-end',
+                            gap: 2,
+                            minWidth: 0,
+                            maxWidth: 174,
+                            flexWrap: 'nowrap',
+                            overflow: 'hidden'
+                          }}
+                          onPointerDown={stopLibraryDocumentActionPropagation}
+                          onMouseDown={stopLibraryDocumentActionPropagation}
+                          onClick={stopLibraryDocumentActionPropagation}
+                        >
+                          {shouldShowRetryAction(doc) ? (
+                            <Tooltip title={getRetryActionLabel(doc)}>
+                              <Button
+                                type="text"
+                                size="small"
+                                icon={<ReloadOutlined />}
+                                style={{ width: 24, height: 24, padding: 0 }}
+                                onClick={() => void handleRetryDocument(doc)}
+                              />
+                            </Tooltip>
+                          ) : null}
+
+                          <Tooltip title={doc.is_favorite ? '取消星标' : '加入星标'}>
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={doc.is_favorite ? <StarFilled style={{ color: '#faad14' }} /> : <StarOutlined />}
+                              style={{ width: 24, height: 24, padding: 0 }}
+                              onClick={() => void handleToggleFavorite(doc)}
+                            />
+                          </Tooltip>
+
+                          <Dropdown
+                            menu={{
+                              items: readMenuItems,
+                              onClick: ({ key }) => void handleSetReadStatus(doc.id, key as ReadStatus)
+                            }}
+                          >
+                            <Button type="text" size="small" icon={getReadStatusIcon(doc.read_status)} style={{ width: 24, height: 24, padding: 0 }} />
+                          </Dropdown>
+
+                          <Popover
+                            open={taggingDocId === doc.id}
+                            onOpenChange={(open) => {
+                              if (open) {
+                                setTaggingDocId(doc.id)
+                                setTaggingChecked(docTagIds)
+                              } else {
+                                setTaggingDocId(null)
+                              }
+                            }}
+                            trigger="click"
+                            title="标签"
+                            content={(
+                              <div style={{ minWidth: 180, maxWidth: 280 }}>
+                                {tags.length === 0 ? (
+                                  <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>还没有标签，请先创建</span>
+                                ) : (
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                                    {sortedSidebarTags.map((item) => {
+                                      const checked = taggingChecked.includes(item.id)
+                                      return (
+                                        <Tooltip key={item.id} title={getTooltipTitle(item.name, 18)}>
+                                          <Tag
+                                            color={checked ? TAG_KIND_META[getTagKind(item)].color : undefined}
+                                            style={{
+                                              cursor: 'pointer',
+                                              margin: 0,
+                                              opacity: checked ? 1 : 0.6,
+                                              maxWidth: 220,
+                                              overflow: 'hidden',
+                                              whiteSpace: 'nowrap',
+                                              textOverflow: 'ellipsis',
+                                              border: checked
+                                                ? `1px solid ${item.color || '#1677ff'}`
+                                                : '1px solid rgba(255,255,255,0.2)'
+                                            }}
+                                            onClick={() => {
+                                              const nextChecked = checked
+                                                ? taggingChecked.filter((id) => id !== item.id)
+                                                : [...taggingChecked, item.id]
+                                              void handleTaggingChange(doc.id, nextChecked)
+                                            }}
+                                          >
+                                            {checked ? '✓ ' : ''}{truncateLabel(item.name, 18)}
+                                          </Tag>
+                                        </Tooltip>
+                                      )
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          >
+                            <Button type="text" size="small" icon={<TagOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
+                          </Popover>
+
+                          <Dropdown menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
+                            <Button type="text" size="small" icon={<MoreOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
+                          </Dropdown>
+
+                          <Popconfirm
+                            title="删除文献"
+                            description="确定要删除这篇文献吗？"
+                            onConfirm={(event) => void handleDelete(event ?? { stopPropagation() {} }, doc.id)}
+                            onCancel={(event) => event?.stopPropagation()}
+                            okText="删除"
+                            cancelText="取消"
+                          >
+                            <Button type="text" danger size="small" icon={<DeleteOutlined />} style={{ width: 24, height: 24, padding: 0 }} onClick={(event) => event.stopPropagation()} />
+                          </Popconfirm>
+                          </div>
                         ) : null}
                       </div>
 
-                      {docFolderNames.length > 0 ? (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                          {docFolderNames.map((name, index) => (
+                    {(docFolderNames.length > 0 || visibleTags.length > 0) ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, minWidth: 0, height: 24, maxHeight: 24, whiteSpace: 'nowrap', overflow: 'hidden' }}>
+                        {docFolderNames.length > 0 ? (
+                          <>
+                          {visibleFolderEntries.map((name, index) => (
                             <Tag
                               key={`${doc.id}-folder-${docFolderIds[index] || index}`}
-                              style={{ margin: 0, cursor: 'pointer' }}
+                              style={{ margin: 0, cursor: 'pointer', maxWidth: 110, height: 22, lineHeight: '20px', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis', flexShrink: 0 }}
                               onClick={(event) => {
                                 event.stopPropagation()
                                 void applyLibraryFilter({ type: 'folder', value: docFolderIds[index] })
@@ -6225,220 +6350,115 @@ export default function LibraryView({
                               {name}
                             </Tag>
                           ))}
-                        </div>
-                      ) : null}
-
-                      {shouldShowDocumentErrorMessage(doc, progressInfo) ? (
-                        <div
-                          style={{
-                            marginTop: 8,
-                            padding: '6px 8px',
-                            borderRadius: 6,
-                            background: 'rgba(255, 77, 79, 0.10)',
-                            border: '1px solid rgba(255, 77, 79, 0.22)',
-                            color: '#ffccc7',
-                            fontSize: 12,
-                            lineHeight: 1.5,
-                          }}
-                        >
-                          失败原因：{doc.error_message}
-                        </div>
-                      ) : null}
-
-                      {shouldShowOcrProgressForDocument(doc, progressInfo) ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
-                      {renderBookTranslationProgress(bookTranslationProgressInfo)}
-
-                      {visibleTags.length > 0 ? (
-                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
-                          {visibleTags.map((tagItem) => {
-                            const tagText = getDisplayTagText(tagItem.name) || tagItem.name
-                            return (
-                            <Tooltip
-                              key={`${doc.id}-tag-${tagItem.id || tagItem.name}`}
-                              title={getTooltipTitle(tagText, viewMode === 'grid' ? 16 : 22)}
-                            >
-                              <Tag
-                                color={TAG_KIND_META[getTagKind(tagItem)].color}
-                                style={{
-                                  margin: 0,
-                                  cursor: 'pointer',
-                                  maxWidth: viewMode === 'grid' ? 180 : 220,
-                                  overflow: 'hidden',
-                                  whiteSpace: 'nowrap',
-                                  textOverflow: 'ellipsis'
-                                }}
-                                onClick={(event) => {
-                                  event.stopPropagation()
-                                  if (tagItem.id) {
-                                    void toggleTagFilter(tagItem.id)
-                                  }
-                                }}
-                              >
-                                {truncateLabel(tagText, viewMode === 'grid' ? 16 : 22)}
-                              </Tag>
-                            </Tooltip>
-                            )
-                          })}
-                          {hiddenTags.length > 0 ? (
-                            <Popover
-                              trigger="click"
-                              title="其余标签"
-                              content={(
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 320 }}>
-                                  {hiddenTags.map((tagItem) => {
-                                    const tagText = getDisplayTagText(tagItem.name) || tagItem.name
-                                    return (
-                                    <Tooltip
-                                      key={`${doc.id}-hidden-${tagItem.id || tagItem.name}`}
-                                      title={getTooltipTitle(tagText, 22)}
-                                    >
-                                      <Tag
-                                        color={TAG_KIND_META[getTagKind(tagItem)].color}
-                                        style={{
-                                          margin: 0,
-                                          cursor: 'pointer',
-                                          maxWidth: 220,
-                                          overflow: 'hidden',
-                                          whiteSpace: 'nowrap',
-                                          textOverflow: 'ellipsis'
-                                        }}
-                                        onClick={(event) => {
-                                          event.stopPropagation()
-                                          if (tagItem.id) {
-                                            void toggleTagFilter(tagItem.id)
-                                          }
-                                        }}
-                                      >
-                                        {truncateLabel(tagText, 22)}
-                                      </Tag>
-                                    </Tooltip>
-                                    )
-                                  })}
-                                </div>
-                              )}
-                            >
-                              <Tag
-                                style={{ margin: 0, cursor: 'pointer' }}
-                                onClick={(event) => event.stopPropagation()}
-                              >
-                                +{hiddenTags.length}
-                              </Tag>
-                            </Popover>
+                          {hiddenFolderEntries.length > 0 ? renderTagSummaryPopover(
+                            hiddenFolderEntries.map((name, index) => (
+                              <Tag key={`${doc.id}-hidden-folder-${docFolderIds[index + visibleFolderEntries.length] || index}`} style={{ margin: 0 }}>{name}</Tag>
+                            )),
+                            `+${hiddenFolderEntries.length}`,
                           ) : null}
-                        </div>
-                      ) : null}
-                    </div>
-
-                    {!batchMode ? (
-                      <div
-                        data-library-document-action="true"
-                        style={{ display: 'flex', alignItems: 'center', gap: 4 }}
-                        onPointerDown={stopLibraryDocumentActionPropagation}
-                        onMouseDown={stopLibraryDocumentActionPropagation}
-                        onClick={stopLibraryDocumentActionPropagation}
-                      >
-                        {shouldShowRetryAction(doc) ? (
-                          <Tooltip title={getRetryActionLabel(doc)}>
-                            <Button
-                              type="text"
-                              size="small"
-                              icon={<ReloadOutlined />}
-                              onClick={() => void handleRetryDocument(doc)}
-                            />
-                          </Tooltip>
+                          </>
                         ) : null}
 
-                        <Tooltip title={doc.is_favorite ? '取消星标' : '加入星标'}>
-                          <Button
-                            type="text"
-                            size="small"
-                            icon={doc.is_favorite ? <StarFilled style={{ color: '#faad14' }} /> : <StarOutlined />}
-                            onClick={() => void handleToggleFavorite(doc)}
-                          />
-                        </Tooltip>
-
-                        <Dropdown
-                          menu={{
-                            items: readMenuItems,
-                            onClick: ({ key }) => void handleSetReadStatus(doc.id, key as ReadStatus)
-                          }}
-                        >
-                          <Button type="text" size="small" icon={getReadStatusIcon(doc.read_status)} />
-                        </Dropdown>
-
-                        <Popover
-                          open={taggingDocId === doc.id}
-                          onOpenChange={(open) => {
-                            if (open) {
-                              setTaggingDocId(doc.id)
-                              setTaggingChecked(docTagIds)
-                            } else {
-                              setTaggingDocId(null)
-                            }
-                          }}
-                          trigger="click"
-                          title="标签"
-                          content={(
-                            <div style={{ minWidth: 180, maxWidth: 280 }}>
-                              {tags.length === 0 ? (
-                                <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>还没有标签，请先创建</span>
-                              ) : (
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                  {sortedSidebarTags.map((item) => {
-                                    const checked = taggingChecked.includes(item.id)
-                                    return (
-                                      <Tooltip key={item.id} title={getTooltipTitle(item.name, 18)}>
-                                        <Tag
-                                          color={checked ? TAG_KIND_META[getTagKind(item)].color : undefined}
-                                          style={{
-                                            cursor: 'pointer',
-                                            margin: 0,
-                                            opacity: checked ? 1 : 0.6,
-                                            maxWidth: 220,
-                                            overflow: 'hidden',
-                                            whiteSpace: 'nowrap',
-                                            textOverflow: 'ellipsis',
-                                            border: checked
-                                              ? `1px solid ${item.color || '#1677ff'}`
-                                              : '1px solid rgba(255,255,255,0.2)'
-                                          }}
-                                          onClick={() => {
-                                            const nextChecked = checked
-                                              ? taggingChecked.filter((id) => id !== item.id)
-                                              : [...taggingChecked, item.id]
-                                            void handleTaggingChange(doc.id, nextChecked)
-                                          }}
-                                        >
-                                          {checked ? '鉁?' : ''}{truncateLabel(item.name, 18)}
-                                        </Tag>
-                                      </Tooltip>
-                                    )
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          )}
-                        >
-                          <Button type="text" size="small" icon={<TagOutlined />} />
-                        </Popover>
-
-                        <Dropdown menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
-                          <Button type="text" size="small" icon={<MoreOutlined />} />
-                        </Dropdown>
-
-                        <Popconfirm
-                          title="删除文献"
-                          description="确定要删除这篇文献吗？"
-                          onConfirm={(event) => void handleDelete(event ?? { stopPropagation() {} }, doc.id)}
-                          onCancel={(event) => event?.stopPropagation()}
-                          okText="删除"
-                          cancelText="取消"
-                        >
-                          <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={(event) => event.stopPropagation()} />
-                        </Popconfirm>
+                        {visibleTags.map((tagItem) => {
+                          const tagText = getDisplayTagText(tagItem.name) || tagItem.name
+                          return (
+                          <Tooltip
+                            key={`${doc.id}-tag-${tagItem.id || tagItem.name}`}
+                            title={getTooltipTitle(tagText, viewMode === 'grid' ? 12 : 22)}
+                          >
+                            <Tag
+                              color={TAG_KIND_META[getTagKind(tagItem)].color}
+                              style={{
+                                margin: 0,
+                                cursor: 'pointer',
+                                maxWidth: viewMode === 'grid' ? 92 : 220,
+                                height: 22,
+                                lineHeight: '20px',
+                                overflow: 'hidden',
+                                whiteSpace: 'nowrap',
+                                textOverflow: 'ellipsis',
+                                flexShrink: 0
+                              }}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                if (tagItem.id) {
+                                  void toggleTagFilter(tagItem.id)
+                                }
+                              }}
+                            >
+                              {truncateLabel(tagText, viewMode === 'grid' ? 12 : 22)}
+                            </Tag>
+                          </Tooltip>
+                          )
+                        })}
+                        {hiddenTags.length > 0 ? (
+                          <Popover
+                            trigger="click"
+                            title="其余标签"
+                            content={(
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 320 }}>
+                                {hiddenTags.map((tagItem) => {
+                                  const tagText = getDisplayTagText(tagItem.name) || tagItem.name
+                                  return (
+                                  <Tooltip
+                                    key={`${doc.id}-hidden-${tagItem.id || tagItem.name}`}
+                                    title={getTooltipTitle(tagText, 22)}
+                                  >
+                                    <Tag
+                                      color={TAG_KIND_META[getTagKind(tagItem)].color}
+                                      style={{
+                                        margin: 0,
+                                        cursor: 'pointer',
+                                        maxWidth: 220,
+                                        overflow: 'hidden',
+                                        whiteSpace: 'nowrap',
+                                        textOverflow: 'ellipsis'
+                                      }}
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        if (tagItem.id) {
+                                          void toggleTagFilter(tagItem.id)
+                                        }
+                                      }}
+                                    >
+                                      {truncateLabel(tagText, 22)}
+                                    </Tag>
+                                  </Tooltip>
+                                  )
+                                })}
+                              </div>
+                            )}
+                          >
+                            <Tag
+                              style={{ margin: 0, cursor: 'pointer', flexShrink: 0 }}
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              +{hiddenTags.length}
+                            </Tag>
+                          </Popover>
+                        ) : null}
                       </div>
                     ) : null}
-                    </div>
+
+                    {shouldShowDocumentErrorMessage(doc, progressInfo) ? (
+                      <div
+                        style={{
+                          marginTop: 8,
+                          padding: '6px 8px',
+                          borderRadius: 6,
+                          background: 'rgba(255, 77, 79, 0.10)',
+                          border: '1px solid rgba(255, 77, 79, 0.22)',
+                          color: '#ffccc7',
+                          fontSize: 12,
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        失败原因：{doc.error_message}
+                      </div>
+                    ) : null}
+
+                    {shouldShowOcrProgressForDocument(doc, progressInfo) ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
+                    {renderBookTranslationProgress(bookTranslationProgressInfo)}
                   </div>
                 </Dropdown>
               )

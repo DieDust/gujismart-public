@@ -5,6 +5,7 @@ import { join, extname } from 'path'
 import { existsSync, readdirSync, statSync } from 'fs'
 import type { BulkAssociationResult, Document, Folder, FolderCreatePayload, FolderImportFile, FolderUpdatePayload } from '../../shared/types'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { buildCumulativeFolderDocumentCounts, resolveFolderAndDescendantIds } from '../folder-scope'
 
 const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
   '.pdf',
@@ -151,14 +152,9 @@ function collectSupportedFolderFiles(dirPath: string): FolderImportFile[] {
 
 export function registerFolderIpc(): void {
   ipcMain.handle('folders:list', async (): Promise<Folder[]> => {
-    return queryAll<Folder>(
-      `SELECT f.*,
-        COUNT(DISTINCT df.doc_id) AS document_count
-       FROM folders f
-       LEFT JOIN document_folders df ON df.folder_id = f.id
-       GROUP BY f.id
-       ORDER BY f.sort_order, f.created_at`,
-    )
+    const counts = buildCumulativeFolderDocumentCounts()
+    return queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order, created_at')
+      .map((folder) => ({ ...folder, document_count: counts[folder.id] || 0 }))
   })
 
   ipcMain.handle('folders:get', async (_event, id: string): Promise<Folder | null> => {
@@ -283,9 +279,15 @@ export function registerFolderIpc(): void {
   })
 
   ipcMain.handle('folders:getDocuments', async (_event, folderId: string): Promise<Document[]> => {
+    const folderIds = resolveFolderAndDescendantIds([folderId])
+    if (folderIds.length === 0) return []
     return queryAll<Document>(
-      'SELECT d.* FROM documents d INNER JOIN document_folders df ON d.id = df.doc_id WHERE df.folder_id = ? ORDER BY d.updated_at DESC',
-      [folderId]
+      `SELECT DISTINCT d.*
+       FROM documents d
+       INNER JOIN document_folders df ON d.id = df.doc_id
+       WHERE df.folder_id IN (${folderIds.map(() => '?').join(', ')})
+       ORDER BY d.updated_at DESC`,
+      folderIds
     )
   })
 

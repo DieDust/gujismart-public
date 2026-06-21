@@ -1,5 +1,6 @@
 ﻿import { app, BrowserWindow, dialog, net, protocol, shell } from 'electron'
-import { join } from 'path'
+import { join, resolve } from 'path'
+import { pathToFileURL } from 'url'
 import { is } from '@electron-toolkit/utils'
 import { closeDatabase, initDatabase, isLargeLibraryForAutomaticMaintenance, listStoredLocalResourcePaths, resolveProfileDir, runDeferredStartupDatabaseMaintenance } from './database'
 import { registerAllIpcHandlers } from './ipc'
@@ -60,9 +61,11 @@ function installConsolePipeGuards(): void {
 
 installConsolePipeGuards()
 
-const profileRoot = is.dev
-  ? join(process.cwd(), 'data', 'profile')
-  : resolveProfileDir()
+const profileRoot = process.env.GUJISMART_PROFILE_DIR
+  ? resolve(process.env.GUJISMART_PROFILE_DIR)
+  : is.dev
+    ? join(process.cwd(), 'data', 'profile')
+    : resolveProfileDir()
 
 if (!existsSync(profileRoot)) {
   mkdirSync(profileRoot, { recursive: true })
@@ -324,8 +327,7 @@ app.whenReady()
   .then(async () => {
     protocol.handle('local-resource', (request) => {
       const filePath = assertAllowedLocalResourceUrl(request.url)
-      const fileUrl = `file:///${filePath.replace(/\\/g, '/')}`
-      return net.fetch(fileUrl)
+      return net.fetch(pathToFileURL(filePath).toString())
     })
 
     await initDatabase()

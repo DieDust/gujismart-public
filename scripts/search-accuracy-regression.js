@@ -166,8 +166,20 @@ function assertCase(search, docIds, testCase) {
 
 function clearSearchIndexForDocuments(database, search, docIds) {
   for (const docId of docIds) {
-    database.run('DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
-    database.run('DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
+    database.run(
+      `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+       SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [docId],
+    )
+    database.run(
+      `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+       SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [docId],
+    )
     database.run('DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
     database.run('DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
     database.run(

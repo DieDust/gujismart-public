@@ -50,6 +50,7 @@ let startupRecoveryCancelRequested = false
 const RECOVERABLE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp'])
 const ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL = 4
 const STARTUP_PDF_PAGE_RECORD_INIT_LIMIT = 1000
+const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
 
@@ -535,6 +536,7 @@ async function removeOrphanStorageDirs(): Promise<number> {
   let removed = 0
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    if (RESERVED_STORAGE_DIR_NAMES.has(entry.name)) continue
     if (knownDocIds.has(entry.name)) continue
     await rm(join(storageRoot, entry.name), { recursive: true, force: true })
     removed += 1

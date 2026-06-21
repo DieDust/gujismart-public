@@ -23,6 +23,7 @@ import {
 import { emitBackgroundTaskStatus } from '../background-tasks'
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged } from '../semantic-search'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
+import { hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { hasVisionOcrConfig, recognizePagesWithVisionModel, refinePagesWithVisionModel } from '../vision-ocr'
 import type { BatchOcrOptions, Document, DocumentPage, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, TocItemV2 } from '../../shared/types'
 
@@ -50,6 +51,8 @@ type OcrSavePageSnapshot = OcrVersionPageRow & {
   proofed_text: string | null
   ocr_text: string | null
   ocr_result: string | null
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
   ocr_status: string | null
 }
 interface OcrVersionWrite {
@@ -567,6 +570,16 @@ function formatBytes(value: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+function formatDurationMs(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 秒'
+  const totalSeconds = Math.max(1, Math.round(value / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes <= 0) return `${seconds} 秒`
+  if (seconds <= 0) return `${minutes} 分钟`
+  return `${minutes} 分 ${seconds} 秒`
+}
+
 function formatOcrError(error: unknown): string {
   if (isOcrAbortError(error)) return OCR_CANCELED_MESSAGE
   const message = (error as Error)?.message || String(error || '')
@@ -795,12 +808,12 @@ function getPageSnapshotsForOcrSave(pageIds: string[]): Map<string, OcrSavePageS
   if (uniquePageIds.length === 0) return new Map()
   const placeholders = uniquePageIds.map(() => '?').join(', ')
   const rows = queryAll<OcrSavePageSnapshot>(
-    `SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_result, ocr_status
+    `SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, ocr_status
      FROM pages
      WHERE id IN (${placeholders})`,
     uniquePageIds,
   )
-  return new Map(rows.map((row) => [row.id, row]))
+  return new Map(hydratePagePayloadRows(rows).map((row) => [row.id, row]))
 }
 
 function markPageOcrVersionsInactive(pageIds: string[]): void {
@@ -825,35 +838,42 @@ function upsertPageOcrVersion(
   if (options.deactivateExisting !== false) {
     markPageOcrVersionsInactive([pageId])
   }
+  const preparedText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', text || '')
+  const preparedResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', result ? JSON.stringify(result) : null)
   run(
     `INSERT INTO page_ocr_versions (
-      id, doc_id, page_id, page_num, engine, label, ocr_text, ocr_result, status, is_active, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, doc_id, page_id, page_num, engine, label, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, status, is_active, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(page_id, engine) DO UPDATE SET
       page_num = excluded.page_num,
       label = excluded.label,
       ocr_text = excluded.ocr_text,
+      ocr_text_ref = excluded.ocr_text_ref,
       ocr_result = excluded.ocr_result,
+      ocr_result_ref = excluded.ocr_result_ref,
       status = excluded.status,
       is_active = excluded.is_active,
       updated_at = excluded.updated_at`,
-    [nanoid(), page.doc_id, pageId, page.page_num || null, engine, getEngineLabel(engine), text || '', result ? JSON.stringify(result) : null, status, 1, now, now],
+    [nanoid(), page.doc_id, pageId, page.page_num || null, engine, getEngineLabel(engine), preparedText.value, preparedText.ref, preparedResult.value, preparedResult.ref, status, 1, now, now],
   )
 }
 
 function updatePageOcrState(pageId: string, result: OcrRecognizeResult, engine: OcrEngine = 'paddle'): void {
-  const page = queryOne<Pick<DocumentPage, 'doc_id'>>('SELECT doc_id FROM pages WHERE id = ?', [pageId])
+  const page = queryOne<OcrVersionPageRow>('SELECT id, doc_id, page_num FROM pages WHERE id = ?', [pageId])
+  if (!page) return
   const repeatedIssue = findSuspiciousRepeatedOcrText(result)
   if (repeatedIssue) {
     throw new Error(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))
   }
   const text = getOcrResultText(result)
+  const preparedText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', text)
+  const preparedResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', result)
   run(
-    'UPDATE pages SET ocr_result = ?, ocr_text = ?, proofed_text = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
-    [JSON.stringify(result), text, null, 'completed', 'pending', pageId],
+    'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, proofed_text = ?, proofed_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
+    [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, null, null, 'completed', 'pending', pageId],
   )
-  upsertPageOcrVersion(pageId, engine, result, text, 'completed')
-  if (page?.doc_id) markDocumentTocDirty(page.doc_id)
+  upsertPageOcrVersion(pageId, engine, result, text, 'completed', page)
+  markDocumentTocDirty(page.doc_id)
 }
 
 function parseMetadata(value: unknown): JsonRecord {
@@ -1076,8 +1096,11 @@ function resetPagesForFullOcrRerun(docId: string): void {
   run(
     `UPDATE pages
      SET ocr_result = NULL,
+         ocr_result_ref = NULL,
          ocr_text = NULL,
+         ocr_text_ref = NULL,
          proofed_text = NULL,
+         proofed_text_ref = NULL,
          ocr_status = ?,
          proof_status = ?
      WHERE doc_id = ?`,
@@ -1294,16 +1317,26 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
       ) {
         continue
       }
+      const preparedResult = existingPage
+        ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_result', resultJson)
+        : { value: resultJson, ref: null }
+      const preparedText = existingPage
+        ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
+        : { value: String(pageResult.text || ''), ref: null }
       run(
         `UPDATE pages
          SET ocr_result = ?,
+             ocr_result_ref = ?,
              ocr_text = ?,
+             ocr_text_ref = ?,
              ocr_status = ?,
              proof_status = CASE WHEN ? THEN proof_status ELSE ? END
          WHERE id = ?`,
         [
-          resultJson,
-          pageResult.text,
+          preparedResult.value,
+          preparedResult.ref,
+          preparedText.value,
+          preparedText.ref,
           pageResult.status,
           hasProofedText ? 1 : 0,
           'pending',
@@ -1728,6 +1761,13 @@ async function processDocumentOcr(
           const isAwaitingAsyncResult = totalPages > 0 && finishedPages >= totalPages
           const hasServerProgress = newlyFinishedPages > 0 || Number(payload.progress || 0) > 0
           const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''
+          const waitingText = payload.waitingMs ? `，已等待 ${formatDurationMs(payload.waitingMs)}` : ''
+          const pollText = payload.pollCount ? `，第 ${payload.pollCount} 次查询` : ''
+          const statusQueryRetryMessage = payload.retryingStatusQuery
+            ? isFullFileUpload
+              ? `PDF 已提交，正在重新查询处理进度${waitingText}${pollText}：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
+              : `PDF 分片已提交，正在重新查询处理进度${waitingText}${pollText}：第 ${payload.chunkIndex || 1}/${payload.totalChunks || 1} 片`
+            : ''
           const asyncProgressMessage = isUploading && isFullFileUpload
             ? `正在上传 PDF：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
             : isUploading
@@ -1763,7 +1803,7 @@ async function processDocumentOcr(
             progress: getDocProgress(getCompleted(), totalDocs, isAwaitingAsyncResult ? 0.97 : docFraction),
             completedPages: finishedPages,
             totalPages,
-            message: fallbackRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue
+            message: fallbackRetryMessage || statusQueryRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue
               ? `排队中：${finishedPages}/${totalPages} 页`
               : isWholePdfFallback && isPreparing
               ? `正在重新提交 PDF：${formatBytes(sourcePdfBytes)}`

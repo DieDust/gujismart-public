@@ -124,6 +124,7 @@ interface GujiFacsimileProofreaderProps {
   pageImageSrc?: string
   pageProofStatus?: 'completed' | 'pending'
   activeBoxIndex?: number
+  activeSearchHitOrdinal?: number
   searchKeyword?: string
   coordinateSourceSize?: { width?: number | null; height?: number | null }
   translationText?: string
@@ -670,6 +671,90 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
   return nextBlocks.sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
 }
 
+function getStackedVerticalBlockKey(block: LayoutBlock): string {
+  const rect = block.__rect
+  if (!rect) return ''
+  const snap = (value: number) => Math.round(value / 2) * 2
+  return [
+    snap(rect.left),
+    snap(rect.top),
+    snap(rect.width),
+    snap(rect.height),
+    getLabel(block),
+  ].join(':')
+}
+
+function splitStackedVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
+  const groups = new Map<string, LayoutBlock[]>()
+  blocks.forEach((block) => {
+    const rect = block.__rect
+    const label = getLabel(block)
+    if (
+      !rect
+      || block.orientation !== 'vertical'
+      || isRenderableTableBlock(block)
+      || isImageLabel(label)
+      || isDecorativeLabel(label)
+      || shouldPreserveVerticalColumns(label)
+      || !getBlockText(block).trim()
+    ) {
+      return
+    }
+    const key = getStackedVerticalBlockKey(block)
+    if (!key) return
+    const current = groups.get(key) || []
+    current.push(block)
+    groups.set(key, current)
+  })
+
+  const movedSourceIndexes = new Set<number>()
+  const replacementBySourceIndex = new Map<number, LayoutBlock[]>()
+  groups.forEach((group) => {
+    if (group.length <= 1) return
+    const firstRect = group[0].__rect
+    if (!firstRect) return
+
+    const normalizedTexts = group.map((block) => normalizeParallelSegmentForMatch(getBlockText(block)))
+    const uniqueTextCount = new Set(normalizedTexts.filter(Boolean)).size
+    if (uniqueTextCount <= 1) {
+      const keep = group.reduce((best, block) => (
+        getTextLength(getBlockText(block)) > getTextLength(getBlockText(best)) ? block : best
+      ), group[0])
+      group.forEach((block) => {
+        if (block === keep) return
+        movedSourceIndexes.add(getBlockSourceIndex(block, -1))
+      })
+      return
+    }
+
+    const columnWidth = firstRect.width / group.length
+    if (columnWidth < 8) return
+    const sortedGroup = [...group].sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
+    sortedGroup.forEach((block, columnIndex) => {
+      const sourceIndex = getBlockSourceIndex(block, columnIndex)
+      const left = firstRect.left + firstRect.width - (columnIndex + 1) * columnWidth
+      replacementBySourceIndex.set(sourceIndex, [{
+        ...block,
+        column_index: Number(block.column_index ?? columnIndex),
+        reading_order: Number(block.reading_order ?? sourceIndex) + columnIndex / 1000,
+        __rect: {
+          left,
+          top: firstRect.top,
+          width: columnWidth,
+          height: firstRect.height,
+        },
+      }])
+      movedSourceIndexes.add(sourceIndex)
+    })
+  })
+
+  const nextBlocks = blocks.flatMap((block, index) => {
+    const sourceIndex = getBlockSourceIndex(block, index)
+    return replacementBySourceIndex.get(sourceIndex) || (movedSourceIndexes.has(sourceIndex) ? [] : [block])
+  })
+  return nextBlocks.sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
+}
+
 function shouldUseImageUnderlay(blocks: LayoutBlock[], pageVerticalMode: boolean): boolean {
   const contentBlocks = blocks.filter((block) => {
     const label = getLabel(block)
@@ -867,6 +952,10 @@ function getVerticalColumns(text: string): string[] {
     .filter(Boolean)
 }
 
+function shouldPreserveVerticalColumns(label: string): boolean {
+  return isTitleLabel(label) || isTocLabel(label)
+}
+
 function getFacsimileLayoutProfile(ocrResult: unknown): FacsimileLayoutProfile {
   const parsed = asOcrResult(ocrResult)
   const sourceType = String(parsed.source_type || '').toLowerCase()
@@ -889,8 +978,8 @@ function getBlockFontWeight(label: string, profile: FacsimileLayoutProfile): num
 
 function getBlockLineHeight(label: string, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile): number {
   if (orientation === 'horizontal') return isTitleLabel(label) ? 1.08 : profile === 'vision' ? 1.18 : 1.24
-  if (isNoteLabel(label)) return 1.02
-  return profile === 'vision' ? 1.04 : 1.08
+  if (isNoteLabel(label)) return profile === 'vision' ? 1.28 : 1.32
+  return profile === 'vision' ? 1.34 : 1.38
 }
 
 type FittedTextLayout = {
@@ -1028,14 +1117,17 @@ function measureTextLayout(rect: BlockRect, text: string, label: string, fontSiz
     }
   }
   const hardColumns = getVerticalColumns(text)
-  const charsPerColumn = Math.max(1, Math.floor(usableHeight / Math.max(1, fontSize * 1.02)))
-  const columns = hardColumns.length > 1
-    ? hardColumns.length
-    : Math.max(1, Math.ceil(length / charsPerColumn))
-  const maxColumnLength = hardColumns.length > 1 ? Math.max(...hardColumns.map((column) => getTextLength(column))) : length
+  if (hardColumns.length <= 1) {
+    const columnCount = Math.max(1, Math.ceil((length * fontSize * 1.02) / usableHeight))
+    return {
+      fittedText: text,
+      overflow: columnCount * fontSize * lineHeight > usableWidth + 0.5,
+    }
+  }
+  const maxColumnLength = Math.max(...hardColumns.map((column) => getTextLength(column)))
   return {
     fittedText: text,
-    overflow: columns * fontSize * lineHeight > usableWidth + 0.5
+    overflow: hardColumns.length * fontSize * lineHeight > usableWidth + 0.5
       || maxColumnLength * fontSize * 1.02 > usableHeight + 0.5,
   }
 }
@@ -1147,17 +1239,12 @@ function mergeSoftLineBreaks(text: string): string {
     .join('\n')
 }
 
-function shouldCollapseVerticalSoftBreaks(rect?: BlockRect | null): boolean {
-  if (!rect) return false
-  return rect.width < 72 || rect.width < rect.height * 0.16
-}
-
-function normalizeDisplayText(text: string, orientation: 'vertical' | 'horizontal', profile: FacsimileLayoutProfile, label: string, rect?: BlockRect | null): string {
+function normalizeDisplayText(text: string, orientation: 'vertical' | 'horizontal', _profile: FacsimileLayoutProfile, label: string, _rect?: BlockRect | null): string {
   const normalized = String(text || '').replace(/\r\n/g, '\n')
   if (orientation === 'vertical') {
     const columns = getVerticalColumns(normalized)
-    if (shouldCollapseVerticalSoftBreaks(rect)) return columns.join('')
-    return columns.join('\n')
+    if (columns.length > 1) return columns.join('\n')
+    return columns.join('')
   }
   if (isTocLabel(label)) {
     return normalized
@@ -1205,31 +1292,79 @@ function renderInlineAnnotations(text: string, keyPrefix: string): ReactNode[] {
   return renderOcrInlineText(text, keyPrefix)
 }
 
-function renderFormattedText(text: string, keyword: string, highlight: boolean): ReactNode {
+function renderFormattedText(text: string, keyword: string, highlight: boolean, activeHitOrdinal = -1): ReactNode {
   const query = String(keyword || '').trim()
   if (!highlight || !query) return renderInlineAnnotations(text, 'text')
   const normalizedText = normalizeSearchText(text)
   const normalizedQuery = normalizeSearchText(query)
-  const index = normalizedText.indexOf(normalizedQuery)
-  if (index < 0) return renderInlineAnnotations(text, 'text')
-  return [
-    ...renderInlineAnnotations(text.slice(0, index), 'before'),
-    <mark key="hit" style={{ background: '#fadb14', color: 'inherit', padding: '0 2px' }}>{text.slice(index, index + query.length)}</mark>,
-    ...renderInlineAnnotations(text.slice(index + query.length), 'after'),
-  ]
+  if (!normalizedText || !normalizedQuery) return renderInlineAnnotations(text, 'text')
+  const nodes: ReactNode[] = []
+  let cursor = 0
+  let hitOrdinal = 0
+  for (;;) {
+    const index = normalizedText.indexOf(normalizedQuery, cursor)
+    if (index < 0) break
+    if (index > cursor) {
+      nodes.push(...renderInlineAnnotations(text.slice(cursor, index), `before-${nodes.length}`))
+    }
+    const end = index + query.length
+    const isActiveHit = hitOrdinal === activeHitOrdinal
+    nodes.push(
+      <mark
+        key={`hit-${hitOrdinal}-${index}`}
+        data-search-hit="true"
+        data-search-active={isActiveHit ? 'true' : undefined}
+        style={{
+          background: isActiveHit ? '#fa8c16' : '#fadb14',
+          color: 'inherit',
+          padding: '0 2px',
+          borderRadius: 2,
+          boxShadow: isActiveHit ? '0 0 0 1px rgba(120, 53, 15, 0.6)' : undefined,
+        }}
+      >
+        {text.slice(index, end)}
+      </mark>,
+    )
+    hitOrdinal += 1
+    cursor = Math.max(end, index + 1)
+  }
+  if (nodes.length === 0) return renderInlineAnnotations(text, 'text')
+  if (cursor < text.length) {
+    nodes.push(...renderInlineAnnotations(text.slice(cursor), `after-${nodes.length}`))
+  }
+  return nodes
 }
 
-function renderFacsimileTable(rows: string[][], keyword: string, highlight: boolean) {
+function renderFacsimileTable(rows: string[][], keyword: string, highlight: boolean, activeHitOrdinal = -1) {
+  let cellHitCursor = 0
   return (
     <table style={{ width: '100%', height: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
       <tbody>
         {rows.map((row, rowIndex) => (
           <tr key={rowIndex}>
-            {row.map((cell, cellIndex) => (
-              <td key={cellIndex} style={{ border: '1px solid rgba(64,48,32,0.28)', padding: 2, verticalAlign: 'top', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal', lineHeight: 1.18, overflow: 'hidden' }}>
-                {renderFormattedText(cell, keyword, highlight && normalizeSearchText(cell).includes(normalizeSearchText(keyword)))}
-              </td>
-            ))}
+            {row.map((cell, cellIndex) => {
+              const normalizedCell = normalizeSearchText(cell)
+              const normalizedKeyword = normalizeSearchText(keyword)
+              let cellHitCount = 0
+              if (highlight && normalizedCell && normalizedKeyword) {
+                let cursor = 0
+                for (;;) {
+                  const next = normalizedCell.indexOf(normalizedKeyword, cursor)
+                  if (next < 0) break
+                  cellHitCount += 1
+                  cursor = next + Math.max(1, normalizedKeyword.length)
+                }
+              }
+              const activeCellOrdinal = activeHitOrdinal >= cellHitCursor && activeHitOrdinal < cellHitCursor + cellHitCount
+                ? activeHitOrdinal - cellHitCursor
+                : -1
+              cellHitCursor += cellHitCount
+              return (
+                <td key={cellIndex} style={{ border: '1px solid rgba(64,48,32,0.28)', padding: 2, verticalAlign: 'top', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal', lineHeight: 1.18, overflow: 'hidden' }}>
+                  {renderFormattedText(cell, keyword, highlight && cellHitCount > 0, activeCellOrdinal)}
+                </td>
+              )
+            })}
           </tr>
         ))}
       </tbody>
@@ -1346,6 +1481,7 @@ export default function GujiFacsimileProofreader({
   pageImageSrc = '',
   pageProofStatus = 'pending',
   activeBoxIndex = -1,
+  activeSearchHitOrdinal = -1,
   searchKeyword = '',
   coordinateSourceSize,
   translationText = '',
@@ -1414,7 +1550,7 @@ export default function GujiFacsimileProofreader({
     }
   }, [onTranslateCurrentPage, pageSourceText, translationLoading, translationText])
   useEffect(() => {
-    const nextBlocks = splitWideVerticalBlocks(normalizePageOrientations(normalizeBlocks(ocrResult)))
+    const nextBlocks = splitStackedVerticalBlocks(splitWideVerticalBlocks(normalizePageOrientations(normalizeBlocks(ocrResult))))
     setBlocks(nextBlocks)
     setHistory([nextBlocks.map((block) => ({ ...block }))])
     setHistoryIndex(0)
@@ -1524,8 +1660,14 @@ export default function GujiFacsimileProofreader({
 
   useEffect(() => {
     if (activeBoxIndex < 0) return
-    rootRef.current?.querySelector<HTMLElement>(`[data-guji-block-index="${activeBoxIndex}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' })
-  }, [activeBoxIndex])
+    const root = rootRef.current
+    const activeHit = root?.querySelector<HTMLElement>('[data-search-active="true"]')
+    if (activeHit) {
+      activeHit.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' })
+      return
+    }
+    root?.querySelector<HTMLElement>(`[data-guji-block-index="${activeBoxIndex}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' })
+  }, [activeBoxIndex, activeSearchHitOrdinal])
 
   useLayoutEffect(() => {
     const target = pageRef.current
@@ -1560,7 +1702,9 @@ export default function GujiFacsimileProofreader({
     return pageImageNaturalSize || coordinateSourceSize
   }, [coordinateSourceSize, pageImageNaturalSize])
   const baseBounds = useMemo(() => getLayoutBounds(blocks, effectiveCoordinateSourceSize), [blocks, effectiveCoordinateSourceSize])
-  const pageBlocks = useMemo(() => blocks.some((block) => block.__rect) ? blocks : buildSyntheticRects(blocks, baseBounds), [baseBounds, blocks])
+  const hasOriginalLayoutCoordinates = useMemo(() => blocks.some((block) => block.__rect), [blocks])
+  const pageBlocks = useMemo(() => hasOriginalLayoutCoordinates ? blocks : buildSyntheticRects(blocks, baseBounds), [baseBounds, blocks, hasOriginalLayoutCoordinates])
+  const isSyntheticLayoutFallback = blocks.length > 0 && !hasOriginalLayoutCoordinates
   const pageVerticalMode = useMemo(() => isVerticalPage(pageBlocks), [pageBlocks])
   const autoImageUnderlay = useMemo(() => shouldUseImageUnderlay(pageBlocks, pageVerticalMode), [pageBlocks, pageVerticalMode])
   const showImageUnderlay = !!pageImageSrc && (imageUnderlayMode === 'on' || (imageUnderlayMode === 'auto' && autoImageUnderlay))
@@ -1649,6 +1793,9 @@ export default function GujiFacsimileProofreader({
     const searchableText = shouldRenderTable ? tableRows.flat().join('\n') : fittedDisplayText
     const normalizedSearchableText = normalizeSearchText(searchableText)
     const padding = isImage ? 0 : shouldRenderTable ? 1 : getBlockPadding(label, orientation, layoutProfile)
+    const verticalDisplayColumnCount = orientation === 'vertical'
+      ? Math.max(1, getVerticalColumns(fittedDisplayText).length)
+      : 1
     return [{
       block,
       sourceIndex,
@@ -1997,6 +2144,29 @@ export default function GujiFacsimileProofreader({
               {translationStatusText}
             </div>
           ) : null}
+          {isSyntheticLayoutFallback ? (
+            <div
+              data-facsimile-missing-layout-warning="true"
+              style={{
+                position: 'absolute',
+                left: '50%',
+                top: 20,
+                transform: 'translateX(-50%)',
+                zIndex: 60,
+                maxWidth: 'calc(100% - 28px)',
+                padding: '7px 12px',
+                borderRadius: 6,
+                background: 'rgba(36, 25, 15, 0.88)',
+                color: '#fff8e8',
+                fontSize: 12,
+                lineHeight: 1.5,
+                boxShadow: '0 8px 22px rgba(0,0,0,0.18)',
+                pointerEvents: 'none',
+              }}
+            >
+              当前 OCR 缺少版式坐标，已切换为临时文本排布；请重新 OCR 本页或修复数据库外置大字段后再使用按位置还原。
+            </div>
+          ) : null}
           {pageBlockLayouts.map((layout) => {
             const {
               block,
@@ -2039,6 +2209,14 @@ export default function GujiFacsimileProofreader({
             const toolbarEdgeStyle = toolbarAlignRight
               ? { right: `${Math.max(0.6, 100 - left - width)}%` }
               : { left: `${Math.max(0.6, left)}%` }
+            const blockLineHeight = getBlockLineHeight(label, orientation, layoutProfile)
+            const preserveVerticalColumns = orientation === 'vertical' && shouldPreserveVerticalColumns(label)
+            const verticalColumnCount = orientation === 'vertical'
+              ? Math.max(1, getVerticalColumns(fittedDisplayText).length)
+              : 1
+            const textWhiteSpace = orientation === 'vertical' ? (verticalColumnCount > 1 || preserveVerticalColumns ? 'pre' : 'normal') : 'pre-wrap'
+            const textWordBreak = orientation === 'vertical' || isTocLabel(label) ? 'normal' : 'break-all'
+            const textOverflowWrap = orientation === 'vertical' || isTocLabel(label) ? 'normal' : 'anywhere'
 
             return (
               <Fragment key={`${sourceIndex}-${block.reading_order ?? sourceIndex}`}>
@@ -2103,11 +2281,11 @@ export default function GujiFacsimileProofreader({
                   <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} rect={rect} bounds={cropBounds} />
                 ) : shouldRenderTable ? (
                   <div style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize, lineHeight: 1.18, fontFamily: FONT_FAMILY }}>
-                    {renderFacsimileTable(tableRows, searchKeyword, isActive && keywordMatch)}
+                    {renderFacsimileTable(tableRows, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
                   </div>
                 ) : (
-                  <div style={{ width: '100%', height: '100%', writingMode: orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb', textOrientation: orientation === 'vertical' ? 'mixed' : undefined, whiteSpace: orientation === 'vertical' ? 'pre-wrap' : 'pre-wrap', wordBreak: isTocLabel(label) ? 'normal' : 'break-all', overflowWrap: isTocLabel(label) ? 'normal' : 'anywhere', lineHeight: getBlockLineHeight(label, orientation, layoutProfile), fontSize, fontWeight: getBlockFontWeight(label, layoutProfile), letterSpacing: 0, textAlign: isTitleLabel(label) ? 'center' : 'start', textIndent: orientation === 'horizontal' && isBodyTextLabel(label) ? '2em' : undefined }}>
-                    {renderFormattedText(fittedDisplayText, searchKeyword, isActive && keywordMatch)}
+                  <div style={{ width: '100%', height: '100%', writingMode: orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb', textOrientation: orientation === 'vertical' ? 'mixed' : undefined, whiteSpace: textWhiteSpace, wordBreak: textWordBreak, overflowWrap: textOverflowWrap, lineHeight: blockLineHeight, fontSize, fontWeight: getBlockFontWeight(label, layoutProfile), letterSpacing: 0, textAlign: isTitleLabel(label) ? 'center' : 'start', textIndent: orientation === 'horizontal' && isBodyTextLabel(label) ? '2em' : undefined }}>
+                    {renderFormattedText(fittedDisplayText, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
                   </div>
                 )}
                 {shouldShowOverflowHint ? (
@@ -2182,7 +2360,7 @@ export default function GujiFacsimileProofreader({
                     textIndent: overlay.orientation === 'horizontal' && isBodyTextLabel(overlay.label) ? '2em' : undefined,
                   }}
                 >
-                  {renderFormattedText(fittedLayout.text, searchKeyword, isActive && keywordMatch)}
+                  {renderFormattedText(fittedLayout.text, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
                 </div>
               </div>
             )

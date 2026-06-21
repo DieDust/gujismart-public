@@ -1,23 +1,34 @@
-import { dialog } from 'electron'
+﻿import { dialog } from 'electron'
 import { existsSync, statSync, writeFileSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import type {
+  DatabaseMaintenanceStage,
   DatabaseMaintenanceResult,
+  DatabaseMaintenanceState,
   DatabaseRequiredMaintenance,
   DatabaseRequiredMaintenanceReason,
   DatabaseSearchIndexStorageStat,
+  DatabaseStorageLayerStat,
   DatabaseStorageDiagnostics,
   DatabaseTableStorageStat,
 } from '../shared/types'
 import { SEARCH_INDEX_VERSION, SEARCH_NGRAM_INDEX_ENABLED } from './search-index-constants'
-import { getDatabase, getDatabaseFilePath, queryOne, run, scheduleDatabaseSave } from './database'
+import { getDatabase, getDatabaseFilePath, isSearchSegmentsFtsRebuildNeeded, queryOne, rebuildSearchTables, run, scheduleDatabaseSave } from './database'
 import { emitBackgroundTaskStatus } from './background-tasks'
+import { cleanupUnreferencedPagePayloads, externalizeLargePayloads, getPagePayloadStorageStats } from './page-payload-store'
 
 // Keep rowid-list batches below SQLite's bound-parameter ceiling. Full ngram
 // cleanup uses rowid ranges instead, so it can safely sweep much larger slices.
 const LEGACY_SEARCH_CLEANUP_BATCH_SIZE = 5_000
 const LEGACY_SEARCH_FULL_CLEANUP_ROWID_BATCH_SIZE = 100_000
 const LEGACY_SEARCH_CLEANUP_YIELD_MS = 10
+const STORAGE_MODEL_VERSION = 'sqlite-metadata-external-assets-v1'
+const DATABASE_MAINTENANCE_STATE_KEY = 'database_maintenance_state'
+const CACHE_VERSION_PREFIX = 'library-sidebar-v2'
+const INLINE_PAGE_PAYLOAD_REQUIRED_BYTES = 1024 * 1024
+const MIN_NOTICEABLE_FREELIST_BYTES = 8 * 1024 * 1024
+const LARGE_FREELIST_BYTES = 64 * 1024 * 1024
+const FREELIST_RATIO_RECOMMEND_THRESHOLD = 0.1
 
 interface CountRow {
   count?: number | null
@@ -30,6 +41,14 @@ interface SampleRow {
 
 interface RowIdRow {
   rowid: number
+}
+
+interface SettingRow {
+  value?: string | null
+}
+
+interface TableInfoRow {
+  name?: string | null
 }
 
 interface LegacySearchCleanupProgress {
@@ -65,6 +84,13 @@ function formatStorageBytes(bytes: number): string {
     index += 1
   }
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`
+}
+
+function isDatabaseCompactionWorthwhile(freelistBytes: number, databaseBytes: number): boolean {
+  if (!Number.isFinite(freelistBytes) || freelistBytes <= 0) return false
+  if (freelistBytes >= LARGE_FREELIST_BYTES) return true
+  return freelistBytes >= MIN_NOTICEABLE_FREELIST_BYTES
+    && freelistBytes >= Math.max(1, databaseBytes) * FREELIST_RATIO_RECOMMEND_THRESHOLD
 }
 
 function delay(ms: number): Promise<void> {
@@ -113,6 +139,122 @@ function formatCount(value: number): string {
   return Number(value || 0).toLocaleString()
 }
 
+function nowIso(): string {
+  return new Date().toISOString()
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key]
+  return typeof value === 'string' && value ? value : null
+}
+
+function booleanField(record: Record<string, unknown>, key: string): boolean {
+  return record[key] === true
+}
+
+function numberField(record: Record<string, unknown>, key: string): number {
+  return numberValue(record[key])
+}
+
+function isMaintenanceStage(value: unknown): value is DatabaseMaintenanceStage {
+  return typeof value === 'string' && [
+    'idle',
+    'diagnose',
+    'cleanup-legacy-index',
+    'externalize-page-payloads',
+    'queue-lightweight-index',
+    'compact',
+    'verify',
+    'completed',
+    'failed',
+  ].includes(value)
+}
+
+function defaultMaintenanceState(): DatabaseMaintenanceState {
+  return {
+    stage: 'idle',
+    canResume: false,
+    lastStartedAt: null,
+    lastCompletedAt: null,
+    lastError: null,
+    oldIndexRowsRemaining: 0,
+    legacyIndexPresent: false,
+    lightweightIndexQueued: false,
+    compactionRecommended: false,
+    migrationVersion: STORAGE_MODEL_VERSION,
+  }
+}
+
+function readPersistedMaintenanceState(): DatabaseMaintenanceState {
+  try {
+    const row = queryOne<SettingRow>('SELECT value FROM settings WHERE key = ?', [DATABASE_MAINTENANCE_STATE_KEY])
+    if (!row?.value) return defaultMaintenanceState()
+    const parsed: unknown = JSON.parse(row.value)
+    if (!isRecord(parsed)) return defaultMaintenanceState()
+    return {
+      stage: isMaintenanceStage(parsed.stage) ? parsed.stage : 'idle',
+      canResume: booleanField(parsed, 'canResume'),
+      lastStartedAt: stringField(parsed, 'lastStartedAt'),
+      lastCompletedAt: stringField(parsed, 'lastCompletedAt'),
+      lastError: stringField(parsed, 'lastError'),
+      oldIndexRowsRemaining: numberField(parsed, 'oldIndexRowsRemaining'),
+      legacyIndexPresent: booleanField(parsed, 'legacyIndexPresent'),
+      lightweightIndexQueued: booleanField(parsed, 'lightweightIndexQueued'),
+      compactionRecommended: booleanField(parsed, 'compactionRecommended'),
+      migrationVersion: stringField(parsed, 'migrationVersion') || STORAGE_MODEL_VERSION,
+    }
+  } catch {
+    return defaultMaintenanceState()
+  }
+}
+
+function tableHasColumn(tableName: string, columnName: string): boolean {
+  try {
+    return getDatabase()
+      .prepare(`PRAGMA table_info(${tableName})`)
+      .all()
+      .some((row) => String((row as TableInfoRow).name || '') === columnName)
+  } catch {
+    return false
+  }
+}
+
+function persistMaintenanceState(patch: Partial<DatabaseMaintenanceState>): DatabaseMaintenanceState {
+  const next = { ...readPersistedMaintenanceState(), ...patch, migrationVersion: STORAGE_MODEL_VERSION }
+  if (tableHasColumn('settings', 'updated_at')) {
+    run(
+      `INSERT INTO settings (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      [DATABASE_MAINTENANCE_STATE_KEY, JSON.stringify(next), nowIso()],
+    )
+  } else {
+    run(
+      `INSERT INTO settings (key, value)
+       VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [DATABASE_MAINTENANCE_STATE_KEY, JSON.stringify(next)],
+    )
+  }
+  scheduleDatabaseSave()
+  return next
+}
+
+function getActiveSearchMaintenanceJobCount(): number {
+  try {
+    const row = queryOne<{ count?: number | null }>(
+      "SELECT COUNT(*) AS count FROM search_index_status WHERE status IN ('queued', 'processing')",
+    )
+    return Number(row?.count || 0)
+  } catch {
+    return 0
+  }
+}
+
 function emitDatabaseMaintenanceProgress(progress: LegacySearchCleanupProgress): void {
   const estimatedMaxRowId = Math.max(1, Number(progress.estimatedMaxRowId || 0))
   const scannedRowId = Math.max(0, Number(progress.scannedRowId || 0))
@@ -130,7 +272,7 @@ function emitDatabaseMaintenanceProgress(progress: LegacySearchCleanupProgress):
   const phaseLabel = progress.phase === 'single-char'
     ? '正在清理旧版单字索引'
     : progress.phase === 'ngram'
-      ? '正在清理巨大 ngram 候选索引'
+      ? '正在清理旧版 ngram 候选索引'
     : progress.phase === 'positions'
       ? '正在移除旧版位置数据'
       : progress.phase === 'staging'
@@ -231,16 +373,86 @@ function getSafeTables(): DatabaseTableStorageStat[] {
 function getSearchIndexStorage(): DatabaseSearchIndexStorageStat {
   const ngramRows = estimateTableRows('search_ngram_index')
   const segmentRows = estimateTableRows('search_index_segments')
+  const segmentTextBytes = estimateSampledBytes('search_index_segments', 'length(text) + length(normalized_text)', segmentRows)
+  const segmentOffsetMapBytes = estimateSampledBytes('search_index_segments', 'length(offset_map)', segmentRows)
   return {
     ngramRows,
     singleCharNgramRows: estimateSampledRows('search_ngram_index', 'length(gram) <= 1', ngramRows),
     ngramPositionsBytes: estimateSampledBytes('search_ngram_index', 'length(positions)', ngramRows),
     segmentRows,
-    segmentTextBytes: estimateSampledBytes('search_index_segments', 'length(text) + length(normalized_text)', segmentRows),
-    segmentOffsetMapBytes: estimateSampledBytes('search_index_segments', 'length(offset_map)', segmentRows),
+    segmentTextBytes,
+    segmentOffsetMapBytes,
     pagesFtsRows: estimateTableRows('pages_fts'),
     searchSegmentsFtsRows: estimateTableRows('search_segments_fts'),
     searchSegmentsTrigramRows: estimateTableRows('search_segments_trigram'),
+    enterpriseSearchMigrationRecommended: isSearchSegmentsFtsRebuildNeeded(),
+  }
+}
+
+function tableRowCount(tables: DatabaseTableStorageStat[], tableName: string): number {
+  return tables.find((table) => table.tableName === tableName)?.rowCount || 0
+}
+
+function estimateStorageLayers(tables: DatabaseTableStorageStat[], searchIndex: DatabaseSearchIndexStorageStat): DatabaseStorageLayerStat[] {
+  const payloadStats = getPagePayloadStorageStats()
+  const metadataRows = [
+    'documents',
+    'folders',
+    'document_folders',
+    'tags',
+    'document_tags',
+    'metadata_candidates',
+    'ai_chat_sessions',
+    'ai_chat_turns',
+    'ai_results',
+  ].reduce((sum, table) => sum + tableRowCount(tables, table), 0)
+  const documentTextRows = tableRowCount(tables, 'pages') + tableRowCount(tables, 'page_ocr_versions')
+  const searchRows = searchIndex.ngramRows
+    + searchIndex.segmentRows
+    + searchIndex.pagesFtsRows
+    + searchIndex.searchSegmentsFtsRows
+    + searchIndex.searchSegmentsTrigramRows
+  const cacheRows = tableRowCount(tables, 'page_ai_layout_cache')
+    + tableRowCount(tables, 'page_translation_cache')
+    + tableRowCount(tables, 'library_state_cache')
+  return [
+    { kind: 'metadata', label: '元数据与关系', rowCount: metadataRows, estimatedBytes: 0 },
+    {
+      kind: 'document-text',
+      label: '页面文本与 OCR 结果',
+      rowCount: documentTextRows,
+      estimatedBytes: payloadStats.inlineCandidateBytes,
+    },
+    {
+      kind: 'external-payload',
+      label: '外置页面大字段',
+      rowCount: payloadStats.externalFileCount,
+      estimatedBytes: payloadStats.externalBytes,
+    },
+    {
+      kind: 'search-index',
+      label: '检索候选索引',
+      rowCount: searchRows,
+      estimatedBytes: searchIndex.ngramPositionsBytes + searchIndex.segmentOffsetMapBytes,
+    },
+    { kind: 'cache', label: '可重建缓存', rowCount: cacheRows, estimatedBytes: 0 },
+    { kind: 'runtime', label: '运行维护状态', rowCount: tableRowCount(tables, 'search_index_status'), estimatedBytes: 0 },
+  ]
+}
+
+function hasLegacyCacheVersion(): boolean {
+  try {
+    const row = queryOne<{ cache_json?: string | null }>(
+      'SELECT cache_json FROM library_state_cache WHERE cache_key = ?',
+      ['library-sidebar-v1'],
+    )
+    if (!row?.cache_json) return false
+    const parsed: unknown = JSON.parse(row.cache_json)
+    if (!isRecord(parsed)) return true
+    const version = typeof parsed.version === 'string' ? parsed.version : ''
+    return !version.startsWith(CACHE_VERSION_PREFIX)
+  } catch {
+    return false
   }
 }
 
@@ -250,10 +462,23 @@ function buildWarnings(diagnostics: Omit<DatabaseStorageDiagnostics, 'warnings' 
     warnings.push('数据库存在较多空闲页，压缩后可能释放明显磁盘空间。')
   }
   if (diagnostics.searchIndex.singleCharNgramRows > 0) {
-    warnings.push('检测到旧版单字 ngram 索引，建议清理并重建轻量索引。')
+    warnings.push('检测到旧版单字检索索引，建议清理并重建轻量索引。')
   }
   if (diagnostics.searchIndex.ngramPositionsBytes > 1024 * 1024 * 256) {
     warnings.push('检索索引位置数据较大，可能是数据库膨胀的主要来源。')
+  }
+  if (diagnostics.searchIndex.enterpriseSearchMigrationRecommended) {
+    warnings.push('新版全文索引结构需要校准。点击一键升级后，软件会在后台重建轻量索引；这不会阻止进入软件。')
+  }
+  const documentTextLayer = diagnostics.storageLayers.find((layer) => layer.kind === 'document-text')
+  if (Number(documentTextLayer?.estimatedBytes || 0) > INLINE_PAGE_PAYLOAD_REQUIRED_BYTES) {
+    warnings.push('检测到较大的页面 OCR 内容仍保存在数据库内部。建议先迁移为外置压缩大字段，再压缩数据库以释放磁盘空间。')
+  }
+  if (diagnostics.externalPayloads.orphanedFileCount > 0) {
+    warnings.push('检测到未被数据库记录引用的外置大字段文件，清理后可释放部分空间。')
+  }
+  if (diagnostics.externalPayloads.missingReferencedFileCount > 0) {
+    warnings.push('检测到数据库引用的外置大字段文件缺失，可能导致版式还原坐标、OCR 结果、检索或导出不完整。请从包含 storage/page-payloads 的完整备份恢复，或重新 OCR 受影响页面。')
   }
   return warnings
 }
@@ -263,6 +488,9 @@ function buildRequiredMaintenance(diagnostics: Omit<DatabaseStorageDiagnostics, 
   if (diagnostics.searchIndex.ngramRows > 0) reasons.push('legacy-ngram-index')
   if (diagnostics.searchIndex.singleCharNgramRows > 0) reasons.push('legacy-single-char-ngram')
   if (diagnostics.searchIndex.ngramPositionsBytes > 0) reasons.push('legacy-ngram-positions')
+  if (diagnostics.searchIndex.enterpriseSearchMigrationRecommended) reasons.push('enterprise-search-index')
+  const documentTextLayer = diagnostics.storageLayers.find((layer) => layer.kind === 'document-text')
+  if (Number(documentTextLayer?.estimatedBytes || 0) > INLINE_PAGE_PAYLOAD_REQUIRED_BYTES) reasons.push('inline-page-payloads')
 
   if (reasons.length === 0) {
     return {
@@ -278,34 +506,87 @@ function buildRequiredMaintenance(diagnostics: Omit<DatabaseStorageDiagnostics, 
     required: true,
     reasons,
     title: '需要升级并压缩文献库数据库',
-    message: '检测到旧版搜索索引仍保存在当前数据库中。继续使用会占用大量空间，并可能影响新版检索与维护任务。请先完成旧索引清理、轻量索引升级和数据库压缩；本流程不会删除文献、OCR 文本或 PDF 原文。',
+    message: '检测到当前文献库还没有完全适配新版企业级数据库结构。请先完成旧索引清理、轻量全文索引升级、页面大字段迁移和数据库压缩；本流程不会删除文献、OCR 文本或 PDF 原文。',
     actionLabel: '升级并压缩数据库',
   }
 }
 
 export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
   const databasePath = getDatabaseFilePath()
+  const databaseBytes = fileSize(databasePath)
   const pageSize = getStoragePragma('page_size')
   const pageCount = getStoragePragma('page_count')
   const freelistCount = getStoragePragma('freelist_count')
+  const freelistBytes = pageSize * freelistCount
+  const compactionRecommended = isDatabaseCompactionWorthwhile(freelistBytes, databaseBytes)
+  const tables = getSafeTables()
+  const searchIndex = getSearchIndexStorage()
+  const pagePayloadStats = getPagePayloadStorageStats()
+  const persistedMaintenanceState = readPersistedMaintenanceState()
+  const legacyIndexPresent = searchIndex.ngramRows > 0 || searchIndex.singleCharNgramRows > 0 || searchIndex.ngramPositionsBytes > 0
+  let maintenanceState: DatabaseMaintenanceState = {
+    ...persistedMaintenanceState,
+    oldIndexRowsRemaining: searchIndex.ngramRows,
+    legacyIndexPresent,
+    compactionRecommended,
+    canResume: persistedMaintenanceState.stage !== 'idle'
+      && persistedMaintenanceState.stage !== 'completed'
+      && (persistedMaintenanceState.stage !== 'failed' || persistedMaintenanceState.canResume),
+    migrationVersion: STORAGE_MODEL_VERSION,
+  }
   const base = {
     databasePath,
-    databaseBytes: fileSize(databasePath),
+    databaseBytes,
     walBytes: fileSize(`${databasePath}-wal`),
     shmBytes: fileSize(`${databasePath}-shm`),
     pageSize,
     pageCount,
     freelistCount,
-    freelistBytes: pageSize * freelistCount,
+    freelistBytes,
     checkedAt: new Date().toISOString(),
     searchIndexVersion: SEARCH_INDEX_VERSION,
-    tables: getSafeTables(),
-    searchIndex: getSearchIndexStorage(),
+    storageModelVersion: STORAGE_MODEL_VERSION,
+    tables,
+    storageLayers: estimateStorageLayers(tables, searchIndex),
+    externalPayloads: {
+      fileCount: pagePayloadStats.externalFileCount,
+      referencedFileCount: pagePayloadStats.referencedFileCount,
+      missingReferencedFileCount: pagePayloadStats.missingReferencedFileCount,
+      orphanedFileCount: pagePayloadStats.orphanedFileCount,
+      bytes: pagePayloadStats.externalBytes,
+      estimatedOrphanedBytes: pagePayloadStats.orphanedBytes,
+      estimatedMissingReferencedBytes: pagePayloadStats.estimatedMissingReferencedBytes,
+    },
+    searchIndex,
+    maintenanceState,
   }
+  const requiredMaintenance = buildRequiredMaintenance(base)
+  if (
+    maintenanceState.stage === 'queue-lightweight-index'
+    && !requiredMaintenance.required
+    && getActiveSearchMaintenanceJobCount() === 0
+  ) {
+    maintenanceState = {
+      ...persistMaintenanceState({
+        stage: 'completed',
+        canResume: false,
+        lastCompletedAt: nowIso(),
+        lastError: null,
+        oldIndexRowsRemaining: searchIndex.ngramRows,
+        legacyIndexPresent,
+        lightweightIndexQueued: false,
+        compactionRecommended,
+      }),
+      oldIndexRowsRemaining: searchIndex.ngramRows,
+      legacyIndexPresent,
+      compactionRecommended,
+    }
+  }
+  const normalizedBase = { ...base, maintenanceState }
   return {
-    ...base,
-    warnings: buildWarnings(base),
-    requiredMaintenance: buildRequiredMaintenance(base),
+    ...normalizedBase,
+    warnings: buildWarnings(normalizedBase),
+    requiredMaintenance,
   }
 }
 
@@ -327,6 +608,15 @@ export async function clearLegacySearchNgramIndex(onProgress: LegacySearchCleanu
   const before = getDatabaseStorageDiagnostics()
   const estimatedMaxRowId = Math.max(1, Number(before.searchIndex.ngramRows || 0))
   try {
+    persistMaintenanceState({
+      stage: 'cleanup-legacy-index',
+      canResume: true,
+      lastStartedAt: nowIso(),
+      lastError: null,
+      oldIndexRowsRemaining: before.searchIndex.ngramRows,
+      legacyIndexPresent: before.maintenanceState.legacyIndexPresent,
+      compactionRecommended: before.freelistBytes > 0,
+    })
     let deletedRows = 0
     let updatedRows = 0
     if (!SEARCH_NGRAM_INDEX_ENABLED) {
@@ -378,29 +668,41 @@ export async function clearLegacySearchNgramIndex(onProgress: LegacySearchCleanu
     run('DELETE FROM search_ngram_index_staging')
     scheduleDatabaseSave()
     const after = getDatabaseStorageDiagnostics()
+    persistMaintenanceState({
+      stage: 'verify',
+      canResume: false,
+      oldIndexRowsRemaining: after.searchIndex.ngramRows,
+      legacyIndexPresent: after.maintenanceState.legacyIndexPresent,
+      compactionRecommended: after.freelistBytes > 0,
+    })
     onProgress({ phase: 'completed', scannedRowId: estimatedMaxRowId, estimatedMaxRowId, deletedRows, updatedRows })
     return {
       success: true,
       message: SEARCH_NGRAM_INDEX_ENABLED
         ? '已分批清理旧版单字索引并移除持久化位置数据。数据库文件大小会在执行“压缩数据库”后真正释放到磁盘。'
-        : '已分批清理巨大 ngram 候选索引；搜索会改用 FTS 与真实文本核验，准确性不受影响但短词搜索可能变慢。数据库文件大小会在执行“压缩数据库”后真正释放到磁盘。',
+        : '已分批清理旧版 ngram 候选索引；搜索会改用 FTS 与真实文本核验，准确性不受影响但短词搜索可能变慢。数据库文件大小会在执行“压缩数据库”后真正释放到磁盘。',
       beforeBytes: before.databaseBytes,
       afterBytes: after.databaseBytes,
       deletedRows,
       updatedRows,
     }
   } catch (error) {
+    persistMaintenanceState({
+      stage: 'failed',
+      canResume: true,
+      lastError: error instanceof Error ? error.message : String(error),
+    })
     emitBackgroundTaskStatus({
       taskId: 'database-maintenance:legacy-search-cleanup',
       kind: 'database-maintenance',
       status: 'error',
       progress: 1,
       errorMessage: error instanceof Error ? error.message : String(error),
-      message: '清理搜索索引失败',
+      message: '娓呯悊鎼滅储绱㈠紩澶辫触',
     })
     return {
       success: false,
-      message: '清理搜索索引失败',
+      message: '娓呯悊鎼滅储绱㈠紩澶辫触',
       error: error instanceof Error ? error.message : String(error),
     }
   }
@@ -410,10 +712,23 @@ export function compactDatabase(): DatabaseMaintenanceResult {
   const databasePath = getDatabaseFilePath()
   const beforeBytes = fileSize(databasePath)
   try {
+    persistMaintenanceState({
+      stage: 'compact',
+      canResume: true,
+      lastStartedAt: nowIso(),
+      lastError: null,
+    })
     getDatabase().pragma('wal_checkpoint(TRUNCATE)')
     getDatabase().exec('VACUUM')
     getDatabase().pragma('wal_checkpoint(TRUNCATE)')
     const afterBytes = fileSize(databasePath)
+    persistMaintenanceState({
+      stage: 'completed',
+      canResume: false,
+      lastCompletedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: false,
+    })
     return {
       success: true,
       message: `数据库压缩完成：${basename(databasePath)}`,
@@ -421,6 +736,12 @@ export function compactDatabase(): DatabaseMaintenanceResult {
       afterBytes,
     }
   } catch (error) {
+    persistMaintenanceState({
+      stage: 'failed',
+      canResume: true,
+      lastError: error instanceof Error ? error.message : String(error),
+      compactionRecommended: true,
+    })
     return {
       success: false,
       message: '数据库压缩失败，原数据库未被删除。',
@@ -431,26 +752,221 @@ export function compactDatabase(): DatabaseMaintenanceResult {
   }
 }
 
+export async function externalizePagePayloadStorage(): Promise<DatabaseMaintenanceResult> {
+  const before = getDatabaseStorageDiagnostics()
+  try {
+    persistMaintenanceState({
+      stage: 'externalize-page-payloads',
+      canResume: true,
+      lastStartedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: before.freelistBytes > 0,
+    })
+
+    let totalRows = 0
+    let totalFields = 0
+    let totalBytes = 0
+    for (;;) {
+      const batch = externalizeLargePayloads({ limit: 500 })
+      totalRows += batch.externalizedRows
+      totalFields += batch.externalizedFields
+      totalBytes += batch.externalizedBytes
+      emitBackgroundTaskStatus({
+        taskId: 'database-maintenance:page-payload-externalize',
+        kind: 'database-maintenance',
+        status: batch.scannedRows > 0 ? 'processing' : 'completed',
+        progress: batch.scannedRows > 0 ? 0.5 : 1,
+        completedCount: totalRows,
+        message: `正在迁移大文本与 OCR 大字段：已处理 ${formatCount(totalRows)} 行。`,
+      })
+      if (batch.scannedRows === 0 || batch.externalizedFields === 0) break
+      await delay(LEGACY_SEARCH_CLEANUP_YIELD_MS)
+    }
+
+    scheduleDatabaseSave()
+    const after = getDatabaseStorageDiagnostics()
+    persistMaintenanceState({
+      stage: 'verify',
+      canResume: false,
+      lastCompletedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: true,
+    })
+    return {
+      success: true,
+      message: `页面大字段迁移完成：已迁移 ${formatCount(totalFields)} 个大字段，约 ${formatStorageBytes(totalBytes)}。请继续压缩数据库以释放数据库文件空间。`,
+      beforeBytes: before.databaseBytes,
+      afterBytes: after.databaseBytes,
+      updatedRows: totalRows,
+    }
+  } catch (error) {
+    persistMaintenanceState({
+      stage: 'failed',
+      canResume: true,
+      lastError: error instanceof Error ? error.message : String(error),
+      compactionRecommended: true,
+    })
+    return {
+      success: false,
+      message: '页面大字段迁移失败，原数据库未被删除。',
+      beforeBytes: before.databaseBytes,
+      afterBytes: getDatabaseStorageDiagnostics().databaseBytes,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+function hasInlinePagePayloadMaintenance(diagnostics: DatabaseStorageDiagnostics): boolean {
+  const documentTextLayer = diagnostics.storageLayers.find((layer) => layer.kind === 'document-text')
+  return Number(documentTextLayer?.estimatedBytes || 0) > INLINE_PAGE_PAYLOAD_REQUIRED_BYTES
+    || diagnostics.requiredMaintenance.reasons.includes('inline-page-payloads')
+}
+
+export async function cleanupExternalPagePayloadStorage(): Promise<DatabaseMaintenanceResult> {
+  const before = getDatabaseStorageDiagnostics()
+  try {
+    persistMaintenanceState({
+      stage: 'externalize-page-payloads',
+      canResume: true,
+      lastStartedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: before.freelistBytes > 0,
+    })
+    emitBackgroundTaskStatus({
+      taskId: 'database-maintenance:external-payload-cleanup',
+      kind: 'database-maintenance',
+      status: 'processing',
+      progress: 0.2,
+      completedCount: 0,
+      message: '正在扫描外置大字段引用。',
+    })
+    const cleanup = cleanupUnreferencedPagePayloads()
+    scheduleDatabaseSave()
+    emitBackgroundTaskStatus({
+      taskId: 'database-maintenance:external-payload-cleanup',
+      kind: 'database-maintenance',
+      status: 'completed',
+      progress: 1,
+      completedCount: cleanup.deletedFiles,
+      totalCount: cleanup.scannedFiles,
+      message: `已清理 ${formatCount(cleanup.deletedFiles)} 个未引用的大字段文件。`,
+    })
+    persistMaintenanceState({
+      stage: 'verify',
+      canResume: false,
+      lastCompletedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: before.freelistBytes > 0,
+    })
+    return {
+      success: true,
+      message: `未引用大字段清理完成：已删除 ${formatCount(cleanup.deletedFiles)} 个文件，约 ${formatStorageBytes(cleanup.deletedBytes)}。`,
+      beforeBytes: before.externalPayloads.bytes,
+      afterBytes: getDatabaseStorageDiagnostics().externalPayloads.bytes,
+      deletedRows: cleanup.deletedFiles,
+    }
+  } catch (error) {
+    persistMaintenanceState({
+      stage: 'failed',
+      canResume: true,
+      lastError: error instanceof Error ? error.message : String(error),
+      compactionRecommended: true,
+    })
+    return {
+      success: false,
+      message: '未引用大字段清理失败，数据库记录未被更改。',
+      beforeBytes: before.externalPayloads.bytes,
+      afterBytes: getDatabaseStorageDiagnostics().externalPayloads.bytes,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
 export async function optimizeLegacyDatabaseStorage(): Promise<DatabaseMaintenanceResult> {
   const before = getDatabaseStorageDiagnostics()
-  const cleaned = await clearLegacySearchNgramIndex()
-  if (!cleaned.success) {
-    return cleaned
+  const hasLegacySearchMaintenance = before.searchIndex.ngramRows > 0
+    || before.searchIndex.singleCharNgramRows > 0
+    || before.searchIndex.ngramPositionsBytes > 0
+  const needsEnterpriseSearchMigration = !!before.searchIndex.enterpriseSearchMigrationRecommended
+  const needsPagePayloadMigration = hasInlinePagePayloadMaintenance(before)
+
+  persistMaintenanceState({
+    stage: 'diagnose',
+    canResume: true,
+    lastStartedAt: nowIso(),
+    lastError: null,
+    oldIndexRowsRemaining: before.searchIndex.ngramRows,
+    legacyIndexPresent: before.maintenanceState.legacyIndexPresent,
+    compactionRecommended: before.freelistBytes > 0 || needsPagePayloadMigration,
+  })
+
+  let cleaned: DatabaseMaintenanceResult = {
+    success: true,
+    message: '旧搜索索引已经清理完成。',
+    beforeBytes: before.databaseBytes,
+    afterBytes: before.databaseBytes,
+    deletedRows: 0,
+    updatedRows: 0,
+  }
+
+  if (hasLegacySearchMaintenance) {
+    cleaned = await clearLegacySearchNgramIndex()
+    if (!cleaned.success) return cleaned
+  }
+
+  if (needsEnterpriseSearchMigration) {
+    try {
+      rebuildSearchTables()
+    } catch (error) {
+      persistMaintenanceState({
+        stage: 'failed',
+        canResume: true,
+        lastError: error instanceof Error ? error.message : String(error),
+        compactionRecommended: true,
+      })
+      return {
+        success: false,
+        message: '企业级搜索索引迁移失败，数据库记录未被删除。',
+        beforeBytes: before.databaseBytes,
+        afterBytes: getDatabaseStorageDiagnostics().databaseBytes,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  let externalized: DatabaseMaintenanceResult = {
+    success: true,
+    message: '页面大字段已经迁移完成。',
+    beforeBytes: before.databaseBytes,
+    afterBytes: before.databaseBytes,
+    deletedRows: 0,
+    updatedRows: 0,
+  }
+  if (needsPagePayloadMigration) {
+    externalized = await externalizePagePayloadStorage()
+    if (!externalized.success) return externalized
   }
 
   const after = getDatabaseStorageDiagnostics()
-  const optimizedRows = Number(cleaned.deletedRows || 0) + Number(cleaned.updatedRows || 0)
+  persistMaintenanceState({
+    stage: 'queue-lightweight-index',
+    canResume: false,
+    oldIndexRowsRemaining: after.searchIndex.ngramRows,
+    legacyIndexPresent: after.maintenanceState.legacyIndexPresent,
+    compactionRecommended: after.freelistBytes > 0,
+  })
 
+  const optimizedRows = Number(cleaned.deletedRows || 0) + Number(cleaned.updatedRows || 0)
+  const externalizedRows = Number(externalized.updatedRows || 0)
+  const didMaintenance = optimizedRows > 0 || needsEnterpriseSearchMigration || needsPagePayloadMigration
   return {
     success: true,
-    message: optimizedRows > 0
-      ? SEARCH_NGRAM_INDEX_ENABLED
-        ? `旧版数据库优化完成：已分批处理 ${optimizedRows.toLocaleString()} 行旧搜索索引数据。为避免软件长时间未响应，本步骤不会自动压缩数据库；如需立刻释放磁盘空间，请在空闲时单独点击“压缩数据库”。当前可压缩空闲页约 ${formatStorageBytes(after.freelistBytes)}。`
-        : `数据库瘦身完成：已分批清理 ${optimizedRows.toLocaleString()} 行 ngram 候选索引。搜索将改用 FTS 与真实文本核验，准确性不受影响但短词搜索可能变慢。本步骤不会自动压缩数据库；如需释放磁盘空间，请在空闲时单独点击“压缩数据库”。当前可压缩空闲页约 ${formatStorageBytes(after.freelistBytes)}。`
-      : `数据库检查完成：未发现需要清理的 ngram 候选索引或旧版位置数据。如需释放磁盘空间，请在空闲时单独点击“压缩数据库”。当前可压缩空闲页约 ${formatStorageBytes(after.freelistBytes)}。`,
+    message: didMaintenance
+      ? `数据库瘦身已完成：${optimizedRows > 0 ? `已清理 ${optimizedRows.toLocaleString()} 行旧候选索引，` : ''}${needsEnterpriseSearchMigration ? '已迁移为更轻量的企业级全文索引结构，' : ''}${needsPagePayloadMigration ? `已迁移 ${externalizedRows.toLocaleString()} 行页面大字段，` : ''}后台会继续重建文献索引。完成后请在空闲时点击“压缩数据库”释放磁盘空间。当前可压缩空闲页约 ${formatStorageBytes(after.freelistBytes)}。`
+      : `数据库检查完成：没有发现需要瘦身的旧搜索索引、企业级索引迁移项或页面大字段迁移项。如需释放磁盘空间，请在空闲时单独点击“压缩数据库”。当前可压缩空闲页约 ${formatStorageBytes(after.freelistBytes)}。`,
     beforeBytes: before.databaseBytes,
     afterBytes: after.databaseBytes,
     deletedRows: cleaned.deletedRows,
-    updatedRows: cleaned.updatedRows,
+    updatedRows: Number(cleaned.updatedRows || 0) + externalizedRows,
   }
 }

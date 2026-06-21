@@ -8,6 +8,7 @@ import {
   HISTORY_CITATION_SEED_VERSION,
   HISTORY_CITATION_STYLE,
 } from '../shared/history-citation'
+import { setPayloadDataDir } from './page-payload-files'
 
 type NativeDatabase = Database.Database
 
@@ -16,6 +17,7 @@ let dbFilePath = ''
 let cachedDataDir = ''
 let ftsAvailable = false
 let searchTrigramFtsAvailable = false
+let searchSegmentsFtsNeedsRebuild = false
 const TOC_RULE_ENGINE_VERSION = '2026-06-05-ocr-structure-v7'
 const DATABASE_CHECKPOINT_MIN_INTERVAL_MS = 2000
 const DATABASE_CHECKPOINT_DEFER_MS = 800
@@ -205,13 +207,17 @@ export function resolvePreferredDataDir(): string {
 }
 
 export function getDataDir(): string {
-  if (cachedDataDir) return cachedDataDir
+  if (cachedDataDir) {
+    setPayloadDataDir(cachedDataDir)
+    return cachedDataDir
+  }
   cachedDataDir = resolvePreferredDataDir()
 
   if (!existsSync(cachedDataDir)) {
     mkdirSync(cachedDataDir, { recursive: true })
   }
   migrateLegacyDataIfNeeded(cachedDataDir)
+  setPayloadDataDir(cachedDataDir)
 
   return cachedDataDir
 }
@@ -232,6 +238,10 @@ export function isFtsAvailable(): boolean {
 
 export function isSearchTrigramFtsAvailable(): boolean {
   return searchTrigramFtsAvailable
+}
+
+export function isSearchSegmentsFtsRebuildNeeded(): boolean {
+  return searchSegmentsFtsNeedsRebuild
 }
 
 function runOn(sqlite: NativeDatabase, sql: string, params?: unknown[]): void {
@@ -281,6 +291,9 @@ CREATE TABLE IF NOT EXISTS pages (
   ocr_text TEXT,
   ocr_result TEXT,
   proofed_text TEXT,
+  ocr_text_ref TEXT,
+  ocr_result_ref TEXT,
+  proofed_text_ref TEXT,
   ocr_status TEXT DEFAULT 'pending',
   proof_status TEXT DEFAULT 'pending',
   created_at TEXT,
@@ -296,6 +309,8 @@ CREATE TABLE IF NOT EXISTS page_ocr_versions (
   label TEXT,
   ocr_text TEXT,
   ocr_result TEXT,
+  ocr_text_ref TEXT,
+  ocr_result_ref TEXT,
   status TEXT DEFAULT 'completed',
   is_active INTEGER DEFAULT 0,
   created_at TEXT,
@@ -542,8 +557,112 @@ CREATE TABLE IF NOT EXISTS research_outputs (
   output_type TEXT NOT NULL,
   title TEXT NOT NULL,
   content TEXT NOT NULL,
+  source_dataset_id TEXT,
   created_at TEXT,
   FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_tasks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT,
+  title TEXT NOT NULL,
+  goal TEXT NOT NULL,
+  kind TEXT DEFAULT 'mixed',
+  scope_json TEXT DEFAULT '{}',
+  field_schema_json TEXT DEFAULT '[]',
+  suggested_queries_json TEXT DEFAULT '[]',
+  status TEXT DEFAULT 'draft',
+  error_message TEXT DEFAULT '',
+  dataset_id TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_task_steps (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  step_key TEXT NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  message TEXT DEFAULT '',
+  progress REAL DEFAULT 0,
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_datasets (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  project_id TEXT,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  field_schema_json TEXT DEFAULT '[]',
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_records (
+  id TEXT PRIMARY KEY,
+  dataset_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  project_id TEXT,
+  doc_id TEXT NOT NULL,
+  page_num INTEGER,
+  excerpt TEXT NOT NULL,
+  locator_json TEXT DEFAULT '',
+  source_hash TEXT DEFAULT '',
+  values_json TEXT DEFAULT '{}',
+  confidence REAL DEFAULT 0.6,
+  status TEXT DEFAULT 'pending',
+  note TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (dataset_id) REFERENCES ai_research_datasets(id) ON DELETE CASCADE,
+  FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL,
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_retrieval_runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  project_id TEXT,
+  plan_json TEXT NOT NULL,
+  stats_json TEXT DEFAULT '{}',
+  status TEXT DEFAULT 'running',
+  message TEXT DEFAULT '',
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_retrieval_stats (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  run_id TEXT,
+  stats_json TEXT NOT NULL,
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (run_id) REFERENCES ai_research_retrieval_runs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ai_research_evidence_packs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT,
+  run_id TEXT,
+  evidence_json TEXT NOT NULL,
+  evidence_count INTEGER DEFAULT 0,
+  truncated INTEGER DEFAULT 0,
+  created_at TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+  FOREIGN KEY (run_id) REFERENCES ai_research_retrieval_runs(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS reader_state (
@@ -570,6 +689,7 @@ CREATE TABLE IF NOT EXISTS page_ai_layout_cache (
   mode TEXT NOT NULL,
   source_hash TEXT NOT NULL,
   result_text TEXT DEFAULT '',
+  result_text_ref TEXT,
   status TEXT DEFAULT 'ready',
   error_message TEXT,
   model TEXT,
@@ -588,6 +708,8 @@ CREATE TABLE IF NOT EXISTS page_translation_cache (
   source_hash TEXT NOT NULL,
   source_text TEXT DEFAULT '',
   translation_text TEXT DEFAULT '',
+  source_text_ref TEXT,
+  translation_text_ref TEXT,
   skipped INTEGER DEFAULT 0,
   status TEXT DEFAULT 'ready',
   error_message TEXT,
@@ -746,6 +868,14 @@ CREATE INDEX IF NOT EXISTS idx_research_notes_source_hash ON research_notes(doc_
 CREATE INDEX IF NOT EXISTS idx_research_project_documents_doc_id ON research_project_documents(doc_id);
 CREATE INDEX IF NOT EXISTS idx_research_outline_project_order ON research_outline_items(project_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_research_outputs_project_id ON research_outputs(project_id);
+CREATE INDEX IF NOT EXISTS idx_ai_research_tasks_project ON ai_research_tasks(project_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_steps_task ON ai_research_task_steps(task_id, step_key);
+CREATE INDEX IF NOT EXISTS idx_ai_research_datasets_project ON ai_research_datasets(project_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_records_dataset ON ai_research_records(dataset_id, status);
+CREATE INDEX IF NOT EXISTS idx_ai_research_records_doc ON ai_research_records(doc_id, page_num);
+CREATE INDEX IF NOT EXISTS idx_ai_research_retrieval_runs_task ON ai_research_retrieval_runs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_retrieval_stats_task ON ai_research_retrieval_stats(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_evidence_packs_task ON ai_research_evidence_packs(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_reader_state_updated_at ON reader_state(updated_at);
 CREATE INDEX IF NOT EXISTS idx_page_ai_layout_cache_doc ON page_ai_layout_cache(doc_id, page_num);
 CREATE INDEX IF NOT EXISTS idx_page_ai_layout_cache_lookup ON page_ai_layout_cache(page_id, mode, source_hash);
@@ -841,9 +971,27 @@ function addColumnIfMissing(sqlite: NativeDatabase, tableName: string, columnSql
   }
 }
 
+function getTableCreateSql(sqlite: NativeDatabase, tableName: string): string {
+  try {
+    const row = sqlite.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName) as { sql?: string } | undefined
+    return String(row?.sql || '')
+  } catch {
+    return ''
+  }
+}
+
+function dropFtsTableIfNotExternalContent(sqlite: NativeDatabase, tableName: string): boolean {
+  const createSql = getTableCreateSql(sqlite, tableName).toLowerCase()
+  if (!createSql) return false
+  if (createSql.includes("content='search_index_segments'") || createSql.includes('content="search_index_segments"')) return false
+  sqlite.exec(`DROP TABLE IF EXISTS ${tableName}`)
+  return true
+}
+
 function ensureFts(sqlite: NativeDatabase): void {
   ftsAvailable = false
   searchTrigramFtsAvailable = false
+  let recreatedSearchSegmentsFts = false
   try {
     sqlite.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
@@ -853,14 +1001,13 @@ function ensureFts(sqlite: NativeDatabase): void {
         content
       );
     `)
+    recreatedSearchSegmentsFts = dropFtsTableIfNotExternalContent(sqlite, 'search_segments_fts') || recreatedSearchSegmentsFts
     sqlite.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_fts USING fts5(
-        segment_id UNINDEXED,
-        doc_id UNINDEXED,
-        page_id UNINDEXED,
-        page_num UNINDEXED,
         title,
-        normalized_text
+        normalized_text,
+        content='search_index_segments',
+        content_rowid='rowid'
       );
     `)
     ftsAvailable = true
@@ -871,13 +1018,12 @@ function ensureFts(sqlite: NativeDatabase): void {
 
   if (!ftsAvailable) return
   try {
+    recreatedSearchSegmentsFts = dropFtsTableIfNotExternalContent(sqlite, 'search_segments_trigram') || recreatedSearchSegmentsFts
     sqlite.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS search_segments_trigram USING fts5(
-        segment_id UNINDEXED,
-        doc_id UNINDEXED,
-        page_id UNINDEXED,
-        page_num UNINDEXED,
         normalized_text,
+        content='search_index_segments',
+        content_rowid='rowid',
         tokenize='trigram'
       );
     `)
@@ -886,6 +1032,7 @@ function ensureFts(sqlite: NativeDatabase): void {
     searchTrigramFtsAvailable = false
     console.warn('[Database] FTS5 trigram unavailable, long CJK search will use verified scan fallback', error)
   }
+  searchSegmentsFtsNeedsRebuild = searchSegmentsFtsNeedsRebuild || recreatedSearchSegmentsFts
 }
 
 function ensureIndexes(sqlite: NativeDatabase): void {
@@ -902,19 +1049,19 @@ function rebuildFts(sqlite: NativeDatabase): void {
     FROM pages
   `)
 
-  sqlite.exec('DELETE FROM search_segments_fts')
+  sqlite.exec("INSERT INTO search_segments_fts(search_segments_fts) VALUES('delete-all')")
   sqlite.exec(`
-    INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
-    SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+    INSERT INTO search_segments_fts (rowid, title, normalized_text)
+    SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
     FROM search_index_segments
     WHERE TRIM(COALESCE(normalized_text, text, '')) != ''
   `)
 
   if (searchTrigramFtsAvailable) {
-    sqlite.exec('DELETE FROM search_segments_trigram')
+    sqlite.exec("INSERT INTO search_segments_trigram(search_segments_trigram) VALUES('delete-all')")
     sqlite.exec(`
-      INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
-      SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+      INSERT INTO search_segments_trigram (rowid, normalized_text)
+      SELECT rowid, COALESCE(normalized_text, text, '')
       FROM search_index_segments
       WHERE TRIM(COALESCE(normalized_text, text, '')) != ''
     `)
@@ -983,11 +1130,15 @@ function ensureFtsSeeded(sqlite: NativeDatabase): void {
   const segmentFtsCount = getSearchSegmentsFtsCount(sqlite)
   const trigramCount = getSearchSegmentsTrigramCount(sqlite)
   if (
-    getFtsPageCount(sqlite) !== getSearchablePageCount(sqlite)
-    || segmentFtsCount < segmentCount
-    || (searchTrigramFtsAvailable && trigramCount < segmentCount)
+    searchSegmentsFtsNeedsRebuild
+    || (
+      getFtsPageCount(sqlite) !== getSearchablePageCount(sqlite)
+      || segmentFtsCount < segmentCount
+      || (searchTrigramFtsAvailable && trigramCount < segmentCount)
+    )
   ) {
     rebuildFts(sqlite)
+    searchSegmentsFtsNeedsRebuild = false
   }
 }
 
@@ -1162,9 +1313,6 @@ function cleanupOrphanRows(sqlite: NativeDatabase): void {
   if (hasTable(sqlite, 'search_index_segments_staging')) {
     statements.push('DELETE FROM search_index_segments_staging')
   }
-  if (hasTable(sqlite, 'search_segments_trigram') && hasTable(sqlite, 'documents')) {
-    statements.push('DELETE FROM search_segments_trigram WHERE doc_id NOT IN (SELECT id FROM documents)')
-  }
   if (hasTable(sqlite, 'document_toc_items') && hasTable(sqlite, 'documents')) {
     statements.push('DELETE FROM document_toc_items WHERE doc_id NOT IN (SELECT id FROM documents)')
   }
@@ -1239,6 +1387,10 @@ function stripLegacyTocMetadata(sqlite: NativeDatabase): void {
 }
 
 function migrateExistingSchema(sqlite: NativeDatabase): void {
+  addColumnIfMissing(sqlite, 'pages', 'ocr_text_ref TEXT', 'ocr_text_ref')
+  addColumnIfMissing(sqlite, 'pages', 'ocr_result_ref TEXT', 'ocr_result_ref')
+  addColumnIfMissing(sqlite, 'pages', 'proofed_text_ref TEXT', 'proofed_text_ref')
+
   addColumnIfMissing(sqlite, 'documents', 'is_favorite INTEGER DEFAULT 0', 'is_favorite')
   addColumnIfMissing(sqlite, 'documents', 'favorite_at TEXT', 'favorite_at')
   addColumnIfMissing(sqlite, 'documents', "read_status TEXT DEFAULT 'unread'", 'read_status')
@@ -1394,6 +1546,117 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'research_notes', "citation_text TEXT DEFAULT ''", 'citation_text')
   addColumnIfMissing(sqlite, 'research_notes', "source_hash TEXT DEFAULT ''", 'source_hash')
   addColumnIfMissing(sqlite, 'research_notes', 'sort_order INTEGER DEFAULT 0', 'sort_order')
+  addColumnIfMissing(sqlite, 'research_outputs', 'source_dataset_id TEXT', 'source_dataset_id')
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS ai_research_tasks (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      title TEXT NOT NULL,
+      goal TEXT NOT NULL,
+      kind TEXT DEFAULT 'mixed',
+      scope_json TEXT DEFAULT '{}',
+      field_schema_json TEXT DEFAULT '[]',
+      suggested_queries_json TEXT DEFAULT '[]',
+      status TEXT DEFAULT 'draft',
+      error_message TEXT DEFAULT '',
+      dataset_id TEXT,
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_research_task_steps (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      step_key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      message TEXT DEFAULT '',
+      progress REAL DEFAULT 0,
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_research_datasets (
+      id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      project_id TEXT,
+      name TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      field_schema_json TEXT DEFAULT '[]',
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_research_records (
+      id TEXT PRIMARY KEY,
+      dataset_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      project_id TEXT,
+      doc_id TEXT NOT NULL,
+      page_num INTEGER,
+      excerpt TEXT NOT NULL,
+      locator_json TEXT DEFAULT '',
+      source_hash TEXT DEFAULT '',
+      values_json TEXT DEFAULT '{}',
+      confidence REAL DEFAULT 0.6,
+      status TEXT DEFAULT 'pending',
+      note TEXT DEFAULT '',
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (dataset_id) REFERENCES ai_research_datasets(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_research_retrieval_runs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT,
+      project_id TEXT,
+      plan_json TEXT NOT NULL,
+      stats_json TEXT DEFAULT '{}',
+      status TEXT DEFAULT 'running',
+      message TEXT DEFAULT '',
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_research_retrieval_stats (
+      id TEXT PRIMARY KEY,
+      task_id TEXT,
+      run_id TEXT,
+      stats_json TEXT NOT NULL,
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (run_id) REFERENCES ai_research_retrieval_runs(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_research_evidence_packs (
+      id TEXT PRIMARY KEY,
+      task_id TEXT,
+      run_id TEXT,
+      evidence_json TEXT NOT NULL,
+      evidence_count INTEGER DEFAULT 0,
+      truncated INTEGER DEFAULT 0,
+      created_at TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY (run_id) REFERENCES ai_research_retrieval_runs(id) ON DELETE CASCADE
+    );
+  `)
+  addColumnIfMissing(sqlite, 'ai_research_tasks', "kind TEXT DEFAULT 'mixed'", 'kind')
+  addColumnIfMissing(sqlite, 'ai_research_tasks', 'dataset_id TEXT', 'dataset_id')
+  addColumnIfMissing(sqlite, 'ai_research_tasks', "error_message TEXT DEFAULT ''", 'error_message')
+  addColumnIfMissing(sqlite, 'ai_research_records', "note TEXT DEFAULT ''", 'note')
+  addColumnIfMissing(sqlite, 'ai_research_records', "status TEXT DEFAULT 'pending'", 'status')
 
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS page_ocr_versions (
@@ -1415,8 +1678,13 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   `)
   addColumnIfMissing(sqlite, 'page_ocr_versions', 'page_num INTEGER', 'page_num')
   addColumnIfMissing(sqlite, 'page_ocr_versions', "label TEXT", 'label')
+  addColumnIfMissing(sqlite, 'page_ocr_versions', 'ocr_text_ref TEXT', 'ocr_text_ref')
+  addColumnIfMissing(sqlite, 'page_ocr_versions', 'ocr_result_ref TEXT', 'ocr_result_ref')
   addColumnIfMissing(sqlite, 'page_ocr_versions', "status TEXT DEFAULT 'completed'", 'status')
   addColumnIfMissing(sqlite, 'page_ocr_versions', 'is_active INTEGER DEFAULT 0', 'is_active')
+  addColumnIfMissing(sqlite, 'page_ai_layout_cache', 'result_text_ref TEXT', 'result_text_ref')
+  addColumnIfMissing(sqlite, 'page_translation_cache', 'source_text_ref TEXT', 'source_text_ref')
+  addColumnIfMissing(sqlite, 'page_translation_cache', 'translation_text_ref TEXT', 'translation_text_ref')
   addColumnIfMissing(sqlite, 'search_index_segments', "offset_map TEXT DEFAULT ''", 'offset_map')
   addColumnIfMissing(sqlite, 'search_index_segments', 'source_start INTEGER DEFAULT 0', 'source_start')
 
@@ -1764,6 +2032,7 @@ export function rebuildSearchTables(): void {
   const database = getDatabase()
   if (ftsAvailable) {
     rebuildFts(database)
+    searchSegmentsFtsNeedsRebuild = false
     saveDatabase()
   }
 }
@@ -1771,21 +2040,35 @@ export function rebuildSearchTables(): void {
 export function refreshSearchSegmentsFtsForDocument(docId: string): void {
   if (!ftsAvailable || !docId) return
   const database = getDatabase()
-  runOn(database, 'DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
-  if (searchTrigramFtsAvailable) {
-    runOn(database, 'DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
+  if (!searchSegmentsFtsNeedsRebuild) {
+    runOn(database,
+      `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+       SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [docId]
+    )
+    if (searchTrigramFtsAvailable) {
+      runOn(database,
+        `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+         SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId]
+      )
+    }
   }
   runOn(database,
-    `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
-     SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+    `INSERT INTO search_segments_fts (rowid, title, normalized_text)
+     SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
      FROM search_index_segments
      WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
     [docId]
   )
   if (searchTrigramFtsAvailable) {
     runOn(database,
-      `INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
-       SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+      `INSERT INTO search_segments_trigram (rowid, normalized_text)
+       SELECT rowid, COALESCE(normalized_text, text, '')
        FROM search_index_segments
        WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
       [docId]

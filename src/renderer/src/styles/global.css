@@ -3,20 +3,24 @@
 /* ====== CSS 变量设计系统 ====== */
 :root {
   /* 品牌色系：古铜金 + 墨色 */
-  --gs-gold: #C4956A;
-  --gs-gold-light: #D4AD84;
-  --gs-gold-dark: #A67B52;
-  --gs-ink: #1a1a1a;
-  --gs-ink-deep: #0a0a0a;
-  --gs-ink-light: #2a2a2a;
-  --gs-paper: #f5efe6;
-  --gs-paper-dark: #e8dfd4;
+  --gs-gold: #c4956a;
+  --gs-gold-light: #d4ad84;
+  --gs-gold-dark: #a67b52;
+  --gs-ink: #1a1816;
+  --gs-ink-deep: #0e0d0c;
+  --gs-ink-light: #24221f;
+  --gs-ink-border: rgba(196, 149, 106, 0.08);
+  --gs-paper: #f6efe2;
+  --gs-paper-dark: #e6dac6;
+  --gs-glass-bg: rgba(255, 255, 255, 0.025);
+  --gs-glass-border: rgba(196, 149, 106, 0.12);
+  --gs-glass-shadow: 0 16px 42px rgba(0, 0, 0, 0.38);
 
   /* 状态色 */
-  --gs-success: #52c41a;
-  --gs-warning: #faad14;
-  --gs-error: #ff4d4f;
-  --gs-info: #1890ff;
+  --gs-success: #2e8b57;
+  --gs-warning: #d99f00;
+  --gs-error: #b22222;
+  --gs-info: #3a5fcd;
 
   /* 文本色 (暗色主题) */
   --gs-text-primary: rgba(255, 255, 255, 0.92);
@@ -31,14 +35,14 @@
   --gs-spacing-xl: 32px;
 
   /* 动画 */
-  --gs-transition-fast: 0.15s ease;
-  --gs-transition-normal: 0.25s ease;
-  --gs-transition-slow: 0.4s ease;
+  --gs-transition-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  --gs-transition-normal: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  --gs-transition-slow: 0.5s cubic-bezier(0.4, 0, 0.2, 1);
 
   /* 阴影 */
-  --gs-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --gs-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --gs-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --gs-shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --gs-shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --gs-shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.6);
 }
 
 /* ====== 基础重置 ====== */
@@ -76,13 +80,13 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
-  border-radius: 3px;
+  background: rgba(196, 149, 106, 0.12);
+  border-radius: 99px;
   transition: background var(--gs-transition-fast);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  background: rgba(196, 149, 106, 0.35);
 }
 
 /* ====== 选中文本样式 ====== */
@@ -120,7 +124,7 @@ body {
   font-size: 18px;
   color: var(--gs-gold);
   letter-spacing: 2px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--gs-ink-border);
   user-select: none;
 }
 
@@ -213,7 +217,7 @@ body {
 }
 
 .status-badge--processing {
-  background: rgba(24, 144, 255, 0.15);
+  background: rgba(58, 95, 205, 0.15);
   color: var(--gs-info);
 }
 
@@ -229,15 +233,15 @@ body {
 
 /* ====== Glassmorphism 卡片 ====== */
 .glass-card {
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--gs-glass-bg);
   backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--gs-glass-border);
   border-radius: 12px;
   transition: all var(--gs-transition-normal);
 }
 
 .glass-card:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.045);
   border-color: rgba(196, 149, 106, 0.2);
   box-shadow: var(--gs-shadow-md);
 }

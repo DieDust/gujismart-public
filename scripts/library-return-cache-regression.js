@@ -25,6 +25,11 @@ assertIncludes(libraryView, 'withLibraryRequestTimeout', 'library list loads sho
 assertIncludes(libraryView, '文献列表加载超时', 'library list timeout should explain how to recover')
 assertIncludes(libraryView, 'const canWarmRefresh = libraryWarmCache?.scopeKey === scopeKey && libraryWarmCache.documents.length > 0', 'library reload should detect warm return state')
 assertIncludes(libraryView, 'loadDocuments(filter, { reset: shouldResetList, silent: canWarmRefresh })', 'return-to-library refresh should be silent when cache is warm')
+assertIncludes(libraryView, 'void loadDocuments(filter, { reset: true, silent: true })', 'import/OCR refresh should reload from the first sorted page instead of preserving stale visual order')
+assertIncludes(libraryView, 'scheduleImportListRefresh()', 'OCR completion should schedule a sorted list refresh')
 assertIncludes(libraryView, 'patchLibraryWarmCache', 'successful list/base/count loads should update warm cache')
+assertIncludes(read('src/shared/types.ts'), "source: 'cache' | 'snapshot' | 'recalculated'", 'library cache should expose whether counts are cached, dirty snapshots, or recalculated')
+assertIncludes(read('src/main/library-state-cache.ts'), "source: 'snapshot'", 'dirty library cache should return the persisted snapshot instead of running heavy counts')
+assertIncludes(read('src/main/library-state-cache.ts'), 'lastCalibratedAt', 'library cache should remember the last full calibration time')
 
 console.log('Library return cache regression checks passed')

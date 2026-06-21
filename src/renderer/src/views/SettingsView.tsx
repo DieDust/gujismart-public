@@ -153,13 +153,115 @@ function formatBytes(value?: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
+const MIN_NOTICEABLE_FREELIST_BYTES = 8 * 1024 * 1024
+const LARGE_FREELIST_BYTES = 64 * 1024 * 1024
+const FREELIST_RATIO_RECOMMEND_THRESHOLD = 0.1
+
+function isDatabaseCompactionWorthwhile(diagnostics: DatabaseStorageDiagnostics | null): boolean {
+  const freelistBytes = Number(diagnostics?.freelistBytes || 0)
+  const databaseBytes = Number(diagnostics?.databaseBytes || 0)
+  if (!Number.isFinite(freelistBytes) || freelistBytes <= 0) return false
+  if (freelistBytes >= LARGE_FREELIST_BYTES) return true
+  return freelistBytes >= MIN_NOTICEABLE_FREELIST_BYTES
+    && freelistBytes >= Math.max(1, databaseBytes) * FREELIST_RATIO_RECOMMEND_THRESHOLD
+}
+
 function formatCount(value?: number): string {
   return Math.max(0, Number(value || 0)).toLocaleString()
 }
 
+function formatDatabaseMaintenanceStage(value?: string | null): string {
+  switch (value) {
+    case 'idle':
+      return '空闲'
+    case 'diagnose':
+      return '正在诊断'
+    case 'cleanup-legacy-index':
+      return '正在清理旧索引'
+    case 'externalize-page-payloads':
+      return '正在迁移大字段'
+    case 'queue-lightweight-index':
+      return '正在排队重建索引'
+    case 'compact':
+      return '正在压缩'
+    case 'verify':
+      return '校验完成'
+    case 'completed':
+      return '已完成'
+    case 'failed':
+      return '失败'
+    default:
+      return value ? String(value) : '空闲'
+  }
+}
+
+function formatDatabaseStorageModel(value?: string | null): string {
+  if (value === 'sqlite-metadata-external-assets-v1') return '元数据与外置资源 v1'
+  return value ? String(value) : '-'
+}
+
+function formatDatabaseStorageLayerLabel(kind?: string, fallback?: string): string {
+  switch (kind) {
+    case 'metadata':
+      return '元数据与关系'
+    case 'document-text':
+      return '页面文本与 OCR 结果'
+    case 'external-payload':
+      return '外置页面大字段'
+    case 'search-index':
+      return '检索候选索引'
+    case 'cache':
+      return '可重建缓存'
+    case 'runtime':
+      return '运行维护状态'
+    default:
+      return fallback || '其他数据'
+  }
+}
+
 function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics | null): boolean {
   if (!diagnostics) return true
-  return Boolean(diagnostics.requiredMaintenance?.required)
+  return !!diagnostics.searchIndex.enterpriseSearchMigrationRecommended
+    || hasLegacySearchIndexResidue(diagnostics)
+    || hasInlinePagePayloadMaintenance(diagnostics)
+}
+
+function hasLegacySearchIndexResidue(diagnostics: DatabaseStorageDiagnostics | null): boolean {
+  if (!diagnostics) return true
+  const reasons = diagnostics.requiredMaintenance?.reasons || []
+  return reasons.some((reason) => (
+    reason === 'legacy-ngram-index'
+    || reason === 'legacy-single-char-ngram'
+    || reason === 'legacy-ngram-positions'
+  ))
+    || diagnostics.searchIndex.ngramRows > 0
+    || diagnostics.searchIndex.singleCharNgramRows > 0
+    || diagnostics.searchIndex.ngramPositionsBytes > 0
+}
+
+function hasInlinePagePayloadMaintenance(diagnostics: DatabaseStorageDiagnostics | null): boolean {
+  if (!diagnostics) return true
+  return diagnostics.requiredMaintenance?.reasons?.includes('inline-page-payloads') || false
+}
+
+function getSearchIndexMaintenancePrompt(diagnostics: DatabaseStorageDiagnostics | null): string {
+  const hasLegacyResidue = hasLegacySearchIndexResidue(diagnostics)
+  const needsEnterpriseMigration = !!diagnostics?.searchIndex.enterpriseSearchMigrationRecommended
+  const needsPayloadMigration = hasInlinePagePayloadMaintenance(diagnostics)
+  if (hasLegacyResidue || needsEnterpriseMigration || needsPayloadMigration) {
+    return `会一次性完成数据库企业级升级：${hasLegacyResidue ? '清理旧检索候选索引，' : ''}${needsEnterpriseMigration ? '升级新版轻量全文索引结构，' : ''}${needsPayloadMigration ? '迁移页面 OCR 大字段，' : ''}并提交索引校准任务；不删除文献、OCR 文本、PDF 原文，也不会重新 OCR。完成后可在空闲时点击“压缩数据库”释放磁盘空间。`
+  }
+  return '搜索索引和页面大字段已经是新版结构，无需再次瘦身。'
+}
+
+function getSearchIndexMaintenanceLoadingText(diagnostics: DatabaseStorageDiagnostics | null): string {
+  const hasLegacyResidue = hasLegacySearchIndexResidue(diagnostics)
+  const needsEnterpriseMigration = !!diagnostics?.searchIndex.enterpriseSearchMigrationRecommended
+  const needsPayloadMigration = hasInlinePagePayloadMaintenance(diagnostics)
+  if (hasLegacyResidue || needsEnterpriseMigration || needsPayloadMigration) {
+    return '正在执行数据库企业级升级：清理索引、升级全文索引并迁移页面大字段，请稍候...'
+  }
+  return '搜索索引和页面大字段已经是新版结构，无需再次瘦身。'
 }
 
 function normalizeAutoBackupIntervalDraft(value: unknown): number {
@@ -276,6 +378,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [glossaryLoading, setGlossaryLoading] = useState(false)
   const [glossaryModalOpen, setGlossaryModalOpen] = useState(false)
   const [editingGlossaryTerm, setEditingGlossaryTerm] = useState<TranslationGlossaryTerm | null>(null)
+  const databaseCompactionWorthwhile = isDatabaseCompactionWorthwhile(databaseDiagnostics)
 
   const setSettingsDirty = useCallback((dirty: boolean) => {
     dirtyRef.current = dirty
@@ -1025,6 +1128,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  useEffect(() => {
+    if (activeSettingsSection !== 'data' || databaseMaintenanceBusy) return
+    void refreshDatabaseDiagnostics()
+  }, [activeSettingsSection])
+
   const handleExportDatabaseDiagnostics = async () => {
     setDatabaseMaintenanceBusy(true)
     try {
@@ -1059,15 +1167,32 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
   const handleOptimizeLegacyDatabase = async () => {
     if (!hasLegacySearchIndexMaintenance(databaseDiagnostics)) {
-      message.info({ content: '旧搜索索引已经清理完成，无需再次瘦身。', key: 'database-maintenance', duration: 4 })
+      message.info({ content: '搜索索引已经是新版结构，无需再次瘦身。', key: 'database-maintenance', duration: 4 })
       setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
       return
     }
     setDatabaseMaintenanceBusy(true)
     setDatabaseMaintenanceProgress(null)
-    message.loading({ content: '正在清理旧搜索索引并提交轻量索引重建任务，窗口不会被完整压缩阻塞，请稍候...', key: 'database-maintenance', duration: 0 })
+    message.loading({ content: getSearchIndexMaintenanceLoadingText(databaseDiagnostics), key: 'database-maintenance', duration: 0 })
     try {
       const result = await window.api.rebuildLightweightSearchIndex()
+      if (result.success) {
+        message.success({ content: result.message, key: 'database-maintenance', duration: 10 })
+      } else {
+        message.error({ content: result.error || result.message, key: 'database-maintenance', duration: 8 })
+      }
+      setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+    } finally {
+      setDatabaseMaintenanceBusy(false)
+    }
+  }
+
+  const handleCleanupExternalPayloads = async () => {
+    setDatabaseMaintenanceBusy(true)
+    setDatabaseMaintenanceProgress(null)
+    message.loading({ content: '正在清理未被数据库引用的外置大字段文件...', key: 'database-maintenance', duration: 0 })
+    try {
+      const result = await window.api.cleanupExternalPayloads()
       if (result.success) {
         message.success({ content: result.message, key: 'database-maintenance', duration: 10 })
       } else {
@@ -1372,12 +1497,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   <Text strong>{formatBytes(databaseDiagnostics?.databaseBytes)}</Text>
                 </div>
                 <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>可压缩空闲页</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {databaseCompactionWorthwhile ? '可压缩空闲页' : '少量空闲页（正常）'}
+                  </Text>
                   <br />
                   <Text strong>{formatBytes(databaseDiagnostics?.freelistBytes)}</Text>
                 </div>
                 <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>ngram 行数</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>旧检索索引行数</Text>
                   <br />
                   <Text strong>{(databaseDiagnostics?.searchIndex.ngramRows || 0).toLocaleString()}</Text>
                 </div>
@@ -1387,11 +1514,51 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   <Text strong>{(databaseDiagnostics?.searchIndex.singleCharNgramRows || 0).toLocaleString()}</Text>
                 </div>
                 <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
-                  <Text type="secondary" style={{ fontSize: 12 }}>trigram FTS</Text>
+                  <Text type="secondary" style={{ fontSize: 12 }}>新版全文索引</Text>
                   <br />
                   <Text strong>{(databaseDiagnostics?.searchIndex.searchSegmentsTrigramRows || 0).toLocaleString()}</Text>
                 </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>维护阶段</Text>
+                  <br />
+                  <Text strong>{formatDatabaseMaintenanceStage(databaseDiagnostics?.maintenanceState.stage)}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>存储模型</Text>
+                  <br />
+                  <Text strong>{formatDatabaseStorageModel(databaseDiagnostics?.storageModelVersion)}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>外置大字段（压缩后）</Text>
+                  <br />
+                  <Text strong>{formatBytes(databaseDiagnostics?.externalPayloads.bytes || 0)}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>未引用大字段</Text>
+                  <br />
+                  <Text strong>{(databaseDiagnostics?.externalPayloads.orphanedFileCount || 0).toLocaleString()}</Text>
+                </div>
+                <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>缺失大字段</Text>
+                  <br />
+                  <Text strong>{(databaseDiagnostics?.externalPayloads.missingReferencedFileCount || 0).toLocaleString()}</Text>
+                </div>
               </div>
+
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                外置大字段按 gzip 压缩并按内容去重保存，显示的是实际磁盘占用；迁移前占用通常会明显更大。
+              </Text>
+              {databaseDiagnostics?.storageLayers?.length ? (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 12 }}>
+                  {databaseDiagnostics.storageLayers.map((layer) => (
+                    <div key={layer.kind} style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.05)' }}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>{formatDatabaseStorageLayerLabel(layer.kind, layer.label)}</Text>
+                      <br />
+                      <Text strong>{formatCount(layer.rowCount)} 行</Text>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
 
               {databaseDiagnostics?.warnings.length ? (
                 <Alert
@@ -1427,9 +1594,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
               <Space wrap>
                 <Popconfirm
-                  title={hasLegacySearchIndexMaintenance(databaseDiagnostics)
-                    ? '会分批清理体积很大的 ngram 候选索引，并提交轻量 trigram FTS 索引重建任务；不删除文献、OCR 文本、PDF 原文。搜索会回到真实文本核验，准确性不受影响。为避免长时间未响应，本步骤不会自动压缩数据库；索引重建完成后可在空闲时单独点击“压缩数据库”释放磁盘空间。'
-                    : '旧搜索索引已经清理完成，无需再次瘦身。'}
+                  title={getSearchIndexMaintenancePrompt(databaseDiagnostics)}
                   okText="开始优化"
                   cancelText="取消"
                   disabled={!hasLegacySearchIndexMaintenance(databaseDiagnostics) || databaseMaintenanceBusy}
@@ -1440,21 +1605,43 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     icon={<DatabaseOutlined />}
                     loading={databaseMaintenanceBusy}
                     disabled={!hasLegacySearchIndexMaintenance(databaseDiagnostics)}
-                    title={hasLegacySearchIndexMaintenance(databaseDiagnostics) ? undefined : '旧搜索索引已经清理完成，无需再次瘦身'}
+                    title={hasLegacySearchIndexMaintenance(databaseDiagnostics) ? undefined : '搜索索引和页面大字段已经是新版结构，无需再次瘦身'}
                   >
-                    一键瘦身搜索索引
+                    一键企业级升级与瘦身
                   </Button>
                 </Popconfirm>
                 <Button icon={<ExportOutlined />} loading={databaseMaintenanceBusy} onClick={() => void handleExportDatabaseDiagnostics()}>
                   导出诊断报告
                 </Button>
                 <Popconfirm
-                  title="压缩数据库可能需要较长时间和额外临时空间，过程中请不要强制退出软件。"
+                  title="只删除外置大字段目录中已经没有任何数据库记录引用的文件；不会删除文献、PDF、OCR 文本或数据库记录。"
+                  okText="清理"
+                  cancelText="取消"
+                  onConfirm={() => void handleCleanupExternalPayloads()}
+                >
+                  <Button
+                    icon={<DatabaseOutlined />}
+                    loading={databaseMaintenanceBusy}
+                    disabled={!databaseDiagnostics?.externalPayloads.orphanedFileCount}
+                  >
+                    清理未引用大字段
+                  </Button>
+                </Popconfirm>
+                <Popconfirm
+                  title={databaseCompactionWorthwhile
+                    ? '压缩数据库可能需要较长时间和额外临时空间，过程中请不要强制退出软件。'
+                    : '当前只有少量 SQLite 空闲页，属于正常写入碎片，暂时不需要压缩。'}
                   okText="压缩"
                   cancelText="取消"
+                  disabled={!databaseCompactionWorthwhile || databaseMaintenanceBusy}
                   onConfirm={() => void handleCompactDatabase()}
                 >
-                  <Button icon={<DatabaseOutlined />} loading={databaseMaintenanceBusy}>
+                  <Button
+                    icon={<DatabaseOutlined />}
+                    loading={databaseMaintenanceBusy}
+                    disabled={!databaseCompactionWorthwhile}
+                    title={databaseCompactionWorthwhile ? undefined : '少量空闲页会被数据库自动复用，无需压缩'}
+                  >
                     压缩数据库
                   </Button>
                 </Popconfirm>

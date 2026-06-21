@@ -111,6 +111,10 @@ interface AsyncJobStatusPayload {
   status?: string
   state?: string
   progress?: number
+  pollCount?: number
+  waitingMs?: number
+  retryingStatusQuery?: boolean
+  statusQueryError?: string
   totalPages?: number
   completedPages?: number
   successPages?: number
@@ -161,6 +165,7 @@ const PDF_LIB_CHUNK_PLAN_MAX_FILE_SIZE = ASYNC_PDF_MAX_FILE_SIZE
 const ASYNC_POLL_MIN_INTERVAL_MS = 1200
 const ASYNC_POLL_BASE_INTERVAL_MS = 5000
 const ASYNC_POLL_MAX_INTERVAL_MS = 12000
+const ASYNC_STATUS_QUERY_TIMEOUT_MS = 30 * 1000
 const ASYNC_RESULT_READY_GRACE_MS = 10 * 60 * 1000
 const ASYNC_JOB_STALLED_TIMEOUT_MS = 10 * 60 * 1000
 const ASYNC_RESULT_PARSE_YIELD_LINE_INTERVAL = 100
@@ -2898,7 +2903,7 @@ async function queryAsyncPdfJob(jobId: string, signal?: AbortSignal): Promise<As
       method: 'GET',
       headers: getAsyncAuthHeaders(),
       signal,
-    }, getOcrUploadTimeoutMs(), 'PDF OCR 状态查询超时，请稍后重试。')
+    }, ASYNC_STATUS_QUERY_TIMEOUT_MS, 'PDF OCR 状态查询超时，正在重新查询服务端处理进度。')
 
     if (!response.ok) {
       const error = new Error(`异步 OCR 查询失败，状态码 ${response.status}`) as Error & { status?: number }
@@ -2925,8 +2930,34 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
   while (true) {
     throwIfAborted(signal)
     pollCount += 1
-    const statusPayload = await queryAsyncPdfJob(jobId, signal)
-    onProgress?.(statusPayload)
+    let statusPayload: AsyncJobStatusPayload
+    try {
+      statusPayload = await queryAsyncPdfJob(jobId, signal)
+    } catch (error) {
+      if (isOcrAbortError(error)) throw error
+      const failure = error as Error & { status?: number; code?: number | string }
+      if (!isRetryableNetworkFailure(failure)) throw failure
+      const waitingMs = Date.now() - lastProgressAt
+      if (waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS) {
+        throw new Error(`PaddleOCR 状态查询长时间没有进展：${failure.message || '服务端未返回处理状态'}。请稍后点击“继续 OCR”重试，已经保存的页面会自动跳过。`)
+      }
+      onProgress?.({
+        status: 'queued',
+        state: 'queued',
+        retryingStatusQuery: true,
+        statusQueryError: failure.message,
+        pollCount,
+        waitingMs,
+      })
+      await sleep(getAsyncPollDelayMs({
+        pollCount,
+        changed: false,
+        completedPages: 0,
+        totalPages: 0,
+        allPagesCompleted: false,
+      }), signal)
+      continue
+    }
 
     const state = String(statusPayload.status || statusPayload.state || '').toLowerCase()
     const jsonUrl = getJsonUrl(statusPayload)
@@ -2949,6 +2980,9 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
     } else if (Date.now() - lastProgressAt > ASYNC_JOB_STALLED_TIMEOUT_MS) {
       throw new Error('PaddleOCR 异步任务长时间没有进展。请稍后继续 OCR，已经保存的页面会自动跳过。')
     }
+    statusPayload.pollCount = pollCount
+    statusPayload.waitingMs = Date.now() - lastProgressAt
+    onProgress?.(statusPayload)
     if (state === 'success' || state === 'completed' || state === 'succeeded' || state === 'done') {
       if (!jsonUrl) {
         throw new Error('异步 OCR 已完成，但未返回结果地址')

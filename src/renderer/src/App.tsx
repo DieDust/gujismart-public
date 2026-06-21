@@ -24,6 +24,7 @@ import type { SettingsViewHandle } from './views/SettingsView'
 import WelcomeView from './views/WelcomeView'
 import { useFolderStore } from './stores/useFolderStore'
 import { useOnboardingStore } from './stores/useOnboardingStore'
+import { clampAiButtonPosition, clampFloatingPanelState, getDefaultFloatingPanelState } from './utils/floatingViewport'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
 import type { AppUpdateInfo, BackgroundTaskProgressEvent, DatabaseStorageDiagnostics, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
@@ -33,7 +34,7 @@ const { Sider, Content, Header } = Layout
 
 type ViewKey = 'welcome' | 'library' | 'settings' | 'dashboard' | 'search' | 'citation' | 'tags' | 'research' | 'excerpts'
 type MenuItem = Required<MenuProps>['items'][number]
-type DatabaseUpgradePhase = 'idle' | 'cleanup' | 'compact'
+type DatabaseUpgradePhase = 'idle' | 'precompact' | 'cleanup' | 'compact'
 type LibraryDroppedImportRequest = {
   id: number
   paths: string[]
@@ -67,6 +68,9 @@ const ONBOARDING_STEP_KEYS = ['welcome', 'paddle_ocr', 'ai_model', 'vision_ocr',
 const ONBOARDING_SETTINGS_LOAD_TIMEOUT_MS = 3000
 const ONBOARDING_SETTINGS_TIMEOUT = Symbol('onboarding-settings-timeout')
 const DATABASE_UPGRADE_UI_SETTLE_MS = 50
+const MIN_NOTICEABLE_FREELIST_BYTES = 8 * 1024 * 1024
+const LARGE_FREELIST_BYTES = 64 * 1024 * 1024
+const FREELIST_RATIO_RECOMMEND_THRESHOLD = 0.1
 
 function hasConfiguredText(value: unknown): boolean {
   return String(value || '').trim().length > 0
@@ -114,6 +118,26 @@ function formatDatabaseUpgradeSavedBytes(before?: number, after?: number): strin
   return saved > 0 ? `，已释放 ${formatDatabaseUpgradeBytes(saved)}` : ''
 }
 
+function isDatabaseCompactionWorthwhile(diagnostics: DatabaseStorageDiagnostics | null): boolean {
+  const freelistBytes = Number(diagnostics?.freelistBytes || 0)
+  const databaseBytes = Number(diagnostics?.databaseBytes || 0)
+  if (!Number.isFinite(freelistBytes) || freelistBytes <= 0) return false
+  if (freelistBytes >= LARGE_FREELIST_BYTES) return true
+  return freelistBytes >= MIN_NOTICEABLE_FREELIST_BYTES
+    && freelistBytes >= Math.max(1, databaseBytes) * FREELIST_RATIO_RECOMMEND_THRESHOLD
+}
+
+function hasRequiredDatabaseMaintenance(diagnostics: DatabaseStorageDiagnostics | null): boolean {
+  const reasons = diagnostics?.requiredMaintenance?.reasons || []
+  return reasons.some((reason) => (
+    reason === 'legacy-ngram-index'
+    || reason === 'legacy-single-char-ngram'
+    || reason === 'legacy-ngram-positions'
+    || reason === 'enterprise-search-index'
+    || reason === 'inline-page-payloads'
+  ))
+}
+
 function waitForDatabaseUpgradeUi(): Promise<void> {
   return new Promise((resolve) => {
     window.setTimeout(resolve, DATABASE_UPGRADE_UI_SETTLE_MS)
@@ -145,6 +169,8 @@ export default function App() {
   const [libraryAiScope, setLibraryAiScope] = useState<LibraryAiScope | undefined>(undefined)
   const [libraryAiScopeLabel, setLibraryAiScopeLabel] = useState('')
   const [libraryAiInitialTab, setLibraryAiInitialTab] = useState<LibraryAiTab>('qa')
+  const [libraryAiResearchProjectId, setLibraryAiResearchProjectId] = useState<string | null>(null)
+  const [activeResearchProjectId, setActiveResearchProjectId] = useState<string | null>(null)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [databaseUpgradeDiagnostics, setDatabaseUpgradeDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
   const [databaseUpgradeVisible, setDatabaseUpgradeVisible] = useState(false)
@@ -247,7 +273,7 @@ export default function App() {
         const diagnostics = await window.api.getDatabaseStorageDiagnostics()
         if (cancelled) return
         setDatabaseUpgradeDiagnostics(diagnostics)
-        setDatabaseUpgradeVisible(Boolean(diagnostics.requiredMaintenance?.required))
+        setDatabaseUpgradeVisible(hasRequiredDatabaseMaintenance(diagnostics))
       } catch (error) {
         console.warn('Failed to evaluate database upgrade state', error)
       }
@@ -304,8 +330,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    panelState.current.x = window.innerWidth - 420 - 24
-    panelState.current.y = 80
+    panelState.current = getDefaultFloatingPanelState()
     if (floatingPanelRef.current) {
       floatingPanelRef.current.style.transform = `translate(${panelState.current.x}px, ${panelState.current.y}px)`
       floatingPanelRef.current.style.width = `${panelState.current.w}px`
@@ -328,6 +353,18 @@ export default function App() {
       pendingPanelStyleRef.current = next
       if (panelFrameRef.current == null) panelFrameRef.current = window.requestAnimationFrame(flushPanelStyle)
     }
+    const applyPanelState = (next: { x: number; y: number; w: number; h: number }) => {
+      const clamped = clampFloatingPanelState(next)
+      panelState.current = clamped
+      schedulePanelStyle(clamped)
+    }
+    const applyButtonPosition = (next: { x: number; y: number }, scale = false) => {
+      const clamped = clampAiButtonPosition(next)
+      btnPosRef.current = clamped
+      if (aiButtonRef.current) {
+        aiButtonRef.current.style.transform = `translate(${clamped.x}px, ${clamped.y}px)${scale ? ' scale(1.05)' : ''}`
+      }
+    }
     const handlePanelMouseMove = (event: MouseEvent) => {
       if (!floatingPanelRef.current) return
 
@@ -336,9 +373,7 @@ export default function App() {
         const dy = event.clientY - interactStart.current.mouseY
         const newX = interactStart.current.panelX + dx
         const newY = interactStart.current.panelY + dy
-        panelState.current.x = newX
-        panelState.current.y = newY
-        schedulePanelStyle({ x: newX, y: newY })
+        applyPanelState({ ...panelState.current, x: newX, y: newY })
       } else if (resizingPanel.current) {
         const dx = event.clientX - interactStart.current.mouseX
         const dy = event.clientY - interactStart.current.mouseY
@@ -362,8 +397,7 @@ export default function App() {
           }
         }
 
-        panelState.current = { x: panelX, y: panelY, w: panelW, h: panelH }
-        schedulePanelStyle({ x: panelX, y: panelY, w: panelW, h: panelH })
+        applyPanelState({ x: panelX, y: panelY, w: panelW, h: panelH })
       }
 
       if (btnDragState.current.isDragging && aiButtonRef.current) {
@@ -372,8 +406,7 @@ export default function App() {
         const dy = event.clientY - btnDragState.current.startY
         const newX = btnDragState.current.btnX + dx
         const newY = btnDragState.current.btnY + dy
-        btnPosRef.current = { x: newX, y: newY }
-        aiButtonRef.current.style.transform = `translate(${newX}px, ${newY}px) scale(1.05)`
+        applyButtonPosition({ x: newX, y: newY }, true)
       }
     }
 
@@ -391,10 +424,8 @@ export default function App() {
 
       if (btnDragState.current.isDragging) {
         btnDragState.current.isDragging = false
-        if (aiButtonRef.current) {
-          aiButtonRef.current.style.transition = ''
-          aiButtonRef.current.style.transform = `translate(${btnPosRef.current.x}px, ${btnPosRef.current.y}px)`
-        }
+        if (aiButtonRef.current) aiButtonRef.current.style.transition = ''
+        applyButtonPosition(btnPosRef.current)
         document.body.style.cursor = ''
         setTimeout(() => {
           btnDragState.current.moved = false
@@ -402,13 +433,20 @@ export default function App() {
       }
     }
 
+    const handleViewportResize = () => {
+      applyPanelState(panelState.current)
+      applyButtonPosition(btnPosRef.current)
+    }
+
     document.addEventListener('mousemove', handlePanelMouseMove)
     document.addEventListener('mouseup', handlePanelMouseUp)
+    window.addEventListener('resize', handleViewportResize)
     return () => {
       if (panelFrameRef.current != null) window.cancelAnimationFrame(panelFrameRef.current)
       pendingPanelStyleRef.current = null
       document.removeEventListener('mousemove', handlePanelMouseMove)
       document.removeEventListener('mouseup', handlePanelMouseUp)
+      window.removeEventListener('resize', handleViewportResize)
     }
   }, [])
 
@@ -524,6 +562,7 @@ export default function App() {
     setLibraryAiScope(normalized.scope)
     setLibraryAiScopeLabel(normalized.scopeLabel || '')
     setLibraryAiInitialTab(normalized.initialTab || 'qa')
+    setLibraryAiResearchProjectId(normalized.researchProjectId || null)
     setLibraryAiOpen(true)
   }
 
@@ -610,9 +649,22 @@ export default function App() {
 
   const handleRequiredDatabaseUpgrade = async () => {
     setDatabaseUpgradeBusy(true)
-    setDatabaseUpgradePhase('cleanup')
     setDatabaseUpgradeProgress(null)
     try {
+      const initialDiagnostics = await window.api.getDatabaseStorageDiagnostics()
+      setDatabaseUpgradeDiagnostics(initialDiagnostics)
+      if (isDatabaseCompactionWorthwhile(initialDiagnostics)) {
+        setDatabaseUpgradePhase('precompact')
+        await waitForDatabaseUpgradeUi()
+        const precompactResult = await window.api.compactDatabase()
+        if (!precompactResult.success) {
+          message.error(precompactResult.error || precompactResult.message || '旧数据库压缩失败，请确认磁盘空间充足后重试。')
+          return
+        }
+        setDatabaseUpgradeDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+      }
+
+      setDatabaseUpgradePhase('cleanup')
       const rebuildResult = await window.api.rebuildLightweightSearchIndex()
       if (!rebuildResult.success) {
         message.error(rebuildResult.error || rebuildResult.message || '数据库升级失败')
@@ -621,8 +673,8 @@ export default function App() {
 
       const cleanupDiagnostics = await window.api.getDatabaseStorageDiagnostics()
       setDatabaseUpgradeDiagnostics(cleanupDiagnostics)
-      if (cleanupDiagnostics.requiredMaintenance?.required) {
-        message.warning('旧索引仍未清理完成，请稍后再次点击升级，或进入设置页查看数据库空间管理进度。')
+      if (hasRequiredDatabaseMaintenance(cleanupDiagnostics)) {
+        message.warning('数据库企业级升级仍未完成，请稍后再次点击升级，或进入设置页查看数据库空间管理进度。')
         return
       }
 
@@ -637,7 +689,7 @@ export default function App() {
       }
 
       setDatabaseUpgradeVisible(false)
-      message.success(`数据库升级并压缩完成${formatDatabaseUpgradeSavedBytes(compactResult.beforeBytes, compactResult.afterBytes)}。搜索索引会在后台继续更新。`)
+      message.success(`数据库企业级升级并压缩完成${formatDatabaseUpgradeSavedBytes(compactResult.beforeBytes, compactResult.afterBytes)}。搜索索引会在后台继续更新。`)
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error || '数据库升级并压缩失败'))
     } finally {
@@ -704,6 +756,8 @@ export default function App() {
         return (
           <ResearchView
             onOpenDocument={openDocumentTarget}
+            onOpenLibraryAi={openLibraryAi}
+            onActiveProjectChange={setActiveResearchProjectId}
           />
         )
       case 'excerpts':
@@ -741,7 +795,17 @@ export default function App() {
   const databaseUpgradeProgressPercent = Math.max(0, Math.min(100, Math.round(Number(databaseUpgradeProgress?.progress || 0) * 100)))
   const databaseUpgradeDescription = requiredMaintenance?.required
     ? requiredMaintenance.message
-    : '旧版搜索索引已清理，仍需要完成数据库压缩后再继续使用。压缩失败时可以重试，或退出软件后稍后再打开。'
+    : '当前文献库需要完成企业级数据库维护后再继续使用。软件会自动跳过已经完成的步骤，只补做仍需要处理的部分。'
+  const databaseUpgradePhaseText = databaseUpgradePhase === 'precompact'
+    ? '正在先压缩旧数据库'
+    : databaseUpgradePhase === 'cleanup'
+      ? '正在升级企业级数据库结构'
+      : '正在完成最终压缩'
+  const databaseUpgradePhaseDescription = databaseUpgradePhase === 'precompact'
+    ? '检测到旧数据库中已有可释放空间，正在先压缩旧库，避免带着旧碎片进入新版结构。'
+    : databaseUpgradePhase === 'cleanup'
+      ? '正在按需清理旧索引、升级新版全文索引，并迁移页面 OCR 大字段。已经完成的步骤会自动跳过。'
+      : '正在把本次升级和迁移产生的空闲页真正释放到磁盘。大数据库可能需要较长时间。'
 
   return (
     <Layout className="app-layout">
@@ -865,6 +929,18 @@ export default function App() {
             <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>旧位置数据</div>
             <strong>{formatDatabaseUpgradeBytes(databaseUpgradeDiagnostics?.searchIndex.ngramPositionsBytes)}</strong>
           </div>
+          <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>新版全文索引</div>
+            <strong>{databaseUpgradeDiagnostics?.searchIndex.enterpriseSearchMigrationRecommended ? '待升级' : '已就绪'}</strong>
+          </div>
+          <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>待迁移大字段</div>
+            <strong>{formatDatabaseUpgradeBytes(databaseUpgradeDiagnostics?.storageLayers?.find((layer) => layer.kind === 'document-text')?.estimatedBytes)}</strong>
+          </div>
+          <div style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.04)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>可压缩空间</div>
+            <strong>{formatDatabaseUpgradeBytes(databaseUpgradeDiagnostics?.freelistBytes)}</strong>
+          </div>
         </div>
         {databaseUpgradeProgress && (databaseUpgradeProgress.status === 'processing' || databaseUpgradeProgress.status === 'queued') ? (
           <div style={{ marginTop: 8 }}>
@@ -878,8 +954,26 @@ export default function App() {
           <Alert
             type="info"
             showIcon
-            message="正在压缩数据库，请不要关闭软件"
-            description="正在把清理旧索引后留下的空闲页真正释放到磁盘。大数据库可能需要较长时间，期间界面可能短暂无响应。"
+            message={databaseUpgradePhaseText}
+            description={databaseUpgradePhaseDescription}
+            style={{ marginTop: 12 }}
+          />
+        ) : null}
+        {databaseUpgradeBusy && databaseUpgradePhase === 'precompact' ? (
+          <Alert
+            type="info"
+            showIcon
+            message={databaseUpgradePhaseText}
+            description={databaseUpgradePhaseDescription}
+            style={{ marginTop: 12 }}
+          />
+        ) : null}
+        {databaseUpgradeBusy && databaseUpgradePhase === 'cleanup' ? (
+          <Alert
+            type="info"
+            showIcon
+            message={databaseUpgradePhaseText}
+            description={databaseUpgradePhaseDescription}
             style={{ marginTop: 12 }}
           />
         ) : null}
@@ -938,7 +1032,10 @@ export default function App() {
           }}
           onClick={() => {
             if (!btnDragState.current.moved) {
-              openLibraryAi({ question: headerSearchKey })
+              openLibraryAi({
+                question: headerSearchKey,
+                researchProjectId: currentView === 'research' ? activeResearchProjectId : null,
+              })
             }
           }}
         >
@@ -982,6 +1079,7 @@ export default function App() {
                 initialScope={libraryAiScope}
                 initialScopeLabel={libraryAiScopeLabel}
                 initialTab={libraryAiInitialTab}
+                initialResearchProjectId={libraryAiResearchProjectId}
                 onOpenDocument={openDocumentTarget}
               />
             </Suspense>

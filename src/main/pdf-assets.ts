@@ -4,6 +4,7 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readSync, rea
 import { copyFile, mkdir, open, readdir, rm, stat, writeFile } from 'fs/promises'
 import { basename, dirname, extname, join, normalize } from 'path'
 import { getDataDir, queryAll, queryOne, run, scheduleDatabaseSave } from './database'
+import { hydratePagePayloadRows, preparePagePayloadUpdate } from './page-payload-store'
 import { buildPdfCompressionMetadata, storePdfWithCompression, storePdfWithCompressionSync } from './pdf-compression'
 import type {
   CompletedPdfAssetCleanupResult,
@@ -46,9 +47,11 @@ interface RepositoryIndexRow {
 
 interface PageAssetRow {
   id: string
+  doc_id: string
   page_num: number | null
   image_path: string | null
   ocr_result: string | null
+  ocr_result_ref?: string | null
 }
 
 type JsonRecord = Record<string, unknown>
@@ -155,10 +158,10 @@ function getCoordinateSourceSize(parsed: JsonRecord, imageSize: { width: number;
 }
 
 function materializeContentImageAssets(docId: string): number {
-  const pages = queryAll<PageAssetRow>(
-    'SELECT id, page_num, image_path, ocr_result FROM pages WHERE doc_id = ? AND image_path IS NOT NULL AND TRIM(image_path) != ?',
+  const pages = hydratePagePayloadRows(queryAll<PageAssetRow>(
+    'SELECT id, doc_id, page_num, image_path, ocr_result, ocr_result_ref FROM pages WHERE doc_id = ? AND image_path IS NOT NULL AND TRIM(image_path) != ?',
     [docId, ''],
-  )
+  ))
   if (pages.length === 0) return 0
 
   const assetDir = join(getDataDir(), 'storage', docId, 'extracted-images')
@@ -208,17 +211,18 @@ function materializeContentImageAssets(docId: string): number {
     })
 
     if (changed) {
-      run('UPDATE pages SET ocr_result = ? WHERE id = ?', [JSON.stringify(parsed), page.id])
+      const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', parsed)
+      run('UPDATE pages SET ocr_result = ?, ocr_result_ref = ? WHERE id = ?', [preparedResult.value, preparedResult.ref, page.id])
     }
   }
   return savedCount
 }
 
 async function materializeContentImageAssetsAsync(docId: string): Promise<number> {
-  const pages = queryAll<PageAssetRow>(
-    'SELECT id, page_num, image_path, ocr_result FROM pages WHERE doc_id = ? AND image_path IS NOT NULL AND TRIM(image_path) != ?',
+  const pages = hydratePagePayloadRows(queryAll<PageAssetRow>(
+    'SELECT id, doc_id, page_num, image_path, ocr_result, ocr_result_ref FROM pages WHERE doc_id = ? AND image_path IS NOT NULL AND TRIM(image_path) != ?',
     [docId, ''],
-  )
+  ))
   if (pages.length === 0) return 0
 
   const assetDir = join(getDataDir(), 'storage', docId, 'extracted-images')
@@ -268,7 +272,8 @@ async function materializeContentImageAssetsAsync(docId: string): Promise<number
     }
 
     if (changed) {
-      run('UPDATE pages SET ocr_result = ? WHERE id = ?', [JSON.stringify(parsed), page.id])
+      const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', parsed)
+      run('UPDATE pages SET ocr_result = ?, ocr_result_ref = ? WHERE id = ?', [preparedResult.value, preparedResult.ref, page.id])
     }
     await yieldToEventLoop()
   }

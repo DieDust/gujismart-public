@@ -29,6 +29,18 @@ const submitAsyncPdfJobBody = sliceBetween(
   'async function queryAsyncPdfJob',
   'async PDF submit',
 )
+const queryAsyncPdfJobBody = sliceBetween(
+  ocrSource,
+  'async function queryAsyncPdfJob',
+  'async function waitForAsyncPdfResult',
+  'async PDF status query',
+)
+const waitForAsyncPdfResultBody = sliceBetween(
+  ocrSource,
+  'async function waitForAsyncPdfResult',
+  'function collectAsyncPagePayloads',
+  'async PDF status polling',
+)
 const createPdfChunkPlanBody = sliceBetween(
   ocrSource,
   'async function createPdfChunkPlan',
@@ -169,7 +181,7 @@ assert(
     && !ocrIpcSource.includes('上传设置')
     && !ocrIpcSource.includes('getOcrImageUploadSettingsText')
     && ocrIpcSource.includes("const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''")
-    && ocrIpcSource.includes('message: fallbackRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue'),
+    && ocrIpcSource.includes('message: fallbackRetryMessage || statusQueryRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue'),
   'OCR IPC progress should use concise user-facing upload/server messages instead of debug explanations.',
 )
 assert(
@@ -282,6 +294,28 @@ assert(
     && ocrSource.includes('pollCount += 1')
     && ocrSource.includes('await sleep(getAsyncPollDelayMs({'),
   'Async PDF status polling should adaptively poll faster near submission/completion instead of always waiting a fixed interval.',
+)
+assert(
+  ocrSource.includes('const ASYNC_STATUS_QUERY_TIMEOUT_MS = 30 * 1000')
+    && queryAsyncPdfJobBody.includes('ASYNC_STATUS_QUERY_TIMEOUT_MS')
+    && !queryAsyncPdfJobBody.includes('getOcrUploadTimeoutMs()'),
+  'Async PDF status queries should use a short dedicated timeout instead of the long upload timeout.',
+)
+assert(
+  waitForAsyncPdfResultBody.includes('try {')
+    && waitForAsyncPdfResultBody.includes('statusPayload = await queryAsyncPdfJob(jobId, signal)')
+    && waitForAsyncPdfResultBody.includes('retryingStatusQuery: true')
+    && waitForAsyncPdfResultBody.includes('statusQueryError: failure.message')
+    && waitForAsyncPdfResultBody.includes('waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS')
+    && waitForAsyncPdfResultBody.includes('await sleep(getAsyncPollDelayMs({'),
+  'Async PDF polling should retry transient status-query failures and fail recoverably after a real no-progress stall.',
+)
+assert(
+  ocrIpcSource.includes('function formatDurationMs')
+    && ocrIpcSource.includes('const statusQueryRetryMessage = payload.retryingStatusQuery')
+    && ocrIpcSource.includes('正在重新查询处理进度')
+    && ocrIpcSource.includes('message: fallbackRetryMessage || statusQueryRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue'),
+  'OCR IPC progress should surface status-query retries with elapsed time instead of leaving documents at a silent 0% wait.',
 )
 assert(
   ocrSource.includes('ASYNC_RESULT_PARSE_YIELD_LINE_INTERVAL')

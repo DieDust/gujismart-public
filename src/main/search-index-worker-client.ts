@@ -6,6 +6,7 @@ import type { SearchReindexDocumentResult } from '../shared/types'
 
 export interface SearchIndexWorkerTask {
   dbFilePath: string
+  dataDir: string
   docId: string
   totalCount: number
   completedCount: number

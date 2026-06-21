@@ -2,7 +2,7 @@
 import { nanoid } from 'nanoid'
 import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
-import { getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
+import { getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import { normalizeChineseSearchText, normalizeWhitespace } from './text-normalization'
 import { getErrorMessage } from '../shared/errors'
 import { emitBackgroundTaskStatus } from './background-tasks'
@@ -17,6 +17,7 @@ import {
   BACKGROUND_REINDEX_TIME_SLICE_MS,
   SEARCH_INDEX_SEGMENT_MAX_CHARS,
   SEARCH_INDEX_SEGMENT_OVERLAP_CHARS,
+  SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS,
   SEARCH_NGRAM_INDEX_ENABLED,
   SEARCH_INDEX_VERSION,
   SEARCH_NGRAM_MAX_POSITIONS_STORED,
@@ -24,6 +25,8 @@ import {
   SEARCH_TRIGRAM_MIN_QUERY_LENGTH,
 } from './search-index-constants'
 import { isSearchIndexWorkerAvailable, runSearchIndexWorkerTask } from './search-index-worker-client'
+import { hydratePagePayloadRow, readPagePayload } from './page-payload-store'
+import { resolveFolderAndDescendantIds } from './folder-scope'
 import type {
   AiPlannedSearchResponse,
   AiSearchPlan,
@@ -160,6 +163,9 @@ interface SearchPageRow {
   proofed_text?: string | null
   ocr_text?: string | null
   ocr_result?: unknown
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
+  proofed_text_ref?: string | null
   has_ocr_result?: number | null
   text?: string | null
   doc_type?: string | null
@@ -261,10 +267,13 @@ const INDEXABLE_PAGE_BASE_SELECT = `
     p.doc_id,
     p.page_num,
     p.proofed_text,
+    p.proofed_text_ref,
     p.ocr_text,
+    p.ocr_text_ref,
     COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '') as text,
     NULL as ocr_result,
-    CASE WHEN p.ocr_result IS NOT NULL AND p.ocr_result <> '' THEN 1 ELSE 0 END as has_ocr_result,
+    p.ocr_result_ref,
+    CASE WHEN (p.ocr_result IS NOT NULL AND p.ocr_result <> '') OR COALESCE(p.ocr_result_ref, '') <> '' THEN 1 ELSE 0 END as has_ocr_result,
     d.doc_type,
     d.title,
     d.file_path
@@ -273,6 +282,7 @@ const INDEXABLE_PAGE_BASE_SELECT = `
 `
 const searchResponseCache = new Map<string, { createdAt: number; response: SearchGroupedResponse }>()
 const searchFilterDocIdsCache = new Map<string, { createdAt: number; docIds: string[] | undefined }>()
+const folderScopeIdsCache = new Map<string, { createdAt: number; folderIds: string[] }>()
 const postingRowsCache = new Map<string, { createdAt: number; rows: SearchHitRow[] }>()
 const trigramCoverageCache = new Map<string, { createdAt: number; missingDocIds: string[] }>()
 const queuedReindexDocIds = new Set<string>()
@@ -304,6 +314,22 @@ function uniqueIds(values: string[]): string[] {
 
 function buildInClause(values: string[]): string {
   return values.map(() => '?').join(', ')
+}
+
+function resolveSearchFolderScopeIds(folderIds: string[]): string[] {
+  const uniqueFolderIds = uniqueIds(folderIds)
+  if (uniqueFolderIds.length === 0) return []
+  const cacheKey = stableStringify(uniqueFolderIds)
+  const cached = folderScopeIdsCache.get(cacheKey)
+  if (cached && Date.now() - cached.createdAt < SEARCH_FILTER_CACHE_TTL_MS) return [...cached.folderIds]
+  const resolved = resolveFolderAndDescendantIds(uniqueFolderIds)
+  folderScopeIdsCache.set(cacheKey, { createdAt: Date.now(), folderIds: resolved })
+  if (folderScopeIdsCache.size > 40) {
+    const oldestKey = [...folderScopeIdsCache.entries()]
+      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
+    if (oldestKey) folderScopeIdsCache.delete(oldestKey)
+  }
+  return resolved
 }
 
 function chunkValues<T>(values: T[], size = 800): T[][] {
@@ -392,8 +418,9 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
   }
 
   if (normalized.type === 'folders') {
-    if (normalized.folderIds.length === 0) return []
-    const placeholders = buildInClause(normalized.folderIds)
+    const folderIds = resolveSearchFolderScopeIds(normalized.folderIds)
+    if (folderIds.length === 0) return []
+    const placeholders = buildInClause(folderIds)
     return queryAll<{ id: string }>(
       `SELECT DISTINCT d.id
        FROM documents d
@@ -401,7 +428,7 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
        WHERE df.folder_id IN (${placeholders})
          AND ${activeDocumentCondition('d')}
        ORDER BY d.is_favorite DESC, d.updated_at DESC`,
-      normalized.folderIds
+      folderIds
     ).map((item) => item.id)
   }
 
@@ -431,7 +458,7 @@ function buildScopePreview(docIds: string[]): LibraryAiScopePreview {
      WHERE id IN (${placeholders})
        AND ${activeDocumentCondition('documents')}
      ORDER BY is_favorite DESC, updated_at DESC
-     LIMIT 5`,
+     LIMIT 500`,
     docIds
   )
   const ocrReady = queryOne<{ count: number }>(
@@ -464,7 +491,9 @@ function resolveSearchableDocumentIds(docIds: string[]): string[] {
          AND ${activeDocumentCondition('d')}
          AND (
            TRIM(COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '')) <> ''
+           OR COALESCE(p.proofed_text_ref, p.ocr_text_ref, '') <> ''
            OR (${INDEXABLE_PAGE_OCR_RESULT_CONDITION} AND p.ocr_result IS NOT NULL AND p.ocr_result <> '')
+           OR (${INDEXABLE_PAGE_OCR_RESULT_CONDITION} AND COALESCE(p.ocr_result_ref, '') <> '')
          )`,
       chunk,
     ).forEach((item) => searchableIds.add(item.doc_id))
@@ -652,16 +681,16 @@ function getOrderedOcrBlocks(page: SearchPageRow): OcrBlock[] {
 }
 
 function pageHasLazyOcrResult(page: SearchPageRow): boolean {
-  return !!page?.ocr_result || Number(page?.has_ocr_result || 0) > 0
+  return !!page?.ocr_result || !!page?.ocr_result_ref || Number(page?.has_ocr_result || 0) > 0
 }
 
 function loadPageOcrResultForSearch(page: SearchPageRow): SearchPageRow {
   if (page.ocr_result || !page.id || !pageHasLazyOcrResult(page)) return page
-  const row = queryOne<{ ocr_result?: string | null }>(
-    'SELECT ocr_result FROM pages WHERE id = ?',
+  const row = queryOne<{ ocr_result?: string | null; ocr_result_ref?: string | null }>(
+    'SELECT ocr_result, ocr_result_ref FROM pages WHERE id = ?',
     [page.id],
   )
-  return row?.ocr_result ? { ...page, ocr_result: row.ocr_result } : page
+  return row ? hydratePagePayloadRow({ ...page, ...row }) : page
 }
 
 function getOrderedOcrBlocksFromPayload(parsed: OcrResultPayload | null): OcrBlock[] {
@@ -694,7 +723,7 @@ function isManagedTextSearchPage(page: SearchPageRow): boolean {
 
 function shouldConsiderOcrBlocksForSearch(page: SearchPageRow): boolean {
   if (!pageHasLazyOcrResult(page)) return false
-  if (!String(page?.proofed_text || page?.ocr_text || '').trim()) return true
+  if (!String(getHydratedPageTextField(page, 'proofed_text') || getHydratedPageTextField(page, 'ocr_text') || '').trim()) return true
   if (isManagedTextSearchPage(page)) return true
   const docText = `${page?.doc_type || ''} ${page?.title || ''}`
   return /报纸|newspaper|古籍|地方志|hybrid|vision_model_ocr|ocr_layout/i.test(docText)
@@ -705,16 +734,24 @@ function shouldPreferOcrBlocksForSearch(page: SearchPageRow, blocks: OcrBlock[],
   const sourceType = String(parsed?.source_type || '')
   const docText = `${page?.doc_type || ''} ${page?.title || ''} ${sourceType}`
   if (/报纸|newspaper|古籍|地方志|hybrid|vision_model_ocr|ocr_layout/i.test(docText)) return true
-  const ocrText = String(page?.ocr_text || '').trim()
+  const ocrText = String(getHydratedPageTextField(page, 'ocr_text') || '').trim()
   const blockText = blocks.map(getBlockText).filter(Boolean).join('')
   return blockText.length >= 80 && ocrText.length > blockText.length * 0.7
 }
 
+function getHydratedPageTextField(page: SearchPageRow, field: 'proofed_text' | 'ocr_text'): string {
+  const inline = String(page?.[field] || '')
+  if (inline.trim()) return inline
+  const ref = String(page?.[`${field}_ref`] || '')
+  if (!ref) return ''
+  return readPagePayload(ref) || ''
+}
+
 function getIndexablePageText(page: SearchPageRow): string {
-  const proofed = String(page?.proofed_text || '').trim()
+  const proofed = String(getHydratedPageTextField(page, 'proofed_text') || '').trim()
   if (proofed) return proofed
 
-  const ocrText = String(page?.ocr_text || '').trim()
+  const ocrText = String(getHydratedPageTextField(page, 'ocr_text') || '').trim()
   const shouldLoadBlocks = shouldConsiderOcrBlocksForSearch(page) && (!!page.ocr_result || !ocrText)
   const pageWithOcrResult = shouldLoadBlocks ? loadPageOcrResultForSearch(page) : page
   const parsed = shouldLoadBlocks ? parseMaybeJson<OcrResultPayload>(pageWithOcrResult?.ocr_result) : null
@@ -818,7 +855,10 @@ function getSearchIndexSegmentStats(docId: string): SearchIndexSegmentStats {
   let ftsCount = 0
   if (isFtsAvailable()) {
     const ftsStats = queryOne<{ count?: number | null }>(
-      'SELECT COUNT(*) as count FROM search_segments_fts WHERE doc_id = ?',
+      `SELECT COUNT(*) as count
+       FROM search_segments_fts fts
+       INNER JOIN search_index_segments s ON s.rowid = fts.rowid
+       WHERE s.doc_id = ?`,
       [docId],
     )
     ftsCount = Number(ftsStats?.count || 0)
@@ -826,7 +866,10 @@ function getSearchIndexSegmentStats(docId: string): SearchIndexSegmentStats {
   let trigramFtsCount = 0
   if (isSearchTrigramFtsAvailable()) {
     const trigramStats = queryOne<{ count?: number | null }>(
-      'SELECT COUNT(*) as count FROM search_segments_trigram WHERE doc_id = ?',
+      `SELECT COUNT(*) as count
+       FROM search_segments_trigram tri
+       INNER JOIN search_index_segments s ON s.rowid = tri.rowid
+       WHERE s.doc_id = ?`,
       [docId],
     )
     trigramFtsCount = Number(trigramStats?.count || 0)
@@ -1065,7 +1108,9 @@ function getIndexablePagesWhereClause(): string {
     AND ${activeDocumentCondition('d')}
     AND (
       TRIM(COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '')) <> ''
+      OR COALESCE(p.proofed_text_ref, p.ocr_text_ref, '') <> ''
       OR (${INDEXABLE_PAGE_OCR_RESULT_CONDITION} AND p.ocr_result IS NOT NULL AND p.ocr_result <> '')
+      OR (${INDEXABLE_PAGE_OCR_RESULT_CONDITION} AND COALESCE(p.ocr_result_ref, '') <> '')
     )`
 }
 
@@ -1253,11 +1298,24 @@ function commitStagedSearchIndexForDocument(
   now: string,
 ): void {
   transaction(() => {
-    if (isFtsAvailable()) {
-      run('DELETE FROM search_segments_fts WHERE doc_id = ?', [docId])
+    const skipFtsDelete = isSearchSegmentsFtsRebuildNeeded()
+    if (isFtsAvailable() && !skipFtsDelete) {
+      run(
+        `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+         SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
     }
-    if (isSearchTrigramFtsAvailable()) {
-      run('DELETE FROM search_segments_trigram WHERE doc_id = ?', [docId])
+    if (isSearchTrigramFtsAvailable() && !skipFtsDelete) {
+      run(
+        `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+         SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId],
+      )
     }
     run('DELETE FROM search_ngram_index WHERE doc_id = ?', [docId])
     run('DELETE FROM search_index_segments WHERE doc_id = ?', [docId])
@@ -1265,7 +1323,16 @@ function commitStagedSearchIndexForDocument(
       `INSERT INTO search_index_segments (
         segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
       )
-       SELECT segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
+       SELECT segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start,
+              CASE
+                WHEN length(COALESCE(text, '')) > ${SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS}
+                THEN substr(text, 1, ${SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS})
+                ELSE text
+              END,
+              normalized_text,
+              '',
+              text_hash,
+              updated_at
        FROM search_index_segments_staging
        WHERE job_id = ?
        ORDER BY ordinal ASC`,
@@ -1280,8 +1347,8 @@ function commitStagedSearchIndexForDocument(
     )
     if (isFtsAvailable()) {
       run(
-        `INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
-         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+        `INSERT INTO search_segments_fts (rowid, title, normalized_text)
+         SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
          FROM search_index_segments
          WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
         [docId],
@@ -1289,8 +1356,8 @@ function commitStagedSearchIndexForDocument(
     }
     if (isSearchTrigramFtsAvailable()) {
       run(
-        `INSERT INTO search_segments_trigram (rowid, segment_id, doc_id, page_id, page_num, normalized_text)
-         SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(normalized_text, text, '')
+        `INSERT INTO search_segments_trigram (rowid, normalized_text)
+         SELECT rowid, COALESCE(normalized_text, text, '')
          FROM search_index_segments
          WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
         [docId],
@@ -1405,6 +1472,7 @@ async function reindexDocumentThroughWorker(docId: string, totalCount: number, c
     const result = await runSearchIndexWorkerTask(
       {
         dbFilePath: getDatabaseFilePath(),
+        dataDir: getDataDir(),
         docId,
         totalCount,
         completedCount,
@@ -1548,33 +1616,34 @@ function loadPageSegmentsForDocument(docId: string): SearchSegmentRow[] {
        doc_id,
        page_num,
        proofed_text,
+       proofed_text_ref,
        ocr_text,
+       ocr_text_ref,
        NULL as ocr_result,
-       CASE WHEN ocr_result IS NOT NULL AND ocr_result <> '' THEN 1 ELSE 0 END as has_ocr_result,
+       ocr_result_ref,
+       CASE WHEN (ocr_result IS NOT NULL AND ocr_result <> '') OR COALESCE(ocr_result_ref, '') <> '' THEN 1 ELSE 0 END as has_ocr_result,
        COALESCE(proofed_text, ocr_text, '') as text
      FROM pages
      WHERE doc_id = ?
-       AND TRIM(COALESCE(proofed_text, ocr_text, '')) <> ''
+       AND (TRIM(COALESCE(proofed_text, ocr_text, '')) <> '' OR COALESCE(proofed_text_ref, ocr_text_ref, ocr_result_ref, '') <> '')
      ORDER BY page_num ASC`,
     [docId],
-  ).map((page, index) => {
-    const text = getIndexablePageText(page) || String(page.text || '')
-    const normalized = normalizeSearchTextWithOffsetMap(text)
-    return {
-      segment_id: `${docId}:page-fallback:${page.id || index}`,
+  ).flatMap((page, index) => (
+    buildSearchIndexSegmentDrafts(docId, page, index).map((segment) => ({
+      segment_id: segment.segmentId,
       doc_id: page.doc_id,
-      page_id: page.id,
-      page_num: Number(page.page_num || index + 1),
-      source_kind: 'page',
-      href: null,
-      title: `第 ${page.page_num || index + 1} 页`,
-      ordinal: index,
-      source_start: 0,
-      text,
-      normalized_text: normalized.text,
-      offset_map: JSON.stringify(normalized.offsets),
-    }
-  })
+      page_id: segment.pageId,
+      page_num: segment.pageNum,
+      source_kind: segment.sourceKind,
+      href: segment.href,
+      title: segment.title,
+      ordinal: segment.ordinal,
+      source_start: segment.sourceStart,
+      text: segment.text,
+      normalized_text: segment.normalizedText,
+      offset_map: JSON.stringify(segment.offsetMap),
+    }))
+  ))
 }
 
 function insertSearchNgramsForStagedSegment(jobId: string, segment: { segmentId: string; docId: string; normalizedText: string }) {
@@ -1713,24 +1782,6 @@ function ensureManagedTextDocumentsIndexed(docIds?: string[]): string[] {
 }
 
 function staleSearchIndexSqlCondition(alias = 'sis'): string {
-  const trigramMissingCondition = isSearchTrigramFtsAvailable()
-    ? `OR (
-      EXISTS (
-        SELECT 1
-        FROM search_index_segments sidx
-        WHERE sidx.doc_id = d.id
-          AND TRIM(COALESCE(sidx.normalized_text, sidx.text, '')) <> ''
-        LIMIT 1
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM search_index_segments sidx_tri
-        INNER JOIN search_segments_trigram tri ON tri.rowid = sidx_tri.rowid
-        WHERE sidx_tri.doc_id = d.id
-        LIMIT 1
-      )
-    )`
-    : ''
   return `(
     ${alias}.doc_id IS NULL
     OR (
@@ -1747,7 +1798,6 @@ function staleSearchIndexSqlCondition(alias = 'sis'): string {
         AND TRIM(COALESCE(sidx.normalized_text, sidx.text, '')) <> ''
       LIMIT 1
     )
-    ${trigramMissingCondition}
   )`
 }
 
@@ -1780,7 +1830,7 @@ function findStaleManagedTextDocIds(docIds?: string[], limit = 80): string[] {
   ).map((item) => item.id)
 }
 
-function checkSearchIndexForScope(docIds?: string[]): string[] {
+function checkSearchIndexForScope(docIds?: string[], options: { autoReindex?: boolean } = {}): string[] {
   const uniqueDocIds = uniqueIds(docIds || [])
   const staleDocIds = uniqueDocIds.length > 0
     ? resolveActiveDocumentIds(uniqueDocIds).filter((docId) => !isUsableSearchIndexStatus(docId, getCurrentSearchIndexStatus(docId)))
@@ -1794,7 +1844,7 @@ function checkSearchIndexForScope(docIds?: string[]): string[] {
          LIMIT ?`,
         [SEARCH_STALE_GLOBAL_SCAN_LIMIT],
       ).map((row) => row.id)
-  if (staleDocIds.length > 0) scheduleBackgroundReindex(staleDocIds)
+  if (staleDocIds.length > 0 && options.autoReindex !== false) scheduleBackgroundReindex(staleDocIds)
   return staleDocIds
 }
 
@@ -1827,12 +1877,14 @@ function matchesDocumentFilters(doc: SearchDocumentRow, options?: SearchOptions)
 
   if (options.folderId) {
     const folderIds = String(doc.folder_ids || '').split('|').filter(Boolean)
-    if (!folderIds.includes(options.folderId)) return false
+    const acceptedFolderIds = resolveSearchFolderScopeIds([options.folderId])
+    if (!acceptedFolderIds.some((folderId) => folderIds.includes(folderId))) return false
   }
 
   if (Array.isArray(options.folderIds) && options.folderIds.length > 0) {
     const folderIds = String(doc.folder_ids || '').split('|').filter(Boolean)
-    if (!options.folderIds.some((folderId) => folderIds.includes(folderId))) return false
+    const acceptedFolderIds = resolveSearchFolderScopeIds(options.folderIds)
+    if (!acceptedFolderIds.some((folderId) => folderIds.includes(folderId))) return false
   }
 
   if (options.tagId) {
@@ -1870,14 +1922,15 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
     ...(options.tagId ? [options.tagId] : []),
     ...(options.tagIds || [])
   ])
-  const folderIds = uniqueIds([
+  const requestedFolderIds = uniqueIds([
     ...(options.folderId ? [options.folderId] : []),
     ...(options.folderIds || [])
   ])
+  const folderIds = resolveSearchFolderScopeIds(requestedFolderIds)
 
   const needsResolution = explicitDocIds.length > 0
     || tagIds.length > 0
-    || folderIds.length > 0
+    || requestedFolderIds.length > 0
     || !!options.docType
     || !!options.author
     || !!options.dynasty
@@ -1923,6 +1976,11 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
       sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
       params.push(tagId)
     })
+  }
+
+  if (requestedFolderIds.length > 0 && folderIds.length === 0) {
+    searchFilterDocIdsCache.set(cacheKey, { createdAt: Date.now(), docIds: [] })
+    return []
   }
 
   if (folderIds.length > 0) {
@@ -2364,7 +2422,7 @@ function runSegmentFtsSearch(keyword: string, limit: number, docIds?: string[]):
     let sql = `SELECT s.segment_id, s.doc_id, s.page_id, s.page_num, s.source_kind, s.href, s.title, s.ordinal, s.source_start, s.text, s.normalized_text, s.offset_map,
         bm25(search_segments_fts) as rank
       FROM search_segments_fts
-      INNER JOIN search_index_segments s ON s.segment_id = search_segments_fts.segment_id
+      INNER JOIN search_index_segments s ON s.rowid = search_segments_fts.rowid
       INNER JOIN documents d ON d.id = s.doc_id
       WHERE search_segments_fts MATCH ?
         AND ${activeDocumentCondition('d')}`
@@ -2546,9 +2604,12 @@ function loadPageFallbackRowsForDocuments(docIds: string[], keyword?: string, ma
          p.doc_id,
          p.page_num,
          p.proofed_text,
+         p.proofed_text_ref,
          p.ocr_text,
+         p.ocr_text_ref,
          NULL as ocr_result,
-         CASE WHEN p.ocr_result IS NOT NULL AND p.ocr_result <> '' THEN 1 ELSE 0 END as has_ocr_result,
+         p.ocr_result_ref,
+         CASE WHEN (p.ocr_result IS NOT NULL AND p.ocr_result <> '') OR COALESCE(p.ocr_result_ref, '') <> '' THEN 1 ELSE 0 END as has_ocr_result,
          d.doc_type,
          d.title,
          d.file_path,
@@ -2560,6 +2621,7 @@ function loadPageFallbackRowsForDocuments(docIds: string[], keyword?: string, ma
          AND (
            TRIM(COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '')) <> ''
            OR (p.ocr_result IS NOT NULL AND p.ocr_result <> '')
+           OR COALESCE(p.proofed_text_ref, p.ocr_text_ref, p.ocr_result_ref, '') <> ''
          )`
     sql += ' ORDER BY p.doc_id ASC, p.page_num ASC'
     queryAll<SearchPageRow>(sql, params).forEach((page, index) => {
@@ -2721,7 +2783,7 @@ function runSegmentNgramSearch(keyword: string, limit: number, docIds?: string[]
 
 function createSearchHit(
   row: SearchSegmentRow,
-  hit: { index: number; length: number; term: string },
+  hit: { index: number; length: number; term: string; originalIndex?: number; originalLength?: number },
   occurrenceIndex: number,
   rank: number,
   contextMode?: SearchOptions['contextMode'],
@@ -2733,7 +2795,13 @@ function createSearchHit(
   const pageIndex = Number.isFinite(ordinal) && !String(row.segment_id || '').includes(':page-fallback:')
     ? Math.max(0, Math.floor(ordinal / 1000))
     : null
-  const originalRange = normalizedRangeToOriginal(row, hit)
+  const hasOriginalRange = Number.isFinite(Number(hit.originalIndex)) && Number.isFinite(Number(hit.originalLength))
+  const originalRange = hasOriginalRange
+    ? {
+      start: Math.max(0, Number(hit.originalIndex)),
+      end: Math.max(1, Number(hit.originalIndex) + Math.max(1, Number(hit.originalLength))),
+    }
+    : normalizedRangeToOriginal(row, hit)
   const sourceStart = getSegmentSourceStart(row)
   const locator: SearchHitLocator = {
     docId: row.doc_id,
@@ -2769,7 +2837,7 @@ function buildHitsFromRows(rows: SearchHitRow[], keyword: string, limit: number,
   const queryTerm = keyword.trim()
   const sessionLimit = options?.resultMode === 'all' ? MAX_DOCUMENT_SEARCH_SESSION_HITS : 1200
   const hardLimit = Math.max(1, Math.min(limit, sessionLimit))
-  for (const row of rows) {
+  for (const row of hydrateSearchRowsText(rows)) {
     const sourceText = row.text || row.normalized_text || ''
     const occurrences = buildOccurrencesForRow(row, keyword)
     for (let occurrenceIndex = 0; occurrenceIndex < occurrences.length; occurrenceIndex += 1) {
@@ -2780,7 +2848,7 @@ function buildHitsFromRows(rows: SearchHitRow[], keyword: string, limit: number,
       const sourceTerm = sourceText.slice(originalIndex, originalIndex + originalLength) || hit.term
       hits.push(createSearchHit(
         row,
-        { index: hit.index, length: hit.length, term: sourceTerm },
+        { index: hit.index, length: hit.length, term: sourceTerm, originalIndex, originalLength },
         occurrenceIndex,
         Number(row.rank || 0) + occurrenceIndex / 1000,
         options?.contextMode,
@@ -2805,12 +2873,34 @@ function parseNgramPositions(value?: string): number[] {
   }
 }
 
+function shouldHydrateSearchRowText(row: SearchHitRow): boolean {
+  if (!row.page_id) return !row.text && !row.normalized_text
+  if (!row.text && !row.normalized_text) return true
+  if (!row.offset_map) return true
+  return Boolean(row.normalized_text && row.text && row.text.length + 16 < row.normalized_text.length)
+}
+
 function hydrateSearchRowsText(rows: SearchHitRow[]): SearchHitRow[] {
-  const missingRows = rows.filter((row) => !row.text && !row.normalized_text)
-  if (missingRows.length === 0) return rows
-  const segmentIds = [...new Set(missingRows.map((row) => row.segment_id))]
+  const rowsNeedingHydration = rows.filter(shouldHydrateSearchRowText)
+  if (rowsNeedingHydration.length === 0) return rows
+
+  const wantedSegmentIds = new Set(rowsNeedingHydration.map((row) => row.segment_id))
   const textBySegmentId = new Map<string, { text: string; normalized_text: string; offset_map?: string | null }>()
-  for (const chunk of chunkValues(segmentIds)) {
+  const docIds = [...new Set(rowsNeedingHydration.map((row) => row.doc_id).filter(Boolean))]
+
+  for (const docId of docIds) {
+    for (const segment of loadPageSegmentsForDocument(docId)) {
+      if (!wantedSegmentIds.has(segment.segment_id)) continue
+      textBySegmentId.set(segment.segment_id, {
+        text: segment.text || '',
+        normalized_text: segment.normalized_text || '',
+        offset_map: segment.offset_map || '',
+      })
+    }
+  }
+
+  const stillMissingSegmentIds = [...wantedSegmentIds].filter((segmentId) => !textBySegmentId.has(segmentId))
+  for (const chunk of chunkValues(stillMissingSegmentIds)) {
     const placeholders = buildInClause(chunk)
     queryAll<{ segment_id: string; text: string; normalized_text: string; offset_map?: string | null }>(
       `SELECT segment_id, text, normalized_text, offset_map FROM search_index_segments WHERE segment_id IN (${placeholders})`,
@@ -2823,10 +2913,12 @@ function hydrateSearchRowsText(rows: SearchHitRow[]): SearchHitRow[] {
       })
     })
   }
+
   return rows.map((row) => {
-    if (row.text || row.normalized_text) return row
     const text = textBySegmentId.get(row.segment_id)
-    return text ? { ...row, ...text } : row
+    return text
+      ? { ...row, text: text.text, normalized_text: text.normalized_text, offset_map: text.offset_map || '' }
+      : row
   })
 }
 
@@ -2965,7 +3057,7 @@ function groupRowsByOccurrences(rows: SearchHitRow[], keyword: string, options?:
       if (resultMode !== 'all' && group.hits.length >= MAX_PREVIEW_HITS_PER_DOC) return
       const hydratedRow = rowTextBySegmentId.get(row.segment_id)
       if (!hydratedRow) return
-      const occurrences = buildOccurrencesForRow(row, keyword)
+      const occurrences = buildOccurrencesForRow(hydratedRow, keyword)
       if (occurrences.length === 0) return
         const sourceText = hydratedRow.text || hydratedRow.normalized_text || ''
         for (let index = 0; index < occurrences.length; index += 1) {
@@ -2976,7 +3068,7 @@ function groupRowsByOccurrences(rows: SearchHitRow[], keyword: string, options?:
           const sourceTerm = sourceText.slice(originalIndex, originalIndex + originalLength) || occurrence.term
           const nextHit = createSearchHit(
             hydratedRow,
-            { index: occurrence.index, length: occurrence.length, term: sourceTerm },
+            { index: occurrence.index, length: occurrence.length, term: sourceTerm, originalIndex, originalLength },
             index,
             Number(row.rank || 0) + index / 1000,
             options?.contextMode,
@@ -3008,6 +3100,7 @@ function groupRowsByOccurrences(rows: SearchHitRow[], keyword: string, options?:
     totalHits,
     groups,
     warnings,
+    status: 'complete',
     page: safePage,
     pageSize: shouldPage ? pageSize : totalDocuments,
     totalPages,
@@ -3086,19 +3179,20 @@ function groupHits(hits: SearchHit[], options?: SearchOptions, warnings: string[
     totalHits: groups.reduce((sum, group) => sum + group.totalHits, 0),
     groups,
     warnings,
+    status: 'complete',
   }
 }
 
 export function querySearchV2(keyword: string, options?: SearchOptions): SearchGroupedResponse {
   const startedAt = Date.now()
   const query = keyword.trim()
-  if (!query) return { query: '', totalDocuments: 0, totalHits: 0, groups: [], warnings: [] }
+  if (!query) return { query: '', totalDocuments: 0, totalHits: 0, groups: [], warnings: [], status: 'preview' }
   const normalizedQuery = normalizeSearchText(query)
   const limit = options?.limit || 50
   const exhaustive = !!options?.exhaustive
   const scopedDocIds = resolveSearchFilterDocIds(options)
   if (scopedDocIds && scopedDocIds.length === 0) {
-    return { query, totalDocuments: 0, totalHits: 0, groups: [], warnings: ['当前筛选范围为空。'] }
+    return { query, totalDocuments: 0, totalHits: 0, groups: [], warnings: ['当前筛选范围为空。'], status: 'complete' }
   }
   if (scopedDocIds && scopedDocIds.length > 0 && scopedDocIds.length <= 8) {
     const staleManagedTextDocIds = findStaleManagedTextDocIds(scopedDocIds, 8)
@@ -3154,7 +3248,8 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     }
   }
 
-  const staleDocIds = checkSearchIndexForScope(scopedDocIds)
+  const autoReindex = options?.autoReindex !== false
+  const staleDocIds = checkSearchIndexForScope(scopedDocIds, { autoReindex })
   const needsCandidateText = (options?.resultMode || 'preview') === 'all' || normalizedQuery.length > 3
   const ngramRows = runSegmentNgramSearch(normalizedQuery, limit, scopedDocIds, exhaustive, needsCandidateText)
   const trigramEligible = isTrigramSearchEligible(normalizedQuery)
@@ -3218,18 +3313,35 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
   const matchedRows = mergeSearchRows(indexedRows, fallbackRows)
   const warnings = matchedRows.length === 0 ? ['当前范围内没有可匹配的全文索引。'] : []
   if (staleDocIds.length > 0) {
-    scheduleBackgroundReindex(staleDocIds)
     const staleIndexedHits = indexedRows.some((row) => staleDocIds.includes(row.doc_id))
-    warnings.push(
-      staleIndexedHits
-        ? `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；本次先使用已有索引展示结果，更新完成后会自动使用新索引。`
-        : allowSynchronousFallback
-        ? `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；本次已对缺失索引文献使用页面文本兜底。`
-        : `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；普通检索先显示已就绪索引结果，完整导出/诊断会补扫缺失文献。`,
-    )
+    if (autoReindex) {
+      scheduleBackgroundReindex(staleDocIds)
+      warnings.push(
+        staleIndexedHits
+          ? `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；本次先使用已有索引展示结果，更新完成后会自动使用新索引。`
+          : allowSynchronousFallback
+          ? `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；本次已对缺失索引文献使用页面文本兜底。`
+          : `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；普通检索先显示已就绪索引结果，完整导出/诊断会补扫缺失文献。`,
+      )
+    } else {
+      warnings.push(
+        staleIndexedHits
+          ? `有 ${staleDocIds.length} 篇文献的搜索索引尚未就绪；本次先使用已有索引和命中页前后文回答，不会自动重建索引。`
+          : allowSynchronousFallback
+          ? `有 ${staleDocIds.length} 篇文献的搜索索引尚未就绪；本次已使用页面文本兜底，不会自动重建索引。`
+          : `有 ${staleDocIds.length} 篇文献的搜索索引尚未就绪；本次只使用已就绪索引结果，不会自动重建索引。`,
+      )
+    }
   }
   const response = groupRowsByOccurrences(matchedRows, normalizedQuery, options, warnings)
-  const result = { ...response, query }
+  const searchStatus = needsScan
+    ? 'scanning'
+    : fallbackRows.length > 0 || staleDocIds.length > 0
+      ? 'verifying'
+      : matchedRows.length > 0
+        ? 'complete'
+        : 'candidate'
+  const result = { ...response, query, status: searchStatus as SearchGroupedResponse['status'] }
   if (SEARCH_METRICS_ENABLED) {
     console.info('[SearchMetrics]', JSON.stringify({
       query,
@@ -3294,6 +3406,7 @@ export function getDocumentSearchHits(docId: string, query: string, options?: Se
     hits,
     activeHitIndex: hits.length > 0 ? 0 : -1,
     status: hits.length > 0 ? 'ready' : indexReady ? 'empty' : 'searching',
+    phase: indexReady ? 'complete' : 'verifying',
   }
 }
 

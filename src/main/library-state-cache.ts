@@ -1,7 +1,10 @@
 import type { LibrarySmartViewCounts, LibraryStateCache } from '../shared/types'
 import { queryAll, queryOne, run, scheduleDatabaseSave } from './database'
+import { buildCumulativeFolderDocumentCounts } from './folder-scope'
 
 const CACHE_KEY = 'library-sidebar-v1'
+const CACHE_VERSION = 'library-sidebar-v3-cumulative-folder-counts'
+let refreshScheduled = false
 
 const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   all: 0,
@@ -78,19 +81,54 @@ function emptyCache(dirty = true): LibraryStateCache {
     folderDocumentCounts: {},
     tagDocumentCounts: {},
     dirty,
+    version: CACHE_VERSION,
+    source: 'snapshot',
+    lastCalibratedAt: null,
     updatedAt: null,
   }
 }
 
-function normalizeCache(payload: unknown, row?: CacheRow | null): LibraryStateCache {
+function scheduleLibraryStateCacheRefresh(delayMs = 1500): void {
+  if (refreshScheduled) return
+  refreshScheduled = true
+  setTimeout(() => {
+    refreshScheduled = false
+    try {
+      refreshLibraryStateCache()
+    } catch {
+      refreshScheduled = false
+    }
+  }, delayMs).unref?.()
+}
+
+function normalizeCache(payload: unknown, row?: CacheRow | null, source: LibraryStateCache['source'] = 'cache'): LibraryStateCache {
   if (!isRecord(payload)) return emptyCache(row?.dirty !== 0)
+  const payloadVersion = typeof payload.version === 'string' ? payload.version : ''
+  if (payloadVersion !== CACHE_VERSION) {
+    return {
+      ...emptyCache(true),
+      smartViewCounts: parseCounts(payload.smartViewCounts),
+      unfiledDocumentTotal: numberValue(payload.unfiledDocumentTotal),
+      tagDocumentCounts: parseCountMap(payload.tagDocumentCounts),
+      updatedAt: typeof row?.updated_at === 'string' ? row.updated_at : null,
+    }
+  }
+  const updatedAt = typeof row?.updated_at === 'string' ? row.updated_at : null
+  const lastCalibratedAt = typeof payload.lastCalibratedAt === 'string'
+    ? payload.lastCalibratedAt
+    : row?.dirty === 0
+      ? updatedAt
+      : null
   return {
     smartViewCounts: parseCounts(payload.smartViewCounts),
     unfiledDocumentTotal: numberValue(payload.unfiledDocumentTotal),
     folderDocumentCounts: parseCountMap(payload.folderDocumentCounts),
     tagDocumentCounts: parseCountMap(payload.tagDocumentCounts),
     dirty: row?.dirty !== 0,
-    updatedAt: typeof row?.updated_at === 'string' ? row.updated_at : null,
+    version: CACHE_VERSION,
+    source,
+    lastCalibratedAt,
+    updatedAt,
   }
 }
 
@@ -100,12 +138,13 @@ function readCacheRow(): CacheRow | null {
 
 export function getLibraryStateCache(): LibraryStateCache {
   const row = readCacheRow()
-  if (!row?.cache_json) return buildLightweightCache(true)
-  if (row.dirty !== 0) return buildLightweightCache(true)
+  if (!row?.cache_json) return emptyCache(true)
   try {
-    return normalizeCache(JSON.parse(row.cache_json), row)
+    const cache = normalizeCache(JSON.parse(row.cache_json), row, row.dirty === 0 ? 'cache' : 'snapshot')
+    if (cache.dirty) scheduleLibraryStateCacheRefresh(200)
+    return cache
   } catch {
-    return buildLightweightCache(true)
+    return emptyCache(true)
   }
 }
 
@@ -184,14 +223,7 @@ function activeDocumentWhere(extra = '1 = 1'): string {
 }
 
 function buildFolderCounts(): Record<string, number> {
-  const rows = queryAll<IdCountRow>(
-    `SELECT f.id, COUNT(DISTINCT d.id) AS count
-     FROM folders f
-     LEFT JOIN document_folders df ON df.folder_id = f.id
-     LEFT JOIN documents d ON d.id = df.doc_id AND COALESCE(d.import_status, '') <> 'deleting'
-     GROUP BY f.id`,
-  )
-  return Object.fromEntries(rows.map((row) => [row.id, numberValue(row.count)]))
+  return buildCumulativeFolderDocumentCounts()
 }
 
 function buildTagCounts(): Record<string, number> {
@@ -230,6 +262,9 @@ function buildCache(): LibraryStateCache {
     folderDocumentCounts: buildFolderCounts(),
     tagDocumentCounts: buildTagCounts(),
     dirty: false,
+    version: CACHE_VERSION,
+    source: 'recalculated',
+    lastCalibratedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   }
 }
@@ -259,6 +294,9 @@ function buildLightweightCache(dirty: boolean): LibraryStateCache {
     folderDocumentCounts: buildFolderCounts(),
     tagDocumentCounts: buildTagCounts(),
     dirty,
+    version: CACHE_VERSION,
+    source: 'recalculated',
+    lastCalibratedAt: dirty ? null : new Date().toISOString(),
     updatedAt: null,
   }
 }
@@ -273,10 +311,12 @@ export function refreshLibraryStateCache(): LibraryStateCache {
        dirty = 0,
        updated_at = excluded.updated_at`,
     [CACHE_KEY, JSON.stringify({
+      version: cache.version,
       smartViewCounts: cache.smartViewCounts,
       unfiledDocumentTotal: cache.unfiledDocumentTotal,
       folderDocumentCounts: cache.folderDocumentCounts,
       tagDocumentCounts: cache.tagDocumentCounts,
+      lastCalibratedAt: cache.lastCalibratedAt,
     }), cache.updatedAt],
   )
   scheduleDatabaseSave()
@@ -286,17 +326,22 @@ export function refreshLibraryStateCache(): LibraryStateCache {
 export function markLibraryStateCacheDirty(): LibraryStateCache {
   const row = readCacheRow()
   const now = new Date().toISOString()
-  const cache = buildLightweightCache(true)
-  const cacheJson = JSON.stringify({
-    smartViewCounts: cache.smartViewCounts,
-    unfiledDocumentTotal: cache.unfiledDocumentTotal,
-    folderDocumentCounts: cache.folderDocumentCounts,
-    tagDocumentCounts: cache.tagDocumentCounts,
-  })
+  let cacheJson = row?.cache_json || ''
+  if (!cacheJson) {
+    const cache = emptyCache(true)
+    cacheJson = JSON.stringify({
+      version: cache.version,
+      smartViewCounts: cache.smartViewCounts,
+      unfiledDocumentTotal: cache.unfiledDocumentTotal,
+      folderDocumentCounts: cache.folderDocumentCounts,
+      tagDocumentCounts: cache.tagDocumentCounts,
+      lastCalibratedAt: cache.lastCalibratedAt,
+    })
+  }
   if (row?.cache_json) {
     run(
-      'UPDATE library_state_cache SET cache_json = ?, dirty = 1, updated_at = ? WHERE cache_key = ?',
-      [cacheJson, now, CACHE_KEY],
+      'UPDATE library_state_cache SET dirty = 1, updated_at = ? WHERE cache_key = ?',
+      [now, CACHE_KEY],
     )
   } else {
     run(
@@ -305,5 +350,6 @@ export function markLibraryStateCacheDirty(): LibraryStateCache {
     )
   }
   scheduleDatabaseSave()
+  scheduleLibraryStateCacheRefresh()
   return getLibraryStateCache()
 }

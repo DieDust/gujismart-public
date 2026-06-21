@@ -88,10 +88,10 @@ function run() {
       CREATE VIRTUAL TABLE search_segments_fts USING fts5(
         segment_id UNINDEXED,
         doc_id UNINDEXED,
-        page_id UNINDEXED,
-        page_num UNINDEXED,
         title,
-        normalized_text
+        normalized_text,
+        content='search_index_segments',
+        content_rowid='rowid'
       );
     `)
   } catch {
@@ -112,7 +112,7 @@ function run() {
   db.prepare('INSERT INTO search_ngram_index (gram, segment_id, doc_id, positions, hit_count) VALUES (?, ?, ?, ?, ?)').run('token', oldSegmentId, docId, '[0,1,2]', 3)
   db.prepare('INSERT INTO search_index_status (doc_id, status, source_hash, segment_count, error_message, indexed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(docId, 'ready', 'old-source', 1, null, now, now)
   if (ftsAvailable) {
-    db.prepare('INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text) VALUES (?, ?, ?, ?, ?, ?, ?)').run(1, oldSegmentId, docId, 'page-old', 1, 'old', 'old text')
+    db.prepare('INSERT INTO search_segments_fts (rowid, title, normalized_text) VALUES (?, ?, ?)').run(1, 'old', 'old text')
   }
 
   db.prepare(`
@@ -131,7 +131,14 @@ function run() {
   assert(stagingRows() === 1, 'staging rows were not created')
 
   const failingSwap = db.transaction(() => {
-    if (ftsAvailable) db.prepare('DELETE FROM search_segments_fts WHERE doc_id = ?').run(docId)
+    if (ftsAvailable) {
+      db.prepare(`
+        INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+        SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+        FROM search_index_segments
+        WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''
+      `).run(docId)
+    }
     db.prepare('DELETE FROM search_ngram_index WHERE doc_id = ?').run(docId)
     db.prepare('DELETE FROM search_index_segments WHERE doc_id = ?').run(docId)
     throw new Error('simulated failure before staged rows are promoted')
@@ -145,7 +152,14 @@ function run() {
   assert(liveSegments() === 1, 'failed swap did not preserve old segments')
 
   const successfulSwap = db.transaction(() => {
-    if (ftsAvailable) db.prepare('DELETE FROM search_segments_fts WHERE doc_id = ?').run(docId)
+    if (ftsAvailable) {
+      db.prepare(`
+        INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+        SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+        FROM search_index_segments
+        WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''
+      `).run(docId)
+    }
     db.prepare('DELETE FROM search_ngram_index WHERE doc_id = ?').run(docId)
     db.prepare('DELETE FROM search_index_segments WHERE doc_id = ?').run(docId)
     db.prepare(`
@@ -165,8 +179,8 @@ function run() {
     `).run(jobId)
     if (ftsAvailable) {
       db.prepare(`
-        INSERT INTO search_segments_fts (rowid, segment_id, doc_id, page_id, page_num, title, normalized_text)
-        SELECT rowid, segment_id, doc_id, page_id, page_num, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+        INSERT INTO search_segments_fts (rowid, title, normalized_text)
+        SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
         FROM search_index_segments
         WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''
       `).run(docId)
@@ -191,7 +205,12 @@ function run() {
   assert(liveSegments() === 1, 'successful swap produced wrong segment count')
   assert(stagingRows() === 0, 'successful swap did not clean staged segment rows')
   if (ftsAvailable) {
-    const ftsRows = Number(db.prepare('SELECT COUNT(*) AS count FROM search_segments_fts WHERE doc_id = ?').get(docId).count)
+    const ftsRows = Number(db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM search_segments_fts fts
+      INNER JOIN search_index_segments s ON s.rowid = fts.rowid
+      WHERE s.doc_id = ?
+    `).get(docId).count)
     assert(ftsRows === 1, 'successful swap did not rebuild FTS rows')
   }
 

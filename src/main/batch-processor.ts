@@ -4,6 +4,7 @@ import { autoExtractAndApply } from './ai'
 import { queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import { OcrAbortError, isOcrAbortError, postProcessRecognizedPageResult, recognizePages, recognizePdfAsync, shouldUseAsyncPdfOcr } from './ocr'
 import { markSearchIndexStaleForPages, notifySearchContentChanged } from './semantic-search'
+import { preparePagePayloadUpdate } from './page-payload-store'
 import type { OcrPageResult } from './ocr'
 import type { BatchJob, BatchProgressEvent, Document, DocumentPage, PageOcrOptions } from '../shared/types'
 
@@ -32,7 +33,8 @@ const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resol
 const ZERO_PAGE_OCR_ERROR = 'OCR 没有返回任何页面，已按异常处理。请重新导入原文件或重新 OCR；如果仍为 0 页，可在文献库使用“清除零页文献”清理空记录。'
 
 function pageContentAvailableCondition(alias = 'p'): string {
-  return `TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''`
+  return `(TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''
+    OR COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, ${alias}.ocr_result_ref, '') <> '')`
 }
 
 function parseJsonRecord(value: unknown): JsonRecord | null {
@@ -165,16 +167,33 @@ class BatchProcessor {
     for (let index = 0; index < pageResults.length; index += BATCH_RESULT_SAVE_CHUNK_SIZE) {
       const chunk = pageResults.slice(index, index + BATCH_RESULT_SAVE_CHUNK_SIZE)
       transaction(() => {
+        const pageIds = chunk.map((pageResult) => pageResult.pageId).filter(Boolean)
+        const placeholders = pageIds.map(() => '?').join(', ')
+        const pageById = new Map((placeholders
+          ? queryAll<Pick<BatchPageRow, 'id' | 'doc_id'>>(`SELECT id, doc_id FROM pages WHERE id IN (${placeholders})`, pageIds)
+          : []
+        ).map((page) => [page.id, page]))
         chunk.forEach((pageResult) => {
           if (pageResult.status === 'error') {
             console.error(`[Batch] Page OCR failed: ${pageResult.pageId}`, pageResult.error)
           }
+          const page = pageById.get(pageResult.pageId)
+          if (!page) return
+          const preparedResult = preparePagePayloadUpdate(
+            page.doc_id,
+            pageResult.pageId,
+            'ocr_result',
+            pageResult.result ? JSON.stringify(pageResult.result) : null,
+          )
+          const preparedText = preparePagePayloadUpdate(page.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
 
           run(
-            'UPDATE pages SET ocr_result = ?, ocr_text = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
+            'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
             [
-              pageResult.result ? JSON.stringify(pageResult.result) : null,
-              pageResult.text,
+              preparedResult.value,
+              preparedResult.ref,
+              preparedText.value,
+              preparedText.ref,
               pageResult.status,
               'pending',
               pageResult.pageId,

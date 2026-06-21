@@ -87,11 +87,44 @@ function getPdfSizeBytes(doc: DocumentHealthSourceRow, metadata: JsonRecord): nu
   return 0
 }
 
+function isReadableLocalAssetPath(filePath: unknown): boolean {
+  const normalized = String(filePath || '').trim()
+  if (!normalized || /^(?:https?|data):/i.test(normalized)) return false
+  try {
+    if (!existsSync(normalized)) return false
+    const fileStat = statSync(normalized)
+    return fileStat.isFile() && fileStat.size > 0
+  } catch {
+    return false
+  }
+}
+
+function isReadableSourcePdf(doc: Pick<DocumentHealthSourceRow, 'file_path'>): boolean {
+  const filePath = String(doc.file_path || '').trim()
+  return extname(filePath).toLowerCase() === '.pdf' && isReadableLocalAssetPath(filePath)
+}
+
+function hasReadablePageImageForDocument(sqlite: NativeDatabase, docId: string, imagePageCount: number): boolean {
+  if (imagePageCount <= 0) return false
+  const rows = queryAll<{ image_path: string | null }>(
+    sqlite,
+    `SELECT image_path
+     FROM pages
+     WHERE doc_id = ?
+       AND image_path IS NOT NULL
+       AND TRIM(image_path) <> ''
+     ORDER BY page_num ASC
+     LIMIT 24`,
+    [docId],
+  )
+  return rows.some((row) => isReadableLocalAssetPath(row.image_path))
+}
+
 function getHealthPdfAssetState(doc: DocumentHealthSourceRow, metadata: JsonRecord): string {
+  const imagePageCount = Number(doc.image_page_count || 0)
+  if (isReadableSourcePdf(doc) || imagePageCount > 0) return 'available'
   const explicitState = String(metadata.pdf_asset_state || '').trim()
-  if (explicitState) return explicitState
-  const filePath = typeof doc.file_path === 'string' ? doc.file_path : ''
-  if (filePath && extname(filePath).toLowerCase() === '.pdf' && existsSync(filePath)) return 'available'
+  if (explicitState === 'text_only' || explicitState === 'available') return 'text_only'
   if (metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count) return 'text_only'
   return 'unknown'
 }
@@ -188,7 +221,13 @@ function buildDocumentHealthReport(sqlite: NativeDatabase): DocumentHealthReport
     FROM documents d`,
   )
   const rows = docs
-    .map(buildDocumentHealthRow)
+    .map((doc) => {
+      const rawImagePageCount = Number(doc.image_page_count || 0)
+      const readableImagePageCount = hasReadablePageImageForDocument(sqlite, String(doc.id), rawImagePageCount)
+        ? rawImagePageCount
+        : 0
+      return buildDocumentHealthRow({ ...doc, image_page_count: readableImagePageCount })
+    })
     .sort((left, right) => right.risk_score - left.risk_score || right.page_count - left.page_count || left.title.localeCompare(right.title, 'zh-Hans-CN'))
   const countIssue = (type: DocumentHealthIssueType) => rows.filter((row) => row.issues.some((issue) => issue.type === type)).length
   const pageStats = queryOne<{ total_pages: number; text_pages: number }>(

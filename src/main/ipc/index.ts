@@ -3,6 +3,7 @@ import { registerFolderIpc } from './folders'
 import { registerTagIpc } from './tags'
 import { registerOcrIpc } from './ocr'
 import { registerAiIpc } from './ai'
+import { registerAiResearchIpc } from './ai-research'
 import { registerBatchIpc } from './batch'
 import { registerSearchIpc } from './search'
 import { registerCitationIpc } from './citation'
@@ -20,6 +21,7 @@ export function registerAllIpcHandlers(): void {
   registerTagIpc()
   registerOcrIpc()
   registerAiIpc()
+  registerAiResearchIpc()
   registerBatchIpc()
   registerSearchIpc()
   registerCitationIpc()

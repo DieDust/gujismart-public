@@ -6,9 +6,12 @@ import {
   Dropdown,
   Empty,
   Input,
+  Modal,
+  Popover,
   Select,
   Space,
   Spin,
+  Steps,
   Tag,
   Tabs,
   Tooltip,
@@ -18,15 +21,17 @@ import {
 import {
   BookOutlined,
   BulbOutlined,
+  CopyOutlined,
   DeleteOutlined,
   DownOutlined,
   HistoryOutlined,
   PlusOutlined,
   RobotOutlined,
+  SearchOutlined,
   SendOutlined,
   TagOutlined,
 } from '@ant-design/icons'
-import type { AiChatSession, AiChatTurn, AiQuestionResponse, AiStreamEvent, AiSynthesisResult, AiSynthesisTemplate, AiTaskType, LibraryAiScope, LibraryAiScopePreview, LibraryAiTab, OpenDocumentTarget, SearchHit, SearchHitLocator } from '@shared/types'
+import type { AiChatSession, AiChatTurn, AiQuestionResponse, AiResearchDataset, AiResearchEvidencePack, AiResearchPlan, AiResearchRecord, AiResearchRetrievalStats, AiResearchTask, AiStreamEvent, AiSynthesisResult, AiSynthesisTemplate, AiTaskType, LibraryAiScope, LibraryAiScopePreview, LibraryAiTab, OpenDocumentTarget, ResearchProject, SearchHit, SearchHitLocator } from '@shared/types'
 import type { EvidenceQaCluster, EvidenceQaPlan, EvidenceQaSource } from '@shared/types'
 import AiMarkdown, { sourceToTarget } from './AiMarkdown'
 import LlmProfileSelector from './LlmProfileSelector'
@@ -39,6 +44,12 @@ const { TextArea } = Input
 type AiPanelMode = 'document' | 'library'
 type DocumentTaskType = Extract<AiTaskType, 'summary' | 'keywords' | 'qa'>
 type ScopeType = 'all' | 'tags' | 'folders' | 'documents'
+type ResearchRunOptions = {
+  goalOverride?: string
+  planOverride?: AiResearchPlan | null
+  autoGenerateReport?: boolean
+  quiet?: boolean
+}
 
 interface AiHistoryItem {
   id: string
@@ -64,6 +75,7 @@ interface AiPanelProps {
   initialScope?: LibraryAiScope
   initialScopeLabel?: string
   initialTab?: LibraryAiTab
+  initialResearchProjectId?: string | null
   selectedText?: string
   onOpenDocument?: (target: OpenDocumentTarget) => void
 }
@@ -74,20 +86,65 @@ const SUMMARY_OPTIONS = [
   { value: '500字左右', label: '详细' }
 ]
 
-const LIBRARY_PROMPTS = [
-  '请基于当前范围内的文献综合归纳研究脉络、主要趋势和可突破的研究空白，不要逐篇复述检索结果。',
-  '请综合比较当前范围内主要观点的共识、分歧和证据强弱，并指出来源。',
-  '请按阶段梳理当前范围内的重要变化，说明变化逻辑、代表性证据和仍缺的材料。'
-]
-
 const ANALYSIS_TEMPLATES = [
-  { value: 'literature_review', label: '文献综述', desc: '综合归纳研究脉络、趋势、分歧与空白。' },
-  { value: 'summary', label: '内容摘要', desc: '生成跨文献综合摘要，避免逐篇复述。' },
-  { value: 'theme_analysis', label: '主题分析', desc: '提炼共同主题、分歧与代表性证据。' },
+  { value: 'literature_review', label: '研究脉络', desc: '综合归纳当前范围内的研究脉络、主要趋势、分歧与研究空白。' },
+  { value: 'theme_analysis', label: '比较观点', desc: '比较主要观点的共识、分歧、证据强弱与代表性来源。' },
+  { value: 'timeline', label: '阶段梳理', desc: '按时间、阶段或制度变化整理材料，并说明变化逻辑。' },
   { value: 'evidence_table', label: '证据表格', desc: '按观点、时间、机构、政策、教育内容整理证据，每格带页码来源。' },
-  { value: 'timeline', label: '时间线', desc: '按时间顺序整理观点、事件与变化。' },
+  { value: 'summary', label: '综合摘要', desc: '生成跨文献综合摘要，避免逐篇复述。' },
   { value: 'custom', label: '自定义分析', desc: '按你的提示词生成定制化分析。' }
 ] as const
+
+const AI_RESEARCH_UI_NOISE_TERMS = new Set([
+  'td', 'tr', 'th', 'div', 'span', 'table', 'tbody', 'thead', 'style', 'class', 'border', 'center',
+  'align', 'valign', 'width', 'height', 'word', 'wrap', 'break', 'word-wrap', 'text-align', 'left',
+  'right', 'font', 'size', 'color', 'margin', 'padding', 'nbsp', 'html', 'body', 'cellspacing',
+  'cellpadding', 'colspan', 'rowspan', 'solid', 'none', 'block', 'inline', 'auto', 'breakword',
+  'wordwrap', 'textalign', '本满', '洲中', '国朝',
+])
+
+const AI_RESEARCH_UI_TASK_WORDS = [
+  '同时出现', '出现次数', '出现频率', '出现篇幅', '提及次数', '提及频率', '关键词', '不同文献',
+  '出现分布', '时间变化', '变化趋势', '相关篇幅', '相关时间', '相关地点', '有多少', '分别有多少',
+  '统计', '比较', '提及', '谈到', '提到', '涉及', '查找', '寻找', '列举', '出现', '分布',
+  '趋势', '变化', '篇幅', '频率', '次数', '数量', '段落', '章节', '页面', '如何', '多少',
+]
+
+function trimAiResearchQueryParticles(value: string): string {
+  return value.trim().replace(/[的了着过和与及或在对中内为是有把将]+$/g, '').trim()
+}
+
+function isAiResearchNoiseTerm(value: string): boolean {
+  const lower = value.trim().toLowerCase()
+  const compact = lower.replace(/[^a-z0-9]/g, '')
+  return AI_RESEARCH_UI_NOISE_TERMS.has(lower) || AI_RESEARCH_UI_NOISE_TERMS.has(compact)
+}
+
+function isReadableAiResearchQuery(value: string): boolean {
+  const query = trimAiResearchQueryParticles(value)
+  const lower = query.toLowerCase()
+  if (!query || isAiResearchNoiseTerm(lower)) return false
+  if (/[?？!！。；;:：()[\]{}"'“”‘’《》<>/\\]/.test(query)) return false
+  if (/^\d+$/.test(query) || /^[\u4e00-\u9fff]$/.test(query)) return false
+  const parts = query.split(/\s+/).filter(Boolean)
+  if (parts.length > 1) return parts.length <= 4 && parts.every((part) => isReadableAiResearchQuery(part))
+  if (/^[\u4e00-\u9fff]{2,6}$/.test(query)) {
+    return !AI_RESEARCH_UI_TASK_WORDS.some((word) => query.includes(word))
+  }
+  if (/^[A-Za-z0-9][A-Za-z0-9_-]{1,40}$/.test(query)) return !isAiResearchNoiseTerm(lower)
+  return false
+}
+
+function isResearchExtractionPrompt(value: string): boolean {
+  const text = value.trim()
+  if (!text) return false
+  return /(?:数据抽取|抽取|提取|抓取|统计|有多少|多少(?:篇|页|次|段|条|份)|出现(?:次数|频率|分布)|提及(?:次数|频率|分布)|篇幅|归类|分类|时空|时间线|证据表|数据集|字段|表格|规律总结)/.test(text)
+}
+
+function emitResearchWorkspaceUpdated(projectId?: string | null) {
+  if (!projectId) return
+  window.dispatchEvent(new CustomEvent('gujismart:research-workspace-updated', { detail: { projectId } }))
+}
 
 function normalizeScope(scope?: LibraryAiScope): LibraryAiScope {
   if (!scope || scope.type === 'all') return { type: 'all' }
@@ -374,6 +431,7 @@ export default function AiPanel({
   initialScope,
   initialScopeLabel,
   initialTab = 'qa',
+  initialResearchProjectId = null,
   selectedText = '',
   onOpenDocument
 }: AiPanelProps) {
@@ -384,6 +442,10 @@ export default function AiPanel({
   const [scope, setScope] = useState<LibraryAiScope>(normalizeScope(initialScope))
   const [scopeLabelOverride, setScopeLabelOverride] = useState(initialScopeLabel || '')
   const [scopePreview, setScopePreview] = useState<LibraryAiScopePreview | null>(null)
+  const [scopeListOpen, setScopeListOpen] = useState(false)
+  const [scopePopoverOpen, setScopePopoverOpen] = useState(false)
+  const [scopeListLoading, setScopeListLoading] = useState(false)
+  const [scopeListDocuments, setScopeListDocuments] = useState<Array<{ id: string; title: string }>>([])
   const [tagOptions, setTagOptions] = useState<Array<{ value: string; label: string }>>([])
   const [folderOptions, setFolderOptions] = useState<Array<{ value: string; label: string }>>([])
   const [documentOptions, setDocumentOptions] = useState<Array<{ value: string; label: string }>>([])
@@ -393,6 +455,20 @@ export default function AiPanel({
   const [analysisLoading, setAnalysisLoading] = useState(false)
   const [analysisResult, setAnalysisResult] = useState('')
   const [analysisSources, setAnalysisSources] = useState<EvidenceQaSource[]>([])
+  const [researchGoal, setResearchGoal] = useState('')
+  const [researchPlan, setResearchPlan] = useState<AiResearchPlan | null>(null)
+  const [researchTask, setResearchTask] = useState<AiResearchTask | null>(null)
+  const [researchDataset, setResearchDataset] = useState<AiResearchDataset | null>(null)
+  const [researchRecords, setResearchRecords] = useState<AiResearchRecord[]>([])
+  const [researchRetrievalStats, setResearchRetrievalStats] = useState<AiResearchRetrievalStats | null>(null)
+  const [researchEvidencePack, setResearchEvidencePack] = useState<AiResearchEvidencePack | null>(null)
+  const [researchReport, setResearchReport] = useState('')
+  const [researchPlanning, setResearchPlanning] = useState(false)
+  const [researchPreviewLoading, setResearchPreviewLoading] = useState(false)
+  const [researchRunning, setResearchRunning] = useState(false)
+  const [researchReportLoading, setResearchReportLoading] = useState(false)
+  const [researchProjects, setResearchProjects] = useState<ResearchProject[]>([])
+  const [researchProjectId, setResearchProjectId] = useState<string | null>(initialResearchProjectId)
   const [chatSessions, setChatSessions] = useState<AiChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState('')
   const [sessionLoading, setSessionLoading] = useState(false)
@@ -415,6 +491,10 @@ export default function AiPanel({
   useEffect(() => {
     setActiveTab(initialTab)
   }, [initialTab])
+
+  useEffect(() => {
+    setResearchProjectId(initialResearchProjectId || null)
+  }, [initialResearchProjectId])
 
   useEffect(() => {
     const loadSessions = async () => {
@@ -475,15 +555,17 @@ export default function AiPanel({
 
     const loadScopeOptions = async () => {
       try {
-        const [tags, folders, documents] = await Promise.all([
+        const [tags, folders, documents, projects] = await Promise.all([
           window.api.listTags(),
           window.api.listFolders(),
-          window.api.listDocuments({ limit: 1000 })
+          window.api.listDocuments({ limit: 1000 }),
+          window.api.listResearchProjects()
         ])
 
         setTagOptions(tags.map((item) => ({ value: item.id, label: item.name })))
         setFolderOptions(folders.map((item) => ({ value: item.id, label: item.name })))
         setDocumentOptions(documents.map((item) => ({ value: item.id, label: item.title || '未命名文献' })))
+        setResearchProjects(projects)
       } catch (error) {
         console.error(error)
         message.error('加载范围选项失败')
@@ -491,6 +573,13 @@ export default function AiPanel({
     }
 
     void loadScopeOptions()
+  }, [mode])
+
+  useEffect(() => {
+    if (mode !== 'document') return
+    window.api.listResearchProjects()
+      .then(setResearchProjects)
+      .catch((error) => console.warn('Failed to load research projects for AI research task', error))
   }, [mode])
 
   useEffect(() => {
@@ -855,6 +944,52 @@ export default function AiPanel({
     return uniqueStringIds(docs.map((item) => item.id))
   }
 
+  const loadScopeListDocuments = async (): Promise<Array<{ id: string; title: string }>> => {
+    if (scope.type === 'documents') {
+      const previewById = new Map((scopePreview?.documents || []).map((item) => [item.id, item.title]))
+      const optionById = new Map(documentOptions.map((item) => [item.value, item.label]))
+      const docs = scope.docIds.map((id) => ({
+        id,
+        title: optionById.get(id) || previewById.get(id) || '未命名文献',
+      }))
+      if (docs.length > 0) return docs
+      return []
+    }
+
+    if (scope.type === 'tags') {
+      if (scope.tagIds.length === 0) return []
+      const docs = await window.api.listDocuments({ tagIds: scope.tagIds, limit: 1000 })
+      return docs.map((item) => ({ id: item.id, title: item.title || '未命名文献' }))
+    }
+
+    if (scope.type === 'folders') {
+      if (scope.folderIds.length === 0) return []
+      const groups = await Promise.all(scope.folderIds.map((folderId) => window.api.listDocuments({ folderId, limit: 1000 })))
+      const byId = new Map<string, { id: string; title: string }>()
+      groups.flat().forEach((item) => {
+        if (item.id && !byId.has(item.id)) byId.set(item.id, { id: item.id, title: item.title || '未命名文献' })
+      })
+      return [...byId.values()]
+    }
+
+    const docs = await window.api.listDocuments({ limit: 1000 })
+    return docs.map((item) => ({ id: item.id, title: item.title || '未命名文献' }))
+  }
+
+  const openScopeList = async () => {
+    setScopePopoverOpen(false)
+    setScopeListOpen(true)
+    setScopeListLoading(true)
+    try {
+      setScopeListDocuments(await loadScopeListDocuments())
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(getErrorMessage(error, '加载文献列表失败'))
+    } finally {
+      setScopeListLoading(false)
+    }
+  }
+
   const runScopeAnalysis = async () => {
     if (analysisTemplate === 'custom' && !analysisPrompt.trim()) {
       message.info('请输入自定义分析要求')
@@ -874,14 +1009,400 @@ export default function AiPanel({
         analysisTemplate,
         analysisTemplate === 'custom' ? analysisPrompt.trim() : undefined
       ) as AiSynthesisResult | string
-      setAnalysisResult(typeof result === 'string' ? result : result.markdown)
+      const markdown = typeof result === 'string' ? result : result.markdown
+      setAnalysisResult(markdown)
       setAnalysisSources(typeof result === 'string' ? [] : result.sources || [])
+      if (researchProjectId && markdown.trim()) {
+        const templateLabel = ANALYSIS_TEMPLATES.find((item) => item.value === analysisTemplate)?.label || 'AI 分析'
+        await window.api.createResearchOutput({
+          project_id: researchProjectId,
+          output_type: analysisTemplate,
+          title: `${templateLabel} - ${scopeLabel}`,
+          content: markdown,
+        })
+        emitResearchWorkspaceUpdated(researchProjectId)
+        message.success('分析结果已保存到研究工作台')
+      }
     } catch (error: unknown) {
       console.error(error)
       message.error(getErrorMessage(error, '专题分析失败'))
     } finally {
       setAnalysisLoading(false)
     }
+  }
+
+  const getResearchScope = (): LibraryAiScope => {
+    if (mode === 'document' && documentId) return { type: 'documents', docIds: [documentId] }
+    return scope
+  }
+
+  const planResearchTask = async (goalOverride?: string, options: { quiet?: boolean } = {}): Promise<AiResearchPlan | null> => {
+    const goal = (goalOverride || researchGoal || question).trim()
+    if (!goal) {
+      message.info('请输入研究任务目标')
+      return null
+    }
+    setResearchPlanning(true)
+    setResearchReport('')
+    try {
+      const plan = await window.api.planAiResearchTask({
+        goal,
+        scope: getResearchScope(),
+        projectId: researchProjectId,
+      })
+      setResearchGoal(goal)
+      setResearchPlan(plan)
+      setResearchTask(null)
+      setResearchDataset(null)
+      setResearchRecords([])
+      setResearchRetrievalStats(null)
+      setResearchEvidencePack(null)
+      if (!options.quiet) message.success('已生成结构化抽取方案')
+      return plan
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '生成研究任务方案失败'))
+      return null
+    } finally {
+      setResearchPlanning(false)
+    }
+  }
+
+  const previewResearchRetrieval = async (
+    goalOverride?: string,
+    planOverride?: AiResearchPlan | null,
+    options: { quiet?: boolean } = {},
+  ): Promise<AiResearchRetrievalStats | null> => {
+    const activePlan = planOverride || researchPlan
+    const goal = (goalOverride || researchGoal || activePlan?.goal || question).trim()
+    if (!goal) {
+      message.info('请输入研究任务目标')
+      return null
+    }
+    setResearchPreviewLoading(true)
+    try {
+      const stats = await window.api.previewAiResearchRetrieval({
+        goal,
+        scope: getResearchScope(),
+        projectId: researchProjectId,
+        fields: activePlan?.fields || [],
+        suggestedQueries: activePlan?.suggestedQueries || [goal],
+        kind: activePlan?.kind,
+      })
+      setResearchRetrievalStats(stats)
+      setResearchEvidencePack(null)
+      if (stats.readableSegmentCount === 0) {
+        message.warning('当前范围没有可读取 OCR 正文')
+      } else if (stats.totalHitCount === 0) {
+        message.warning('当前范围有 OCR 正文，但关键词未命中')
+      } else if (!options.quiet) {
+        message.success(`已完成本地统计：累计命中 ${stats.totalHitCount} 次，涉及 ${stats.totalDocumentCount} 篇文献`)
+      }
+      return stats
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '预览检索统计失败'))
+      return null
+    } finally {
+      setResearchPreviewLoading(false)
+    }
+  }
+
+  const runResearchEndToEnd = async (goalOverride?: string) => {
+    const goal = (goalOverride || question || researchGoal).trim()
+    if (!goal) {
+      message.info('请输入研究任务目标')
+      return
+    }
+    setActiveTab('research')
+    setResearchGoal(goal)
+    setResearchTask(null)
+    setResearchDataset(null)
+    setResearchRecords([])
+    setResearchReport('')
+    setResearchRetrievalStats(null)
+    setResearchEvidencePack(null)
+
+    const plan = await planResearchTask(goal, { quiet: true })
+    if (!plan) return
+
+    const stats = await previewResearchRetrieval(goal, plan, { quiet: true })
+    if (!stats || stats.readableSegmentCount === 0 || stats.totalHitCount === 0) return
+
+    await runResearchTask({
+      goalOverride: goal,
+      planOverride: plan,
+      autoGenerateReport: true,
+      quiet: true,
+    })
+    setQuestion('')
+  }
+
+  const prepareResearchFromUnifiedPrompt = async (goalOverride?: string) => {
+    const goal = (goalOverride || question || researchGoal).trim()
+    if (!goal) {
+      message.info('请输入研究任务目标')
+      return
+    }
+    setActiveTab('research')
+    setResearchGoal(goal)
+    setResearchTask(null)
+    setResearchDataset(null)
+    setResearchRecords([])
+    setResearchReport('')
+    setResearchRetrievalStats(null)
+    setResearchEvidencePack(null)
+    const plan = await planResearchTask(goal)
+    if (!plan) return
+    await previewResearchRetrieval(goal, plan)
+    setQuestion('')
+  }
+
+  const handleUnifiedPromptSubmit = async () => {
+    const nextQuestion = question.trim()
+    if (!nextQuestion) {
+      message.info('请输入问题或研究任务')
+      return
+    }
+    if (activeTab === 'research' || isResearchExtractionPrompt(nextQuestion)) {
+      await runResearchEndToEnd(nextQuestion)
+      return
+    }
+    if (mode === 'document') {
+      await runDocumentTask('qa', { question: nextQuestion })
+      return
+    }
+    await runLibraryQuestion(nextQuestion)
+  }
+
+  const runResearchTask = async (options: ResearchRunOptions = {}) => {
+    const activePlan = options.planOverride || researchPlan
+    const goal = (options.goalOverride || researchGoal || activePlan?.goal || question).trim()
+    if (!goal) {
+      message.info('请输入研究任务目标')
+      return
+    }
+    const fields = activePlan?.fields || []
+    if (fields.length === 0) {
+      message.info('请先生成字段方案')
+      return
+    }
+    setResearchRunning(true)
+    setResearchReport('')
+    try {
+      const task = await window.api.createAiResearchTask({
+        title: activePlan?.title || goal.slice(0, 40),
+        goal,
+        scope: getResearchScope(),
+        projectId: researchProjectId,
+        kind: activePlan?.kind,
+        fields,
+        suggestedQueries: activePlan?.suggestedQueries || [goal],
+      })
+      setResearchTask(task)
+      const result = await window.api.runAiResearchTask(task.id)
+      setResearchTask(result.task)
+      setResearchDataset(result.dataset)
+      setResearchRecords(result.records)
+      setResearchRetrievalStats(result.retrievalStats || null)
+      setResearchEvidencePack(result.evidencePack || null)
+      emitResearchWorkspaceUpdated(result.dataset?.project_id || researchProjectId)
+      if (options.autoGenerateReport && result.dataset?.id && result.records.length > 0) {
+        await generateResearchReportForDataset(result.dataset.id, goal, { quiet: true })
+      }
+      message.success(options.autoGenerateReport
+        ? `已完成研究分析：生成 ${result.records.length} 条记录和一份报告`
+        : `已生成 ${result.records.length} 条结构化研究记录`)
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '运行研究任务失败'))
+    } finally {
+      setResearchRunning(false)
+    }
+  }
+
+  const generateResearchReportForDataset = async (datasetId: string, goal: string, options: { quiet?: boolean } = {}) => {
+    setResearchReportLoading(true)
+    try {
+      const result = await window.api.generateAiResearchReport({
+        datasetId,
+        templateType: 'theme_analysis',
+        customPrompt: goal,
+      })
+      setResearchReport(result.content)
+      emitResearchWorkspaceUpdated(researchProjectId)
+      if (!options.quiet) message.success(result.outputId ? '报告已生成并保存到研究专题' : '报告已生成')
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '生成数据报告失败'))
+    } finally {
+      setResearchReportLoading(false)
+    }
+  }
+
+  const generateResearchReport = async () => {
+    if (!researchDataset?.id) return
+    await generateResearchReportForDataset(researchDataset.id, researchGoal)
+  }
+
+  const copyResearchDataset = async () => {
+    if (!researchDataset?.id) return
+    const result = await window.api.exportAiResearchDataset(researchDataset.id, 'markdown')
+    await navigator.clipboard.writeText(result.content)
+    message.success(`已复制 ${result.recordCount} 条数据记录`)
+  }
+
+  const getResearchKindLabel = (kind?: string) => {
+    if (kind === 'statistical') return '统计型'
+    if (kind === 'extraction') return '抽取型'
+    if (kind === 'synthesis') return '综述型'
+    return '混合型'
+  }
+
+  const renderResearchRetrievalSummary = () => {
+    if (!researchRetrievalStats) return null
+    const topStats = researchRetrievalStats.queryStats
+      .filter((stat) => isReadableAiResearchQuery(stat.query))
+      .slice(0, 16)
+    const visibleCooccurringTerms = researchRetrievalStats.cooccurringTerms
+      .filter((bucket) => isReadableAiResearchQuery(bucket.label))
+      .slice(0, 12)
+    const packedEvidenceCount = researchEvidencePack?.totalEvidenceCount || 0
+    const completedRecordCount = researchRecords.length
+    const pipelineItems: Array<{ title: string; description: string; status: 'finish' | 'process' | 'wait' }> = [
+      {
+        title: '全库统计完成',
+        description: `本地已统计 ${researchRetrievalStats.readableSegmentCount} 个可读文本段，累计 ${researchRetrievalStats.totalDocumentCount} 篇、${researchRetrievalStats.totalPageCount} 页、${researchRetrievalStats.totalHitCount} 次命中。`,
+        status: 'finish',
+      },
+      {
+        title: '已压缩代表证据',
+        description: researchEvidencePack
+          ? `已从全库命中中压缩出 ${packedEvidenceCount} 条代表证据，控制每篇文献和每页占比，避免少数文献占满上下文。`
+          : '下一步会把海量命中压缩成小证据包，再交给 AI 阅读。',
+        status: researchEvidencePack ? 'finish' : 'process',
+      },
+      {
+        title: 'AI 基于代表证据分析',
+        description: researchTask?.status === 'completed'
+          ? `AI 已基于代表证据生成 ${completedRecordCount} 条可复核记录。`
+          : researchEvidencePack
+            ? 'AI 只读取压缩后的代表证据和本地统计数字，不会通篇读取全部页面。'
+            : '证据包生成后，AI 再负责归纳、解释和抽取。',
+        status: researchTask?.status === 'completed' ? 'finish' : researchEvidencePack ? 'process' : 'wait',
+      },
+    ]
+    return (
+      <div
+        style={{
+          padding: 12,
+          borderRadius: 8,
+          background: 'rgba(255,255,255,0.03)',
+          border: '1px solid rgba(255,255,255,0.08)',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+          <Text strong>检索统计预览</Text>
+          <Tag color={researchRetrievalStats.highFrequencyTriggered ? 'orange' : 'green'}>
+            {researchRetrievalStats.highFrequencyTriggered ? '已触发高频词收缩' : '无需收缩'}
+          </Tag>
+        </div>
+        <Alert
+          type="info"
+          showIcon
+          message="全库参与统计，AI 只读代表证据"
+          description="精确数量由本地检索计算；AI 只根据压缩后的代表证据做解释、归纳和抽取，不会把上万页全文全部塞进模型。"
+          style={{ marginBottom: 12 }}
+        />
+        <Steps
+          size="small"
+          items={pipelineItems}
+          style={{ marginBottom: 14 }}
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8 }}>
+          <div><Text type="secondary">可读文本段</Text><div>{researchRetrievalStats.readableSegmentCount}</div></div>
+          <div><Text type="secondary">累计文献</Text><div>{researchRetrievalStats.totalDocumentCount}</div></div>
+          <div><Text type="secondary">累计页面</Text><div>{researchRetrievalStats.totalPageCount}</div></div>
+          <div><Text type="secondary">累计命中</Text><div>{researchRetrievalStats.totalHitCount}</div></div>
+        </div>
+        {topStats.length > 0 ? (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ marginBottom: 6 }}>
+              <Text strong style={{ fontSize: 13 }}>实际统计词</Text>
+              <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                下面每一行都会参与本地全文统计，右侧数字分别是文献数、页数和出现次数。
+              </Text>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {topStats.map((stat) => (
+                <div
+                  key={`${stat.round}-${stat.query}`}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(120px, 1fr) auto auto auto auto',
+                    gap: 8,
+                    alignItems: 'center',
+                    fontSize: 12,
+                    color: 'var(--gs-text-secondary)',
+                  }}
+                >
+                  <Text ellipsis title={stat.query}>{stat.query}</Text>
+                  <span>{stat.documentCount} 篇</span>
+                  <span>{stat.pageCount} 页</span>
+                  <span>{stat.hitCount} 次</span>
+                  {stat.highFrequency ? <Tag color="orange" style={{ margin: 0 }}>高频</Tag> : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <Text type="secondary" style={{ display: 'block', marginTop: 10 }}>
+            {researchRetrievalStats.readableSegmentCount === 0
+              ? '当前范围没有可读取 OCR 正文。'
+              : researchRetrievalStats.queryStats.length > 0
+                ? '已过滤掉无效检索词，请输入更明确的人名、地名、机构名或主题词。'
+                : '关键词未命中，请换成更明确的检索词。'}
+          </Text>
+        )}
+        {visibleCooccurringTerms.length > 0 ? (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ marginBottom: 6 }}>
+              <Text strong style={{ fontSize: 13 }}>命中片段中的常见相关词</Text>
+              <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                这些蓝色词来自命中片段，只用于理解语境和后续收缩，不代表本轮统计对象。
+              </Text>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {visibleCooccurringTerms.map((bucket) => (
+                <Tag key={bucket.key} color="blue" style={{ margin: 0 }}>{bucket.label}</Tag>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {researchEvidencePack ? (
+          <div style={{ marginTop: 12, borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: 10 }}>
+            <div style={{ color: 'var(--gs-text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
+              <div>
+                全库命中 {researchEvidencePack.statsSummary.totalHitCount} 次，覆盖 {researchEvidencePack.statsSummary.totalDocumentCount} 篇、{researchEvidencePack.statsSummary.totalPageCount} 页。
+              </div>
+              <div>
+                进入 AI 的代表证据：{researchEvidencePack.totalEvidenceCount} 条
+                {researchEvidencePack.truncated ? '，已按文献和页面预算压缩' : ''}
+              </div>
+            </div>
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {researchEvidencePack.evidence.slice(0, 5).map((item) => (
+                <div key={item.id} style={{ fontSize: 12, color: 'var(--gs-text-tertiary)', lineHeight: 1.6 }}>
+                  <BookOutlined style={{ color: 'var(--gs-gold)', marginRight: 6 }} />
+                  {item.doc_title} · 第 {item.page_num || '?'} 页 · {item.query}
+                  {item.localStats ? (
+                    <span style={{ marginLeft: 8 }}>
+                      本词统计：{item.localStats.documentCount} 篇 · {item.localStats.pageCount} 页 · {item.localStats.hitCount} 次
+                    </span>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    )
   }
 
   const renderEmptyState = () => {
@@ -983,9 +1504,239 @@ export default function AiPanel({
     )
   }
 
+  const renderResearchPanel = () => (
+    <div style={{ paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <Alert
+        type="info"
+        showIcon
+        message="输入研究目标后，点击一次就会完成统计、抽取和报告。"
+        description="软件会先做本地全库统计检索，再压缩代表证据交给 AI。数量、页数和命中文献数由本地数据库计算；AI 负责归纳解释，结果会在下方直接展示。"
+      />
+
+      {researchGoal.trim() ? (
+        <div
+          style={{
+            padding: 12,
+            borderRadius: 8,
+            background: 'rgba(255,255,255,0.03)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            color: 'var(--gs-text-secondary)',
+            lineHeight: 1.7,
+          }}
+        >
+          <Text type="secondary" style={{ fontSize: 12 }}>当前研究目标</Text>
+          <div style={{ marginTop: 4, color: 'var(--gs-text-primary)' }}>{researchGoal}</div>
+        </div>
+      ) : (
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="请在底部输入框写下你要统计、抽取或归类的目标，例如“统计这些文献里关于地方教育经费的时间、地区和变化规律”。"
+        />
+      )}
+
+      {(() => {
+        const researchBusy = researchPlanning || researchPreviewLoading || researchRunning || researchReportLoading
+        const effectiveResearchGoal = researchGoal.trim() || question.trim()
+        return (
+      <Space direction="vertical" style={{ width: '100%' }} size={8}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
+          <Text style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>
+            当前范围：{mode === 'document' ? documentTitle || '当前文献' : scopeLabel}
+          </Text>
+          <Select
+            allowClear
+            size="small"
+            placeholder="归入研究专题"
+            value={researchProjectId || undefined}
+            style={{ minWidth: 180 }}
+            onChange={(value) => setResearchProjectId(value || null)}
+            options={researchProjects.map((project) => ({ value: project.id, label: project.name }))}
+          />
+        </div>
+        <Space wrap>
+          <Button
+            type="primary"
+            icon={<RobotOutlined />}
+            loading={researchBusy}
+            disabled={!effectiveResearchGoal}
+            onClick={() => void runResearchEndToEnd(effectiveResearchGoal)}
+          >
+            开始完整分析
+          </Button>
+          <Button icon={<CopyOutlined />} disabled={!researchDataset} onClick={() => void copyResearchDataset()}>
+            复制完整结果
+          </Button>
+          <Dropdown
+            menu={{
+              items: [
+                {
+                  key: 'prepare',
+                  label: '只生成方案和统计预览',
+                  icon: <SearchOutlined />,
+                  disabled: !effectiveResearchGoal,
+                  onClick: () => void prepareResearchFromUnifiedPrompt(effectiveResearchGoal),
+                },
+                {
+                  key: 'rerun-extraction',
+                  label: '只重新抽取数据',
+                  icon: <RobotOutlined />,
+                  disabled: !researchPlan,
+                  onClick: () => void runResearchTask(),
+                },
+                {
+                  key: 'report',
+                  label: '只重新生成报告',
+                  icon: <BulbOutlined />,
+                  disabled: !researchDataset,
+                  onClick: () => void generateResearchReport(),
+                },
+              ],
+            }}
+          >
+            <Button icon={<DownOutlined />}>更多</Button>
+          </Dropdown>
+        </Space>
+      </Space>
+        )
+      })()}
+
+      {researchPlan ? (
+        <div
+          style={{
+            padding: 12,
+            borderRadius: 8,
+            background: 'rgba(255,255,255,0.03)',
+            border: '1px solid rgba(255,255,255,0.08)',
+          }}
+        >
+          <Space size={6} wrap>
+            <Text strong>{researchPlan.title}</Text>
+            <Tag color="geekblue">{getResearchKindLabel(researchPlan.kind)}</Tag>
+          </Space>
+          <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {researchPlan.fields.map((field) => (
+              <Tooltip key={field.key} title={field.description || field.key}>
+                <Tag color={field.type === 'date' ? 'blue' : field.type === 'place' ? 'green' : field.type === 'category' ? 'purple' : 'gold'} style={{ margin: 0 }}>
+                  {field.label}
+                </Tag>
+              </Tooltip>
+            ))}
+          </div>
+          {(() => {
+            const sourceQueries = researchRetrievalStats?.plan.queries.length
+              ? researchRetrievalStats.plan.queries
+              : researchPlan.suggestedQueries
+            const visibleQueries = sourceQueries.filter(isReadableAiResearchQuery).slice(0, 16)
+            if (visibleQueries.length === 0) return null
+            return (
+              <div style={{ marginTop: 10, color: 'var(--gs-text-tertiary)', fontSize: 12 }}>
+                {researchRetrievalStats ? '实际统计词' : '候选统计词'}：{visibleQueries.join('、')}
+              </div>
+            )
+          })()}
+        </div>
+      ) : null}
+
+      {renderResearchRetrievalSummary()}
+
+      {researchTask ? (
+        <div style={{ color: 'var(--gs-text-secondary)', fontSize: 13 }}>
+          任务状态：<Tag color={researchTask.status === 'completed' ? 'green' : researchTask.status === 'error' ? 'red' : 'blue'}>{researchTask.status}</Tag>
+          {researchTask.error_message ? <Text type="danger">{researchTask.error_message}</Text> : null}
+        </div>
+      ) : null}
+
+      {researchRecords.length > 0 ? (
+        <div
+          style={{
+            padding: 12,
+            borderRadius: 8,
+            background: 'rgba(255,255,255,0.03)',
+            border: '1px solid rgba(255,255,255,0.08)',
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+            <Text strong>已抽取 {researchRecords.length} 条记录</Text>
+            <Button size="small" type="primary" loading={researchReportLoading} onClick={() => void generateResearchReport()}>
+              重新生成报告
+            </Button>
+          </div>
+          <Space direction="vertical" style={{ width: '100%' }}>
+            {researchRecords.slice(0, 6).map((record) => (
+              <div
+                key={record.id}
+                style={{
+                  padding: '8px 10px',
+                  borderRadius: 8,
+                  border: '1px solid rgba(255,255,255,0.06)',
+                  background: 'rgba(255,255,255,0.025)',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                  <Text strong style={{ color: 'var(--gs-text-primary)' }}>{record.doc_title || record.doc_id}</Text>
+                  <Tag color="blue">第 {record.page_num || '?'} 页</Tag>
+                </div>
+                <div style={{ marginTop: 6, color: 'var(--gs-text-secondary)', fontSize: 12, lineHeight: 1.6 }}>
+                  {record.excerpt.slice(0, 180)}
+                </div>
+              </div>
+            ))}
+          </Space>
+          {researchRecords.length > 6 ? (
+            <Text style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>这里只显示前 6 条，点击“复制完整结果”可查看全部记录。</Text>
+          ) : null}
+        </div>
+      ) : null}
+
+      {researchReport ? (
+        <div
+          style={{
+            padding: 14,
+            borderRadius: 8,
+            background: 'rgba(255,255,255,0.03)',
+            border: '1px solid rgba(255,255,255,0.08)',
+          }}
+        >
+          <AiMarkdown content={researchReport} sources={[]} prompt={researchGoal} onOpenDocument={onOpenDocument} />
+        </div>
+      ) : null}
+    </div>
+  )
+
   const activeSession = chatSessions.find((session) => session.id === activeSessionId)
   const activeTurnCount = getChatTurnCount(activeSession, history)
   const shouldSuggestNewSession = activeTurnCount >= 20
+  const scopePreviewSummary = scopePreview
+    ? `${scopePreview.count} 篇文献，${scopePreview.ocrReadyCount} 篇已有可用文本`
+    : '正在读取范围'
+  const scopePreviewContent = (
+    <div className="ai-scope-popover" onWheel={(event) => event.stopPropagation()}>
+      <div className="ai-scope-popover-header">
+        <Text strong>{scopeLabel}</Text>
+        <Text type="secondary">{scopePreviewSummary}</Text>
+      </div>
+      {scopePreview && scopePreview.documents.length > 0 ? (
+        <div className="ai-scope-popover-list">
+          {scopePreview.documents.map((item, index) => (
+            <div className="ai-scope-popover-item" key={item.id}>
+              <span>{index + 1}</span>
+              <Text ellipsis title={item.title}>{item.title || '未命名文献'}</Text>
+            </div>
+          ))}
+          {scopePreview.count > scopePreview.documents.length ? (
+            <div className="ai-scope-popover-more">
+              已预览前 {scopePreview.documents.length} 篇，还有 {scopePreview.count - scopePreview.documents.length} 篇可在完整列表查看。
+            </div>
+          ) : null}
+          <Button block size="small" style={{ marginTop: 8 }} onClick={() => void openScopeList()}>
+            展开完整列表
+          </Button>
+        </div>
+      ) : (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={scopePreview ? '当前范围内暂无文献' : '正在读取文献范围'} />
+      )}
+    </div>
+  )
   const sessionMenuItems = chatSessions.length
     ? chatSessions.map((session) => ({
       key: session.id,
@@ -999,6 +1750,7 @@ export default function AiPanel({
       ),
     }))
     : [{ key: 'empty', disabled: true, label: '暂无历史对话' }]
+  const unifiedPromptIsResearch = activeTab === 'research' || isResearchExtractionPrompt(question)
 
   return (
     <div
@@ -1063,8 +1815,22 @@ export default function AiPanel({
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-              <Text strong style={{ color: 'var(--gs-text-primary)' }}>全库问答范围</Text>
-              <Tag color="gold" style={{ margin: 0 }}>{scopeLabel}</Tag>
+              <div style={{ minWidth: 0 }}>
+                <Text strong style={{ color: 'var(--gs-text-primary)' }}>AI 读取范围</Text>
+                <div style={{ marginTop: 4, color: 'var(--gs-text-secondary)', fontSize: 12 }}>
+                  {scopePreviewSummary}
+                </div>
+              </div>
+              <Popover
+                content={scopePreviewContent}
+                trigger="hover"
+                placement="bottomRight"
+                overlayClassName="ai-scope-popover-overlay"
+                open={scopePopoverOpen}
+                onOpenChange={setScopePopoverOpen}
+              >
+                <Button size="small" icon={<BookOutlined />}>查看文献</Button>
+              </Popover>
             </div>
 
             <Select
@@ -1116,46 +1882,28 @@ export default function AiPanel({
                 maxTagCount="responsive"
               />
             ) : null}
-
-            <div
-              style={{
-                padding: '10px 12px',
-                borderRadius: 8,
-                background: 'rgba(255,255,255,0.03)',
-                border: '1px solid rgba(255,255,255,0.06)'
-              }}
-            >
-              <div style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>
-                {scopePreview
-                  ? `当前范围包含 ${scopePreview.count} 篇文献，其中 ${scopePreview.ocrReadyCount} 篇已有可用文本。`
-                  : '正在预览当前范围...'}
-              </div>
-              {scopePreview && scopePreview.documents.length > 0 ? (
-                <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                  {scopePreview.documents.map((item) => (
-                    <Tooltip key={item.id} title={item.title}>
-                      <Tag style={{ margin: 0, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {item.title}
-                      </Tag>
-                    </Tooltip>
-                  ))}
-                </div>
-              ) : null}
-            </div>
           </div>
         )}
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto', padding: mode === 'library' ? '0 16px 16px' : '20px 16px' }} ref={scrollRef}>
-        {mode === 'library' ? (
-          <Tabs
-            activeKey={activeTab}
-            onChange={(key) => setActiveTab(key as 'qa' | 'analysis')}
-            items={[
-              { key: 'qa', label: '问答' },
-              { key: 'analysis', label: '模板分析' }
-            ]}
-          />
+        {mode === 'library' || mode === 'document' ? (
+          <div className="ai-panel-tabs-sticky">
+            <Tabs
+              activeKey={activeTab}
+              onChange={(key) => setActiveTab(key as LibraryAiTab)}
+              items={mode === 'library'
+                ? [
+                  { key: 'qa', label: '提问' },
+                  { key: 'analysis', label: '一键分析' },
+                  { key: 'research', label: '数据抽取' },
+                ]
+                : [
+                  { key: 'qa', label: '提问' },
+                  { key: 'research', label: '数据抽取' },
+                ]}
+            />
+          </div>
         ) : null}
 
         {mode === 'library' && activeTab === 'analysis' ? (
@@ -1246,6 +1994,8 @@ export default function AiPanel({
           </div>
         ) : null}
 
+        {activeTab === 'research' ? renderResearchPanel() : null}
+
         {activeTab === 'qa' ? (
           <>
         {history.length === 0 && !loading ? renderEmptyState() : null}
@@ -1282,7 +2032,7 @@ export default function AiPanel({
       </div>
 
       <div className="ai-chat-input-wrapper">
-        {mode === 'library' && activeTab === 'analysis' ? null : mode === 'document' ? (
+        {mode === 'document' && activeTab !== 'research' ? (
           <div className="ai-quick-actions">
             <Space.Compact style={{ flexShrink: 0 }}>
               <Select
@@ -1302,15 +2052,7 @@ export default function AiPanel({
               关键词
             </Button>
           </div>
-        ) : (
-          <div className="ai-quick-actions">
-            {LIBRARY_PROMPTS.map((prompt) => (
-              <Button key={prompt} size="small" icon={<RobotOutlined />} onClick={() => void runLibraryQuestion(prompt)}>
-                {prompt.includes('时间') ? '时间线' : prompt.includes('比较') ? '比较观点' : '研究脉络'}
-              </Button>
-            ))}
-          </div>
-        )}
+        ) : null}
 
         {mode === 'document' ? (
           <Space direction="vertical" style={{ width: '100%' }} size={8}>
@@ -1332,17 +2074,17 @@ export default function AiPanel({
               </div>
             ) : null}
             <Input.Search
-              placeholder={selectedText.trim() ? '围绕选中文字提问...' : '基于当前文献提问...'}
-              enterButton={<Button icon={<SendOutlined />} type="primary" />}
+              placeholder={selectedText.trim() ? '围绕选中文字提问，或输入要抽取的数据...' : '基于当前文献提问，或输入要抽取/统计的目标...'}
+              enterButton={<Button icon={unifiedPromptIsResearch ? <RobotOutlined /> : <SendOutlined />} type="primary">{unifiedPromptIsResearch ? '开始完整分析' : undefined}</Button>}
               size="large"
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
               onSearch={() => {
                 if (question.trim()) {
-                  void runDocumentTask('qa', { question })
+                  void handleUnifiedPromptSubmit()
                 }
               }}
-              loading={loading}
+              loading={loading || researchPlanning || researchPreviewLoading}
               style={{ borderRadius: 8 }}
             />
           </Space>
@@ -1350,28 +2092,63 @@ export default function AiPanel({
           <Space direction="vertical" style={{ width: '100%' }} size={10}>
             <TextArea
               rows={3}
-              placeholder="面向当前范围提问，例如：这个主题有哪些主要研究观点？哪些论文证据最强？"
+              placeholder="面向当前范围提问，或直接写研究任务，例如：统计这些文献里某类问题的时间、地点、人物和变化规律。"
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
               onPressEnter={(event) => {
                 if (event.shiftKey) return
                 event.preventDefault()
                 if (question.trim()) {
-                  void runLibraryQuestion()
+                  void handleUnifiedPromptSubmit()
                 }
               }}
             />
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-              <Text style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>
-                当前范围：{scopeLabel}
-              </Text>
-              <Button type="primary" icon={<SendOutlined />} loading={loading} onClick={() => void runLibraryQuestion()}>
-                开始提问
+              <div style={{ minWidth: 0 }}>
+                <Text style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>
+                  当前范围：{scopeLabel}
+                </Text>
+                <div style={{ color: 'var(--gs-text-tertiary)', fontSize: 12, marginTop: 2 }}>
+                  优先读取关键词命中的原文页及前后文本，不会通篇阅读。
+                </div>
+              </div>
+              <Button
+                type="primary"
+                icon={unifiedPromptIsResearch ? <RobotOutlined /> : <SendOutlined />}
+                loading={loading || researchPlanning || researchPreviewLoading || researchRunning || researchReportLoading}
+                onClick={() => void handleUnifiedPromptSubmit()}
+              >
+                {unifiedPromptIsResearch ? '开始完整分析' : '开始提问'}
               </Button>
             </div>
           </Space>
         )}
       </div>
+      <Modal
+        title={`${scopeLabel} · 文献列表`}
+        open={scopeListOpen}
+        onCancel={() => setScopeListOpen(false)}
+        footer={null}
+        width={720}
+        destroyOnHidden
+      >
+        <div className="ai-scope-modal-summary">
+          {scopePreviewSummary}
+          {scopeListDocuments.length > 0 ? `，当前列表显示 ${scopeListDocuments.length} 篇` : ''}
+        </div>
+        <div className="ai-scope-modal-list">
+          <Spin spinning={scopeListLoading}>
+          {scopeListDocuments.length ? scopeListDocuments.map((item, index) => (
+            <div className="ai-scope-popover-item" key={item.id}>
+              <span>{index + 1}</span>
+              <Text title={item.title}>{item.title || '未命名文献'}</Text>
+            </div>
+          )) : (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前范围内暂无文献" />
+          )}
+          </Spin>
+        </div>
+      </Modal>
     </div>
   )
 }

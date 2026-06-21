@@ -194,7 +194,13 @@ async function run() {
       search.reindexDocument(docId)
     }
     database.run('DELETE FROM search_ngram_index WHERE doc_id = ?', [legacySegmentDocId])
-    database.run('DELETE FROM search_segments_fts WHERE doc_id = ?', [legacySegmentDocId])
+    database.run(
+      `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+       SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [legacySegmentDocId],
+    )
     const mixedLegacyResponse = search.querySearchV2('zz', { docIds: [legacySegmentDocId, modernSegmentDocId], limit: 80 })
     assert.strictEqual(mixedLegacyResponse.totalDocuments, 2)
     assert.deepStrictEqual(
@@ -218,7 +224,13 @@ async function run() {
       )
       search.reindexDocument(docId)
     }
-    database.run('DELETE FROM search_segments_trigram WHERE doc_id = ?', [missingTrigramDocId])
+    database.run(
+      `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+       SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [missingTrigramDocId],
+    )
     const partialTrigramResponse = search.querySearchV2('partial-trigram-token', { docIds: [missingTrigramDocId, presentTrigramDocId], limit: 80 })
     assert.deepStrictEqual(
       partialTrigramResponse.groups.map((group) => group.docId).sort(),

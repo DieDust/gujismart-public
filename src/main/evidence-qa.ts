@@ -1,7 +1,8 @@
 import { createHash } from 'crypto'
-import { callLLM, callLLMStream, getDocumentBrief, runAiTask, type AiDocumentBrief } from './ai'
+import { callLLM, callLLMStream, runAiTask, type AiDocumentBrief } from './ai'
 import { fullTextSearch, previewLibraryAiScope } from './semantic-search'
 import { queryAll, queryOne } from './database'
+import { resolveFolderAndDescendantIds } from './folder-scope'
 import type {
   AiSearchPlan,
   EvidenceQaCluster,
@@ -20,13 +21,13 @@ const MAX_QUERIES = 18
 const MAX_CLUSTERS = 8
 const MAX_CONTEXT_CHARS = 26000
 const MAX_PAGE_TEXT_CHARS = 1800
-const MAX_OVERVIEW_PAGE_TEXT_CHARS = 700
-const MAX_OVERVIEW_PAGES_PER_CLUSTER = 3
 const MIN_TEXT_FOR_WIDE_RADIUS = 360
 const OVERVIEW_QUERY_LABEL = '全文概览'
 const MAX_REFINEMENT_ROUNDS = 3
 const MAX_REFINEMENT_DOCS = 6
 const MAX_REFINEMENT_CONTEXT_CHARS = 14000
+const MAX_INITIAL_RESULTS_PER_DOCUMENT = 3
+const MAX_INITIAL_CLUSTERS_PER_DOCUMENT = 2
 
 type EvidenceQaScope =
   | { type: 'documents'; docIds: string[] }
@@ -94,28 +95,9 @@ function fallbackPlan(question: string): EvidenceQaPlan {
   }
 }
 
-function overviewPlan(question: string): EvidenceQaPlan {
-  return {
-    ...fallbackPlan(question),
-    intent: '概括当前文献内容',
-    keywords: [OVERVIEW_QUERY_LABEL],
-    expandedKeywords: [],
-    excludeKeywords: [],
-    inferredFilters: {},
-    notes: '识别为全文概览问题，已读取当前范围内的 OCR 正文，而不是按问题原句做关键词检索。',
-  }
-}
-
 function extractCurrentQuestion(question: string): string {
   const match = String(question || '').match(/当前问题：([\s\S]+)$/)
   return (match?.[1] || question).trim()
-}
-
-function isOverviewQuestion(question: string): boolean {
-  const normalized = extractCurrentQuestion(question).replace(/\s+/g, '')
-  if (!normalized) return false
-  return /(?:这篇|本文|文章|论文|文献|全[文章]|整篇|这本|本书|材料).{0,12}(?:讲了?什么|主要内容|内容|大意|主旨|主题|观点|结论|摘要|概括|总结|综述)/.test(normalized)
-    || /(?:总结|概括|摘要|综述|介绍).{0,12}(?:这篇|本文|文章|论文|文献|全[文章]|整篇|这本|本书|材料)/.test(normalized)
 }
 
 function isQuestionLike(value: string): boolean {
@@ -174,7 +156,7 @@ function normalizeScopeDocumentIds(scope?: EvidenceQaScope): string[] | undefine
     return queryAll<{ id: string }>(sql, params).map((item) => item.id)
   }
   if (scope.type === 'folders') {
-    const folderIds = uniqueStrings(scope.folderIds || [])
+    const folderIds = resolveFolderAndDescendantIds(uniqueStrings(scope.folderIds || []))
     if (folderIds.length === 0) return []
     return queryAll<{ id: string }>(
       `SELECT DISTINCT d.id
@@ -201,6 +183,65 @@ function buildQueries(question: string, plan: EvidenceQaPlan): string[] {
   ], MAX_QUERIES).filter((query) => query.length > 1 || direct.length === 1)
 }
 
+function shouldDiversifyAcrossDocuments(docIds: string[] | undefined): boolean {
+  return !docIds || docIds.length !== 1
+}
+
+function diversifyByDocument<T extends { doc_id?: string | null; relevance_score?: number | null }>(
+  items: T[],
+  limit: number,
+  perDocumentLimit: number,
+  enabled: boolean,
+): T[] {
+  const sorted = [...items].sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0))
+  if (!enabled) return sorted.slice(0, limit)
+
+  const selected: T[] = []
+  const selectedItems = new Set<T>()
+  const perDocCounts = new Map<string, number>()
+  for (const item of sorted) {
+    if (selected.length >= limit) break
+    const docId = String(item.doc_id || '')
+    const currentCount = perDocCounts.get(docId) || 0
+    if (docId && currentCount >= perDocumentLimit) continue
+    selected.push(item)
+    selectedItems.add(item)
+    if (docId) perDocCounts.set(docId, currentCount + 1)
+  }
+
+  for (const item of sorted) {
+    if (selected.length >= limit) break
+    if (selectedItems.has(item)) continue
+    selected.push(item)
+  }
+
+  return selected
+}
+
+function diversifyClustersByDocument(clusters: EvidenceQaCluster[], limit: number): EvidenceQaCluster[] {
+  const sorted = [...clusters].sort((left, right) => right.score - left.score)
+  const selected: EvidenceQaCluster[] = []
+  const selectedIds = new Set<string>()
+  const perDocCounts = new Map<string, number>()
+
+  for (const cluster of sorted) {
+    if (selected.length >= limit) break
+    const currentCount = perDocCounts.get(cluster.doc_id) || 0
+    if (currentCount >= MAX_INITIAL_CLUSTERS_PER_DOCUMENT) continue
+    selected.push(cluster)
+    selectedIds.add(cluster.id)
+    perDocCounts.set(cluster.doc_id, currentCount + 1)
+  }
+
+  for (const cluster of sorted) {
+    if (selected.length >= limit) break
+    if (selectedIds.has(cluster.id)) continue
+    selected.push(cluster)
+  }
+
+  return selected
+}
+
 function searchEvidence(
   question: string,
   plan: EvidenceQaPlan,
@@ -219,6 +260,7 @@ function searchEvidence(
         limit: Math.max(24, Math.min(limit * 2, 60)),
         contextMode: 'long',
         exhaustive: query.length <= 3,
+        autoReindex: false,
       }).map((item) => ({
         ...item,
         matched_query: item.matched_query || query,
@@ -244,9 +286,12 @@ function searchEvidence(
       if (!existing || Number(item.relevance_score || 0) > Number(existing.relevance_score || 0)) deduped.set(key, item)
     })
 
-  const results = [...deduped.values()]
-    .sort((left, right) => Number(right.relevance_score || 0) - Number(left.relevance_score || 0))
-    .slice(0, limit)
+  const results = diversifyByDocument(
+    [...deduped.values()],
+    limit,
+    MAX_INITIAL_RESULTS_PER_DOCUMENT,
+    shouldDiversifyAcrossDocuments(docIds),
+  )
 
   return { results, expandedQueries, warnings }
 }
@@ -277,6 +322,17 @@ function parseMetadata(value: unknown): DocumentMetadataResult {
     return isRecord(parsed) ? parsed : {}
   } catch {
     return {}
+  }
+}
+
+function getCachedDocumentBrief(docId: string): AiDocumentBrief | null {
+  const cached = queryOne<{ summary_json: string }>('SELECT summary_json FROM ai_document_summaries WHERE doc_id = ?', [docId])
+  if (!cached?.summary_json) return null
+  try {
+    const parsed: unknown = JSON.parse(cached.summary_json)
+    return isRecord(parsed) ? parsed as unknown as AiDocumentBrief : null
+  } catch {
+    return null
   }
 }
 
@@ -320,13 +376,8 @@ async function buildRefinementContext(docIds: string[], question: string): Promi
     const doc = queryOne<EvidenceRefinementDocumentRow>('SELECT id, title, author, doc_type, dynasty, metadata FROM documents WHERE id = ?', [docId])
     if (!doc) continue
 
-    let brief: AiDocumentBrief | null = null
-    try {
-      brief = await getDocumentBrief(docId)
-      if (brief) briefs.push(brief)
-    } catch (error) {
-      console.warn('[EvidenceQA] Failed to load document brief for query refinement', error)
-    }
+    const brief = getCachedDocumentBrief(docId)
+    if (brief) briefs.push(brief)
 
     const metadata = parseMetadata(doc.metadata)
     const metadataText = [
@@ -337,18 +388,12 @@ async function buildRefinementContext(docIds: string[], question: string): Promi
       metadata.subject,
       metadata.description,
     ].filter(Boolean).join('；')
-    const pages = selectRepresentativePagesForRefinement(getDocumentTextPages(docId), 5)
-    const pageText = pages
-      .map((page) => `第 ${page.page_num} 页：${truncateText(page.text, 420)}`)
-      .join('\n')
     const block = [
       `【文献】${doc.title || brief?.title || '未命名文献'}${doc.author || brief?.author ? ` / ${doc.author || brief?.author}` : ''}`,
       doc.doc_type || doc.dynasty ? `类型/年代：${[doc.doc_type, doc.dynasty].filter(Boolean).join(' / ')}` : '',
       metadataText ? `元数据摘要：${truncateText(metadataText, 700)}` : '',
-      brief?.summary ? `AI 摘要：${truncateText(brief.summary, 800)}` : '',
       brief?.keywords?.length ? `AI 关键词：${brief.keywords.slice(0, 12).join('、')}` : '',
       brief?.toc?.length ? `目录线索：${brief.toc.slice(0, 10).map((item) => item.title).join('、')}` : '',
-      pageText ? `正文样本：\n${pageText}` : '',
     ].filter(Boolean).join('\n')
 
     if (!block.trim()) continue
@@ -532,51 +577,6 @@ function getPageWindow(docId: string, pageNum: number, radius: number): Evidence
     .filter((page) => page.text)
 }
 
-function getDocumentTextPages(docId: string): EvidenceQaClusterPage[] {
-  return queryAll<{ page_num: number; text: string }>(
-    "SELECT page_num, COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '') as text FROM pages WHERE doc_id = ? ORDER BY page_num",
-    [docId],
-  )
-    .map((page) => ({
-      page_num: Number(page.page_num),
-      text: truncateText(page.text || '', MAX_PAGE_TEXT_CHARS),
-      role: 'hit' as const,
-    }))
-    .filter((page) => page.text)
-}
-
-function selectOverviewPages(pages: EvidenceQaClusterPage[]): EvidenceQaClusterPage[] {
-  if (pages.length <= MAX_OVERVIEW_PAGES_PER_CLUSTER) return pages
-  const lastIndex = pages.length - 1
-  const indexes = new Set<number>()
-  for (let index = 0; index < MAX_OVERVIEW_PAGES_PER_CLUSTER; index += 1) {
-    const ratio = index / (MAX_OVERVIEW_PAGES_PER_CLUSTER - 1)
-    indexes.add(Math.round(lastIndex * ratio))
-  }
-  return [...indexes]
-    .sort((left, right) => left - right)
-    .map((index) => pages[index])
-    .filter(Boolean)
-}
-
-function resolveOverviewDocumentIds(scope: EvidenceQaScope | undefined, docIds: string[] | undefined): string[] {
-  if (docIds) return uniqueStrings(docIds, MAX_CLUSTERS)
-  if (scope && scope.type !== 'all') return []
-  return queryAll<{ id: string }>(
-    `SELECT d.id
-     FROM documents d
-     WHERE EXISTS (
-       SELECT 1
-       FROM pages p
-       WHERE p.doc_id = d.id
-         AND COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '') <> ''
-     )
-     ORDER BY d.is_favorite DESC, COALESCE(d.last_opened_at, d.updated_at) DESC, d.updated_at DESC
-     LIMIT ?`,
-    [MAX_CLUSTERS],
-  ).map((item) => item.id)
-}
-
 function makeSourceFromResult(result: EvidenceSearchResult): EvidenceQaSource {
   const snippet = stripSnippetMarkers(result.snippet || '')
   return {
@@ -602,7 +602,7 @@ function buildEvidenceClusters(results: EvidenceSearchResult[]): EvidenceQaClust
     grouped.set(key, bucket)
   })
 
-  return [...grouped.entries()]
+  const clusters = [...grouped.entries()]
     .map(([key, items]) => {
       const [docId, pageText] = key.split(':')
       const pageNum = Number(pageText)
@@ -626,53 +626,8 @@ function buildEvidenceClusters(results: EvidenceSearchResult[]): EvidenceQaClust
       } satisfies EvidenceQaCluster
     })
     .filter((cluster) => cluster.pages.length > 0)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, MAX_CLUSTERS)
-}
 
-function buildDocumentOverviewClusters(docIds: string[]): EvidenceQaCluster[] {
-  const documentIds = uniqueStrings(docIds, MAX_CLUSTERS)
-  const clusters: EvidenceQaCluster[] = []
-  const perDocLimit = Math.max(1, Math.floor(MAX_CLUSTERS / Math.max(1, documentIds.length)))
-
-  for (const docId of documentIds) {
-    const pages = getDocumentTextPages(docId)
-    if (pages.length === 0) continue
-    const docTitle = getDocTitle(docId)
-    const chunkSize = Math.max(1, Math.ceil(pages.length / perDocLimit))
-    for (let index = 0; index < pages.length && clusters.length < MAX_CLUSTERS; index += chunkSize) {
-      const chunk = pages.slice(index, index + chunkSize)
-      const pageNums = chunk.map((page) => page.page_num)
-      const overviewPages = selectOverviewPages(chunk).map((page) => ({
-        ...page,
-        text: truncateText(page.text, MAX_OVERVIEW_PAGE_TEXT_CHARS),
-      }))
-      const snippet = stripSnippetMarkers(overviewPages.map((page) => `第 ${page.page_num} 页：${page.text}`).join(' ').slice(0, 420))
-      const source: EvidenceQaSource = {
-        doc_id: docId,
-        doc_title: docTitle,
-        page_num: overviewPages[0]?.page_num || pageNums[0] || null,
-        snippet,
-        rank: clusters.length,
-        matched_query: OVERVIEW_QUERY_LABEL,
-        source_hash: hashSource(`${docId}:overview:${pageNums.join('-')}:${snippet}`),
-      }
-      clusters.push({
-        id: hashSource(`${docId}:overview:${pageNums.join('-')}`),
-        doc_id: docId,
-        doc_title: docTitle,
-        anchor_page_num: pageNums[0] || null,
-        page_range: [Math.min(...pageNums), Math.max(...pageNums)] as [number, number],
-        score: Math.max(1, pages.length - index),
-        queries: [OVERVIEW_QUERY_LABEL],
-        hit_count: chunk.length,
-        pages: overviewPages,
-        sources: [source],
-      })
-    }
-  }
-
-  return clusters
+  return diversifyClustersByDocument(clusters, MAX_CLUSTERS)
 }
 
 function isOverviewEvidence(plan: EvidenceQaPlan, expandedQueries: string[]): boolean {
@@ -799,31 +754,6 @@ export async function buildEvidenceForQuestion(
         warnings: ['当前范围内没有可用的 OCR 文本。'],
         emptyAnswer: '证据不足。\n当前范围内没有可用的 OCR 文本，请先完成 OCR 或调整范围。',
       }
-    }
-  }
-
-  if (isOverviewQuestion(trimmed)) {
-    const overviewDocIds = resolveOverviewDocumentIds(scope, docIds)
-    const clusters = buildDocumentOverviewClusters(overviewDocIds)
-    const plan = overviewPlan(trimmed)
-    if (clusters.length === 0) {
-      return {
-        trimmed,
-        plan,
-        expandedQueries: [OVERVIEW_QUERY_LABEL],
-        clusters: [],
-        sources: [],
-        warnings: ['当前范围内没有可用于全文概览的 OCR 文本。'],
-        emptyAnswer: '证据不足。\n当前范围内没有可用于全文概览的 OCR 文本，请先完成 OCR 或调整范围。',
-      }
-    }
-    return {
-      trimmed,
-      plan,
-      expandedQueries: [OVERVIEW_QUERY_LABEL],
-      clusters,
-      sources: flattenSources(clusters),
-      warnings: [],
     }
   }
 

@@ -8,6 +8,7 @@ import OpenCC from 'opencc-js'
 import { PDFDocument, rgb, StandardFonts, type PDFImage, type PDFPage, type PDFFont } from 'pdf-lib'
 import * as fontkit from '@pdf-lib/fontkit'
 import { isTocLabel, looksLikeTocText, parseTocEntries, type TocFormattedEntry } from '../shared/toc-format'
+import { hydratePagePayloadRows } from './page-payload-store'
 import type { Document, DocumentExportFormat, DocumentExportOptions } from '../shared/types'
 
 marked.setOptions({
@@ -24,6 +25,9 @@ interface ExportPage {
   ocr_text?: string | null
   ocr_result?: string | null
   proofed_text?: string | null
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
+  proofed_text_ref?: string | null
   proof_status?: string | null
 }
 
@@ -31,6 +35,8 @@ interface ExportPageOcrVersion {
   page_id: string
   ocr_text?: string | null
   ocr_result?: string | null
+  ocr_text_ref?: string | null
+  ocr_result_ref?: string | null
 }
 
 interface LayoutBlock {
@@ -898,13 +904,13 @@ function hasLayoutBlocks(page: ExportPage): boolean {
 }
 
 function withActiveOcrVersions(docId: string, pages: ExportPage[]): ExportPage[] {
-  const versions = queryAll<ExportPageOcrVersion>(
-    `SELECT page_id, ocr_text, ocr_result
+  const versions = hydratePagePayloadRows(queryAll<ExportPageOcrVersion>(
+    `SELECT page_id, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref
      FROM page_ocr_versions
      WHERE doc_id = ? AND is_active = 1 AND status = ?
      ORDER BY page_num`,
     [docId, 'completed'],
-  )
+  ))
   if (versions.length === 0) return pages
 
   const versionByPageId = new Map(versions.map((version) => [version.page_id, version]))
@@ -2519,7 +2525,7 @@ export async function exportDocument(
   const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [docId])
   if (!doc) throw new Error('文献不存在')
 
-  const pages = withActiveOcrVersions(docId, queryAll<ExportPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId]))
+  const pages = withActiveOcrVersions(docId, hydratePagePayloadRows(queryAll<ExportPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])))
   const metadataObj = parseMaybeJson<JsonRecord>(doc.metadata, {})
   const metadataSource = metadataText(metadataObj, 'source')
   const metadataVersion = metadataText(metadataObj, 'version')

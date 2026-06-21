@@ -2,7 +2,9 @@ import { ipcMain } from 'electron'
 import type { DatabaseMaintenanceResult, DatabaseStorageDiagnostics } from '../../shared/types'
 import {
   clearLegacySearchNgramIndex,
+  cleanupExternalPagePayloadStorage,
   compactDatabase,
+  externalizePagePayloadStorage,
   exportDatabaseStorageDiagnostics,
   getDatabaseStorageDiagnostics,
   optimizeLegacyDatabaseStorage,
@@ -10,7 +12,18 @@ import {
 import { queueAllDocumentsReindex } from '../semantic-search'
 
 function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics): boolean {
-  return Boolean(diagnostics.requiredMaintenance?.required)
+  const reasons = diagnostics.requiredMaintenance?.reasons || []
+  return !!diagnostics.searchIndex.enterpriseSearchMigrationRecommended
+    || diagnostics.searchIndex.ngramRows > 0
+    || diagnostics.searchIndex.singleCharNgramRows > 0
+    || diagnostics.searchIndex.ngramPositionsBytes > 0
+    || reasons.some((reason) => (
+    reason === 'legacy-ngram-index'
+    || reason === 'legacy-single-char-ngram'
+    || reason === 'legacy-ngram-positions'
+    || reason === 'enterprise-search-index'
+    || reason === 'inline-page-payloads'
+  ))
 }
 
 export function registerDatabaseMaintenanceIpc(): void {
@@ -34,12 +47,20 @@ export function registerDatabaseMaintenanceIpc(): void {
     return await optimizeLegacyDatabaseStorage()
   })
 
+  ipcMain.handle('database:externalizePagePayloads', async (): Promise<DatabaseMaintenanceResult> => {
+    return await externalizePagePayloadStorage()
+  })
+
+  ipcMain.handle('database:cleanupExternalPayloads', async (): Promise<DatabaseMaintenanceResult> => {
+    return await cleanupExternalPagePayloadStorage()
+  })
+
   ipcMain.handle('search:rebuildLightweightIndex', async (): Promise<DatabaseMaintenanceResult> => {
     const diagnostics = getDatabaseStorageDiagnostics()
     if (!hasLegacySearchIndexMaintenance(diagnostics)) {
       return {
         success: true,
-        message: '旧搜索索引已经清理完成，无需再次瘦身或重建索引。',
+        message: '搜索索引已经是新版结构，无需再次瘦身或升级。',
         beforeBytes: diagnostics.databaseBytes,
         afterBytes: diagnostics.databaseBytes,
         deletedRows: 0,
@@ -47,7 +68,8 @@ export function registerDatabaseMaintenanceIpc(): void {
       }
     }
 
-    const cleaned = await clearLegacySearchNgramIndex()
+    const cleaned = await optimizeLegacyDatabaseStorage()
+    if (!cleaned.success) return cleaned
     const queued = queueAllDocumentsReindex()
     return {
       ...cleaned,

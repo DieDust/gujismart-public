@@ -280,6 +280,12 @@ assert(
   'Startup recovery should clean orphan storage directories incrementally instead of deleting every leftover directory concurrently.',
 )
 assert(
+  startupRecovery.includes('RESERVED_STORAGE_DIR_NAMES')
+    && startupRecovery.includes("'page-payloads'")
+    && /async function removeOrphanStorageDirs\(\)[\s\S]{0,500}RESERVED_STORAGE_DIR_NAMES\.has\(entry\.name\)[\s\S]{0,500}await rm/.test(startupRecovery),
+  'Startup recovery should preserve shared enterprise storage directories such as page-payloads.',
+)
+assert(
   documentsIpc.includes("pages.length, 'processing', 'pending', 'processing'")
     && documentsIpc.includes("parsedEbook.sections.length,\n              'processing'")
     && documentsIpc.includes("UPDATE documents SET ocr_status = ?, import_status = ?, error_message = NULL"),
