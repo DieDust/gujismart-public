@@ -4,15 +4,19 @@
 
 ## 界面预览
 
-![欢迎页](docs/images/tutorial-01-welcome.png)
+![首页](docs/images/screenshot-01-home.png)
 
-| 文献库 | 研究工作台 |
+| 文件夹 | 摘录 |
 | --- | --- |
-| ![文献库](docs/images/tutorial-02-library.png) | ![研究工作台](docs/images/tutorial-03-research.png) |
+| ![文件夹功能](docs/images/screenshot-02-folders.png) | ![摘录功能](docs/images/screenshot-03-excerpts.png) |
 
-| 检索 | 引用 |
+| 检索 | 图片显示 |
 | --- | --- |
-| ![检索](docs/images/tutorial-04-search.png) | ![引用](docs/images/tutorial-05-citation.png) |
+| ![检索功能](docs/images/screenshot-04-search.png) | ![图片显示功能](docs/images/screenshot-05-reader-images.png) |
+
+| 版式还原 | 引用 |
+| --- | --- |
+| ![版式还原功能](docs/images/screenshot-06-layout-restore.png) | ![引用功能](docs/images/screenshot-07-citation.png) |
 
 ## 功能概览
 
