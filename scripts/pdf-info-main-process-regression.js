@@ -7,6 +7,7 @@ function assert(condition, message) {
 
 const root = path.join(__dirname, '..')
 const rendererPdfSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'utils', 'pdf.ts'), 'utf8')
+const fileAccessSource = fs.readFileSync(path.join(root, 'src', 'main', 'file-access.ts'), 'utf8')
 const mainPdfInfoSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-info.ts'), 'utf8')
 const preloadSource = fs.readFileSync(path.join(root, 'src', 'preload', 'index.ts'), 'utf8')
 const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
@@ -40,32 +41,40 @@ assert(
   'renderer should build local-resource URLs for file-path PDF rendering',
 )
 assert(
-  rendererPdfSource.includes("encodeURI(pathname).replace(/#/g, '%23').replace(/\\?/g, '%3F')"),
-  'renderer local-resource URLs should encode fragment/query separators without encoding Windows drive colons',
+  rendererPdfSource.includes("`local-resource://file/${encodeURIComponent(normalized)}`"),
+  'renderer local-resource URLs should encode the whole normalized path under the file host',
 )
 assert(
-  !rendererPdfSource.includes('local-resource://${encodeURI(pathname)}'),
-  'renderer local-resource URLs should not use encodeURI for whole paths',
+  !rendererPdfSource.includes('encodeURI(pathname)'),
+  'renderer local-resource URLs should not use path-style encodeURI because Windows drive colons can be lost',
 )
 assert(
-  !rendererPdfSource.includes('encodeURIComponent(part)'),
-  'renderer local-resource URLs should not encode Windows drive colons in path segments',
+  fileAccessSource.includes("if (urlObj.hostname === 'file')") && fileAccessSource.includes("decodeURIComponent(urlObj.pathname.replace(/^\\/+/, ''))"),
+  'main local-resource parser should decode file-host URLs back to original Windows paths',
 )
 assert(
-  getCachedPdfDocumentBody.includes('url: toLocalResourceUrl(cacheKey)'),
-  'renderer cached PDF previews should load file paths through local-resource URLs',
+  fileAccessSource.includes("filePath[2] === ':'"),
+  'main local-resource parser should keep compatibility with older path-style local-resource URLs',
 )
 assert(
-  !getCachedPdfDocumentBody.includes('readPdfFileBuffer('),
-  'renderer cached PDF previews should not read the entire PDF into renderer memory',
+  rendererPdfSource.includes('function isLocalResourceResponseError') && rendererPdfSource.includes('Unexpected server response \\(0\\)'),
+  'renderer should detect Electron local-resource status-0 PDF.js failures',
 )
 assert(
-  convertPdfFileToImagesBody.includes('url: toLocalResourceUrl(filePath)'),
-  'renderer file-path PDF conversion should load through local-resource URLs',
+  rendererPdfSource.includes('async function loadPdfDocumentFromFile') && rendererPdfSource.includes('url: toLocalResourceUrl(normalizedPath)'),
+  'renderer cached PDF previews should try local-resource URLs first',
 )
 assert(
-  !convertPdfFileToImagesBody.includes('readPdfFileBuffer(filePath)'),
-  'renderer file-path PDF conversion should not read the entire PDF into renderer memory',
+  rendererPdfSource.includes('data: await readPdfFileBuffer(normalizedPath)'),
+  'renderer PDF previews should fall back to file-buffer loading when local-resource responses are reported as status 0',
+)
+assert(
+  getCachedPdfDocumentBody.includes('loadPdfDocumentFromFile(cacheKey'),
+  'renderer cached PDF previews should use the shared local-resource-with-fallback loader',
+)
+assert(
+  convertPdfFileToImagesBody.includes('loadPdfDocumentFromFile(filePath'),
+  'renderer file-path PDF conversion should use the same local-resource-with-fallback loader',
 )
 assert(
   mainPdfInfoSource.includes("'--show-npages'"),

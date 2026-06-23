@@ -1,5 +1,79 @@
 # 更新日志 / Changelog
 
+## 1.0.5 - 2026-06-23
+
+### 中文
+
+#### 改进
+
+- 新增独立“文件夹”页面，支持类似资源管理器的目录树、文件夹卡片和文献封面预览。
+- 支持文件夹拖拽归类与同级排序，禁止拖入自身或子文件夹，避免误操作破坏层级。
+- 文件夹页面支持文献封面网格、未分类入口、滚动加载、多选拖拽和文献卡片大小调整。
+- 文件夹页面支持选中文献后的批量移入文件夹、从当前文件夹移出、删除文献本体和右键操作。
+- 文件夹页面新增文献排序，可按题名、导入时间、更新时间、页数、文献年代、最后打开时间排序。
+- 文件夹页面拖入文件或目录时，会在当前页面原地导入并写入目标文件夹，不再跳转到文献库。
+- 从文件夹页面打开文献后返回，会恢复之前选中的文件夹和滚动位置。
+- 手动导出完整备份时，现在会生成单个 `.zip` 备份包，导入时可直接选择压缩包；旧版备份文件夹仍然兼容。
+- 导入备份前会自动写入一份当前数据安全备份包，方便用户在导入后不满意或选错备份时再恢复。
+- 设置页数据管理支持直接拖入 `.zip` 备份包导入，减少手动选择步骤；导入前仍会确认并写入安全备份包。
+- 统一标签管理、引用格式、研究工作台和文件夹页面的基础视觉样式，减少内联样式并统一页面标题、卡片和拖拽反馈。
+
+#### 修复
+
+- 修复文件夹页面上传文件后自动切到文献库的问题。
+- 修复文件夹页面打开文献再返回后回到初始页面的问题。
+- 修复手动数据备份只导出文件夹、不方便转移和再次导入的问题。
+- 修复文件夹拖拽反馈依赖内联边框、视觉状态不统一的问题。
+- 修复部分标签批量操作入口占用顶部空间、页面操作不够清晰的问题。
+- 修复安装在带空格、中文或特殊路径时，PDF 本地资源地址可能解析异常，导致原 PDF/校对原图无法加载的问题。
+- 修复部分 Windows/Electron 环境下 PDF.js 把本地 PDF 协议响应识别为状态 0，导致仍然提示 `Unexpected server response (0)` 的问题；现在会自动回退到安全的文件缓冲加载。
+- 修复旧 PDF 路径不可读时，校对模式直接弹出 `fs:readFileBuffer` 底层错误的问题；已有页图会继续显示，手动选择 PDF 时也会真正使用新选择的文件。
+- 修复从移动硬盘、旧电脑或旧安装目录恢复整套软件数据后，数据库里的旧绝对路径导致全部 PDF 原图无法读取、自动补回失败的问题；安装版和便携版都会优先使用当前软件目录下的 `data`，不再默认迁到 C 盘 AppData。
+- 修复旧 `storage/文献ID/...` 路径搬家后无法自愈的问题；打开文献、检查原图状态和补回 PDF 时会按当前库目录重新定位，并把可读的新路径写回数据库。
+- 修复从校对模式切回阅读模式后，源图/版式阅读器的单页设置被重置为双页的问题；普通阅读模式和源图/版式阅读器会分别保存自己的阅读偏好。
+- 修正文件夹来源状态文案：拖入电脑文件夹只会创建同名分类并导入当时的 PDF，不会绑定、扫描或自动同步后续变动；移除容易误解的“绑定磁盘目录”入口。
+
+#### 下载
+
+- `GujiSmart-1.0.5-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.0.5-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Improvements
+
+- Added a dedicated Folders page with an Explorer-like tree, folder cards, and document cover previews.
+- Added folder drag-and-drop classification and sibling ordering, with safeguards against moving a folder into itself or its descendants.
+- Added document cover grids, an Unfiled entry, incremental loading, multi-select dragging, and adjustable document card sizes in the Folders page.
+- Added batch actions after selecting documents in the Folders page, including move to folder, remove from current folder, delete document records, and context-menu actions.
+- Added document sorting in the Folders page by title, import time, update time, page count, publication year, and last opened time.
+- Dropping files or directories into the Folders page now imports them in place and assigns them to the target folder without switching to the Library page.
+- Returning from a document opened through the Folders page now restores the previously selected folder and scroll position.
+- Manual full backup export now creates a single `.zip` backup package that can be selected directly during import, while legacy backup folders remain supported.
+- Before importing a backup, the app now automatically writes a restorable safety backup package of the current data.
+- The Settings data management page now supports importing a `.zip` backup package by drag-and-drop, while still confirming the operation and writing a safety backup first.
+- Unified baseline visual styling across Tags, Citation, Research, and Folders views, reducing inline styles and standardizing headers, cards, and drag feedback.
+
+#### Fixes
+
+- Fixed Folders page imports unexpectedly navigating to the Library page.
+- Fixed returning from a document opened in the Folders page resetting the folder view to its initial state.
+- Fixed manual data backup exporting only a folder, which made transfer and later import inconvenient.
+- Fixed inconsistent folder drag feedback caused by inline border styles.
+- Fixed unclear top-bar batch actions in Tags management by moving selected-tag actions into a floating action bar.
+- Fixed local PDF resource parsing in installation paths with spaces, Chinese characters, or special characters, which could prevent the original PDF/proof image view from loading.
+- Fixed a PDF.js compatibility issue in some Windows/Electron environments where local PDF protocol responses were reported as status 0 and still showed `Unexpected server response (0)`; the app now falls back to safe file-buffer loading automatically.
+- Fixed raw `fs:readFileBuffer` errors when an old PDF path is no longer readable; existing page images continue to display, and manually selected replacement PDFs are now used instead of being short-circuited by stale paths.
+- Fixed whole-library restores from an external drive, an old computer, or an old install directory where stale absolute paths could make all original PDFs unreadable and automatic restoration fail. Installer and portable builds now prefer the current software directory's `data` folder instead of moving the library to AppData by default.
+- Fixed stale `storage/document-id/...` paths after moving a library. Document open, source-state checks, and PDF restoration now relocate managed files into the active library storage directory and write readable paths back to the database.
+- Fixed source/facsimile reader single-page layout resetting to two-page layout after switching from proof mode back to reading mode. The ordinary text reader and source/facsimile reader now keep separate reading preferences.
+- Clarified folder source wording: dropping a computer folder only creates a same-named category and imports the PDFs at that moment; it does not bind, scan, or auto-sync future changes. Misleading disk-binding actions were removed.
+
+#### Downloads
+
+- `GujiSmart-1.0.5-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.0.5-Portable-x64.exe` for portable use.
+
 ## 1.0.4 - 2026-06-21
 
 ### 中文

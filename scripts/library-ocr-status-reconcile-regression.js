@@ -9,6 +9,7 @@ function assert(condition, message) {
 
 async function run() {
   const userDataDir = path.join(os.tmpdir(), 'gujismart-ocr-status-user-' + Date.now())
+  const profileDir = path.join(os.tmpdir(), 'gujismart-ocr-status-profile-' + Date.now())
   const dataDir = path.join(os.tmpdir(), 'gujismart-ocr-status-db-' + Date.now())
   const samplePath = path.join(userDataDir, 'library-ocr-status-reconcile.json')
   const title = 'library ocr status reconcile regression'
@@ -49,6 +50,7 @@ async function run() {
       ...process.env,
       GUJISMART_SMOKE: '1',
       GUJISMART_DATA_DIR: dataDir,
+      GUJISMART_PROFILE_DIR: profileDir,
     },
   })
 
@@ -136,8 +138,12 @@ async function run() {
   }
 }
 
-run().catch((error) => {
-  console.error('Library OCR status reconcile regression failed.')
-  console.error(error)
-  process.exit(1)
-})
+run()
+  .then(() => {
+    process.exit(0)
+  })
+  .catch((error) => {
+    console.error('Library OCR status reconcile regression failed.')
+    console.error(error)
+    process.exit(1)
+  })

@@ -26,6 +26,10 @@ function isInsidePath(candidate: string, root: string): boolean {
 
 function pathFromLocalResourceUrl(value: string): string {
   const urlObj = new URL(value)
+  if (urlObj.hostname === 'file') {
+    return decodeURIComponent(urlObj.pathname.replace(/^\/+/, ''))
+  }
+
   let filePath = decodeURIComponent(urlObj.pathname)
   if (filePath.length > 2 && filePath[0] === '/' && filePath[2] === ':') {
     filePath = filePath.substring(1)

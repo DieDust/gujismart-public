@@ -3,7 +3,7 @@ import { nativeImage } from 'electron'
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs'
 import { copyFile, mkdir, open, readdir, rm, stat, writeFile } from 'fs/promises'
 import { basename, dirname, extname, join, normalize } from 'path'
-import { getDataDir, queryAll, queryOne, run, scheduleDatabaseSave } from './database'
+import { getDataDir, queryAll, queryOne, resolveManagedStoragePath, run, scheduleDatabaseSave } from './database'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from './page-payload-store'
 import { buildPdfCompressionMetadata, storePdfWithCompression, storePdfWithCompressionSync } from './pdf-compression'
 import type {
@@ -634,8 +634,9 @@ export function backfillLibraryFileFingerprints(): { scannedCount: number; updat
   let scannedCount = 0
   let updatedCount = 0
   for (const doc of docs) {
-    if (!doc.file_path || !existsSync(doc.file_path)) continue
-    const ext = extname(doc.file_path).toLowerCase()
+    const filePath = resolveManagedStoragePath(doc.file_path, doc.id)
+    if (!filePath || !existsSync(filePath)) continue
+    const ext = extname(filePath).toLowerCase()
     if (!FINGERPRINT_EXTENSIONS.has(ext)) continue
 
     scannedCount += 1
@@ -644,7 +645,7 @@ export function backfillLibraryFileFingerprints(): { scannedCount: number; updat
     const needsPdf = ext === '.pdf' && !metadata.pdf_sha256
     if (!needsGeneric && !needsPdf) continue
 
-    updateMetadata(doc.id, buildFileFingerprintPatch(doc.file_path, undefined, doc.page_count || undefined))
+    updateMetadata(doc.id, buildFileFingerprintPatch(filePath, undefined, doc.page_count || undefined))
     updatedCount += 1
   }
   run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['library_file_fingerprints_backfilled_at', new Date().toISOString()])
@@ -661,8 +662,9 @@ async function backfillLibraryFileFingerprintsAsync(): Promise<{ scannedCount: n
   let scannedCount = 0
   let updatedCount = 0
   for (const doc of docs) {
-    if (!doc.file_path || !(await pathExists(doc.file_path))) continue
-    const ext = extname(doc.file_path).toLowerCase()
+    const filePath = resolveManagedStoragePath(doc.file_path, doc.id)
+    if (!filePath || !(await pathExists(filePath))) continue
+    const ext = extname(filePath).toLowerCase()
     if (!FINGERPRINT_EXTENSIONS.has(ext)) continue
 
     scannedCount += 1
@@ -671,8 +673,8 @@ async function backfillLibraryFileFingerprintsAsync(): Promise<{ scannedCount: n
     const needsPdf = ext === '.pdf' && !metadata.pdf_sha256
     if (!needsGeneric && !needsPdf) continue
 
-    const fingerprint = await getFileFingerprintAsync(doc.file_path)
-    updateMetadata(doc.id, buildFileFingerprintPatch(doc.file_path, fingerprint, doc.page_count || undefined))
+    const fingerprint = await getFileFingerprintAsync(filePath)
+    updateMetadata(doc.id, buildFileFingerprintPatch(filePath, fingerprint, doc.page_count || undefined))
     updatedCount += 1
     await yieldToEventLoop()
   }
@@ -882,19 +884,20 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
   const preservedImageCount = materializeContentImageAssets(docId)
   const storageDir = join(getDataDir(), 'storage', docId)
   const metadata = parseMetadata(doc.metadata)
-  if (doc.file_path && extname(doc.file_path).toLowerCase() === '.pdf' && existsSync(doc.file_path) && !metadata.pdf_sha256) {
-    const fingerprint = getPdfFingerprint(doc.file_path)
+  const filePath = resolveManagedStoragePath(doc.file_path, docId)
+  if (filePath && extname(filePath).toLowerCase() === '.pdf' && existsSync(filePath) && !metadata.pdf_sha256) {
+    const fingerprint = getPdfFingerprint(filePath)
     updateMetadata(docId, {
       pdf_sha256: fingerprint.sha256,
       pdf_size_bytes: fingerprint.sizeBytes,
       pdf_page_count: doc.page_count || undefined,
-      original_file_name: basename(doc.file_path),
+      original_file_name: basename(filePath),
     })
   }
   const pathsToDelete = new Set<string>()
   const addPath = (value?: string | null) => {
     if (!value) return
-    const normalizedPath = normalize(value)
+    const normalizedPath = normalize(resolveManagedStoragePath(value, docId))
     if (isPathInsideDirectory(normalizedPath, storageDir) && existsSync(normalizedPath)) {
       pathsToDelete.add(normalizedPath)
     }
@@ -935,19 +938,20 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
   const preservedImageCount = await materializeContentImageAssetsAsync(docId)
   const storageDir = join(getDataDir(), 'storage', docId)
   const metadata = parseMetadata(doc.metadata)
-  if (doc.file_path && extname(doc.file_path).toLowerCase() === '.pdf' && await pathExists(doc.file_path) && !metadata.pdf_sha256) {
-    const fingerprint = await getPdfFingerprintAsync(doc.file_path)
+  const filePath = resolveManagedStoragePath(doc.file_path, docId)
+  if (filePath && extname(filePath).toLowerCase() === '.pdf' && await pathExists(filePath) && !metadata.pdf_sha256) {
+    const fingerprint = await getPdfFingerprintAsync(filePath)
     updateMetadata(docId, {
       pdf_sha256: fingerprint.sha256,
       pdf_size_bytes: fingerprint.sizeBytes,
       pdf_page_count: doc.page_count || undefined,
-      original_file_name: basename(doc.file_path),
+      original_file_name: basename(filePath),
     })
   }
   const pathsToDelete = new Set<string>()
   const addPath = async (value?: string | null) => {
     if (!value) return
-    const normalizedPath = normalize(value)
+    const normalizedPath = normalize(resolveManagedStoragePath(value, docId))
     if (isPathInsideDirectory(normalizedPath, storageDir) && await pathExists(normalizedPath)) {
       pathsToDelete.add(normalizedPath)
     }
@@ -1056,10 +1060,14 @@ export async function shutdownPdfAssetRuntime(timeoutMs = 3000): Promise<void> {
 export function restorePdfAssetForDocument(docId: string, manualPath?: string): PdfAssetRestoreResult {
   const doc = queryOne<DocumentRow>('SELECT id, title, file_path, thumb_path, page_count, metadata FROM documents WHERE id = ?', [docId])
   if (!doc) return { restored: false, error: '文献不存在' }
-  if (doc.file_path && existsSync(doc.file_path)) {
+  const existingPdfPath = resolveManagedStoragePath(doc.file_path, docId)
+  if (!manualPath && existingPdfPath && existsSync(existingPdfPath)) {
+    if (existingPdfPath !== doc.file_path) {
+      run('UPDATE documents SET file_path = ?, updated_at = ? WHERE id = ?', [existingPdfPath, new Date().toISOString(), docId])
+    }
     updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState })
     scheduleDatabaseSave()
-    return { restored: true, path: doc.file_path }
+    return { restored: true, path: existingPdfPath }
   }
 
   const metadata = parseMetadata(doc.metadata)
@@ -1124,10 +1132,14 @@ export function restorePdfAssetForDocument(docId: string, manualPath?: string): 
 export async function restorePdfAssetForDocumentAsync(docId: string, manualPath?: string, knownSourceFingerprint?: PdfFingerprint): Promise<PdfAssetRestoreResult> {
   const doc = queryOne<DocumentRow>('SELECT id, title, file_path, thumb_path, page_count, metadata FROM documents WHERE id = ?', [docId])
   if (!doc) return { restored: false, error: '文献不存在' }
-  if (doc.file_path && await pathExists(doc.file_path)) {
+  const existingPdfPath = resolveManagedStoragePath(doc.file_path, docId)
+  if (!manualPath && existingPdfPath && await pathExists(existingPdfPath)) {
+    if (existingPdfPath !== doc.file_path) {
+      run('UPDATE documents SET file_path = ?, updated_at = ? WHERE id = ?', [existingPdfPath, new Date().toISOString(), docId])
+    }
     updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState })
     scheduleDatabaseSave()
-    return { restored: true, path: doc.file_path }
+    return { restored: true, path: existingPdfPath }
   }
 
   const metadata = parseMetadata(doc.metadata)

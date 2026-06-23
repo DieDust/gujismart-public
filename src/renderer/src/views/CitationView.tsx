@@ -501,9 +501,9 @@ export default function CitationView() {
   }
 
   return (
-    <div style={{ padding: '24px 32px', height: '100%', overflow: 'auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-        <Title level={3} style={{ color: 'var(--gs-gold)', margin: 0 }}>
+    <div className="gs-view-container">
+      <div className="gs-view-header">
+        <Title level={3} className="gs-view-title">
           引用格式管理
         </Title>
         <Space>
@@ -527,26 +527,17 @@ export default function CitationView() {
         description="每个槽位对应规范中的一种文献类型。导出时选择这套标准后，系统会按元数据里的文献类型自动匹配专著、古籍、期刊、报纸、档案、电子文献等格式。"
       />
 
-      <div style={{ display: 'grid', gridTemplateColumns: '260px minmax(0, 1fr)', gap: 18, alignItems: 'start' }}>
-        <Card size="small" title="引用标准" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+      <div className="citation-view-grid">
+        <Card size="small" title="引用标准" className="citation-preset-sidebar">
           <Space direction="vertical" size={8} style={{ width: '100%' }}>
             {styles.map((style) => (
               <button
                 key={style.id}
                 type="button"
                 onClick={() => setSelectedStyleId(style.id)}
-                style={{
-                  width: '100%',
-                  textAlign: 'left',
-                  border: selectedStyleId === style.id ? '1px solid var(--gs-gold)' : '1px solid rgba(255,255,255,0.08)',
-                  background: selectedStyleId === style.id ? 'rgba(191, 145, 91, 0.18)' : 'rgba(255,255,255,0.025)',
-                  color: 'var(--gs-text-primary)',
-                  borderRadius: 6,
-                  padding: '8px 10px',
-                  cursor: 'pointer',
-                }}
+                className={`citation-style-button ${selectedStyleId === style.id ? 'active' : ''}`}
               >
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                <div className="citation-style-button-main">
                   <Text strong>{style.name}</Text>
                   {style.is_default ? <Tag color="gold">默认</Tag> : null}
                 </div>
@@ -580,7 +571,7 @@ export default function CitationView() {
       ) : !selectedStyle ? (
         <Empty description="请先创建一套引用标准" />
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 14 }}>
+        <div className="citation-slot-grid">
           {DOCUMENT_TYPE_ORDER.map((type) => {
             const template = templatesByType[type]
             const rawTemplateText = template?.template_text || FORMAT_TYPE_DEFAULTS[type] || ''
@@ -595,14 +586,14 @@ export default function CitationView() {
                     {template ? <Tag color="green">已设置</Tag> : <Tag>未设置</Tag>}
                   </Space>
                 }
-                style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}
+                className="citation-slot-card"
               >
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
                   <Text type="secondary" style={{ fontSize: 12 }}>
                     {template ? template.name : '导出此类型文献时将使用这里设置的格式。'}
                   </Text>
                   <Paragraph ellipsis={{ rows: 2, expandable: true, symbol: '展开' }} style={{ color: 'var(--gs-text-secondary)', fontSize: 13, marginBottom: 0 }}>
-                    <code style={{ background: 'rgba(255,255,255,0.04)', padding: '2px 6px', borderRadius: 3 }}>
+                    <code className="citation-code-block">
                       {displayText || '尚未设置格式'}
                     </code>
                   </Paragraph>

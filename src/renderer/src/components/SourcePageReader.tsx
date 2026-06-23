@@ -128,8 +128,22 @@ type ReaderPageMetrics = {
   linesPerPage: number
   limit: number
 }
+type SourcePageReaderPreferences = {
+  view_mode: ViewMode
+  font_size: number
+  line_height: number
+  theme: ReaderTheme
+}
 const AI_LAYOUT_FRONTEND_TIMEOUT_MS = 90_000
 const READER_IMAGE_CACHE_LIMIT = 24
+const SOURCE_PAGE_READER_PREFERENCES_SETTING_KEY = 'source_page_reader_preferences'
+const SOURCE_PAGE_READER_PREFERENCES_SAVE_DELAY_MS = 350
+const SOURCE_PAGE_READER_DEFAULT_PREFERENCES: SourcePageReaderPreferences = {
+  view_mode: 'spread',
+  font_size: 17,
+  line_height: 1.9,
+  theme: 'paper',
+}
 const readerImageDataUrlCache = new Map<string, string>()
 const readerImageDataUrlPromises = new Map<string, Promise<string>>()
 
@@ -200,6 +214,33 @@ function parseMaybeJson(value: unknown, fallback: unknown = null): unknown {
 function parseMaybeRecord(value: unknown): JsonRecord {
   const parsed = parseMaybeJson(value, {})
   return isJsonRecord(parsed) ? parsed : {}
+}
+
+function isViewModeValue(value: unknown): value is ViewMode {
+  return value === 'single' || value === 'spread'
+}
+
+function isReaderThemeValue(value: unknown): value is ReaderTheme {
+  return value === 'paper' || value === 'sepia' || value === 'dark'
+}
+
+function normalizeNumberPreference(value: unknown, fallback: number, min: number, max: number): number {
+  const numberValue = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numberValue)) return fallback
+  return Math.min(max, Math.max(min, numberValue))
+}
+
+function parseSourcePageReaderPreferences(value: unknown): SourcePageReaderPreferences {
+  const record = parseMaybeRecord(value)
+  const defaultPreferences = SOURCE_PAGE_READER_DEFAULT_PREFERENCES
+  const viewMode = readRecordValue(record, 'view_mode')
+  const theme = readRecordValue(record, 'theme')
+  return {
+    view_mode: isViewModeValue(viewMode) ? viewMode : defaultPreferences.view_mode,
+    font_size: normalizeNumberPreference(readRecordValue(record, 'font_size'), defaultPreferences.font_size, 13, 26),
+    line_height: normalizeNumberPreference(readRecordValue(record, 'line_height'), defaultPreferences.line_height, 1.3, 2.4),
+    theme: isReaderThemeValue(theme) ? theme : defaultPreferences.theme,
+  }
 }
 
 function parseMetadata(doc: ReaderDocument | null | undefined): JsonRecord {
@@ -2505,6 +2546,9 @@ export default function SourcePageReader({
   const indexedSearchRequestRef = useRef(0)
   const emittedLocalSearchKeywordRef = useRef('')
   const localSearchEditedRef = useRef(false)
+  const sourceReaderPreferencesLoadedRef = useRef(false)
+  const sourceReaderPreferencesSaveTimerRef = useRef<number | null>(null)
+  const latestSourceReaderPreferencesRef = useRef<SourcePageReaderPreferences>(SOURCE_PAGE_READER_DEFAULT_PREFERENCES)
   const [readerViewportHeight, setReaderViewportHeight] = useState(720)
   const [readerViewportWidth, setReaderViewportWidth] = useState(1100)
   const readerPageMetrics = useMemo(
@@ -2605,6 +2649,61 @@ export default function SourcePageReader({
   useEffect(() => {
     localSearchEditedRef.current = localSearchEdited
   }, [localSearchEdited])
+
+  useEffect(() => {
+    let active = true
+    void window.api.getSetting(SOURCE_PAGE_READER_PREFERENCES_SETTING_KEY)
+      .then((stored) => {
+        if (!active) return
+        const preferences = parseSourcePageReaderPreferences(stored)
+        setViewMode(preferences.view_mode)
+        setFontSize(preferences.font_size)
+        setLineHeight(preferences.line_height)
+        setTheme(preferences.theme)
+        latestSourceReaderPreferencesRef.current = preferences
+      })
+      .catch((error: unknown) => {
+        console.error('Failed to load source page reader preferences', error)
+      })
+      .finally(() => {
+        if (active) sourceReaderPreferencesLoadedRef.current = true
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!sourceReaderPreferencesLoadedRef.current) return
+    if (sourceReaderPreferencesSaveTimerRef.current) {
+      window.clearTimeout(sourceReaderPreferencesSaveTimerRef.current)
+    }
+    const preferences: SourcePageReaderPreferences = {
+      view_mode: viewMode,
+      font_size: fontSize,
+      line_height: lineHeight,
+      theme,
+    }
+    latestSourceReaderPreferencesRef.current = preferences
+    sourceReaderPreferencesSaveTimerRef.current = window.setTimeout(() => {
+      sourceReaderPreferencesSaveTimerRef.current = null
+      void window.api.setSetting(SOURCE_PAGE_READER_PREFERENCES_SETTING_KEY, JSON.stringify(preferences)).catch((error: unknown) => {
+        console.error('Failed to save source page reader preferences', error)
+      })
+    }, SOURCE_PAGE_READER_PREFERENCES_SAVE_DELAY_MS)
+  }, [fontSize, lineHeight, theme, viewMode])
+
+  useEffect(() => () => {
+    if (sourceReaderPreferencesSaveTimerRef.current) {
+      window.clearTimeout(sourceReaderPreferencesSaveTimerRef.current)
+      sourceReaderPreferencesSaveTimerRef.current = null
+      if (sourceReaderPreferencesLoadedRef.current) {
+        void window.api.setSetting(SOURCE_PAGE_READER_PREFERENCES_SETTING_KEY, JSON.stringify(latestSourceReaderPreferencesRef.current)).catch((error: unknown) => {
+          console.error('Failed to flush source page reader preferences', error)
+        })
+      }
+    }
+  }, [])
 
   useEffect(() => {
     const nextSearchKeyword = searchKeyword || ''

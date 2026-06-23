@@ -55,6 +55,7 @@ import MetadataEditor from '../components/MetadataEditor'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
+import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
@@ -82,12 +83,14 @@ const VIRTUAL_LIST_MIN_DOCUMENTS = 8
 const IMPORT_LIST_REFRESH_DEBOUNCE_MS = 350
 const UNFILED_FOLDER_ID = '__gujismart_unfiled__'
 const UNFILED_FOLDER_NAME = '未分类'
+const FOLDER_DRAG_MIME = 'application/x-gujismart-folder-id'
 
 type TagSemanticKind = 'manual' | 'docType' | 'responsibility' | 'carrier' | 'publication' | 'subject' | 'other'
 type StatusMeta = { text: string; color: string }
 type TagPickerMode = 'single' | 'batch'
 type LibrarySortValue = 'default' | `${Exclude<LibraryDocumentSortKey, 'default'>}:${LibraryDocumentSortDirection}`
 type LibraryPageSize = typeof LIBRARY_PAGE_SIZE_OPTIONS[number]
+type FolderDropPosition = 'inside' | 'before' | 'after'
 
 const LIBRARY_SORT_OPTIONS: Array<{ value: LibrarySortValue; label: string }> = [
   { value: 'default', label: '默认排序' },
@@ -371,16 +374,27 @@ function isExternalFileDrag(event: DragEvent<HTMLElement>): boolean {
   return event.dataTransfer.types.includes('Files')
 }
 
+function isFolderDrag(event: DragEvent<HTMLElement>): boolean {
+  return event.dataTransfer.types.includes(FOLDER_DRAG_MIME)
+}
+
+function getDragFolderId(event: DragEvent<HTMLElement>): string {
+  return event.dataTransfer.getData(FOLDER_DRAG_MIME).trim()
+}
+
+function getFolderDropPosition(event: DragEvent<HTMLElement>): FolderDropPosition {
+  const rect = event.currentTarget.getBoundingClientRect()
+  const offsetY = event.clientY - rect.top
+  if (offsetY < rect.height * 0.25) return 'before'
+  if (offsetY > rect.height * 0.75) return 'after'
+  return 'inside'
+}
+
 function isFolderDropDrag(event: DragEvent<HTMLElement>): boolean {
-  return isDocumentDrag(event) || isExternalFileDrag(event)
+  return isDocumentDrag(event) || isExternalFileDrag(event) || isFolderDrag(event)
 }
 
 type FolderItem = Folder
-
-interface FolderTreeNode extends FolderItem {
-  children: FolderTreeNode[]
-  depth: number
-}
 
 type TagItem = SharedTag
 
@@ -443,7 +457,7 @@ interface LibraryViewProps {
   initialFilter?: LibraryFilter
   initialFocusSection?: 'tags' | 'folders' | 'smart'
   importRequest?: number
-  droppedImportRequest?: { id: number; paths: string[] } | null
+  droppedImportRequest?: { id: number; paths: string[]; folderId?: string | null } | null
   onDroppedImportHandled?: (requestId: number) => void
   onOpenLibraryAi?: (payload?: LibraryAiOpenPayload) => void
 }
@@ -666,6 +680,9 @@ interface DocumentCardContext {
   taggingDocId: string | null
   taggingChecked: string[]
   handleRowClick: (docId: string, event?: MouseEvent<HTMLElement>) => void
+  handleDocumentContextMenu: (docId: string) => void
+  getDocumentContextMenuItems: (docId: string, singleItems: MenuProps['items']) => MenuProps['items']
+  handleDocumentContextMenuClick: (docId: string, singleHandler: MenuProps['onClick']) => MenuProps['onClick']
   openMetadataEditor: (docId: string) => Promise<void>
   applyLibraryFilter: (filter: LibraryFilter) => Promise<void>
   toggleTagFilter: (tagId: string) => Promise<void>
@@ -682,6 +699,7 @@ interface DocumentCardContext {
   handleRemoveFromFolder: (docId: string, folderId: string) => Promise<void>
   getDragDocIds: (docId: string) => string[]
   handleDocumentDragStart: (event: DragEvent<HTMLElement>, docId: string) => void
+  handleBatchMenu: MenuProps['onClick']
   handleDelete: (event: StopPropagationEvent, docId: string) => Promise<void>
   handleCleanupPdfAssets: (doc: DocumentItem) => Promise<void>
   handleRestorePdfAssets: (doc: DocumentItem) => Promise<void>
@@ -1335,83 +1353,6 @@ function renderSelectableTagList(
   )
 }
 
-function sortFolders(left: FolderItem, right: FolderItem): number {
-  const orderGap = Number(left.sort_order || 0) - Number(right.sort_order || 0)
-  if (orderGap !== 0) return orderGap
-  return left.name.localeCompare(right.name, 'zh-Hans-CN')
-}
-
-function buildFolderTree(folders: FolderItem[]): FolderTreeNode[] {
-  const nodeMap = new Map<string, FolderTreeNode>()
-  folders.forEach((folder) => {
-    nodeMap.set(folder.id, { ...folder, children: [], depth: 0 })
-  })
-
-  const roots: FolderTreeNode[] = []
-  nodeMap.forEach((node) => {
-    const parentId = node.parent_id || null
-    const parent = parentId ? nodeMap.get(parentId) : null
-    if (parent && parent.id !== node.id) {
-      node.depth = parent.depth + 1
-      parent.children.push(node)
-      return
-    }
-    roots.push(node)
-  })
-
-  const sortTree = (nodes: FolderTreeNode[], depth = 0): FolderTreeNode[] => (
-    nodes
-      .sort(sortFolders)
-      .map((node) => {
-        node.depth = depth
-        node.children = sortTree(node.children, depth + 1)
-        return node
-      })
-  )
-
-  return sortTree(roots)
-}
-
-function flattenVisibleFolders(nodes: FolderTreeNode[], collapsedIds: string[]): FolderTreeNode[] {
-  const collapsed = new Set(collapsedIds)
-  const result: FolderTreeNode[] = []
-  const visit = (node: FolderTreeNode) => {
-    result.push(node)
-    if (collapsed.has(node.id)) return
-    node.children.forEach(visit)
-  }
-  nodes.forEach(visit)
-  return result
-}
-
-function collectFolderDescendantIds(folders: FolderItem[], folderId: string): string[] {
-  const childrenByParent = new Map<string, string[]>()
-  folders.forEach((folder) => {
-    if (!folder.parent_id) return
-    const current = childrenByParent.get(folder.parent_id) || []
-    current.push(folder.id)
-    childrenByParent.set(folder.parent_id, current)
-  })
-
-  const result: string[] = []
-  const visit = (id: string) => {
-    result.push(id)
-    ;(childrenByParent.get(id) || []).forEach(visit)
-  }
-  visit(folderId)
-  return result
-}
-
-function isFolderDescendant(folders: FolderItem[], folderId: string, possibleParentId: string): boolean {
-  const parentById = new Map(folders.map((folder) => [folder.id, folder.parent_id || null]))
-  let current = parentById.get(folderId) || null
-  while (current) {
-    if (current === possibleParentId) return true
-    current = parentById.get(current) || null
-  }
-  return false
-}
-
 function getDocumentListRowHeight(doc: DocumentItem | undefined, context: DocumentCardContext): number {
   if (!doc) return LIST_ROW_MIN_HEIGHT
 
@@ -1613,15 +1554,21 @@ function DocumentVirtualRow({
   return (
     <div {...ariaAttributes} style={{ ...style, padding: '0 24px 4px', boxSizing: 'border-box' }}>
       <Dropdown
-        menu={{ items: moreMenuItems, onClick: handleMoreClick }}
+        menu={{
+          items: context.getDocumentContextMenuItems(doc.id, moreMenuItems),
+          onClick: context.handleDocumentContextMenuClick(doc.id, handleMoreClick),
+        }}
         trigger={['contextMenu']}
-        disabled={context.batchMode}
       >
         <div
           draggable
           onDragStart={(event) => context.handleDocumentDragStart(event, doc.id)}
           data-library-document-card="true"
           data-document-id={doc.id}
+          onMouseDown={(event) => {
+            if (event.button === 2) context.handleDocumentContextMenu(doc.id)
+          }}
+          onContextMenu={() => context.handleDocumentContextMenu(doc.id)}
           onClick={(event) => context.handleRowClick(doc.id, event)}
           onDoubleClick={() => void context.openMetadataEditor(doc.id)}
           style={{
@@ -1861,7 +1808,7 @@ export default function LibraryView({
   const [documentTagSearch, setDocumentTagSearch] = useState('')
   const [batchFolderModalOpen, setBatchFolderModalOpen] = useState(false)
   const [batchFolderTargetId, setBatchFolderTargetId] = useState<string | null>(null)
-  const [folderDropTargetId, setFolderDropTargetId] = useState<string | null>(null)
+  const [folderDropTarget, setFolderDropTarget] = useState<{ id: string; position: FolderDropPosition } | null>(null)
   const [sidebarWidth, setSidebarWidth] = useState(250)
   const [sectionHeights, setSectionHeights] = useState({ smart: 24, folder: 30, tag: 46 })
   const [collapsedSections, setCollapsedSections] = useState({ smart: false, folder: false, tag: false })
@@ -3142,26 +3089,28 @@ export default function LibraryView({
     })
   }
 
+  const buildLibraryFolderMenuItems = (folder: FolderItem): MenuProps['items'] => [
+    { key: 'open', label: '打开文件夹', icon: <FolderOpenOutlined /> },
+    { type: 'divider' },
+    { key: 'create_child', label: '新建子文件夹', icon: <FolderAddOutlined /> },
+    { key: 'rename', label: '重命名', icon: <EditOutlined /> },
+    { type: 'divider' },
+    { key: 'delete', label: '删除文件夹', icon: <DeleteOutlined />, danger: true },
+  ]
+
+  const handleLibraryFolderMenuClick = (folder: FolderItem, key: string) => {
+    if (key === 'open') void toggleLibraryFilter({ type: 'folder', value: folder.id })
+    if (key === 'create_child') openCreateChildFolder(folder.id)
+    if (key === 'rename') openRenameFolder(folder)
+    if (key === 'delete') void handleDeleteFolder(folder)
+  }
+
   const toggleFolderCollapsed = (folderId: string) => {
     setFolderCollapsedIds((current) => (
       current.includes(folderId)
         ? current.filter((id) => id !== folderId)
         : [...current, folderId]
     ))
-  }
-
-  const handleImportFolder = async () => {
-    try {
-      const folderPath = await window.api.selectExternalFolder()
-      if (!folderPath) return
-      const folderName = folderPath.split(/[/\\]/).pop() || '导入文件夹'
-      await window.api.createFolder({ name: folderName, external_path: folderPath })
-      message.success('已导入外部文件夹')
-      await loadBaseData()
-    } catch (error) {
-      console.error(error)
-      message.error('导入文件夹失败')
-    }
   }
 
   const handleCreateTag = async () => {
@@ -4592,7 +4541,7 @@ export default function LibraryView({
     if (droppedImportRequest.id === lastDroppedImportRequestRef.current) return
     lastDroppedImportRequestRef.current = droppedImportRequest.id
     const request = droppedImportRequest
-    void importDroppedSources(request.paths).finally(() => {
+    void importDroppedSources(request.paths, request.folderId || null).finally(() => {
       onDroppedImportHandled?.(request.id)
     })
   }, [droppedImportRequest, onDroppedImportHandled])
@@ -4999,10 +4948,67 @@ export default function LibraryView({
     event.dataTransfer.setData('text/plain', docIds.join('\n'))
   }, [getDragDocIds])
 
+  const handleFolderDragStart = useCallback((event: DragEvent<HTMLElement>, folderId: string) => {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData(FOLDER_DRAG_MIME, folderId)
+    event.dataTransfer.setData('text/plain', folderId)
+  }, [])
+
+  const handleMoveFolder = useCallback(async (folderId: string, parentId: string | null, options?: { beforeId?: string | null; afterId?: string | null }) => {
+    if (!folderId) return
+    if (folderId === parentId) {
+      message.warning('不能把文件夹移动到自己里面')
+      return
+    }
+    if (parentId && isFolderDescendant(folderItems, parentId, folderId)) {
+      message.warning('不能把文件夹移动到自己的子文件夹里面')
+      return
+    }
+
+    try {
+      const nextFolders = await window.api.moveFolder({
+        id: folderId,
+        parent_id: parentId,
+        before_id: options?.beforeId || null,
+        after_id: options?.afterId || null,
+      })
+      const stateCache = await window.api.refreshLibraryStateCache()
+      const foldersWithCounts = applyLibraryStateCacheToFolders(nextFolders, stateCache)
+      setFolders(foldersWithCounts)
+      setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
+      setSmartViewCounts(stateCache.smartViewCounts)
+      patchLibraryWarmCache(currentLibraryScopeKey, {
+        folders: foldersWithCounts,
+        smartViewCounts: stateCache.smartViewCounts,
+        unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
+      })
+      window.dispatchEvent(new Event(LIBRARY_RELATIONS_CHANGED_EVENT))
+      message.success('文件夹位置已更新')
+    } catch (error) {
+      message.error(getErrorMessage(error, '移动文件夹失败'))
+    }
+  }, [currentLibraryScopeKey, folderItems, setFolders])
+
   const handleFolderDrop = async (event: DragEvent<HTMLElement>, folderId: string) => {
     event.preventDefault()
     event.stopPropagation()
-    setFolderDropTargetId(null)
+    setFolderDropTarget(null)
+
+    if (isFolderDrag(event)) {
+      const draggedFolderId = getDragFolderId(event)
+      const targetFolder = folderItems.find((item) => item.id === folderId)
+      if (!targetFolder) return
+      const position = getFolderDropPosition(event)
+      if (position === 'inside') {
+        await handleMoveFolder(draggedFolderId, folderId)
+      } else {
+        await handleMoveFolder(draggedFolderId, targetFolder.parent_id || null, {
+          beforeId: position === 'before' ? targetFolder.id : null,
+          afterId: position === 'after' ? targetFolder.id : null,
+        })
+      }
+      return
+    }
 
     if (isDocumentDrag(event)) {
       const docIds = getDragDocumentIds(event)
@@ -5080,6 +5086,7 @@ export default function LibraryView({
       ],
     },
     { type: 'divider' },
+    { key: 'delete_selected', label: '删除所选文献', icon: <DeleteOutlined />, danger: true },
     { key: 'delete_zero_page', label: '清除零页文献', icon: <DeleteOutlined />, danger: true },
     { key: 'cleanup_pdf_assets', label: '删除所选原文件', icon: <PictureOutlined /> },
     { key: 'restore_pdf_assets', label: '补回所选原文', icon: <ImportOutlined /> }
@@ -5114,6 +5121,16 @@ export default function LibraryView({
     if (String(key).startsWith('export:')) {
       void handleBatchExport(String(key).replace('export:', '') as DocumentExportFormat)
     }
+    if (key === 'delete_selected') {
+      Modal.confirm({
+        title: `删除 ${selectedIds.length} 篇文献？`,
+        content: '会提交后台删除所选文献，不会阻塞当前界面。',
+        okText: '删除文献',
+        cancelText: '取消',
+        okButtonProps: { danger: true },
+        onOk: () => void handleBatchDelete(),
+      })
+    }
     if (key === 'delete_zero_page') handleDeleteZeroPageDocuments()
     if (key === 'cleanup_pdf_assets') handleBatchCleanupPdfAssets()
     if (key === 'restore_pdf_assets') void handleBatchRestorePdfAssets()
@@ -5125,6 +5142,33 @@ export default function LibraryView({
       }
     }
   }
+
+  const handleDocumentContextMenu = useCallback((docId: string) => {
+    if (selectedIdSet.has(docId) && selectedIds.length > 0) {
+      setBatchMode(true)
+      return
+    }
+    setSelectedIds([docId])
+    setBatchMode(true)
+    lastClickedDocIdRef.current = docId
+  }, [selectedIdSet, selectedIds.length, setSelectedIds])
+
+  const getDocumentContextMenuItems = useCallback((docId: string, singleItems: MenuProps['items']) => {
+    if (selectedIdSet.has(docId) && selectedIds.length > 0) {
+      return batchMenuItems
+    }
+    return singleItems
+  }, [batchMenuItems, selectedIdSet, selectedIds.length])
+
+  const handleDocumentContextMenuClick = useCallback((docId: string, singleHandler: MenuProps['onClick']): MenuProps['onClick'] => {
+    return (info) => {
+      if (selectedIdSet.has(docId) && selectedIds.length > 0) {
+        handleBatchMenu(info)
+        return
+      }
+      singleHandler?.(info)
+    }
+  }, [handleBatchMenu, selectedIdSet, selectedIds.length])
 
   const toggleSectionCollapsed = (section: 'smart' | 'folder' | 'tag') => {
     setCollapsedSections((current) => ({ ...current, [section]: !current[section] }))
@@ -5213,6 +5257,9 @@ export default function LibraryView({
     taggingDocId,
     taggingChecked,
     handleRowClick,
+    handleDocumentContextMenu,
+    getDocumentContextMenuItems,
+    handleDocumentContextMenuClick,
     openMetadataEditor,
     applyLibraryFilter,
     toggleTagFilter,
@@ -5229,6 +5276,7 @@ export default function LibraryView({
     handleRemoveFromFolder,
     getDragDocIds,
     handleDocumentDragStart,
+    handleBatchMenu,
     handleDelete,
     handleCleanupPdfAssets,
     handleRestorePdfAssets,
@@ -5242,7 +5290,11 @@ export default function LibraryView({
     bookTranslationProgressByDoc,
     folders,
     handleAddToFolder,
+    handleBatchMenu,
     handleCancelOcr,
+    handleDocumentContextMenu,
+    getDocumentContextMenuItems,
+    handleDocumentContextMenuClick,
     handleDocumentDragStart,
     handleCleanupPdfAssets,
     handleForceRerunDocument,
@@ -5325,14 +5377,9 @@ export default function LibraryView({
                   <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12, fontWeight: 600 }}>文件夹</span>
                   <DownOutlined style={{ fontSize: 12, transform: collapsedSections.folder ? 'rotate(-90deg)' : 'rotate(0deg)', transition: 'transform 0.2s ease' }} />
                 </div>
-                <Space size={2}>
-                  <Tooltip title="导入外部文件夹">
-                    <Button size="small" type="text" icon={<ImportOutlined />} onClick={() => void handleImportFolder()} />
-                  </Tooltip>
-                  <Tooltip title="新建文件夹">
-                    <Button size="small" type="text" icon={<PlusOutlined />} onClick={() => void handleCreateFolder()} />
-                  </Tooltip>
-                </Space>
+                <Tooltip title="新建文件夹">
+                  <Button size="small" type="text" icon={<PlusOutlined />} onClick={() => void handleCreateFolder()} />
+                </Tooltip>
               </div>
               {!collapsedSections.folder ? (
                 <>
@@ -5396,53 +5443,90 @@ export default function LibraryView({
                             </div>
                           )
                         })()}
+                        <div
+                          onDragEnter={(event) => {
+                            if (!isFolderDrag(event)) return
+                            event.preventDefault()
+                            event.stopPropagation()
+                            setFolderDropTarget({ id: '__root__', position: 'inside' })
+                          }}
+                          onDragOver={(event) => {
+                            if (!isFolderDrag(event)) return
+                            event.preventDefault()
+                            event.stopPropagation()
+                            event.dataTransfer.dropEffect = 'move'
+                            setFolderDropTarget({ id: '__root__', position: 'inside' })
+                          }}
+                          onDragLeave={(event) => {
+                            if (!isFolderDrag(event)) return
+                            event.stopPropagation()
+                            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                              setFolderDropTarget((current) => current?.id === '__root__' ? null : current)
+                            }
+                          }}
+                          onDrop={(event) => {
+                            if (!isFolderDrag(event)) return
+                            event.preventDefault()
+                            event.stopPropagation()
+                            const folderId = getDragFolderId(event)
+                            setFolderDropTarget(null)
+                            void handleMoveFolder(folderId, null)
+                          }}
+                          style={{
+                            minHeight: 26,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            borderRadius: 6,
+                            border: folderDropTarget?.id === '__root__' ? '1px dashed rgba(196,149,106,0.72)' : '1px dashed rgba(255,255,255,0.08)',
+                            color: 'var(--gs-text-tertiary)',
+                            fontSize: 12,
+                            background: folderDropTarget?.id === '__root__' ? 'rgba(196,149,106,0.16)' : 'rgba(255,255,255,0.02)',
+                          }}
+                        >
+                          拖到这里移为顶层文件夹
+                        </div>
                         {visibleFolders.map((item) => {
                           const active = filter.type === 'folder' && filter.value === item.id
                           const collapsed = folderCollapsedIds.includes(item.id)
                           const hasChildren = item.children.length > 0
-                          const dropActive = folderDropTargetId === item.id
-                          const menuItems: MenuProps['items'] = [
-                            { key: 'create_child', label: '新建子文件夹', icon: <FolderAddOutlined /> },
-                            { key: 'rename', label: '重命名', icon: <EditOutlined /> },
-                            { type: 'divider' },
-                            { key: 'delete', label: '删除文件夹', icon: <DeleteOutlined />, danger: true },
-                          ]
+                          const dropActive = folderDropTarget?.id === item.id
+                          const dropPosition = dropActive ? folderDropTarget.position : null
                           return (
                             <Dropdown
                               key={item.id}
                               trigger={['contextMenu']}
                               menu={{
-                                items: menuItems,
-                                onClick: ({ key }) => {
-                                  if (key === 'create_child') openCreateChildFolder(item.id)
-                                  if (key === 'rename') openRenameFolder(item)
-                                  if (key === 'delete') void handleDeleteFolder(item)
-                                }
+                                items: buildLibraryFolderMenuItems(item),
+                                onClick: ({ key }) => handleLibraryFolderMenuClick(item, String(key))
                               }}
                             >
                               <div
                                 role="button"
                                 tabIndex={0}
+                                draggable
+                                onDragStart={(event) => handleFolderDragStart(event, item.id)}
+                                onDragEnd={() => setFolderDropTarget(null)}
                                 onClick={() => void toggleLibraryFilter({ type: 'folder', value: item.id })}
                                 onDoubleClick={() => openRenameFolder(item)}
                                 onDragEnter={(event) => {
                                   if (!isFolderDropDrag(event)) return
                                   event.preventDefault()
                                   event.stopPropagation()
-                                  setFolderDropTargetId(item.id)
+                                  setFolderDropTarget({ id: item.id, position: isFolderDrag(event) ? getFolderDropPosition(event) : 'inside' })
                                 }}
                                 onDragOver={(event) => {
                                   if (!isFolderDropDrag(event)) return
                                   event.preventDefault()
                                   event.stopPropagation()
-                                  event.dataTransfer.dropEffect = 'copy'
-                                  setFolderDropTargetId(item.id)
+                                  event.dataTransfer.dropEffect = isFolderDrag(event) ? 'move' : 'copy'
+                                  setFolderDropTarget({ id: item.id, position: isFolderDrag(event) ? getFolderDropPosition(event) : 'inside' })
                                 }}
                                 onDragLeave={(event) => {
                                   if (!isFolderDropDrag(event)) return
                                   event.stopPropagation()
                                   if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
-                                    setFolderDropTargetId((current) => current === item.id ? null : current)
+                                    setFolderDropTarget((current) => current?.id === item.id ? null : current)
                                   }
                                 }}
                                 onDrop={(event) => void handleFolderDrop(event, item.id)}
@@ -5462,7 +5546,10 @@ export default function LibraryView({
                                     : active
                                       ? 'rgba(24,144,255,0.86)'
                                       : 'transparent',
-                                  border: dropActive ? '1px dashed rgba(196,149,106,0.72)' : '1px solid transparent',
+                                  borderTop: dropPosition === 'before' ? '2px solid rgba(196,149,106,0.95)' : '1px solid transparent',
+                                  borderBottom: dropPosition === 'after' ? '2px solid rgba(196,149,106,0.95)' : '1px solid transparent',
+                                  borderLeft: dropPosition === 'inside' ? '1px dashed rgba(196,149,106,0.72)' : '1px solid transparent',
+                                  borderRight: dropPosition === 'inside' ? '1px dashed rgba(196,149,106,0.72)' : '1px solid transparent',
                                   color: active ? '#fff' : 'var(--gs-text-primary)',
                                   cursor: 'pointer',
                                   outline: 'none'
@@ -6122,15 +6209,21 @@ export default function LibraryView({
               return (
                 <Dropdown
                   key={doc.id}
-                  menu={{ items: moreMenuItems, onClick: handleMoreClick }}
+                  menu={{
+                    items: getDocumentContextMenuItems(doc.id, moreMenuItems),
+                    onClick: handleDocumentContextMenuClick(doc.id, handleMoreClick),
+                  }}
                   trigger={['contextMenu']}
-                  disabled={batchMode}
                 >
                   <div
                     draggable
                     onDragStart={(event) => handleDocumentDragStart(event, doc.id)}
                     data-library-document-card="true"
                     data-document-id={doc.id}
+                    onMouseDown={(event) => {
+                      if (event.button === 2) handleDocumentContextMenu(doc.id)
+                    }}
+                    onContextMenu={() => handleDocumentContextMenu(doc.id)}
                     onClick={(event) => handleRowClick(doc.id, event)}
                     onDoubleClick={() => void openMetadataEditor(doc.id)}
                     style={{

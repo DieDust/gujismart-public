@@ -3,9 +3,25 @@ import { queryAll, queryOne, run, saveDatabase, transaction } from '../database'
 import { nanoid } from 'nanoid'
 import { join, extname } from 'path'
 import { existsSync, readdirSync, statSync } from 'fs'
-import type { BulkAssociationResult, Document, Folder, FolderCreatePayload, FolderImportFile, FolderUpdatePayload } from '../../shared/types'
+import type {
+  BulkAssociationResult,
+  Document,
+  Folder,
+  FolderContentOptions,
+  FolderContentResult,
+  FolderCreatePayload,
+  FolderDocumentMovePayload,
+  FolderImportFile,
+  FolderMovePayload,
+  FolderOverviewDocument,
+  FolderOverviewResult,
+  FolderUpdatePayload,
+  LibraryDocumentSortDirection,
+  LibraryDocumentSortKey,
+} from '../../shared/types'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { buildCumulativeFolderDocumentCounts, resolveFolderAndDescendantIds } from '../folder-scope'
+import { allowFileAccessPaths } from '../file-access'
 
 const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
   '.pdf',
@@ -25,6 +41,9 @@ const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
   '.azw3',
 ])
 
+const DEFAULT_FOLDER_CONTENT_LIMIT = 80
+const MAX_FOLDER_CONTENT_LIMIT = 240
+
 function normalizeFolderName(value: unknown): string {
   return String(value || '').trim()
 }
@@ -32,6 +51,18 @@ function normalizeFolderName(value: unknown): string {
 function normalizeParentId(value: unknown): string | null {
   const parentId = String(value || '').trim()
   return parentId || null
+}
+
+function folderParentWhere(parentId: string | null): { sql: string; params: unknown[] } {
+  return parentId
+    ? { sql: 'parent_id = ?', params: [parentId] }
+    : { sql: 'parent_id IS NULL', params: [] }
+}
+
+function listFoldersWithCounts(): Folder[] {
+  const counts = buildCumulativeFolderDocumentCounts()
+  return queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order, created_at')
+    .map((folder) => ({ ...folder, document_count: counts[folder.id] || 0 }))
 }
 
 function findFolderByNameInParent(name: string, parentId: string | null, excludeId?: string): Folder | null {
@@ -129,6 +160,414 @@ function mergeFolderInto(sourceId: string, targetId: string, data: FolderUpdateP
   return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [targetId])
 }
 
+function getFolderChildrenMap(folders: Array<Pick<Folder, 'id' | 'parent_id'>>): Map<string, string[]> {
+  const childrenByParent = new Map<string, string[]>()
+  folders.forEach((folder) => {
+    const parentId = normalizeParentId(folder.parent_id)
+    if (!parentId) return
+    childrenByParent.set(parentId, [...(childrenByParent.get(parentId) || []), folder.id])
+  })
+  return childrenByParent
+}
+
+function assertFolderMoveAllowed(folderId: string, nextParentId: string | null): Folder {
+  const current = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
+  if (!current) throw new Error('文件夹不存在')
+
+  if (nextParentId) {
+    if (nextParentId === folderId) throw new Error('不能把文件夹移动到自己里面')
+    const parent = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [nextParentId])
+    if (!parent) throw new Error('目标文件夹不存在')
+    const descendants = new Set(resolveFolderAndDescendantIds([folderId]))
+    if (descendants.has(nextParentId)) throw new Error('不能把文件夹移动到自己的子文件夹里面')
+  }
+
+  const conflict = findFolderByNameInParent(current.name, nextParentId, folderId)
+  if (conflict) throw new Error(`同一层级已有同名文件夹“${current.name}”`)
+  return current
+}
+
+function reorderFolderSiblings(folderId: string, nextParentId: string | null, beforeId?: string | null, afterId?: string | null): void {
+  const parentWhere = folderParentWhere(nextParentId)
+  const siblings = queryAll<Folder>(
+    `SELECT * FROM folders WHERE ${parentWhere.sql} ORDER BY sort_order ASC, created_at ASC`,
+    parentWhere.params,
+  ).filter((folder) => folder.id !== folderId)
+
+  let insertIndex = siblings.length
+  const normalizedBeforeId = String(beforeId || '').trim()
+  const normalizedAfterId = String(afterId || '').trim()
+  if (normalizedBeforeId) {
+    const beforeIndex = siblings.findIndex((folder) => folder.id === normalizedBeforeId)
+    if (beforeIndex >= 0) insertIndex = beforeIndex
+  } else if (normalizedAfterId) {
+    const afterIndex = siblings.findIndex((folder) => folder.id === normalizedAfterId)
+    if (afterIndex >= 0) insertIndex = afterIndex + 1
+  }
+
+  const orderedIds = siblings.map((folder) => folder.id)
+  orderedIds.splice(insertIndex, 0, folderId)
+  orderedIds.forEach((id, index) => {
+    run('UPDATE folders SET sort_order = ? WHERE id = ?', [index + 1, id])
+  })
+}
+
+function moveFolder(payload: FolderMovePayload): Folder[] {
+  const folderId = String(payload?.id || '').trim()
+  if (!folderId) throw new Error('文件夹不存在')
+  const nextParentId = normalizeParentId(payload.parent_id)
+  const current = assertFolderMoveAllowed(folderId, nextParentId)
+  const now = new Date().toISOString()
+
+  transaction(() => {
+    run('UPDATE folders SET parent_id = ?, updated_at = ? WHERE id = ?', [nextParentId, now, current.id])
+    reorderFolderSiblings(current.id, nextParentId, payload.before_id, payload.after_id)
+  })
+  saveDatabase()
+  markLibraryStateCacheDirty()
+  return listFoldersWithCounts()
+}
+
+interface FolderDirectCountRow {
+  folder_id: string
+  count: number
+}
+
+interface FolderDocumentPreviewRow extends FolderOverviewDocument {
+  folder_id: string
+}
+
+type FolderContentDocumentRow = FolderOverviewDocument
+
+interface NormalizedFolderContentOptions {
+  folderId: string | null
+  unfiledOnly: boolean
+  limit: number
+  offset: number
+  sortKey: LibraryDocumentSortKey
+  sortDirection: LibraryDocumentSortDirection
+}
+
+const FOLDER_CONTENT_SORT_KEYS = new Set<LibraryDocumentSortKey>([
+  'default',
+  'title',
+  'createdAt',
+  'updatedAt',
+  'publicationYear',
+  'lastOpened',
+  'pageCount',
+])
+
+function normalizeFolderContentSortKey(value: unknown): LibraryDocumentSortKey {
+  const sortKey = String(value || 'default') as LibraryDocumentSortKey
+  return FOLDER_CONTENT_SORT_KEYS.has(sortKey) ? sortKey : 'default'
+}
+
+function normalizeFolderContentSortDirection(value: unknown): LibraryDocumentSortDirection {
+  return value === 'asc' ? 'asc' : 'desc'
+}
+
+function buildMissingLastOrder(expression: string, direction: 'ASC' | 'DESC'): string {
+  return `CASE WHEN ${expression} IS NULL OR TRIM(CAST(${expression} AS TEXT)) = '' THEN 1 ELSE 0 END ASC, ${expression} ${direction}`
+}
+
+function buildDocumentMetadataValueExpression(key: string): string {
+  return `CASE WHEN json_valid(d.metadata) THEN json_extract(d.metadata, '$.${key}') ELSE NULL END`
+}
+
+function buildDocumentMetadataTextExpression(key: string): string {
+  return `CAST(${buildDocumentMetadataValueExpression(key)} AS TEXT)`
+}
+
+function buildFolderContentOrderBy(options: Pick<NormalizedFolderContentOptions, 'sortKey' | 'sortDirection'>): string {
+  const direction = options.sortDirection === 'asc' ? 'ASC' : 'DESC'
+  const titleExpression = "LOWER(COALESCE(NULLIF(TRIM(d.title), ''), NULLIF(TRIM(d.file_path), ''), d.id))"
+  const publicationYearExpression = `CAST(COALESCE(
+    NULLIF(TRIM(${buildDocumentMetadataTextExpression('publication_year')}), ''),
+    NULLIF(TRIM(${buildDocumentMetadataTextExpression('year')}), ''),
+    NULLIF(TRIM(${buildDocumentMetadataTextExpression('publish_year')}), ''),
+    NULLIF(TRIM(${buildDocumentMetadataTextExpression('date')}), ''),
+    NULLIF(TRIM(${buildDocumentMetadataTextExpression('issue_date')}), ''),
+    NULLIF(TRIM(${buildDocumentMetadataTextExpression('publication_time')}), '')
+  ) AS INTEGER)`
+  const stableFallback = `${titleExpression} ASC, d.id ASC`
+
+  switch (options.sortKey) {
+    case 'title':
+      return `${titleExpression} ${direction}, d.id ASC`
+    case 'createdAt':
+      return `${buildMissingLastOrder('d.created_at', direction)}, ${stableFallback}`
+    case 'updatedAt':
+      return `${buildMissingLastOrder('d.updated_at', direction)}, ${stableFallback}`
+    case 'publicationYear':
+      return `${buildMissingLastOrder(publicationYearExpression, direction)}, ${stableFallback}`
+    case 'lastOpened':
+      return `${buildMissingLastOrder('d.last_opened_at', direction)}, ${stableFallback}`
+    case 'pageCount':
+      return `${buildMissingLastOrder('d.page_count', direction)}, ${stableFallback}`
+    case 'default':
+    default:
+      return `COALESCE(d.updated_at, d.created_at, '') DESC, ${stableFallback}`
+  }
+}
+
+function buildFolderOverview(): FolderOverviewResult {
+  const folders = queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order ASC, created_at ASC')
+  const cumulativeCounts = buildCumulativeFolderDocumentCounts()
+  const childrenByParent = getFolderChildrenMap(folders)
+  const directCounts = new Map<string, number>()
+  queryAll<FolderDirectCountRow>(
+    `SELECT df.folder_id, COUNT(DISTINCT df.doc_id) as count
+     FROM document_folders df
+     INNER JOIN documents d ON d.id = df.doc_id
+     WHERE COALESCE(d.import_status, '') <> 'deleting'
+     GROUP BY df.folder_id`,
+  ).forEach((row) => {
+    directCounts.set(row.folder_id, Number(row.count || 0))
+  })
+
+  const directDocsByFolder = new Map<string, FolderOverviewDocument[]>()
+  queryAll<FolderDocumentPreviewRow>(
+    `SELECT
+       df.folder_id,
+       d.id,
+       d.title,
+       d.author,
+      d.doc_type,
+      d.page_count,
+      d.thumb_path,
+      d.created_at,
+      d.updated_at,
+      d.last_opened_at,
+      (
+         SELECT p.image_path
+         FROM pages p
+         WHERE p.doc_id = d.id
+           AND p.image_path IS NOT NULL
+           AND TRIM(p.image_path) <> ''
+         ORDER BY p.page_num ASC
+         LIMIT 1
+       ) as first_page_image_path
+     FROM document_folders df
+     INNER JOIN documents d ON d.id = df.doc_id
+     WHERE COALESCE(d.import_status, '') <> 'deleting'
+     ORDER BY COALESCE(d.updated_at, d.created_at, '') DESC, d.title ASC`,
+  ).forEach((row) => {
+    const current = directDocsByFolder.get(row.folder_id) || []
+    current.push({
+      id: row.id,
+      title: row.title || '未命名文献',
+      author: row.author || null,
+      doc_type: row.doc_type || null,
+      page_count: row.page_count || null,
+      thumb_path: row.thumb_path || null,
+      first_page_image_path: row.first_page_image_path || null,
+      created_at: row.created_at || null,
+      updated_at: row.updated_at || null,
+      last_opened_at: row.last_opened_at || null,
+    })
+    directDocsByFolder.set(row.folder_id, current)
+  })
+
+  const sortRecentDocuments = (items: FolderOverviewDocument[]): FolderOverviewDocument[] => (
+    [...items].sort((left, right) => String(right.updated_at || '').localeCompare(String(left.updated_at || '')) || left.title.localeCompare(right.title, 'zh-Hans-CN'))
+  )
+
+  const recentMemo = new Map<string, FolderOverviewDocument[]>()
+  const collectRecentDocuments = (folderId: string, stack = new Set<string>()): FolderOverviewDocument[] => {
+    if (recentMemo.has(folderId)) return recentMemo.get(folderId) || []
+    if (stack.has(folderId)) return []
+    stack.add(folderId)
+    const byId = new Map<string, FolderOverviewDocument>()
+    ;(directDocsByFolder.get(folderId) || []).slice(0, 6).forEach((doc) => byId.set(doc.id, doc))
+    ;(childrenByParent.get(folderId) || []).forEach((childId) => {
+      collectRecentDocuments(childId, stack).forEach((doc) => byId.set(doc.id, doc))
+    })
+    stack.delete(folderId)
+    const recent = sortRecentDocuments([...byId.values()]).slice(0, 6)
+    recentMemo.set(folderId, recent)
+    return recent
+  }
+
+  const overviewFolders = folders.map((folder) => ({
+    ...folder,
+    document_count: cumulativeCounts[folder.id] || 0,
+    direct_document_count: directCounts.get(folder.id) || 0,
+    cumulative_document_count: cumulativeCounts[folder.id] || 0,
+    child_folder_count: (childrenByParent.get(folder.id) || []).length,
+    recent_documents: collectRecentDocuments(folder.id),
+  }))
+
+  const totalDocumentCount = Number(queryOne<{ count: number }>(
+    "SELECT COUNT(*) as count FROM documents WHERE COALESCE(import_status, '') <> 'deleting'",
+  )?.count || 0)
+  const unfiledDocumentCount = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(*) as count
+     FROM documents d
+     WHERE COALESCE(d.import_status, '') <> 'deleting'
+       AND NOT EXISTS (SELECT 1 FROM document_folders df WHERE df.doc_id = d.id)`,
+  )?.count || 0)
+
+  return {
+    folders: overviewFolders,
+    root_folder_count: folders.filter((folder) => !folder.parent_id).length,
+    total_folder_count: folders.length,
+    total_document_count: totalDocumentCount,
+    unfiled_document_count: unfiledDocumentCount,
+  }
+}
+
+function mapFolderContentRows(rows: FolderContentDocumentRow[]): FolderOverviewDocument[] {
+  const documents = rows.map((row) => ({
+    id: row.id,
+    title: row.title || '未命名文献',
+    author: row.author || null,
+    doc_type: row.doc_type || null,
+    page_count: row.page_count || null,
+    thumb_path: row.thumb_path || null,
+    first_page_image_path: row.first_page_image_path || null,
+    created_at: row.created_at || null,
+    updated_at: row.updated_at || null,
+    last_opened_at: row.last_opened_at || null,
+  }))
+  allowFileAccessPaths(documents.flatMap((doc) => [doc.thumb_path || '', doc.first_page_image_path || '']).filter(Boolean))
+  return documents
+}
+
+function normalizeFolderContentOptions(input?: FolderContentOptions | string | null): NormalizedFolderContentOptions {
+  const rawOptions = typeof input === 'object' && input !== null
+    ? input
+    : { folderId: input }
+  const rawLimit = Number(rawOptions.limit || DEFAULT_FOLDER_CONTENT_LIMIT)
+  const rawOffset = Number(rawOptions.offset || 0)
+  return {
+    folderId: normalizeParentId(rawOptions.folderId),
+    unfiledOnly: Boolean(rawOptions.unfiledOnly),
+    limit: Math.max(1, Math.min(MAX_FOLDER_CONTENT_LIMIT, Number.isFinite(rawLimit) ? Math.floor(rawLimit) : DEFAULT_FOLDER_CONTENT_LIMIT)),
+    offset: Math.max(0, Number.isFinite(rawOffset) ? Math.floor(rawOffset) : 0),
+    sortKey: normalizeFolderContentSortKey(rawOptions.sortKey),
+    sortDirection: normalizeFolderContentSortDirection(rawOptions.sortDirection),
+  }
+}
+
+function getFolderContent(options?: FolderContentOptions | string | null): FolderContentResult {
+  const { folderId: normalizedFolderId, unfiledOnly, limit, offset, sortKey, sortDirection } = normalizeFolderContentOptions(options)
+  if (!normalizedFolderId && !unfiledOnly) {
+    return {
+      folder_id: null,
+      unfiled: false,
+      documents: [],
+      total_document_count: 0,
+      limit,
+      offset,
+      has_more: false,
+    }
+  }
+  if (normalizedFolderId) {
+    const folder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [normalizedFolderId])
+    if (!folder) {
+      return {
+        folder_id: normalizedFolderId,
+        unfiled: false,
+        documents: [],
+        total_document_count: 0,
+        limit,
+        offset,
+        has_more: false,
+      }
+    }
+  }
+
+  const selectSql = `
+    SELECT
+      d.id,
+      d.title,
+      d.author,
+      d.doc_type,
+      d.page_count,
+      d.thumb_path,
+      d.created_at,
+      d.updated_at,
+      d.last_opened_at,
+      (
+        SELECT p.image_path
+        FROM pages p
+        WHERE p.doc_id = d.id
+          AND p.image_path IS NOT NULL
+          AND TRIM(p.image_path) <> ''
+        ORDER BY p.page_num ASC
+        LIMIT 1
+      ) as first_page_image_path
+    FROM documents d
+    ${normalizedFolderId ? 'INNER JOIN document_folders df ON d.id = df.doc_id' : ''}
+  `
+  const conditions = ["COALESCE(d.import_status, '') <> 'deleting'"]
+  const params: unknown[] = []
+  if (normalizedFolderId) {
+    conditions.push('df.folder_id = ?')
+    params.push(normalizedFolderId)
+  } else if (unfiledOnly) {
+    conditions.push('NOT EXISTS (SELECT 1 FROM document_folders df_unfiled WHERE df_unfiled.doc_id = d.id)')
+  }
+
+  const whereSql = `WHERE ${conditions.join(' AND ')}`
+  const rows = queryAll<FolderContentDocumentRow>(
+    `${selectSql}
+     ${whereSql}
+     ORDER BY ${buildFolderContentOrderBy({ sortKey, sortDirection })}
+     LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  )
+  const total = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(DISTINCT d.id) as count
+     FROM documents d
+     ${normalizedFolderId ? 'INNER JOIN document_folders df ON d.id = df.doc_id' : ''}
+     ${whereSql}`,
+    params,
+  )?.count || 0)
+
+  return {
+    folder_id: normalizedFolderId,
+    unfiled: unfiledOnly,
+    documents: mapFolderContentRows(rows),
+    total_document_count: total,
+    limit,
+    offset,
+    has_more: offset + rows.length < total,
+  }
+}
+
+function moveDocumentsToFolder(payload: FolderDocumentMovePayload): BulkAssociationResult {
+  const targetFolderId = String(payload?.target_folder_id || '').trim()
+  const sourceFolderId = normalizeParentId(payload?.source_folder_id)
+  const uniqueDocIds = [...new Set((payload?.docIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  if (!targetFolderId || uniqueDocIds.length === 0) return { count: 0 }
+
+  const targetFolder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [targetFolderId])
+  if (!targetFolder) throw new Error('目标文件夹不存在')
+  if (sourceFolderId) {
+    const sourceFolder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [sourceFolderId])
+    if (!sourceFolder) throw new Error('来源文件夹不存在')
+    if (sourceFolderId === targetFolderId) return { count: uniqueDocIds.length }
+  }
+
+  const now = new Date().toISOString()
+  transaction(() => {
+    for (const docId of uniqueDocIds) {
+      run('INSERT OR IGNORE INTO document_folders (doc_id, folder_id) VALUES (?, ?)', [docId, targetFolderId])
+    }
+    if (sourceFolderId) {
+      const placeholders = uniqueDocIds.map(() => '?').join(', ')
+      run(`DELETE FROM document_folders WHERE folder_id = ? AND doc_id IN (${placeholders})`, [sourceFolderId, ...uniqueDocIds])
+      run('UPDATE folders SET updated_at = ? WHERE id = ?', [now, sourceFolderId])
+    }
+    run('UPDATE folders SET updated_at = ? WHERE id = ?', [now, targetFolderId])
+  })
+  saveDatabase()
+  markLibraryStateCacheDirty()
+  return { count: uniqueDocIds.length }
+}
+
 function collectSupportedFolderFiles(dirPath: string): FolderImportFile[] {
   const results: FolderImportFile[] = []
   for (const fileName of readdirSync(dirPath)) {
@@ -152,9 +591,15 @@ function collectSupportedFolderFiles(dirPath: string): FolderImportFile[] {
 
 export function registerFolderIpc(): void {
   ipcMain.handle('folders:list', async (): Promise<Folder[]> => {
-    const counts = buildCumulativeFolderDocumentCounts()
-    return queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order, created_at')
-      .map((folder) => ({ ...folder, document_count: counts[folder.id] || 0 }))
+    return listFoldersWithCounts()
+  })
+
+  ipcMain.handle('folders:getOverview', async (): Promise<FolderOverviewResult> => {
+    return buildFolderOverview()
+  })
+
+  ipcMain.handle('folders:getContent', async (_event, options?: FolderContentOptions | string | null): Promise<FolderContentResult> => {
+    return getFolderContent(options)
   })
 
   ipcMain.handle('folders:get', async (_event, id: string): Promise<Folder | null> => {
@@ -230,6 +675,14 @@ export function registerFolderIpc(): void {
     return true
   })
 
+  ipcMain.handle('folders:move', async (_event, data: FolderMovePayload): Promise<Folder[]> => {
+    return moveFolder(data)
+  })
+
+  ipcMain.handle('folders:moveDocuments', async (_event, data: FolderDocumentMovePayload): Promise<BulkAssociationResult> => {
+    return moveDocumentsToFolder(data)
+  })
+
   ipcMain.handle('folders:delete', async (_event, id: string): Promise<boolean> => {
     const folderId = String(id || '').trim()
     if (!folderId) return false
@@ -293,7 +746,7 @@ export function registerFolderIpc(): void {
 
   ipcMain.handle('folders:selectExternal', async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({
-      title: '选择外部文件夹',
+      title: '选择电脑文件夹',
       properties: ['openDirectory']
     })
     if (result.canceled || result.filePaths.length === 0) return null

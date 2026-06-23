@@ -78,13 +78,35 @@ function buildPdfLoadParams(source: PdfLoadSource): DocumentInitParameters {
 
 function toLocalResourceUrl(filePath: unknown): string {
   const normalized = normalizePdfFilePath(filePath).replace(/\\/g, '/')
-  const pathname = normalized.startsWith('/') ? normalized : `/${normalized}`
-  const encodedPathname = encodeURI(pathname).replace(/#/g, '%23').replace(/\?/g, '%3F')
-  return `local-resource://${encodedPathname}`
+  return `local-resource://file/${encodeURIComponent(normalized)}`
 }
 
 function normalizePdfCacheKey(filePath: unknown): string {
   return normalizePdfFilePath(filePath)
+}
+
+function isLocalResourceResponseError(error: unknown): boolean {
+  const status = typeof error === 'object' && error !== null && 'status' in error
+    ? Number((error as { status?: unknown }).status)
+    : Number.NaN
+  const message = error instanceof Error ? error.message : String(error || '')
+  return status === 0 || /Unexpected server response \(0\)/i.test(message)
+}
+
+async function loadPdfDocumentFromSource(source: PdfLoadSource, timeoutMessage: string): Promise<PDFDocumentProxy> {
+  const loadingTask = pdfjsLib.getDocument(buildPdfLoadParams(source))
+  return withTimeout(loadingTask.promise, 30000, timeoutMessage)
+}
+
+async function loadPdfDocumentFromFile(filePath: unknown, timeoutMessage: string): Promise<PDFDocumentProxy> {
+  const normalizedPath = normalizePdfFilePath(filePath)
+  try {
+    return await loadPdfDocumentFromSource({ url: toLocalResourceUrl(normalizedPath) }, timeoutMessage)
+  } catch (error) {
+    if (!isLocalResourceResponseError(error)) throw error
+    console.warn('本地 PDF 协议返回状态异常，已回退到文件缓冲加载', error)
+    return loadPdfDocumentFromSource({ data: await readPdfFileBuffer(normalizedPath) }, timeoutMessage)
+  }
 }
 
 async function getCachedPdfDocument(filePath: unknown): Promise<PDFDocumentProxy> {
@@ -95,10 +117,13 @@ async function getCachedPdfDocument(filePath: unknown): Promise<PDFDocumentProxy
     return cached.promise
   }
 
-  const loadingTask = pdfjsLib.getDocument(buildPdfLoadParams({ url: toLocalResourceUrl(cacheKey) }))
-  const promise = withTimeout(loadingTask.promise, 30000, 'PDF 页面加载超时，请确认文件未损坏后重试。')
+  const promise = loadPdfDocumentFromFile(cacheKey, 'PDF 页面加载超时，请确认文件未损坏后重试。')
 
   pdfDocumentCache.set(cacheKey, { promise, lastUsed: Date.now() })
+  void promise.catch(() => {
+    const current = pdfDocumentCache.get(cacheKey)
+    if (current?.promise === promise) pdfDocumentCache.delete(cacheKey)
+  })
 
   if (pdfDocumentCache.size > MAX_CACHED_PDF_DOCUMENTS) {
     const staleEntries = [...pdfDocumentCache.entries()]
@@ -152,7 +177,10 @@ export async function convertPdfToImages(fileBuffer: ArrayBuffer, scaleOrOptions
 }
 
 export async function convertPdfFileToImages(filePath: unknown, scaleOrOptions: number | PdfConvertOptions = 2.0): Promise<PdfExtractResult> {
-  return convertPdfSourceToImages({ url: toLocalResourceUrl(filePath) }, scaleOrOptions)
+  return convertPdfDocumentToImages(
+    await loadPdfDocumentFromFile(filePath, 'PDF 页面加载超时，请确认文件未损坏后重试。'),
+    scaleOrOptions
+  )
 }
 
 export async function getPdfFileInfo(filePath: unknown): Promise<PdfInfo> {
@@ -189,12 +217,17 @@ export async function renderPdfFilePageToImage(filePath: unknown, pageNum: numbe
 }
 
 async function convertPdfSourceToImages(source: PdfLoadSource, scaleOrOptions: number | PdfConvertOptions = 2.0): Promise<PdfExtractResult> {
+  return convertPdfDocumentToImages(
+    await loadPdfDocumentFromSource(source, 'PDF 页面加载超时，请确认文件未损坏后重试。'),
+    scaleOrOptions
+  )
+}
+
+async function convertPdfDocumentToImages(pdf: PDFDocumentProxy, scaleOrOptions: number | PdfConvertOptions = 2.0): Promise<PdfExtractResult> {
   const options: PdfConvertOptions = typeof scaleOrOptions === 'number'
     ? { scale: scaleOrOptions, collectImages: true }
     : { collectImages: true, ...scaleOrOptions }
   const scale = options.scale ?? 2.0
-  const loadingTask = pdfjsLib.getDocument(buildPdfLoadParams(source))
-  const pdf = await withTimeout(loadingTask.promise, 30000, 'PDF 页面加载超时，请确认文件未损坏后重试。')
   
   const pageCount = pdf.numPages
   const images: string[] = []

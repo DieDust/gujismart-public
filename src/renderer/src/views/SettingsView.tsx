@@ -344,6 +344,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [retryCount, setRetryCount] = useState(3)
   const [backupStatus, setBackupStatus] = useState<BackupStatus | null>(null)
   const [backupBusy, setBackupBusy] = useState(false)
+  const [backupDropActive, setBackupDropActive] = useState(false)
   const [databaseDiagnostics, setDatabaseDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
   const [databaseMaintenanceBusy, setDatabaseMaintenanceBusy] = useState(false)
   const [databaseMaintenanceProgress, setDatabaseMaintenanceProgress] = useState<BackgroundTaskProgressEvent | null>(null)
@@ -1051,7 +1052,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     try {
       const result = await window.api.createBackup()
       if (result?.success) {
-        message.success(`已备份到 ${result.path}`)
+        message.success(`已导出完整备份包：${result.path}`)
       } else if (result?.error) {
         message.error(result.error)
       }
@@ -1076,6 +1077,37 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     } finally {
       setBackupBusy(false)
     }
+  }
+
+  const handleImportBackupFromPath = async (filePath: string) => {
+    const normalizedPath = filePath.trim()
+    if (!normalizedPath) return
+    if (!normalizedPath.toLowerCase().endsWith('.zip')) {
+      message.info('请拖入 GujiSmart 备份压缩包（.zip）')
+      return
+    }
+    Modal.confirm({
+      title: '导入拖入的备份包？',
+      content: '导入会覆盖当前数据库和配置；软件会先自动写入一份当前数据安全备份包，方便之后还原。',
+      okText: '导入备份包',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setBackupBusy(true)
+        try {
+          const result = await window.api.importBackupFromPath(normalizedPath)
+          if (result?.success) {
+            message.success(result.safetyBackupPath
+              ? `导入完成，软件将自动重启；当前数据安全备份包：${result.safetyBackupPath}`
+              : '导入完成，软件将自动重启')
+          } else if (!result?.canceled && result?.error) {
+            message.error(result.error)
+          }
+        } finally {
+          setBackupBusy(false)
+        }
+      },
+    })
   }
 
   const handleRunAutoBackupNow = async () => {
@@ -1754,17 +1786,55 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </div>
 
               <Space direction="vertical" style={{ width: '100%' }}>
+                <div
+                  className={`settings-backup-dropzone ${backupDropActive ? 'is-active' : ''}`}
+                  onDragEnter={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    setBackupDropActive(true)
+                  }}
+                  onDragOver={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    event.dataTransfer.dropEffect = 'copy'
+                    setBackupDropActive(true)
+                  }}
+                  onDragLeave={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                      setBackupDropActive(false)
+                    }
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    setBackupDropActive(false)
+                    const filePath = Array.from(event.dataTransfer.files)
+                      .map((file) => window.api.getPathForFile(file))
+                      .find((path) => path?.toLowerCase().endsWith('.zip'))
+                    if (!filePath) {
+                      message.info('请拖入 GujiSmart 备份压缩包（.zip）')
+                      return
+                    }
+                    void handleImportBackupFromPath(filePath)
+                  }}
+                >
+                  <ImportOutlined />
+                  <span>拖入 .zip 备份包导入</span>
+                  <small>导入前会自动保存当前数据安全备份包</small>
+                </div>
                 <Button block icon={<DownloadOutlined />} loading={backupBusy} onClick={() => void handleCreateBackup()}>
-                  导出完整备份
+                  导出完整备份包
                 </Button>
                 <Popconfirm
-                  title="导入备份会覆盖当前数据库和配置，软件会先创建安全副本。确定继续吗？"
+                  title="导入备份包或旧版备份目录会覆盖当前数据库和配置，软件会先创建安全副本。确定继续吗？"
                   okText="导入备份"
                   cancelText="取消"
                   onConfirm={() => void handleImportBackup()}
                 >
                   <Button block danger icon={<ImportOutlined />} loading={backupBusy}>
-                    导入备份
+                    导入备份包
                   </Button>
                 </Popconfirm>
                 <Button block icon={<ReloadOutlined />} loading={backupBusy} onClick={() => void handleRunAutoBackupNow()}>

@@ -11,7 +11,7 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshTagUsageForTags, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { normalizePageResult } from '../ocr'
@@ -23,7 +23,6 @@ import {
   addPdfRepositoryPath,
   annotateDocumentFileFingerprint,
   annotatePdfMetadata,
-  autoCleanupPdfAssetsIfEnabled,
   cleanupCompletedPdfAssetsAsync,
   cleanupPdfAssetsAsync,
   copyFileWithFingerprintAsync,
@@ -2285,7 +2284,8 @@ function markDocumentTocDirty(docId: string): void {
 }
 
 function migratePath(oldPath: string, storageDir: string): string {
-  if (!oldPath || existsSync(oldPath)) return oldPath
+  const relocatedPath = resolveManagedStoragePath(oldPath)
+  if (!oldPath || existsSync(relocatedPath)) return relocatedPath
   const fileName = basename(oldPath)
   const docFolderName = basename(dirname(oldPath))
   const newPath = join(storageDir, docFolderName, fileName)
@@ -2686,8 +2686,8 @@ function isReadableLocalAssetPath(filePath: unknown): boolean {
   }
 }
 
-function isReadableSourcePdf(doc: Pick<Document, 'file_path'>): boolean {
-  const filePath = String(doc.file_path || '').trim()
+function isReadableSourcePdf(doc: Pick<Document, 'id' | 'file_path'>): boolean {
+  const filePath = resolveManagedStoragePath(String(doc.file_path || '').trim(), doc.id)
   return extname(filePath).toLowerCase() === '.pdf' && isReadableLocalAssetPath(filePath)
 }
 
@@ -2703,7 +2703,7 @@ function hasReadablePageImageForDocument(docId: string, imagePageCount: number):
      LIMIT 24`,
     [docId],
   )
-  return rows.some((row) => isReadableLocalAssetPath(row.image_path))
+  return rows.some((row) => isReadableLocalAssetPath(resolveManagedStoragePath(row.image_path, docId)))
 }
 
 function getVerifiedPdfAssetInfo(
@@ -2714,14 +2714,9 @@ function getVerifiedPdfAssetInfo(
   const hasReadableImage = hasReadablePageImageForDocument(String(doc.id), rawImagePageCount)
   const explicitState = String(metadata.pdf_asset_state || '').trim()
   const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
-  const autoCleanupEnabled = queryOne<{ value: string | null }>("SELECT value FROM settings WHERE key = 'auto_delete_pdf_assets_after_ocr'")?.value === 'true'
-  const autoCleanupShouldHideAssets = autoCleanupEnabled && String(doc.ocr_status || '') === 'completed'
   let state: VerifiedPdfAssetState = 'unknown'
 
-  if (autoCleanupShouldHideAssets) {
-    autoCleanupPdfAssetsIfEnabled(String(doc.id))
-    state = 'text_only'
-  } else if (isReadableSourcePdf(doc) || hasReadableImage) {
+  if (isReadableSourcePdf(doc) || hasReadableImage) {
     state = 'available'
   } else if (explicitState === 'text_only' || explicitState === 'available' || hasPdfFingerprint || rawImagePageCount > 0) {
     state = 'text_only'
@@ -2741,7 +2736,9 @@ function normalizeDocumentSourceAssetsForRead<T extends { image_path?: string | 
   let readableImagePageCount = 0
   for (const page of pages) {
     if (!page.image_path) continue
-    if (isReadableLocalAssetPath(page.image_path)) {
+    const relocatedImagePath = resolveManagedStoragePath(page.image_path, doc.id)
+    if (isReadableLocalAssetPath(relocatedImagePath)) {
+      page.image_path = relocatedImagePath
       readableImagePageCount += 1
     } else {
       page.image_path = null
@@ -2750,15 +2747,7 @@ function normalizeDocumentSourceAssetsForRead<T extends { image_path?: string | 
   const metadata = parseDocumentMetadata(doc.metadata)
   const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
   const explicitState = String(metadata.pdf_asset_state || '').trim()
-  const autoCleanupEnabled = queryOne<{ value: string | null }>("SELECT value FROM settings WHERE key = 'auto_delete_pdf_assets_after_ocr'")?.value === 'true'
-  const autoCleanupShouldHideAssets = autoCleanupEnabled && String(doc.ocr_status || '') === 'completed'
-  if (autoCleanupShouldHideAssets) {
-    autoCleanupPdfAssetsIfEnabled(String(doc.id))
-    for (const page of pages) page.image_path = null
-  }
-  const state: VerifiedPdfAssetState = autoCleanupShouldHideAssets
-    ? 'text_only'
-    : isReadableSourcePdf(doc) || readableImagePageCount > 0
+  const state: VerifiedPdfAssetState = isReadableSourcePdf(doc) || readableImagePageCount > 0
     ? 'available'
     : explicitState === 'available' || explicitState === 'text_only' || hasPdfFingerprint
       ? 'text_only'
@@ -2808,9 +2797,13 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
     const folders = foldersByDoc.get(doc.id) || []
     const actualPageCount = Number(doc.actual_page_count || 0)
     const storedPageCount = Number(doc.page_count || 0)
+    const relocatedFilePath = doc.file_path ? resolveManagedStoragePath(doc.file_path, doc.id) : doc.file_path
+    const relocatedThumbPath = doc.thumb_path ? resolveManagedStoragePath(doc.thumb_path, doc.id) : doc.thumb_path
     const pdfAssetInfo = getVerifiedPdfAssetInfo(doc)
     return {
       ...doc,
+      file_path: relocatedFilePath,
+      thumb_path: relocatedThumbPath,
       page_count: Math.max(storedPageCount, actualPageCount),
       actual_page_count: actualPageCount,
       image_page_count: pdfAssetInfo.imagePageCount,
@@ -2876,7 +2869,7 @@ function getPdfSizeBytes(doc: DocumentHealthSourceRow, metadata: JsonRecord): nu
   )
   if (Number.isFinite(metadataSize) && metadataSize > 0) return metadataSize
 
-  const filePath = typeof doc.file_path === 'string' ? doc.file_path : ''
+  const filePath = resolveManagedStoragePath(typeof doc.file_path === 'string' ? doc.file_path : '', doc.id)
   if (filePath && extname(filePath).toLowerCase() === '.pdf' && existsSync(filePath)) {
     try {
       return statSync(filePath).size
@@ -3321,7 +3314,8 @@ export function registerDocumentIpc(): void {
             [pdfFingerprint.sha256],
           )
           if (existing?.id) {
-            const alreadyHasPdf = Boolean(existing.file_path && existsSync(existing.file_path))
+            const existingPdfPath = resolveManagedStoragePath(existing.file_path, existing.id)
+            const alreadyHasPdf = Boolean(existingPdfPath && existsSync(existingPdfPath))
             const restored = await restorePdfAssetForDocumentAsync(existing.id, filePath, pdfFingerprint)
             await rm(destDir, { recursive: true, force: true }).catch(() => undefined)
             if (!restored.restored) {
@@ -3526,7 +3520,8 @@ export function registerDocumentIpc(): void {
               [pdfFingerprint.sha256],
             )
             if (existing?.id) {
-              const alreadyHasPdf = Boolean(existing.file_path && existsSync(existing.file_path))
+              const existingPdfPath = resolveManagedStoragePath(existing.file_path, existing.id)
+              const alreadyHasPdf = Boolean(existingPdfPath && existsSync(existingPdfPath))
               const restored = await restorePdfAssetForDocumentAsync(existing.id, filePath, pdfFingerprint)
               await rm(destDir, { recursive: true, force: true }).catch(() => undefined)
               if (!restored.restored) {
@@ -4523,11 +4518,12 @@ export function registerDocumentIpc(): void {
     params.push(docId)
     run(`UPDATE documents SET ${updates.join(', ')} WHERE id = ?`, params)
 
-    if (typeof doc.file_path === 'string' && existsSync(doc.file_path)) {
-      if (extname(doc.file_path).toLowerCase() === '.pdf') {
-        annotatePdfMetadata(docId, doc.file_path, safePageCount)
+    const docFilePath = resolveManagedStoragePath(doc.file_path, docId)
+    if (docFilePath && existsSync(docFilePath)) {
+      if (extname(docFilePath).toLowerCase() === '.pdf') {
+        annotatePdfMetadata(docId, docFilePath, safePageCount)
       } else {
-        annotateDocumentFileFingerprint(docId, doc.file_path, safePageCount)
+        annotateDocumentFileFingerprint(docId, docFilePath, safePageCount)
       }
     }
 

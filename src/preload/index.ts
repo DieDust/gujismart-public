@@ -78,8 +78,13 @@ import type {
   DocumentExportOptions,
   DocumentLightDetail,
   Folder,
+  FolderContentResult,
+  FolderContentOptions,
   FolderCreatePayload,
+  FolderDocumentMovePayload,
   FolderImportFile,
+  FolderMovePayload,
+  FolderOverviewResult,
   FolderUpdatePayload,
   DocumentHealthReport,
   DocumentHealthReportOptions,
@@ -396,11 +401,18 @@ const api = {
     ipcRenderer.invoke('aiResearch:exportDataset', datasetId, format),
 
   listFolders: (): Promise<Folder[]> => ipcRenderer.invoke('folders:list'),
+  getFolderOverview: (): Promise<FolderOverviewResult> => ipcRenderer.invoke('folders:getOverview'),
+  getFolderContent: (options?: FolderContentOptions | string | null): Promise<FolderContentResult> =>
+    ipcRenderer.invoke('folders:getContent', options),
   getFolder: (id: string): Promise<Folder | null> => ipcRenderer.invoke('folders:get', id),
   createFolder: (data: FolderCreatePayload): Promise<Folder | null> =>
     ipcRenderer.invoke('folders:create', data),
   updateFolder: (id: string, data: FolderUpdatePayload): Promise<boolean> =>
     ipcRenderer.invoke('folders:update', id, data),
+  moveFolder: (data: FolderMovePayload): Promise<Folder[]> =>
+    ipcRenderer.invoke('folders:move', data),
+  moveDocumentsToFolder: (data: FolderDocumentMovePayload): Promise<BulkAssociationResult> =>
+    ipcRenderer.invoke('folders:moveDocuments', data),
   deleteFolder: (id: string): Promise<boolean> => ipcRenderer.invoke('folders:delete', id),
   addDocumentToFolder: (docId: string, folderId: string): Promise<boolean> =>
     ipcRenderer.invoke('folders:addDocument', docId, folderId),
@@ -623,6 +635,8 @@ const api = {
 
   createBackup: (): Promise<BackupResult> => ipcRenderer.invoke('backup:create'),
   importBackup: (): Promise<BackupImportResult> => ipcRenderer.invoke('backup:import'),
+  importBackupFromPath: (filePath: string): Promise<BackupImportResult> =>
+    ipcRenderer.invoke('backup:importFromPath', filePath),
   restoreBackup: (): Promise<BackupImportResult> => ipcRenderer.invoke('backup:restore'),
   getBackupStatus: (): Promise<BackupStatus> => ipcRenderer.invoke('backup:getStatus'),
   configureAutoBackup: (enabled: boolean, intervalHours: number, includeStorage?: boolean, slotCount?: number): Promise<BackupStatus> =>

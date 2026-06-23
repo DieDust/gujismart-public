@@ -1,5 +1,5 @@
 ﻿import { app } from 'electron'
-import { dirname, join, resolve } from 'path'
+import { basename, dirname, join, normalize, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { is } from '@electron-toolkit/utils'
 import Database from 'better-sqlite3'
@@ -129,10 +129,18 @@ function getDatabaseMtime(dir: string): number {
   return 0
 }
 
+function getInstallDataRoot(): string {
+  return join(dirname(app.getPath('exe')), 'data')
+}
+
+function getPortableDataRoot(): string | null {
+  const portableDir = String(process.env.PORTABLE_EXECUTABLE_DIR || '').trim()
+  return portableDir ? join(portableDir, 'data') : null
+}
+
 function getStableAppRoot(): string {
-  return is.dev
-    ? resolve(process.cwd(), 'data')
-    : join(dirname(app.getPath('exe')), 'data')
+  if (is.dev) return resolve(process.cwd(), 'data')
+  return getPortableDataRoot() || getInstallDataRoot()
 }
 
 export function resolveProfileDir(): string {
@@ -150,12 +158,13 @@ function getLegacyDataDirs(targetDir: string): string[] {
   ].filter(Boolean)))
 
   const candidates = [
-    join(dirname(app.getPath('exe')), 'data'),
+    getInstallDataRoot(),
+    getPortableDataRoot(),
     ...legacyNames.flatMap((name) => [
     join(app.getPath('appData'), name, 'data'),
     join(app.getPath('appData'), name, 'data', 'profile', 'data'),
     ]),
-  ]
+  ].filter((dir): dir is string => Boolean(dir))
 
   const target = resolve(targetDir).toLowerCase()
   return Array.from(new Set(candidates))
@@ -163,11 +172,26 @@ function getLegacyDataDirs(targetDir: string): string[] {
 }
 
 function migrateLegacyDataIfNeeded(targetDir: string): void {
-  if (hasUserData(targetDir)) return
-
   const sourceDir = getLegacyDataDirs(targetDir)
     .filter((dir) => existsSync(dir) && hasUserData(dir))
     .sort((left, right) => getDatabaseMtime(right) - getDatabaseMtime(left))[0]
+
+  if (hasUserData(targetDir)) {
+    if (hasUserDatabase(targetDir) && !hasUserStorage(targetDir) && sourceDir && hasUserStorage(sourceDir)) {
+      try {
+        copyDirRecursive(join(sourceDir, 'storage'), join(targetDir, 'storage'))
+        writeFileSync(
+          join(targetDir, '.migrated-storage-from-legacy-data'),
+          `Migrated storage from ${sourceDir} at ${new Date().toISOString()}\n`,
+          'utf-8',
+        )
+        console.log(`[Database] Migrated legacy storage from ${sourceDir}`)
+      } catch (error) {
+        console.error('[Database] Failed to migrate legacy storage', error)
+      }
+    }
+    return
+  }
 
   if (!sourceDir) return
 
@@ -197,13 +221,10 @@ export function resolvePreferredDataDir(): string {
     return preferredDir
   }
 
-  const fallbackDir = is.dev
-    ? join(app.getPath('userData'), 'data')
-    : join(app.getPath('documents'), 'GujiSmart', 'data')
-  if (!existsSync(fallbackDir)) {
-    mkdirSync(fallbackDir, { recursive: true })
-  }
-  return fallbackDir
+  const softwareDir = dirname(app.getPath('exe'))
+  throw new Error(
+    `当前软件目录不可写，无法创建或更新文献库数据。请把软件目录移动到可写位置，或调整目录权限后重试。\n软件目录：${softwareDir}`,
+  )
 }
 
 export function getDataDir(): string {
@@ -220,6 +241,39 @@ export function getDataDir(): string {
   setPayloadDataDir(cachedDataDir)
 
   return cachedDataDir
+}
+
+export function resolveManagedStoragePath(filePath: string | null | undefined, docId?: string | null): string {
+  const rawPath = String(filePath || '').trim()
+  if (!rawPath) return rawPath
+
+  const pathParts = normalize(rawPath).split(/[\\/]+/).filter(Boolean)
+  const lowerParts = pathParts.map((part) => part.toLowerCase())
+  const storageIndex = lowerParts.lastIndexOf('storage')
+  const safeDocId = String(docId || '').trim()
+  const safeDocIdLower = safeDocId.toLowerCase()
+  let relativeParts: string[] = []
+
+  if (storageIndex >= 0 && storageIndex < pathParts.length - 1) {
+    if (safeDocIdLower) {
+      const docIndex = lowerParts.findIndex((part, index) => index > storageIndex && part === safeDocIdLower)
+      if (docIndex >= 0) {
+        relativeParts = pathParts.slice(docIndex)
+      }
+    }
+    if (relativeParts.length === 0) {
+      relativeParts = pathParts.slice(storageIndex + 1)
+    }
+  }
+
+  if (relativeParts.length === 0 && safeDocId) {
+    const fileName = basename(rawPath)
+    if (fileName) relativeParts = [safeDocId, fileName]
+  }
+
+  if (relativeParts.length === 0) return rawPath
+  const relocatedPath = join(getDataDir(), 'storage', ...relativeParts)
+  return existsSync(relocatedPath) ? relocatedPath : rawPath
 }
 
 export function getDatabase(): NativeDatabase {

@@ -987,6 +987,66 @@ export interface FolderCreatePayload {
 
 export type FolderUpdatePayload = Partial<Pick<Folder, 'name' | 'parent_id' | 'external_path' | 'icon' | 'color' | 'sort_order'>>
 
+export interface FolderMovePayload {
+  id: string
+  parent_id?: string | null
+  before_id?: string | null
+  after_id?: string | null
+}
+
+export interface FolderDocumentMovePayload {
+  docIds: string[]
+  source_folder_id?: string | null
+  target_folder_id: string
+}
+
+export interface FolderContentOptions {
+  folderId?: string | null
+  unfiledOnly?: boolean
+  limit?: number
+  offset?: number
+  sortKey?: LibraryDocumentSortKey
+  sortDirection?: LibraryDocumentSortDirection
+}
+
+export interface FolderOverviewDocument {
+  id: string
+  title: string
+  author?: string | null
+  doc_type?: string | null
+  page_count?: number | null
+  thumb_path?: string | null
+  first_page_image_path?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+  last_opened_at?: string | null
+}
+
+export interface FolderContentResult {
+  folder_id: string | null
+  unfiled?: boolean
+  documents: FolderOverviewDocument[]
+  total_document_count: number
+  limit: number
+  offset: number
+  has_more: boolean
+}
+
+export interface FolderOverviewItem extends Folder {
+  direct_document_count: number
+  cumulative_document_count: number
+  child_folder_count: number
+  recent_documents: FolderOverviewDocument[]
+}
+
+export interface FolderOverviewResult {
+  folders: FolderOverviewItem[]
+  root_folder_count: number
+  total_folder_count: number
+  total_document_count: number
+  unfiled_document_count: number
+}
+
 export interface FolderImportFile {
   name: string
   path: string

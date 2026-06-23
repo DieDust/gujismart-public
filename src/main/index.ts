@@ -1,10 +1,10 @@
-﻿import { app, BrowserWindow, dialog, net, protocol, shell } from 'electron'
+﻿import { app, BrowserWindow, dialog, protocol, shell } from 'electron'
 import { join, resolve } from 'path'
-import { pathToFileURL } from 'url'
 import { is } from '@electron-toolkit/utils'
 import { closeDatabase, initDatabase, isLargeLibraryForAutomaticMaintenance, listStoredLocalResourcePaths, resolveProfileDir, runDeferredStartupDatabaseMaintenance } from './database'
 import { registerAllIpcHandlers } from './ipc'
-import { existsSync, mkdirSync } from 'fs'
+import { createReadStream, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'fs'
+import { Readable } from 'stream'
 import { startAutoBackupScheduler, stopAutoBackupScheduler } from './backup'
 import { backfillLibraryFileFingerprints, shutdownPdfAssetRuntime } from './pdf-assets'
 import { scheduleStartupMetadataReclassification } from './metadata-reclassifier'
@@ -26,6 +26,75 @@ let startupMaintenanceScheduled = false
 const STARTUP_MAINTENANCE_DELAY_MS = 15_000
 
 type ConsoleMethodName = 'log' | 'info' | 'warn' | 'error' | 'debug'
+
+function getLocalResourceMimeType(filePath: string): string {
+  const lower = filePath.toLowerCase()
+  if (lower.endsWith('.pdf')) return 'application/pdf'
+  if (lower.endsWith('.png')) return 'image/png'
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+  if (lower.endsWith('.webp')) return 'image/webp'
+  if (lower.endsWith('.gif')) return 'image/gif'
+  return 'application/octet-stream'
+}
+
+function parseRangeHeader(rangeHeader: string | null, fileSize: number): { start: number; end: number } | null {
+  if (!rangeHeader) return null
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim())
+  if (!match) return null
+
+  const [, rawStart, rawEnd] = match
+  if (!rawStart && !rawEnd) return null
+
+  if (!rawStart) {
+    const suffixLength = Number.parseInt(rawEnd, 10)
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null
+    return {
+      start: Math.max(0, fileSize - suffixLength),
+      end: Math.max(0, fileSize - 1),
+    }
+  }
+
+  const start = Number.parseInt(rawStart, 10)
+  const end = rawEnd ? Number.parseInt(rawEnd, 10) : fileSize - 1
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= fileSize) return null
+  return {
+    start,
+    end: Math.min(end, fileSize - 1),
+  }
+}
+
+function streamFileResponse(filePath: string, request: Request): Response {
+  const fileStat = statSync(filePath)
+  if (!fileStat.isFile() || fileStat.size <= 0) {
+    return new Response('Local resource is not a readable file', { status: 404 })
+  }
+
+  const range = parseRangeHeader(request.headers.get('range'), fileStat.size)
+  const headers = new Headers({
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
+    'Content-Type': getLocalResourceMimeType(filePath),
+  })
+
+  if (request.headers.get('range') && !range) {
+    headers.set('Content-Range', `bytes */${fileStat.size}`)
+    return new Response(null, { status: 416, headers })
+  }
+
+  const start = range?.start ?? 0
+  const end = range?.end ?? fileStat.size - 1
+  const contentLength = Math.max(0, end - start + 1)
+  headers.set('Content-Length', String(contentLength))
+  if (range) headers.set('Content-Range', `bytes ${start}-${end}/${fileStat.size}`)
+
+  if (request.method === 'HEAD') {
+    return new Response(null, { status: range ? 206 : 200, headers })
+  }
+
+  const nodeStream = createReadStream(filePath, { start, end })
+  const body = Readable.toWeb(nodeStream) as unknown as BodyInit
+  return new Response(body, { status: range ? 206 : 200, headers })
+}
 
 function isBrokenPipeError(error: unknown): boolean {
   return typeof error === 'object'
@@ -67,8 +136,22 @@ const profileRoot = process.env.GUJISMART_PROFILE_DIR
     ? join(process.cwd(), 'data', 'profile')
     : resolveProfileDir()
 
-if (!existsSync(profileRoot)) {
-  mkdirSync(profileRoot, { recursive: true })
+try {
+  if (!existsSync(profileRoot)) {
+    mkdirSync(profileRoot, { recursive: true })
+  }
+  const profileWriteProbe = join(profileRoot, '.write-test')
+  writeFileSync(profileWriteProbe, 'ok')
+  unlinkSync(profileWriteProbe)
+} catch (error) {
+  const softwareDir = is.dev ? process.cwd() : resolve(profileRoot, '..', '..')
+  dialog.showErrorBox(
+    '无法打开文献库数据目录',
+    `当前软件目录不可写，GujiSmart 无法在当前目录保存数据库和缓存。\n\n请把软件目录移动到可写位置，或调整目录权限后重试。\n\n软件目录：${softwareDir}`,
+  )
+  console.error('[App] Failed to prepare profile directory', error)
+  app.exit(1)
+  throw error
 }
 
 app.setPath('userData', profileRoot)
@@ -327,7 +410,7 @@ app.whenReady()
   .then(async () => {
     protocol.handle('local-resource', (request) => {
       const filePath = assertAllowedLocalResourceUrl(request.url)
-      return net.fetch(pathToFileURL(filePath).toString())
+      return streamFileResponse(filePath, request)
     })
 
     await initDatabase()

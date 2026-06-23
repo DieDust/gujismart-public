@@ -386,29 +386,15 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
   }
 
   return (
-    <div style={{ padding: '24px 32px', height: '100%', overflow: 'auto' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-        <Title level={3} style={{ margin: 0, color: 'var(--gs-gold)' }}>
+    <div className="gs-view-container">
+      <div className="gs-view-header">
+        <Title level={3} className="gs-view-title">
           标签管理中心
         </Title>
         <Space>
-          {batchMode ? (
-            <>
-              <Button icon={<FileAddOutlined />} disabled={selectedTagIds.length === 0} onClick={() => void openDocumentPicker(selectedTagIds)}>
-                添加文献{selectedTagIds.length > 0 ? ` (${selectedTagIds.length})` : ''}
-              </Button>
-              <Button danger icon={<DeleteOutlined />} onClick={() => void handleBatchDelete()}>
-                删除已选{selectedTagIds.length > 0 ? ` (${selectedTagIds.length})` : ''}
-              </Button>
-              <Button icon={<CloseOutlined />} onClick={() => { setBatchMode(false); setSelectedTagIds([]) }}>
-                取消批量
-              </Button>
-            </>
-          ) : (
-            <Button icon={<CheckSquareOutlined />} onClick={() => setBatchMode(true)}>
-              批量操作
-            </Button>
-          )}
+          <Button icon={batchMode ? <CloseOutlined /> : <CheckSquareOutlined />} onClick={() => { setBatchMode((value) => !value); setSelectedTagIds([]) }}>
+            {batchMode ? '退出批量' : '批量操作'}
+          </Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowNewTag(true)}>
             新建标签
           </Button>
@@ -416,7 +402,7 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
       </div>
 
       <div>
-        <div style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 10, padding: 18 }}>
+        <div className="tags-view-search-wrapper">
           <Space direction="vertical" size={12} style={{ width: '100%' }}>
             <Input
               prefix={<SearchOutlined />}
@@ -441,24 +427,16 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
             <div
               ref={tagListRef}
               onMouseDown={handleTagListMouseDown}
-              style={{
-                marginTop: 18,
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 18,
-                paddingLeft: 56,
-                boxSizing: 'border-box',
-                cursor: 'crosshair',
-              }}
+              className="tags-group-list-scroll"
             >
               {groupedTags.map((group) => (
                 <div key={group.kind}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                  <div className="tags-group-title-row">
                     <Text strong>{group.label}</Text>
                     <Text type="secondary">{group.items.length} 个标签</Text>
                   </div>
 
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}>
+                  <div className="tags-group-items">
                     {group.items.map((tagItem) => {
                       const selected = selectedTagIdSet.has(tagItem.id)
                       return (
@@ -472,18 +450,7 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
                               toggleSelectedTag(tagItem.id)
                             }
                           }}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 8,
-                            minWidth: 0,
-                            maxWidth: '100%',
-                            padding: '8px 12px',
-                            borderRadius: 8,
-                            background: selected ? 'rgba(24,144,255,0.14)' : 'rgba(255,255,255,0.04)',
-                            border: selected ? '1px solid rgba(24,144,255,0.55)' : '1px solid rgba(255,255,255,0.08)',
-                            cursor: batchMode ? 'pointer' : 'default'
-                          }}
+                          className={`tag-card-item ${selected ? 'selected' : ''} ${batchMode ? 'is-batch' : ''}`}
                         >
                           {editingTagId === tagItem.id ? (
                             <Space size={6}>
@@ -500,19 +467,7 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
                             <>
                               {batchMode ? (
                                 <div
-                                  style={{
-                                    width: 16,
-                                    height: 16,
-                                    borderRadius: 4,
-                                    border: selected ? '2px solid #1890ff' : '2px solid rgba(255,255,255,0.3)',
-                                    background: selected ? '#1890ff' : 'transparent',
-                                    color: '#fff',
-                                    fontSize: 10,
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                    flexShrink: 0
-                                  }}
+                                  className={`tag-select-check ${selected ? 'selected' : ''}`}
                                 >
                                   {selected ? '✓' : ''}
                                 </div>
@@ -608,6 +563,26 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
         </div>
       </div>
 
+      <div className={`gs-floating-bar ${selectedTagIds.length > 0 ? 'active' : ''}`}>
+        <span className="gs-floating-bar-info">已选 {selectedTagIds.length} 个标签</span>
+        <Space size={10}>
+          <Button
+            type="primary"
+            icon={<FileAddOutlined />}
+            disabled={selectedTagIds.length === 0}
+            onClick={() => void openDocumentPicker(selectedTagIds)}
+          >
+            添加文献
+          </Button>
+          <Button danger icon={<DeleteOutlined />} onClick={() => void handleBatchDelete()}>
+            批量删除
+          </Button>
+          <Button type="text" onClick={() => setSelectedTagIds([])}>
+            取消选择
+          </Button>
+        </Space>
+      </div>
+
       <Modal
         title="新建标签"
         open={showNewTag}
@@ -618,20 +593,14 @@ export default function TagsView({ onOpenTag }: TagsViewProps) {
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Input placeholder="标签名称" value={newTagName} onChange={(event) => setNewTagName(event.target.value)} />
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          <div className="tag-preset-color-grid">
             {presetColors.map((color) => (
               <button
                 key={color}
                 type="button"
                 onClick={() => setNewTagColor(color)}
-                style={{
-                  width: 28,
-                  height: 28,
-                  borderRadius: 8,
-                  border: newTagColor === color ? '2px solid #fff' : '1px solid rgba(255,255,255,0.12)',
-                  background: color,
-                  cursor: 'pointer'
-                }}
+                className={`tag-preset-color-btn ${newTagColor === color ? 'active' : ''}`}
+                style={{ background: color }}
               />
             ))}
           </div>

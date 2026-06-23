@@ -37,6 +37,7 @@ import {
   exportDocumentListCsv,
   getBackupStatus,
   importBackupData,
+  importBackupFromPath,
   openAutoBackupDirectory,
   openDataDirectory,
   runAutoBackupNow,
@@ -922,6 +923,18 @@ export function registerBackupIpc(): void {
   ipcMain.handle('backup:restore', handleImportBackup)
 
   ipcMain.handle('backup:import', handleImportBackup)
+
+  ipcMain.handle('backup:importFromPath', async (_event, filePath: string): Promise<BackupImportResult> => {
+    try {
+      const result = await importBackupFromPath(filePath)
+      if (result.success) {
+        scheduleRestart()
+      }
+      return result
+    } catch (error) {
+      return { success: false, error: (error as Error).message }
+    }
+  })
 
   ipcMain.handle('backup:getStatus', async (): Promise<BackupStatus> => {
     return getBackupStatus()

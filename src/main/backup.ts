@@ -1,6 +1,10 @@
 import { dialog, shell } from 'electron'
-import { isAbsolute, join, normalize, relative, resolve } from 'path'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
+import { createWriteStream } from 'fs'
+import { tmpdir } from 'os'
+import { basename, extname, isAbsolute, join, normalize, relative, resolve } from 'path'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
+import { ZipArchive } from 'archiver'
+import extract from 'extract-zip'
 import Database from 'better-sqlite3'
 import { closeDatabase, getDataDir, queryAll, run, saveDatabase } from './database'
 import type { BackupImportResult, BackupResult, BackupSlot, BackupStatus, CompactAutoBackupResult } from '../shared/types'
@@ -9,6 +13,7 @@ let autoBackupTimer: ReturnType<typeof setInterval> | null = null
 let autoBackupRunning = false
 const MIN_AUTO_BACKUP_SLOT_COUNT = 1
 const AUTO_BACKUP_SLOT_COUNT = 3
+const BACKUP_ARCHIVE_EXTENSION = '.zip'
 
 interface DocumentListCsvRow {
   title: string | null
@@ -74,6 +79,51 @@ function isSameOrInside(parentDir: string, targetPath: string): boolean {
 function assertManagedDataChild(dataDir: string, targetPath: string): void {
   if (!isPathInside(dataDir, targetPath)) {
     throw new Error(`拒绝操作数据目录之外的路径：${targetPath}`)
+  }
+}
+
+function ensureZipExtension(filePath: string): string {
+  return extname(filePath).toLowerCase() === BACKUP_ARCHIVE_EXTENSION ? filePath : `${filePath}${BACKUP_ARCHIVE_EXTENSION}`
+}
+
+function createTempBackupDir(prefix: string): string {
+  return mkdtempSync(join(tmpdir(), `${prefix}-`))
+}
+
+async function writeBackupZip(sourceDir: string, archivePath: string): Promise<void> {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const output = createWriteStream(archivePath)
+    const archive = new ZipArchive({ zlib: { level: 6 } })
+
+    output.on('close', () => resolvePromise())
+    output.on('error', rejectPromise)
+    archive.on('warning', (error: Error) => rejectPromise(error))
+    archive.on('error', rejectPromise)
+
+    archive.pipe(output)
+    archive.directory(sourceDir, false)
+    void archive.finalize()
+  })
+}
+
+function assertSafeExtractEntry(entryPath: string): void {
+  const normalized = normalize(entryPath)
+  if (!normalized || isAbsolute(normalized) || normalized.startsWith('..') || normalized.includes(`..\\`) || normalized.includes('../')) {
+    throw new Error('备份压缩包包含不安全路径，已拒绝导入')
+  }
+}
+
+async function extractBackupZip(archivePath: string): Promise<string> {
+  const targetDir = createTempBackupDir('gujismart-backup-import')
+  try {
+    await extract(archivePath, {
+      dir: targetDir,
+      onEntry: (entry) => assertSafeExtractEntry(entry.fileName),
+    })
+    return targetDir
+  } catch (error) {
+    rmSync(targetDir, { recursive: true, force: true })
+    throw error
   }
 }
 
@@ -190,11 +240,21 @@ function replaceManagedDirectory(dataDir: string, directoryName: 'db' | 'storage
   }
 }
 
-function createSafetyBackupBeforeImport(dataDir: string): string {
+async function createSafetyBackupBeforeImport(dataDir: string): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const safetyBackupDir = join(dataDir, 'pre-import-backups', `before-import-${timestamp}`)
-  assertManagedDataChild(dataDir, safetyBackupDir)
-  return copyCurrentDataTo(safetyBackupDir, 'manual')
+  const safetyBackupRoot = join(dataDir, 'pre-import-backups')
+  const safetyBackupPath = join(safetyBackupRoot, `before-import-${timestamp}.zip`)
+  const tempBackupDir = createTempBackupDir('gujismart-pre-import-backup')
+  assertManagedDataChild(dataDir, safetyBackupRoot)
+  assertManagedDataChild(dataDir, safetyBackupPath)
+  try {
+    mkdirSync(safetyBackupRoot, { recursive: true })
+    copyCurrentDataTo(tempBackupDir, 'manual')
+    await writeBackupZip(tempBackupDir, safetyBackupPath)
+    return safetyBackupPath
+  } finally {
+    rmSync(tempBackupDir, { recursive: true, force: true })
+  }
 }
 
 function getAutoBackupRoot(): string {
@@ -286,36 +346,59 @@ function copyCurrentDataTo(backupDir: string, type: 'manual' | 'auto', slot?: nu
 export async function backupData(): Promise<string | null> {
   const { canceled, filePath } = await dialog.showSaveDialog({
     title: '备份数据',
-    defaultPath: `文献管理_备份_${new Date().toISOString().slice(0, 10)}`,
-    filters: [{ name: '备份目录', extensions: ['*'] }]
+    defaultPath: `文献管理_备份_${new Date().toISOString().slice(0, 10)}.zip`,
+    filters: [{ name: 'GujiSmart 备份压缩包', extensions: ['zip'] }]
   })
 
   if (canceled || !filePath) return null
 
+  const archivePath = ensureZipExtension(filePath)
+  const tempBackupDir = createTempBackupDir('gujismart-backup-export')
   try {
-    return copyCurrentDataTo(filePath, 'manual')
+    copyCurrentDataTo(tempBackupDir, 'manual')
+    await writeBackupZip(tempBackupDir, archivePath)
+    return archivePath
   } catch (error) {
     console.error('[Backup] 备份失败:', error)
     throw new Error(`备份失败: ${(error as Error).message}`)
+  } finally {
+    rmSync(tempBackupDir, { recursive: true, force: true })
   }
 }
 
 export async function importBackupData(): Promise<BackupImportResult> {
   const { canceled, filePaths } = await dialog.showOpenDialog({
     title: '导入备份并恢复',
-    properties: ['openDirectory']
+    properties: ['openFile', 'openDirectory'],
+    filters: [
+      { name: 'GujiSmart 备份压缩包或旧版备份目录', extensions: ['zip'] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
   })
 
   if (canceled || filePaths.length === 0) {
     return { success: false, canceled: true, path: null }
   }
 
+  return importBackupFromPath(filePaths[0])
+}
+
+export async function importBackupFromPath(inputPath: string): Promise<BackupImportResult> {
+  const rawPath = String(inputPath || '').trim()
+  if (!rawPath) {
+    return { success: false, canceled: true, path: null }
+  }
+
+  let extractedBackupDir: string | null = null
   try {
-    const backupDir = resolve(filePaths[0])
+    const selectedPath = resolve(rawPath)
+    const isArchive = statSync(selectedPath).isFile() || extname(selectedPath).toLowerCase() === BACKUP_ARCHIVE_EXTENSION
+    extractedBackupDir = isArchive ? await extractBackupZip(selectedPath) : null
+    const backupDir = extractedBackupDir || selectedPath
     validateBackupDirectory(backupDir)
 
     const dataDir = getDataDir()
-    const safetyBackupPath = createSafetyBackupBeforeImport(dataDir)
+    const safetyBackupPath = await createSafetyBackupBeforeImport(dataDir)
 
     closeDatabase()
     replaceManagedDirectory(dataDir, 'db', getBackupDbDir(backupDir))
@@ -323,14 +406,16 @@ export async function importBackupData(): Promise<BackupImportResult> {
 
     return {
       success: true,
-      path: backupDir,
-      importedBackupPath: backupDir,
+      path: selectedPath,
+      importedBackupPath: selectedPath,
       safetyBackupPath,
       requiresRestart: true,
     }
   } catch (error) {
     console.error('[Backup] 导入备份失败:', error)
     throw new Error(`导入备份失败: ${(error as Error).message}`)
+  } finally {
+    if (extractedBackupDir) rmSync(extractedBackupDir, { recursive: true, force: true })
   }
 }
 

@@ -52,6 +52,7 @@ import {
 import { shouldTranslatePageText } from '@shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '@shared/translation-source'
 import { DEFAULT_HIGHLIGHT_COLOR } from '../utils/highlightColors'
+import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import type { AiTaskOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageUpdatePayload, PageTranslationCacheItem, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, TranslationGlossaryScope } from '@shared/types'
 
 const { Title, Text } = Typography
@@ -76,6 +77,7 @@ const FACSIMILE_FONT_SCALE_DEFAULT = 1.1
 const FACSIMILE_FONT_SCALE_MIN = 0.5
 const FACSIMILE_FONT_SCALE_MAX = 1.35
 const READER_DISPLAY_SCRIPT_STORAGE_KEY = 'gujismart.reader.displayScript'
+const READER_GLOBAL_PREFERENCES_SETTING_KEY = 'reader_global_preferences'
 const READER_SEARCH_RESULT_PAGE_SIZE = 10
 const PROOF_PAGE_WINDOW_RADIUS = 1
 const PROOF_IMAGE_PREFETCH_DELAY_MS = 260
@@ -116,6 +118,7 @@ type PageViewMode = 'single' | 'bird'
 type BirdDensity = 'small' | 'medium' | 'large'
 type ReaderTheme = 'paper' | 'sepia' | 'dark'
 type ReaderDisplayScript = 'original' | 'simplified' | 'traditional'
+type ReaderViewMode = 'single' | 'spread'
 type ReaderSidebarTab = 'toc' | 'search'
 type DocumentMode = 'read' | 'proof'
 type ProofViewMode = 'facsimile' | 'text'
@@ -212,6 +215,54 @@ function getNumericRecordValue(source: unknown, key: string): number | null {
   const value = readRecordValue(source, key)
   const numberValue = Number(value)
   return Number.isFinite(numberValue) ? numberValue : null
+}
+
+function isReaderViewMode(value: unknown): value is ReaderViewMode {
+  return value === 'single' || value === 'spread'
+}
+
+function isReaderTheme(value: unknown): value is ReaderTheme {
+  return value === 'paper' || value === 'sepia' || value === 'dark'
+}
+
+function isReaderDisplayScript(value: unknown): value is ReaderDisplayScript {
+  return value === 'original' || value === 'simplified' || value === 'traditional'
+}
+
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) return fallback
+  return Math.max(min, Math.min(max, numberValue))
+}
+
+function readReaderViewMode(value: unknown): ReaderViewMode | null {
+  return isReaderViewMode(value) ? value : null
+}
+
+function readReaderTheme(value: unknown): ReaderTheme | null {
+  return isReaderTheme(value) ? value : null
+}
+
+function readReaderDisplayScript(value: unknown): ReaderDisplayScript | null {
+  return isReaderDisplayScript(value) ? value : null
+}
+
+function parseReaderGlobalPreferences(value: unknown): ReaderGlobalPreferences {
+  const parsed = typeof value === 'string' ? parseMaybeJson(value) : isJsonRecord(value) ? value : null
+  const viewMode = readReaderViewMode(readRecordValue(parsed, 'view_mode'))
+  const theme = readReaderTheme(readRecordValue(parsed, 'theme'))
+  const displayScript = readReaderDisplayScript(readRecordValue(parsed, 'display_script'))
+  return {
+    view_mode: viewMode || DEFAULT_READER_GLOBAL_PREFERENCES.view_mode,
+    font_family: typeof readRecordValue(parsed, 'font_family') === 'string' && String(readRecordValue(parsed, 'font_family')).trim()
+      ? String(readRecordValue(parsed, 'font_family'))
+      : DEFAULT_READER_GLOBAL_PREFERENCES.font_family,
+    font_size: clampNumber(readRecordValue(parsed, 'font_size'), DEFAULT_READER_GLOBAL_PREFERENCES.font_size, 13, 26),
+    line_height: clampNumber(readRecordValue(parsed, 'line_height'), DEFAULT_READER_GLOBAL_PREFERENCES.line_height, 1.3, 2.4),
+    page_width: clampNumber(readRecordValue(parsed, 'page_width'), DEFAULT_READER_GLOBAL_PREFERENCES.page_width, 380, 680),
+    theme: theme || DEFAULT_READER_GLOBAL_PREFERENCES.theme,
+    display_script: displayScript || DEFAULT_READER_GLOBAL_PREFERENCES.display_script,
+  }
 }
 
 function looksLikeMetadataMojibake(value: string): boolean {
@@ -337,6 +388,26 @@ function getSearchLocatorKey(locator: SearchHitLocator | null | undefined, keywo
     locator.charEnd ?? '',
     locator.queryTerm || keyword,
   ].join('|')
+}
+
+type ReaderGlobalPreferences = {
+  view_mode: ReaderViewMode
+  font_family: string
+  font_size: number
+  line_height: number
+  page_width: number
+  theme: ReaderTheme
+  display_script: ReaderDisplayScript
+}
+
+const DEFAULT_READER_GLOBAL_PREFERENCES: ReaderGlobalPreferences = {
+  view_mode: 'spread',
+  font_family: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif",
+  font_size: 17,
+  line_height: 1.9,
+  page_width: 520,
+  theme: 'paper',
+  display_script: 'original',
 }
 
 function getDocumentOpenContextKey(
@@ -1084,17 +1155,18 @@ export default function DocumentView({
   const [quickGlossaryNote, setQuickGlossaryNote] = useState('')
   const [selectedTextForAi, setSelectedTextForAi] = useState('')
   const [readerContextTextForAi, setReaderContextTextForAi] = useState('')
-  const [readerFontFamily, setReaderFontFamily] = useState("'Noto Serif SC', 'Source Han Serif SC', SimSun, serif")
-  const [readerFontSize, setReaderFontSize] = useState(17)
-  const [readerLineHeight, setReaderLineHeight] = useState(1.9)
-  const [readerPageWidth, setReaderPageWidth] = useState(520)
-  const [readerTheme, setReaderTheme] = useState<ReaderTheme>('paper')
+  const [readerViewMode, setReaderViewMode] = useState<ReaderViewMode>(DEFAULT_READER_GLOBAL_PREFERENCES.view_mode)
+  const [readerFontFamily, setReaderFontFamily] = useState(DEFAULT_READER_GLOBAL_PREFERENCES.font_family)
+  const [readerFontSize, setReaderFontSize] = useState(DEFAULT_READER_GLOBAL_PREFERENCES.font_size)
+  const [readerLineHeight, setReaderLineHeight] = useState(DEFAULT_READER_GLOBAL_PREFERENCES.line_height)
+  const [readerPageWidth, setReaderPageWidth] = useState(DEFAULT_READER_GLOBAL_PREFERENCES.page_width)
+  const [readerTheme, setReaderTheme] = useState<ReaderTheme>(DEFAULT_READER_GLOBAL_PREFERENCES.theme)
   const [readerDisplayScript, setReaderDisplayScript] = useState<ReaderDisplayScript>(() => {
     try {
       const stored = window.localStorage.getItem(READER_DISPLAY_SCRIPT_STORAGE_KEY)
-      return stored === 'simplified' || stored === 'traditional' ? stored : 'original'
+      return isReaderDisplayScript(stored) ? stored : DEFAULT_READER_GLOBAL_PREFERENCES.display_script
     } catch {
-      return 'original'
+      return DEFAULT_READER_GLOBAL_PREFERENCES.display_script
     }
   })
   const [readerBookTranslationRequest, setReaderBookTranslationRequest] = useState(0)
@@ -1140,6 +1212,9 @@ export default function DocumentView({
   const documentModeTouchedRef = useRef(false)
   const documentModeSwitchSerialRef = useRef(0)
   const readerSaveTimerRef = useRef<number | null>(null)
+  const readerPreferencesLoadedRef = useRef(false)
+  const readerPreferencesSaveTimerRef = useRef<number | null>(null)
+  const latestReaderPreferencesRef = useRef<ReaderGlobalPreferences>(DEFAULT_READER_GLOBAL_PREFERENCES)
   const latestReaderStateRef = useRef<ReaderStateSavePayload>({})
   const searchRequestIdRef = useRef(0)
   const searchPagesRequestIdRef = useRef(0)
@@ -1795,12 +1870,12 @@ export default function DocumentView({
       document_mode: 'read',
       location_key: `page:${page?.page_num || nextIndex + 1}`,
       progress: pageCount <= 1 ? 1 : nextIndex / Math.max(1, pageCount - 1),
-      view_mode: 'spread',
+      view_mode: readerViewMode,
       font_size: readerFontSize,
       line_height: readerLineHeight,
       theme: readerTheme,
     }
-  }, [currentPage, currentPageIndex, doc?.id, pageCount, readerFontSize, readerLineHeight, readerTheme, sortedPages])
+  }, [currentPage, currentPageIndex, doc?.id, pageCount, readerFontSize, readerLineHeight, readerTheme, readerViewMode, sortedPages])
 
   const buildTextReaderState = useCallback((pageIndex: number): ReaderStateSavePayload | null => {
     if (!doc?.id || readerVirtualPageCount === 0) return null
@@ -1811,12 +1886,12 @@ export default function DocumentView({
       document_mode: 'read',
       location_key: `text-reader:${nextIndex + 1}`,
       progress: readerVirtualPageCount <= 1 ? 1 : nextIndex / Math.max(1, readerVirtualPageCount - 1),
-      view_mode: 'spread',
+      view_mode: readerViewMode,
       font_size: readerFontSize,
       line_height: readerLineHeight,
       theme: readerTheme,
     }
-  }, [doc?.id, readerFontSize, readerLineHeight, readerTheme, readerVirtualPageCount, readerVirtualPages])
+  }, [doc?.id, readerFontSize, readerLineHeight, readerTheme, readerViewMode, readerVirtualPageCount, readerVirtualPages])
 
   const buildProofReaderState = useCallback((pageIndex: number): ReaderStateSavePayload | null => {
     if (!doc?.id || pageCount === 0) return null
@@ -2330,9 +2405,6 @@ export default function DocumentView({
       const latestPageCount = pageCountRef.current
       const latestReaderVirtualPages = readerVirtualPagesRef.current
       const latestSortedPages = sortedPagesRef.current
-      if (state.font_size) setReaderFontSize(state.font_size)
-      if (state.line_height) setReaderLineHeight(state.line_height)
-      if (state.theme === 'paper' || state.theme === 'sepia' || state.theme === 'dark') setReaderTheme(state.theme)
       const canRestoreDocumentMode = !documentModeTouchedRef.current
       if (canRestoreDocumentMode && state.view_mode === 'single') setDocumentMode('read')
       const savedLocationKey = String(state.location_key || '')
@@ -2495,12 +2567,78 @@ export default function DocumentView({
   }, [currentPageIndex])
 
   useEffect(() => {
+    let active = true
+    void window.api.getSetting(READER_GLOBAL_PREFERENCES_SETTING_KEY)
+      .then((stored) => {
+        if (!active) return
+        const preferences = parseReaderGlobalPreferences(stored)
+        setReaderViewMode(preferences.view_mode)
+        setReaderFontFamily(preferences.font_family)
+        setReaderFontSize(preferences.font_size)
+        setReaderLineHeight(preferences.line_height)
+        setReaderPageWidth(preferences.page_width)
+        setReaderTheme(preferences.theme)
+        setReaderDisplayScript(preferences.display_script)
+        latestReaderPreferencesRef.current = preferences
+        try {
+          window.localStorage.setItem(READER_DISPLAY_SCRIPT_STORAGE_KEY, preferences.display_script)
+        } catch {
+          // The settings table remains the source of truth.
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('Failed to load reader global preferences', error)
+      })
+      .finally(() => {
+        if (active) readerPreferencesLoadedRef.current = true
+      })
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
     try {
       window.localStorage.setItem(READER_DISPLAY_SCRIPT_STORAGE_KEY, readerDisplayScript)
     } catch {
       // Ignore storage failures; the switch still works for the current session.
     }
   }, [readerDisplayScript])
+
+  useEffect(() => {
+    if (!readerPreferencesLoadedRef.current) return
+    if (readerPreferencesSaveTimerRef.current) {
+      window.clearTimeout(readerPreferencesSaveTimerRef.current)
+    }
+    const preferences: ReaderGlobalPreferences = {
+      view_mode: readerViewMode,
+      font_family: readerFontFamily,
+      font_size: readerFontSize,
+      line_height: readerLineHeight,
+      page_width: readerPageWidth,
+      theme: readerTheme,
+      display_script: readerDisplayScript,
+    }
+    latestReaderPreferencesRef.current = preferences
+    readerPreferencesSaveTimerRef.current = window.setTimeout(() => {
+      readerPreferencesSaveTimerRef.current = null
+      void window.api.setSetting(READER_GLOBAL_PREFERENCES_SETTING_KEY, JSON.stringify(preferences)).catch((error: unknown) => {
+        console.error('Failed to save reader global preferences', error)
+      })
+    }, 350)
+  }, [readerDisplayScript, readerFontFamily, readerFontSize, readerLineHeight, readerPageWidth, readerTheme, readerViewMode])
+
+  useEffect(() => () => {
+    if (readerPreferencesSaveTimerRef.current) {
+      window.clearTimeout(readerPreferencesSaveTimerRef.current)
+      readerPreferencesSaveTimerRef.current = null
+      if (readerPreferencesLoadedRef.current) {
+        void window.api.setSetting(READER_GLOBAL_PREFERENCES_SETTING_KEY, JSON.stringify(latestReaderPreferencesRef.current)).catch((error: unknown) => {
+          console.error('Failed to flush reader global preferences', error)
+        })
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!doc?.id || pageCount === 0 || shouldUseManagedTextReader || documentMode !== 'read') return
@@ -2511,7 +2649,7 @@ export default function DocumentView({
       document_mode: 'read',
       location_key: `page:${currentPage?.page_num || currentPageIndex + 1}`,
       progress,
-      view_mode: 'spread',
+      view_mode: readerViewMode,
       font_size: readerFontSize,
       line_height: readerLineHeight,
       theme: readerTheme,
@@ -2530,6 +2668,7 @@ export default function DocumentView({
     pageCount,
     readerFontSize,
     readerLineHeight,
+    readerViewMode,
     readerStateReady,
     readerTheme,
     saveReaderStateSoon,
@@ -2600,20 +2739,24 @@ export default function DocumentView({
     }
 
     if (doc?.file_path && String(doc.file_path).toLowerCase().endsWith('.pdf') && page.page_num) {
-      const rendered = await renderPdfFilePageToImage(doc.file_path, page.page_num)
-      putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
-      if (options?.updateDoc !== false && doc?.id && page.id) {
-        const imagePath = await window.api.cachePageImage(doc.id, page.page_num, rendered.dataUrl)
-        await window.api.updatePage(page.id, { image_path: imagePath })
-        setDoc((previous) => {
-          if (!previous?.pages) return previous
-          return {
-            ...previous,
-            pages: previous.pages.map((item) => item.id === page.id ? { ...item, image_path: imagePath } : item),
-          }
-        })
+      try {
+        const rendered = await renderPdfFilePageToImage(doc.file_path, page.page_num)
+        putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
+        if (options?.updateDoc !== false && doc?.id && page.id) {
+          const imagePath = await window.api.cachePageImage(doc.id, page.page_num, rendered.dataUrl)
+          await window.api.updatePage(page.id, { image_path: imagePath })
+          setDoc((previous) => {
+            if (!previous?.pages) return previous
+            return {
+              ...previous,
+              pages: previous.pages.map((item) => item.id === page.id ? { ...item, image_path: imagePath } : item),
+            }
+          })
+        }
+        return rendered.dataUrl
+      } catch (error) {
+        console.warn('[DocumentView] PDF source is not readable, keeping page image unavailable', error)
       }
-      return rendered.dataUrl
     }
 
     return ''
@@ -3149,8 +3292,41 @@ export default function DocumentView({
     targetPage: DocumentViewPage | undefined = currentPage,
   ): Promise<boolean> => {
     if (!doc?.id || !targetPage?.page_num) return false
+    const cacheKey = getPageImageCacheKey(targetPage, doc.id, documentId)
+    pageImageCacheRef.current.delete(cacheKey)
+    if (doc.file_path && String(doc.file_path).toLowerCase().endsWith('.pdf')) {
+      releaseCachedPdfDocument(doc.file_path)
+    }
     const messageKey = `restore-pdf-page-${doc.id}-${targetPage.page_num}`
     try {
+      if (sourceFilePath) {
+        message.loading({ content: '正在生成当前页预览…', key: messageKey, duration: 0 })
+        const rendered = await renderPdfFilePageToImage(sourceFilePath, targetPage.page_num)
+        const imagePath = await window.api.cachePageImage(doc.id, targetPage.page_num, rendered.dataUrl)
+        putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
+        if (targetPage.id) {
+          await window.api.updatePage(targetPage.id, { image_path: imagePath })
+        }
+        setDoc((previous) => {
+          if (!previous?.pages) return previous
+          const nextMetadata = parseMaybeJson(previous.metadata)
+          return {
+            ...previous,
+            file_path: sourceFilePath || previous.file_path,
+            metadata: JSON.stringify({ ...nextMetadata, pdf_asset_state: 'available' }),
+            pages: previous.pages.map((page) => (
+              page.id === targetPage.id || page.page_num === targetPage.page_num
+                ? { ...page, image_path: imagePath }
+                : page
+            )),
+          }
+        })
+        if (targetPage.id === currentPage?.id || targetPage.page_num === currentPage?.page_num) {
+          setImageDataUrl(rendered.dataUrl)
+        }
+        return true
+      }
+
       const result = await ensureOcrPageImages(doc, {
         pageNums: [targetPage.page_num],
         sourceFilePath,
@@ -3158,7 +3334,7 @@ export default function DocumentView({
         onProgress: (content, key) => message.loading({ content, key: key || messageKey, duration: 0 }),
         onPageCached: async (pageNum, imagePath, dataUrl) => {
           if (pageNum !== targetPage.page_num) return
-          putLimitedPageImageCache(pageImageCacheRef.current, getPageImageCacheKey(targetPage, doc.id, documentId), dataUrl)
+          putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, dataUrl)
           if (targetPage.id) {
             await window.api.updatePage(targetPage.id, { image_path: imagePath })
           }
@@ -3171,6 +3347,9 @@ export default function DocumentView({
         result.cachedPageNums.includes(targetPage.page_num)
         || await isReadablePageImagePath(targetPage.image_path)
       )
+    } catch (error) {
+      console.warn('[DocumentView] restored PDF is not readable for current page preview', error)
+      return isReadablePageImagePath(targetPage.image_path)
     } finally {
       message.destroy(messageKey)
     }
@@ -3182,9 +3361,14 @@ export default function DocumentView({
     try {
       const result = await window.api.restorePdfForDocument(doc.id, manualPath)
       if (result?.restored) {
-        const pageReady = await cacheRestoredPdfCurrentPage(result.path, targetPage)
-        message.success(pageReady ? 'PDF 原图已补回，当前页预览已恢复' : 'PDF 原图已补回，可以继续原图校对')
-        await refreshDocumentKeepPage(targetPage?.id || currentPage?.id)
+        const refreshed = await refreshDocumentKeepPage(targetPage?.id || currentPage?.id)
+        const refreshedPage = refreshed?.pages?.find((page) => (
+          (targetPage?.id && page.id === targetPage.id)
+          || (targetPage?.page_num && page.page_num === targetPage.page_num)
+        ))
+        const pageReady = await cacheRestoredPdfCurrentPage(result.path, refreshedPage || targetPage)
+        window.dispatchEvent(new Event(LIBRARY_RELATIONS_CHANGED_EVENT))
+        message.success(pageReady ? 'PDF 原图已补回，当前页预览已恢复' : 'PDF 原图已补回；当前页预览生成失败，可手动重新选择 PDF 或重新打开文献')
         return true
       }
       message.warning(result?.error || '未能补回 PDF 原图')
@@ -3229,7 +3413,7 @@ export default function DocumentView({
       const restored = await handleRestorePdfAsset(undefined, sortedPages[syncedPageIndex] || currentPage)
       if (documentModeSwitchSerialRef.current !== switchSerial) return
       if (!restored) {
-        message.warning('Unable to restore original PDF automatically')
+        message.warning('无法自动补回原始 PDF，请手动选择 PDF')
         return
       }
     }
@@ -3942,7 +4126,9 @@ export default function DocumentView({
     { key: 'rerun-layout', label: '重排本页版面' },
   ]
 
-  const readerPages = [readerCurrentPage, readerNextPage].filter(Boolean)
+  const readerPages = (readerViewMode === 'spread'
+    ? [readerCurrentPage, readerNextPage]
+    : [readerCurrentPage]).filter(Boolean)
   const readerSearchMatches = shouldUseTextReaderMode ? textReaderMatches : searchMatches
   const readerSearchResultTotalPages = Math.max(1, Math.ceil(readerSearchMatches.length / READER_SEARCH_RESULT_PAGE_SIZE))
   const readerSearchResultPageSafe = Math.max(1, Math.min(readerSearchResultPage, readerSearchResultTotalPages))
@@ -4144,13 +4330,17 @@ export default function DocumentView({
       </div>
     </div>
   )
-  const goReaderPrevSpread = () => setReaderPageIndex((value) => clampPageIndex(value - 2, readerVirtualPageCount))
-  const goReaderNextSpread = () => setReaderPageIndex((value) => clampPageIndex(value + 2, readerVirtualPageCount))
+  const goReaderPrevSpread = () => setReaderPageIndex((value) => clampPageIndex(value - (readerViewMode === 'spread' ? 2 : 1), readerVirtualPageCount))
+  const goReaderNextSpread = () => setReaderPageIndex((value) => clampPageIndex(value + (readerViewMode === 'spread' ? 2 : 1), readerVirtualPageCount))
   const handleReaderPageClick = (side: 'left' | 'right') => (event: ReactMouseEvent<HTMLDivElement>) => {
     const selection = window.getSelection()?.toString()
     if (selection) return
     const target = event.target as HTMLElement
     if (target.closest('button,input,textarea,select,a')) return
+    if (readerViewMode === 'single') {
+      goReaderNextSpread()
+      return
+    }
     if (side === 'left') {
       goReaderPrevSpread()
     } else {
@@ -4162,7 +4352,7 @@ export default function DocumentView({
       <Space size={4} wrap>
         <Button size="small" disabled={shouldUseTextReaderMode ? readerPageIndex === 0 : currentPageIndex === 0} onClick={() => {
           if (shouldUseTextReaderMode) {
-            setReaderPageIndex((value) => clampPageIndex(value - 2, readerVirtualPageCount))
+            setReaderPageIndex((value) => clampPageIndex(value - (readerViewMode === 'spread' ? 2 : 1), readerVirtualPageCount))
           } else {
             setCurrentPageIndex((value) => clampPageIndex(value - 1, pageCount))
           }
@@ -4194,7 +4384,7 @@ export default function DocumentView({
         </Button>
         <Button size="small" disabled={shouldUseTextReaderMode ? readerPageIndex >= readerVirtualPageCount - 1 : currentPageIndex >= pageCount - 1} onClick={() => {
           if (shouldUseTextReaderMode) {
-            setReaderPageIndex((value) => clampPageIndex(value + 2, readerVirtualPageCount))
+            setReaderPageIndex((value) => clampPageIndex(value + (readerViewMode === 'spread' ? 2 : 1), readerVirtualPageCount))
           } else {
             setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCount))
           }
@@ -4236,6 +4426,18 @@ export default function DocumentView({
         <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>版心</span>
         <Slider min={380} max={680} step={20} value={readerPageWidth} onChange={setReaderPageWidth} style={{ margin: 0 }} />
         <Text style={{ color: 'var(--gs-text-secondary)', fontSize: 12, textAlign: 'right' }}>{readerPageWidth}</Text>
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center' }}>
+        <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>版式</span>
+        <Segmented
+          size="small"
+          value={readerViewMode}
+          onChange={(value) => setReaderViewMode(value as ReaderViewMode)}
+          options={[
+            { value: 'spread', label: '双页' },
+            { value: 'single', label: '单页' },
+          ]}
+        />
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center' }}>
         <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>主题</span>

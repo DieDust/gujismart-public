@@ -839,10 +839,10 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   }
 
   return (
-    <div className="research-workbench">
+    <div className="research-workbench gs-view-container">
       <div className="research-header">
         <div>
-          <Title level={3} style={{ color: 'var(--gs-gold)', margin: 0 }}>研究工作台</Title>
+          <Title level={3} className="gs-view-title">研究工作台</Title>
           <Text type="secondary">把摘录整理成专题证据、论点结构和可导出的写作草稿。</Text>
         </div>
         <Space wrap>
@@ -1099,7 +1099,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
                           <button
                             key={item.id}
                             type="button"
-                            className={`research-outline-item ${active ? 'active' : ''}`}
+                            className={`research-outline-item research-outline-tree-item ${active ? 'active' : ''}`}
                             style={{ paddingLeft: 12 + depth * 18 }}
                             onClick={() => setSelectedOutlineId(active ? null : item.id)}
                           >

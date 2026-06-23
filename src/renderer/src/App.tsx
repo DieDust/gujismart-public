@@ -7,6 +7,7 @@ import {
   DashboardOutlined,
   FileTextOutlined,
   FileSearchOutlined,
+  FolderOpenOutlined,
   FormatPainterOutlined,
   PlusOutlined,
   QuestionCircleOutlined,
@@ -32,12 +33,17 @@ import './styles/app.css'
 
 const { Sider, Content, Header } = Layout
 
-type ViewKey = 'welcome' | 'library' | 'settings' | 'dashboard' | 'search' | 'citation' | 'tags' | 'research' | 'excerpts'
+type ViewKey = 'welcome' | 'library' | 'folders' | 'settings' | 'dashboard' | 'search' | 'citation' | 'tags' | 'research' | 'excerpts'
 type MenuItem = Required<MenuProps>['items'][number]
 type DatabaseUpgradePhase = 'idle' | 'precompact' | 'cleanup' | 'compact'
 type LibraryDroppedImportRequest = {
   id: number
   paths: string[]
+  folderId?: string | null
+}
+type FoldersViewState = {
+  selectedFolderId: string | null
+  scrollTop: number
 }
 
 const AiPanel = lazy(() => import('./components/AiPanel'))
@@ -46,6 +52,7 @@ const CitationView = lazy(() => import('./views/CitationView'))
 const DashboardView = lazy(() => import('./views/DashboardView'))
 const DocumentView = lazy(() => import('./views/DocumentView'))
 const ExcerptsView = lazy(() => import('./views/ExcerptsView'))
+const FoldersView = lazy(() => import('./views/FoldersView'))
 const LibraryView = lazy(() => import('./views/LibraryView'))
 const ResearchView = lazy(() => import('./views/ResearchView'))
 const SearchView = lazy(() => import('./views/SearchView'))
@@ -165,6 +172,7 @@ export default function App() {
   const [libraryAiOpen, setLibraryAiOpen] = useState(false)
   const [libraryImportRequest, setLibraryImportRequest] = useState(0)
   const [libraryDroppedImportRequest, setLibraryDroppedImportRequest] = useState<LibraryDroppedImportRequest | null>(null)
+  const [foldersViewState, setFoldersViewState] = useState<FoldersViewState | null>(null)
   const [libraryAiQuestion, setLibraryAiQuestion] = useState('')
   const [libraryAiScope, setLibraryAiScope] = useState<LibraryAiScope | undefined>(undefined)
   const [libraryAiScopeLabel, setLibraryAiScopeLabel] = useState('')
@@ -452,6 +460,7 @@ export default function App() {
 
   const menuItems: MenuItem[] = useMemo(() => ([
     { key: 'library', icon: <BookOutlined />, label: '文献库' },
+    { key: 'folders', icon: <FolderOpenOutlined />, label: '文件夹' },
     { key: 'research', icon: <ReadOutlined />, label: '研究' },
     { key: 'excerpts', icon: <FileTextOutlined />, label: '摘录' },
     { key: 'search', icon: <FileSearchOutlined />, label: '检索' },
@@ -532,15 +541,16 @@ export default function App() {
     return () => window.removeEventListener('gujismart:onboarding-action', handleOnboardingAction)
   }, [handleImport, runWithSettingsLeaveGuard])
 
-  const handleDroppedImport = (paths: string[]) => {
+  const handleDroppedImport = (paths: string[], folderId?: string | null) => {
     runWithSettingsLeaveGuard(() => {
       setCurrentDocId(null)
       setCurrentView('library')
-      setLibraryFilter({ type: 'all' })
-      setLibraryFocusSection(undefined)
+      setLibraryFilter(folderId ? { type: 'folder', value: folderId } : { type: 'all' })
+      setLibraryFocusSection(folderId ? 'folders' : undefined)
       setLibraryDroppedImportRequest({
         id: libraryDroppedImportSeqRef.current += 1,
         paths,
+        folderId: folderId || null,
       })
     })
   }
@@ -580,6 +590,11 @@ export default function App() {
     setDocumentHighlightColor(normalized.highlightColor || '')
     setDocumentSourceLabel(normalized.sourceLabel || '')
     setDocumentStartReaderBookTranslation(!!normalized.startReaderBookTranslation)
+  }
+
+  const openDocumentFromFolders = (target: OpenDocumentTarget | string, state: FoldersViewState) => {
+    setFoldersViewState(state)
+    openDocumentTarget(target)
   }
 
   useEffect(() => {
@@ -748,6 +763,15 @@ export default function App() {
             onDroppedImportHandled={(requestId) => {
               setLibraryDroppedImportRequest((current) => (current?.id === requestId ? null : current))
             }}
+          />
+        )
+      case 'folders':
+        return (
+          <FoldersView
+            onOpenFolder={(folderId) => openLibraryWithFilter({ type: 'folder', value: folderId }, 'folders')}
+            onOpenDocument={openDocumentFromFolders}
+            initialState={foldersViewState}
+            onStateChange={setFoldersViewState}
           />
         )
       case 'settings':

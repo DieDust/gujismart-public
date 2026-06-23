@@ -192,6 +192,14 @@ function includeOrderedRange(hitIds: string[], orderedIds: string[], orderedRank
   return ranged
 }
 
+function clearNativeTextSelection(): void {
+  try {
+    window.getSelection()?.removeAllRanges()
+  } catch {
+    // Selection cleanup is best-effort; drag selection should still continue.
+  }
+}
+
 export function useDragMultiSelect<TElement extends HTMLElement>({
   rootRef,
   itemSelector,
@@ -382,6 +390,7 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
     }
 
     event.preventDefault()
+    clearNativeTextSelection()
     sessionRef.current = session
     if (reactPreview) setSelection(session)
     if (activeClassName) root.classList.add(activeClassName)
@@ -398,14 +407,21 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
     }
 
     const previousUserSelect = document.body.style.userSelect
+    const previousRootUserSelect = root.style.userSelect
+    const previousScrollRootUserSelect = scrollRoot.style.userSelect
     document.body.style.userSelect = 'none'
+    root.style.userSelect = 'none'
+    scrollRoot.style.userSelect = 'none'
 
     const cleanup = () => {
       window.removeEventListener('mousemove', handleMouseMove)
       window.removeEventListener('mouseup', handleMouseUp)
       scrollRoot.removeEventListener('scroll', handleScroll)
       window.removeEventListener('scroll', handleScroll, true)
+      clearNativeTextSelection()
       document.body.style.userSelect = previousUserSelect
+      root.style.userSelect = previousRootUserSelect
+      scrollRoot.style.userSelect = previousScrollRootUserSelect
       if (activeClassName) root.classList.remove(activeClassName)
     }
 
@@ -431,6 +447,8 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
     }
 
     function handleMouseMove(moveEvent: globalThis.MouseEvent) {
+      moveEvent.preventDefault()
+      clearNativeTextSelection()
       schedulePreview(moveEvent.clientX, moveEvent.clientY)
     }
 
@@ -440,7 +458,8 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
       schedulePreview(activeSession.latestX, activeSession.latestY)
     }
 
-    function handleMouseUp() {
+    function handleMouseUp(upEvent: globalThis.MouseEvent) {
+      upEvent.preventDefault()
       finish()
     }
 
