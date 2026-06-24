@@ -162,6 +162,77 @@ function lineNumber(source, index) {
 }
 
 const findings = []
+
+function addFinding(file, check, line = 1) {
+  findings.push({ file, line, check })
+}
+
+function readRequiredText(relativePath) {
+  const fullPath = path.join(root, relativePath)
+  if (!fs.existsSync(fullPath)) {
+    addFinding(relativePath, 'required open-source metadata file is missing')
+    return ''
+  }
+  return fs.readFileSync(fullPath, 'utf8')
+}
+
+function requireText(relativePath, source, pattern, check) {
+  if (pattern.test(source)) return
+  addFinding(relativePath, check)
+}
+
+function requirePackageField(pkg, fieldPath, expectedValue) {
+  const value = fieldPath.split('.').reduce((current, key) => {
+    if (current && Object.prototype.hasOwnProperty.call(current, key)) {
+      return current[key]
+    }
+    return undefined
+  }, pkg)
+  if (value === expectedValue) return
+  addFinding('package.json', `package metadata ${fieldPath} must be ${expectedValue}`)
+}
+
+function runMetadataChecks() {
+  let pkg = {}
+  try {
+    pkg = JSON.parse(readRequiredText('package.json'))
+  } catch (error) {
+    addFinding('package.json', `package metadata must be valid JSON: ${error.message}`)
+  }
+
+  requirePackageField(pkg, 'license', 'Apache-2.0')
+  requirePackageField(pkg, 'private', false)
+  requirePackageField(pkg, 'repository.url', 'git+https://github.com/DieDust/gujismart-public.git')
+  requirePackageField(pkg, 'bugs.url', 'https://github.com/DieDust/gujismart-public/issues')
+  requirePackageField(pkg, 'homepage', 'https://github.com/DieDust/gujismart-public#readme')
+
+  const license = readRequiredText('LICENSE')
+  requireText('LICENSE', license, /Apache License\s+Version 2\.0/i, 'project LICENSE must contain Apache License 2.0 text')
+
+  const notice = readRequiredText('NOTICE')
+  requireText('NOTICE', notice, /Copyright 2026 DieDust/, 'NOTICE must include project copyright attribution')
+  requireText('NOTICE', notice, /THIRD_PARTY_NOTICES\.md/, 'NOTICE must point to third-party notices')
+  requireText('NOTICE', notice, /QPDF/i, 'NOTICE must retain bundled QPDF attribution')
+
+  const readme = readRequiredText('README.md')
+  requireText('README.md', readme, /\[Apache License 2\.0\]\(LICENSE\)/, 'README must link the main Apache-2.0 license')
+  requireText('README.md', readme, /\[NOTICE\]\(NOTICE\)/, 'README must link NOTICE')
+  requireText('README.md', readme, /\[THIRD_PARTY_NOTICES\.md\]\(THIRD_PARTY_NOTICES\.md\)/, 'README must link third-party notices')
+
+  const contributing = readRequiredText('CONTRIBUTING.md')
+  requireText('CONTRIBUTING.md', contributing, /Licensing and Attribution/, 'CONTRIBUTING must explain licensing and attribution expectations')
+  requireText('CONTRIBUTING.md', contributing, /THIRD_PARTY_NOTICES\.md/, 'CONTRIBUTING must require third-party attribution updates')
+
+  const thirdParty = readRequiredText('THIRD_PARTY_NOTICES.md')
+  requireText('THIRD_PARTY_NOTICES.md', thirdParty, /resources\/vendor\/qpdf\//, 'third-party notices must document bundled QPDF')
+  requireText('THIRD_PARTY_NOTICES.md', thirdParty, /Microsoft Visual C\+\+ Runtime Files/, 'third-party notices must document bundled Microsoft runtime files')
+  requireText('THIRD_PARTY_NOTICES.md', thirdParty, /jszip[\s\S]+MIT OR GPL-3\.0-or-later/, 'third-party notices must document jszip dual license')
+  requireText('THIRD_PARTY_NOTICES.md', thirdParty, /pdfjs-dist[\s\S]+Apache-2\.0/, 'third-party notices must document pdfjs-dist license')
+  requireText('THIRD_PARTY_NOTICES.md', thirdParty, /playwright[\s\S]+Apache-2\.0/, 'third-party notices must document Playwright license')
+}
+
+runMetadataChecks()
+
 for (const relativePath of walk(root)) {
   const normalizedPath = relativePath.split(path.sep).join('/').toLowerCase()
   for (const check of pathChecks) {

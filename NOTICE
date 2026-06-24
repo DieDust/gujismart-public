@@ -1,0 +1,16 @@
+GujiSmart
+Copyright 2026 DieDust
+
+This product is licensed under the Apache License, Version 2.0.
+
+This product includes third-party open-source software and bundled runtime
+components. See THIRD_PARTY_NOTICES.md for attribution, license summaries,
+and the locations of bundled third-party license files.
+
+This product includes QPDF runtime files:
+
+  Copyright 2005-2021 Jay Berkenbilt,
+  2022-2026 Jay Berkenbilt and Manfred Holger.
+
+QPDF is licensed under the Apache License, Version 2.0. Its bundled license
+notice is included at resources/vendor/qpdf/share/doc/qpdf/license.html.

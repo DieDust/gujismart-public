@@ -24,11 +24,7 @@ npm run test:evidence-qa
 npm run smoke
 ```
 
-Manual corpus QA scripts require a local corpus and are not part of the default open-source test path:
-
-```bash
-GUJISMART_QA_DATA_DIR=/path/to/local/corpus npm run test:manual-corpus
-```
+Manual corpus QA scripts require private local data and are intentionally kept outside the public repository. Do not add scripts, default paths, document IDs, or fallback keywords that depend on a maintainer's private library.
 
 ## Code Style
 
@@ -58,3 +54,10 @@ Please include:
 ## Security
 
 Do not include API keys, credentials, private datasets, institution-only content, or real user library databases in issues or PRs.
+
+## Licensing and Attribution
+
+- New source files are contributed under the project's Apache-2.0 license unless explicitly stated otherwise.
+- Do not copy third-party source files, binaries, images, models, datasets, or documentation into the repository without also adding their license and attribution to `THIRD_PARTY_NOTICES.md`.
+- Bundled runtime binaries belong under `resources/vendor/` and must keep their upstream license files or notices.
+- Prefer package-manager dependencies over vendored code when practical, so license metadata remains traceable through `package-lock.json`.

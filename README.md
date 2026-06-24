@@ -37,7 +37,9 @@
 - AI：OpenAI 兼容接口
 
 ## 快速开始
-前往release下载最新安装包即可。
+
+前往 [GitHub Releases](https://github.com/DieDust/gujismart-public/releases) 下载最新安装包即可。
+
 ```bash
 npm install
 npm run dev
@@ -92,11 +94,11 @@ npm run check
 npm run build
 ```
 
-## 许可证
+## 许可证与第三方声明
 
 本项目使用 [Apache License 2.0](LICENSE)。
 
-随包第三方运行时组件见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+项目版权和必须保留的归属声明见 [NOTICE](NOTICE)。随包第三方运行时组件、直接 npm 依赖和构建工具许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 作者
 

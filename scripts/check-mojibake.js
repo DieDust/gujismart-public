@@ -40,7 +40,18 @@ function walk(target, files = []) {
 function extractStringLiterals(source, fileName) {
   const ext = path.extname(fileName)
   if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) {
-    return [{ text: source, index: 0 }]
+    const lines = source.split(/\r?\n/)
+    let index = 0
+    return lines.map((line) => {
+      const literal = { text: line, index }
+      index += line.length
+      if (source.slice(index, index + 2) === '\r\n') {
+        index += 2
+      } else if (source[index] === '\n') {
+        index += 1
+      }
+      return literal
+    }).filter((line) => line.text.trim())
   }
 
   const literals = []
