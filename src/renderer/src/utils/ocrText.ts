@@ -1064,19 +1064,54 @@ export function getOrderedOcrBlocks(page: OcrTextPage): OcrTextBlock[] {
     return [...blocks].sort(compareByPositiveBlockOrder)
   }
 
+  return [...blocks].sort(compareByOriginalReadingOrder)
+}
+
+function compareByOriginalReadingOrder(left: OcrTextBlock, right: OcrTextBlock): number {
+  const leftOrder = Number(left?.reading_order)
+  const rightOrder = Number(right?.reading_order)
+  const leftBlockOrder = Number(left?.block_order)
+  const rightBlockOrder = Number(right?.block_order)
+  if (Number.isFinite(leftOrder) || Number.isFinite(rightOrder)) {
+    return (Number.isFinite(leftOrder) ? leftOrder : Number.MAX_SAFE_INTEGER)
+      - (Number.isFinite(rightOrder) ? rightOrder : Number.MAX_SAFE_INTEGER)
+  }
+  if (Number.isFinite(leftBlockOrder) || Number.isFinite(rightBlockOrder)) {
+    return (Number.isFinite(leftBlockOrder) ? leftBlockOrder : Number.MAX_SAFE_INTEGER)
+      - (Number.isFinite(rightBlockOrder) ? rightBlockOrder : Number.MAX_SAFE_INTEGER)
+  }
+  const leftPoint = getBlockPoint(left)
+  const rightPoint = getBlockPoint(right)
+  return leftPoint.top - rightPoint.top || leftPoint.left - rightPoint.left
+}
+
+function getManualReadingOrder(block: OcrTextBlock): number | null {
+  const order = Number(block?.manual_reading_order)
+  return Number.isFinite(order) ? order : null
+}
+
+function compareByManualReadingOrder(left: OcrTextBlock, right: OcrTextBlock, preferPositiveBlockOrder: boolean): number {
+  const leftOrder = getManualReadingOrder(left)
+  const rightOrder = getManualReadingOrder(right)
+  if (leftOrder !== null || rightOrder !== null) {
+    const orderDelta = (leftOrder !== null ? leftOrder : Number.MAX_SAFE_INTEGER)
+      - (rightOrder !== null ? rightOrder : Number.MAX_SAFE_INTEGER)
+    if (orderDelta !== 0) return orderDelta
+  }
+
+  if (preferPositiveBlockOrder) return compareByPositiveBlockOrder(left, right)
+  return compareByOriginalReadingOrder(left, right)
+}
+
+export function getTextFlowOcrBlocks(page: OcrTextPage): OcrTextBlock[] {
+  const blocks = getOcrTextBlocks(page)
+  if (blocks.length === 0) return []
+  if (!blocks.some((block) => getManualReadingOrder(block) !== null)) return getOrderedOcrBlocks(page)
+  const preferPositiveBlockOrder = shouldPreferPositiveBlockOrder(blocks)
+
   return [...blocks].sort((left, right) => {
-    const leftOrder = Number(left?.reading_order)
-    const rightOrder = Number(right?.reading_order)
-    const leftBlockOrder = Number(left?.block_order)
-    const rightBlockOrder = Number(right?.block_order)
-    if (Number.isFinite(leftOrder) || Number.isFinite(rightOrder)) {
-      return (Number.isFinite(leftOrder) ? leftOrder : Number.MAX_SAFE_INTEGER)
-        - (Number.isFinite(rightOrder) ? rightOrder : Number.MAX_SAFE_INTEGER)
-    }
-    if (Number.isFinite(leftBlockOrder) || Number.isFinite(rightBlockOrder)) {
-      return (Number.isFinite(leftBlockOrder) ? leftBlockOrder : Number.MAX_SAFE_INTEGER)
-        - (Number.isFinite(rightBlockOrder) ? rightBlockOrder : Number.MAX_SAFE_INTEGER)
-    }
+    const manualDelta = compareByManualReadingOrder(left, right, preferPositiveBlockOrder)
+    if (manualDelta !== 0) return manualDelta
     const leftPoint = getBlockPoint(left)
     const rightPoint = getBlockPoint(right)
     return leftPoint.top - rightPoint.top || leftPoint.left - rightPoint.left
@@ -1084,7 +1119,7 @@ export function getOrderedOcrBlocks(page: OcrTextPage): OcrTextBlock[] {
 }
 
 function getOrderedBlockText(page: OcrTextPage): string {
-  const ordered = getOrderedOcrBlocks(page)
+  const ordered = getTextFlowOcrBlocks(page)
   if (ordered.length === 0) return ''
 
   return ordered.map((block) => {
@@ -1118,7 +1153,7 @@ function shouldPreferOcrBlocksForReading(page: OcrTextPage, blocks: OcrTextBlock
 }
 
 export function extractPageText(page: OcrTextPage): string {
-  const blocks = getOrderedOcrBlocks(page)
+  const blocks = getTextFlowOcrBlocks(page)
   if (shouldPreferOcrBlocksForReading(page, blocks)) {
     const blockText = blocks.map(getBlockText).filter(Boolean).join('\n\n')
     if (blockText.trim()) return blockText
@@ -1330,7 +1365,7 @@ export function getReadablePageText(page: OcrTextPage): string {
       : element.text).filter(Boolean).join('\n\n')
   }
 
-  const blocks = getOrderedOcrBlocks(page)
+  const blocks = getTextFlowOcrBlocks(page)
   if (shouldPreferOcrBlocksForReading(page, blocks)) {
     const blockText = blocks
       .map((block) => normalizeOcrTextForReading(getBlockText(block)))
@@ -1693,13 +1728,13 @@ function getEbookReadableElements(page: OcrTextPage): ReadablePageElement[] {
 export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[] {
   if (isEbookPage(page)) return getEbookReadableElements(page)
 
-  const blocks = getOrderedOcrBlocks(page)
+  const blocks = getTextFlowOcrBlocks(page)
   const cursor = { value: 0 }
   const elements: ReadablePageElement[] = []
   const layoutBlocks = getLayoutAwareBlocks(page)
 
   if (layoutBlocks.length > 0) {
-    for (const block of getOrderedOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } })) {
+    for (const block of getTextFlowOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } })) {
       const label = getBlockLabel(block)
       const rawText = getBlockText(block)
       const displayText = getBlockDisplayText(block)

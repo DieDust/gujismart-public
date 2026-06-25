@@ -16,6 +16,7 @@ import {
   ImportOutlined,
   PictureOutlined,
   PlusOutlined,
+  QuestionCircleOutlined,
   ReloadOutlined,
   RobotOutlined,
   RightOutlined,
@@ -97,6 +98,7 @@ interface FoldersViewProps {
 
 interface FoldersViewState {
   selectedFolderId: string | null
+  selectedFolderName?: string
   scrollTop: number
 }
 
@@ -236,12 +238,17 @@ function isFoldersMarqueeBlockedTarget(target: EventTarget | null): boolean {
     '.folder-card',
     '.folders-tree-row',
     '.folders-root-drop',
+    '.folders-selection-bar',
     'button',
     'input',
     'textarea',
     'select',
     'a',
     '[contenteditable="true"]',
+    '.ant-select',
+    '.ant-segmented',
+    '.ant-slider',
+    '.ant-checkbox-wrapper',
     '.ant-dropdown',
     '.ant-popover',
     '.ant-modal',
@@ -251,6 +258,7 @@ function isFoldersMarqueeBlockedTarget(target: EventTarget | null): boolean {
 export default function FoldersView({ onOpenFolder, onOpenDocument, initialState, onStateChange }: FoldersViewProps) {
   const contentRef = useRef<HTMLDivElement | null>(null)
   const suppressDocumentClickRef = useRef(false)
+  const lastSelectedDocumentIdRef = useRef<string | null>(null)
   const restoredStateRef = useRef(false)
   const activeImportFilePathsRef = useRef<Set<string>>(new Set())
   const [overview, setOverview] = useState<FolderOverviewResult | null>(null)
@@ -303,12 +311,20 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     }))
   ), [folders, selectedFolder])
 
+  const clearDocumentSelection = useCallback(() => {
+    setSelectedDocumentIds([])
+    lastSelectedDocumentIdRef.current = null
+  }, [])
+
   const emitStateChange = useCallback((folderId = selectedFolderId) => {
     onStateChange?.({
       selectedFolderId: folderId,
+      selectedFolderName: folderId === UNFILED_FOLDER_ID
+        ? UNFILED_FOLDER_NAME
+        : folders.find((folder) => folder.id === folderId)?.name || '',
       scrollTop: contentRef.current?.scrollTop || 0,
     })
-  }, [onStateChange, selectedFolderId])
+  }, [folders, onStateChange, selectedFolderId])
 
   const buildContentOptions = useCallback((folderId: string | null, offset = 0): FolderContentOptions => ({
     ...parseFolderDocumentSortValue(documentSort),
@@ -388,6 +404,13 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       // Local storage is optional; sorting still works for this session.
     }
   }, [documentSort])
+
+  useEffect(() => {
+    const anchorId = lastSelectedDocumentIdRef.current
+    if (selectedDocumentIds.length === 0 || (anchorId && !documentIdOrder.includes(anchorId))) {
+      lastSelectedDocumentIdRef.current = null
+    }
+  }, [documentIdOrder, selectedDocumentIds.length])
 
   useEffect(() => {
     if (restoredStateRef.current || !initialState || !contentRef.current || loading || contentLoading) return
@@ -835,7 +858,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
 
   const handleDocumentSortChange = (value: FolderDocumentSortValue) => {
     setDocumentSort(value)
-    setSelectedDocumentIds([])
+    clearDocumentSelection()
     setCoverSources({})
     if (contentRef.current) contentRef.current.scrollTop = 0
   }
@@ -1109,7 +1132,10 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
 
   const handleDocumentDragStart = (event: DragEvent<HTMLElement>, docId: string) => {
     const docIds = selectedDocumentIdSet.has(docId) && selectedDocumentIds.length > 0 ? selectedDocumentIds : [docId]
-    if (!selectedDocumentIdSet.has(docId)) setSelectedDocumentIds([docId])
+    if (!selectedDocumentIdSet.has(docId)) {
+      setSelectedDocumentIds([docId])
+      lastSelectedDocumentIdRef.current = docId
+    }
     suppressDocumentClickRef.current = true
     event.dataTransfer.effectAllowed = 'move'
     event.dataTransfer.setData(DOCUMENT_DRAG_MIME, JSON.stringify(docIds))
@@ -1161,22 +1187,36 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
 
   const handleDocumentCardClick = (event: MouseEvent<HTMLButtonElement>, docId: string) => {
     if (suppressDocumentClickRef.current) return
-    if (event.ctrlKey || event.metaKey || event.shiftKey) {
+    if (event.shiftKey) {
       event.preventDefault()
+      const anchorId = lastSelectedDocumentIdRef.current || selectedDocumentIds[selectedDocumentIds.length - 1]
       setSelectedDocumentIds((current) => {
-        if (event.shiftKey && current.length > 0) {
-          const lastId = current[current.length - 1]
-          const start = documentIdOrder.indexOf(lastId)
-          const end = documentIdOrder.indexOf(docId)
-          if (start >= 0 && end >= 0) {
-            const [from, to] = start <= end ? [start, end] : [end, start]
-            return Array.from(new Set([...current, ...documentIdOrder.slice(from, to + 1)]))
-          }
+        const start = anchorId ? documentIdOrder.indexOf(anchorId) : -1
+        const end = documentIdOrder.indexOf(docId)
+        if (start >= 0 && end >= 0) {
+          const [from, to] = start <= end ? [start, end] : [end, start]
+          const rangeIds = documentIdOrder.slice(from, to + 1)
+          if (event.ctrlKey || event.metaKey) return Array.from(new Set([...current, ...rangeIds]))
+          return rangeIds
         }
         return current.includes(docId) ? current.filter((id) => id !== docId) : [...current, docId]
       })
+      lastSelectedDocumentIdRef.current = docId
       return
     }
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault()
+      setSelectedDocumentIds((current) => (
+        current.includes(docId) ? current.filter((id) => id !== docId) : [...current, docId]
+      ))
+      lastSelectedDocumentIdRef.current = docId
+      return
+    }
+    lastSelectedDocumentIdRef.current = docId
+    setSelectedDocumentIds([docId])
+  }
+
+  const openDocumentInTab = (docId: string) => {
     emitStateChange(selectedFolderId)
     onOpenDocument?.(docId, {
       selectedFolderId,
@@ -1233,6 +1273,29 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     adjustDocumentCardSize(event.deltaY > 0 ? -DOCUMENT_CARD_SIZE_STEP : DOCUMENT_CARD_SIZE_STEP)
   }
 
+  const selectAllLoadedDocuments = useCallback(() => {
+    setSelectedDocumentIds(documentIdOrder)
+    lastSelectedDocumentIdRef.current = documentIdOrder[documentIdOrder.length - 1] || null
+  }, [documentIdOrder])
+
+  const invertLoadedDocumentSelection = useCallback(() => {
+    setSelectedDocumentIds((current) => {
+      const currentSet = new Set(current)
+      const nextIds = documentIdOrder.filter((id) => !currentSet.has(id))
+      lastSelectedDocumentIdRef.current = nextIds[nextIds.length - 1] || null
+      return nextIds
+    })
+  }, [documentIdOrder])
+
+  const handleContentClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    if (suppressDocumentClickRef.current) return
+    if (selectedDocumentIds.length === 0 || event.defaultPrevented || event.ctrlKey || event.metaKey || event.shiftKey) return
+    const target = event.target
+    if (!(target instanceof HTMLElement)) return
+    if (isFoldersMarqueeBlockedTarget(target)) return
+    clearDocumentSelection()
+  }, [clearDocumentSelection, selectedDocumentIds.length])
+
   const { startDragSelect: handleContentMouseDown } = useDragMultiSelect<HTMLDivElement>({
     rootRef: contentRef,
     itemSelector: '[data-folder-document-card="true"]',
@@ -1248,6 +1311,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       if (!sameStringArray(selectedDocumentIds, nextIds)) {
         setSelectedDocumentIds(nextIds)
       }
+      lastSelectedDocumentIdRef.current = nextIds[nextIds.length - 1] || null
     },
     onDragEnd: () => {
       suppressDocumentClickRef.current = true
@@ -1435,6 +1499,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     const selected = selectedDocumentIdSet.has(doc.id)
     const actionDocIds = getActionDocIds(doc.id)
     const menuItems: MenuProps['items'] = [
+      { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
       { key: 'open', label: '打开文献', icon: <BookOutlined /> },
       {
         key: 'ocr',
@@ -1486,12 +1551,8 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         menu={{
           items: menuItems,
           onClick: ({ key }) => {
-            if (key === 'open') {
-              emitStateChange(selectedFolderId)
-              onOpenDocument?.(doc.id, {
-                selectedFolderId,
-                scrollTop: contentRef.current?.scrollTop || 0,
-              })
+            if (key === 'open' || key === 'open_new_tab') {
+              openDocumentInTab(doc.id)
             }
             if (String(key).startsWith('ocr:')) void handleFolderBatchOcr(actionDocIds, String(key).replace('ocr:', '') as OcrEngine)
             if (String(key).startsWith('ocr_force:')) void handleFolderBatchOcr(actionDocIds, String(key).replace('ocr_force:', '') as OcrEngine, true)
@@ -1513,11 +1574,15 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
           data-folder-document-card="true"
           data-document-id={doc.id}
           onContextMenu={() => {
-            if (!selected) setSelectedDocumentIds([doc.id])
+            if (!selected) {
+              setSelectedDocumentIds([doc.id])
+              lastSelectedDocumentIdRef.current = doc.id
+            }
           }}
           onDragStart={(event) => handleDocumentDragStart(event, doc.id)}
           onDragEnd={finishDocumentDrag}
           onClick={(event) => handleDocumentCardClick(event, doc.id)}
+          onDoubleClick={() => openDocumentInTab(doc.id)}
           title={doc.title}
         >
           <span className={`folder-document-cover ${getDocumentCoverClass(doc.doc_type)}`}>
@@ -1541,12 +1606,22 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
 
   const renderDocumentSelectionBar = () => {
     if (selectedDocumentIds.length === 0) return null
+    const loadedCount = documentIdOrder.length
     return (
       <div className="folders-selection-bar">
         <div className="folders-selection-info">
-          已选 {selectedDocumentIds.length} 篇文献
+          <span>已选 {selectedDocumentIds.length} 篇文献</span>
+          <Tooltip title="Ctrl 点击可增减选择；Shift 点击可连续选择；点击空白处退出多选。">
+            <QuestionCircleOutlined className="folders-selection-help" />
+          </Tooltip>
         </div>
         <Space size={8} wrap>
+          <Button size="small" icon={<CheckSquareOutlined />} disabled={loadedCount === 0} onClick={selectAllLoadedDocuments}>
+            全选已加载
+          </Button>
+          <Button size="small" disabled={loadedCount === 0} onClick={invertLoadedDocumentSelection}>
+            反选
+          </Button>
           <Dropdown
             menu={{
               items: [
@@ -1614,7 +1689,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
               批量处理
             </Button>
           </Dropdown>
-          <Button size="small" onClick={() => setSelectedDocumentIds([])}>
+          <Button size="small" onClick={clearDocumentSelection}>
             取消选择
           </Button>
         </Space>
@@ -1721,6 +1796,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         style={{ '--folder-document-card-size': `${documentCardSize}px` } as CSSProperties}
         onScroll={handleContentScroll}
         onMouseDown={handleContentMouseDown}
+        onClick={handleContentClick}
         onWheel={handleContentWheel}
         onDragOver={handleContentDragOver}
         onDrop={handleContentDrop}

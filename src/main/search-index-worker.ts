@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { createHash } from 'crypto'
 import { parentPort } from 'worker_threads'
 import { getErrorMessage } from '../shared/errors'
+import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
 import {
   BACKGROUND_REINDEX_DELETE_BATCH_SIZE,
   BACKGROUND_REINDEX_PAGE_BATCH_SIZE,
@@ -428,6 +429,8 @@ function suppressOverrepresentedLines(text: string): string {
 }
 
 function getOrderedOcrBlocksFromPayload(parsed: OcrResultPayload | null): OcrBlock[] {
+  const ir = getOrBuildOcrPageIr(parsed)
+  if (ir) return deriveOcrReadingBlocksFromIr(ir) as OcrBlock[]
   const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
   const rawLayoutBlocks = Array.isArray(parsed?.raw_layout_result) ? parsed.raw_layout_result : []
   const blocks = layoutBlocks.length > 0
@@ -505,12 +508,15 @@ function getIndexablePageText(sqlite: NativeDatabase, page: SearchPageRow): stri
   const shouldLoadBlocks = shouldConsiderOcrBlocksForSearch(page) && (!!page.ocr_result || !ocrText)
   const pageWithOcrResult = shouldLoadBlocks ? loadPageOcrResultForSearch(sqlite, page) : page
   const parsed = shouldLoadBlocks ? parseMaybeJson<OcrResultPayload>(pageWithOcrResult?.ocr_result) : null
+  const ir = getOrBuildOcrPageIr(parsed, { pageIndex: Number(page.page_num || 0) || 1 })
   const blocks = parsed ? getOrderedOcrBlocksFromPayload(parsed) : []
   if (blocks.length > 0 && shouldPreferOcrBlocksForSearch(page, blocks, parsed)) {
     const blockText = suppressOverrepresentedLines(blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'))
     if (blockText.trim()) return blockText.trim()
   }
 
+  const irText = ir ? deriveOcrTextFromIr(ir) : ''
+  if (irText) return suppressOverrepresentedLines(irText)
   if (ocrText) return suppressOverrepresentedLines(ocrText)
   return suppressOverrepresentedLines(blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n')).trim()
 }

@@ -2754,7 +2754,7 @@ export default function EbookReader({
   }
 
   const renderSidebar = () => (
-    <aside style={{ width: 282, flex: '0 0 282px', border: '1px solid rgba(112,75,35,0.22)', borderRadius: 8, background: '#efe3ce', boxShadow: '0 16px 32px rgba(48,30,12,0.18)', display: 'flex', flexDirection: 'column', overflow: 'hidden', margin: 12, marginRight: 0 }}>
+    <aside className="ebook-reader-sidebar" style={{ width: 282, flex: '0 0 282px', border: '1px solid rgba(112,75,35,0.22)', borderRadius: 8, background: '#efe3ce', boxShadow: '0 16px 32px rgba(48,30,12,0.18)', display: 'flex', flexDirection: 'column', overflow: 'hidden', margin: 12, marginRight: 0 }}>
       <div style={{ padding: '10px 12px', borderBottom: '1px solid rgba(112,75,35,0.22)' }}>
         <Segmented
           size="small"

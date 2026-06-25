@@ -56,6 +56,7 @@ import {
 } from '../../shared/parallel-translation'
 import { shouldTranslatePageText } from '../../shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '../../shared/translation-source'
+import { deriveOcrTextFromIr, ensureOcrResultIr, getOcrPageIr } from '../../shared/ocr-ir'
 import { allowFileAccessPath, allowFileAccessPaths, assertAllowedLocalFilePath } from '../file-access'
 import type {
   AiTaskOptions,
@@ -2651,10 +2652,15 @@ function parsePageOcrMeta(page: PageOcrMetaRow): { has_ocr_text: boolean; needs_
   try {
     const parsed = typeof page.ocr_result === 'string' ? JSON.parse(page.ocr_result) : page.ocr_result
     const blocks = isJsonRecord(parsed) && Array.isArray(parsed.layout_result) ? parsed.layout_result : []
+    const ir = getOcrPageIr(parsed)
     const hasText = hasInlineText || hasStructuredOcrText(parsed)
     return {
       has_ocr_text: hasText,
-      needs_layout_attention: blocks.some((block) => isJsonRecord(block) && !!block.needs_enhancement),
+      needs_layout_attention: blocks.some((block) => isJsonRecord(block) && !!block.needs_enhancement)
+        || Boolean(ir && (
+          ir.page.quality.score < 0.65
+          || ir.page.quality.issues.some((issue) => issue.severity === 'error' || issue.severity === 'warning')
+        )),
     }
   } catch {
     return { has_ocr_text: hasInlineText, needs_layout_attention: false }
@@ -4622,16 +4628,42 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('pages:update', async (_event, pageId: string, data: PageUpdatePayload) => {
-    const page = queryOne<{ doc_id: string }>('SELECT doc_id FROM pages WHERE id = ?', [pageId])
+    const page = queryOne<{ doc_id: string; page_num: number | null; image_path: string | null }>(
+      'SELECT doc_id, page_num, image_path FROM pages WHERE id = ?',
+      [pageId],
+    )
     if (!page) return false
+    const normalizedData: PageUpdatePayload = { ...data }
+    if ('ocr_result' in normalizedData && normalizedData.ocr_result) {
+      let imageSize: { width: number; height: number } | null = null
+      const imagePath = String(normalizedData.image_path || page.image_path || '').trim()
+      if (imagePath) {
+        try {
+          const image = nativeImage.createFromPath(imagePath)
+          if (!image.isEmpty()) imageSize = image.getSize()
+        } catch {
+          imageSize = null
+        }
+      }
+      const normalizedResult = ensureOcrResultIr(normalizedData.ocr_result, {
+        pageIndex: Number(page.page_num || 0) || 1,
+        pageWidth: imageSize?.width,
+        pageHeight: imageSize?.height,
+        forceRebuild: true,
+      })
+      normalizedData.ocr_result = normalizedResult
+      if (!('ocr_text' in normalizedData) && normalizedResult.gujismart_ir) {
+        normalizedData.ocr_text = deriveOcrTextFromIr(normalizedResult.gujismart_ir)
+      }
+    }
 
     const allowedFields: Array<keyof PageUpdatePayload> = ['image_path', 'ocr_text', 'ocr_result', 'proofed_text', 'ocr_status', 'proof_status']
     const sets: string[] = []
     const params: unknown[] = []
 
     for (const field of allowedFields) {
-      if (!(field in data)) continue
-      const value = data[field]
+      if (!(field in normalizedData)) continue
+      const value = normalizedData[field]
       if (field === 'ocr_text' || field === 'ocr_result' || field === 'proofed_text') {
         const prepared = preparePagePayloadUpdate(page.doc_id, pageId, field, value)
         sets.push(`${field} = ?`, `${field}_ref = ?`)
@@ -4647,7 +4679,7 @@ export function registerDocumentIpc(): void {
     params.push(pageId)
     run(`UPDATE pages SET ${sets.join(', ')} WHERE id = ?`, params)
     syncDocumentProofStatus(page.doc_id)
-    if ('ocr_text' in data || 'proofed_text' in data || 'ocr_result' in data) {
+    if ('ocr_text' in normalizedData || 'proofed_text' in normalizedData || 'ocr_result' in normalizedData) {
       markDocumentTocDirty(page.doc_id)
     }
     markSearchIndexStaleForPages([pageId])
@@ -4672,12 +4704,18 @@ export function registerDocumentIpc(): void {
       }
     }
 
-    let ocrText = page.ocr_text as string
-    if (Array.isArray(ocrResult?.words_result)) {
-      ocrText = ocrResult.words_result.map((item) => textValue(isJsonRecord(item) ? item.words : '')).join('\n')
-    }
+    const normalizedOcrResult = ocrResult
+      ? ensureOcrResultIr(ocrResult, {
+          pageIndex: Number(page.page_num || 0) || 1,
+          generatedAt: getOcrPageIr(page.ocr_result)?.generatedAt,
+          forceRebuild: true,
+        })
+      : null
+    const ocrText = normalizedOcrResult?.gujismart_ir
+      ? deriveOcrTextFromIr(normalizedOcrResult.gujismart_ir)
+      : String(page.ocr_text || '')
 
-    const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', ocrResult)
+    const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', normalizedOcrResult)
     const nextOcrText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', ocrText)
     run('UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, proofed_text = ?, proofed_text_ref = ?, proof_status = ? WHERE id = ?', [
       nextOcrResult.value,

@@ -190,6 +190,8 @@ function createWindow(): void {
 
   let windowShownInitialized = false
   let windowShowFallbackTimer: NodeJS.Timeout | null = null
+  let rendererRecoveryAttempts = 0
+  let rendererRecoveryResetTimer: NodeJS.Timeout | null = null
   const showWindowIfNeeded = (win: BrowserWindow): void => {
     if (!win.isVisible()) {
       win.show()
@@ -230,6 +232,14 @@ function createWindow(): void {
   mainWindow.webContents.on('did-finish-load', () => {
     console.log(`[Main] Renderer finished loading: ${mainWindow?.webContents.getURL() || ''}`)
     showMainWindowFallback('did-finish-load')
+    if (rendererRecoveryResetTimer) {
+      clearTimeout(rendererRecoveryResetTimer)
+    }
+    rendererRecoveryResetTimer = setTimeout(() => {
+      rendererRecoveryAttempts = 0
+      rendererRecoveryResetTimer = null
+    }, 15000)
+    rendererRecoveryResetTimer.unref?.()
   })
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
@@ -245,6 +255,41 @@ function createWindow(): void {
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
     console.error(`[Main] Renderer process gone: reason=${details.reason}; exitCode=${details.exitCode}`)
+    const win = mainWindow
+    if (
+      !win
+      || win.isDestroyed()
+      || quitConfirmed
+      || details.reason === 'clean-exit'
+    ) {
+      return
+    }
+    if (rendererRecoveryResetTimer) {
+      clearTimeout(rendererRecoveryResetTimer)
+      rendererRecoveryResetTimer = null
+    }
+    if (rendererRecoveryAttempts >= 2) {
+      void dialog.showMessageBox(win, {
+        type: 'error',
+        title: '页面渲染失败',
+        message: '界面连续加载失败，请重启软件。',
+        detail: '文献库数据仍保存在本地，不会因本次界面异常而丢失。',
+        buttons: ['关闭软件'],
+        defaultId: 0,
+        noLink: true,
+      }).finally(() => {
+        quitConfirmed = true
+        app.quit()
+      })
+      return
+    }
+    rendererRecoveryAttempts += 1
+    setTimeout(() => {
+      if (!win.isDestroyed()) {
+        console.warn(`[Main] Reloading renderer after process failure (attempt ${rendererRecoveryAttempts}/2)`)
+        win.webContents.reload()
+      }
+    }, 500).unref?.()
   })
 
   const windowShowFallbackDelayMs = is.dev ? 12000 : 8000

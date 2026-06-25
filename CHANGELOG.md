@@ -1,5 +1,73 @@
 # 更新日志 / Changelog
 
+## 1.0.6 - 2026-06-25
+
+### 中文
+
+#### 改进
+
+- 校对模式的右侧文本块列表支持拖拽重排，适合修正 OCR 在多栏、插图或复杂版式下产生的阅读顺序问题。
+- 扩大文本块拖拽热区为左侧整列，并增加行间插入提示和拖动过渡反馈，让手动重排更容易命中、更顺滑。
+- 拖放后会立即保存当前页新的阅读顺序，并同步刷新普通阅读模式、搜索和摘录读取到的文本顺序。
+- 手动顺序写入独立的 `manual_reading_order` 字段，不改 OCR 块坐标，也不影响版式还原视图的坐标排版。
+- 新增 GujiSmart OCR IR v1，将不同 OCR 引擎的结果统一为 span、line、block、paragraph、page 和 document 层级，同时保留原始坐标、来源、置信度和质量原因。
+- PDF 导入增加文本层质量预检，可区分文本型、扫描型和混合型页面，优先保留可信原生文本，并仅对需要的页面继续 OCR。
+- 阅读、搜索、翻译和纯文本导出统一从结构化 OCR 正文流派生；页眉、页脚和页码会保留在独立层，不再默认混入正文。
+- 支持在不重新调用 OCR、也不覆盖人工校对文本的情况下重建全文结构、阅读顺序和跨页关系。
+- 改进横排同栏、竖排相邻列和跨页正文的段落连续性判断，并补充图片、表格、公式、题注与脚注的父子关系。
+- OCR 质量检查现在可只裁剪并重识别低置信度、异常字符或待增强文本块，正常区域、原坐标和人工校对文本保持不变。
+- OCR 阅读流会优先采用引擎返回的方向与阅读顺序，并按整篇正文的主方向统一横排或竖排；竖排在缺少明确顺序时按从右到左排列，单个误判块不再打乱全文。
+- 旧版结构化 OCR 会在阅读时惰性转换到当前 IR，无需批量迁移；OCR IR 管线升级到 1.2.0，旧管线结果可按新规则重新派生。
+- 阅读、翻译、搜索和纯文本导出统一使用段落级阅读流，校对编辑和版式还原仍保留原始块与坐标。
+- 新增 Paddle、视觉模型和混合 OCR 的固定基准样本，持续检查横排、竖排、富内容关系、正文流和质量报告。
+- 首页新增“文件夹”入口卡片，可直接进入文件夹页面，让欢迎页功能入口形成完整两行布局。
+- 优化文件夹页和文献库的框选多选体验：多选框会跟随滚动内容移动，拖到边缘时会自动滚动，空白处点击可退出多选。
+- 文件夹页新增“全选已加载”“反选”和 Ctrl/Shift 多选提示，使操作更接近系统文件管理器。
+- 新增工作区自动保存与恢复：退出软件后重新打开，会恢复此前打开的标签页、标签顺序、当前标签、文献目标、文件夹位置和侧栏折叠状态。
+- 工作区只保存轻量导航信息，不写入 OCR 全文或检索结果大对象；文献阅读进度继续使用现有阅读状态单独恢复。
+
+#### 修复
+
+- 修复文本块拖拽完成后高亮可能落到目标位置原有文本块的问题；现在高亮会继续跟随被拖动的同一个文本块。
+
+#### 下载
+
+- `GujiSmart-1.0.6-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.0.6-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Improvements
+
+- Added drag-and-drop reordering for OCR text blocks in the proofing text list, useful for correcting reading-order issues from multi-column pages, figures, or complex layouts.
+- Expanded the drag hit area to a full left-side lane with insertion indicators and smoother row transitions.
+- Dropping a block now immediately saves the current page's reading order and refreshes the text order used by normal reading mode, search, and excerpts.
+- Manual order is stored in a separate `manual_reading_order` field, leaving OCR block coordinates and the facsimile/layout restoration view unchanged.
+- Added GujiSmart OCR IR v1, normalizing OCR engines into span, line, block, paragraph, page, and document layers while retaining coordinates, provenance, confidence, and quality reasons.
+- Added PDF text-layer quality preflight to distinguish native-text, scanned, and mixed pages, preserving trustworthy native text and OCRing only pages that need it.
+- Reading, search, translation, and plain-text export now derive from the same structured OCR body flow; headers, footers, and page numbers remain available without entering the default body text.
+- Added full-document structure rebuilding without another OCR request and without overwriting manually proofread text.
+- Improved paragraph continuity for same-column horizontal text, adjacent vertical columns, and cross-page body text, with richer parent-child links among images, tables, formulas, captions, and footnotes.
+- OCR quality checks can now crop and rerecognize only low-confidence, invalid-character, or enhancement-needed text blocks while preserving unaffected regions, source coordinates, and proofread text.
+- OCR reading flow now prioritizes engine-provided orientation and reading order, then normalizes body text to the document's dominant horizontal or vertical direction. Vertical fallback runs right to left, so isolated misclassified blocks no longer disrupt the document.
+- Legacy structured OCR is now lazily converted to the current IR during reading without a bulk migration; OCR IR pipeline 1.2.0 can rederive older pipeline output with current rules.
+- Reading, translation, search, and plain-text export now share a paragraph-level reading flow, while proofing and facsimile restoration retain original blocks and coordinates.
+- Added fixed Paddle, vision-model, and hybrid OCR benchmarks covering horizontal text, vertical columns, rich-content relationships, body flow, and quality reports.
+- Added a Folders entry card to the welcome page, linking directly to the folder overview and completing the two-row shortcut layout.
+- Improved drag multi-select in the Folders page and Library: the marquee is anchored to the scrolling content, edge-dragging auto-scrolls, and blank-space clicks exit multi-select.
+- Added "select loaded", invert selection, and Ctrl/Shift selection hints in the Folders page for a more Explorer-like workflow.
+- Added automatic workspace persistence and restoration. Reopening the app restores open tabs, tab order, the active tab, document targets, folder context, and sidebar collapse state.
+- Workspace snapshots store only lightweight navigation data, excluding OCR text and large search-result objects; document reading progress continues to restore through the existing reader-state storage.
+
+#### Fixes
+
+- Fixed the active highlight after dragging a text block so it stays on the dragged block instead of the block that previously occupied the drop position.
+
+#### Downloads
+
+- `GujiSmart-1.0.6-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.0.6-Portable-x64.exe` for portable use.
+
 ## 1.0.5 - 2026-06-23
 
 ### 中文

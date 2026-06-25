@@ -532,7 +532,7 @@ async function verifySearchReaderRoundTrip(window, userDataDir) {
   }, { id: docId, session: searchSession })
   await window.waitForFunction(() => {
     const text = document.querySelector('main')?.textContent || ''
-    return text.includes('smoke-reader') && text.includes('roundtrip-keyword') && document.querySelectorAll('mark').length > 0
+    return text.includes('roundtrip-keyword') && document.querySelectorAll('main mark').length > 0
   }, null, { timeout: 5000 })
 
   const state = await window.evaluate(async (id) => window.api.getReaderState(id), docId)
@@ -705,7 +705,8 @@ async function verifyReaderSearchStaysWithinVisibleSpread(window, userDataDir) {
   try {
     await window.waitForFunction(() => {
       const text = document.querySelector('main')?.textContent || ''
-      return text.includes('smoke-visible-spread') && /1\s*\/\s*4/.test(text)
+      const activeTabTitle = document.querySelector('[data-app-tab-active="true"]')?.textContent || ''
+      return (activeTabTitle.includes('smoke-visible-spread') || text.includes('smoke-visible-spread')) && /1\s*\/\s*4/.test(text)
     }, null, { timeout: 5000 })
   } catch (error) {
     const text = await window.locator('main').innerText().catch(() => '')
@@ -932,15 +933,11 @@ async function verifyReaderSearchHasSingleActiveHighlight(window, userDataDir) {
       locator: session.hits?.[0]?.locator
     })
   }, docId)
-  await window.waitForTimeout(500)
-  const actualDocTitle = await window.locator('main h4').first().innerText().catch(() => '')
-  if (!actualDocTitle.includes('zz-smoke-many-active')) {
-    throw new Error(`Expected many-active document to be opened, saw title: ${actualDocTitle}`)
-  }
 
   await window.waitForFunction(() => {
     const text = document.querySelector('main')?.textContent || ''
-    return text.includes('zz-smoke-many-active') && /1\s*\/\s*\d+/.test(text)
+    const activeTabTitle = document.querySelector('[data-app-tab-active="true"]')?.textContent || ''
+    return (activeTabTitle.includes('zz-smoke-many-active') || text.includes('zz-smoke-many-active')) && /1\s*\/\s*\d+/.test(text)
   }, null, { timeout: 5000 })
 
   const nextSearchButton = window.locator('button[data-reader-search-next="true"]').first()
@@ -1073,7 +1070,8 @@ async function verifyReaderSearchKeepsActiveVisibleAcrossManyPageFlips(window, u
 
   await window.waitForFunction(() => {
     const text = document.querySelector('main')?.textContent || ''
-    return text.includes('zz-smoke-page-flip-search') && /1\s*\/\s*\d+/.test(text)
+    const activeTabTitle = document.querySelector('[data-app-tab-active="true"]')?.textContent || ''
+    return (activeTabTitle.includes('zz-smoke-page-flip-search') || text.includes('zz-smoke-page-flip-search')) && /1\s*\/\s*\d+/.test(text)
   }, null, { timeout: 5000 })
 
   const nextSearchButton = window.locator('button[data-reader-search-next="true"]').first()
@@ -1205,7 +1203,8 @@ async function verifyReaderSearchSyncsAfterManualPageFlip(window, userDataDir) {
 
   await window.waitForFunction(() => {
     const text = document.querySelector('main')?.textContent || ''
-    return text.includes('zz-smoke-manual-page-sync') && /1\s*\/\s*\d+/.test(text)
+    const activeTabTitle = document.querySelector('[data-app-tab-active="true"]')?.textContent || ''
+    return (activeTabTitle.includes('zz-smoke-manual-page-sync') || text.includes('zz-smoke-manual-page-sync')) && /1\s*\/\s*\d+/.test(text)
   }, null, { timeout: 5000 })
 
   const pageNextButton = window.locator('button[data-reader-page-next="true"]').first()
@@ -1320,7 +1319,8 @@ async function verifyReaderSearchKeepsActiveVisibleInLongSection(window, userDat
 
   await window.waitForFunction(() => {
     const text = document.querySelector('main')?.textContent || ''
-    return text.includes('zz-smoke-long-section-search') && /1\s*\/\s*\d+/.test(text)
+    const activeTabTitle = document.querySelector('[data-app-tab-active="true"]')?.textContent || ''
+    return (activeTabTitle.includes('zz-smoke-long-section-search') || text.includes('zz-smoke-long-section-search')) && /1\s*\/\s*\d+/.test(text)
   }, null, { timeout: 5000 })
 
   const nextSearchButton = window.locator('button[data-reader-search-next="true"]').first()
@@ -1430,7 +1430,8 @@ async function verifyReaderSearchRendersHtmlTables(window, userDataDir) {
 
   await window.waitForFunction(() => {
     const text = document.querySelector('main')?.textContent || ''
-    return text.includes('zz-smoke-html-table') && text.includes('日语')
+    const activeTabTitle = document.querySelector('[data-app-tab-active="true"]')?.textContent || ''
+    return (activeTabTitle.includes('zz-smoke-html-table') || text.includes('zz-smoke-html-table')) && text.includes('日语')
   }, null, { timeout: 5000 })
 
   const state = await window.evaluate(() => {

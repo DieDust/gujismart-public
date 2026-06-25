@@ -1,0 +1,133 @@
+[
+  {
+    "name": "paddle-horizontal-paragraph",
+    "options": {
+      "pageIndex": 1,
+      "pageWidth": 1000,
+      "pageHeight": 1000,
+      "engine": "paddle"
+    },
+    "result": {
+      "source_type": "paddle_ocr",
+      "layout_result": [
+        {
+          "words": "Benchmark header",
+          "label": "header",
+          "reading_order": 0,
+          "location": { "left": 80, "top": 20, "width": 840, "height": 30 }
+        },
+        {
+          "words": "Paragraph begins",
+          "label": "text",
+          "reading_order": 1,
+          "column_index": 0,
+          "confidence": 0.94,
+          "location": { "left": 100, "top": 140, "width": 700, "height": 60 }
+        },
+        {
+          "words": "and ends in the same column.",
+          "label": "text",
+          "reading_order": 2,
+          "column_index": 0,
+          "confidence": 0.93,
+          "location": { "left": 102, "top": 210, "width": 698, "height": 60 }
+        }
+      ]
+    },
+    "expected": {
+      "engine": "paddle",
+      "paragraphCount": 1,
+      "readingBlockCount": 1,
+      "discardedBlockCount": 1,
+      "text": "Paragraph begins and ends in the same column."
+    }
+  },
+  {
+    "name": "vision-vertical-columns",
+    "options": {
+      "pageIndex": 2,
+      "pageWidth": 1000,
+      "pageHeight": 1000,
+      "engine": "vision_model"
+    },
+    "result": {
+      "source_type": "vision_model_ocr",
+      "layout_result": [
+        {
+          "words": "天地玄黄",
+          "label": "vertical_text",
+          "orientation": "vertical",
+          "reading_order": 0,
+          "column_index": 0,
+          "confidence": 0.9,
+          "location": { "left": 820, "top": 100, "width": 45, "height": 620 }
+        },
+        {
+          "words": "宇宙洪荒",
+          "label": "vertical_text",
+          "orientation": "vertical",
+          "reading_order": 1,
+          "column_index": 1,
+          "confidence": 0.91,
+          "location": { "left": 760, "top": 105, "width": 45, "height": 615 }
+        }
+      ]
+    },
+    "expected": {
+      "engine": "vision_model",
+      "paragraphCount": 1,
+      "readingBlockCount": 1,
+      "discardedBlockCount": 0,
+      "text": "天地玄黄宇宙洪荒"
+    }
+  },
+  {
+    "name": "hybrid-rich-content",
+    "options": {
+      "pageIndex": 3,
+      "pageWidth": 1000,
+      "pageHeight": 1000,
+      "engine": "hybrid"
+    },
+    "result": {
+      "source_type": "hybrid_ocr",
+      "layout_result": [
+        {
+          "words": "Rich content paragraph.",
+          "label": "text",
+          "reading_order": 0,
+          "confidence": 0.96,
+          "location": { "left": 100, "top": 100, "width": 800, "height": 70 }
+        },
+        {
+          "words": "figure",
+          "label": "image",
+          "reading_order": 1,
+          "image_path": "fixture-image.jpg",
+          "location": { "left": 140, "top": 220, "width": 500, "height": 300 }
+        },
+        {
+          "words": "Figure 1 caption",
+          "label": "caption",
+          "reading_order": 2,
+          "location": { "left": 150, "top": 535, "width": 480, "height": 45 }
+        },
+        {
+          "words": "A\tB\n1\t2",
+          "label": "table",
+          "reading_order": 3,
+          "rows": [["A", "B"], ["1", "2"]],
+          "location": { "left": 100, "top": 650, "width": 800, "height": 220 }
+        }
+      ]
+    },
+    "expected": {
+      "engine": "hybrid",
+      "paragraphCount": 2,
+      "readingBlockCount": 4,
+      "discardedBlockCount": 0,
+      "textIncludes": ["Rich content paragraph.", "Figure 1 caption", "A\tB"],
+      "captionHasParent": true
+    }
+  }
+]

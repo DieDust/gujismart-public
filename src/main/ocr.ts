@@ -7,7 +7,7 @@ import { app, nativeImage } from 'electron'
 import { PDFDocument } from 'pdf-lib'
 import { queryOne } from './database'
 import { isAbortError } from '../shared/errors'
-import type { OcrProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult, OcrRecognizeWordResult, OcrSecondPass, PageOcrOptions } from '../shared/types'
+import type { OcrBoundingBox, OcrProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult, OcrRecognizeWordResult, OcrSecondPass, PageOcrOptions } from '../shared/types'
 export type { OcrProfile, OcrSecondPass, PageOcrOptions } from '../shared/types'
 
 type JsonRecord = Record<string, unknown>
@@ -1611,6 +1611,15 @@ function cropImageToDataUrl(filePath: string, location: LayoutLocation): string 
     height,
   })
   return cropped.toDataURL()
+}
+
+export async function recognizeImageRegion(
+  filePath: string,
+  location: OcrBoundingBox,
+  preferVertical = false,
+): Promise<OcrRecognizeResult> {
+  const dataUrl = cropImageToDataUrl(filePath, location)
+  return recognizeImage(dataUrl, { preferVertical })
 }
 
 function getResultPlainText(result: OcrResultPayload): string {

@@ -484,6 +484,10 @@ function isLibraryMarqueeBlockedTarget(target: EventTarget | null): boolean {
     'select',
     'a',
     '[contenteditable="true"]',
+    '.ant-select',
+    '.ant-segmented',
+    '.ant-slider',
+    '.ant-checkbox-wrapper',
     '.ant-dropdown',
     '.ant-popover',
     '.ant-modal',
@@ -680,6 +684,7 @@ interface DocumentCardContext {
   taggingDocId: string | null
   taggingChecked: string[]
   handleRowClick: (docId: string, event?: MouseEvent<HTMLElement>) => void
+  handleDocumentOpen: (docId: string) => void
   handleDocumentContextMenu: (docId: string) => void
   getDocumentContextMenuItems: (docId: string, singleItems: MenuProps['items']) => MenuProps['items']
   handleDocumentContextMenuClick: (docId: string, singleHandler: MenuProps['onClick']) => MenuProps['onClick']
@@ -1414,6 +1419,7 @@ function DocumentVirtualRow({
     ...[1, 2, 3, 4, 5].map((value) => ({ key: String(value), label: `${'★'.repeat(value)}${'☆'.repeat(5 - value)}` })),
   ]
   const moreMenuItems: MenuProps['items'] = [
+    { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
     { key: 'edit', label: '编辑元数据', icon: <EditOutlined /> },
     ...(shouldShowRetryAction(doc)
       ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
@@ -1476,6 +1482,10 @@ function DocumentVirtualRow({
 
   const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
     domEvent.stopPropagation()
+    if (key === 'open_new_tab') {
+      context.handleDocumentOpen(doc.id)
+      return
+    }
     if (key === 'edit') {
       void context.openMetadataEditor(doc.id)
       return
@@ -1570,7 +1580,7 @@ function DocumentVirtualRow({
           }}
           onContextMenu={() => context.handleDocumentContextMenu(doc.id)}
           onClick={(event) => context.handleRowClick(doc.id, event)}
-          onDoubleClick={() => void context.openMetadataEditor(doc.id)}
+          onDoubleClick={() => context.handleDocumentOpen(doc.id)}
           style={{
             height: '100%',
             display: 'flex',
@@ -4919,15 +4929,20 @@ export default function LibraryView({
       }
     }
 
-    if (batchMode || event?.ctrlKey || event?.metaKey) {
+    if (event?.ctrlKey || event?.metaKey) {
       toggleSelect(docId)
       setBatchMode(true)
       lastClickedDocIdRef.current = docId
       return
     }
     lastClickedDocIdRef.current = docId
+    setSelectedIds([docId])
+    setBatchMode(false)
+  }, [batchMode, documentIdOrder, documents, selectedIds, setSelectedIds, toggleSelect])
+
+  const handleDocumentOpen = useCallback((docId: string) => {
     onSelectDoc?.({ docId })
-  }, [batchMode, documentIdOrder, documents, onSelectDoc, selectedIds, setSelectedIds, toggleSelect])
+  }, [onSelectDoc])
 
   const openDocumentTagModal = useCallback((docId: string) => {
     const doc = documentsRef.current.find((item) => item.id === docId)
@@ -5155,20 +5170,28 @@ export default function LibraryView({
 
   const getDocumentContextMenuItems = useCallback((docId: string, singleItems: MenuProps['items']) => {
     if (selectedIdSet.has(docId) && selectedIds.length > 0) {
-      return batchMenuItems
+      return [
+        { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
+        { type: 'divider' as const },
+        ...(batchMenuItems || []),
+      ]
     }
     return singleItems
   }, [batchMenuItems, selectedIdSet, selectedIds.length])
 
   const handleDocumentContextMenuClick = useCallback((docId: string, singleHandler: MenuProps['onClick']): MenuProps['onClick'] => {
     return (info) => {
+      if (info.key === 'open_new_tab') {
+        handleDocumentOpen(docId)
+        return
+      }
       if (selectedIdSet.has(docId) && selectedIds.length > 0) {
         handleBatchMenu(info)
         return
       }
       singleHandler?.(info)
     }
-  }, [handleBatchMenu, selectedIdSet, selectedIds.length])
+  }, [handleBatchMenu, handleDocumentOpen, selectedIdSet, selectedIds.length])
 
   const toggleSectionCollapsed = (section: 'smart' | 'folder' | 'tag') => {
     setCollapsedSections((current) => ({ ...current, [section]: !current[section] }))
@@ -5244,6 +5267,17 @@ export default function LibraryView({
     },
   })
 
+  const handleLibraryContentClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    if (suppressLibraryClickRef.current) return
+    if (!batchMode && selectedIds.length === 0) return
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.shiftKey) return
+    const target = event.target
+    if (!(target instanceof HTMLElement)) return
+    if (isLibraryMarqueeBlockedTarget(target)) return
+    clearSelection()
+    setBatchMode(false)
+  }, [batchMode, clearSelection, selectedIds.length])
+
   const listCardContext = useMemo<DocumentCardContext>(() => ({
     viewMode,
     batchMode,
@@ -5257,6 +5291,7 @@ export default function LibraryView({
     taggingDocId,
     taggingChecked,
     handleRowClick,
+    handleDocumentOpen,
     handleDocumentContextMenu,
     getDocumentContextMenuItems,
     handleDocumentContextMenuClick,
@@ -5296,6 +5331,7 @@ export default function LibraryView({
     getDocumentContextMenuItems,
     handleDocumentContextMenuClick,
     handleDocumentDragStart,
+    handleDocumentOpen,
     handleCleanupPdfAssets,
     handleForceRerunDocument,
     handleQuickAddTagToDocument,
@@ -5956,6 +5992,7 @@ export default function LibraryView({
           ref={libraryContentRef}
           className="library-content"
           onMouseDown={handleLibraryContentMouseDown}
+          onClick={handleLibraryContentClick}
           onScroll={(event) => {
             if (viewMode === 'grid') maybeLoadMoreFromScroll(event.currentTarget)
           }}
@@ -6059,6 +6096,7 @@ export default function LibraryView({
               ]
 
               const moreMenuItems: MenuProps['items'] = [
+                { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
                 { key: 'edit', label: '编辑元数据', icon: <EditOutlined /> },
                 ...(shouldShowRetryAction(doc)
                   ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
@@ -6131,6 +6169,10 @@ export default function LibraryView({
 
               const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
                 domEvent.stopPropagation()
+                if (key === 'open_new_tab') {
+                  handleDocumentOpen(doc.id)
+                  return
+                }
                 if (key === 'edit') {
                   void openMetadataEditor(doc.id)
                   return
@@ -6225,7 +6267,7 @@ export default function LibraryView({
                     }}
                     onContextMenu={() => handleDocumentContextMenu(doc.id)}
                     onClick={(event) => handleRowClick(doc.id, event)}
-                    onDoubleClick={() => void openMetadataEditor(doc.id)}
+                    onDoubleClick={() => handleDocumentOpen(doc.id)}
                     style={{
                       display: 'flex',
                       flexDirection: 'column',

@@ -34,6 +34,7 @@ type DragSession = DragMultiSelectState & {
   scrollRoot: HTMLElement
   overlay: HTMLDivElement | null
   overlayLabel: HTMLSpanElement | null
+  autoScrollFrame: number | null
   previewIdsSet: Set<string>
   accumulatedHitIds: Set<string>
   targetById: Map<string, HTMLElement>
@@ -117,12 +118,11 @@ function getElementContentRect(root: HTMLElement, element: HTMLElement): DragSel
   return { left, top, right, bottom, width: right - left, height: bottom - top }
 }
 
-function contentRectToVisibleViewportRect(root: HTMLElement, rect: DragSelectionRect): DragSelectionRect {
-  const rootRect = root.getBoundingClientRect()
-  const left = Math.max(rootRect.left, rootRect.left + rect.left - root.scrollLeft)
-  const top = Math.max(rootRect.top, rootRect.top + rect.top - root.scrollTop)
-  const right = Math.min(rootRect.right, rootRect.left + rect.right - root.scrollLeft)
-  const bottom = Math.min(rootRect.bottom, rootRect.top + rect.bottom - root.scrollTop)
+function contentRectToVisibleContentRect(root: HTMLElement, rect: DragSelectionRect): DragSelectionRect {
+  const left = Math.max(root.scrollLeft, rect.left)
+  const top = Math.max(root.scrollTop, rect.top)
+  const right = Math.min(root.scrollLeft + root.clientWidth, rect.right)
+  const bottom = Math.min(root.scrollTop + root.clientHeight, rect.bottom)
   return {
     left,
     top,
@@ -131,6 +131,36 @@ function contentRectToVisibleViewportRect(root: HTMLElement, rect: DragSelection
     width: Math.max(0, right - left),
     height: Math.max(0, bottom - top),
   }
+}
+
+function getAutoScrollDelta(root: HTMLElement, clientX: number, clientY: number): { x: number; y: number } {
+  const rect = root.getBoundingClientRect()
+  const edgeSize = Math.min(96, Math.max(48, rect.height * 0.16))
+  const maxStep = 18
+  let x = 0
+  let y = 0
+
+  if (root.scrollHeight > root.clientHeight + 1) {
+    const topGap = clientY - rect.top
+    const bottomGap = rect.bottom - clientY
+    if (topGap < edgeSize) {
+      y = -Math.ceil(Math.min(1, (edgeSize - topGap) / edgeSize) * maxStep)
+    } else if (bottomGap < edgeSize) {
+      y = Math.ceil(Math.min(1, (edgeSize - bottomGap) / edgeSize) * maxStep)
+    }
+  }
+
+  if (root.scrollWidth > root.clientWidth + 1) {
+    const leftGap = clientX - rect.left
+    const rightGap = rect.right - clientX
+    if (leftGap < edgeSize) {
+      x = -Math.ceil(Math.min(1, (edgeSize - leftGap) / edgeSize) * maxStep)
+    } else if (rightGap < edgeSize) {
+      x = Math.ceil(Math.min(1, (edgeSize - rightGap) / edgeSize) * maxStep)
+    }
+  }
+
+  return { x, y }
 }
 
 export function sameStringArray(left: string[], right: string[]): boolean {
@@ -261,7 +291,7 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
 
   const updateOverlay = useCallback((session: DragSession, rect: DragSelectionRect) => {
     if (!session.overlay) return
-    const visibleRect = contentRectToVisibleViewportRect(session.scrollRoot, rect)
+    const visibleRect = contentRectToVisibleContentRect(session.scrollRoot, rect)
     session.overlay.style.left = `${visibleRect.left}px`
     session.overlay.style.top = `${visibleRect.top}px`
     session.overlay.style.width = `${visibleRect.width}px`
@@ -383,6 +413,7 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
       dragStarted: false,
       overlay: null,
       overlayLabel: null,
+      autoScrollFrame: null,
       targetById: new Map(),
       targets: [],
       orderedIds,
@@ -394,24 +425,28 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
     sessionRef.current = session
     if (reactPreview) setSelection(session)
     if (activeClassName) root.classList.add(activeClassName)
+
+    const previousUserSelect = document.body.style.userSelect
+    const previousRootUserSelect = root.style.userSelect
+    const previousScrollRootUserSelect = scrollRoot.style.userSelect
+    const previousScrollRootPosition = scrollRoot.style.position
+    const shouldRestoreScrollRootPosition = window.getComputedStyle(scrollRoot).position === 'static'
+    document.body.style.userSelect = 'none'
+    root.style.userSelect = 'none'
+    scrollRoot.style.userSelect = 'none'
+    if (shouldRestoreScrollRootPosition) scrollRoot.style.position = 'relative'
+
     if (!reactPreview) {
       const overlay = document.createElement('div')
       overlay.className = overlayClassName
       const label = document.createElement('span')
       label.style.display = 'none'
       overlay.appendChild(label)
-      document.body.appendChild(overlay)
+      scrollRoot.appendChild(overlay)
       session.overlay = overlay
       session.overlayLabel = label
       updateOverlay(session, getContentSelectionRect(session))
     }
-
-    const previousUserSelect = document.body.style.userSelect
-    const previousRootUserSelect = root.style.userSelect
-    const previousScrollRootUserSelect = scrollRoot.style.userSelect
-    document.body.style.userSelect = 'none'
-    root.style.userSelect = 'none'
-    scrollRoot.style.userSelect = 'none'
 
     const cleanup = () => {
       window.removeEventListener('mousemove', handleMouseMove)
@@ -422,6 +457,7 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
       document.body.style.userSelect = previousUserSelect
       root.style.userSelect = previousRootUserSelect
       scrollRoot.style.userSelect = previousScrollRootUserSelect
+      if (shouldRestoreScrollRootPosition) scrollRoot.style.position = previousScrollRootPosition
       if (activeClassName) root.classList.remove(activeClassName)
     }
 
@@ -432,6 +468,10 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
         window.cancelAnimationFrame(activeSession.frame)
         activeSession.frame = null
         updatePreview()
+      }
+      if (activeSession.autoScrollFrame !== null) {
+        window.cancelAnimationFrame(activeSession.autoScrollFrame)
+        activeSession.autoScrollFrame = null
       }
       const finalIds = activeSession.previewIds
       const shouldCommit = activeSession.moved
@@ -450,12 +490,40 @@ export function useDragMultiSelect<TElement extends HTMLElement>({
       moveEvent.preventDefault()
       clearNativeTextSelection()
       schedulePreview(moveEvent.clientX, moveEvent.clientY)
+      scheduleAutoScroll()
     }
 
     function handleScroll() {
       const activeSession = sessionRef.current
       if (!activeSession || !activeSession.moved) return
       schedulePreview(activeSession.latestX, activeSession.latestY)
+    }
+
+    function scheduleAutoScroll() {
+      const activeSession = sessionRef.current
+      if (!activeSession || activeSession.autoScrollFrame !== null) return
+      activeSession.autoScrollFrame = window.requestAnimationFrame(runAutoScroll)
+    }
+
+    function runAutoScroll() {
+      const activeSession = sessionRef.current
+      if (!activeSession) return
+      const delta = getAutoScrollDelta(activeSession.scrollRoot, activeSession.latestX, activeSession.latestY)
+      if (delta.x === 0 && delta.y === 0) {
+        activeSession.autoScrollFrame = null
+        return
+      }
+      const previousLeft = activeSession.scrollRoot.scrollLeft
+      const previousTop = activeSession.scrollRoot.scrollTop
+      activeSession.scrollRoot.scrollLeft += delta.x
+      activeSession.scrollRoot.scrollTop += delta.y
+      const didScroll = activeSession.scrollRoot.scrollLeft !== previousLeft || activeSession.scrollRoot.scrollTop !== previousTop
+      if (didScroll) schedulePreview(activeSession.latestX, activeSession.latestY)
+      if (!didScroll) {
+        activeSession.autoScrollFrame = null
+        return
+      }
+      activeSession.autoScrollFrame = window.requestAnimationFrame(runAutoScroll)
     }
 
     function handleMouseUp(upEvent: globalThis.MouseEvent) {

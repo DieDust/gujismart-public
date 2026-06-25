@@ -8,9 +8,45 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Serif+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    .renderer-startup {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      color: #d9d4cf;
+      background: #0e0d0c;
+      font-family: Inter, "Noto Serif SC", sans-serif;
+    }
+
+    .renderer-startup__content {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .renderer-startup__mark {
+      width: 26px;
+      height: 26px;
+      border: 2px solid rgba(196, 149, 106, 0.25);
+      border-top-color: #c4956a;
+      border-radius: 50%;
+      animation: renderer-startup-spin 0.9s linear infinite;
+    }
+
+    @keyframes renderer-startup-spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
 </head>
 <body>
-  <div id="root"></div>
+  <div id="root">
+    <div class="renderer-startup" role="status">
+      <div class="renderer-startup__content">
+        <span class="renderer-startup__mark" aria-hidden="true"></span>
+        <span>正在启动文献管理...</span>
+      </div>
+    </div>
+  </div>
   <script type="module" src="./src/main.tsx"></script>
 </body>
 </html>

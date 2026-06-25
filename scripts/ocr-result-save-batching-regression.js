@@ -130,7 +130,7 @@ assert(
 )
 assert(
   ocrIpcSource.includes('function getPageSnapshotsForOcrSave')
-    && ocrIpcSource.includes('SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, ocr_status')
+    && ocrIpcSource.includes('SELECT id, doc_id, page_num, image_path, proofed_text, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, ocr_status')
     && ocrIpcSource.includes('hydratePagePayloadRows(rows)')
     && savePageOcrResultsBody.includes('const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)')
     && savePageOcrResultsBody.includes('pageSnapshots = getPageSnapshotsForOcrSave(guardedPageResults.map((pageResult) => pageResult.pageId))')
@@ -356,7 +356,7 @@ assert(
 )
 assert(
   drainReindexQueueBody.includes('scheduleBackgroundReindex([], { delayMs: BACKGROUND_REINDEX_DRAIN_PAUSE_MS })')
-    && scheduleBackgroundReindexBody.includes('options: { activeResolved?: boolean; delayMs?: number }')
+    && scheduleBackgroundReindexBody.includes('options: { activeResolved?: boolean; delayMs?: number; reason?: SearchIndexReindexReason }')
     && scheduleBackgroundReindexBody.includes('options.delayMs ?? BACKGROUND_REINDEX_DELAY_MS'),
   'search background reindexing should pause before continuing a non-empty queue after each drain batch.',
 )

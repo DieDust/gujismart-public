@@ -8,6 +8,7 @@ import OpenCC from 'opencc-js'
 import { PDFDocument, rgb, StandardFonts, type PDFImage, type PDFPage, type PDFFont } from 'pdf-lib'
 import * as fontkit from '@pdf-lib/fontkit'
 import { isTocLabel, looksLikeTocText, parseTocEntries, type TocFormattedEntry } from '../shared/toc-format'
+import { deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
 import { hydratePagePayloadRows } from './page-payload-store'
 import type { Document, DocumentExportFormat, DocumentExportOptions } from '../shared/types'
 
@@ -333,7 +334,10 @@ function metadataText(metadata: JsonRecord, key: string, fallback = ''): string 
 }
 
 function getPageText(page: ExportPage): string {
-  return String(page.proofed_text || page.ocr_text || '').trim()
+  const proofedText = String(page.proofed_text || '').trim()
+  if (proofedText) return proofedText
+  const ir = getOrBuildOcrPageIr(page.ocr_result, { pageIndex: Number(page.page_num || 0) || 1 })
+  return String((ir ? deriveOcrTextFromIr(ir) : '') || page.ocr_text || '').trim()
 }
 
 function getBlockLabel(block: OcrLayoutBlockPayload): string {

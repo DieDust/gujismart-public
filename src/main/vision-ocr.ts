@@ -25,8 +25,10 @@ interface VisionLayoutBlock extends OcrRecognizeLayoutBlock {
   table_html?: string
   markdown?: string
   reading_order: number
+  reading_order_source?: 'ocr' | 'source'
   confidence: number | null
   column_index: number | null
+  orientation?: 'horizontal' | 'vertical'
   location: LayoutRect | null
   segmentation_source?: string
   rejected_title_reason?: string
@@ -416,6 +418,13 @@ function normalizeLabel(label: string): string {
   return 'text'
 }
 
+function normalizeOrientation(value: unknown): 'horizontal' | 'vertical' | undefined {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (/vertical|top[-_\s]*to[-_\s]*bottom|ttb|竖排|直排/.test(normalized)) return 'vertical'
+  if (/horizontal|横排/.test(normalized)) return 'horizontal'
+  return undefined
+}
+
 function pointCoordinate(point: unknown, key: 'x' | 'y', tupleIndex: number): number | null {
   if (isJsonRecord(point)) return finiteNumber(point[key])
   if (Array.isArray(point)) return finiteNumber(point[tupleIndex])
@@ -508,6 +517,11 @@ function normalizeVisionBlock(block: unknown, index: number): VisionLayoutBlock 
   const readingOrder = finiteNumber(readRecordValue(block, 'reading_order'))
   const confidence = finiteNumber(readRecordValue(block, 'confidence'))
   const columnIndex = finiteNumber(readRecordValue(block, 'column_index'))
+  const orientation = normalizeOrientation(firstRecordValue(block, [
+    'orientation',
+    'text_orientation',
+    'writing_mode',
+  ]))
   return {
     words,
     label: tableRows.length > 0 ? 'table' : normalizeLabel(fieldText(block, ['label']) || 'text'),
@@ -519,8 +533,10 @@ function normalizeVisionBlock(block: unknown, index: number): VisionLayoutBlock 
     table_html: html || undefined,
     markdown: markdown || undefined,
     reading_order: readingOrder === null ? index : readingOrder,
+    reading_order_source: readingOrder === null ? 'source' : 'ocr',
     confidence,
     column_index: columnIndex,
+    orientation,
     location: normalizeLocation(firstRecordValue(block, ['location', 'bbox', 'box', 'points'])),
     segmentation_source: 'vision_model',
   }
@@ -549,6 +565,7 @@ function normalizeVisionResult(parsed: JsonRecord, page: VisionSourcePage, rawCo
         words: line.trim(),
         label: 'text',
         reading_order: index,
+        reading_order_source: 'source',
         confidence: null,
         column_index: null,
         location: null,
@@ -593,9 +610,10 @@ function buildVisionOcrPrompt(pageNum: number, docType?: string | null): string 
     '你是古籍、报纸和历史文献的视觉 OCR 与版面整理助手。',
     '请直接观察图片，不要只做普通 OCR。需要理解版面顺序、小字夹注、栏位、标题和目录线索。',
     '只返回严格 JSON，不要 Markdown，不要解释。',
-    'JSON 格式：{"text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[{"row":0,"col":0,"text":""}],"reading_order":0,"column_index":0,"location":{"left":0,"top":0,"width":0,"height":0},"confidence":0.0}],"toc_candidates":[{"title":"","level":1,"pageNum":1,"confidence":0.0}],"warnings":[]}',
+    'JSON 格式：{"text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[{"row":0,"col":0,"text":""}],"reading_order":0,"column_index":0,"orientation":"horizontal|vertical","location":{"left":0,"top":0,"width":0,"height":0},"confidence":0.0}],"toc_candidates":[{"title":"","level":1,"pageNum":1,"confidence":0.0}],"warnings":[]}',
     `当前为校对模式原始第 ${pageNum} 页。toc_candidates.pageNum 必须使用这个原始页码或图中明确出现的页码。`,
     '必须保留 layout_blocks。每个 block 应尽量包含 location 坐标，并在 text 字段中给出适合阅读和检索的完整正文。',
+    '每个文字 block 都要给出 orientation。普通文献应以整篇主方向为准，不要把局部窄框随意判成竖排；古籍竖排默认按从右到左排列。',
     isGuji
       ? '古籍要求：按原文顺序整理，尽量加现代标点和自然段；不得擅自补写原文没有的字；看不清用 □ 或 [疑字] 标记；小字夹注放在相邻正文后，用括注或单独 note block 表示。'
       : '',
@@ -789,7 +807,8 @@ function buildVisionOcrFallbackPrompt(pageNum: number): string {
     'Return strict JSON only.',
     'OCR this image as completely as possible. Do not summarize. Do not use ellipsis for skipped visible text.',
     'For a newspaper, read columns from right to left and each column from top to bottom.',
-    'Use this schema: {"text":"","layout_blocks":[{"words":"","label":"text|title|table","rows":[[""]],"cells":[]}],"toc_candidates":[],"warnings":[]}.',
+    'Use one dominant orientation for normal body text; vertical historical text reads right to left.',
+    'Use this schema: {"text":"","layout_blocks":[{"words":"","label":"text|title|table","rows":[[""]],"cells":[],"reading_order":0,"column_index":0,"orientation":"horizontal|vertical"}],"toc_candidates":[],"warnings":[]}.',
     `The original proofing page number is ${pageNum}.`,
   ].join('\n')
 }
@@ -880,7 +899,8 @@ function buildVisionRefinePrompt(pageNum: number, baseText: string): string {
     'For each layout block, words should contain the corrected text for that block. For a table block, include rows or cells and also a tab/newline text form in words.',
     'For newspapers, identify article/ad/notice titles and column order from right to left. Do not put ordinary article titles under the previous article unless it is truly a section.',
     'Return at most 120 layout_blocks and at most 80 toc_candidates. Prefer faithful corrected content over compact anchors.',
-    'Use this schema: {"corrected_text":"","text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[{"row":0,"col":0,"text":""}],"reading_order":0,"column_index":0,"confidence":0.0}],"toc_candidates":[{"title":"","level":1,"entry_type":"section|article|ad|notice|commentary|unknown","parent_title":"","pageNum":1,"charIndex":0,"confidence":0.0}],"correction_warnings":[],"warnings":[]}.',
+    'Use one dominant orientation for normal body text. Set each text block orientation to horizontal or vertical; vertical historical text reads right to left.',
+    'Use this schema: {"corrected_text":"","text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[{"row":0,"col":0,"text":""}],"reading_order":0,"column_index":0,"orientation":"horizontal|vertical","confidence":0.0}],"toc_candidates":[{"title":"","level":1,"entry_type":"section|article|ad|notice|commentary|unknown","parent_title":"","pageNum":1,"charIndex":0,"confidence":0.0}],"correction_warnings":[],"warnings":[]}.',
     `The original proofing page number is ${pageNum}.`,
     titleCandidates.length > 0 ? `Possible title/anchor lines from base_text:\n${titleCandidates.join('\n')}` : '',
     `base_text:\n${String(baseText || '').slice(0, 7000)}`,
@@ -894,7 +914,8 @@ function buildVisionOcrNewspaperFullTextPrompt(pageNum: number): string {
     'Read from right to left by columns, and from top to bottom within each column.',
     'Transcribe every visible title, advertisement, notice, news item, and commentary. Do not output only the headings.',
     'If a character is unclear, use □ or [疑字]. Never replace unread text with ellipsis.',
-    'Use this schema: {"text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[],"reading_order":0,"column_index":0,"confidence":0.0}],"toc_candidates":[],"warnings":[]}.',
+    'Set orientation to vertical for body blocks unless the visible page is clearly horizontal.',
+    'Use this schema: {"text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[],"reading_order":0,"column_index":0,"orientation":"horizontal|vertical","confidence":0.0}],"toc_candidates":[],"warnings":[]}.',
     `The original proofing page number is ${pageNum}.`,
   ].join('\n')
 }
@@ -996,6 +1017,7 @@ function buildFallbackHybridResult(page: VisionRefineSourcePage, message: string
           words: line.trim(),
           label: 'text',
           reading_order: index,
+          reading_order_source: 'source',
           confidence: null,
           column_index: null,
           location: null,

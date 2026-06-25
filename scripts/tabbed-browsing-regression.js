@@ -1,0 +1,138 @@
+const fs = require('fs')
+const path = require('path')
+
+const root = path.resolve(__dirname, '..')
+
+function read(relativePath) {
+  return fs.readFileSync(path.join(root, relativePath), 'utf8')
+}
+
+function assertIncludes(source, needle, label) {
+  if (!source.includes(needle)) {
+    throw new Error(`${label}: missing ${needle}`)
+  }
+}
+
+function assertNotIncludes(source, needle, label) {
+  if (source.includes(needle)) {
+    throw new Error(`${label}: unexpected ${needle}`)
+  }
+}
+
+const packageJson = JSON.parse(read('package.json'))
+const app = read('src/renderer/src/App.tsx')
+const documentView = read('src/renderer/src/views/DocumentView.tsx')
+const libraryView = read('src/renderer/src/views/LibraryView.tsx')
+const foldersView = read('src/renderer/src/views/FoldersView.tsx')
+const appCss = read('src/renderer/src/styles/app.css')
+const workspace = read('src/renderer/src/utils/appWorkspace.ts')
+
+assertIncludes(app, 'type AppTab =', 'App should define an internal tab model')
+assertIncludes(app, "const [tabs, setTabs] = useState<AppTab[]>", 'App should store open tabs')
+assertIncludes(app, 'const [activeTabId, setActiveTabId]', 'App should track the active tab')
+assertIncludes(app, 'loadAppWorkspace(window.localStorage)', 'App should restore the previous workspace at startup')
+assertIncludes(app, 'saveAppWorkspace(window.localStorage, {', 'App should persist workspace changes')
+assertIncludes(app, "window.addEventListener('beforeunload', saveBeforeUnload)", 'App should flush the workspace before the window closes')
+assertIncludes(app, 'siderCollapsed,', 'workspace persistence should include the sidebar state')
+assertIncludes(app, 'data-app-tab-strip="true"', 'App should render a tab strip')
+assertIncludes(app, 'data-app-tab-kind={tab.kind}', 'tabs should expose their kind for regression coverage')
+assertIncludes(app, 'data-app-tab-menu-trigger="true"', 'tab strip should expose a collapsed tab menu trigger')
+assertIncludes(app, 'data-app-tab-menu-search="true"', 'global search should live inside the collapsed tab menu')
+assertIncludes(app, 'data-app-tab-menu-item="true"', 'collapsed tab menu should list open tabs')
+assertIncludes(app, '<div className="app-tab-rail">', 'new-home control should stay grouped immediately after the tab scroller')
+assertIncludes(app, "style={{ '--app-tab-strip-ideal-width': `${tabStripIdealWidth}px` } as React.CSSProperties}", 'tab strip should size itself from the number of open tabs')
+assertIncludes(app, 'const TAB_PREFERRED_WIDTH = 210', 'tabs should have a comfortable default width')
+assertIncludes(app, 'function reorderAppTabs(', 'tab order changes should use a dedicated reorder helper')
+assertIncludes(app, 'data-app-tab-id={tab.id}', 'tabs should expose stable ids for drag reordering')
+assertIncludes(app, 'onPointerDown={(event) => handleTabPointerDown(event, tab.id)}', 'tab dragging should use pointer tracking instead of a detached native drag preview')
+assertIncludes(app, 'const scheduleTabDragFrame = () => {', 'tab dragging should update on animation frames')
+assertIncludes(app, "previewElement.classList.add('app-tab-drag-preview')", 'the complete dragged tab should move in an unclipped body-level preview')
+assertIncludes(app, 'document.body.appendChild(previewElement)', 'the dragged preview should escape the scroll-strip clipping boundary')
+assertIncludes(app, 'window.innerWidth - drag.width - 6', 'the dragged preview should remain visible at the right window edge')
+assertIncludes(app, 'const desiredCenter = drag.clientX - drag.grabOffsetX + drag.width / 2', 'live sorting should follow the dragged tab center')
+assertIncludes(app, 'pendingTabLayoutRef.current = captureTabLayout()', 'tab reordering should capture sibling positions before a move')
+assertIncludes(app, 'const animation = element.animate(', 'neighboring tabs should animate into their new positions')
+assertIncludes(app, 'setTabs(nextTabs)', 'live pointer movement should update the tab array order')
+assertNotIncludes(app, 'event.dataTransfer.setData', 'tab dragging should not fall back to the native drag ghost')
+assertIncludes(app, 'placeholder="搜索打开的标签页"', 'the collapsed menu search should describe tab-only search')
+assertIncludes(app, 'const filteredTabs = useMemo(() => {', 'tab search should filter the open tab model')
+assertIncludes(app, '{filteredTabs.map((tab) => {', 'the collapsed menu should render only matching tabs')
+assertNotIncludes(app, "openViewTab('search', { forceNew: true, initialSearchKeyword: keyword })", 'tab search should not start a document search')
+assertIncludes(app, 'title: state.selectedFolderName || VIEW_TITLES.folders', 'folder tabs should display the selected folder name')
+assertIncludes(app, 'onAuxClick={(event) => {', 'tabs should support middle-click close')
+assertIncludes(app, 'if (event.button === 1 && closable) closeTab(tab.id)', 'middle click should close a tab')
+assertIncludes(app, "const SINGLETON_VIEW_KEYS = new Set<AppViewKey>(['library', 'excerpts', 'citation', 'tags', 'dashboard', 'settings'])", 'singleton views should be explicit')
+assertIncludes(app, "const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research'])", 'multi-instance views should be explicit')
+assertIncludes(app, "openViewTab(view, { forceNew: MULTI_INSTANCE_VIEW_KEYS.has(view) })", 'sidebar should create new tabs for multi-instance views')
+assertIncludes(app, 'if (nextTabs.length === 0)', 'closing the last tab should recover a home tab')
+assertIncludes(app, 'return [createHomeTab()]', 'last-tab close should recreate home')
+assertIncludes(app, 'activeTab.kind === \'document\'', 'only the active document tab should render DocumentView')
+assertIncludes(app, 'compactHeader', 'document tabs should use the compact document header')
+assertNotIncludes(app, 'const [currentDocId, setCurrentDocId]', 'App should not use the old single-document state')
+assertNotIncludes(app, 'const [currentView, setCurrentView]', 'App should not use the old single-view state')
+assertNotIncludes(app, 'className="header-right app-tab-actions"', 'tab header should not keep the old right-side action row')
+assertNotIncludes(app, '<Badge status="success"', 'tab header should not show a redundant ready status')
+assertNotIncludes(app, '<QuestionCircleOutlined', 'tab header should not show the onboarding question button')
+assertNotIncludes(app, '<LlmProfileSelector', 'collapsed tab menu should not contain model switching')
+
+assertIncludes(documentView, 'compactHeader?: boolean', 'DocumentView should accept compact header mode')
+assertIncludes(documentView, 'compactHeader = false', 'DocumentView compact header should be opt-in')
+assertIncludes(documentView, '{!compactHeader ? (', 'DocumentView should hide the duplicate title in tab mode')
+
+assertIncludes(libraryView, 'const handleDocumentOpen = useCallback', 'LibraryView should separate opening from selection')
+assertIncludes(libraryView, 'setSelectedIds([docId])', 'LibraryView single click should select one document')
+assertIncludes(libraryView, "if (event?.ctrlKey || event?.metaKey)", 'LibraryView Ctrl/Meta click should keep multi-select')
+assertIncludes(libraryView, "if (event?.shiftKey && lastClickedDocIdRef.current)", 'LibraryView Shift click should keep range select')
+assertIncludes(libraryView, "key: 'open_new_tab', label: '在新标签页打开'", 'LibraryView context menu should expose new-tab open')
+assertIncludes(libraryView, 'onDoubleClick={() => context.handleDocumentOpen(doc.id)}', 'Library virtual cards should open on double click')
+assertIncludes(libraryView, 'onDoubleClick={() => handleDocumentOpen(doc.id)}', 'Library grid cards should open on double click')
+
+assertIncludes(foldersView, 'const openDocumentInTab = (docId: string) => {', 'FoldersView should separate opening from selection')
+assertIncludes(foldersView, 'setSelectedDocumentIds([docId])', 'FoldersView single click should select one document')
+assertIncludes(foldersView, "key: 'open_new_tab', label: '在新标签页打开'", 'FoldersView context menu should expose new-tab open')
+assertIncludes(foldersView, "if (key === 'open' || key === 'open_new_tab')", 'FoldersView open actions should share the tab-opening path')
+assertIncludes(foldersView, 'onDoubleClick={() => openDocumentInTab(doc.id)}', 'FoldersView document cards should open on double click')
+assertIncludes(foldersView, 'selectedFolderName?: string', 'FoldersView tab state should carry the visible folder name')
+assertIncludes(foldersView, 'selectedFolderName: folderId === UNFILED_FOLDER_ID', 'FoldersView should report the current folder name to its tab')
+
+assertIncludes(appCss, '.app-tab-strip', 'CSS should style the tab strip')
+assertIncludes(appCss, '.app-tab.is-active', 'CSS should style the active tab')
+assertIncludes(appCss, '.app-tab-close', 'CSS should style tab close affordance')
+assertIncludes(appCss, '.app-tab-menu-popover .ant-popover-inner', 'CSS should style the collapsed tab menu')
+assertIncludes(appCss, '.app-tab-menu-item.is-active', 'CSS should distinguish the active tab inside the collapsed menu')
+assertIncludes(appCss, 'height: 32px;', 'tabs should use the compact floating-pill height')
+assertIncludes(appCss, 'border-radius: 16px;', 'tabs should use a pill silhouette')
+assertIncludes(appCss, '.app-tab::after', 'active tabs should expose a compact gold indicator')
+assertIncludes(appCss, 'transform: translateX(-50%) scaleX(1);', 'active indicator should expand from the center')
+assertIncludes(appCss, 'mask-image: linear-gradient(to right, rgba(0, 0, 0, 0.58) 0%, #000 2%, #000 98%, rgba(0, 0, 0, 0.58) 100%);', 'overflowing tabs should fade without obscuring edge tabs')
+assertIncludes(appCss, '.app-tab-strip::-webkit-scrollbar', 'tab strip should hide its native scrollbar')
+assertIncludes(appCss, '.app-tab:hover .app-tab-close', 'tab close affordance should appear on hover')
+assertIncludes(appCss, 'backdrop-filter: blur(20px);', 'collapsed tab menu should use the planned glass treatment')
+assertIncludes(appCss, '.app-tab:not(.is-active)', 'inactive tabs should keep a subtle visible surface')
+assertIncludes(appCss, 'border-bottom-color: rgba(196, 149, 106, 0.14);', 'inactive tabs should keep a faint bottom edge')
+assertIncludes(appCss, 'width: min(var(--app-tab-strip-ideal-width, 100%), calc(100% - 32px));', 'tab strip should cap its ideal width to the available rail')
+assertIncludes(appCss, 'min-width: 92px;', 'crowded tabs should shrink to a browser-like minimum width')
+assertIncludes(appCss, 'max-width: 210px;', 'uncrowded tabs should remain comfortably wide')
+assertIncludes(appCss, 'flex: 1 1 210px;', 'tabs should share compression evenly as the strip fills')
+assertIncludes(appCss, '.app-tab.is-dragging-source', 'the original tab should remain as a quiet layout placeholder while dragging')
+assertIncludes(appCss, '.app-tab-drag-preview', 'the complete dragged tab should use an unclipped fixed preview')
+assertIncludes(appCss, 'position: fixed;', 'the dragged tab preview should not be clipped by the tab scroller')
+assertIncludes(appCss, 'z-index: 4000;', 'the dragged tab preview should stay above the app header')
+assertIncludes(appCss, 'box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34)', 'the dragged tab should lift visually above its neighbors')
+assertIncludes(appCss, 'body.is-app-tab-dragging *', 'the drag cursor should remain stable across the window')
+
+assertIncludes(workspace, "export const APP_WORKSPACE_STORAGE_KEY = 'gujismart.app-workspace.v1'", 'workspace storage should use a versioned key')
+assertIncludes(workspace, 'const MAX_RESTORED_TABS = 60', 'workspace restoration should cap tab count')
+assertIncludes(workspace, 'const tabs = sanitizeTabs(parsed.tabs)', 'workspace restoration should validate saved tabs')
+assertIncludes(workspace, 'storage.removeItem(APP_WORKSPACE_STORAGE_KEY)', 'invalid workspace data should be discarded safely')
+assertIncludes(workspace, 'target: { ...target, docId }', 'document tabs should restore a normalized document target')
+assertNotIncludes(workspace, 'searchSession:', 'workspace storage should not persist full search-result sessions')
+
+if (packageJson.scripts['check:tabbed-browsing'] !== 'node scripts/tabbed-browsing-regression.js') {
+  throw new Error('package.json is missing check:tabbed-browsing')
+}
+if (!String(packageJson.scripts.check || '').includes('check:tabbed-browsing')) {
+  throw new Error('npm run check does not include check:tabbed-browsing')
+}
+
+console.log('Tabbed browsing regression checks passed.')

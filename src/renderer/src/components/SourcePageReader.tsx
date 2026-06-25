@@ -4317,7 +4317,10 @@ export default function SourcePageReader({
   }
 
   const renderToc = () => (
-    <aside style={{ width: 282, flex: '0 0 282px', border: `1px solid ${tocStyle.border}`, borderRadius: 8, background: tocStyle.background, boxShadow: tocStyle.shadow, display: 'flex', flexDirection: 'column', overflow: 'hidden', margin: 12, marginRight: 0 }}>
+    <aside
+      className={`source-reader-sidebar ${theme === 'dark' ? 'is-dark' : 'is-light'}`}
+      style={{ width: 282, flex: '0 0 282px', border: `1px solid ${tocStyle.border}`, borderRadius: 8, background: tocStyle.background, boxShadow: tocStyle.shadow, display: 'flex', flexDirection: 'column', overflow: 'hidden', margin: 12, marginRight: 0 }}
+    >
       <div style={{ padding: '10px 12px', borderBottom: `1px solid ${tocStyle.border}` }}>
         <Segmented
           size="small"

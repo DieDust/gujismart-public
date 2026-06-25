@@ -1,9 +1,9 @@
-import { ImportOutlined, BookOutlined, SettingOutlined, SearchOutlined, FormatPainterOutlined } from '@ant-design/icons'
+import { ImportOutlined, BookOutlined, SettingOutlined, SearchOutlined, FormatPainterOutlined, FolderOpenOutlined } from '@ant-design/icons'
 import { PRODUCT_NAME, PRODUCT_SUBTITLE } from '@shared/types'
 
 interface WelcomeViewProps {
   onImport: () => void
-  onNavigate: (view: 'library' | 'settings' | 'search' | 'citation') => void
+  onNavigate: (view: 'library' | 'folders' | 'settings' | 'search' | 'citation') => void
 }
 
 export default function WelcomeView({ onImport, onNavigate }: WelcomeViewProps) {
@@ -30,6 +30,16 @@ export default function WelcomeView({ onImport, onNavigate }: WelcomeViewProps) 
             管理已导入的文献
             <br />
             标签、文件夹、状态一目了然
+          </span>
+        </div>
+
+        <div className="glass-card welcome-card" onClick={() => onNavigate('folders')}>
+          <FolderOpenOutlined className="welcome-card-icon" />
+          <span className="welcome-card-title">文件夹</span>
+          <span className="welcome-card-desc">
+            按目录整理文献
+            <br />
+            拖拽归类、封面预览和批量处理
           </span>
         </div>
 

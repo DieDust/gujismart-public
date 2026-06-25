@@ -1,4 +1,5 @@
 import type { DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResult } from './types'
+import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from './ocr-ir'
 import { normalizeTranslationSourceText } from './translation-cache'
 
 type JsonRecord = Record<string, unknown>
@@ -555,6 +556,10 @@ function recognizedTextBlocksFrom(source: unknown): TranslationBlock[] {
 }
 
 function getOcrBlocks(ocrResult: unknown): TranslationBlock[] {
+  const ir = getOrBuildOcrPageIr(ocrResult)
+  if (ir) {
+    return deriveOcrReadingBlocksFromIr(ir).map((block) => block as TranslationBlock)
+  }
   const parsed = asOcrResult(ocrResult)
   if (!parsed) return []
   const layoutBlocks = asBlockArray(parsed.layout_result)
@@ -894,11 +899,21 @@ function isEbookLikePage(page: TranslationSourcePage | null | undefined): boolea
 }
 
 function getFallbackPageText(page: TranslationSourcePage | null | undefined): string {
-  return String(page?.text || page?.proofed_text || page?.ocr_text || getOcrResultText(page?.ocr_result) || '').trim()
+  const ir = getOrBuildOcrPageIr(page?.ocr_result)
+  return String(
+    page?.text
+    || page?.proofed_text
+    || (ir ? deriveOcrTextFromIr(ir) : '')
+    || page?.ocr_text
+    || getOcrResultText(page?.ocr_result)
+    || '',
+  ).trim()
 }
 
 export function getCanonicalPageTranslationSourceText(page: TranslationSourcePage | null | undefined): string {
   if (!page) return ''
+  const proofedText = String(page.proofed_text || '').trim()
+  if (proofedText) return normalizeTranslationSourceText(proofedText)
   if (!isEbookLikePage(page)) {
     const blockText = getCanonicalTranslationBlocksForPage(page)
       .map((block) => getCanonicalTranslationBlockText(block))

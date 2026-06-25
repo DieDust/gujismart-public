@@ -143,4 +143,15 @@ assertNotIncludes(
   '电子书/源文件阅读器保持自己的内部阅读体系，不应被本次普通阅读偏好改造接管。',
 )
 
+assertIncludes(
+  sourcePageReader,
+  "className={`source-reader-sidebar ${theme === 'dark' ? 'is-dark' : 'is-light'}`}",
+  'Source reader empty states must expose the active light or dark sidebar theme for readable contrast.',
+)
+assertIncludes(
+  ebookReader,
+  'className="ebook-reader-sidebar"',
+  'Ebook reader empty states must use the readable light-sidebar contrast treatment.',
+)
+
 console.log('reader-preferences regression checks passed')

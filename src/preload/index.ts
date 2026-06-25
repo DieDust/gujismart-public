@@ -113,6 +113,8 @@ import type {
   MetadataCandidate,
   OcrEngine,
   OcrProgressEvent,
+  OcrRegionRerecognitionOptions,
+  OcrRegionRerecognitionResult,
   OcrRecognizeMode,
   OcrRecognizeResult,
   OnboardingStep,
@@ -288,6 +290,11 @@ const api = {
     ipcRenderer.invoke('pages:resetOcr', pageId),
   rerunPageOcr: (pageId: string, options?: PageOcrOptions): Promise<boolean> =>
     ipcRenderer.invoke('pages:rerunOcr', pageId, options),
+  rerecognizeLowQualityOcrBlocks: (
+    pageId: string,
+    options?: OcrRegionRerecognitionOptions,
+  ): Promise<OcrRegionRerecognitionResult> =>
+    ipcRenderer.invoke('pages:rerecognizeLowQualityBlocks', pageId, options),
   rerunPageVisionOcr: (pageId: string): Promise<boolean> =>
     ipcRenderer.invoke('pages:rerunVisionOcr', pageId),
   enhanceGujiPage: (pageId: string, options?: PageOcrOptions): Promise<boolean> =>
@@ -316,6 +323,8 @@ const api = {
     ipcRenderer.invoke('ocr:cancelDocument', docId),
   batchOcr: (docIds: string[], options?: BatchOcrOptions): Promise<number> =>
     ipcRenderer.invoke('documents:batchOcr', docIds, options),
+  reprocessOcrStructure: (docId: string): Promise<number> =>
+    ipcRenderer.invoke('documents:reprocessOcrStructure', docId),
 
   classifyDocument: (ocrText: string): Promise<string> =>
     ipcRenderer.invoke('ai:classify', ocrText),

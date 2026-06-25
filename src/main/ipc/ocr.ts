@@ -1,9 +1,10 @@
-import { ipcMain } from 'electron'
+import { ipcMain, nativeImage } from 'electron'
 import { statSync } from 'fs'
 import { nanoid } from 'nanoid'
 import { autoExtractAndApply } from '../ai'
 import { clearPageSearchIndexForDocuments, queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { autoCleanupPdfAssetsIfEnabled, restorePdfAssetForDocument } from '../pdf-assets'
+import { analyzePdfTextLayer } from '../pdf-preflight'
 import {
   findSuspiciousRepeatedOcrText,
   formatSuspiciousRepeatedOcrTextIssue,
@@ -15,6 +16,7 @@ import {
   prepareImageForOcrUpload,
   isOcrAbortError,
   recognizeImage,
+  recognizeImageRegion,
   recognizePages,
   recognizePdfAsync,
   recognizeTraditional,
@@ -25,7 +27,19 @@ import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifyS
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { hasVisionOcrConfig, recognizePagesWithVisionModel, refinePagesWithVisionModel } from '../vision-ocr'
-import type { BatchOcrOptions, Document, DocumentPage, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, TocItemV2 } from '../../shared/types'
+import {
+  OCR_IR_PIPELINE_VERSION,
+  OCR_IR_SCHEMA_VERSION,
+  applyOcrRegionTextReplacement,
+  buildOcrDocumentV1,
+  buildOcrPageIr,
+  deriveOcrTextFromIr,
+  deriveOcrWordsResultFromIr,
+  ensureOcrResultIr,
+  getOcrPageIr,
+  getOcrRegionRerecognitionCandidates,
+} from '../../shared/ocr-ir'
+import type { BatchOcrOptions, Document, DocumentPage, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, OcrRegionRerecognitionOptions, OcrRegionRerecognitionResult, PdfTextLayerAnalysis, PdfTextLayerPageAnalysis, TocItemV2 } from '../../shared/types'
 
 const AUTO_METADATA_TIMEOUT_MS = 120_000
 const AUTO_METADATA_QUEUE_TIMEOUT_MS = 30 * 60_000
@@ -48,6 +62,7 @@ type OcrPageRow = DocumentPage
 type OcrPageWithImage = OcrPageRecord & { image_path: string }
 type OcrVersionPageRow = Pick<DocumentPage, 'id' | 'doc_id' | 'page_num'>
 type OcrSavePageSnapshot = OcrVersionPageRow & {
+  image_path: string | null
   proofed_text: string | null
   ocr_text: string | null
   ocr_result: string | null
@@ -808,7 +823,7 @@ function getPageSnapshotsForOcrSave(pageIds: string[]): Map<string, OcrSavePageS
   if (uniquePageIds.length === 0) return new Map()
   const placeholders = uniquePageIds.map(() => '?').join(', ')
   const rows = queryAll<OcrSavePageSnapshot>(
-    `SELECT id, doc_id, page_num, proofed_text, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, ocr_status
+    `SELECT id, doc_id, page_num, image_path, proofed_text, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, ocr_status
      FROM pages
      WHERE id IN (${placeholders})`,
     uniquePageIds,
@@ -858,21 +873,281 @@ function upsertPageOcrVersion(
   )
 }
 
+function persistPdfTextLayerSummary(doc: OcrDocumentRow, analysis: PdfTextLayerAnalysis): void {
+  const currentMetadata = queryOne<Pick<OcrDocumentRow, 'metadata'>>(
+    'SELECT metadata FROM documents WHERE id = ?',
+    [doc.id],
+  )?.metadata
+  const metadata = parseMetadata(currentMetadata ?? doc.metadata)
+  metadata.pdf_text_layer_analysis = {
+    mode: analysis.mode,
+    page_count: analysis.pageCount,
+    sampled_page_nums: analysis.sampledPageNums,
+    native_text_page_count: analysis.nativeTextPageCount,
+    ocr_page_count: analysis.ocrPageCount,
+    average_clean_characters: analysis.averageCleanCharacters,
+    analyzed_at: analysis.analyzedAt,
+    analyzer_version: 'gujismart-pdf-text-layer/v1',
+  }
+  run('UPDATE documents SET metadata = ?, updated_at = ? WHERE id = ?', [
+    JSON.stringify(metadata),
+    new Date().toISOString(),
+    doc.id,
+  ])
+}
+
+function buildNativePdfPageResult(page: OcrPageRow, analysis: PdfTextLayerPageAnalysis): OcrPageResult {
+  return {
+    pageId: page.id,
+    status: 'completed',
+    text: analysis.text,
+    result: {
+      source_type: 'native_pdf_text',
+      text: analysis.text,
+      page_num: analysis.pageNum,
+      page_width: analysis.pageWidth,
+      page_height: analysis.pageHeight,
+      layout_result: analysis.layoutBlocks,
+      words_result: analysis.layoutBlocks.map((block) => ({ words: String(block.words || '') })),
+      pdf_text_layer_quality: {
+        mode: analysis.mode,
+        clean_character_count: analysis.cleanCharacterCount,
+        invalid_unicode_ratio: analysis.invalidUnicodeRatio,
+        replacement_character_ratio: analysis.replacementCharacterRatio,
+        coordinate_coverage: analysis.coordinateCoverage,
+        image_object_count: analysis.imageObjectCount,
+        reasons: analysis.reasons,
+      },
+    },
+  }
+}
+
+function getPageImageSize(imagePath?: string | null): { width: number; height: number } | null {
+  const path = String(imagePath || '').trim()
+  if (!path) return null
+  try {
+    const image = nativeImage.createFromPath(path)
+    if (image.isEmpty()) return null
+    const size = image.getSize()
+    return size.width > 0 && size.height > 0 ? size : null
+  } catch {
+    return null
+  }
+}
+
+function normalizeOcrResultForStorage(
+  result: unknown,
+  page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null | undefined,
+  engine: OcrEngine,
+): { result: OcrRecognizeResult; text: string } {
+  const imageSize = getPageImageSize(page?.image_path)
+  const normalized = ensureOcrResultIr(result, {
+    pageIndex: Number(page?.page_num || 0) || 1,
+    pageWidth: imageSize?.width,
+    pageHeight: imageSize?.height,
+    engine,
+    generatedAt: getOcrPageIr(page?.ocr_result)?.generatedAt,
+    forceRebuild: true,
+  })
+  return {
+    result: normalized,
+    text: normalized.gujismart_ir ? deriveOcrTextFromIr(normalized.gujismart_ir) : getOcrResultText(normalized),
+  }
+}
+
+function getRegionResultText(result: OcrRecognizeResult): string {
+  if (Array.isArray(result.words_result)) {
+    const text = result.words_result.map((item) => String(item?.words || '')).filter(Boolean).join('\n').trim()
+    if (text) return text
+  }
+  return String(result.text || '').trim()
+}
+
+function getRegionResultConfidence(result: OcrRecognizeResult): number | undefined {
+  if (!Array.isArray(result.words_result)) return undefined
+  const scores = result.words_result
+    .map((item) => Number(item?.confidence ?? item?.score))
+    .filter((score) => Number.isFinite(score))
+  if (scores.length === 0) return undefined
+  return scores.reduce((sum, score) => sum + score, 0) / scores.length
+}
+
+async function rerecognizeLowQualityPageRegions(
+  page: OcrPageRow,
+  options: OcrRegionRerecognitionOptions = {},
+): Promise<OcrRegionRerecognitionResult> {
+  if (!page.image_path) throw new Error('当前页缺少图像，无法局部重识别')
+  const currentResult = parseJsonRecord(page.ocr_result)
+  if (!currentResult) throw new Error('当前页没有可用于局部重识别的 OCR 结果')
+  const imageSize = getPageImageSize(page.image_path)
+  const envelope = getOcrPageIr(currentResult) || buildOcrPageIr(currentResult, {
+    pageIndex: Number(page.page_num || 0) || 1,
+    pageWidth: imageSize?.width,
+    pageHeight: imageSize?.height,
+    forceRebuild: true,
+  })
+  const maxBlocks = Math.max(1, Math.min(20, Math.floor(options.maxBlocks || 8)))
+  const candidates = getOcrRegionRerecognitionCandidates(envelope, maxBlocks)
+  if (candidates.length === 0) {
+    return {
+      attemptedBlockCount: 0,
+      updatedBlockCount: 0,
+      skippedBlockCount: 0,
+      failedBlockCount: 0,
+      updatedBlockIds: [],
+    }
+  }
+
+  let nextResult = JSON.parse(JSON.stringify(currentResult)) as OcrResultRecord
+  const updatedBlockIds: string[] = []
+  let skippedBlockCount = 0
+  let failedBlockCount = 0
+  let firstError: Error | null = null
+  for (const candidate of candidates) {
+    try {
+      const recognized = await recognizeImageRegion(page.image_path, candidate.bbox, candidate.orientation === 'vertical')
+      const nextText = getRegionResultText(recognized)
+      const replacement = applyOcrRegionTextReplacement(nextResult, {
+        sourceIndex: candidate.sourceIndex,
+        text: nextText,
+        confidence: getRegionResultConfidence(recognized),
+        reasons: candidate.reasons,
+      })
+      if (!replacement.updated) {
+        skippedBlockCount += 1
+        continue
+      }
+      nextResult = replacement.result as OcrResultRecord
+      updatedBlockIds.push(candidate.blockId)
+    } catch (error) {
+      failedBlockCount += 1
+      if (!firstError) firstError = error instanceof Error ? error : new Error(String(error || '局部 OCR 失败'))
+    }
+  }
+
+  if (updatedBlockIds.length === 0) {
+    if (firstError && failedBlockCount === candidates.length) throw firstError
+    return {
+      attemptedBlockCount: candidates.length,
+      updatedBlockCount: 0,
+      skippedBlockCount,
+      failedBlockCount,
+      updatedBlockIds,
+    }
+  }
+
+  const normalized = normalizeOcrResultForStorage(nextResult, page, 'paddle')
+  const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', normalized.result)
+  const preparedText = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_text', normalized.text)
+  const updatedAt = new Date().toISOString()
+  transaction(() => {
+    run(
+      'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ? WHERE id = ?',
+      [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, page.id],
+    )
+    run(
+      `UPDATE page_ocr_versions
+       SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, updated_at = ?
+       WHERE page_id = ? AND is_active = 1`,
+      [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, updatedAt, page.id],
+    )
+  })
+  markDocumentTocDirty(page.doc_id)
+  markSearchIndexStaleForPages([page.id])
+  notifySearchContentChanged()
+  scheduleDatabaseSave()
+  return {
+    attemptedBlockCount: candidates.length,
+    updatedBlockCount: updatedBlockIds.length,
+    skippedBlockCount,
+    failedBlockCount,
+    updatedBlockIds,
+  }
+}
+
+function reprocessDocumentOcrStructure(docId: string): string[] {
+  const rows = hydratePagePayloadRows(queryAll<DocumentPage>(
+    `SELECT *
+     FROM pages
+     WHERE doc_id = ? AND ocr_status = 'completed'
+     ORDER BY page_num`,
+    [docId],
+  ))
+  const pagesWithResults = rows
+    .map((page) => ({ page, result: parseJsonRecord(page.ocr_result) }))
+    .filter((item): item is { page: DocumentPage; result: OcrResultRecord } => Boolean(item.result))
+  if (pagesWithResults.length === 0) return []
+
+  const generatedAt = new Date().toISOString()
+  const documentIr = buildOcrDocumentV1(
+    pagesWithResults.map((item) => item.result),
+    { forceRebuild: true, generatedAt },
+  )
+  const changedPageIds: string[] = []
+
+  transaction(() => {
+    pagesWithResults.forEach(({ page, result }, index) => {
+      const irPage = documentIr.pages[index]
+      if (!irPage) return
+      const envelope = {
+        schemaVersion: OCR_IR_SCHEMA_VERSION,
+        generator: 'GujiSmart' as const,
+        pipelineVersion: OCR_IR_PIPELINE_VERSION,
+        generatedAt,
+        page: {
+          ...irPage,
+          pageIndex: Number(page.page_num || irPage.pageIndex || index + 1),
+        },
+      }
+      const text = deriveOcrTextFromIr(envelope)
+      const nextResult: OcrResultRecord = {
+        ...result,
+        text,
+        words_result: deriveOcrWordsResultFromIr(envelope),
+        gujismart_ir: envelope,
+        ir_text: text,
+        normalization: {
+          ...(isJsonRecord(result.normalization) ? result.normalization : {}),
+          schema_version: OCR_IR_SCHEMA_VERSION,
+          pipeline_version: OCR_IR_PIPELINE_VERSION,
+          generated_at: generatedAt,
+          document_postprocessed: true,
+        },
+      }
+      const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', JSON.stringify(nextResult))
+      const preparedText = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_text', text)
+      run(
+        'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ? WHERE id = ?',
+        [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, page.id],
+      )
+      run(
+        `UPDATE page_ocr_versions
+         SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, updated_at = ?
+         WHERE page_id = ? AND is_active = 1`,
+        [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, generatedAt, page.id],
+      )
+      changedPageIds.push(page.id)
+    })
+  })
+  return changedPageIds
+}
+
 function updatePageOcrState(pageId: string, result: OcrRecognizeResult, engine: OcrEngine = 'paddle'): void {
-  const page = queryOne<OcrVersionPageRow>('SELECT id, doc_id, page_num FROM pages WHERE id = ?', [pageId])
+  const page = queryOne<OcrSavePageSnapshot>('SELECT id, doc_id, page_num, image_path, proofed_text, ocr_text, ocr_result, ocr_status FROM pages WHERE id = ?', [pageId])
   if (!page) return
   const repeatedIssue = findSuspiciousRepeatedOcrText(result)
   if (repeatedIssue) {
     throw new Error(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))
   }
-  const text = getOcrResultText(result)
+  const normalized = normalizeOcrResultForStorage(result, page, engine)
+  const text = normalized.text
   const preparedText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', text)
-  const preparedResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', result)
+  const preparedResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', normalized.result)
   run(
     'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, proofed_text = ?, proofed_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
     [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, null, null, 'completed', 'pending', pageId],
   )
-  upsertPageOcrVersion(pageId, engine, result, text, 'completed', page)
+  upsertPageOcrVersion(pageId, engine, normalized.result, text, 'completed', page)
   markDocumentTocDirty(page.doc_id)
 }
 
@@ -1301,18 +1576,22 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
       if (pageResult.status === 'error' && hasExistingCompletedText) {
         continue
       }
-      const resultPayload = pageResult.result || (pageResult.error
+      const normalizedCompleted = pageResult.status === 'completed' && pageResult.result
+        ? normalizeOcrResultForStorage(pageResult.result, existingPage, engine)
+        : null
+      const resultPayload = normalizedCompleted?.result || pageResult.result || (pageResult.error
         ? {
             source_type: 'ocr_error',
             error: pageResult.error,
             failed_at: new Date().toISOString(),
           }
         : null)
+      const resultText = normalizedCompleted?.text || pageResult.text
       const resultJson = resultPayload ? JSON.stringify(resultPayload) : null
       if (
         existingPage
         && String(existingPage.ocr_status || '') === pageResult.status
-        && String(existingPage.ocr_text || '') === String(pageResult.text || '')
+        && String(existingPage.ocr_text || '') === String(resultText || '')
         && String(existingPage.ocr_result || '') === String(resultJson || '')
       ) {
         continue
@@ -1321,8 +1600,8 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
         ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_result', resultJson)
         : { value: resultJson, ref: null }
       const preparedText = existingPage
-        ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
-        : { value: String(pageResult.text || ''), ref: null }
+        ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_text', resultText)
+        : { value: String(resultText || ''), ref: null }
       run(
         `UPDATE pages
          SET ocr_result = ?,
@@ -1346,7 +1625,7 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
       changedPageIds.push(pageResult.pageId)
       if (existingPage?.doc_id) changedDocIds.add(existingPage.doc_id)
       const existingText = String(existingPage?.ocr_text || '').trim()
-      const nextText = String(pageResult.text || '').trim()
+      const nextText = String(resultText || '').trim()
       const existingResult = String(existingPage?.ocr_result || '')
       const nextResult = String(resultJson || '')
       const shouldInvalidateToc = pageResult.status === 'completed'
@@ -1362,7 +1641,7 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
           pageId: pageResult.pageId,
           page: existingPage,
           result: resultPayload,
-          text: pageResult.text,
+          text: resultText,
           status: pageResult.status,
         })
       }
@@ -1586,8 +1865,64 @@ async function processDocumentOcr(
     let pageResults: OcrPageResult[] = []
     let pageResultsPersistedInChunks = false
     let streamedAsyncPageSummary: { total: number; completed: number; failed: number; pending: number } | null = null
+    let usedNativePdfTextOnly = false
 
-    if (engine === 'hybrid') {
+    if (engine === 'paddle' && pdfPath && !forceFullRerun && pagesForOcr.length > 0) {
+      try {
+        const preflight = await analyzePdfTextLayer(pdfPath, { maxSamplePages: 10, analyzeAllPages: true })
+        persistPdfTextLayerSummary(doc, preflight)
+        if (preflight.mode !== 'ocr') {
+          pages = await ensurePageRecordsIfNeeded(docId, pages, preflight.pageCount)
+          pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
+          const pendingPageNumbers = new Set(pagesForOcr.map((page) => Number(page.page_num || 0)).filter((pageNum) => pageNum > 0))
+          const nativeAnalysisByPage = new Map(
+            preflight.pages
+              .filter((page) => page.mode === 'native_text' && pendingPageNumbers.has(page.pageNum))
+              .map((page) => [page.pageNum, page]),
+          )
+          const nativeResults = pagesForOcr
+            .map((page) => {
+              const analysis = nativeAnalysisByPage.get(Number(page.page_num || 0))
+              return analysis ? buildNativePdfPageResult(page, analysis) : null
+            })
+            .filter((item): item is OcrPageResult => item !== null)
+          const scanPages = pagesForOcr.filter((page) => !nativeAnalysisByPage.has(Number(page.page_num || 0)))
+          const canSelectPagesSafely = scanPages.length === 0 || !findMissingReadablePageImage(scanPages)
+
+          if (nativeResults.length > 0 && canSelectPagesSafely) {
+            emitOcrStatus(event, {
+              docId,
+              status: 'processing',
+              phase: 'ocr',
+              progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(nativeResults.length, pagesForOcr.length)),
+              completedPages: completedBefore + nativeResults.length,
+              totalPages: getDocTotalPages() || preflight.pageCount,
+              message: scanPages.length === 0
+                ? `已验证 PDF 原生文本层，直接读取 ${nativeResults.length} 页`
+                : `已读取 ${nativeResults.length} 页原生文本，剩余 ${scanPages.length} 页进行 OCR`,
+            })
+            if (scanPages.length === 0) {
+              pageResults = nativeResults
+              pagesForOcr = []
+              canUsePdfAsync = false
+              usedNativePdfTextOnly = true
+            } else {
+              await savePageOcrResultsBatchedDeferred(nativeResults, 'paddle', { refreshSearch: false })
+              pages = queryAll<OcrPageRow>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])
+              pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
+              completedBefore = getCompletedOcrPageCount(pages)
+              canUsePdfAsync = false
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('[OCR] PDF text-layer preflight failed; continuing with OCR', error)
+      }
+    }
+
+    if (usedNativePdfTextOnly) {
+      // pageResults already contains the trusted native PDF text pages.
+    } else if (engine === 'hybrid') {
       if (!hasVisionOcrConfig()) {
         throw new Error('请先配置视觉模型 OCR 后再使用混合 OCR。')
       }
@@ -2010,6 +2345,10 @@ async function processDocumentOcr(
       )
     }
 
+    const reprocessedPageIds = reprocessDocumentOcrStructure(docId)
+    reprocessedPageIds.forEach((pageId) => deferredFinalizePageIds.add(pageId))
+    if (reprocessedPageIds.length > 0) deferredDatabaseSaveNeeded = true
+
     updateDocumentStatus(docId, 'completed', 'processed', null)
     syncDocumentProofStatus(docId)
     autoCleanupPdfAssetsIfEnabled(docId)
@@ -2178,6 +2517,19 @@ export function registerOcrIpc(): void {
       console.error('OCR error:', error)
       throw new Error((error as Error).message)
     }
+  })
+
+  ipcMain.handle('documents:reprocessOcrStructure', async (_event, docId: string): Promise<number> => {
+    const safeDocId = String(docId || '').trim()
+    if (!safeDocId) return 0
+    const changedPageIds = reprocessDocumentOcrStructure(safeDocId)
+    if (changedPageIds.length > 0) {
+      markDocumentTocDirty(safeDocId)
+      markSearchIndexStaleForPages(changedPageIds)
+      notifySearchContentChanged()
+      scheduleDatabaseSave()
+    }
+    return changedPageIds.length
   })
 
   ipcMain.handle('documents:batchOcr', async (event, docIds: string[], options?: BatchOcrOptions) => {
@@ -2358,6 +2710,16 @@ export function registerOcrIpc(): void {
       throw error
     }
   })
+
+  ipcMain.handle(
+    'pages:rerecognizeLowQualityBlocks',
+    async (_event, pageId: string, options?: OcrRegionRerecognitionOptions): Promise<OcrRegionRerecognitionResult> => {
+      const storedPage = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+      const page = storedPage ? hydratePagePayloadRows([storedPage])[0] : null
+      if (!page) throw new Error('当前页面不存在')
+      return rerecognizeLowQualityPageRegions(page, options)
+    },
+  )
 
   ipcMain.handle('pages:rerunVisionOcr', async (event, pageId: string) => {
     const page = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])

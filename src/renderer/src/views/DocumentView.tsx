@@ -38,7 +38,7 @@ import {
 } from '@shared/parallel-translation'
 import { releaseCachedPdfDocument, renderPdfFilePageToImage } from '../utils/pdf'
 import { ensurePdfPageImagesForOcr as ensureOcrPageImages, isReadablePageImagePath } from '../utils/ocrPageImages'
-import { extractPageText, getCitationPageNumber, getOcrBlockText, getOrderedOcrBlocks, getReadablePageElements, getReadablePageText, normalizeOcrTextForReading } from '../utils/ocrText'
+import { extractPageText, getCitationPageNumber, getOcrBlockText, getOrderedOcrBlocks, getReadablePageElements, getReadablePageText, getTextFlowOcrBlocks, normalizeOcrTextForReading } from '../utils/ocrText'
 import { clampAiButtonPosition, clampFloatingPanelState, getDefaultFloatingPanelState } from '../utils/floatingViewport'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { resolveDocumentCitation } from '../utils/citations'
@@ -51,6 +51,7 @@ import {
 } from '@shared/translation-cache'
 import { shouldTranslatePageText } from '@shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '@shared/translation-source'
+import { getOrBuildOcrPageIr, getOcrPageIr, getOcrRegionRerecognitionCandidates } from '@shared/ocr-ir'
 import { DEFAULT_HIGHLIGHT_COLOR } from '../utils/highlightColors'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import type { AiTaskOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageUpdatePayload, PageTranslationCacheItem, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, TranslationGlossaryScope } from '@shared/types'
@@ -99,6 +100,22 @@ interface DocumentViewProps {
   startReaderBookTranslation?: boolean
   onBack: () => void
   onOpenDocument?: (target: OpenDocumentTarget) => void
+  compactHeader?: boolean
+}
+
+function getOcrQualityIssueLabel(code: string): string {
+  const labels: Record<string, string> = {
+    empty_text: '存在空文本块',
+    missing_coordinates: '部分文本缺少坐标',
+    low_confidence: '存在低置信度文本',
+    invalid_unicode: '存在异常字符',
+    suspicious_repetition: '存在疑似重复识别',
+    reading_order_gap: '阅读顺序不连续',
+    fallback_used: '使用了回退结果',
+    needs_enhancement: '存在需要局部增强的文本块',
+    discarded_content: '已分离页眉页脚等非正文内容',
+  }
+  return labels[code] || code
 }
 
 type ReaderTranslationQueueItem = ReaderTranslationPayload & {
@@ -182,6 +199,7 @@ type ReaderPage = {
 type SearchMatch = {
   pageIndex: number
   boxIndex: number
+  textFlowIndex?: number
   charIndex: number
   boxTop: number
   boxLeft: number
@@ -581,15 +599,40 @@ function getFacsimileOcrResult(ocrResult: unknown): FacsimileOcrResult | null {
   if (!parsed) return null
   const layoutBlocks = asFacsimileBlocks(parsed.layout_result)
   const rawLayoutBlocks = asFacsimileBlocks(parsed.raw_layout_result)
+  const nestedBoxes = asFacsimileBlocks(readRecordValue(readRecordValue(parsed, 'layout_det_res'), 'boxes'))
+  const rootBoxes = asFacsimileBlocks(parsed.boxes)
   const wordsResult = asFacsimileBlocks(parsed.words_result)
   const layoutCoordinateCount = layoutBlocks.filter(hasBlockCoordinates).length
   const rawCoordinateCount = rawLayoutBlocks.filter(hasBlockCoordinates).length
+  const nestedBoxCoordinateCount = nestedBoxes.filter(hasBlockCoordinates).length
+  const rootBoxCoordinateCount = rootBoxes.filter(hasBlockCoordinates).length
   if (rawCoordinateCount > layoutCoordinateCount) {
     const mergedRawLayoutBlocks = mergeFacsimileRawLayoutText(rawLayoutBlocks, wordsResult)
     return {
       ...parsed,
       layout_result: mergedRawLayoutBlocks,
       facsimile_layout_source: 'raw_layout_result',
+    }
+  }
+  if (layoutCoordinateCount > 0) {
+    return {
+      ...parsed,
+      layout_result: layoutBlocks,
+      facsimile_layout_source: 'layout_result',
+    }
+  }
+  if (nestedBoxCoordinateCount > 0) {
+    return {
+      ...parsed,
+      layout_result: nestedBoxes,
+      facsimile_layout_source: 'layout_det_res.boxes',
+    }
+  }
+  if (rootBoxCoordinateCount > 0) {
+    return {
+      ...parsed,
+      layout_result: rootBoxes,
+      facsimile_layout_source: 'boxes',
     }
   }
   return parsed
@@ -616,6 +659,55 @@ export function __getFacsimileOcrResultForTest(ocrResult: unknown): FacsimileOcr
 
 function getBoxText(box: FacsimileLayoutBlock): string {
   return getOcrBlockText(box)
+}
+
+function getBoxIdentityPart(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function getBoxIdentity(box: FacsimileLayoutBlock): string {
+  const stableId = getBoxIdentityPart(box.id || box.block_id || box.uuid || box.key).trim()
+  if (stableId) return `id:${stableId}`
+  return [
+    getBoxIdentityPart(box.reading_order),
+    getBoxIdentityPart(box.block_order),
+    getBoxText(box).replace(/\s+/g, ' ').trim(),
+    getBoxIdentityPart(getBoxLocation(box)),
+  ].join('|')
+}
+
+function buildBoxIndexMap(sourceBoxes: FacsimileLayoutBlock[], targetBoxes: FacsimileLayoutBlock[]): number[] {
+  const targetIndexes = new Map<string, number[]>()
+  targetBoxes.forEach((box, index) => {
+    const key = getBoxIdentity(box)
+    const indexes = targetIndexes.get(key) || []
+    indexes.push(index)
+    targetIndexes.set(key, indexes)
+  })
+
+  const usedIndexes = new Map<string, number>()
+  return sourceBoxes.map((box) => {
+    const key = getBoxIdentity(box)
+    const usedIndex = usedIndexes.get(key) || 0
+    usedIndexes.set(key, usedIndex + 1)
+    return targetIndexes.get(key)?.[usedIndex] ?? -1
+  })
+}
+
+function getMappedBoxIndex(indexMap: number[], index: number): number {
+  const mappedIndex = indexMap[index]
+  return Number.isInteger(mappedIndex) && mappedIndex >= 0 ? mappedIndex : index
+}
+
+function findBoxIndexByIdentity(boxes: FacsimileLayoutBlock[], box: FacsimileLayoutBlock): number {
+  const identity = getBoxIdentity(box)
+  return boxes.findIndex((candidate) => getBoxIdentity(candidate) === identity)
 }
 
 function getBoxSortPoint(box: FacsimileLayoutBlock): { top: number; left: number } {
@@ -1113,6 +1205,7 @@ export default function DocumentView({
   startReaderBookTranslation = false,
   onBack,
   onOpenDocument,
+  compactHeader = false,
 }: DocumentViewProps) {
   const openContextKey = getDocumentOpenContextKey(documentId, locator, initialPageIndex, searchKeyword, sourceId, highlightExcerpt, revealToc, searchSession)
   const [doc, setDoc] = useState<DocumentViewDocument | null>(null)
@@ -1475,6 +1568,20 @@ export default function DocumentView({
   )
   const docMetadataObj = useMemo(() => parseMaybeJson(doc?.metadata) || {}, [doc?.metadata])
   const layoutBoxes = useMemo(() => (currentPage ? getOrderedOcrBlocks(currentPage) as FacsimileLayoutBlock[] : []), [currentPage])
+  const textFlowBoxes = useMemo(() => (currentPage ? getTextFlowOcrBlocks(currentPage) as FacsimileLayoutBlock[] : []), [currentPage])
+  const layoutToTextFlowBoxIndex = useMemo(() => buildBoxIndexMap(layoutBoxes, textFlowBoxes), [layoutBoxes, textFlowBoxes])
+  const textFlowToLayoutBoxIndex = useMemo(() => buildBoxIndexMap(textFlowBoxes, layoutBoxes), [layoutBoxes, textFlowBoxes])
+  const activeTextEditorBoxIndex = activeBoxIndex >= 0 ? getMappedBoxIndex(layoutToTextFlowBoxIndex, activeBoxIndex) : -1
+  const handleTextEditorLineFocus = useCallback((textFlowIndex: number, textFlowBox?: FacsimileLayoutBlock) => {
+    if (textFlowBox) {
+      const layoutIndex = findBoxIndexByIdentity(layoutBoxes, textFlowBox)
+      if (layoutIndex >= 0) {
+        setActiveBoxIndex(layoutIndex)
+        return
+      }
+    }
+    setActiveBoxIndex(getMappedBoxIndex(textFlowToLayoutBoxIndex, textFlowIndex))
+  }, [layoutBoxes, textFlowToLayoutBoxIndex])
   const coordinateSourceSize = useMemo(() => {
     const gujiProcessing = readRecordValue(ocrResultObj, 'guji_processing')
     return {
@@ -1505,6 +1612,14 @@ export default function DocumentView({
     [currentPage, doc, facsimileOcrResultObj],
   )
   const currentPageProofStatus = currentPage?.proof_status === 'completed' ? 'completed' : 'pending'
+  const currentPageOcrQuality = useMemo(
+    () => getOrBuildOcrPageIr(ocrResultObj, { pageIndex: Number(currentPage?.page_num || 0) || 1 })?.page.quality || null,
+    [currentPage?.page_num, ocrResultObj],
+  )
+  const currentPageRegionCandidateCount = useMemo(() => {
+    const ir = getOrBuildOcrPageIr(ocrResultObj, { pageIndex: Number(currentPage?.page_num || 0) || 1 })
+    return ir ? getOcrRegionRerecognitionCandidates(ir, 20).length : 0
+  }, [currentPage?.page_num, ocrResultObj])
   const currentPageLayoutAttention = !!currentPage?.needs_layout_attention
   const metadataOcrEngine = readRecordValue(docMetadataObj, 'ocr_engine')
   const currentOcrEngine = isOcrEngine(metadataOcrEngine) ? metadataOcrEngine : 'paddle'
@@ -1708,7 +1823,8 @@ export default function DocumentView({
       const pageHits = findSearchOccurrences(text, effectiveSearchKeyword)
       if (pageHits.length === 0) return
 
-      const boxes = getOrderedOcrBlocks(page) as FacsimileLayoutBlock[]
+      const boxes = getTextFlowOcrBlocks(page) as FacsimileLayoutBlock[]
+      const textFlowToLayoutIndex = buildBoxIndexMap(boxes, getOrderedOcrBlocks(page) as FacsimileLayoutBlock[])
       let boxHitCount = 0
       boxes.forEach((box, boxIndex) => {
         const boxText = getBoxText(box)
@@ -1719,7 +1835,8 @@ export default function DocumentView({
         boxHits.forEach((hit) => {
           matches.push({
             pageIndex,
-            boxIndex,
+            boxIndex: getMappedBoxIndex(textFlowToLayoutIndex, boxIndex),
+            textFlowIndex: boxIndex,
             charIndex: hit.charIndex,
             boxTop: point.top,
             boxLeft: point.left,
@@ -1744,6 +1861,7 @@ export default function DocumentView({
 
     return matches.sort((left, right) => (
       left.pageIndex - right.pageIndex
+      || (left.textFlowIndex ?? Number.MAX_SAFE_INTEGER) - (right.textFlowIndex ?? Number.MAX_SAFE_INTEGER)
       || left.boxTop - right.boxTop
       || left.boxLeft - right.boxLeft
       || left.boxIndex - right.boxIndex
@@ -3244,7 +3362,15 @@ export default function DocumentView({
               ? String(data.proofed_text ?? data.ocr_text ?? page.proofed_text ?? page.ocr_text ?? '').trim().length > 0
               : page.has_ocr_text,
             needs_layout_attention: data.ocr_result !== undefined
-              ? asFacsimileBlocks(readRecordValue(parseMaybeJson(data.ocr_result), 'layout_result')).some((block) => !!block?.needs_enhancement)
+              ? (() => {
+                  const parsedResult = parseMaybeJson(data.ocr_result)
+                  const ir = getOcrPageIr(parsedResult)
+                  return asFacsimileBlocks(readRecordValue(parsedResult, 'layout_result')).some((block) => !!block?.needs_enhancement)
+                    || Boolean(ir && (
+                      ir.page.quality.score < 0.65
+                      || ir.page.quality.issues.some((issue) => issue.severity === 'error' || issue.severity === 'warning')
+                    ))
+                })()
               : page.needs_layout_attention,
           }
         })
@@ -3501,6 +3627,63 @@ export default function DocumentView({
     } catch (error: unknown) {
       console.error(error)
       message.error(`视觉 OCR failed: ${getErrorMessage(error, 'Unknown error')}`)
+    } finally {
+      setOcrProcessing(false)
+    }
+  }
+
+  const handleReprocessDocumentOcrStructure = async () => {
+    if (!doc?.id) return
+    const targetPageId = currentPage?.id
+    setOcrProcessing(true)
+    try {
+      const changedPageCount = await window.api.reprocessOcrStructure(doc.id)
+      if (targetPageId) await refreshDocumentKeepPage(targetPageId)
+      setPageTranslations({})
+      setSkippedTranslationPageIds({})
+      message.success(changedPageCount > 0
+        ? `已重新整理 ${changedPageCount} 页文本结构，未重新调用 OCR`
+        : '没有可重新整理的 OCR 页面')
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(getErrorMessage(error, '重新整理 OCR 结构失败'))
+    } finally {
+      setOcrProcessing(false)
+    }
+  }
+
+  const handleRerecognizeLowQualityBlocks = async () => {
+    if (!currentPage?.id) return
+    const targetPageId = currentPage.id
+    setOcrProcessing(true)
+    try {
+      const hasPageImage = await ensureCurrentPageImageCached(currentPage)
+      if (!hasPageImage) {
+        throw new Error('当前页缺少图像，且没有可用于局部重识别的 PDF 原稿')
+      }
+      const result = await window.api.rerecognizeLowQualityOcrBlocks(targetPageId, { maxBlocks: 8 })
+      if (result.updatedBlockCount > 0) {
+        await refreshDocumentKeepPage(targetPageId)
+        await loadCurrentPageOcrVersions(targetPageId)
+        setPageTranslations((current) => {
+          const next = { ...current }
+          delete next[targetPageId]
+          return next
+        })
+        setSkippedTranslationPageIds((current) => {
+          const next = { ...current }
+          delete next[targetPageId]
+          return next
+        })
+        message.success(`已局部重识别 ${result.updatedBlockCount} 个异常文本块，人工校对文本未改动`)
+      } else if (result.attemptedBlockCount === 0) {
+        message.info('当前页没有适合局部重识别的异常文本块')
+      } else {
+        message.info('异常区域已检查，但没有质量更好的识别结果')
+      }
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(getErrorMessage(error, '局部重识别失败'))
     } finally {
       setOcrProcessing(false)
     }
@@ -4048,6 +4231,11 @@ export default function DocumentView({
 
     if (key === 'rerun-layout') {
       void handleRerunCurrentPageLayout()
+      return
+    }
+
+    if (key === 'reprocess-structure') {
+      void handleReprocessDocumentOcrStructure()
     }
   }
 
@@ -4124,6 +4312,7 @@ export default function DocumentView({
     { key: 'rerun-vision-ocr', label: '用视觉 OCR 重识别本页' },
     ...(shouldUseVerticalOcr || facsimileProofCandidate ? [{ key: 'enhance-guji', label: '增强本页竖排识别' }] : []),
     { key: 'rerun-layout', label: '重排本页版面' },
+    { key: 'reprocess-structure', label: '重新整理全文结构（不重新 OCR）' },
   ]
 
   const readerPages = (readerViewMode === 'spread'
@@ -4595,31 +4784,33 @@ export default function DocumentView({
 
   return (
     <div style={{ padding: '16px 24px', height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-          <Button className="document-back-button" icon={<ArrowLeftOutlined />} onClick={() => void handleBack()} type="text" style={{ flexShrink: 0 }}>
-            返回
-          </Button>
-          <Title
-            level={4}
-            style={{
-              margin: 0,
-              color: 'var(--gs-text-primary)',
-              cursor: 'pointer',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              flex: '1 1 auto',
-              minWidth: 0,
-            }}
-            onDoubleClick={() => setEditorVisible(true)}
-            title={doc.title}
-          >
-            {doc.title}
-          </Title>
-        </div>
+      <div style={{ marginBottom: compactHeader ? 8 : 12 }}>
+        {!compactHeader ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <Button className="document-back-button" icon={<ArrowLeftOutlined />} onClick={() => void handleBack()} type="text" style={{ flexShrink: 0 }}>
+              返回
+            </Button>
+            <Title
+              level={4}
+              style={{
+                margin: 0,
+                color: 'var(--gs-text-primary)',
+                cursor: 'pointer',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                flex: '1 1 auto',
+                minWidth: 0,
+              }}
+              onDoubleClick={() => setEditorVisible(true)}
+              title={doc.title}
+            >
+              {doc.title}
+            </Title>
+          </div>
+        ) : null}
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 8px', alignItems: 'center', marginBottom: 8, paddingLeft: 52 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 8px', alignItems: 'center', marginBottom: 8, paddingLeft: compactHeader ? 0 : 52 }}>
           <Tag color="purple">{getDisplayDocType(doc.doc_type)}</Tag>
           {getDisplayMetadataText(doc.author) ? <Tag color="blue">{getDisplayMetadataText(doc.author)}</Tag> : null}
           {getDisplayMetadataText(doc.dynasty) ? <Tag color="gold">{getDisplayMetadataText(doc.dynasty)}</Tag> : null}
@@ -4631,12 +4822,42 @@ export default function DocumentView({
               <Tag color={currentPageProofStatus === 'completed' ? 'gold' : 'default'}>
                 {`校对：${currentPageProofStatus === 'completed' ? '已完成' : '待处理'}`}
               </Tag>
-              {currentPageLayoutAttention ? <Tag color="orange">版面需复核</Tag> : null}
+              {currentPageLayoutAttention ? (
+                <Popover
+                  title="OCR 质量检查"
+                  content={(
+                    <div style={{ maxWidth: 320 }}>
+                      {currentPageOcrQuality ? (
+                        <>
+                          <div style={{ marginBottom: 6 }}>质量评分：{Math.round(currentPageOcrQuality.score * 100)}</div>
+                          {[...new Set(currentPageOcrQuality.issues
+                            .filter((issue) => issue.severity !== 'info')
+                            .map((issue) => getOcrQualityIssueLabel(issue.code)))]
+                             .slice(0, 6)
+                             .map((label) => <div key={label}>{label}</div>)}
+                          {currentPageRegionCandidateCount > 0 ? (
+                            <Button
+                              size="small"
+                              loading={ocrProcessing}
+                              style={{ marginTop: 10 }}
+                              onClick={() => void handleRerecognizeLowQualityBlocks()}
+                            >
+                              局部重识别异常块（{currentPageRegionCandidateCount}）
+                            </Button>
+                          ) : null}
+                        </>
+                      ) : '当前版面包含需要人工确认的区域'}
+                    </div>
+                  )}
+                >
+                  <Tag color="orange" style={{ cursor: 'help' }}>版面需复核</Tag>
+                </Popover>
+              ) : null}
             </>
           )}
         </div>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, paddingLeft: 52 }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, paddingLeft: compactHeader ? 0 : 52 }}>
           <Segmented
             size="small"
             value={isEbookDocument ? 'read' : documentMode}
@@ -5259,8 +5480,8 @@ export default function DocumentView({
                   }
                 }}
                 onTextSelectionChange={setSelectedTextForAi}
-                activeBoxIndex={activeBoxIndex}
-                onLineFocus={setActiveBoxIndex}
+                activeBoxIndex={activeTextEditorBoxIndex}
+                onLineFocus={handleTextEditorLineFocus}
                 switchToRegion={switchToRegion}
                 onSwitchToRegionConsumed={() => setSwitchToRegion(false)}
                 searchKeyword={effectiveSearchKeyword}

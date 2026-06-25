@@ -2,6 +2,7 @@
 import { nanoid } from 'nanoid'
 import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
+import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
 import { getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import { normalizeChineseSearchText, normalizeWhitespace } from './text-normalization'
 import { getErrorMessage } from '../shared/errors'
@@ -91,6 +92,13 @@ interface SearchNgramCandidateRow extends SearchSegmentRow {
 }
 
 type CurrentSearchIndexStatus = Pick<SearchIndexStatus, 'status' | 'source_hash' | 'segment_count' | 'error_message' | 'updated_at'>
+type SearchIndexReindexReason =
+  | 'manual'
+  | 'content-changed'
+  | 'search-scope-stale'
+  | 'search-managed-text-stale'
+  | 'search-hit-locator'
+  | 'global-stale-suppressed'
 
 type JsonRecord = Record<string, unknown>
 
@@ -694,6 +702,8 @@ function loadPageOcrResultForSearch(page: SearchPageRow): SearchPageRow {
 }
 
 function getOrderedOcrBlocksFromPayload(parsed: OcrResultPayload | null): OcrBlock[] {
+  const ir = getOrBuildOcrPageIr(parsed)
+  if (ir) return deriveOcrReadingBlocksFromIr(ir) as OcrBlock[]
   const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
   const rawLayoutBlocks = Array.isArray(parsed?.raw_layout_result) ? parsed.raw_layout_result : []
   const blocks = layoutBlocks.length > 0
@@ -755,12 +765,15 @@ function getIndexablePageText(page: SearchPageRow): string {
   const shouldLoadBlocks = shouldConsiderOcrBlocksForSearch(page) && (!!page.ocr_result || !ocrText)
   const pageWithOcrResult = shouldLoadBlocks ? loadPageOcrResultForSearch(page) : page
   const parsed = shouldLoadBlocks ? parseMaybeJson<OcrResultPayload>(pageWithOcrResult?.ocr_result) : null
+  const ir = getOrBuildOcrPageIr(parsed, { pageIndex: Number(page.page_num || 0) || 1 })
   const blocks = parsed ? getOrderedOcrBlocksFromPayload(parsed) : []
   if (blocks.length > 0 && shouldPreferOcrBlocksForSearch(page, blocks, parsed)) {
     const blockText = suppressOverrepresentedLines(blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'))
     if (blockText.trim()) return blockText.trim()
   }
 
+  const irText = ir ? deriveOcrTextFromIr(ir) : ''
+  if (irText) return suppressOverrepresentedLines(irText)
   if (ocrText) return suppressOverrepresentedLines(ocrText)
 
   return suppressOverrepresentedLines(blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n')).trim()
@@ -1020,7 +1033,7 @@ function restoreSearchIndexStatusFromSegments(docId: string, stats: SearchIndexS
 
 function repairUsableLegacySearchIndexStatus(docId: string, status?: CurrentSearchIndexStatus | null): boolean {
   const current = status || getCurrentSearchIndexStatus(docId)
-  if (!current || current.status === 'ready') return false
+  if (current?.status === 'ready') return false
 
   const stats = getSearchIndexSegmentStats(docId)
   if (!isStoredSearchIndexCurrentForDocument(docId, stats)) return false
@@ -1031,7 +1044,7 @@ function repairUsableLegacySearchIndexStatus(docId: string, status?: CurrentSear
 
 function isUsableSearchIndexStatus(docId: string, status?: CurrentSearchIndexStatus | null): boolean {
   const current = status || getCurrentSearchIndexStatus(docId)
-  if (!current) return false
+  if (!current) return repairUsableLegacySearchIndexStatus(docId, current)
   if (current.status === 'ready') {
     return hasSearchIndexSegments(docId)
   }
@@ -1064,6 +1077,29 @@ function emitSearchIndexTaskStatus(payload: {
     kind: 'search-index',
     ...payload,
   })
+}
+
+function getSearchIndexReindexReasonLabel(reason?: SearchIndexReindexReason): string {
+  switch (reason) {
+    case 'manual':
+      return '手动重建'
+    case 'content-changed':
+      return '文献内容已更新'
+    case 'search-scope-stale':
+      return '当前检索范围索引待更新'
+    case 'search-managed-text-stale':
+      return '电子书/文本索引待更新'
+    case 'search-hit-locator':
+      return '命中定位需要补全索引'
+    case 'global-stale-suppressed':
+      return '全库疑似过期索引已暂缓自动重建'
+    default:
+      return '搜索索引待更新'
+  }
+}
+
+function getSearchIndexReindexMessage(reason?: SearchIndexReindexReason): string {
+  return `正在后台更新搜索索引（${getSearchIndexReindexReasonLabel(reason)}），不影响阅读和浏览`
 }
 
 function updateSearchIndexStatus(
@@ -1553,7 +1589,7 @@ async function drainReindexQueue(): Promise<void> {
   }
 }
 
-function scheduleBackgroundReindex(docIds: string[], options: { activeResolved?: boolean; delayMs?: number } = {}): void {
+function scheduleBackgroundReindex(docIds: string[], options: { activeResolved?: boolean; delayMs?: number; reason?: SearchIndexReindexReason } = {}): void {
   const requestedDocIds = uniqueIds(docIds)
   const newDocIds = requestedDocIds.length > 0
     ? options.activeResolved ? requestedDocIds : resolveActiveDocumentIds(requestedDocIds)
@@ -1573,7 +1609,7 @@ function scheduleBackgroundReindex(docIds: string[], options: { activeResolved?:
       totalCount: queuedReindexDocIds.size,
       completedCount: 0,
       progress: 0,
-      message: '正在后台更新搜索索引，不影响阅读和浏览',
+      message: getSearchIndexReindexMessage(options.reason),
     })
   }
   if (!AUTO_BACKGROUND_REINDEX_ENABLED) return
@@ -1716,7 +1752,7 @@ export function queueDocumentReindex(docId: string): SearchReindexDocumentResult
     markSearchIndexDirty()
     return { docId, status: 'skipped', segmentCount: 0, error: '文献正在后台删除' }
   }
-  scheduleBackgroundReindex([docId])
+  scheduleBackgroundReindex([docId], { reason: 'manual' })
   const status = getCurrentSearchIndexStatus(docId)
   return { docId, status: 'queued', segmentCount: Number(status?.segment_count || 0) }
 }
@@ -1725,7 +1761,7 @@ export function queueAllDocumentsReindex(): SearchReindexAllResult {
   const docs = queryAll<{ id: string }>(
     `SELECT id FROM documents WHERE ${activeDocumentCondition('documents')} ORDER BY updated_at DESC`,
   )
-  scheduleBackgroundReindex(docs.map((doc) => doc.id))
+  scheduleBackgroundReindex(docs.map((doc) => doc.id), { reason: 'manual' })
   return { total: docs.length, ready: 0, errors: 0, queued: docs.length }
 }
 
@@ -1738,7 +1774,7 @@ function ensureDocumentIndexed(docId: string): void {
   if (resolveActiveDocumentIds([docId]).length === 0) return
   const status = getCurrentSearchIndexStatus(docId)
   if (!isUsableSearchIndexStatus(docId, status)) {
-    scheduleBackgroundReindex([docId])
+    scheduleBackgroundReindex([docId], { reason: 'search-scope-stale' })
   }
 }
 
@@ -1775,7 +1811,7 @@ function ensureManagedTextDocumentsIndexed(docIds?: string[]): string[] {
   const reindexed: string[] = []
   docs.forEach((doc) => {
     if (isUsableSearchIndexStatus(doc.id, getCurrentSearchIndexStatus(doc.id))) return
-    scheduleBackgroundReindex([doc.id])
+    scheduleBackgroundReindex([doc.id], { reason: 'search-managed-text-stale' })
     reindexed.push(doc.id)
   })
   return reindexed
@@ -1832,6 +1868,7 @@ function findStaleManagedTextDocIds(docIds?: string[], limit = 80): string[] {
 
 function checkSearchIndexForScope(docIds?: string[], options: { autoReindex?: boolean } = {}): string[] {
   const uniqueDocIds = uniqueIds(docIds || [])
+  const scoped = uniqueDocIds.length > 0
   const staleDocIds = uniqueDocIds.length > 0
     ? resolveActiveDocumentIds(uniqueDocIds).filter((docId) => !isUsableSearchIndexStatus(docId, getCurrentSearchIndexStatus(docId)))
     : queryAll<{ id: string }>(
@@ -1844,7 +1881,9 @@ function checkSearchIndexForScope(docIds?: string[], options: { autoReindex?: bo
          LIMIT ?`,
         [SEARCH_STALE_GLOBAL_SCAN_LIMIT],
       ).map((row) => row.id)
-  if (staleDocIds.length > 0 && options.autoReindex !== false) scheduleBackgroundReindex(staleDocIds)
+  if (staleDocIds.length > 0 && scoped && options.autoReindex !== false) {
+    scheduleBackgroundReindex(staleDocIds, { reason: 'search-scope-stale' })
+  }
   return staleDocIds
 }
 
@@ -3194,9 +3233,12 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
   if (scopedDocIds && scopedDocIds.length === 0) {
     return { query, totalDocuments: 0, totalHits: 0, groups: [], warnings: ['当前筛选范围为空。'], status: 'complete' }
   }
-  if (scopedDocIds && scopedDocIds.length > 0 && scopedDocIds.length <= 8) {
+  const autoReindex = options?.autoReindex !== false
+  if (autoReindex && scopedDocIds && scopedDocIds.length > 0 && scopedDocIds.length <= 8) {
     const staleManagedTextDocIds = findStaleManagedTextDocIds(scopedDocIds, 8)
-    if (staleManagedTextDocIds.length > 0) scheduleBackgroundReindex(staleManagedTextDocIds)
+    if (staleManagedTextDocIds.length > 0) {
+      scheduleBackgroundReindex(staleManagedTextDocIds, { reason: 'search-managed-text-stale' })
+    }
   }
 
   const cacheKey = stableStringify({
@@ -3248,7 +3290,6 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     }
   }
 
-  const autoReindex = options?.autoReindex !== false
   const staleDocIds = checkSearchIndexForScope(scopedDocIds, { autoReindex })
   const needsCandidateText = (options?.resultMode || 'preview') === 'all' || normalizedQuery.length > 3
   const ngramRows = runSegmentNgramSearch(normalizedQuery, limit, scopedDocIds, exhaustive, needsCandidateText)
@@ -3314,14 +3355,21 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
   const warnings = matchedRows.length === 0 ? ['当前范围内没有可匹配的全文索引。'] : []
   if (staleDocIds.length > 0) {
     const staleIndexedHits = indexedRows.some((row) => staleDocIds.includes(row.doc_id))
-    if (autoReindex) {
-      scheduleBackgroundReindex(staleDocIds)
+    if (autoReindex && !!scopedDocIds) {
       warnings.push(
         staleIndexedHits
           ? `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；本次先使用已有索引展示结果，更新完成后会自动使用新索引。`
           : allowSynchronousFallback
           ? `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；本次已对缺失索引文献使用页面文本兜底。`
           : `有 ${staleDocIds.length} 篇文献的搜索索引正在后台更新；普通检索先显示已就绪索引结果，完整导出/诊断会补扫缺失文献。`,
+      )
+    } else if (autoReindex) {
+      warnings.push(
+        staleIndexedHits
+          ? `检测到 ${staleDocIds.length} 篇文献的索引状态可能过期；本次先使用已有索引展示结果，不会自动启动全库重建。`
+          : allowSynchronousFallback
+          ? `检测到 ${staleDocIds.length} 篇文献的索引状态可能过期；本次已使用页面文本兜底，不会自动启动全库重建。`
+          : `检测到 ${staleDocIds.length} 篇文献的索引状态可能过期；可在健康检查中手动修复。`,
       )
     } else {
       warnings.push(
@@ -3383,7 +3431,7 @@ export function getDocumentSearchHits(docId: string, query: string, options?: Se
   const status = getCurrentSearchIndexStatus(docId)
   const indexReady = isUsableSearchIndexStatus(docId, status)
   if (!indexReady) {
-    scheduleBackgroundReindex([docId])
+    scheduleBackgroundReindex([docId], { reason: 'search-hit-locator' })
   }
   let segments = indexReady ? loadSearchSegmentsForDocument(docId) : []
   if (segments.length === 0) {

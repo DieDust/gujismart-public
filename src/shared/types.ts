@@ -232,6 +232,18 @@ export interface PageOcrOptions {
   secondPass?: OcrSecondPass
 }
 
+export interface OcrRegionRerecognitionOptions {
+  maxBlocks?: number
+}
+
+export interface OcrRegionRerecognitionResult {
+  attemptedBlockCount: number
+  updatedBlockCount: number
+  skippedBlockCount: number
+  failedBlockCount: number
+  updatedBlockIds: string[]
+}
+
 export interface TypesetAnnotationItem {
   id: string
   type: TypesetAnnotationType
@@ -335,11 +347,223 @@ export interface OcrRecognizeLayoutBlock {
   [key: string]: unknown
 }
 
+export type OcrIrSemanticType =
+  | 'document_title'
+  | 'heading'
+  | 'paragraph'
+  | 'abstract'
+  | 'reference'
+  | 'list'
+  | 'index'
+  | 'note'
+  | 'caption'
+  | 'footnote'
+  | 'page_header'
+  | 'page_footer'
+  | 'page_number'
+  | 'aside'
+  | 'table'
+  | 'image'
+  | 'chart'
+  | 'formula_inline'
+  | 'formula_display'
+  | 'code'
+  | 'seal'
+  | 'unknown'
+
+export type OcrIrOrientation = 'horizontal' | 'vertical' | 'unknown'
+export type OcrIrOrientationSource =
+  | 'ocr'
+  | 'coordinate'
+  | 'page_consensus'
+  | 'document_consensus'
+  | 'unknown'
+export type OcrReadingOrderSource = 'ocr' | 'coordinate' | 'source'
+export type OcrIrSourceEngine = OcrEngine | 'native_pdf_text' | 'imported' | 'unknown'
+
+export interface OcrBoundingBox {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+export interface OcrIrSource {
+  engine: OcrIrSourceEngine
+  provider?: string
+  model?: string
+  stage?: string
+  sourceIndex?: number
+}
+
+export interface OcrProcessingEvent {
+  stage: string
+  action: string
+  timestamp?: string
+  reason?: string
+}
+
+export interface OcrQualityIssue {
+  code:
+    | 'empty_text'
+    | 'missing_coordinates'
+    | 'low_confidence'
+    | 'invalid_unicode'
+    | 'suspicious_repetition'
+    | 'reading_order_gap'
+    | 'fallback_used'
+    | 'needs_enhancement'
+    | 'discarded_content'
+  severity: 'info' | 'warning' | 'error'
+  message: string
+  blockId?: string
+}
+
+export interface OcrQualityReport {
+  score: number
+  coordinateCoverage: number
+  confidenceCoverage: number
+  lowConfidenceBlockCount: number
+  missingCoordinateBlockCount: number
+  discardedBlockCount: number
+  issues: OcrQualityIssue[]
+}
+
+export interface OcrAssetRef {
+  id: string
+  kind: 'image' | 'chart' | 'table' | 'formula' | 'crop'
+  path?: string
+  mimeType?: string
+  bbox?: OcrBoundingBox
+  normalizedBbox?: OcrBoundingBox
+}
+
+export interface OcrTableCellV1 {
+  row: number
+  column: number
+  rowSpan: number
+  columnSpan: number
+  text: string
+  bbox?: OcrBoundingBox
+  normalizedBbox?: OcrBoundingBox
+}
+
+export interface OcrTableV1 {
+  rows: string[][]
+  cells: OcrTableCellV1[]
+  html?: string
+  markdown?: string
+  complexity: 'simple' | 'complex' | 'unknown'
+  continuesFromPreviousPage?: boolean
+  continuesToNextPage?: boolean
+}
+
+export interface OcrFormulaV1 {
+  latex: string
+  display: boolean
+  sourceText?: string
+  assetId?: string
+}
+
+export interface OcrSpanV1 {
+  id: string
+  type: 'text' | 'formula_inline' | 'phonetic' | 'unknown'
+  text: string
+  bbox?: OcrBoundingBox
+  normalizedBbox?: OcrBoundingBox
+  confidence?: number
+  source: OcrIrSource
+}
+
+export interface OcrLineV1 {
+  id: string
+  text: string
+  bbox?: OcrBoundingBox
+  normalizedBbox?: OcrBoundingBox
+  confidence?: number
+  spans: OcrSpanV1[]
+}
+
+export interface OcrBlockV1 {
+  id: string
+  type: OcrIrSemanticType
+  text: string
+  rawText?: string
+  bbox?: OcrBoundingBox
+  normalizedBbox?: OcrBoundingBox
+  confidence?: number
+  orientation: OcrIrOrientation
+  orientationSource: OcrIrOrientationSource
+  sourceOrientation: OcrIrOrientation
+  sourceOrientationSource: OcrIrOrientationSource
+  readingOrder: number
+  sourceReadingOrder?: number
+  readingOrderSource: OcrReadingOrderSource
+  manualReadingOrder?: number
+  columnIndex?: number
+  lines: OcrLineV1[]
+  childBlockIds?: string[]
+  parentBlockId?: string
+  table?: OcrTableV1
+  formula?: OcrFormulaV1
+  assetId?: string
+  source: OcrIrSource
+  processing: OcrProcessingEvent[]
+}
+
+export interface OcrParagraphV1 {
+  id: string
+  type: 'heading' | 'paragraph' | 'list' | 'note' | 'reference'
+  text: string
+  blockIds: string[]
+  readingOrder: number
+  orientation?: OcrIrOrientation
+  columnIndex?: number
+  bbox?: OcrBoundingBox
+  normalizedBbox?: OcrBoundingBox
+  continuationGroupId?: string
+  continuesFromPreviousPage?: boolean
+  continuesToNextPage?: boolean
+}
+
+export interface OcrPageV1 {
+  pageIndex: number
+  width: number
+  height: number
+  orientation: OcrIrOrientation
+  orientationSource: OcrIrOrientationSource
+  blocks: OcrBlockV1[]
+  discardedBlocks: OcrBlockV1[]
+  paragraphs: OcrParagraphV1[]
+  assets: OcrAssetRef[]
+  quality: OcrQualityReport
+}
+
+export interface OcrPageIrEnvelopeV1 {
+  schemaVersion: 'gujismart-ocr-ir/v1'
+  generator: 'GujiSmart'
+  pipelineVersion: string
+  generatedAt: string
+  page: OcrPageV1
+}
+
+export interface OcrDocumentV1 {
+  schemaVersion: 'gujismart-ocr-ir/v1'
+  generator: 'GujiSmart'
+  pipelineVersion: string
+  orientation: OcrIrOrientation
+  orientationConfidence: number
+  pages: OcrPageV1[]
+  paragraphs: OcrParagraphV1[]
+  quality: OcrQualityReport
+}
+
 export interface OcrRecognizeResult {
   text?: string
   words_result?: OcrRecognizeWordResult[]
   layout_result?: OcrRecognizeLayoutBlock[]
   source_type?: string
+  gujismart_ir?: OcrPageIrEnvelopeV1
   [key: string]: unknown
 }
 
@@ -406,6 +630,34 @@ export interface PdfInfoResult {
   title: string
   pageCount: number
   source?: 'qpdf' | 'pdf-lib' | 'pdfjs'
+}
+
+export type PdfTextLayerMode = 'native_text' | 'ocr' | 'mixed'
+
+export interface PdfTextLayerPageAnalysis {
+  pageNum: number
+  mode: Exclude<PdfTextLayerMode, 'mixed'>
+  pageWidth: number
+  pageHeight: number
+  text: string
+  cleanCharacterCount: number
+  invalidUnicodeRatio: number
+  replacementCharacterRatio: number
+  coordinateCoverage: number
+  imageObjectCount: number
+  reasons: string[]
+  layoutBlocks: OcrRecognizeLayoutBlock[]
+}
+
+export interface PdfTextLayerAnalysis {
+  mode: PdfTextLayerMode
+  pageCount: number
+  sampledPageNums: number[]
+  nativeTextPageCount: number
+  ocrPageCount: number
+  averageCleanCharacters: number
+  analyzedAt: string
+  pages: PdfTextLayerPageAnalysis[]
 }
 
 export interface PdfAssetCleanupResult {
