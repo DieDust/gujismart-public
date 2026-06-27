@@ -88,6 +88,24 @@ function insertStructuredResultOnlyPage(database, id, docId, pageNum) {
   )
 }
 
+function insertErrorResultOnlyPage(database, id, docId, pageNum) {
+  database.run(
+    'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      docId,
+      pageNum,
+      null,
+      null,
+      JSON.stringify({ source_type: 'ocr_error', error: 'startup quality failure placeholder', failed_at: new Date().toISOString() }),
+      null,
+      'completed',
+      'pending',
+      new Date().toISOString(),
+    ],
+  )
+}
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -250,6 +268,15 @@ async function run() {
       metadata: JSON.stringify({ pdf_page_count: 3 }),
     })
     insertPage(database, 'page_completed_missing_pages_1', 'doc_completed_missing_pages', 1, 'completed')
+    insertDocument(database, 'doc_completed_error_placeholder', {
+      pageCount: 2,
+      importStatus: 'processed',
+      ocrStatus: 'completed',
+      errorMessage: 'simulated stale error placeholder status',
+      metadata: JSON.stringify({ pdf_page_count: 2 }),
+    })
+    insertPage(database, 'page_completed_error_placeholder_1', 'doc_completed_error_placeholder', 1, 'completed')
+    insertErrorResultOnlyPage(database, 'page_completed_error_placeholder_2', 'doc_completed_error_placeholder', 2)
     insertDocument(database, 'doc_interrupted_large_pdf', {
       filePath: interruptedLargePdfPath,
       pageCount: 1200,
@@ -302,12 +329,12 @@ async function run() {
     assert.strictEqual(summary.resetTranslationCacheRows, 1)
     assert.strictEqual(summary.orphanStorageDirs, 1)
     assert.strictEqual(summary.deletingDocuments.queuedDocuments, 2)
-    assert.strictEqual(summary.ocr.recoveredDocuments, 3)
+    assert.strictEqual(summary.ocr.recoveredDocuments, 4)
     assert.strictEqual(summary.completedOcrDocuments, 2)
     assert.strictEqual(summary.repairedInterruptedImports, 5)
     assert.strictEqual(summary.initializedPdfPageRecords, 5)
     assert.strictEqual(summary.recoveredPdfCompressionSources, 1)
-    assert.strictEqual(summary.reindexedRecoveredOcrDocuments, 5)
+    assert.strictEqual(summary.reindexedRecoveredOcrDocuments, 6)
     assert.deepStrictEqual(summary.resumedBatchQueue, {
       resumedJobs: 0,
       resumedItems: 0,
@@ -319,6 +346,7 @@ async function run() {
     assert.deepStrictEqual(
       database.queryAll('SELECT doc_id, status, error_message FROM search_index_status ORDER BY doc_id'),
       [
+        { doc_id: 'doc_completed_error_placeholder', status: 'queued', error_message: null },
         { doc_id: 'doc_completed_missing_pages', status: 'queued', error_message: null },
         { doc_id: 'doc_completed_result_only', status: 'queued', error_message: null },
         { doc_id: 'doc_completed_text_without_file', status: 'queued', error_message: null },
@@ -357,6 +385,14 @@ async function run() {
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_completed_missing_pages']),
       { ocr_status: 'pending', import_status: 'stored', error_message: null, page_count: 3 },
+    )
+    assert.deepStrictEqual(
+      database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_completed_error_placeholder']),
+      { ocr_status: 'pending', import_status: 'stored', error_message: null, page_count: 2 },
+    )
+    assert.deepStrictEqual(
+      database.queryAll('SELECT page_num, ocr_status FROM pages WHERE doc_id = ? ORDER BY page_num', ['doc_completed_error_placeholder']),
+      [{ page_num: 1, ocr_status: 'completed' }, { page_num: 2, ocr_status: 'pending' }],
     )
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_interrupted_large_pdf']),

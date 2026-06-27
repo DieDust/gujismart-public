@@ -16,6 +16,7 @@ export type SearchFilters = Pick<
   | 'favoritesOnly'
   | 'yearFrom'
   | 'yearTo'
+  | 'translationScope'
 >
 
 interface SearchState {

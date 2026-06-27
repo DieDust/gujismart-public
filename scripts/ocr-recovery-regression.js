@@ -85,6 +85,24 @@ function insertStructuredResultOnlyPage(database, id, docId, pageNum) {
   )
 }
 
+function insertErrorResultOnlyPage(database, id, docId, pageNum) {
+  database.run(
+    'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [
+      id,
+      docId,
+      pageNum,
+      null,
+      null,
+      JSON.stringify({ source_type: 'ocr_error', error: 'quality failure placeholder', failed_at: new Date().toISOString() }),
+      null,
+      'completed',
+      'pending',
+      new Date().toISOString(),
+    ],
+  )
+}
+
 function getDoc(database, id) {
   return database.queryOne('SELECT ocr_status, import_status, error_message FROM documents WHERE id = ?', [id])
 }
@@ -147,6 +165,15 @@ async function run() {
     insertStructuredResultOnlyPage(database, 'page_result_only_1', 'doc_result_only_pending', 1)
     insertStructuredResultOnlyPage(database, 'page_result_only_2', 'doc_result_only_pending', 2)
 
+    insertDocument(database, 'doc_error_placeholder_completed', {
+      pageCount: 2,
+      ocrStatus: 'completed',
+      importStatus: 'processed',
+      errorMessage: null,
+    })
+    insertPage(database, 'page_error_placeholder_completed_1', 'doc_error_placeholder_completed', 1, 'completed')
+    insertErrorResultOnlyPage(database, 'page_error_placeholder_completed_2', 'doc_error_placeholder_completed', 2)
+
     insertDocument(database, 'doc_partial_large_pdf', {
       pageCount: 1200,
       ocrStatus: 'processing',
@@ -179,13 +206,13 @@ async function run() {
     database.run('PRAGMA foreign_keys = ON')
 
     const summary = recovery.recoverInterruptedOcrJobs()
-    assert.strictEqual(summary.recoveredDocuments, 6)
-    assert.strictEqual(summary.recoveredPages, 2)
+    assert.strictEqual(summary.recoveredDocuments, 7)
+    assert.strictEqual(summary.recoveredPages, 3)
     assert.strictEqual(summary.recoveredCompletedPages, 4)
     assert.strictEqual(summary.recoveredBatchItems, 2)
     assert.strictEqual(summary.removedOrphanedBatchItems, 1)
     assert.strictEqual(summary.completedDocuments, 3)
-    assert.strictEqual(summary.pendingDocuments, 3)
+    assert.strictEqual(summary.pendingDocuments, 4)
 
     assert.deepStrictEqual(getDoc(database, 'doc_interrupted'), {
       ocr_status: 'pending',
@@ -220,6 +247,13 @@ async function run() {
       error_message: null,
     })
     assert.deepStrictEqual(getPageStatuses(database, 'doc_result_only_pending'), ['completed', 'completed'])
+
+    assert.deepStrictEqual(getDoc(database, 'doc_error_placeholder_completed'), {
+      ocr_status: 'pending',
+      import_status: 'stored',
+      error_message: null,
+    })
+    assert.deepStrictEqual(getPageStatuses(database, 'doc_error_placeholder_completed'), ['completed', 'pending'])
 
     assert.deepStrictEqual(getDoc(database, 'doc_partial_large_pdf'), {
       ocr_status: 'pending',

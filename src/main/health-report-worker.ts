@@ -63,7 +63,22 @@ function firstMetadataValue(metadata: JsonRecord, keys: string[]): unknown {
 }
 
 function buildPageContentAvailableCondition(alias = 'p'): string {
-  return `TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''`
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
 }
 
 function getPdfSizeBytes(doc: DocumentHealthSourceRow, metadata: JsonRecord): number {
@@ -214,7 +229,7 @@ function buildDocumentHealthReport(sqlite: NativeDatabase): DocumentHealthReport
     `SELECT
       d.*,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND ${buildPageContentAvailableCondition('p')}) as text_page_count,
-      (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed') as ocr_completed_page_count,
+      (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p')}) as ocr_completed_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
       (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
       (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count

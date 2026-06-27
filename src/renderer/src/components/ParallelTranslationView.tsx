@@ -1,11 +1,12 @@
-import { Fragment, useMemo, type CSSProperties } from 'react'
-import { Button, Typography } from 'antd'
-import { CloseOutlined } from '@ant-design/icons'
+import { Fragment, useMemo, useState, type CSSProperties } from 'react'
+import { Button, Input, Space, Tag, Typography, message } from 'antd'
+import { CheckOutlined, CloseOutlined, EditOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
   buildParallelTranslationSegments,
   splitTextForParallelTranslation,
   type ParallelTranslationSegment,
 } from '@shared/parallel-translation'
+import type { TranslationUnitV1 } from '@shared/types'
 
 export { buildParallelTranslationSegments, splitTextForParallelTranslation }
 export type { ParallelTranslationSegment }
@@ -40,6 +41,9 @@ interface ParallelTranslationViewProps {
   activeSegmentId?: string
   onActiveSegmentChange?: (segmentId: string) => void
   onSelectedTextChange?: (text: string) => void
+  units?: TranslationUnitV1[]
+  onUpdateUnit?: (unitId: string, translationText: string) => Promise<void> | void
+  onRetranslateUnit?: (unitId: string) => Promise<void> | void
   onClose?: () => void
 }
 
@@ -59,13 +63,27 @@ export default function ParallelTranslationView({
   activeSegmentId = '',
   onActiveSegmentChange,
   onSelectedTextChange,
+  units = [],
+  onUpdateUnit,
+  onRetranslateUnit,
   onClose,
 }: ParallelTranslationViewProps) {
   const effectiveTranslationText = skipped ? sourceText : translationText
   const segments = useMemo(
-    () => buildParallelTranslationSegments(sourceText, loading ? '' : effectiveTranslationText),
-    [effectiveTranslationText, loading, sourceText],
+    () => units.length > 0
+      ? units.map((unit) => ({
+          id: unit.id,
+          source: unit.sourceText,
+          translation: unit.translationText || (unit.skipped ? unit.sourceText : ''),
+        }))
+      : buildParallelTranslationSegments(sourceText, loading ? '' : effectiveTranslationText),
+    [effectiveTranslationText, loading, sourceText, units],
   )
+  const unitById = useMemo(() => new Map(units.map((unit) => [unit.id, unit])), [units])
+  const [editingUnitId, setEditingUnitId] = useState('')
+  const [editingText, setEditingText] = useState('')
+  const [savingUnitId, setSavingUnitId] = useState('')
+  const [retryingUnitId, setRetryingUnitId] = useState('')
   const isDark = themeName === 'dark'
   const pageWidth = pageMetrics?.pageWidth || 760
   const activeBorder = isDark ? 'rgba(255, 210, 132, 0.90)' : 'rgba(180, 105, 28, 0.82)'
@@ -132,6 +150,34 @@ export default function ParallelTranslationView({
     if (selected) onSelectedTextChange?.(selected)
   }
 
+  const saveUnit = async (unitId: string) => {
+    if (!onUpdateUnit) return
+    setSavingUnitId(unitId)
+    try {
+      await onUpdateUnit(unitId, editingText)
+      setEditingUnitId('')
+      message.success('译文已保存')
+    } catch (error) {
+      console.error(error)
+      message.error('保存译文失败')
+    } finally {
+      setSavingUnitId('')
+    }
+  }
+
+  const retryUnit = async (unitId: string) => {
+    if (!onRetranslateUnit) return
+    setRetryingUnitId(unitId)
+    try {
+      await onRetranslateUnit(unitId)
+    } catch (error) {
+      console.error(error)
+      message.error('重译失败')
+    } finally {
+      setRetryingUnitId('')
+    }
+  }
+
   return (
     <div style={shellStyle} data-reader-translation-compare="true">
       <div style={gridStyle}>
@@ -148,6 +194,7 @@ export default function ParallelTranslationView({
         </div>
         {segments.map((segment, index) => {
           const isLast = index === segments.length - 1
+          const unit = unitById.get(segment.id)
           const translation = loading
             ? index === 0 ? '正在翻译...' : ''
             : segment.translation
@@ -173,7 +220,63 @@ export default function ParallelTranslationView({
                 onClick={() => onActiveSegmentChange?.(segment.id)}
                 style={cellStyle(segment.id, isLast)}
               >
-                {translation ? translation : <Text style={{ color: themeStyle.muted }}>{index === 0 ? '暂无翻译' : '待补译'}</Text>}
+                {editingUnitId === segment.id ? (
+                  <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                    <Input.TextArea
+                      autoSize={{ minRows: 3, maxRows: 12 }}
+                      value={editingText}
+                      onChange={(event) => setEditingText(event.target.value)}
+                    />
+                    <Space size={6}>
+                      <Button
+                        size="small"
+                        type="primary"
+                        icon={<CheckOutlined />}
+                        loading={savingUnitId === segment.id}
+                        onClick={() => void saveUnit(segment.id)}
+                      >
+                        保存
+                      </Button>
+                      <Button size="small" onClick={() => setEditingUnitId('')}>取消</Button>
+                    </Space>
+                  </Space>
+                ) : (
+                  <>
+                    {unit ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, minHeight: 24 }}>
+                        {unit.manualOverride ? <Tag color="gold">人工译文</Tag> : null}
+                        {unit.stale ? <Tag color="warning">原文已变化</Tag> : null}
+                        {unit.status === 'error' ? <Tag color="error">翻译失败</Tag> : null}
+                        <span style={{ flex: 1 }} />
+                        {onRetranslateUnit && !unit.skipped ? (
+                          <Button
+                            type="text"
+                            size="small"
+                            title="按当前模式重译此块"
+                            icon={<ReloadOutlined />}
+                            loading={retryingUnitId === segment.id}
+                            onClick={() => void retryUnit(segment.id)}
+                          />
+                        ) : null}
+                        {onUpdateUnit && !unit.skipped ? (
+                          <Button
+                            type="text"
+                            size="small"
+                            title="编辑译文"
+                            icon={<EditOutlined />}
+                            onClick={() => {
+                              setEditingUnitId(segment.id)
+                              setEditingText(translation || '')
+                            }}
+                          />
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {translation
+                      ? translation
+                      : <Text style={{ color: themeStyle.muted }}>{loading ? '翻译中...' : '待翻译'}</Text>}
+                  </>
+                )}
               </div>
             </Fragment>
           )

@@ -14,7 +14,7 @@ import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } 
 import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
-import { normalizePageResult } from '../ocr'
+import { normalizePageResult, normalizeStoredGujiOcrResultForRead } from '../ocr'
 import { emitBackgroundTaskStatus } from '../background-tasks'
 import { isHealthReportWorkerAvailable, runHealthReportWorkerTask } from '../health-report-worker-client'
 import { buildPdfCompressionMetadata, getPdfCompressionSettings } from '../pdf-compression'
@@ -36,6 +36,7 @@ import {
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
 import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { normalizeHistoryDocType } from '../../shared/history-citation'
@@ -110,6 +111,7 @@ import type {
   Tag,
   TocItemV2,
   TranslationStyle,
+  TranslationMode,
 } from '../../shared/types'
 
 type JsonRecord = Record<string, unknown>
@@ -296,13 +298,34 @@ async function deleteRowsByDocIdsAsync(tableName: string, docIds: string[]): Pro
 async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
   if (!isFtsAvailable()) return
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
-    const tableNames = isSearchTrigramFtsAvailable()
-      ? ['pages_fts', 'search_segments_fts', 'search_segments_trigram']
-      : ['pages_fts', 'search_segments_fts']
-    for (const tableName of tableNames) {
+    const tableSelectors = [
+      {
+        tableName: 'pages_fts',
+        selectSql: `SELECT rowid FROM pages_fts WHERE doc_id IN (${placeholders}) LIMIT ?`,
+      },
+      {
+        tableName: 'search_segments_fts',
+        selectSql: `SELECT f.rowid
+                    FROM search_segments_fts f
+                    INNER JOIN search_index_segments s ON s.rowid = f.rowid
+                    WHERE s.doc_id IN (${placeholders})
+                    LIMIT ?`,
+      },
+      ...(isSearchTrigramFtsAvailable()
+        ? [{
+            tableName: 'search_segments_trigram',
+            selectSql: `SELECT f.rowid
+                        FROM search_segments_trigram f
+                        INNER JOIN search_index_segments s ON s.rowid = f.rowid
+                        WHERE s.doc_id IN (${placeholders})
+                        LIMIT ?`,
+          }]
+        : []),
+    ]
+    for (const { tableName, selectSql } of tableSelectors) {
       while (true) {
         const rows = queryAll<{ rowid: number }>(
-          `SELECT rowid FROM ${tableName} WHERE doc_id IN (${placeholders}) LIMIT ?`,
+          selectSql,
           [...chunkIds, DELETE_ROW_CHUNK_SIZE],
         )
         if (rows.length === 0) break
@@ -1043,7 +1066,7 @@ function getBookTranslationContext(pages: BookTranslationPageWorkItem[], sourceI
   return page ? page.sourceText.slice(0, 360) : ''
 }
 
-async function runBookTranslationJob(docId: string, jobId: string, options: BookTranslationOptions = {}) {
+async function runLegacyBookTranslationJob(docId: string, jobId: string, options: BookTranslationOptions = {}) {
   throwIfBookTranslationShuttingDown()
   const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [docId])
   if (!doc) throw new Error('文献不存在')
@@ -2293,6 +2316,196 @@ function migratePath(oldPath: string, storageDir: string): string {
   return existsSync(newPath) ? newPath : oldPath
 }
 
+async function runBookTranslationJob(docId: string, jobId: string, options: BookTranslationOptions = {}) {
+  throwIfBookTranslationShuttingDown()
+  const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [docId])
+  if (!doc) throw new Error('文献不存在')
+  const outputPath = getBookTranslationFilePath(doc)
+  const mode: TranslationMode = options.mode === 'fast' || options.mode === 'quality' ? options.mode : 'balanced'
+
+  if (options.clearCache) {
+    clearMachineTranslationUnits(docId)
+    run('DELETE FROM page_translation_cache WHERE doc_id = ?', [docId])
+    scheduleDatabaseSave()
+    emitBookTranslationProgress({
+      jobId,
+      docId,
+      status: 'completed',
+      progress: 1,
+      completedPages: 0,
+      failedPages: 0,
+      cachedPages: 0,
+      stalePages: 0,
+      translatedPages: 0,
+      skippedPages: 0,
+      totalPages: 0,
+      outputPath,
+      message: '已清除机器译文，人工修订译文已保留',
+    })
+    return
+  }
+
+  const rawPages = hydratePagePayloadRows(queryAll<BookTranslationPageRow>(
+    `SELECT id, doc_id, page_num, ocr_text, ocr_text_ref, proofed_text, proofed_text_ref,
+            ocr_result, ocr_result_ref
+     FROM pages WHERE doc_id = ? ORDER BY page_num`,
+    [docId],
+  ))
+  const pages: BookTranslationPageWorkItem[] = rawPages.map((page, sourceIndex) => {
+    const sourceText = getBookTranslationSourceText(page)
+    return {
+      ...page,
+      sourceIndex,
+      sourceText,
+      translationText: '',
+      sourceHash: '',
+      onlyNonChinese: false,
+    }
+  }).filter((page) => page.sourceText)
+  const totalPages = pages.length
+  emitBookTranslationProgress({
+    jobId,
+    docId,
+    status: 'processing',
+    progress: 0,
+    completedPages: 0,
+    failedPages: 0,
+    cachedPages: 0,
+    translatedPages: 0,
+    skippedPages: 0,
+    totalPages,
+    outputPath,
+    message: totalPages ? `开始整书翻译（${mode === 'fast' ? '快速' : mode === 'quality' ? '高质量' : '均衡'}模式）` : '没有可翻译文本',
+  })
+  if (totalPages === 0) {
+    writeBookTranslationFile(doc, pages, outputPath)
+    emitBookTranslationProgress({
+      jobId,
+      docId,
+      status: 'completed',
+      progress: 1,
+      totalPages: 0,
+      completedPages: 0,
+      outputPath,
+      message: '没有可翻译文本',
+    })
+    return
+  }
+
+  let cachedPages = 0
+  let translatedPages = 0
+  let skippedPages = 0
+  let failedPages = 0
+  let completedPages = 0
+  let nextPageIndex = 0
+  const defaultConcurrency = mode === 'fast' ? 4 : mode === 'quality' ? 1 : 2
+  const concurrency = Math.max(1, Math.min(4, Math.round(Number(options.concurrency || defaultConcurrency))))
+
+  const emitProgress = (page: BookTranslationPageWorkItem | null, messageText: string, errorMessage?: string) => {
+    emitBookTranslationProgress({
+      jobId,
+      docId,
+      status: 'processing',
+      progress: totalPages ? Math.min(1, completedPages / totalPages) : 1,
+      completedPages,
+      failedPages,
+      cachedPages,
+      translatedPages,
+      skippedPages,
+      totalPages,
+      pageNum: page?.page_num,
+      outputPath,
+      message: messageText,
+      errorMessage,
+    })
+  }
+
+  const translateOnePage = async (page: BookTranslationPageWorkItem) => {
+    try {
+      throwIfBookTranslationShuttingDown()
+      const beforeUnits = ensurePageTranslationUnits(page.id)
+      const failedUnitIds = beforeUnits.filter((unit) => unit.status === 'error').map((unit) => unit.id)
+      if (options.retryFailedOnly && failedUnitIds.length === 0) {
+        skippedPages += 1
+        completedPages += 1
+        emitProgress(page, `已跳过第 ${page.page_num} 页：没有失败块`)
+        return
+      }
+      const wasReady = beforeUnits.length > 0 && beforeUnits.every((unit) => (
+        unit.skipped || Boolean(unit.translationText.trim())
+      ))
+      const previousPage = pages[page.sourceIndex - 1]
+      const nextPage = pages[page.sourceIndex + 1]
+      emitProgress(page, `正在翻译第 ${page.page_num} 页`)
+      const result = await translatePageUnits({
+        docId,
+        pageId: page.id,
+        mode,
+        glossaryProjectId: options.glossaryProjectId,
+        style: options.style || DEFAULT_TRANSLATION_STYLE,
+        force: Boolean(options.retryFailedOnly),
+        unitIds: options.retryFailedOnly ? failedUnitIds : undefined,
+        priority: 'book',
+        documentTitle: doc.title || '',
+        pageContextBefore: previousPage?.sourceText.slice(0, 500) || '',
+        pageContextAfter: nextPage?.sourceText.slice(0, 500) || '',
+      })
+      page.translationText = result.translationText
+      if (!result.complete || result.failedCount > 0) failedPages += 1
+      else if (result.skippedCount === result.units.length) skippedPages += 1
+      else if (wasReady && !options.retryFailedOnly) cachedPages += 1
+      else translatedPages += 1
+      completedPages += 1
+      writeBookTranslationFile(doc, pages, outputPath)
+      emitProgress(
+        page,
+        result.complete
+          ? `整书翻译中：${completedPages}/${totalPages} 页`
+          : `第 ${page.page_num} 页仍有 ${result.failedCount} 个翻译块失败，已继续后续页面`,
+      )
+    } catch (error) {
+      if (isBookTranslationShutdownError(error)) throw error
+      failedPages += 1
+      completedPages += 1
+      const errorMessage = getErrorMessage(error, '页面翻译失败')
+      writeBookTranslationFile(doc, pages, outputPath)
+      emitProgress(page, `第 ${page.page_num} 页翻译失败，已继续后续页面`, errorMessage)
+    }
+    await yieldToEventLoop()
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, pages.length) }, async () => {
+    while (!bookTranslationRuntimeShuttingDown && nextPageIndex < pages.length) {
+      const page = pages[nextPageIndex]
+      nextPageIndex += 1
+      if (page) await translateOnePage(page)
+    }
+  })
+  const workerResults = await Promise.allSettled(workers)
+  throwIfBookTranslationShuttingDown()
+  const workerError = workerResults.find((result) => result.status === 'rejected')
+  if (workerError?.status === 'rejected') throw workerError.reason
+
+  writeBookTranslationFile(doc, pages, outputPath)
+  emitBookTranslationProgress({
+    jobId,
+    docId,
+    status: failedPages ? 'partial' : 'completed',
+    progress: 1,
+    completedPages: totalPages - failedPages,
+    failedPages,
+    cachedPages,
+    translatedPages,
+    skippedPages,
+    totalPages,
+    outputPath,
+    message: failedPages
+      ? `整书翻译部分完成：新翻译 ${translatedPages} 页，缓存 ${cachedPages} 页，失败 ${failedPages} 页`
+      : `整书翻译完成：新翻译 ${translatedPages} 页，缓存 ${cachedPages} 页`,
+    errorMessage: failedPages ? `仍有 ${failedPages} 页失败，可重试失败页` : undefined,
+  })
+}
+
 function getLibrarySortDirection(options?: ListDocumentOptions): 'ASC' | 'DESC' {
   return options?.sortDirection === 'asc' ? 'ASC' : 'DESC'
 }
@@ -2320,12 +2533,26 @@ function buildDocumentTextPageCountExpression(alias = 'd'): string {
 }
 
 function buildDocumentCompletedPageCountExpression(alias = 'd'): string {
-  return `(SELECT COUNT(*) FROM pages p_ocr_count WHERE p_ocr_count.doc_id = ${alias}.id AND p_ocr_count.ocr_status = 'completed')`
+  return `(SELECT COUNT(*) FROM pages p_ocr_count WHERE p_ocr_count.doc_id = ${alias}.id AND p_ocr_count.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p_ocr_count')})`
 }
 
 function buildPageContentAvailableCondition(alias = 'p'): string {
-  return `(TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''
-    OR COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, ${alias}.ocr_result_ref, '') <> '')`
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
 }
 
 function buildDocumentOcrCompleteCondition(alias = 'd'): string {
@@ -2667,6 +2894,35 @@ function parsePageOcrMeta(page: PageOcrMetaRow): { has_ocr_text: boolean; needs_
   }
 }
 
+function repairStoredGujiOcrPageForRead(page: DocumentPage): boolean {
+  if (!page.image_path || !page.ocr_result) return false
+  const parsed = parseJsonRecord(page.ocr_result)
+  if (!parsed) return false
+  const repaired = normalizeStoredGujiOcrResultForRead(parsed, page.image_path)
+  if (!repaired) return false
+  const before = JSON.stringify(parsed)
+  const after = JSON.stringify(repaired)
+  if (before === after) return false
+  page.ocr_result = after
+  const prepared = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', after)
+  run(
+    'UPDATE pages SET ocr_result = ?, ocr_result_ref = ? WHERE id = ?',
+    [prepared.value, prepared.ref, page.id],
+  )
+  return true
+}
+
+function repairStoredGujiOcrPagesForRead(pages: DocumentPage[]): void {
+  let repairedCount = 0
+  for (const page of pages) {
+    if (repairStoredGujiOcrPageForRead(page)) repairedCount += 1
+    Object.assign(page, parsePageOcrMeta(page))
+  }
+  if (repairedCount > 0) {
+    scheduleDatabaseSave()
+  }
+}
+
 function parseDocumentMetadata(raw: unknown): JsonRecord {
   if (!raw) return {}
   if (isJsonRecord(raw)) return raw
@@ -2982,7 +3238,7 @@ function getDocumentHealthReport(): DocumentHealthReport {
       d.*,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id) as actual_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND ${buildPageContentAvailableCondition('p')}) as text_page_count,
-      (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed') as ocr_completed_page_count,
+      (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p')}) as ocr_completed_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
       (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
       (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count
@@ -3721,8 +3977,8 @@ export function registerDocumentIpc(): void {
         page.image_path = migratePath(page.image_path, storageDir)
         allowFileAccessPath(page.image_path)
       }
-      Object.assign(page, parsePageOcrMeta(page))
     }
+    repairStoredGujiOcrPagesForRead(pages)
     normalizeDocumentSourceAssetsForRead(doc, pages)
 
     return {
@@ -3841,8 +4097,9 @@ export function registerDocumentIpc(): void {
         page.image_path = migratePath(page.image_path, storageDir)
         allowFileAccessPath(page.image_path)
       }
-      Object.assign(page, parsePageOcrMeta(page), { __full: true })
+      page.__full = true
     }
+    repairStoredGujiOcrPagesForRead(pages)
     return pages
   })
 
@@ -3898,8 +4155,9 @@ export function registerDocumentIpc(): void {
         page.image_path = migratePath(page.image_path, storageDir)
         allowFileAccessPath(page.image_path)
       }
-      Object.assign(page, parsePageOcrMeta(page), { __full: true })
+      page.__full = true
     }
+    repairStoredGujiOcrPagesForRead(pages)
     return {
       document: doc,
       pages,

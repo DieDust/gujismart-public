@@ -1288,6 +1288,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       excerpt: activeHit ? stripSnippetMarkers(activeHit.snippet).slice(0, 120) : undefined,
       sourceId: 'search',
       locator: activeHit?.locator,
+      openTranslation: Boolean(activeHit?.locator.translationSource),
       searchSession: buildFocusedSearchSession(activeKeyword || activeHit?.locator.queryTerm || inputValue, activeHit),
     })
   }
@@ -1315,6 +1316,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         pageSize: SEARCH_DOCUMENT_HIT_PAGE_SIZE,
         contextMode,
         resultMode: 'all',
+        translationScope: filters.translationScope,
       })
       setDocumentHitPages((previous) => ({
         ...previous,
@@ -1403,6 +1405,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                   }}
                 >
                   <Tag color="blue">第 {hit.locator.pageNum || 1} 页</Tag>
+                  {hit.locator.translationSource ? <Tag color="gold">译文</Tag> : null}
                   <Tag color="default">#{globalIndex + 1}</Tag>
                   {highlightSnippet(hit.snippet, highlightTerms)}
                 </button>
@@ -1476,6 +1479,16 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           <Button type={searchMode === 'fulltext' ? 'primary' : 'default'} onClick={() => setSearchMode('fulltext')}>全文检索</Button>
           <Button type={searchMode === 'ai' ? 'primary' : 'default'} onClick={() => setSearchMode('ai')}>AI 检索</Button>
         </Button.Group>
+        <Select
+          value={filters.translationScope || 'all'}
+          onChange={(value) => setFilterPatch({ translationScope: value })}
+          style={{ width: 128 }}
+          options={[
+            { value: 'all', label: '全部文本' },
+            { value: 'source', label: '仅原文' },
+            { value: 'translation', label: '仅译文' },
+          ]}
+        />
         <Select
           mode="multiple"
           allowClear
@@ -1867,6 +1880,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                         }}
                       >
                         <Tag color={'blue'}>第 {hit.locator.pageNum || index + 1} 页</Tag>
+                        {hit.locator.translationSource ? <Tag color="gold">译文</Tag> : null}
                         {highlightSnippet(hit.snippet, highlightTerms)}
                       </button>
                       ))}

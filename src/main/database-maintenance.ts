@@ -365,6 +365,7 @@ function getSafeTables(): DatabaseTableStorageStat[] {
     'ai_results',
     'page_ai_layout_cache',
     'page_translation_cache',
+    'page_translation_units',
     'library_state_cache',
   ]
   return tables.map((tableName) => ({ tableName, rowCount: estimateTableRows(tableName) }))
@@ -414,6 +415,7 @@ function estimateStorageLayers(tables: DatabaseTableStorageStat[], searchIndex: 
     + searchIndex.searchSegmentsTrigramRows
   const cacheRows = tableRowCount(tables, 'page_ai_layout_cache')
     + tableRowCount(tables, 'page_translation_cache')
+    + tableRowCount(tables, 'page_translation_units')
     + tableRowCount(tables, 'library_state_cache')
   return [
     { kind: 'metadata', label: '元数据与关系', rowCount: metadataRows, estimatedBytes: 0 },

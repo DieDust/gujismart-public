@@ -154,6 +154,8 @@ function sanitizeLocator(value: unknown): SearchHitLocator | undefined {
   const pageIndex = cleanFiniteNumber(value.pageIndex)
   const normalizedCharStart = cleanFiniteNumber(value.normalizedCharStart)
   const normalizedCharEnd = cleanFiniteNumber(value.normalizedCharEnd)
+  const blockId = cleanString(value.blockId, MAX_ID_LENGTH)
+  const translationUnitId = cleanString(value.translationUnitId, MAX_ID_LENGTH)
   if (sourceType) locator.sourceType = sourceType
   if (pageId) locator.pageId = pageId
   if (href) locator.href = href
@@ -162,6 +164,9 @@ function sanitizeLocator(value: unknown): SearchHitLocator | undefined {
   if (pageIndex !== undefined) locator.pageIndex = pageIndex
   if (normalizedCharStart !== undefined) locator.normalizedCharStart = normalizedCharStart
   if (normalizedCharEnd !== undefined) locator.normalizedCharEnd = normalizedCharEnd
+  if (blockId) locator.blockId = blockId
+  if (translationUnitId) locator.translationUnitId = translationUnitId
+  if (value.translationSource === true) locator.translationSource = true
   return locator
 }
 
@@ -189,6 +194,7 @@ function sanitizeDocumentTarget(value: unknown, fallbackDocId = ''): OpenDocumen
   if (sourceLabel) target.sourceLabel = sourceLabel
   if (highlightColor) target.highlightColor = highlightColor
   if (value.startReaderBookTranslation === true) target.startReaderBookTranslation = true
+  if (value.openTranslation === true) target.openTranslation = true
   return target
 }
 

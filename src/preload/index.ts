@@ -123,6 +123,9 @@ import type {
   PageUpdatePayload,
   PageTranslationCacheItem,
   PageTranslationCachePayload,
+  PageTranslationRequest,
+  PageTranslationProgressEvent,
+  PageTranslationResult,
   PdfAssetCleanupResult,
   PdfAssetRestoreResult,
   PdfRepositoryIndexResult,
@@ -169,6 +172,8 @@ import type {
   TagCreatePayload,
   TagUpdatePayload,
   TaskProgressEvent,
+  TranslationUnitUpdatePayload,
+  TranslationUnitV1,
   TocItemSource,
   TocItemV2,
   TranslationGlossaryListOptions,
@@ -272,6 +277,23 @@ const api = {
     ipcRenderer.invoke('reader:getTranslationCache', docId, pageIds),
   saveTranslationCache: (docId: string, pageId: string, payload: PageTranslationCachePayload): Promise<PageTranslationCacheItem | null> =>
     ipcRenderer.invoke('reader:saveTranslationCache', docId, pageId, payload),
+  getPageTranslationUnits: (pageId: string): Promise<TranslationUnitV1[]> =>
+    ipcRenderer.invoke('translation:getPageUnits', pageId),
+  getPagesTranslationUnits: (pageIds: string[]): Promise<Record<string, TranslationUnitV1[]>> =>
+    ipcRenderer.invoke('translation:getPagesUnits', pageIds),
+  translatePageUnits: (request: PageTranslationRequest): Promise<PageTranslationResult> =>
+    ipcRenderer.invoke('translation:translatePage', request),
+  updateTranslationUnit: (unitId: string, payload: TranslationUnitUpdatePayload): Promise<TranslationUnitV1 | null> =>
+    ipcRenderer.invoke('translation:updateUnit', unitId, payload),
+  clearMachineTranslationUnits: (docId: string, pageId?: string): Promise<number> =>
+    ipcRenderer.invoke('translation:clearMachine', docId, pageId),
+  cancelTranslationTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke('translation:cancelTask', taskId),
+  onPageTranslationProgress: (callback: (event: PageTranslationProgressEvent) => void): IpcUnsubscribe => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: PageTranslationProgressEvent) => callback(payload)
+    ipcRenderer.on('translation:pageProgress', listener)
+    return () => ipcRenderer.removeListener('translation:pageProgress', listener)
+  },
   translateBook: (docId: string, options?: BookTranslationOptions): Promise<BookTranslationStartResult> =>
     ipcRenderer.invoke('documents:translateBook', docId, options),
   getDocumentToc: (docId: string): Promise<TocItemV2[]> =>

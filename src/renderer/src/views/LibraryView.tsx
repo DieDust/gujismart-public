@@ -1440,7 +1440,9 @@ function DocumentVirtualRow({
       label: '翻译整本书',
       icon: <RobotOutlined />,
       children: [
-        { key: 'translate_book:start', label: '开始 / 继续翻译' },
+        { key: 'translate_book:start:balanced', label: '均衡模式（推荐）' },
+        { key: 'translate_book:start:fast', label: '快速模式' },
+        { key: 'translate_book:start:quality', label: '高质量模式' },
         { key: 'translate_book:retry_failed', label: '仅重试失败页' },
         { key: 'translate_book:clear_cache', label: '清除本书翻译缓存', danger: true },
       ],
@@ -1502,8 +1504,9 @@ function DocumentVirtualRow({
       void context.handleAiExtractForDoc(doc.id)
       return
     }
-    if (key === 'translate_book' || key === 'translate_book:start') {
-      void context.handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE })
+    if (String(key).startsWith('translate_book:start:')) {
+      const mode = String(key).replace('translate_book:start:', '') as BookTranslationOptions['mode']
+      void context.handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE, mode })
       return
     }
     if (key === 'translate_book:retry_failed') {
@@ -2445,6 +2448,7 @@ export default function LibraryView({
       ) {
         activeOcrToastKeysRef.current.delete(toastKey)
         message.destroy(toastKey)
+        message.destroy(`ocr-error-${data.docId}`)
         window.setTimeout(() => {
           setOcrProgressByDoc((current) => {
             const existing = current[data.docId]
@@ -3375,6 +3379,7 @@ export default function LibraryView({
   const handleTranslateBook = async (doc: DocumentItem, options: BookTranslationOptions = {}) => {
     const normalizedOptions: BookTranslationOptions = {
       style: DEFAULT_TRANSLATION_STYLE,
+      mode: 'balanced',
       ...options,
     }
     const isClearCache = Boolean(normalizedOptions.clearCache)

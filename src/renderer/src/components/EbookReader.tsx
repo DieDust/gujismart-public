@@ -11,13 +11,14 @@ import {
   FileTextOutlined,
   LeftOutlined,
   PlusOutlined,
+  ReloadOutlined,
   RightOutlined,
   RobotOutlined,
   SearchOutlined,
   SettingOutlined,
 } from '@ant-design/icons'
 import ePub from 'epubjs'
-import type { Document as LibraryDocument, DocumentPage, ReaderTranslationOptions, ReaderTranslationPayload, ResearchNote, ResearchProject, SearchHitLocator, SearchSessionState, TocItemV2 } from '@shared/types'
+import type { Document as LibraryDocument, DocumentPage, ReaderTranslationOptions, ReaderTranslationPayload, ResearchNote, ResearchProject, SearchHitLocator, SearchSessionState, TocItemV2, TranslationMode, TranslationUnitV1 } from '@shared/types'
 import { getCitationPageNumber, getReadablePageElements, getReadablePageText, normalizeOcrTextForReading, type ReadablePageElement } from '../utils/ocrText'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import { getErrorMessage } from '@shared/errors'
@@ -194,6 +195,7 @@ interface EbookReaderProps {
   locator?: SearchHitLocator
   searchSession?: SearchSessionState
   pageTranslations?: Record<string, string>
+  pageTranslationUnits?: Record<string, TranslationUnitV1[]>
   translatingPageIds?: Record<string, boolean>
   skippedTranslationPageIds?: Record<string, boolean>
   translationGlossaryProjectId?: string
@@ -201,12 +203,16 @@ interface EbookReaderProps {
   selectedTextForGlossary?: string
   displayScript?: ReaderDisplayScript
   bookTranslationRequest?: number
+  translationMode?: TranslationMode
   onDisplayScriptChange?: (script: ReaderDisplayScript) => void
   onPageIndexChange: (pageIndex: number) => void
   onSearchKeywordChange?: (keyword: string) => void
   onSelectedTextChange?: (text: string) => void
   onContextTextChange?: (text: string) => void
   onTranslateCurrentPage?: (payload: ReaderTranslationPayload, options?: ReaderTranslationOptions) => void
+  onTranslationModeChange?: (mode: TranslationMode) => void
+  onUpdateTranslationUnit?: (pageId: string, unitId: string, translationText: string) => Promise<void> | void
+  onRetranslateTranslationUnit?: (payload: ReaderTranslationPayload, unitId: string) => Promise<void> | void
   onTranslationGlossaryProjectChange?: (projectId: string) => void
   onAddSelectedTerm?: () => void
   onReaderStateChange?: (state: {
@@ -1396,6 +1402,7 @@ export default function EbookReader({
   locator,
   searchSession,
   pageTranslations = {},
+  pageTranslationUnits = {},
   translatingPageIds = {},
   skippedTranslationPageIds = {},
   translationGlossaryProjectId = '',
@@ -1403,12 +1410,16 @@ export default function EbookReader({
   selectedTextForGlossary = '',
   displayScript = 'original',
   bookTranslationRequest = 0,
+  translationMode = 'balanced',
   onDisplayScriptChange,
   onPageIndexChange,
   onSearchKeywordChange,
   onSelectedTextChange,
   onContextTextChange,
   onTranslateCurrentPage,
+  onTranslationModeChange,
+  onUpdateTranslationUnit,
+  onRetranslateTranslationUnit,
   onTranslationGlossaryProjectChange,
   onAddSelectedTerm,
   onReaderStateChange,
@@ -2841,6 +2852,7 @@ export default function EbookReader({
             pageLabel={pageLabel}
             sourceText={currentText}
             translationText={activeTranslationText}
+            units={textPage ? pageTranslationUnits[textPage.id] || [] : []}
             loading={activeTranslationLoading}
             skipped={activeTranslationSkipped}
             themeName={theme}
@@ -2850,6 +2862,18 @@ export default function EbookReader({
             activeSegmentId={activeParallelSegmentId}
             onActiveSegmentChange={setActiveParallelSegmentId}
             onSelectedTextChange={onSelectedTextChange}
+            onUpdateUnit={onUpdateTranslationUnit && textPage
+              ? (unitId, translationText) => onUpdateTranslationUnit(textPage.id, unitId, translationText)
+              : undefined}
+            onRetranslateUnit={onRetranslateTranslationUnit && textPage
+              ? (unitId) => onRetranslateTranslationUnit({
+                  pageId: textPage.id,
+                  readerPageKey: textPage.id,
+                  cachePageId: textPage.id,
+                  pageNum: textPage.sourcePageNum,
+                  text: currentText,
+                }, unitId)
+              : undefined}
             onClose={() => setTranslationOpen(false)}
           />
         ) : (
@@ -3029,6 +3053,16 @@ export default function EbookReader({
           <span style={{ color: translationOpen ? '#d6a85f' : 'var(--gs-text-secondary)', fontSize: 12 }}>翻译模式</span>
           {translationOpen ? (
             <>
+              <Segmented
+                size="small"
+                value={translationMode}
+                onChange={(value) => onTranslationModeChange?.(value as TranslationMode)}
+                options={[
+                  { value: 'fast', label: '快速' },
+                  { value: 'balanced', label: '均衡' },
+                  { value: 'quality', label: '高质量' },
+                ]}
+              />
               <LlmProfileSelector width={170} />
               <Select
                 size="small"
@@ -3049,6 +3083,23 @@ export default function EbookReader({
                 onClick={() => onAddSelectedTerm?.()}
               >
                 加入术语
+              </Button>
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                disabled={!textPage || !currentText}
+                onClick={() => {
+                  if (!textPage || !currentText) return
+                  onTranslateCurrentPage?.({
+                    pageId: textPage.id,
+                    readerPageKey: textPage.id,
+                    cachePageId: textPage.id,
+                    pageNum: textPage.sourcePageNum,
+                    text: currentText,
+                  }, { priority: 'current', force: true })
+                }}
+              >
+                重译本页
               </Button>
             </>
           ) : null}

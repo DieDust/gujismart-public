@@ -29,12 +29,27 @@ interface BatchQueueResumeRow {
 const BATCH_PAGE_INSERT_CHUNK_SIZE = 50
 const BATCH_RESULT_SAVE_CHUNK_SIZE = 12
 const BATCH_RESULT_POSTPROCESS_CHUNK_SIZE = 12
+const BATCH_GUJI_ASYNC_PDF_PAGE_RANGE_CHUNK_SIZE = 25
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
 const ZERO_PAGE_OCR_ERROR = 'OCR 没有返回任何页面，已按异常处理。请重新导入原文件或重新 OCR；如果仍为 0 页，可在文献库使用“清除零页文献”清理空记录。'
 
 function pageContentAvailableCondition(alias = 'p'): string {
-  return `(TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''
-    OR COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, ${alias}.ocr_result_ref, '') <> '')`
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
 }
 
 function parseJsonRecord(value: unknown): JsonRecord | null {
@@ -48,14 +63,45 @@ function parseJsonRecord(value: unknown): JsonRecord | null {
   }
 }
 
+function getTextFromUnknown(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value).trim()
+  }
+  return ''
+}
+
+function getMarkdownTextFromUnknown(value: unknown): string {
+  const directText = getTextFromUnknown(value)
+  if (directText) return directText
+  const record = parseJsonRecord(value)
+  if (!record) return ''
+  return getTextFromUnknown(record.text)
+}
+
 function getOcrWordsText(result: unknown): string {
-  if (!result || typeof result !== 'object') return ''
-  const wordsResult = (result as { words_result?: unknown }).words_result
+  const record = parseJsonRecord(result)
+  if (!record) return ''
+  const text = getTextFromUnknown(record.text)
+  if (text) return text
+  const markdownText = getMarkdownTextFromUnknown(record.markdown)
+  if (markdownText) return markdownText
+  const wordsResult = record.words_result
   if (!Array.isArray(wordsResult)) return ''
   return wordsResult
-    .map((item) => String((item as { words?: unknown })?.words || '').trim())
+    .map((item) => {
+      const word = parseJsonRecord(item)
+      return getTextFromUnknown(word?.words)
+    })
     .filter(Boolean)
     .join('\n')
+}
+
+function getAsyncPdfPostProcessOptions(ocrOptions: Required<PageOcrOptions>): Required<PageOcrOptions> {
+  if (ocrOptions.profile !== 'guji_print_vertical') return ocrOptions
+  return {
+    ...ocrOptions,
+    secondPass: 'none',
+  }
 }
 
 function clearDeferredPdfPageRecordMarker(docId: string): void {
@@ -152,8 +198,14 @@ class BatchProcessor {
     )
   }
 
-  private isPageOcrCompleted(page: Pick<BatchPageRow, 'ocr_status'>): boolean {
-    return String(page?.ocr_status || '') === 'completed'
+  private isPageOcrCompleted(page: Pick<BatchPageRow, 'ocr_status' | 'proofed_text' | 'ocr_text' | 'ocr_result' | 'proofed_text_ref' | 'ocr_text_ref' | 'ocr_result_ref'>): boolean {
+    const inlineText = String(page.proofed_text || page.ocr_text || '').trim()
+    const textRefs = String(page.proofed_text_ref || page.ocr_text_ref || '').trim()
+    const resultRef = String(page.ocr_result_ref || '').trim()
+    const result = String(page.ocr_result || '').trim()
+    const hasInlineText = Boolean(inlineText && inlineText !== '{"externalized":true}')
+    const hasUsableResult = Boolean(result && result !== '{"externalized":true}' && !(/"error"\s*:/.test(result) && /"failed_at"\s*:/.test(result)))
+    return String(page?.ocr_status || '') === 'completed' && (hasInlineText || Boolean(textRefs) || Boolean(resultRef) || hasUsableResult)
   }
 
   private getPagesNeedingOcr(pages: BatchPageRow[]): BatchPageRow[] {
@@ -224,11 +276,12 @@ class BatchProcessor {
     ocrOptions: Required<PageOcrOptions>,
   ): Promise<OcrPageResult[]> {
     const pageResults: OcrPageResult[] = []
+    const postProcessOptions = getAsyncPdfPostProcessOptions(ocrOptions)
     for (let index = 0; index < pages.length; index += BATCH_RESULT_POSTPROCESS_CHUNK_SIZE) {
       const chunk = pages.slice(index, index + BATCH_RESULT_POSTPROCESS_CHUNK_SIZE)
       const chunkResults = await Promise.all(chunk.map(async (item) => {
         const rawResult = results[item.resultIndex] || null
-        const result = rawResult ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, ocrOptions) : null
+        const result = rawResult ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions) : null
         return {
           pageId: item.page.id,
           result,
@@ -344,10 +397,8 @@ class BatchProcessor {
              SELECT COUNT(*)
              FROM pages p
              WHERE p.doc_id = d.id
-               AND (
-                 p.ocr_status = 'completed'
-                 OR ${pageContentAvailableCondition('p')}
-               )
+               AND p.ocr_status = 'completed'
+               AND ${pageContentAvailableCondition('p')}
            ) >= COALESCE(d.page_count, 0)
          )`,
     ).map((row) => row.id).filter(Boolean)
@@ -542,9 +593,17 @@ class BatchProcessor {
               .map((page) => Number(page.page_num))
               .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0)
             : undefined
+          const requireFullFileUpload = false
+          const pageRangeChunkSize = ocrOptions.profile === 'guji_print_vertical'
+            ? BATCH_GUJI_ASYNC_PDF_PAGE_RANGE_CHUNK_SIZE
+            : undefined
+          const targetPageNumSet = new Set(targetPageNums || [])
           const results = await recognizePdfAsync(pdfPath, undefined, {
             fallbackPageCount: Math.max(pages.length, Number(doc?.page_count || 0) || 0),
             signal: controller.signal,
+            ocrOptions,
+            requireFullFileUpload,
+            pageRangeChunkSize,
             targetPageNums,
             collectChunkResults: false,
             onChunkComplete: async (chunk) => {
@@ -552,13 +611,18 @@ class BatchProcessor {
               pages = await this.ensurePageRecordsIfNeeded(docId, pages, Math.max(pages.length, chunk.totalPages))
               pagesForOcr = this.getPagesNeedingOcr(pages)
               const chunkPages = chunk.sourcePageIndexes
-                .map((sourcePageIndex) => ({
+                .map((sourcePageIndex, resultIndex) => ({
                   page: pages[sourcePageIndex],
                   sourcePageIndex,
+                  resultIndex: requireFullFileUpload ? sourcePageIndex : resultIndex,
                 }))
-                .filter((item): item is { page: BatchPageRow; sourcePageIndex: number } => Boolean(item.page))
+                .filter((item): item is { page: BatchPageRow; sourcePageIndex: number; resultIndex: number } => {
+                  if (!item.page) return false
+                  if (!requireFullFileUpload || targetPageNumSet.size === 0) return true
+                  return targetPageNumSet.has(Number(item.page.page_num || item.sourcePageIndex + 1))
+                })
               const chunkPageResults = await this.postProcessPdfResultsBatched(
-                chunkPages.map((item, index) => ({ ...item, resultIndex: index })),
+                chunkPages,
                 chunk.results,
                 ocrOptions,
               )
@@ -591,7 +655,10 @@ class BatchProcessor {
             pages = await this.ensurePageRecordsIfNeeded(docId, pages, Math.max(pages.length, results.length))
             pagesForOcr = this.getPagesNeedingOcr(pages)
             pageResults = await this.postProcessPdfResultsBatched(
-              pagesForOcr.map((page, index) => ({ page, sourcePageIndex: Number(page.page_num || index + 1) - 1, resultIndex: index })),
+              pagesForOcr.map((page, index) => {
+                const sourcePageIndex = Number(page.page_num || index + 1) - 1
+                return { page, sourcePageIndex, resultIndex: requireFullFileUpload ? sourcePageIndex : index }
+              }),
               results,
               ocrOptions,
             )

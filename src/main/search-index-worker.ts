@@ -740,6 +740,43 @@ function buildSearchIndexSegmentDrafts(sqlite: NativeDatabase, docId: string, pa
   })
 }
 
+function buildTranslationSearchIndexSegmentDrafts(sqlite: NativeDatabase, docId: string): SearchIndexSegmentDraft[] {
+  const rows = queryAll<{
+    page_id: string
+    page_num: number
+    unit_id: string
+    block_id: string
+    unit_order: number
+    translation_text: string
+  }>(
+    sqlite,
+    `SELECT page_id, page_num, unit_id, block_id, unit_order, translation_text
+     FROM page_translation_units
+     WHERE doc_id = ?
+       AND TRIM(COALESCE(translation_text, '')) <> ''
+     ORDER BY page_num, unit_order`,
+    [docId],
+  )
+  return rows.map((row) => {
+    const text = String(row.translation_text || '').trim()
+    const normalized = normalizeSearchTextWithOffsetMap(text)
+    return {
+      segmentId: `translation:${row.unit_id}:${row.block_id}`,
+      pageId: row.page_id,
+      pageNum: Number(row.page_num || 0),
+      sourceKind: 'translation',
+      href: null,
+      title: `第 ${row.page_num || '?'} 页 · 译文`,
+      ordinal: Math.max(0, Number(row.page_num || 1) - 1) * 1000 + 500 + Number(row.unit_order || 0),
+      sourceStart: 0,
+      text,
+      normalizedText: normalized.text,
+      offsetMap: normalized.offsets,
+      textHash: hashText(`${docId}:${row.unit_id}:${normalized.text}`),
+    }
+  })
+}
+
 function insertSearchIndexSegmentDraftIntoStaging(sqlite: NativeDatabase, jobId: string, docId: string, segment: SearchIndexSegmentDraft, now: string): void {
   runOn(
     sqlite,
@@ -957,6 +994,19 @@ async function reindexDocument(task: SearchIndexWorkerTask): Promise<SearchReind
         message: '正在后台更新搜索索引，不影响阅读和浏览',
       })
       sliceStartedAt = await yieldAfterSearchIndexSlice(sliceStartedAt)
+    }
+
+    const translationSegments = buildTranslationSearchIndexSegmentDrafts(sqlite, docId)
+    for (let segmentIndex = 0; segmentIndex < translationSegments.length; segmentIndex += BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE) {
+      const segmentChunk = translationSegments.slice(segmentIndex, segmentIndex + BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE)
+      transaction(sqlite, () => {
+        segmentChunk.forEach((segment) => insertSearchIndexSegmentDraftIntoStaging(sqlite, stagingJobId, docId, segment, now))
+      })
+      segmentChunk.forEach((segment) => segmentHashes.push(segment.textHash))
+      segmentCount += segmentChunk.length
+      for (const segment of segmentChunk) {
+        sliceStartedAt = await insertSearchNgramsForStagedSegmentInBackground(sqlite, stagingJobId, docId, segment, sliceStartedAt)
+      }
     }
 
     const readyAt = new Date().toISOString()

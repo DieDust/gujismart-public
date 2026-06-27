@@ -966,7 +966,10 @@ function getStoredSearchIndexContentSignature(docId: string): SearchIndexContent
 
 function buildCurrentSearchIndexContentSignature(docId: string): SearchIndexContentSignature {
   const pages = loadIndexablePagesForDocument(docId)
-  const segments = pages.flatMap((page, index) => buildSearchIndexSegmentDrafts(docId, page, index))
+  const segments = [
+    ...pages.flatMap((page, index) => buildSearchIndexSegmentDrafts(docId, page, index)),
+    ...buildTranslationSearchIndexSegmentDrafts(docId),
+  ]
   return buildSearchIndexContentSignature(segments.map((segment) => ({
     segmentId: segment.segmentId,
     pageId: segment.pageId,
@@ -1471,6 +1474,19 @@ async function reindexDocumentInBackground(docId: string, totalCount: number, co
       sliceStartedAt = await yieldAfterSearchIndexSlice(sliceStartedAt)
     }
 
+    const translationSegments = buildTranslationSearchIndexSegmentDrafts(docId)
+    for (let segmentIndex = 0; segmentIndex < translationSegments.length; segmentIndex += BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE) {
+      const segmentChunk = translationSegments.slice(segmentIndex, segmentIndex + BACKGROUND_REINDEX_SEGMENT_WRITE_BATCH_SIZE)
+      transaction(() => {
+        segmentChunk.forEach((segment) => insertSearchIndexSegmentDraftIntoStaging(stagingJobId, docId, segment, now))
+      })
+      segmentChunk.forEach((segment) => segmentHashes.push(segment.textHash))
+      segmentCount += segmentChunk.length
+      for (const segment of segmentChunk) {
+        sliceStartedAt = await insertSearchNgramsForStagedSegmentInBackground(stagingJobId, docId, segment, sliceStartedAt)
+      }
+    }
+
     const readyAt = new Date().toISOString()
     const sourceHash = versionedSourceHash(segmentHashes)
     commitStagedSearchIndexForDocument(stagingJobId, docId, sourceHash, segmentCount, readyAt)
@@ -1700,7 +1716,10 @@ export function reindexDocument(docId: string): SearchReindexDocumentResult {
   const stagingJobId = createSearchIndexStagingJobId(docId)
   try {
     const pages = loadIndexablePagesForDocument(docId)
-    const segments = pages.flatMap((page, index) => buildSearchIndexSegmentDrafts(docId, page, index))
+    const segments = [
+      ...pages.flatMap((page, index) => buildSearchIndexSegmentDrafts(docId, page, index)),
+      ...buildTranslationSearchIndexSegmentDrafts(docId),
+    ]
 
     const sourceHash = versionedSourceHash(segments.map((segment) => segment.textHash))
     transaction(() => {
@@ -2845,6 +2864,10 @@ function createSearchHit(
   const locator: SearchHitLocator = {
     docId: row.doc_id,
     segmentId: row.segment_id,
+    sourceType: row.source_kind || 'page',
+    blockId: row.source_kind === 'translation' ? row.segment_id.split(':')[2] || null : null,
+    translationUnitId: row.source_kind === 'translation' ? row.segment_id.split(':')[1] || null : null,
+    translationSource: row.source_kind === 'translation',
     pageId: row.page_id || null,
     pageNum,
     pageIndex,
@@ -2876,7 +2899,13 @@ function buildHitsFromRows(rows: SearchHitRow[], keyword: string, limit: number,
   const queryTerm = keyword.trim()
   const sessionLimit = options?.resultMode === 'all' ? MAX_DOCUMENT_SEARCH_SESSION_HITS : 1200
   const hardLimit = Math.max(1, Math.min(limit, sessionLimit))
-  for (const row of hydrateSearchRowsText(rows)) {
+  for (const row of hydrateSearchRowsText(rows).filter((item) => (
+    options?.translationScope === 'translation'
+      ? item.source_kind === 'translation'
+      : options?.translationScope === 'source'
+        ? item.source_kind !== 'translation'
+        : true
+  ))) {
     const sourceText = row.text || row.normalized_text || ''
     const occurrences = buildOccurrencesForRow(row, keyword)
     for (let occurrenceIndex = 0; occurrenceIndex < occurrences.length; occurrenceIndex += 1) {
@@ -2961,6 +2990,42 @@ function hydrateSearchRowsText(rows: SearchHitRow[]): SearchHitRow[] {
   })
 }
 
+function buildTranslationSearchIndexSegmentDrafts(docId: string): SearchIndexSegmentDraft[] {
+  const rows = queryAll<{
+    page_id: string
+    page_num: number
+    unit_id: string
+    block_id: string
+    unit_order: number
+    translation_text: string
+  }>(
+    `SELECT page_id, page_num, unit_id, block_id, unit_order, translation_text
+     FROM page_translation_units
+     WHERE doc_id = ?
+       AND TRIM(COALESCE(translation_text, '')) <> ''
+     ORDER BY page_num, unit_order`,
+    [docId],
+  )
+  return rows.map((row) => {
+    const text = String(row.translation_text || '').trim()
+    const normalized = normalizeSearchTextWithOffsetMap(text)
+    return {
+      segmentId: `translation:${row.unit_id}:${row.block_id}`,
+      pageId: row.page_id,
+      pageNum: Number(row.page_num || 0),
+      sourceKind: 'translation',
+      href: null,
+      title: `第 ${row.page_num || '?'} 页 · 译文`,
+      ordinal: Math.max(0, Number(row.page_num || 1) - 1) * 1000 + 500 + Number(row.unit_order || 0),
+      sourceStart: 0,
+      text,
+      normalizedText: normalized.text,
+      offsetMap: normalized.offsets,
+      textHash: hashText(`${docId}:${row.unit_id}:${normalized.text}`),
+    }
+  })
+}
+
 function buildOccurrencesForRow(row: SearchHitRow, keyword: string): Array<{ index: number; length: number; term: string; originalIndex?: number; originalLength?: number }> {
   const sourceText = row.text || row.normalized_text || ''
   const normalizedKeyword = normalizeSearchText(keyword).trim()
@@ -2991,6 +3056,13 @@ function buildOccurrencesForRow(row: SearchHitRow, keyword: string): Array<{ ind
 }
 
 function groupRowsByOccurrences(rows: SearchHitRow[], keyword: string, options?: SearchOptions, warnings: string[] = []): SearchGroupedResponse {
+  rows = rows.filter((item) => (
+    options?.translationScope === 'translation'
+      ? item.source_kind === 'translation'
+      : options?.translationScope === 'source'
+        ? item.source_kind !== 'translation'
+        : true
+  ))
   const docMap = loadDocumentMap([...new Set(rows.map((row) => row.doc_id))])
   const grouped = new Map<string, SearchDocumentGroup>()
   const resultMode = options?.resultMode || 'preview'
@@ -3265,6 +3337,7 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     favoritesOnly: !!options?.favoritesOnly,
     yearFrom: options?.yearFrom || null,
     yearTo: options?.yearTo || null,
+    translationScope: options?.translationScope || 'all',
   })
   const cached = searchResponseCache.get(cacheKey)
   if (cached && Date.now() - cached.createdAt < SEARCH_CACHE_TTL_MS) {
@@ -3288,6 +3361,25 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
         folderNames: [...(group.folderNames || [])],
       })),
     }
+  }
+
+  if (options?.translationScope === 'source' || options?.translationScope === 'translation') {
+    const params: Array<string | number> = [normalizedQuery]
+    const sourceCondition = options.translationScope === 'translation'
+      ? "s.source_kind = 'translation'"
+      : "s.source_kind <> 'translation'"
+    let sql = `SELECT s.segment_id, s.doc_id, s.page_id, s.page_num, s.source_kind, s.href, s.title,
+                      s.ordinal, s.source_start, s.text, s.normalized_text, s.offset_map, 10 as rank
+               FROM search_index_segments s
+               WHERE ${sourceCondition}
+                 AND instr(COALESCE(s.normalized_text, s.text, ''), ?) > 0`
+    if (scopedDocIds && scopedDocIds.length > 0) {
+      sql += ` AND s.doc_id IN (${buildInClause(scopedDocIds)})`
+      params.push(...scopedDocIds)
+    }
+    sql += ' ORDER BY s.doc_id, s.page_num, s.ordinal LIMIT ?'
+    params.push(options.resultMode === 'all' ? MAX_DOCUMENT_SEARCH_SESSION_HITS : Math.max(1000, limit * 80))
+    return groupRowsByOccurrences(queryAll<SearchHitRow>(sql, params), query, options)
   }
 
   const staleDocIds = checkSearchIndexForScope(scopedDocIds, { autoReindex })

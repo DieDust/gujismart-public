@@ -7,6 +7,7 @@ import {
   MinusOutlined,
   PlusOutlined,
   RotateRightOutlined,
+  ReloadOutlined,
   SaveOutlined,
   SettingOutlined,
   UndoOutlined,
@@ -23,7 +24,7 @@ import {
   getCanonicalPageTranslationSourceText,
   getCanonicalTranslationBlockText,
 } from '@shared/translation-source'
-import type { Document, DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResult, PageUpdatePayload } from '@shared/types'
+import type { Document, DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResult, PageUpdatePayload, TranslationMode, TranslationUnitV1 } from '@shared/types'
 
 type ProofDisplayScript = 'original' | 'simplified' | 'traditional'
 type BlockRect = { left: number; top: number; width: number; height: number }
@@ -40,6 +41,10 @@ type LayoutBlock = OcrRecognizeLayoutBlock & JsonRecord & {
   class?: string
   layout_label?: string
   orientation?: 'vertical' | 'horizontal' | string
+  orientation_source?: string
+  source_orientation?: string
+  source_orientation_source?: string
+  segmentation_source?: string
   reading_order?: number
   column_index?: number
   line_index?: number
@@ -127,12 +132,17 @@ interface GujiFacsimileProofreaderProps {
   activeSearchHitOrdinal?: number
   searchKeyword?: string
   coordinateSourceSize?: { width?: number | null; height?: number | null }
+  preferVerticalLayout?: boolean
   translationText?: string
+  translationUnits?: TranslationUnitV1[]
   translationLoading?: boolean
   translationSkipped?: boolean
   translationOpen?: boolean
+  translationMode?: TranslationMode
   onTranslationOpenChange?: (open: boolean) => void
+  onTranslationModeChange?: (mode: TranslationMode) => void
   onTranslateCurrentPage?: (text: string) => void
+  onRetranslateCurrentPage?: (text: string) => void
   onSelectBox?: (index: number) => void
   onSave: (pageId: string, data: PageUpdatePayload) => void
   onTextSelectionChange?: (text: string) => void
@@ -153,6 +163,7 @@ const FACSIMILE_FONT_SCALE_MIN = 0.1
 const FACSIMILE_FONT_SCALE_MAX = 5
 const FACSIMILE_FONT_SCALE_STEP = 0.02
 const FACSIMILE_TEXT_FIT_ITERATIONS = 7
+const FACSIMILE_SPLIT_COLUMN_SOURCE_INDEX_BASE = 1_000_000
 type ImageUnderlayMode = 'auto' | 'on' | 'off'
 
 const LABEL_COLORS: Record<string, string> = {
@@ -264,6 +275,27 @@ function primitiveText(value: unknown): string {
   return ''
 }
 
+function getOrientationValue(block: unknown): 'vertical' | 'horizontal' | null {
+  const orientation = readRecordValue(block, 'orientation')
+  return orientation === 'vertical' || orientation === 'horizontal' ? orientation : null
+}
+
+function normalizeOrientationSource(value: unknown): string {
+  return primitiveText(value).trim().toLowerCase().replace(/[_-]+/g, ' ')
+}
+
+function isManualOrientationSource(value: unknown): boolean {
+  const normalized = normalizeOrientationSource(value)
+  return normalized === 'manual' || normalized === 'manual override' || normalized === 'user' || normalized === 'user override'
+}
+
+function getManualOrientation(block: unknown): 'vertical' | 'horizontal' | null {
+  const orientation = getOrientationValue(block)
+  if (!orientation) return null
+  const source = firstRecordValue(block, ['orientation_source', 'orientationSource'])
+  return isManualOrientationSource(source) ? orientation : null
+}
+
 function asOcrResult(value: unknown): FacsimileOcrResult {
   const parsed = parseMaybeJson(value, {})
   return isJsonRecord(parsed) ? parsed as FacsimileOcrResult : {}
@@ -338,11 +370,11 @@ function getOrientationLabelText(block: unknown): string {
 }
 
 function isTitleLabel(label: string): boolean {
-  return /title|heading|题|標|卷|篇/.test(label)
+  return /title|heading|题名|标题|篇题/.test(label)
 }
 
 function isNoteLabel(label: string): boolean {
-  return /note|annotation|footnote|夹注|夾注|注文|注释|註/.test(label)
+  return /note|annotation|footnote|夹注|注释|注解/.test(label)
 }
 
 function isDecorativeLabel(label: string): boolean {
@@ -354,7 +386,7 @@ function isTocLabel(label: string): boolean {
 }
 
 function isExplicitVerticalLabel(label: string): boolean {
-  return /vertical[_\s-]*text|col[_\s-]*text|column[_\s-]*text|vertical|竖排|豎排|直排|縦書き|縦組み/i.test(label)
+  return /vertical[_\s-]*text|col[_\s-]*text|column[_\s-]*text|vertical|竖排|縦書き|縦組み/i.test(label)
 }
 
 function isExplicitHorizontalLabel(label: string): boolean {
@@ -374,6 +406,38 @@ function isBodyTextLabel(label: string): boolean {
   return /^(?:text|paragraph|body)$/.test(label) || /正文/.test(label)
 }
 
+function isOrdinaryVerticalPageTextBlock(block: unknown): boolean {
+  const label = getLabel(block)
+  if (isLikelyVerticalPseudoTableBlock(block)) return true
+  if (!isBodyTextLabel(label)) return false
+  if (isTocLabel(label) || isDecorativeLabel(label) || isImageLabel(label) || isRenderableTableBlock(block)) return false
+  const text = getBlockText(block)
+  const rect = getRect(block)
+  if (!rect || !text.trim()) return false
+  const compactLength = Array.from(text.replace(/\s+/g, '')).length
+  if (compactLength < 12) return false
+  const wideShortLine = rect.width >= rect.height * 2.1 && rect.height <= 82
+  if (wideShortLine && compactLength < 72) return false
+  return getVerticalScriptRatio(text) >= 0.35
+}
+
+function hasVerticalColumnTextShape(block: unknown): boolean {
+  const label = getLabel(block)
+  if (isLikelyVerticalPseudoTableBlock(block)) return true
+  if (!isBodyTextLabel(label) && !isNoteLabel(label) && !isTitleLabel(label)) return false
+  if (isTocLabel(label) || isDecorativeLabel(label) || isImageLabel(label) || isRenderableTableBlock(block)) return false
+  const rect = getRect(block)
+  const text = getBlockText(block)
+  if (!rect || !text.trim() || getVerticalScriptRatio(text) < 0.42) return false
+  const compactLength = Array.from(text.replace(/\s+/g, '')).length
+  if (isTallVerticalTextBlock(block)) return true
+  const columns = getVerticalColumns(text)
+  if (columns.length >= 2 && columns.filter((column) => column.length >= 2).length >= 2) return true
+  if (rect.height < 90 || compactLength < 42) return false
+  if (rect.width >= 120 && rect.height >= 90 && compactLength >= 60) return true
+  return rect.height >= rect.width * 0.72 && compactLength >= 36
+}
+
 function isNaturallyHorizontalLabel(label: string): boolean {
   const normalized = String(label || '').toLowerCase().replace(/[_-]+/g, ' ')
   return /\b(?:doc title|document title|paragraph title|title|heading|section title|abstract|reference|references|caption|figure caption|table caption|header|footer|number|page number|keyword|keywords|author|journal|date)\b/.test(normalized)
@@ -386,6 +450,70 @@ function isImageLabel(label: string): boolean {
 
 function isRenderableTableBlock(block: unknown): boolean {
   return isTableBlock(block) && getBlockTableRows(block).length > 0
+}
+
+function tableRowsToPlainText(rows: string[][]): string {
+  return rows.map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join('')).filter(Boolean).join('\n')
+}
+
+function tableRowsToVerticalColumnText(rows: string[][]): string {
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  if (rows.length <= 4 && columnCount >= 4) {
+    const columns: string[] = []
+    for (let columnIndex = columnCount - 1; columnIndex >= 0; columnIndex -= 1) {
+      const columnText = rows.map((row) => String(row[columnIndex] || '').trim()).filter(Boolean).join('')
+      if (columnText) columns.push(columnText)
+    }
+    return columns.join('\n')
+  }
+  return tableRowsToPlainText(rows)
+}
+
+function getPseudoTableText(block: unknown): string {
+  const rows = getBlockTableRows(block)
+  return rows.length > 0 ? tableRowsToVerticalColumnText(rows) : getBlockText(block)
+}
+
+function isLikelyVerticalPseudoTableBlock(block: unknown): boolean {
+  if (!isRenderableTableBlock(block)) return false
+  const rows = getBlockTableRows(block)
+  const rect = getRect(block)
+  const text = getPseudoTableText(block)
+  const compactCells = rows.flat().map((cell) => String(cell || '').replace(/\s+/g, '')).filter(Boolean)
+  const compactText = compactCells.join('')
+  if (!rect || compactCells.length < 4 || compactText.length < 16) return false
+  if (getVerticalScriptRatio(compactText) < 0.58) return false
+
+  const rowCount = rows.length
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  const maxCellLength = Math.max(0, ...compactCells.map((cell) => cell.length))
+  const shortCellRatio = compactCells.filter((cell) => cell.length <= 8).length / Math.max(1, compactCells.length)
+  const numericCellCount = compactCells.filter((cell) => /(?:\d|[０-９]|[一二三四五六七八九十百千万]+(?:年|月|日|時|时|分|円|元|割|％|%))/.test(cell)).length
+  if (numericCellCount >= Math.max(3, Math.ceil(compactCells.length * 0.25))) return false
+  const expandedVerticalLineShape = rect.height >= rect.width * 0.42 || columnCount >= 4
+  const denseVerticalTextGrid = compactCells.length >= 12
+    && shortCellRatio >= 0.68
+    && maxCellLength <= 18
+    && (rowCount >= 5 || columnCount >= 4)
+  const expandedSparseVocabularyGrid = rowCount <= 4
+    && columnCount >= 4
+    && compactCells.length >= 6
+    && shortCellRatio >= 0.72
+    && maxCellLength <= 14
+  if (expandedVerticalLineShape && (denseVerticalTextGrid || expandedSparseVocabularyGrid)) return true
+  const longCellCount = compactCells.filter((cell) => cell.length >= 18).length
+  const punctuationCount = Array.from(compactText).filter((char) => /[，。；：！？、“”‘’（）《》,.!?;:]/.test(char)).length
+  const hasNarrativeCells = longCellCount >= 2 || maxCellLength >= 42 || punctuationCount >= 8
+  if (hasNarrativeCells) return false
+
+  const verticalLineShape = rect.height >= rect.width * 0.55 || columnCount >= 4
+  const manyShortCjkCells = compactCells.length >= 6 && maxCellLength <= 14
+  const sparseVocabularyGrid = rowCount <= 4 && columnCount >= 4 && manyShortCjkCells
+  return verticalLineShape && sparseVocabularyGrid
+}
+
+function shouldRenderAsTableBlock(block: unknown, pageVerticalMode = false): boolean {
+  return isRenderableTableBlock(block) && !(pageVerticalMode && isLikelyVerticalPseudoTableBlock(block))
 }
 
 function getBlockImagePath(block: unknown): string {
@@ -519,7 +647,7 @@ function isStrongHorizontalTextBlock(block: unknown): boolean {
 function isVerticalPage(blocks: LayoutBlock[]): boolean {
   const meaningfulBlocks = blocks.filter((block) => {
     const label = getLabel(block)
-    return !isRenderableTableBlock(block) && !isImageLabel(label) && !!getRect(block) && !!getBlockText(block).trim()
+    return (!isRenderableTableBlock(block) || isLikelyVerticalPseudoTableBlock(block)) && !isImageLabel(label) && !!getRect(block) && !!getBlockText(block).trim()
   })
   if (meaningfulBlocks.length < 3) return false
   const verticalCount = meaningfulBlocks.filter((block) => (
@@ -532,7 +660,9 @@ function isVerticalPage(blocks: LayoutBlock[]): boolean {
 }
 
 function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
-  if (isRenderableTableBlock(block)) return 'horizontal'
+  if (isRenderableTableBlock(block) && !isLikelyVerticalPseudoTableBlock(block)) return 'horizontal'
+  const manualOrientation = getManualOrientation(block)
+  if (manualOrientation) return manualOrientation
   if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   const explicitOrientation = getExplicitOcrOrientation(block)
   if (explicitOrientation) return explicitOrientation
@@ -547,10 +677,15 @@ function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
 }
 
 function inferPageAwareOrientation(block: unknown, pageVerticalMode: boolean): 'vertical' | 'horizontal' {
-  if (isRenderableTableBlock(block) || isImageLabel(getLabel(block))) return 'horizontal'
+  if (shouldRenderAsTableBlock(block, pageVerticalMode) || isImageLabel(getLabel(block))) return 'horizontal'
+  const manualOrientation = getManualOrientation(block)
+  if (manualOrientation) return manualOrientation
   if (!pageVerticalMode) return inferOrientation(block)
-  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   if (isTocLabel(getLabel(block))) return 'horizontal'
+  if (isLikelyVerticalPseudoTableBlock(block)) return 'vertical'
+  if (hasVerticalColumnTextShape(block)) return 'vertical'
+  if (isOrdinaryVerticalPageTextBlock(block)) return 'vertical'
+  if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   const explicitOrientation = getExplicitOcrOrientation(block)
   if (explicitOrientation) return explicitOrientation
   return 'vertical'
@@ -614,9 +749,24 @@ function normalizeBlocks(ocrResult: unknown): LayoutBlock[] {
   return [...blocks, ...imageBlocks].sort((left, right) => Number(left.reading_order || 0) - Number(right.reading_order || 0))
 }
 
-function normalizePageOrientations(blocks: LayoutBlock[]): LayoutBlock[] {
-  const pageVerticalMode = isVerticalPage(blocks)
-  return blocks.map((block) => ({ ...block, orientation: inferPageAwareOrientation(block, pageVerticalMode) }))
+function normalizePageOrientations(blocks: LayoutBlock[], preferVerticalLayout = false): LayoutBlock[] {
+  const pageVerticalMode = preferVerticalLayout || isVerticalPage(blocks)
+  return blocks.map((block) => {
+    const sourceOrientation = block.source_orientation === 'vertical' || block.source_orientation === 'horizontal'
+      ? block.source_orientation
+      : getOrientationValue(block)
+    const orientation = inferPageAwareOrientation(block, pageVerticalMode)
+    const orientationSource = getManualOrientation(block)
+      ? 'manual'
+      : block.orientation_source || (pageVerticalMode && sourceOrientation && sourceOrientation !== orientation ? 'page_consensus' : undefined)
+    return {
+      ...block,
+      orientation,
+      orientation_source: orientationSource,
+      source_orientation: block.source_orientation || sourceOrientation || orientation,
+      source_orientation_source: block.source_orientation_source || (sourceOrientation ? 'ocr' : undefined),
+    }
+  })
 }
 
 function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
@@ -627,7 +777,7 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
     if (
       !rect
       || block.orientation !== 'vertical'
-      || isRenderableTableBlock(block)
+      || shouldRenderAsTableBlock(block, true)
       || isImageLabel(label)
       || isDecorativeLabel(label)
       || rect.width < 72
@@ -637,7 +787,8 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
       return
     }
 
-    const columns = getVerticalColumns(getBlockText(block))
+    const columnSourceText = isLikelyVerticalPseudoTableBlock(block) ? getPseudoTableText(block) : getBlockText(block)
+    const columns = getVerticalColumns(columnSourceText)
     if (columns.length < 2) {
       nextBlocks.push(block)
       return
@@ -650,6 +801,7 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
     }
 
     columns.forEach((columnText, columnIndex) => {
+      const sourceIndex = getBlockSourceIndex(block, blockIndex)
       const left = rect.left + rect.width - (columnIndex + 1) * columnWidth
       nextBlocks.push({
         ...block,
@@ -664,7 +816,7 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
           width: columnWidth,
           height: rect.height,
         },
-        __sourceIndex: getBlockSourceIndex(block, blockIndex) * 100 + columnIndex,
+        __sourceIndex: FACSIMILE_SPLIT_COLUMN_SOURCE_INDEX_BASE + sourceIndex * 1000 + columnIndex,
       })
     })
   })
@@ -692,7 +844,7 @@ function splitStackedVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
     if (
       !rect
       || block.orientation !== 'vertical'
-      || isRenderableTableBlock(block)
+      || shouldRenderAsTableBlock(block, true)
       || isImageLabel(label)
       || isDecorativeLabel(label)
       || shouldPreserveVerticalColumns(label)
@@ -758,7 +910,7 @@ function splitStackedVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
 function shouldUseImageUnderlay(blocks: LayoutBlock[], pageVerticalMode: boolean): boolean {
   const contentBlocks = blocks.filter((block) => {
     const label = getLabel(block)
-    return !isDecorativeLabel(label) && !isRenderableTableBlock(block) && !!block.__rect && !!getBlockText(block).trim()
+    return !isDecorativeLabel(label) && !shouldRenderAsTableBlock(block, pageVerticalMode) && !!block.__rect && !!getBlockText(block).trim()
   })
   const imageBlockCount = blocks.filter((block) => isImageLabel(getLabel(block)) || !!getBlockImagePath(block)).length
   if (pageVerticalMode && contentBlocks.length >= 6 && imageBlockCount === 0) return false
@@ -895,13 +1047,14 @@ function buildFacsimileTranslationOverlays(
   pageBlocks: LayoutBlock[],
   pageSourceText: string,
   translationText: string,
+  preferVerticalLayout = false,
 ): FacsimileTranslationOverlay[] {
   if (!isParallelTranslationDisplayReady(pageSourceText, translationText)) return []
   const blockTexts = pageBlocks.map((block) => getBlockText(block))
   const segments = buildParallelTranslationSegments(pageSourceText, translationText)
   const overlays: FacsimileTranslationOverlay[] = []
   let coverageCursor: TranslationCoverageCursor = { blockIndex: 0, offset: 0 }
-  const pageVerticalMode = isVerticalPage(pageBlocks)
+  const pageVerticalMode = preferVerticalLayout || isVerticalPage(pageBlocks)
 
   segments.forEach((segment, segmentIndex) => {
     const translation = segment.translation.trim()
@@ -924,6 +1077,7 @@ function buildFacsimileTranslationOverlays(
     const firstBlock = coveredBlocks[0]
     const labels = coveredBlocks.map((block) => getLabel(block)).filter(Boolean)
     const label = labels.find((item) => !isDecorativeLabel(item)) || labels[0] || 'text'
+    if (isImageLabel(label)) return
     const verticalCount = coveredBlocks.filter((block) => inferPageAwareOrientation(block, pageVerticalMode) === 'vertical').length
     overlays.push({
       id: segment.id || `translation-segment-${segmentIndex}`,
@@ -950,6 +1104,32 @@ function getVerticalColumns(text: string): string[] {
   return hardLines
     .map((line) => line.replace(/[ \t]+/g, '').trim())
     .filter(Boolean)
+}
+
+function buildFacsimileTranslationOverlaysFromUnits(
+  pageBlocks: LayoutBlock[],
+  units: TranslationUnitV1[],
+  preferVerticalLayout = false,
+): FacsimileTranslationOverlay[] {
+  const pageVerticalMode = preferVerticalLayout || isVerticalPage(pageBlocks)
+  return units.flatMap((unit, unitIndex) => {
+    const text = String(unit.translationText || (unit.skipped ? unit.sourceText : '')).trim()
+    const rect = unit.sourceRect
+    if (!text || !rect || rect.width <= 0 || rect.height <= 0) return []
+    const sourceIndex = Number.isFinite(Number(unit.sourceIndex)) ? Number(unit.sourceIndex) : unit.blockIndex
+    const block = pageBlocks.find((item, index) => getBlockSourceIndex(item, index) === sourceIndex)
+      || pageBlocks[unit.blockIndex]
+    const label = block ? getLabel(block) : unit.blockType || 'text'
+    if (isImageLabel(label)) return []
+    return [{
+      id: unit.id || `translation-unit-${unitIndex}`,
+      sourceIndexes: [sourceIndex],
+      text,
+      rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      label,
+      orientation: block ? inferPageAwareOrientation(block, pageVerticalMode) : 'horizontal',
+    }]
+  })
 }
 
 function shouldPreserveVerticalColumns(label: string): boolean {
@@ -1036,8 +1216,8 @@ function tokenizeForLineBreak(text: string): string[] {
   return tokens
 }
 
-const LINE_START_FORBIDDEN = '，。、；：？！）》】』」’”.,;:?!%)]}…'
-const LINE_END_FORBIDDEN = '（《【『「‘“([{'
+const LINE_START_FORBIDDEN = '，。、；：？！）》】」』”’、,;:?!%)]}…'
+const LINE_END_FORBIDDEN = '（《【「『“‘([{'
 
 function wrapParagraphToWidth(paragraph: string, maxWidth: number, fontSize: number, label: string, profile: FacsimileLayoutProfile): string[] {
   const source = String(paragraph || '').trim()
@@ -1264,7 +1444,7 @@ function normalizeTranslatedTextForLayout(text: string, orientation: 'vertical' 
   const normalized = String(text || '')
     .replace(/\r/g, '\n')
     .replace(/\u00a0/g, ' ')
-    .replace(/^\s*\[?S\d{1,4}\]?\s*[:：\-、]?\s*/gmi, '')
+    .replace(/^\s*\[?S\d{1,4}\]?\s*[:：.)、-]?\s*/gmi, '')
     .trim()
   if (!normalized) return ''
   const merged = mergeSoftLineBreaks(normalized)
@@ -1385,14 +1565,42 @@ function shouldIgnoreCanvasDrag(target: EventTarget | null): boolean {
   return target instanceof HTMLElement && !!target.closest('button,input,textarea,.ant-slider,.ant-switch,[data-guji-block-index]')
 }
 
-function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofStatus: 'completed' | 'pending'): PageUpdatePayload {
+function isGujiVerticalOcrResult(ocrResult: unknown): boolean {
+  const parsed = asOcrResult(ocrResult)
+  const processing = readRecordValue(parsed, 'guji_processing')
+  const profile = isJsonRecord(processing) ? String(processing.profile || '').toLowerCase() : ''
+  return profile === 'guji_print_vertical'
+}
+
+function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofStatus: 'completed' | 'pending', preferVerticalLayout = false): PageUpdatePayload {
+  const pageVerticalMode = preferVerticalLayout || isVerticalPage(blocks)
   const normalizedBlocks = blocks.map((block, index) => {
     const { __rect, __synthetic, __sourceIndex, ...rest } = block
+    const orientation = inferPageAwareOrientation(block, pageVerticalMode)
+    const pseudoTable = pageVerticalMode && isLikelyVerticalPseudoTableBlock(block)
+    const words = pseudoTable ? getPseudoTableText(block) : getBlockText(block)
     return {
       ...rest,
-      words: getBlockText(block),
+      words,
+      label: pseudoTable ? 'text' : rest.label,
+      type: pseudoTable && rest.type === 'table' ? 'text' : rest.type,
+      block_type: pseudoTable && rest.block_type === 'table' ? 'text' : rest.block_type,
+      rows: pseudoTable ? undefined : rest.rows,
+      table_rows: pseudoTable ? undefined : rest.table_rows,
+      tableRows: pseudoTable ? undefined : rest.tableRows,
+      cells: pseudoTable ? undefined : rest.cells,
+      table_cells: pseudoTable ? undefined : rest.table_cells,
+      tableCells: pseudoTable ? undefined : rest.tableCells,
+      html: pseudoTable ? undefined : rest.html,
+      table_html: pseudoTable ? undefined : rest.table_html,
+      tableHtml: pseudoTable ? undefined : rest.tableHtml,
+      markdown: pseudoTable ? undefined : rest.markdown,
+      md: pseudoTable ? undefined : rest.md,
       reading_order: index,
-      orientation: inferOrientation(block),
+      orientation,
+      orientation_source: isManualOrientationSource(block.orientation_source) ? 'manual' : block.orientation_source,
+      source_orientation: block.source_orientation || getOrientationValue(block) || orientation,
+      source_orientation_source: block.source_orientation_source || 'ocr',
       location: block.location || (__rect ? { left: __rect.left, top: __rect.top, width: __rect.width, height: __rect.height } : undefined),
     }
   })
@@ -1484,12 +1692,17 @@ export default function GujiFacsimileProofreader({
   activeSearchHitOrdinal = -1,
   searchKeyword = '',
   coordinateSourceSize,
+  preferVerticalLayout = false,
   translationText = '',
+  translationUnits = [],
   translationLoading = false,
   translationSkipped = false,
   translationOpen: controlledTranslationOpen,
+  translationMode = 'balanced',
   onTranslationOpenChange,
+  onTranslationModeChange,
   onTranslateCurrentPage,
+  onRetranslateCurrentPage,
   onSelectBox,
   onSave,
   onTextSelectionChange,
@@ -1525,6 +1738,10 @@ export default function GujiFacsimileProofreader({
   const [fontReadyVersion, setFontReadyVersion] = useState(0)
   const [pageImageNaturalSize, setPageImageNaturalSize] = useState<{ width: number; height: number } | null>(null)
   const layoutProfile = useMemo(() => getFacsimileLayoutProfile(ocrResult), [ocrResult])
+  const effectivePreferVerticalLayout = useMemo(
+    () => preferVerticalLayout || isGujiVerticalOcrResult(ocrResult),
+    [ocrResult, preferVerticalLayout],
+  )
   const pageSourceText = useMemo(() => blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'), [blocks])
   const translationOpen = controlledTranslationOpen ?? internalTranslationOpen
   const setTranslationOpen = useCallback((open: boolean) => {
@@ -1550,14 +1767,14 @@ export default function GujiFacsimileProofreader({
     }
   }, [onTranslateCurrentPage, pageSourceText, translationLoading, translationText])
   useEffect(() => {
-    const nextBlocks = splitStackedVerticalBlocks(splitWideVerticalBlocks(normalizePageOrientations(normalizeBlocks(ocrResult))))
+    const nextBlocks = splitStackedVerticalBlocks(splitWideVerticalBlocks(normalizePageOrientations(normalizeBlocks(ocrResult), effectivePreferVerticalLayout)))
     setBlocks(nextBlocks)
     setHistory([nextBlocks.map((block) => ({ ...block }))])
     setHistoryIndex(0)
     setEditingIndex(-1)
     setEditValue('')
     translationRequestKeyRef.current = ''
-  }, [ocrResult, pageId])
+  }, [effectivePreferVerticalLayout, ocrResult, pageId])
 
   useEffect(() => {
     setIsPanning(false)
@@ -1705,7 +1922,7 @@ export default function GujiFacsimileProofreader({
   const hasOriginalLayoutCoordinates = useMemo(() => blocks.some((block) => block.__rect), [blocks])
   const pageBlocks = useMemo(() => hasOriginalLayoutCoordinates ? blocks : buildSyntheticRects(blocks, baseBounds), [baseBounds, blocks, hasOriginalLayoutCoordinates])
   const isSyntheticLayoutFallback = blocks.length > 0 && !hasOriginalLayoutCoordinates
-  const pageVerticalMode = useMemo(() => isVerticalPage(pageBlocks), [pageBlocks])
+  const pageVerticalMode = useMemo(() => effectivePreferVerticalLayout || isVerticalPage(pageBlocks), [effectivePreferVerticalLayout, pageBlocks])
   const autoImageUnderlay = useMemo(() => shouldUseImageUnderlay(pageBlocks, pageVerticalMode), [pageBlocks, pageVerticalMode])
   const showImageUnderlay = !!pageImageSrc && (imageUnderlayMode === 'on' || (imageUnderlayMode === 'auto' && autoImageUnderlay))
   const bounds = useMemo(() => getLayoutBounds(pageBlocks, effectiveCoordinateSourceSize), [effectiveCoordinateSourceSize, pageBlocks])
@@ -1743,9 +1960,12 @@ export default function GujiFacsimileProofreader({
   }, [pageId, pageImageNaturalSize?.height, pageImageNaturalSize?.width, schedulePageRecenter])
 
   const translationOverlays = useMemo(() => {
+    if (translationOpen && translationUnits.length > 0) {
+      return buildFacsimileTranslationOverlaysFromUnits(pageBlocks, translationUnits, pageVerticalMode)
+    }
     if (!translationOpen || translationLoading || translationSkipped || !translationText.trim() || !pageSourceText.trim()) return []
-    return buildFacsimileTranslationOverlays(pageBlocks, pageSourceText, translationText)
-  }, [pageBlocks, pageSourceText, translationLoading, translationOpen, translationSkipped, translationText])
+    return buildFacsimileTranslationOverlays(pageBlocks, pageSourceText, translationText, pageVerticalMode)
+  }, [pageBlocks, pageSourceText, pageVerticalMode, translationLoading, translationOpen, translationSkipped, translationText, translationUnits])
   const hasTranslationOverlay = translationOverlays.length > 0
   const translationStatusText = translationOpen
     ? translationLoading
@@ -1776,11 +1996,11 @@ export default function GujiFacsimileProofreader({
     const label = getLabel(block)
     const labelColor = LABEL_COLORS[label] || LABEL_COLORS.text
     const labelName = LABEL_NAMES[label] || label
-    const isTable = isRenderableTableBlock(block)
+    const isTable = shouldRenderAsTableBlock(block, pageVerticalMode)
     const isImage = isImageLabel(label)
     const tableRows = isTable ? getBlockTableRows(block) : []
     const orientation = isTable ? 'horizontal' : inferPageAwareOrientation(block, pageVerticalMode)
-    const originalText = getBlockText(block)
+    const originalText = !isTable && isLikelyVerticalPseudoTableBlock(block) ? getPseudoTableText(block) : getBlockText(block)
     const shouldRenderTable = isTable
     const scaledRect = pagePixelWidth > 0 ? getScaledRect(rect, bounds, pagePixelWidth) : rect
     const displayText = transformText(normalizeDisplayText(originalText, orientation, layoutProfile, label, scaledRect), displayScript)
@@ -1856,6 +2076,10 @@ export default function GujiFacsimileProofreader({
       lineHeight: getBlockLineHeight(overlay.label, overlay.orientation, layoutProfile),
     }
   }), [bounds, displayScript, layoutProfile, pageBaseFontSize, pagePixelWidth, translationOverlays])
+  const translatedSourceIndexes = useMemo(
+    () => new Set(translationOverlays.flatMap((overlay) => overlay.sourceIndexes)),
+    [translationOverlays],
+  )
   const editingBlock = useMemo(() => (
     editingIndex < 0 ? null : blocks.find((block, index) => getBlockSourceIndex(block, index) === editingIndex) || null
   ), [blocks, editingIndex])
@@ -1871,19 +2095,25 @@ export default function GujiFacsimileProofreader({
   }, [historyIndex])
 
   const persistBlocks = useCallback((nextBlocks: LayoutBlock[]) => {
-    onSave(pageId, buildOcrPayload(ocrResult, nextBlocks, pageProofStatus))
-  }, [ocrResult, onSave, pageId, pageProofStatus])
+    onSave(pageId, buildOcrPayload(ocrResult, nextBlocks, pageProofStatus, effectivePreferVerticalLayout))
+  }, [effectivePreferVerticalLayout, ocrResult, onSave, pageId, pageProofStatus])
 
   const commitBlocks = useCallback((nextBlocks: LayoutBlock[], nextActiveIndex?: number) => {
-    const nextPageVerticalMode = isVerticalPage(nextBlocks)
-    const normalizedBlocks = nextBlocks.map((block, index) => ({ ...block, reading_order: index, orientation: inferPageAwareOrientation(block, nextPageVerticalMode), __sourceIndex: getBlockSourceIndex(block, index) }))
+    const nextPageVerticalMode = effectivePreferVerticalLayout || isVerticalPage(nextBlocks)
+    const normalizedBlocks = nextBlocks.map((block, index) => ({
+      ...block,
+      reading_order: index,
+      orientation: inferPageAwareOrientation(block, nextPageVerticalMode),
+      orientation_source: isManualOrientationSource(block.orientation_source) ? 'manual' : block.orientation_source,
+      __sourceIndex: getBlockSourceIndex(block, index),
+    }))
     setBlocks(normalizedBlocks)
     pushHistory(normalizedBlocks)
     persistBlocks(normalizedBlocks)
     setEditingIndex(-1)
     setEditValue('')
     if (typeof nextActiveIndex === 'number') onSelectBox?.(nextActiveIndex)
-  }, [onSelectBox, persistBlocks, pushHistory])
+  }, [effectivePreferVerticalLayout, onSelectBox, persistBlocks, pushHistory])
 
   const handleUndo = useCallback(() => {
     if (!canUndo) return
@@ -1904,19 +2134,24 @@ export default function GujiFacsimileProofreader({
   }, [blocks, commitBlocks, editValue, editingIndex])
 
   const handleToggleBlockOrientation = useCallback((sourceIndex: number) => {
+    const pageVerticalModeForToggle = effectivePreferVerticalLayout || isVerticalPage(blocks)
     const nextBlocks = blocks.map((block, index) => {
       if (getBlockSourceIndex(block, index) !== sourceIndex) return block
-      const currentOrientation = block.orientation === 'vertical' || block.orientation === 'horizontal'
-        ? block.orientation
-        : inferOrientation(block)
+      const currentOrientation = inferPageAwareOrientation(block, pageVerticalModeForToggle)
+      const sourceOrientation = block.source_orientation === 'vertical' || block.source_orientation === 'horizontal'
+        ? block.source_orientation
+        : getOrientationValue(block) || currentOrientation
       return {
         ...block,
         orientation: currentOrientation === 'vertical' ? 'horizontal' : 'vertical',
+        orientation_source: 'manual',
+        source_orientation: sourceOrientation,
+        source_orientation_source: block.source_orientation_source || 'ocr',
         segmentation_source: 'manual',
       }
     })
     commitBlocks(nextBlocks, sourceIndex)
-  }, [blocks, commitBlocks])
+  }, [blocks, commitBlocks, effectivePreferVerticalLayout])
 
   useEffect(() => {
     if (editingIndex >= 0 && !editingBlock) {
@@ -2082,6 +2317,28 @@ export default function GujiFacsimileProofreader({
               onChange={handleTranslationOpenChange}
             />
             <span style={{ color: translationOpen ? '#d6a85f' : 'var(--gs-text-secondary)', fontSize: 12 }}>翻译模式</span>
+            {translationOpen ? (
+              <>
+                <Segmented
+                  size="small"
+                  value={translationMode}
+                  onChange={(value) => onTranslationModeChange?.(value as TranslationMode)}
+                  options={[
+                    { value: 'fast', label: '快速' },
+                    { value: 'balanced', label: '均衡' },
+                    { value: 'quality', label: '高质量' },
+                  ]}
+                />
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  disabled={!pageSourceText.trim() || translationLoading}
+                  onClick={() => onRetranslateCurrentPage?.(pageSourceText)}
+                >
+                  重译本页
+                </Button>
+              </>
+            ) : null}
             {translationStatusText ? (
               <span data-facsimile-translation-status="true" style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>
                 {translationStatusText}
@@ -2191,7 +2448,7 @@ export default function GujiFacsimileProofreader({
               padding,
               cropBounds,
             } = layout
-            const shouldUseOverlayTranslation = translationOpen && hasTranslationOverlay
+            const shouldUseOverlayTranslation = translationOpen && translatedSourceIndexes.has(sourceIndex) && !isImage
             const hasOverflow = fittedLayout.overflow
             const isActive = sourceIndex === activeBoxIndex
             const keywordMatch = !!normalizedSearchKeyword && normalizedSearchableText.includes(normalizedSearchKeyword)
@@ -2295,7 +2552,7 @@ export default function GujiFacsimileProofreader({
               </Fragment>
             )
           })}
-          {translationOverlayLayouts.map((layout) => {
+          {translationOpen && translationOverlayLayouts.map((layout) => {
             const {
               overlay,
               left,
@@ -2327,15 +2584,15 @@ export default function GujiFacsimileProofreader({
                   boxSizing: 'border-box',
                   border: showRules ? '1px solid rgba(45, 33, 21, 0.18)' : undefined,
                   boxShadow: isActive
-                    ? 'inset 0 0 0 2px #1677ff, 0 8px 18px rgba(45,33,21,0.14)'
+                    ? 'inset 0 0 0 2px #1677ff'
                     : keywordMatch
-                      ? 'inset 0 0 0 2px #d48806, 0 8px 18px rgba(45,33,21,0.12)'
-                      : '0 6px 14px rgba(45,33,21,0.08)',
+                      ? 'inset 0 0 0 2px #d48806'
+                      : undefined,
                   background: isActive
-                    ? 'rgba(235, 246, 255, 0.92)'
+                    ? 'rgba(235, 246, 255, 0.1)'
                     : keywordMatch
-                      ? 'rgba(255, 248, 204, 0.92)'
-                      : 'rgba(255, 253, 247, 0.9)',
+                      ? 'rgba(255, 248, 204, 0.14)'
+                      : 'transparent',
                   color: labelColor,
                   cursor: 'pointer',
                   overflow: 'hidden',

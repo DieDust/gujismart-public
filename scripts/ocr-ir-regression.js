@@ -359,6 +359,44 @@ try {
   assert.strictEqual(verticalOutlier.orientationSource, 'document_consensus')
   assert.ok(verticalOutlier.processing.some((event) => event.action === 'apply_dominant_reading_orientation'))
 
+  const manualOrientationDocument = ocrIr.buildOcrDocumentV1([
+    {
+      page_width: 1000,
+      page_height: 1000,
+      layout_result: [
+        textBlock('Vertical body one with enough text', 0, {
+          orientation: 'vertical',
+          location: { left: 820, top: 100, width: 45, height: 600 },
+        }),
+        textBlock('Manual horizontal body should stay horizontal', 1, {
+          orientation: 'horizontal',
+          orientation_source: 'manual',
+          source_orientation: 'horizontal',
+          source_orientation_source: 'ocr',
+          location: { left: 120, top: 760, width: 700, height: 60 },
+        }),
+      ],
+    },
+    {
+      page_width: 1000,
+      page_height: 1000,
+      layout_result: [
+        textBlock('Vertical body two with enough text', 0, {
+          orientation: 'vertical',
+          location: { left: 820, top: 100, width: 45, height: 600 },
+        }),
+        textBlock('Vertical body three with enough text', 1, {
+          orientation: 'vertical',
+          location: { left: 760, top: 100, width: 45, height: 600 },
+        }),
+      ],
+    },
+  ], { forceRebuild: true })
+  const manualHorizontal = manualOrientationDocument.pages[0].blocks.find((block) => block.text === 'Manual horizontal body should stay horizontal')
+  assert.strictEqual(manualHorizontal.orientation, 'horizontal')
+  assert.strictEqual(manualHorizontal.orientationSource, 'manual')
+  assert.ok(!manualHorizontal.processing.some((event) => event.action === 'apply_dominant_reading_orientation'))
+
   const horizontalDocument = ocrIr.buildOcrDocumentV1([{
     page_width: 1000,
     page_height: 1000,

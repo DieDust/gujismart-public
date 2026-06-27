@@ -224,6 +224,8 @@ assertIncludes(database, 'ocr_result_ref TEXT', 'database schema should include 
 assertIncludes(database, 'proofed_text_ref TEXT', 'database schema should include external proofed_text refs')
 assertIncludes(documentsIpc, 'preparePagePayloadUpdate', 'page updates should write large payloads through the payload store')
 assertIncludes(documentsIpc, 'hydratePagePayloadRows', 'document reads should hydrate external page payloads')
+assertIncludes(documentsIpc, 'normalizeStoredGujiOcrResultForRead', 'document reads should repair stored guji OCR payloads before rendering')
+assertNotIncludes(documentsIpc, 'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, updated_at = ?', 'document read repair should not write pages.updated_at because pages has no updated_at column')
 assertIncludes(documentsIpc, 'proofed_text_ref', 'document content counts should treat external proofed text refs as content')
 assertIncludes(documentsIpc, 'ocr_text_ref', 'document content counts should treat external OCR text refs as content')
 assertIncludes(documentsIpc, 'ocr_result_ref', 'document content counts should treat external OCR result refs as content')

@@ -154,7 +154,22 @@ function buildMissingMetadataCondition(keys: string[]): string {
 }
 
 function buildPageContentAvailableCondition(alias = 'p'): string {
-  return `TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''`
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
 }
 
 function buildDocumentTextPageCountExpression(alias = 'd'): string {
@@ -162,7 +177,7 @@ function buildDocumentTextPageCountExpression(alias = 'd'): string {
 }
 
 function buildDocumentCompletedPageCountExpression(alias = 'd'): string {
-  return `(SELECT COUNT(*) FROM pages p_ocr_count WHERE p_ocr_count.doc_id = ${alias}.id AND p_ocr_count.ocr_status = 'completed')`
+  return `(SELECT COUNT(*) FROM pages p_ocr_count WHERE p_ocr_count.doc_id = ${alias}.id AND p_ocr_count.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p_ocr_count')})`
 }
 
 function buildDocumentOcrCompleteCondition(alias = 'd'): string {

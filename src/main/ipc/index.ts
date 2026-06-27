@@ -14,6 +14,7 @@ import { registerTocIpc } from './toc'
 import { registerGlossaryIpc } from './glossary'
 import { registerLibraryIpc } from './library'
 import { registerDatabaseMaintenanceIpc } from './database-maintenance'
+import { registerTranslationIpc } from './translation'
 
 export function registerAllIpcHandlers(): void {
   registerDocumentIpc()
@@ -37,6 +38,7 @@ export function registerAllIpcHandlers(): void {
   registerGlossaryIpc()
   registerLibraryIpc()
   registerDatabaseMaintenanceIpc()
+  registerTranslationIpc()
 
   console.log('[IPC] All handlers registered')
 }

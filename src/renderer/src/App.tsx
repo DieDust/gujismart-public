@@ -46,6 +46,7 @@ type AppViewKey = WorkspaceViewKey
 type MenuItem = Required<MenuProps>['items'][number]
 type DatabaseUpgradePhase = 'idle' | 'precompact' | 'cleanup' | 'compact'
 type TabDropPosition = 'before' | 'after'
+type AppTabDensity = 'normal' | 'compact' | 'tight' | 'icon'
 type AppTabPointerDrag = {
   tabId: string
   pointerId: number
@@ -107,8 +108,10 @@ const LARGE_FREELIST_BYTES = 64 * 1024 * 1024
 const FREELIST_RATIO_RECOMMEND_THRESHOLD = 0.1
 const HOME_TAB_ID = 'home'
 const TAB_DRAG_ACTIVATION_DISTANCE = 4
-const TAB_DRAG_AUTO_SCROLL_EDGE = 52
 const TAB_PREFERRED_WIDTH = 210
+const TAB_COMPACT_SLOT_WIDTH = 118
+const TAB_TIGHT_SLOT_WIDTH = 74
+const TAB_ICON_SLOT_WIDTH = 46
 const TAB_STRIP_GAP = 6
 const TAB_STRIP_HORIZONTAL_PADDING = 16
 const SINGLETON_VIEW_KEYS = new Set<AppViewKey>(['library', 'excerpts', 'citation', 'tags', 'dashboard', 'settings'])
@@ -167,6 +170,13 @@ function getTabIcon(tab: AppTab) {
   if (tab.kind === 'home') return <HomeOutlined />
   if (tab.kind === 'document') return <FileOutlined />
   return getViewIcon(tab.view)
+}
+
+function getTabDensityForSlot(slotWidth: number): AppTabDensity {
+  if (slotWidth <= TAB_ICON_SLOT_WIDTH) return 'icon'
+  if (slotWidth <= TAB_TIGHT_SLOT_WIDTH) return 'tight'
+  if (slotWidth <= TAB_COMPACT_SLOT_WIDTH) return 'compact'
+  return 'normal'
 }
 
 function reorderAppTabs(current: AppTab[], sourceId: string, targetId: string, position: TabDropPosition): AppTab[] {
@@ -284,6 +294,7 @@ export default function App() {
   const [databaseUpgradeBusy, setDatabaseUpgradeBusy] = useState(false)
   const [databaseUpgradePhase, setDatabaseUpgradePhase] = useState<DatabaseUpgradePhase>('idle')
   const [databaseUpgradeProgress, setDatabaseUpgradeProgress] = useState<BackgroundTaskProgressEvent | null>(null)
+  const [tabDensity, setTabDensity] = useState<AppTabDensity>('normal')
   const onboardingVisible = useOnboardingStore((state) => state.visible)
   const activeTab = useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0] || createHomeTab(), [activeTabId, tabs])
   const activeViewKey: ViewKey = activeTab.kind === 'home'
@@ -354,6 +365,31 @@ export default function App() {
     timer: null as ReturnType<typeof setTimeout> | null
   })
   tabsRef.current = tabs
+
+  useLayoutEffect(() => {
+    const strip = tabStripRef.current
+    if (!strip) return
+
+    const measure = () => {
+      const tabCount = Math.max(1, tabsRef.current.length)
+      const usableWidth = Math.max(
+        1,
+        strip.clientWidth
+          - TAB_STRIP_HORIZONTAL_PADDING
+          - Math.max(0, tabCount - 1) * TAB_STRIP_GAP,
+      )
+      setTabDensity(getTabDensityForSlot(usableWidth / tabCount))
+    }
+
+    measure()
+    const resizeObserver = new ResizeObserver(measure)
+    resizeObserver.observe(strip)
+    window.addEventListener('resize', measure)
+    return () => {
+      resizeObserver.disconnect()
+      window.removeEventListener('resize', measure)
+    }
+  }, [tabs.length, siderCollapsed])
 
   useEffect(() => {
     window.api.listFolders()
@@ -873,17 +909,6 @@ export default function App() {
       const strip = tabStripRef.current
       if (!drag?.moved || !strip) return
 
-      const stripBounds = strip.getBoundingClientRect()
-      const leftEdgeDistance = drag.clientX - stripBounds.left
-      const rightEdgeDistance = stripBounds.right - drag.clientX
-      let scrollVelocity = 0
-      if (leftEdgeDistance < TAB_DRAG_AUTO_SCROLL_EDGE) {
-        scrollVelocity = -Math.ceil((TAB_DRAG_AUTO_SCROLL_EDGE - Math.max(0, leftEdgeDistance)) / 4)
-      } else if (rightEdgeDistance < TAB_DRAG_AUTO_SCROLL_EDGE) {
-        scrollVelocity = Math.ceil((TAB_DRAG_AUTO_SCROLL_EDGE - Math.max(0, rightEdgeDistance)) / 4)
-      }
-      if (scrollVelocity !== 0) strip.scrollLeft += scrollVelocity
-
       const previewLeft = Math.min(
         Math.max(6, drag.clientX - drag.grabOffsetX),
         Math.max(6, window.innerWidth - drag.width - 6),
@@ -923,7 +948,6 @@ export default function App() {
           return
         }
       }
-      if (scrollVelocity !== 0) scheduleTabDragFrame()
     })
   }
 
@@ -1285,6 +1309,7 @@ export default function App() {
           highlightColor={target.highlightColor || ''}
           sourceLabel={target.sourceLabel || ''}
           startReaderBookTranslation={!!target.startReaderBookTranslation}
+          openTranslation={!!target.openTranslation}
           onOpenDocument={(nextTarget) => openDocumentTarget(nextTarget)}
           onBack={() => closeTab(activeTab.id)}
           compactHeader
@@ -1445,6 +1470,8 @@ export default function App() {
               ref={tabStripRef}
               className={`app-tab-strip ${draggedTabId ? 'is-dragging' : ''}`}
               data-app-tab-strip="true"
+              data-app-tab-density={tabDensity}
+              data-app-tab-count={tabs.length}
               style={{ '--app-tab-strip-ideal-width': `${tabStripIdealWidth}px` } as React.CSSProperties}
             >
               {tabs.map((tab) => {

@@ -111,17 +111,30 @@ function resetInterruptedSearchIndexJobs(): string[] {
 }
 
 function resetInterruptedTranslationCacheRows(): number {
-  const count = countRows("SELECT COUNT(*) as count FROM page_translation_cache WHERE status = 'processing'")
-  if (count <= 0) return 0
-  run(
-    `UPDATE page_translation_cache
-     SET status = 'error',
-         error_message = ?,
-         updated_at = ?
-     WHERE status = 'processing'`,
-    ['Interrupted by previous app shutdown; restart translation to continue cache generation.', new Date().toISOString()],
-  )
-  return count
+  const cacheCount = countRows("SELECT COUNT(*) as count FROM page_translation_cache WHERE status = 'processing'")
+  const unitCount = countRows("SELECT COUNT(*) as count FROM page_translation_units WHERE status = 'processing'")
+  const now = new Date().toISOString()
+  if (cacheCount > 0) {
+    run(
+      `UPDATE page_translation_cache
+       SET status = 'error',
+           error_message = ?,
+           updated_at = ?
+       WHERE status = 'processing'`,
+      ['Interrupted by previous app shutdown; restart translation to continue cache generation.', now],
+    )
+  }
+  if (unitCount > 0) {
+    run(
+      `UPDATE page_translation_units
+       SET status = CASE WHEN TRIM(COALESCE(translation_text, '')) <> '' THEN 'stale' ELSE 'pending' END,
+           stale = CASE WHEN TRIM(COALESCE(translation_text, '')) <> '' THEN 1 ELSE stale END,
+           updated_at = ?
+       WHERE status = 'processing'`,
+      [now],
+    )
+  }
+  return cacheCount + unitCount
 }
 
 function resetInterruptedAiLayoutCacheRows(): number {
@@ -150,13 +163,11 @@ function reconcileCompletedOcrDocuments(): number {
          OR d.error_message IS NOT NULL
        )
        AND (
-         SELECT COUNT(*)
-         FROM pages p
-         WHERE p.doc_id = d.id
-           AND (
-             p.ocr_status = 'completed'
-             OR ${completedPageContentPredicate('p')}
-           )
+       SELECT COUNT(*)
+       FROM pages p
+       WHERE p.doc_id = d.id
+           AND COALESCE(p.ocr_status, '') = 'completed'
+           AND ${completedPageContentPredicate('p')}
        ) >= COALESCE(d.page_count, 0)`,
   )
   const docIds = rows.map((row) => row.id).filter(Boolean)
@@ -257,14 +268,29 @@ function metadataPageCount(metadata: Record<string, unknown>): number {
 }
 
 function completedPageContentPredicate(alias = 'p'): string {
-  return `TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''`
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
 }
 
 function summarizeDocumentPages(docId: string): { total: number; completed: number } {
   const row = queryAll<{ total: number; completed: number }>(
     `SELECT
        COUNT(*) as total,
-       SUM(CASE WHEN ocr_status = 'completed' OR ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed
+       SUM(CASE WHEN ocr_status = 'completed' AND ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed
      FROM pages
      WHERE doc_id = ?`,
     [docId],

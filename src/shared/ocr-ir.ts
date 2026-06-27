@@ -296,6 +296,7 @@ function parseOrientationSource(value: unknown): OcrIrOrientationSource | null {
   if (normalized === 'coordinate') return 'coordinate'
   if (normalized === 'page consensus') return 'page_consensus'
   if (normalized === 'document consensus') return 'document_consensus'
+  if (normalized === 'manual' || normalized === 'manual override' || normalized === 'user' || normalized === 'user override') return 'manual'
   if (normalized === 'unknown') return 'unknown'
   return null
 }
@@ -880,6 +881,7 @@ function applyReadingOrientation(
   if (orientation === 'unknown') return
   blocks.forEach((block) => {
     if (!READING_FLOW_ORIENTATION_TYPES.has(block.type) || !block.text.trim()) return
+    if (block.orientationSource === 'manual') return
     if (block.orientation !== orientation) {
       block.processing.push({
         stage: source === 'document_consensus' ? 'document_postprocess' : 'page_postprocess',

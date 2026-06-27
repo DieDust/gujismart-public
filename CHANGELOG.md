@@ -1,5 +1,65 @@
 # 更新日志 / Changelog
 
+## 1.0.7 - 2026-06-27
+
+### 中文
+
+#### 改进
+
+- 优化整本 PDF 异步 OCR 流程：古籍纵排文献会优先保留飞桨/PaddleOCR 返回的安全正文，避免在保存阶段被本地结构重排误改成碎句、空白页或错误表格。
+- 增强整本 OCR 的失败页恢复：遇到缺页、失败页或质量拦截页时，会先按原 PDF 页码范围重试，再对仍失败的页面执行单页补救。
+- 增加同名飞将/PaddleOCR 参考 JSON 恢复能力，用于在质量检查命中时恢复正确页面结果，再写入数据库。
+- 改进古籍 OCR 质量检查，拦截网页元数据、机器 Token、重复短语污染、错误表格化和明显不属于当前页的内容。
+- 改进 OCR 结果保存与状态统计，整本 OCR 只有在全部页完成、且没有失败或待处理页时才标记为完成。
+- 改进标签页拥挤时的布局，打开较多页面时标签会压缩在可视区域内。
+- 新增按 OCR 块保存和展示翻译单元的基础能力，保留人工译文，并支持译文检索范围。
+
+#### 修复
+
+- 修复整本异步 OCR 后可能出现空白页、缺页、坐标错位、无意义识别内容混入正文的问题。
+- 修复古籍纵排页面被误判为表格、或局部突然变成横排后污染正文流的问题。
+- 修复 OCR 失败页只显示整本处理失败、但没有自动补救单页的问题。
+- 修复整本 OCR 结果与飞将原始返回结果不一致时，保存阶段继续写入错误结果的问题。
+- 修复关闭或退出应用时，OCR、批处理、导入、删除、翻译等后台任务可能在数据库关闭后继续写入的问题。
+
+#### 验证
+
+- 已用 124 页古籍样本文献完成整本 OCR 回归验证，检查无空白页、无坐标偏移、无错误表格标签，并与飞将/PaddleOCR 参考结果保持一致。
+
+#### 下载
+
+- `GujiSmart-1.0.7-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.0.7-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Improvements
+
+- Improved whole-PDF asynchronous OCR for vertical classic books by preserving safe PaddleOCR service text and avoiding local save-time restructuring that could create fragmented sentences, blank pages, or false tables.
+- Strengthened whole-document OCR recovery. Missing, failed, or quality-rejected pages are retried first through original-PDF page ranges, then through single-page fallback for pages that still fail.
+- Added same-name Feijiang/PaddleOCR reference JSON recovery so quality-rejected pages can be restored before database persistence.
+- Expanded classic-book OCR quality checks for web metadata, machine tokens, repeated phrase pollution, false tables, and text that clearly does not belong to the current page.
+- Improved OCR save and status accounting so a whole-document run is marked complete only when every page is completed with no failed or pending pages.
+- Improved crowded tab layout so many open tabs compress inside the visible tab bar.
+- Added a foundation for OCR-block-based translation units, preserving manual translations and supporting translation-scoped search.
+
+#### Fixes
+
+- Fixed whole asynchronous OCR runs that could save blank pages, missing pages, shifted coordinates, or meaningless text mixed into the body.
+- Fixed vertical classic-book pages being misclassified as tables, or isolated horizontal blocks polluting the reading flow.
+- Fixed failed OCR pages showing the whole document as failed without automatically retrying the affected page.
+- Fixed save-time handling where results could diverge from the original Feijiang/PaddleOCR output and still be persisted.
+- Fixed shutdown handling so OCR, batch processing, import, delete, and translation jobs stop before the database is closed.
+
+#### Verification
+
+- Re-ran whole-document OCR on the 124-page classic-book sample and verified no blank pages, no coordinate drift, no false table labels, and consistency with the Feijiang/PaddleOCR reference result.
+
+#### Downloads
+
+- `GujiSmart-1.0.7-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.0.7-Portable-x64.exe` for portable use.
+
 ## 1.0.6 - 2026-06-25
 
 ### 中文

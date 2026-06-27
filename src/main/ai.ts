@@ -1709,6 +1709,7 @@ export async function runAiTask(taskType: AiTaskType, text: string, options?: Ai
     }
     case 'translate': {
       const translationStyle = String(options?.translationStyle || DEFAULT_TRANSLATION_STYLE)
+      const translationMode = String(options?.translationMode || 'balanced')
       const contextLines = [
         options?.documentTitle ? `Document title: ${String(options.documentTitle).slice(0, 120)}` : '',
         options?.pageNum ? `Page: ${options.pageNum}` : '',
@@ -1727,6 +1728,35 @@ export async function runAiTask(taskType: AiTaskType, text: string, options?: Ai
         ...(contextLines.length ? ['', 'Document context:', ...contextLines] : []),
         ...(glossaryPrompt ? ['', glossaryPrompt] : []),
       ]
+      if (options?.translationUnits) {
+        const reviewDraft = String(options?.previousTranslation || '').trim()
+        prompt = [
+          ...sharedPromptParts,
+          '',
+          options?.translationReview
+            ? 'Review and correct the following page translation into accurate, fluent modern Chinese.'
+            : 'Translate the following page units into accurate, fluent modern Chinese.',
+          'Read all units together for page-level context, but return every unit separately using its exact ID.',
+          'The unit IDs are application data. They must be copied exactly and must never be translated or renumbered.',
+          'Rules:',
+          '1. Output exactly one line for every input unit, in the same order.',
+          '2. Every line must begin with the exact marker, for example [tu_ab12cd34].',
+          '3. Do not merge, split, omit, invent, explain, summarize, or add markdown fences.',
+          '4. Preserve placeholders such as __GS_PH_0000__ exactly. Never translate or delete them.',
+          '5. Keep names, dates, numbers, citations, note markers, and terminology accurate and consistent.',
+          '6. Translate foreign language, classical Chinese, old-style Chinese, and mixed-language prose into readable modern Chinese.',
+          '7. Put only the current unit translation after its marker, even when context comes from adjacent units.',
+          `Mode: ${translationMode}.`,
+          '',
+          `Unit count: ${options?.segmentCount || ''}`,
+          'Source units:',
+          `"""${compactText.slice(0, 12000)}"""`,
+          ...(options?.translationReview
+            ? ['', 'Current translation draft:', `"""${reviewDraft.slice(0, 12000)}"""`]
+            : []),
+        ].join('\n')
+        break
+      }
       if (options?.parallelSegments) {
         const repairDraft = String(options?.previousTranslation || options?.alignmentRepairText || '').trim()
         if (options?.parallelAlignmentRepair) {

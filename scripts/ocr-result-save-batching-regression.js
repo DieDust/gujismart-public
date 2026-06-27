@@ -13,8 +13,17 @@ function sliceBetween(source, startMarker, endMarker, label) {
   return source.slice(start, end)
 }
 
+function hasLikelyHardcodedPrivateDocId(source) {
+  return /\b(?:docId|documentId|pageId|sourceId|id)\b\s*[:=]\s*['"][A-Za-z0-9_-]{20,}['"]/.test(source)
+}
+
 const root = path.join(__dirname, '..')
 const ocrIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
+const ocrCoreSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr.ts'), 'utf8')
+const ocrTextSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'utils', 'ocrText.ts'), 'utf8')
+const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
+const libraryViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
+const textEditorSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'TextEditor.tsx'), 'utf8')
 const semanticSearchSource = fs.readFileSync(path.join(root, 'src', 'main', 'semantic-search.ts'), 'utf8')
 const searchIndexConstantsSource = fs.readFileSync(path.join(root, 'src', 'main', 'search-index-constants.ts'), 'utf8')
 const pdfAssetsSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-assets.ts'), 'utf8')
@@ -48,6 +57,36 @@ const savePageOcrResultsBody = sliceBetween(
   'async function savePageOcrResultsBatched',
   'OCR page result save body',
 )
+const savePageQualityFailureOcrErrorBody = sliceBetween(
+  ocrIpcSource,
+  'async function savePageQualityFailureOcrError',
+  'function finishRecoveredPageQualityFailure',
+  'OCR quality failure save body',
+)
+const retryIncompletePagesWithSinglePageOcrBody = sliceBetween(
+  ocrIpcSource,
+  'async function retryIncompletePagesWithSinglePageOcr',
+  'function getRiskyPageImageRetryOptions',
+  'single-page incomplete OCR retry body',
+)
+const singlePageRetryCatchBody = sliceBetween(
+  retryIncompletePagesWithSinglePageOcrBody,
+  '    } catch (error) {',
+  '    }\n  }\n  }',
+  'single-page incomplete OCR retry catch body',
+)
+const resetPagesForFullOcrRerunBody = sliceBetween(
+  ocrIpcSource,
+  'function resetPagesForFullOcrRerun',
+  'function hasIncompleteOcrPages',
+  'full OCR rerun reset body',
+)
+const isLikelyBookishPdfTableResultBody = sliceBetween(
+  ocrIpcSource,
+  'function isLikelyBookishPdfTableResult',
+  'function getOcrBlockRect',
+  'bookish PDF table detection body',
+)
 const savePageOcrResultsBatchedBody = sliceBetween(
   ocrIpcSource,
   'async function savePageOcrResultsBatched',
@@ -71,6 +110,42 @@ const postProcessPdfOcrResultsBatchedBody = sliceBetween(
   'async function postProcessPdfOcrResultsBatched',
   'async function recognizeSinglePage',
   'batched PDF OCR result post-processing helper',
+)
+const riskyPageImageOcrBody = sliceBetween(
+  ocrIpcSource,
+  'async function recognizeRiskyPageImageOcrPages',
+  'async function rerunPageLayoutOnly',
+  'risky page-image OCR route body',
+)
+const reprocessDocumentOcrStructureBody = sliceBetween(
+  ocrIpcSource,
+  'function reprocessDocumentOcrStructure',
+  'function updatePageOcrState',
+  'document OCR structure reprocess body',
+)
+const preserveRawGujiReferenceTextBody = sliceBetween(
+  ocrIpcSource,
+  'function preserveRawGujiReferenceText',
+  'function normalizeFeijiangReferenceTextOnlyResult',
+  'Feijiang reference text-only preservation body',
+)
+const normalizeFeijiangReferenceTextOnlyResultBody = sliceBetween(
+  ocrIpcSource,
+  'function normalizeFeijiangReferenceTextOnlyResult',
+  'function isFeijiangReferenceRecoveredResult',
+  'Feijiang reference text-only normalization body',
+)
+const getFacsimileOcrResultBody = sliceBetween(
+  documentViewSource,
+  'function getFacsimileOcrResult',
+  'function hasFacsimileCoordinates',
+  'facsimile OCR result body',
+)
+const flushOcrStatusBufferBody = sliceBetween(
+  libraryViewSource,
+  'const flushOcrStatusBuffer = useCallback',
+  '  useEffect(() => {',
+  'library OCR status flush body',
 )
 const deferredSingleSaveBody = sliceBetween(
   processDocumentOcrBody,
@@ -110,7 +185,188 @@ const autoCleanupPdfAssetsIfEnabledBody = sliceBetween(
 )
 const ocrSaveChunkSize = Number((ocrIpcSource.match(/const OCR_RESULT_SAVE_CHUNK_SIZE = (\d+)/) || [])[1] || 0)
 const ocrPostprocessChunkSize = Number((ocrIpcSource.match(/const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = (\d+)/) || [])[1] || 0)
+const qualityFailureSaveCallCount = (ocrIpcSource.match(/savePageQualityFailureOcrError\(/g) || []).length
 
+assert(
+  ocrIpcSource.includes('function hasGujiVerticalQuestionPhrasePollution')
+    && ocrIpcSource.includes('malformedQuotePhraseCount')
+    && ocrIpcSource.includes('repeatedBarePhraseCount')
+    && ocrIpcSource.includes('hasGujiVerticalQuestionPhrasePollution(totalText)')
+    && ocrIpcSource.includes('短语被反复插入并把原句切碎'),
+  'Guji OCR quality checks should reject repeated short phrase pollution that breaks vertical question sentences into fragments.',
+)
+assert(
+  ocrIpcSource.includes('const OCR_AUTO_FAILED_PAGE_RETRY_LIMIT')
+    && ocrIpcSource.includes('const OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX')
+    && ocrIpcSource.includes('const OCR_ORIGINAL_PDF_RETRY_ATTEMPTS = 3')
+    && ocrIpcSource.includes('function retryIncompletePagesWithSinglePageOcr')
+    && ocrIpcSource.includes('function retryIncompletePagesWithOriginalPdfOcr')
+    && ocrIpcSource.includes('function getOriginalPdfRetryPageRangeTargetNums')
+    && ocrIpcSource.includes('function getOriginalPdfRetryStrategies')
+    && ocrIpcSource.includes('requireFullFileUpload: true')
+    && ocrIpcSource.includes('const originalPdfRetryResults = await retryIncompletePagesWithOriginalPdfOcr(doc, pdfPath, signal, onProgress)')
+    && ocrIpcSource.includes('targetPageNums,')
+    && ocrIpcSource.includes('targetPageNums: retryStrategy.targetPageNums')
+    && ocrIpcSource.includes('pageRangeChunkSize,')
+    && ocrIpcSource.includes('const maxAttempts = retryOptions.profile === \'guji_print_vertical\' ? OCR_ORIGINAL_PDF_RETRY_ATTEMPTS : 1')
+    && ocrIpcSource.includes('let remainingPages = pages')
+    && ocrIpcSource.includes('const retryStrategy = getOriginalPdfRetryStrategies(')
+    && ocrIpcSource.includes('pageRangeChunkSize: retryStrategy.pageRangeChunkSize')
+    && ocrIpcSource.includes('requireFullFileUpload: retryStrategy.requireFullFileUpload')
+    && ocrIpcSource.includes('? pageNum - 1')
+    && ocrIpcSource.includes('resultIndexByPageNum.get(pageNum)')
+    && ocrIpcSource.includes('const rawResults = await recognizePdfAsync(pdfPath')
+    && ocrIpcSource.includes('const resultsByPageId = new Map<string, OcrPageResult>()')
+    && ocrIpcSource.includes('originalPdfRetryResults.forEach((pageResult) => {')
+    && ocrIpcSource.includes("filter((pageResult) => pageResult.status === 'completed')")
+    && ocrIpcSource.includes('resultsByPageId.set(originalPage.id, {')
+    && !ocrIpcSource.includes('if (pdfPath) return []')
+    && ocrIpcSource.includes('const baseRetryOptions = resolveDocOcrOptions(doc.doc_type)')
+    && ocrIpcSource.includes('hasOldBookRouteHints(doc)')
+    && ocrIpcSource.includes('oldSchoolBookSignals')
+    && ocrIpcSource.includes('教科書|讀本|読本')
+    && ocrIpcSource.includes('? getVerticalFallbackOcrOptions(baseRetryOptions)')
+    && ocrIpcSource.includes('const attemptedPageIds = new Set(')
+    && ocrIpcSource.includes('while (true)')
+    && ocrIpcSource.includes('getIncompletePagesForSinglePageRetry(doc.id, attemptedPageIds)')
+    && ocrIpcSource.includes('attemptedPageIds.add(originalPage.id)')
+    && ocrIpcSource.includes('function getAutomaticSinglePageRetryOptions')
+    && !ocrIpcSource.includes("routePreference === 'page_image_vertical'")
+    && ocrIpcSource.includes('hasOldBookRouteHints(doc)')
+    && processDocumentOcrBody.includes('await retryIncompletePagesWithSinglePageOcr(')
+    && processDocumentOcrBody.includes('await savePageOcrResultsBatchedDeferred(retryResults')
+    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0'),
+  'Document OCR should automatically retry failed or incomplete PDF pages with original-PDF pageRanges, then continue to single-page image OCR for pages that still failed.',
+)
+assert(
+  ocrIpcSource.includes('function isOcrPageSummaryComplete')
+    && ocrIpcSource.includes('stats.completed === stats.total && stats.failed === 0 && stats.pending === 0')
+    && ocrIpcSource.includes('return isOcrPageSummaryComplete(stats)')
+    && ocrIpcSource.includes('const completed = isOcrPageSummaryComplete(stats)')
+    && ocrIpcSource.includes('const nextStatus = isOcrPageSummaryComplete(stats)'),
+  'Document OCR completion should require all pages completed and no failed or pending pages.',
+)
+assert(
+  ocrIpcSource.includes('function getPreferredGujiServiceText')
+    && ocrIpcSource.includes('function preservePreferredGujiServiceText')
+    && ocrIpcSource.includes('function isUnsafeGujiPreferredServiceText')
+    && ocrIpcSource.includes('function hasSafeGujiPreferredServiceText')
+    && ocrIpcSource.includes('/<(?:table|img)\\b/i.test(value)')
+    && ocrIpcSource.includes('findLikelyRunawayRepeatedOcrText(value)')
+    && ocrIpcSource.includes('hasGujiWebMetadataHallucination(value)')
+    && ocrIpcSource.includes('hasGujiVerticalQuestionPhrasePollution(value)')
+    && ocrIpcSource.includes("text_source: 'paddle_markdown'")
+    && ocrIpcSource.includes('const preferredGujiText = gujiOptions')
+    && ocrIpcSource.includes('|| getPreferredGujiServiceText(normalized)')
+    && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(result)')
+    && ocrIpcSource.includes('const storageResult = gujiOptions && preferredGujiText')
+    && reprocessDocumentOcrStructureBody.includes('getGujiOcrOptionsForResult(sourceResult)')
+    && reprocessDocumentOcrStructureBody.includes('? getPreferredGujiServiceText(sourceResult)')
+    && reprocessDocumentOcrStructureBody.includes('preservePreferredGujiServiceText(nextResultBase, preferredGujiText)')
+    && ocrIpcSource.includes('const text = preferredGujiText || irText')
+    && ocrIpcSource.includes('ir_text: irText'),
+  'Guji OCR saves should preserve PaddleOCR markdown text as the page text instead of overwriting it with IR paragraph reconstruction.',
+)
+assert(
+  postProcessPdfOcrResultsBatchedBody.includes('const safePreferredText = hasSafeGujiPreferredServiceText(result)')
+    && ocrIpcSource.includes('function getUsableGujiAsyncPdfServiceText')
+    && ocrIpcSource.includes('function getGujiAsyncPdfRetryableQualityIssue')
+    && ocrIpcSource.includes('formatAsyncPdfRetryableQualityIssue(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))')
+    && ocrIpcSource.includes('delete metadata.ocr_last_quality_issue')
+    && ocrIpcSource.includes('hasGujiWebMetadataHallucination(candidate)')
+    && ocrIpcSource.includes('hasGujiMachineTokenHallucination(candidate)')
+    && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(result)')
+    && ocrIpcSource.includes('gujismart_async_pdf_result: true')
+    && ocrIpcSource.includes('pageResult.result.gujismart_async_pdf_result === true')
+    && postProcessPdfOcrResultsBatchedBody.includes("if (ocrOptions.profile === 'guji_print_vertical') {")
+    && postProcessPdfOcrResultsBatchedBody.includes('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)')
+    && postProcessPdfOcrResultsBatchedBody.includes("status: 'error'")
+    && postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification')
+    && postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue')
+    && postProcessPdfOcrResultsBatchedBody.includes('const underSegmented = !safePreferredText')
+    && postProcessPdfOcrResultsBatchedBody.indexOf('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)') < postProcessPdfOcrResultsBatchedBody.indexOf('gujismart_async_pdf_result: true')
+    && postProcessPdfOcrResultsBatchedBody.indexOf("if (ocrOptions.profile === 'guji_print_vertical') {") < postProcessPdfOcrResultsBatchedBody.indexOf('const safePreferredText = hasSafeGujiPreferredServiceText(result)'),
+  'Guji async PDF OCR should preserve good PaddleOCR PDF results, but reject retryable runaway or hallucinated PDF results before saving them as completed.',
+)
+assert(
+  ocrIpcSource.includes("const OCR_FEIJIANG_REFERENCE_ENV = 'GUJISMART_OCR_REFERENCE_JSON_DIR'")
+    && ocrIpcSource.includes('function findFeijiangReferenceJsonPath')
+    && ocrIpcSource.includes('function loadFeijiangOcrReference')
+    && ocrIpcSource.includes('function recoverGujiPageFromFeijiangReference')
+    && ocrIpcSource.includes('function recoverGujiPagesFromFeijiangReference')
+    && ocrIpcSource.includes('function getGujiFeijiangReferenceMismatchIssue')
+    && ocrIpcSource.includes('function recoverCompletedGujiPagesWithReferenceMismatch')
+    && ocrIpcSource.includes('function recoverCompletedGujiPagesFromFeijiangReference')
+    && ocrIpcSource.includes('const syncGujiPaddleReferenceResults = async')
+    && ocrIpcSource.includes("lowerName.includes('paddleocr')")
+    && ocrIpcSource.includes("filter((key) => /^\\d+$/.test(key))")
+    && ocrIpcSource.includes('function normalizeFeijiangReferencePayloadForRecovery')
+    && ocrIpcSource.includes('normalizePageResult(payload) as OcrPageResultPayload')
+    && ocrIpcSource.includes("source: 'feijiang_reference_json'")
+    && ocrIpcSource.includes('function preserveRawGujiReferenceText')
+    && ocrIpcSource.includes('function getRawFeijiangReferenceText')
+    && ocrIpcSource.includes("text_source: 'feijiang_reference_markdown'")
+    && ocrIpcSource.includes('if (isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText)')
+    && ocrIpcSource.indexOf('if (isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText)') < ocrIpcSource.indexOf('const storageResultBase = gujiOptions')
+    && reprocessDocumentOcrStructureBody.includes('const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)')
+    && reprocessDocumentOcrStructureBody.includes('isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText')
+    && reprocessDocumentOcrStructureBody.includes('const structureResults = pagesWithResults.map')
+    && reprocessDocumentOcrStructureBody.includes('preserveRawGujiReferenceText(result as OcrRecognizeResult, rawFeijiangReferenceText, { page, generatedAt })')
+    && reprocessDocumentOcrStructureBody.includes('? preserveRawGujiReferenceText(nextResultBase, preferredGujiText, { page, generatedAt })')
+    && !ocrIpcSource.includes('E:\\\\Download\\\\edge')
+    && !hasLikelyHardcodedPrivateDocId(ocrIpcSource)
+    && postProcessPdfOcrResultsBatchedBody.includes('const feijiangReference = ocrOptions.profile === \'guji_print_vertical\'')
+    && postProcessPdfOcrResultsBatchedBody.includes('recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const referenceMismatchIssue = referencePayload')
+    && postProcessPdfOcrResultsBatchedBody.includes('getGujiFeijiangReferenceMismatchIssue(result, referencePayload)')
+    && !ocrIpcSource.includes('postProcessRecognizedPageResult(payload, page.image_path, getAsyncPdfPostProcessOptions(ocrOptions), { signal })')
+    && !ocrIpcSource.includes('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, page.image_path, ocrOptions)')
+    && ocrIpcSource.includes('gujismart_recovered_from_feijiang_json: true')
+    && processDocumentOcrBody.includes('await recoverCompletedGujiPagesFromFeijiangReference(')
+    && processDocumentOcrBody.includes('persistedPageSummary = await syncGujiPaddleReferenceResults(persistedPageSummary)')
+    && processDocumentOcrBody.includes('await savePageOcrResultsBatchedDeferred(retryResults')
+    && processDocumentOcrBody.indexOf('await savePageOcrResultsBatchedDeferred(retryResults') < processDocumentOcrBody.lastIndexOf('persistedPageSummary = await syncGujiPaddleReferenceResults(persistedPageSummary)')
+    && ocrIpcSource.includes('const recoveredResults = await recoverGujiPagesFromFeijiangReference(remainingPages, pdfPath, retryOptions, signal)'),
+  'Guji async PDF OCR should sync all recoverable pages from a same-name PaddleOCR reference JSON after async save and after incomplete-page retries, without hardcoded private paths.',
+)
+assert(
+  ocrIpcSource.includes('function createFeijiangReferenceTextOnlyIr')
+    && ocrIpcSource.includes('function getFeijiangReferenceLayoutSafetyIssue')
+    && ocrIpcSource.includes('function preserveTrustedFeijiangReferenceLayout')
+    && ocrIpcSource.includes('function summarizeDiscardedFeijiangLayoutSources')
+    && preserveRawGujiReferenceTextBody.includes('source_type: String(source.source_type || \'feijiang_reference_text\')')
+    && preserveRawGujiReferenceTextBody.includes('const layoutSafetyIssue = getFeijiangReferenceLayoutSafetyIssue(source, options.page)')
+    && preserveRawGujiReferenceTextBody.includes('return preserveTrustedFeijiangReferenceLayout(result, text, options)')
+    && preserveRawGujiReferenceTextBody.includes('layout_result: []')
+    && preserveRawGujiReferenceTextBody.includes('words_result: []')
+    && preserveRawGujiReferenceTextBody.includes('gujismart_ir: textOnlyIr')
+    && preserveRawGujiReferenceTextBody.includes('ir_text: \'\'')
+    && preserveRawGujiReferenceTextBody.includes('discarded_untrusted_feijiang_reference_layout: true')
+    && preserveRawGujiReferenceTextBody.includes('discarded_untrusted_feijiang_reference_layout_issue: layoutSafetyIssue')
+    && preserveRawGujiReferenceTextBody.includes('discarded_untrusted_feijiang_reference_layout_summary: discardedLayoutSummary')
+    && !normalizeFeijiangReferenceTextOnlyResultBody.includes('ensureOcrResultIr(textOnlyResult')
+    && !normalizeFeijiangReferenceTextOnlyResultBody.includes('forceRebuild: true'),
+  'Recovered Feijiang reference pages should keep safe reference layout coordinates, and fall back to text-only OCR only when the reference layout fails safety checks.',
+)
+assert(
+  ocrTextSource.includes('function shouldSuppressUntrustedFeijiangReferenceLayout')
+    && ocrTextSource.includes('normalization.discarded_untrusted_feijiang_reference_layout === true')
+    && ocrTextSource.includes('if (shouldSuppressUntrustedFeijiangReferenceLayout(parsed)) return []')
+    && getFacsimileOcrResultBody.includes('normalization.discarded_untrusted_feijiang_reference_layout === true')
+    && getFacsimileOcrResultBody.includes('layout_result: []')
+    && getFacsimileOcrResultBody.includes('raw_layout_result: []')
+    && getFacsimileOcrResultBody.includes('words_result: []')
+    && getFacsimileOcrResultBody.includes("facsimile_layout_source: 'feijiang_reference_text_only'")
+    && textEditorSource.includes('function buildPlainTextWordsResult')
+    && textEditorSource.includes('getMarkdownText(ocrResult?.markdown) || getTextValue(ocrResult?.text)'),
+  'Renderer should suppress untrusted Feijiang reference layout boxes while still showing text-only OCR content in the proofing editor.',
+)
+assert(
+  flushOcrStatusBufferBody.includes('data.status === \'completed\'')
+    && flushOcrStatusBufferBody.includes('message.destroy(`ocr-error-${data.docId}`)')
+    && flushOcrStatusBufferBody.indexOf('if (data.status === \'error\')') > flushOcrStatusBufferBody.indexOf('data.status === \'completed\''),
+  'A final successful OCR completion event should clear stale page-level OCR error toasts from earlier retryable chunk failures.',
+)
 assert(
   saveOptions.includes('deferDatabaseSave?: boolean'),
   'OCR result save options should explicitly support deferring database checkpoints.',
@@ -139,10 +395,172 @@ assert(
 )
 assert(
   ocrIpcSource.includes('function guardRepeatedOcrPageResult')
-    && ocrIpcSource.includes('findSuspiciousRepeatedOcrText(pageResult.result || pageResult.text)')
+    && ocrIpcSource.includes('findLikelyRunawayRepeatedOcrText(pageResult.result || pageResult.text)')
     && ocrIpcSource.includes('formatSuspiciousRepeatedOcrTextIssue(repeatedIssue)')
+    && ocrIpcSource.includes('OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX')
+    && ocrIpcSource.includes('isOcrQualityFailureMessage(pageResult.error)')
     && savePageOcrResultsBody.indexOf('const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)') < savePageOcrResultsBody.indexOf('transaction(() => {'),
-  'savePageOcrResults should guard suspicious repeated OCR text before writing page rows.',
+  'savePageOcrResults should guard suspicious runaway repeated OCR text and persist async PDF quality failures as retryable error pages.',
+)
+assert(
+  resetPagesForFullOcrRerunBody.includes('SET proofed_text = NULL')
+    && !resetPagesForFullOcrRerunBody.includes('ocr_result = NULL')
+    && !resetPagesForFullOcrRerunBody.includes('ocr_text = NULL')
+    && savePageOcrResultsBody.includes('const hasExistingOcrText = String(existingPage?.ocr_text || \'\').trim().length > 0')
+    && savePageOcrResultsBody.includes("if (pageResult.status === 'error' && existingPage && hasExistingOcrText && !isOcrQualityFailureMessage(pageResult.error))")
+    && savePageOcrResultsBody.includes("SET ocr_status = ?")
+    && savePageOcrResultsBody.includes("'completed',"),
+  'Full-document OCR reruns should keep existing OCR text for transient failures, but quality failures must not restore bad old OCR as completed.',
+)
+assert(
+  ocrIpcSource.includes('function isOcrQualityFailureMessage')
+    && ocrIpcSource.includes('少量横排大块')
+    && ocrIpcSource.includes('本页结果未写入正文'),
+  'OCR quality failures should be distinguished from transient upload/network failures before preserving old page text.',
+)
+assert(
+  ocrIpcSource.includes('function savePageQualityFailureOcrError')
+    && ocrIpcSource.includes('async function savePageQualityFailureOcrError')
+    && ocrIpcSource.includes('function recoverPageQualityFailureFromFeijiangReference')
+    && savePageQualityFailureOcrErrorBody.includes('const recovered = await recoverPageQualityFailureFromFeijiangReference(page, doc, options)')
+    && savePageQualityFailureOcrErrorBody.includes("return 'recovered'")
+    && savePageQualityFailureOcrErrorBody.includes('savePageOcrResults([{')
+    && savePageQualityFailureOcrErrorBody.includes("text: '',")
+    && savePageQualityFailureOcrErrorBody.includes("status: 'error',")
+    && savePageQualityFailureOcrErrorBody.indexOf('recoverPageQualityFailureFromFeijiangReference') < savePageQualityFailureOcrErrorBody.indexOf('savePageOcrResults([{')
+    && qualityFailureSaveCallCount >= 4,
+  'Manual page OCR actions should recover trusted Feijiang reference pages before persisting layout-quality failures through the normal OCR save path.',
+)
+assert(
+  singlePageRetryCatchBody.includes('if (isOcrQualityFailureMessage(message))')
+    && singlePageRetryCatchBody.includes('const recovered = await recoverPageQualityFailureFromFeijiangReference(originalPage, doc, {')
+    && singlePageRetryCatchBody.includes('resultsByPageId.set(originalPage.id, recovered)')
+    && singlePageRetryCatchBody.indexOf('const recovered = await recoverPageQualityFailureFromFeijiangReference(originalPage, doc, {') < singlePageRetryCatchBody.indexOf("status: 'error'"),
+  'Automatic failed-page OCR retries should restore quality-rejected guji pages from the same-name Feijiang reference JSON before saving an error placeholder.',
+)
+assert(
+  ocrIpcSource.includes('function isRetryableOcrError')
+    && ocrIpcSource.includes("if (isOcrQualityFailureMessage(message) || message.includes('缺少可读取页图')) return false"),
+  'OCR quality failures should stop the document attempt instead of triggering repeated full-document retries.',
+)
+assert(
+  ocrIpcSource.includes('OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX')
+    && ocrIpcSource.includes('rawMessage.includes(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX)')
+    && ocrIpcSource.includes('waitingResultFileMessage')
+    && ocrCoreSource.includes('ASYNC_RESULT_FILE_NOT_READY_PREFIX')
+    && ocrCoreSource.includes('ASYNC_RESULT_DOWNLOAD_IDLE_TIMEOUT_MS')
+    && ocrCoreSource.includes('readAsyncResultChunkWithTimeout')
+    && ocrCoreSource.includes('awaitingResultFile?: boolean')
+    && ocrCoreSource.includes('statusPayload.awaitingResultFile = true'),
+  'Async PDF OCR should show the result-file wait state and must not automatically rerun the whole document when the service never returns a result URL.',
+)
+assert(
+  ocrIpcSource.includes('function getLikelyGujiPdfTableMisclassification')
+    && ocrIpcSource.includes('PDF 异步 OCR 疑似把古籍竖排版面误判成表格')
+    && ocrIpcSource.includes('function getLikelyAsyncPdfTableMisclassification')
+    && ocrIpcSource.includes('function ensurePageImageForOcrFallback')
+    && ocrIpcSource.includes('function renderPdfPageToImageBuffer')
+    && ocrIpcSource.includes('function getVerticalFallbackOcrOptions')
+    && ocrIpcSource.includes('function markDocumentPreferPageImageOcr')
+    && ocrIpcSource.includes('metadata.ocr_last_quality_issue = reason')
+    && ocrIpcSource.includes('delete metadata.ocr_route_preference')
+    && ocrIpcSource.includes('function clearDocumentOcrRoutePreference')
+    && ocrIpcSource.includes('function resolveFallbackPdfPathForPostProcess')
+    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackPdfPath = pdfPath || resolveFallbackPdfPathForPostProcess(pages)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification(result, item.page.image_path, ocrOptions)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const underSegmented = !safePreferredText')
+    && postProcessPdfOcrResultsBatchedBody.includes('markDocumentPreferPageImageOcr(')
+    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackOptions = getVerticalFallbackOcrOptions(ocrOptions)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackResult = sanitizeGujiNonBookHallucinations(')
+    && postProcessPdfOcrResultsBatchedBody.includes('await recognizeSinglePageWithResolvedOptions(fallbackPage, fallbackOptions, signal)')
+    && postProcessPdfOcrResultsBatchedBody.includes('getRiskyPageImageNonTableHardIssue(fallbackResult, fallbackPage.image_path, fallbackOptions)')
+    && postProcessPdfOcrResultsBatchedBody.includes('recognizeSplitPageImageFallback(fallbackPage, fallbackOptions, signal, fallbackIssue)')
+    && postProcessPdfOcrResultsBatchedBody.includes('Number.POSITIVE_INFINITY')
+    && postProcessPdfOcrResultsBatchedBody.includes('if (underSegmented)')
+    && postProcessPdfOcrResultsBatchedBody.includes("status: 'completed'")
+    && postProcessPdfOcrResultsBatchedBody.includes('error: qualityIssue'),
+  'PDF async OCR should detect likely book-page table/repetition/under-segmentation quality issues and fall back to vertical page-image OCR before saving, rendering a missing page image from the source PDF when possible.',
+)
+assert(
+  isLikelyBookishPdfTableResultBody.includes('tableBlocks.length === 0')
+    && isLikelyBookishPdfTableResultBody.includes('tableBlocks.some(hasNarrativeTableCells)')
+    && !isLikelyBookishPdfTableResultBody.includes('hasBookChrome')
+    && !isLikelyBookishPdfTableResultBody.includes('blocks.length <= 8'),
+  'Book-page table fallback detection should be conservative and must not treat any table plus header/footer chrome as a bad OCR page.',
+)
+assert(
+  ocrIpcSource.includes('const horizontalDominatedBookPage = textBlocks.length <= 24')
+    && ocrIpcSource.includes('verticalRatio < 0.12')
+    && ocrIpcSource.includes('pageSize.width >= pageSize.height * 1.05')
+    && ocrIpcSource.includes('getUnderSegmentedRiskyPageImageMessage')
+    && ocrIpcSource.includes('reportProgress(page, \'error\', message)')
+    && ocrIpcSource.includes("if (underSegmented)")
+    && ocrIpcSource.includes("status: 'error'"),
+  'Risky page-image OCR should reject under-segmented double-page facsimile results instead of saving few horizontal blocks as completed.',
+)
+assert(
+  ocrIpcSource.includes("if (primaryOptions.profile === 'guji_print_vertical') return null")
+    && !ocrIpcSource.includes("primaryOptions.profile === 'guji_print_vertical' && docType !== '\\u53e4\\u7c4d'"),
+  'Risky page-image OCR should not replace a vertical guji result with a general retry that can reintroduce table-shaped vertical text.',
+)
+assert(
+  ocrIpcSource.includes('function getRiskyPageImagePageOptions')
+    && ocrIpcSource.includes('hasVerticalGujiProcessingMeta(pageResult) || hasVerticalBlockLayoutSignals(pageResult, page.image_path)')
+    && riskyPageImageOcrBody.includes('for (const page of pages)')
+    && riskyPageImageOcrBody.includes('const pageOptions = getRiskyPageImagePageOptions(page, primaryOptions)')
+    && riskyPageImageOcrBody.includes('recognizeSinglePageWithResolvedOptions(page, pageOptions, options.signal)')
+    && !riskyPageImageOcrBody.includes('Promise.all(pages.map')
+    && !riskyPageImageOcrBody.includes('createLimiter')
+    && !riskyPageImageOcrBody.includes('limit(async'),
+  'Risky whole-document page-image OCR should use the same per-page single-page wrapper and vertical option resolution as manual current-page OCR, not concurrent batch OCR.',
+)
+assert(
+  ocrIpcSource.includes('const OCR_LAYOUT_QUALITY_REJECTED_PREFIX')
+    && ocrIpcSource.includes('function getLikelyGujiNonBookHallucinationIssue')
+    && ocrIpcSource.includes('hasGujiWebMetadataHallucination(totalText)')
+    && ocrIpcSource.includes('hasGujiModernDateHallucination(totalText)')
+    && ocrIpcSource.includes('hasGujiMachineTokenHallucination(text)')
+    && ocrIpcSource.includes('function hasGujiUnexpectedScriptHallucination')
+    && ocrIpcSource.includes('function hasGujiKanaPunctuationSubstitutionIssue')
+    && ocrIpcSource.includes('throw new Error(hardIssue)')
+    && ocrIpcSource.includes('function sanitizeGujiNonBookHallucinations')
+    && ocrIpcSource.includes('function getGujiOcrOptionsForResult')
+    && ocrIpcSource.includes('function stripGujiStoragePlaceholders')
+    && ocrIpcSource.includes('function filterGujiPlaceholderBlocks')
+    && ocrIpcSource.includes('function isGujiDuplicateHeaderBlock')
+    && ocrIpcSource.includes('removed_duplicate_header_blocks')
+    && ocrIpcSource.includes('function isGujiPageEdgeMarkerBlock')
+    && ocrIpcSource.includes('function isGujiNoisyPageMarkerLikeText')
+    && ocrIpcSource.includes('removed_page_marker_blocks')
+    && ocrIpcSource.includes('function isGujiTinyNoiseBlock')
+    && ocrIpcSource.includes('removed_tiny_noise_blocks')
+    && ocrIpcSource.includes('const storageResultBase = gujiOptions')
+    && ocrIpcSource.includes('ensureOcrResultIr(stripGujiStoragePlaceholders(sanitizeGujiNonBookHallucinations(normalized, gujiOptions, page?.image_path))')
+    && ocrIpcSource.includes('layout_result: nextLayout')
+    && ocrIpcSource.includes('const storageText = gujiOptions && preferredGujiText')
+    && ocrIpcSource.includes('isEmptyTableMarkupPlaceholder(text)')
+    && ocrIpcSource.includes('rebuilt_text_without_ocr_placeholders')
+    && ocrIpcSource.includes('function getRiskyPageImageLayoutQualityIssue')
+    && ocrIpcSource.includes('const hallucinationIssue = getLikelyGujiNonBookHallucinationIssue(result, imagePath, ocrOptions)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue(result, item.page.image_path, ocrOptions)')
+    && ocrIpcSource.includes('message.includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)')
+    && ocrIpcSource.includes('String(message || \'\').includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)')
+    && ocrIpcSource.includes('return message.replace(OCR_LAYOUT_QUALITY_REJECTED_PREFIX, \'\').trim()'),
+  'Risky page-image OCR should reject obvious layout-quality failures and non-book hallucinations without triggering full-document retries or showing internal markers.',
+)
+assert(
+  ocrIpcSource.includes('function isLikelyMergedWideVerticalGujiBlock')
+    && ocrIpcSource.includes('isLikelyMergedWideVerticalGujiBlock(block, pageSize)')
+    && ocrIpcSource.includes('|| mergedWideVerticalBlocks > 0')
+    && ocrCoreSource.includes('function splitMergedWideVerticalTextLineBlocks')
+    && ocrCoreSource.includes('function splitMergedWideVerticalTextBlock')
+    && ocrCoreSource.includes('function filterGujiTinyNoiseBlocks')
+    && ocrCoreSource.includes('merged_wide_vertical_line_blocks_split')
+    && ocrCoreSource.includes('removed_tiny_noise_blocks')
+    && ocrCoreSource.includes('nextBlocks.push(...splitMergedWideVerticalTextBlock(block))')
+    && ocrCoreSource.includes('filterGujiTinyNoiseBlocks(splitMergedWideVerticalTextLineBlocks(clamped, options), options)'),
+  'Guji vertical OCR should treat merged wide vertical blocks as a soft fallback signal, split line-delimited wide blocks, and remove tiny OCR noise before storage/readback.',
 )
 assert(
   !savePageOcrResultsBody.includes("queryOne<{")
@@ -154,6 +572,8 @@ assert(
   ocrIpcSource.includes('function markPageOcrVersionsInactive')
     && ocrIpcSource.includes('UPDATE page_ocr_versions SET is_active = 0 WHERE page_id IN')
     && savePageOcrResultsBody.includes('const versionWrites: OcrVersionWrite[] = []')
+    && savePageOcrResultsBody.includes('const shouldWriteOcrVersion = resultPayload && existingPage')
+    && savePageOcrResultsBody.includes("pageResult.status === 'error' && isOcrQualityFailureMessage(pageResult.error)")
     && savePageOcrResultsBody.includes('versionWrites.push({')
     && savePageOcrResultsBody.includes('markPageOcrVersionsInactive(versionWrites.map((item) => item.pageId))')
     && savePageOcrResultsBody.includes('upsertPageOcrVersion(item.pageId, engine, item.result, item.text, item.status, item.page')
@@ -284,10 +704,19 @@ assert(
   'PDF OCR should not treat an empty async return as zero-page failure after chunks were already saved to the database.',
 )
 assert(
-  asyncPdfBranchBody.includes('pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)')
-    && asyncPdfBranchBody.includes('pagesForOcr.map((page, index) => ({ page, sourcePageIndex: Number(page.page_num || index + 1) - 1, resultIndex: index }))')
+  ocrIpcSource.includes('function getPagesForOcrAttempt')
+    && ocrIpcSource.includes('return getPagesNeedingOcr(pages, resumeExisting || attempt > 1)')
+    && processDocumentOcrBody.includes('const resumeThisAttempt = resumeExisting || attempt > 1')
+    && processDocumentOcrBody.includes('pagesForOcr = getPagesForOcrAttempt(pages, resumeExisting, attempt)'),
+  'document OCR retries should resume already completed pages after the first failed attempt, even when the original request was a full rerun.',
+)
+assert(
+  asyncPdfBranchBody.includes('pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)')
+    && asyncPdfBranchBody.includes('const asyncResultPageItems = pagesForOcr.map((page, index) => {')
+    && asyncPdfBranchBody.includes('const resultIndex = asyncPdfRouteRisk?.requireFullFileUpload ? sourcePageIndex : index')
+    && asyncPdfBranchBody.includes('asyncResultPageItems,')
     && !asyncPdfBranchBody.includes('pages.map((page, index) => ({ page, sourcePageIndex: index, resultIndex: index }))'),
-  'PDF OCR async fallback save path should post-process only unfinished resume pages and map results by original page number.',
+  'PDF OCR async fallback save path should post-process only unfinished resume pages and map whole-PDF guarded results by original page number.',
 )
 assert(
   ocrIpcSource.includes('function hasSequentialPageRecords')

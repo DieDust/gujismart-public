@@ -29,11 +29,7 @@ import type { ViewerViewport } from '../components/ImageViewer'
 import GujiFacsimileProofreader, { getFacsimileTranslationSourceText, isFacsimileProofCandidate } from '../components/GujiFacsimileProofreader'
 import EbookReader, { isManagedTextDocument } from '../components/EbookReader'
 import {
-  buildParallelTranslationInputFromSegments,
-  buildParallelTranslationInputBatches,
-  isParallelTranslationAligned,
   isParallelTranslationDisplayReady,
-  normalizeParallelTranslationLayout,
   projectParallelTranslationTextToSource,
 } from '@shared/parallel-translation'
 import { releaseCachedPdfDocument, renderPdfFilePageToImage } from '../utils/pdf'
@@ -49,12 +45,12 @@ import {
   buildTranslationCacheKey,
   normalizeTranslationSourceText,
 } from '@shared/translation-cache'
-import { shouldTranslatePageText } from '@shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '@shared/translation-source'
+import { shouldTranslatePageText } from '@shared/translation-text'
 import { getOrBuildOcrPageIr, getOcrPageIr, getOcrRegionRerecognitionCandidates } from '@shared/ocr-ir'
 import { DEFAULT_HIGHLIGHT_COLOR } from '../utils/highlightColors'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
-import type { AiTaskOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageUpdatePayload, PageTranslationCacheItem, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, TranslationGlossaryScope } from '@shared/types'
+import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, TranslationGlossaryScope, TranslationMode, TranslationUnitV1 } from '@shared/types'
 
 const { Title, Text } = Typography
 const AiPanel = lazy(() => import('../components/AiPanel'))
@@ -98,6 +94,7 @@ interface DocumentViewProps {
   highlightColor?: string
   sourceLabel?: string
   startReaderBookTranslation?: boolean
+  openTranslation?: boolean
   onBack: () => void
   onOpenDocument?: (target: OpenDocumentTarget) => void
   compactHeader?: boolean
@@ -121,6 +118,7 @@ function getOcrQualityIssueLabel(code: string): string {
 type ReaderTranslationQueueItem = ReaderTranslationPayload & {
   priority: ReaderTranslationPriority
   generation: number
+  force?: boolean
 }
 
 function getReaderTranslationKey(payload: Pick<ReaderTranslationPayload, 'pageId' | 'readerPageKey'>): string {
@@ -151,10 +149,10 @@ type TranslatablePage = TranslationSourcePage & { id: string; sourcePageNum?: nu
 type TranslationCacheMatch = { row: PageTranslationCacheItem; sourceHash: string; translationText?: string }
 type ParallelReaderTranslationRequest = {
   pageId: string
+  cachePageId?: string
   pageNum: number
   sourceText: string
-  onlyNonChinese?: boolean
-  layoutVersion?: number
+  force?: boolean
   isStale?: () => boolean
 }
 type DragTimer = ReturnType<typeof window.setTimeout> | 0
@@ -597,6 +595,20 @@ function mergeFacsimileRawLayoutText(rawLayoutBlocks: FacsimileLayoutBlock[], wo
 function getFacsimileOcrResult(ocrResult: unknown): FacsimileOcrResult | null {
   const parsed = asFacsimileOcrResult(ocrResult)
   if (!parsed) return null
+  const normalization = readRecordValue(parsed, 'normalization')
+  if (
+    parsed.gujismart_recovered_from_feijiang_json === true
+    && isJsonRecord(normalization)
+    && normalization.discarded_untrusted_feijiang_reference_layout === true
+  ) {
+    return {
+      ...parsed,
+      layout_result: [],
+      raw_layout_result: [],
+      words_result: [],
+      facsimile_layout_source: 'feijiang_reference_text_only',
+    }
+  }
   const layoutBlocks = asFacsimileBlocks(parsed.layout_result)
   const rawLayoutBlocks = asFacsimileBlocks(parsed.raw_layout_result)
   const nestedBoxes = asFacsimileBlocks(readRecordValue(readRecordValue(parsed, 'layout_det_res'), 'boxes'))
@@ -1203,6 +1215,7 @@ export default function DocumentView({
   highlightColor = '',
   sourceLabel = '',
   startReaderBookTranslation = false,
+  openTranslation = false,
   onBack,
   onOpenDocument,
   compactHeader = false,
@@ -1234,6 +1247,7 @@ export default function DocumentView({
   const [birdDensity, setBirdDensity] = useState<BirdDensity>('medium')
   const [sharedViewport, setSharedViewport] = useState<ViewerViewport | undefined>(undefined)
   const [pageTranslations, setPageTranslations] = useState<Record<string, string>>({})
+  const [pageTranslationUnits, setPageTranslationUnits] = useState<Record<string, TranslationUnitV1[]>>({})
   const [pageTranslationHashes, setPageTranslationHashes] = useState<Record<string, string>>({})
   const [skippedTranslationPageIds, setSkippedTranslationPageIds] = useState<Record<string, boolean>>({})
   const [translatingPageIds, setTranslatingPageIds] = useState<Record<string, boolean>>({})
@@ -1241,6 +1255,7 @@ export default function DocumentView({
   const [translationGlossaryProjectId, setTranslationGlossaryProjectId] = useState('')
   const [translationGlossarySignature, setTranslationGlossarySignature] = useState('none')
   const [translationGlossaryProjects, setTranslationGlossaryProjects] = useState<ResearchProject[]>([])
+  const [translationMode, setTranslationMode] = useState<TranslationMode>('balanced')
   const [quickGlossaryModalOpen, setQuickGlossaryModalOpen] = useState(false)
   const [quickGlossaryScope, setQuickGlossaryScope] = useState<TranslationGlossaryScope>('global')
   const [quickGlossarySourceTerm, setQuickGlossarySourceTerm] = useState('')
@@ -1299,6 +1314,7 @@ export default function DocumentView({
   const translationCurrentGenerationRef = useRef(0)
   const translationCurrentActiveGenerationRef = useRef(0)
   const translationWorkerActiveRef = useRef(false)
+  const translationTaskIdsRef = useRef<Map<string, string>>(new Map())
   const pageImageCacheRef = useRef<Map<string, string>>(new Map())
   const readerVisiblePageIndexRef = useRef(initialPageIndex)
   const readerStateLoadedRef = useRef(false)
@@ -1424,14 +1440,21 @@ export default function DocumentView({
   }, [doc?.id, translationModelSignature])
 
   const hasReadyTranslationForSource = useCallback((pageId: string, sourceText: string) => {
+    const units = pageTranslationUnits[pageId] || []
+    if (units.length > 0 && units.every((unit) => unit.skipped || Boolean(unit.translationText.trim()))) return true
     const translationText = pageTranslations[pageId]
     if (!pageId || !sourceText || !translationText) return false
     if (pageTranslationHashes[pageId] !== getTranslationSourceHash(pageId, sourceText)) return false
     return !!skippedTranslationPageIds[pageId] || isParallelTranslationDisplayReady(sourceText, translationText)
-  }, [getTranslationSourceHash, pageTranslationHashes, pageTranslations, skippedTranslationPageIds])
+  }, [getTranslationSourceHash, pageTranslationHashes, pageTranslationUnits, pageTranslations, skippedTranslationPageIds])
 
   const clearReaderTranslationRuntime = useCallback(() => {
+    translationTaskIdsRef.current.forEach((taskId) => {
+      void window.api.cancelTranslationTask(taskId)
+    })
+    translationTaskIdsRef.current.clear()
     setPageTranslations({})
+    setPageTranslationUnits({})
     setPageTranslationHashes({})
     setSkippedTranslationPageIds({})
     setTranslatingPageIds({})
@@ -1464,6 +1487,15 @@ export default function DocumentView({
     setDocumentMode('read')
     setReaderBookTranslationRequest((value) => value + 1)
   }, [startReaderBookTranslation])
+
+  useEffect(() => {
+    if (!openTranslation || !readerStateReady) return
+    const timer = window.setTimeout(() => {
+      const toggle = document.querySelector<HTMLInputElement>('[data-reader-translation-toggle="true"]')
+      if (toggle && !toggle.checked) toggle.click()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [openTranslation, readerStateReady])
 
   useEffect(() => {
     let active = true
@@ -2107,8 +2139,13 @@ export default function DocumentView({
       .filter((page) => isDocumentPageForDoc(page, targetDocId) && getTranslationSourceText(page))
     if (candidates.length === 0) return
     try {
-      const rows = await window.api.getTranslationCache(targetDocId, candidates.map((page) => page.id))
+      const pageIds = candidates.map((page) => page.id)
+      const [rows, unitsByPage] = await Promise.all([
+        window.api.getTranslationCache(targetDocId, pageIds),
+        window.api.getPagesTranslationUnits(pageIds),
+      ])
       if (activeDocumentIdRef.current !== targetDocId) return
+      setPageTranslationUnits((current) => ({ ...unitsByPage, ...current }))
       if (!Array.isArray(rows) || rows.length === 0) return
       const nextTranslations: Record<string, string> = {}
       const nextHashes: Record<string, string> = {}
@@ -2141,8 +2178,14 @@ export default function DocumentView({
     if (!doc?.id || !pageId || !cachePageId || !sourceText) return false
     const targetDocId = doc.id
     try {
-      const rows = await window.api.getTranslationCache(targetDocId, [cachePageId])
+      const [rows, units] = await Promise.all([
+        window.api.getTranslationCache(targetDocId, [cachePageId]),
+        window.api.getPageTranslationUnits(cachePageId).catch(() => []),
+      ])
       if (activeDocumentIdRef.current !== targetDocId) return false
+      if (units.length > 0) {
+        setPageTranslationUnits((current) => ({ ...current, [pageId]: units }))
+      }
       const match = Array.isArray(rows) ? findTranslationCacheMatch(rows, cachePageId, sourceText) : null
       if (!match) return false
       setPageTranslations((current) => ({ ...current, [pageId]: String(match.translationText || match.row.translation_text) }))
@@ -2200,91 +2243,39 @@ export default function DocumentView({
 
   const translateTextAsParallelSegments = useCallback(async ({
     pageId,
+    cachePageId = pageId,
     pageNum,
     sourceText,
-    onlyNonChinese = false,
-    layoutVersion = 6,
+    force = false,
     isStale,
   }: ParallelReaderTranslationRequest): Promise<string | null> => {
     if (!doc?.id || !pageId || !sourceText) return null
-    const naturalSourceText = normalizeTranslationSourceText(sourceText)
-    const translationBatches = buildParallelTranslationInputBatches(naturalSourceText, { maxChars: 5200, maxSegments: 100 })
-    if (translationBatches.length === 0) throw new Error('本页没有可翻译句子')
-
-    const translatedBatches: string[] = []
-    for (let batchIndex = 0; batchIndex < translationBatches.length; batchIndex += 1) {
-      if (isStale?.()) return null
-      const translationInput = translationBatches[batchIndex]
-      const translationTaskOptions: AiTaskOptions = {
-        pageId,
-        pageNum,
+    if (isStale?.()) return null
+    const taskId = `reader-${cachePageId}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    translationTaskIdsRef.current.set(pageId, taskId)
+    try {
+      const result = await window.api.translatePageUnits({
+        taskId,
+        docId: doc.id,
+        pageId: cachePageId,
+        mode: translationMode,
         glossaryProjectId: activeTranslationGlossaryProjectId,
-        translationStyle: DEFAULT_TRANSLATION_STYLE,
+        style: DEFAULT_TRANSLATION_STYLE,
+        force,
+        priority: 'current',
         documentTitle: doc.title || '',
-        pageContextBefore: getAdjacentTranslationContext(pageId, -1),
-        pageContextAfter: getAdjacentTranslationContext(pageId, 1),
-        onlyNonChinese,
-        readerMode: true,
-        layoutVersion,
-        parallelSegments: true,
-        segmentCount: translationInput.segmentCount,
-      }
-      const result = await window.api.runAiTask(doc.id, 'translate', translationInput.input, translationTaskOptions)
+        pageContextBefore: getAdjacentTranslationContext(cachePageId, -1),
+        pageContextAfter: getAdjacentTranslationContext(cachePageId, 1),
+      })
       if (isStale?.()) return null
-
-      let batchTranslationText = normalizeParallelTranslationLayout(result, translationInput.segmentCount)
-      if (!isParallelTranslationAligned(translationInput.segments.join('\n'), batchTranslationText)) {
-        const repairedResult = await window.api.runAiTask(doc.id, 'translate', translationInput.input, {
-          ...translationTaskOptions,
-          parallelAlignmentRepair: true,
-          previousTranslation: result,
-        })
-        if (isStale?.()) return null
-        batchTranslationText = normalizeParallelTranslationLayout(repairedResult, translationInput.segmentCount)
+      setPageTranslationUnits((current) => ({ ...current, [pageId]: result.units }))
+      return result.translationText
+    } finally {
+      if (translationTaskIdsRef.current.get(pageId) === taskId) {
+        translationTaskIdsRef.current.delete(pageId)
       }
-      if (!isParallelTranslationAligned(translationInput.segments.join('\n'), batchTranslationText)) {
-        const sentenceTranslations: string[] = []
-        for (let segmentIndex = 0; segmentIndex < translationInput.segments.length; segmentIndex += 1) {
-          if (isStale?.()) return null
-          const segment = translationInput.segments[segmentIndex]
-          const singleInput = buildParallelTranslationInputFromSegments([segment], { maxSegments: 1, maxChars: 5200 })
-          const singleTaskOptions: AiTaskOptions = {
-            ...translationTaskOptions,
-            segmentCount: 1,
-            pageContextBefore: segmentIndex > 0 ? translationInput.segments[segmentIndex - 1] : translationTaskOptions.pageContextBefore,
-            pageContextAfter: segmentIndex + 1 < translationInput.segments.length ? translationInput.segments[segmentIndex + 1] : translationTaskOptions.pageContextAfter,
-          }
-          const singleResult = await window.api.runAiTask(doc.id, 'translate', singleInput.input, singleTaskOptions)
-          if (isStale?.()) return null
-          let singleTranslationText = normalizeParallelTranslationLayout(singleResult, 1)
-          if (!isParallelTranslationAligned(segment, singleTranslationText)) {
-            const repairedSingleResult = await window.api.runAiTask(doc.id, 'translate', singleInput.input, {
-              ...singleTaskOptions,
-              parallelAlignmentRepair: true,
-              previousTranslation: singleResult,
-            })
-            if (isStale?.()) return null
-            singleTranslationText = normalizeParallelTranslationLayout(repairedSingleResult, 1)
-          }
-          if (!isParallelTranslationAligned(segment, singleTranslationText)) {
-            throw new Error(`第 ${pageNum || ''} 页第 ${batchIndex + 1} 批第 ${segmentIndex + 1} 句译文未按句对齐`)
-          }
-          sentenceTranslations.push(singleTranslationText)
-        }
-        batchTranslationText = sentenceTranslations.join('\n').trim()
-      }
-      if (!isParallelTranslationAligned(translationInput.segments.join('\n'), batchTranslationText)) {
-        throw new Error(`第 ${pageNum || ''} 页第 ${batchIndex + 1} 批译文未按句对齐`)
-      }
-      translatedBatches.push(batchTranslationText)
     }
-
-    const translationText = translatedBatches.join('\n').trim()
-    if (!isParallelTranslationAligned(naturalSourceText, translationText)) {
-      throw new Error(`第 ${pageNum || ''} 页译文未完整对齐`)
-    }
-    return translationText
-  }, [activeTranslationGlossaryProjectId, doc?.id, doc?.title, getAdjacentTranslationContext])
+  }, [activeTranslationGlossaryProjectId, doc?.id, doc?.title, getAdjacentTranslationContext, translationMode])
 
   useEffect(() => {
     void loadCurrentPageOcrVersions(currentPage?.id)
@@ -2714,6 +2705,12 @@ export default function DocumentView({
       active = false
     }
   }, [])
+
+  useEffect(() => window.api.onPageTranslationProgress((event: PageTranslationProgressEvent) => {
+    if (!doc?.id || event.docId !== doc.id) return
+    setPageTranslationUnits((current) => ({ ...current, [event.pageId]: event.units }))
+    setPageTranslations((current) => ({ ...current, [event.pageId]: event.translationText }))
+  }), [doc?.id])
 
   useEffect(() => {
     try {
@@ -3954,7 +3951,7 @@ export default function DocumentView({
     }
   }
 
-  const translatePage = useCallback(async (page: TranslatablePage, silent = false) => {
+  const translatePage = useCallback(async (page: TranslatablePage, silent = false, force = false) => {
     if (!doc?.id || !page?.id) return
     const targetDocId = doc.id
     if (page.doc_id && !isDocumentPageForDoc(page, targetDocId)) return
@@ -3963,21 +3960,10 @@ export default function DocumentView({
       if (!silent) message.info('本页没有可翻译的文本')
       return
     }
-    if (hasReadyTranslationForSource(page.id, sourceText) || translationInFlightRef.current.has(page.id)) return
+    if ((!force && hasReadyTranslationForSource(page.id, sourceText)) || translationInFlightRef.current.has(page.id)) return
     const sourceHash = getTranslationSourceHash(page.id, sourceText)
-    if (await restoreTranslationFromCache(page.id, Number(page.page_num || page.sourcePageNum || 0), sourceText)) return
+    if (!force && await restoreTranslationFromCache(page.id, Number(page.page_num || page.sourcePageNum || 0), sourceText)) return
     if (activeDocumentIdRef.current !== targetDocId) return
-
-    const translationDecision = shouldTranslatePageText(sourceText)
-    if (!translationDecision.shouldTranslate) {
-      if (activeDocumentIdRef.current !== targetDocId) return
-      setPageTranslations((current) => ({ ...current, [page.id]: sourceText }))
-      setPageTranslationHashes((current) => ({ ...current, [page.id]: sourceHash }))
-      setSkippedTranslationPageIds((current) => ({ ...current, [page.id]: true }))
-      persistTranslationCache(page.id, Number(page.page_num || page.sourcePageNum || 0), sourceText, sourceText, true)
-      if (!silent) message.info('本页以中文为主，已保留原文')
-      return
-    }
 
     translationInFlightRef.current.add(page.id)
     setTranslatingPageIds((current) => ({ ...current, [page.id]: true }))
@@ -3987,14 +3973,12 @@ export default function DocumentView({
         pageId: page.id,
         pageNum,
         sourceText,
-        onlyNonChinese: translationDecision.mixedLanguage,
-        layoutVersion: 6,
+        force,
       })
       if (!nextResult) return
       if (activeDocumentIdRef.current !== targetDocId) return
       setPageTranslations((current) => ({ ...current, [page.id]: nextResult }))
       setPageTranslationHashes((current) => ({ ...current, [page.id]: sourceHash }))
-      persistTranslationCache(page.id, pageNum, sourceText, nextResult, false)
       setSkippedTranslationPageIds((current) => {
         const next = { ...current }
         delete next[page.id]
@@ -4013,7 +3997,7 @@ export default function DocumentView({
         })
       }
     }
-  }, [doc?.id, getTranslationSourceHash, hasReadyTranslationForSource, persistTranslationCache, restoreTranslationFromCache, translateTextAsParallelSegments])
+  }, [doc?.id, getTranslationSourceHash, hasReadyTranslationForSource, restoreTranslationFromCache, translateTextAsParallelSegments])
 
   const toggleReaderTranslation = useCallback(() => {
     if (clickReaderControl('[data-reader-translation-toggle="true"]')) return
@@ -4030,9 +4014,9 @@ export default function DocumentView({
       if (!silent) message.info('当前阅读页还没有可整理的文本')
       return
     }
-    if (hasReadyTranslationForSource(translationKey, sourceText)) return
+    if (!item.force && hasReadyTranslationForSource(translationKey, sourceText)) return
     const sourceHash = getTranslationSourceHash(translationKey, sourceText)
-    if (await restoreTranslationFromCache(translationKey, Number(item.pageNum || 0), sourceText, cachePageId)) return
+    if (!item.force && await restoreTranslationFromCache(translationKey, Number(item.pageNum || 0), sourceText, cachePageId)) return
     if (activeDocumentIdRef.current !== targetDocId) return
     if (item.generation !== translationCurrentGenerationRef.current) return
     if (translationInFlightGenerationRef.current.get(translationKey) === item.generation) return
@@ -4043,9 +4027,10 @@ export default function DocumentView({
     try {
       const nextResult = await translateTextAsParallelSegments({
         pageId: translationKey,
+        cachePageId,
         pageNum: item.pageNum,
         sourceText,
-        layoutVersion: 6,
+        force: item.force,
         isStale: () => (
           item.generation !== translationCurrentGenerationRef.current
           || translationInFlightGenerationRef.current.get(translationKey) !== item.generation
@@ -4057,7 +4042,6 @@ export default function DocumentView({
       if (translationInFlightGenerationRef.current.get(translationKey) !== item.generation) return
       setPageTranslations((current) => ({ ...current, [translationKey]: nextResult }))
       setPageTranslationHashes((current) => ({ ...current, [translationKey]: sourceHash }))
-      persistTranslationCache(cachePageId, Number(item.pageNum || 0), sourceText, nextResult, false)
       setSkippedTranslationPageIds((current) => {
         const next = { ...current }
         delete next[translationKey]
@@ -4080,7 +4064,7 @@ export default function DocumentView({
         translationCurrentActiveGenerationRef.current = 0
       }
     }
-  }, [doc?.id, getTranslationSourceHash, hasReadyTranslationForSource, persistTranslationCache, restoreTranslationFromCache, translateTextAsParallelSegments])
+  }, [doc?.id, getTranslationSourceHash, hasReadyTranslationForSource, restoreTranslationFromCache, translateTextAsParallelSegments])
 
   const drainReaderTranslationQueue = useCallback(() => {
     if (translationWorkerActiveRef.current) return
@@ -4125,7 +4109,7 @@ export default function DocumentView({
 
     const translationKey = getReaderTranslationKey(payload)
     const priority = options.priority || 'current'
-    const alreadyTranslated = hasReadyTranslationForSource(translationKey, sourceText)
+    const alreadyTranslated = !options.force && hasReadyTranslationForSource(translationKey, sourceText)
     if (priority === 'current') {
       const activeGeneration = translationCurrentActiveGenerationRef.current
       if (translationCurrentPageIdRef.current === translationKey && alreadyTranslated) {
@@ -4146,7 +4130,7 @@ export default function DocumentView({
         translationCurrentActiveGenerationRef.current = 0
         return
       }
-      const currentItem: ReaderTranslationQueueItem = { ...payload, text: sourceText, priority, generation }
+      const currentItem: ReaderTranslationQueueItem = { ...payload, text: sourceText, priority, generation, force: options.force }
       void runQueuedReaderTranslation(currentItem, false).finally(() => drainReaderTranslationQueue())
       drainReaderTranslationQueue()
       return
@@ -4158,7 +4142,7 @@ export default function DocumentView({
     const effectiveGeneration = generation > 0 ? generation : translationCurrentGenerationRef.current + 1
     if (generation <= 0 && priority === 'book') translationCurrentGenerationRef.current = effectiveGeneration
     if (translationInFlightGenerationRef.current.get(translationKey) === effectiveGeneration) return
-    const prefetchItem: ReaderTranslationQueueItem = { ...payload, text: sourceText, priority, generation: effectiveGeneration }
+    const prefetchItem: ReaderTranslationQueueItem = { ...payload, text: sourceText, priority, generation: effectiveGeneration, force: options.force }
     const queue = translationQueueRef.current
       .filter((item) => item.generation === effectiveGeneration && getReaderTranslationKey(item) !== translationKey)
     translationQueueRef.current = priority === 'book'
@@ -4166,6 +4150,56 @@ export default function DocumentView({
       : [...queue.filter((item) => item.priority === 'prefetch'), prefetchItem].slice(0, 2)
     drainReaderTranslationQueue()
   }, [drainReaderTranslationQueue, hasReadyTranslationForSource])
+
+  const updateReaderTranslationUnit = useCallback(async (pageId: string, unitId: string, translationText: string) => {
+    const updated = await window.api.updateTranslationUnit(unitId, {
+      translationText,
+      manualOverride: true,
+    })
+    if (!updated) throw new Error('翻译单元不存在')
+    setPageTranslationUnits((current) => {
+      const nextUnits = (current[pageId] || []).map((unit) => unit.id === unitId ? updated : unit)
+      setPageTranslations((translations) => ({
+        ...translations,
+        [pageId]: nextUnits.map((unit) => unit.translationText || (unit.skipped ? unit.sourceText : '')).filter(Boolean).join('\n'),
+      }))
+      return { ...current, [pageId]: nextUnits }
+    })
+  }, [])
+
+  const retranslateReaderTranslationUnit = useCallback(async (payload: ReaderTranslationPayload, unitId: string) => {
+    if (!doc?.id) return
+    const translationKey = getReaderTranslationKey(payload)
+    const cachePageId = getReaderTranslationCachePageId(payload)
+    setTranslatingPageIds((current) => ({ ...current, [translationKey]: true }))
+    try {
+      const result = await window.api.translatePageUnits({
+        docId: doc.id,
+        pageId: cachePageId,
+        mode: translationMode,
+        glossaryProjectId: activeTranslationGlossaryProjectId,
+        style: DEFAULT_TRANSLATION_STYLE,
+        force: true,
+        unitIds: [unitId],
+        priority: 'current',
+        documentTitle: doc.title || '',
+        pageContextBefore: getAdjacentTranslationContext(cachePageId, -1),
+        pageContextAfter: getAdjacentTranslationContext(cachePageId, 1),
+      })
+      setPageTranslationUnits((current) => ({ ...current, [translationKey]: result.units }))
+      setPageTranslations((current) => ({ ...current, [translationKey]: result.translationText }))
+      setPageTranslationHashes((current) => ({
+        ...current,
+        [translationKey]: getTranslationSourceHash(translationKey, payload.text),
+      }))
+    } finally {
+      setTranslatingPageIds((current) => {
+        const next = { ...current }
+        delete next[translationKey]
+        return next
+      })
+    }
+  }, [activeTranslationGlossaryProjectId, doc?.id, doc?.title, getAdjacentTranslationContext, getTranslationSourceHash, translationMode])
 
   const openQuickGlossaryTermModal = useCallback(() => {
     const sourceTerm = selectedTextForAi.replace(/\s+/g, ' ').trim()
@@ -4933,6 +4967,7 @@ export default function DocumentView({
               locator={locator}
               searchSession={readerDocumentSearchSession}
               pageTranslations={readerPageTranslations}
+              pageTranslationUnits={pageTranslationUnits}
               translatingPageIds={translatingPageIds}
               skippedTranslationPageIds={skippedTranslationPageIds}
               translationGlossaryProjectId={translationGlossaryProjectId}
@@ -4940,6 +4975,7 @@ export default function DocumentView({
               selectedTextForGlossary={selectedTextForAi}
               displayScript={readerDisplayScript}
               bookTranslationRequest={readerBookTranslationRequest}
+              translationMode={translationMode}
               onDisplayScriptChange={setReaderDisplayScript}
               onPageIndexChange={(pageIndex) => {
                 const nextIndex = clampPageIndex(pageIndex, pageCount)
@@ -4961,6 +4997,9 @@ export default function DocumentView({
               onTranslateCurrentPage={(payload, options) => {
                 requestReaderTranslation(payload, options)
               }}
+              onTranslationModeChange={setTranslationMode}
+              onUpdateTranslationUnit={updateReaderTranslationUnit}
+              onRetranslateTranslationUnit={retranslateReaderTranslationUnit}
               onTranslationGlossaryProjectChange={(projectId) => {
                 setTranslationGlossaryProjectId(projectId)
                 clearReaderTranslationRuntime()
@@ -5003,6 +5042,7 @@ export default function DocumentView({
             sourceLabel={sourceLabel}
             searchSession={readerDocumentSearchSession}
             pageTranslations={sourceReaderPageTranslations}
+            pageTranslationUnits={pageTranslationUnits}
             translatingPageIds={translatingPageIds}
             skippedTranslationPageIds={skippedTranslationPageIds}
             translationGlossaryProjectId={translationGlossaryProjectId}
@@ -5010,6 +5050,7 @@ export default function DocumentView({
             selectedTextForGlossary={selectedTextForAi}
             displayScript={readerDisplayScript}
             bookTranslationRequest={readerBookTranslationRequest}
+            translationMode={translationMode}
             onDisplayScriptChange={setReaderDisplayScript}
             onPageIndexChange={(pageIndex) => {
               const nextIndex = clampPageIndex(pageIndex, pageCount)
@@ -5033,6 +5074,9 @@ export default function DocumentView({
             onTranslateCurrentPage={(payload, options) => {
               requestReaderTranslation(payload, options)
             }}
+            onTranslationModeChange={setTranslationMode}
+            onUpdateTranslationUnit={updateReaderTranslationUnit}
+            onRetranslateTranslationUnit={retranslateReaderTranslationUnit}
             onTranslationGlossaryProjectChange={(projectId) => {
               setTranslationGlossaryProjectId(projectId)
               clearReaderTranslationRuntime()
@@ -5452,16 +5496,27 @@ export default function DocumentView({
                 activeSearchHitOrdinal={activeProofSearchHitOrdinal}
                 searchKeyword={effectiveSearchKeyword}
                 coordinateSourceSize={coordinateSourceSize}
+                preferVerticalLayout={shouldUseVerticalOcr}
                 translationText={currentFacsimileTranslationText}
+                translationUnits={currentPage?.id ? pageTranslationUnits[currentPage.id] || [] : []}
                 translationLoading={currentPage?.id ? !!translatingPageIds[currentPage.id] : false}
                 translationSkipped={currentFacsimileTranslationSkipped}
                 translationOpen={facsimileTranslationOpen}
+                translationMode={translationMode}
                 onTranslationOpenChange={setFacsimileTranslationOpen}
+                onTranslationModeChange={setTranslationMode}
                 onTranslateCurrentPage={(text) => {
                   if (!currentPage?.id) return
                   requestReaderTranslation(
                     { pageId: currentPage.id, pageNum: currentPage.page_num, text },
                     { priority: 'current' },
+                  )
+                }}
+                onRetranslateCurrentPage={(text) => {
+                  if (!currentPage?.id) return
+                  requestReaderTranslation(
+                    { pageId: currentPage.id, pageNum: currentPage.page_num, text },
+                    { priority: 'current', force: true },
                   )
                 }}
                 onSave={handleSavePage}

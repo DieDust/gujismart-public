@@ -31,7 +31,7 @@ function summarizePages(docId: string): PageStatusSummary {
   const row = queryOne<PageStatusSummary>(
     `SELECT
        COUNT(*) as total,
-       SUM(CASE WHEN ocr_status = 'completed' THEN 1 ELSE 0 END) as completed
+       SUM(CASE WHEN ocr_status = 'completed' AND ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed
      FROM pages
      WHERE doc_id = ?`,
     [docId],
@@ -43,7 +43,22 @@ function summarizePages(docId: string): PageStatusSummary {
 }
 
 function completedPageContentPredicate(alias = 'p'): string {
-  return `TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), NULLIF(${alias}.ocr_result, ''), '')) <> ''`
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
 }
 
 function parseJsonRecord(value: unknown): JsonRecord | null {
@@ -86,6 +101,13 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
              AND COALESCE(content_page.ocr_status, '') <> 'completed'
              AND ${completedPageContentPredicate('content_page')}
          )
+         OR EXISTS (
+           SELECT 1
+           FROM pages invalid_completed_page
+           WHERE invalid_completed_page.doc_id = d.id
+             AND COALESCE(invalid_completed_page.ocr_status, '') = 'completed'
+             AND NOT (${completedPageContentPredicate('invalid_completed_page')})
+         )
        )`,
   ).filter((row) => row.id)
   const interruptedDocIds = interruptedDocs.map((row) => row.id)
@@ -106,6 +128,14 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
        AND COALESCE(d.import_status, '') <> 'deleting'
        AND NOT (${completedPageContentPredicate('p')})`,
   )
+  const invalidCompletedPages = countRows(
+    `SELECT COUNT(*) as count
+     FROM pages p
+     INNER JOIN documents d ON d.id = p.doc_id
+     WHERE p.ocr_status = 'completed'
+       AND COALESCE(d.import_status, '') <> 'deleting'
+       AND NOT (${completedPageContentPredicate('p')})`,
+  )
   const recoveredBatchItems = countRows("SELECT COUNT(*) as count FROM batch_queue WHERE status IN ('queued', 'processing')")
   const removedOrphanedBatchItems = countRows(
     `SELECT COUNT(*) as count
@@ -115,7 +145,7 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
 
   const summary: OcrRecoverySummary = {
     recoveredDocuments: interruptedDocIds.length,
-    recoveredPages,
+    recoveredPages: recoveredPages + invalidCompletedPages,
     recoveredCompletedPages,
     recoveredBatchItems,
     removedOrphanedBatchItems,
@@ -149,7 +179,13 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
     run(
       `UPDATE pages
        SET ocr_status = 'pending'
-       WHERE ocr_status IN ('queued', 'processing')
+       WHERE (
+           ocr_status IN ('queued', 'processing')
+           OR (
+             ocr_status = 'completed'
+             AND NOT (${completedPageContentPredicate('pages')})
+           )
+         )
          AND doc_id IN (
            SELECT id FROM documents WHERE COALESCE(import_status, '') <> 'deleting'
          )`,

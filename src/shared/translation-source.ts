@@ -555,12 +555,7 @@ function recognizedTextBlocksFrom(source: unknown): TranslationBlock[] {
   }))
 }
 
-function getOcrBlocks(ocrResult: unknown): TranslationBlock[] {
-  const ir = getOrBuildOcrPageIr(ocrResult)
-  if (ir) {
-    return deriveOcrReadingBlocksFromIr(ir).map((block) => block as TranslationBlock)
-  }
-  const parsed = asOcrResult(ocrResult)
+function getLayoutOcrBlocks(parsed: TranslationOcrResult | null): TranslationBlock[] {
   if (!parsed) return []
   const layoutBlocks = asBlockArray(parsed.layout_result)
   const rawLayoutBlocks = asBlockArray(parsed.raw_layout_result)
@@ -581,6 +576,11 @@ function getOcrBlocks(ocrResult: unknown): TranslationBlock[] {
     getPathValue(parsed, ['res', 'prunedResult', 'parsing_res_list']),
   )
   if (directBlocks.length > 0) return directBlocks
+  return []
+}
+
+function getFallbackRecognizedOcrBlocks(parsed: TranslationOcrResult | null): TranslationBlock[] {
+  if (!parsed) return []
   const recognizedBlocks = recognizedTextBlocksFrom(getPathValue(parsed, ['overall_ocr_res']))
   if (recognizedBlocks.length > 0) return recognizedBlocks
   const nestedRecognizedBlocks = recognizedTextBlocksFrom(getPathValue(parsed, ['res', 'overall_ocr_res']))
@@ -588,6 +588,19 @@ function getOcrBlocks(ocrResult: unknown): TranslationBlock[] {
   const rootRecognizedBlocks = recognizedTextBlocksFrom(parsed)
   if (rootRecognizedBlocks.length > 0) return rootRecognizedBlocks
   return asBlockArray(parsed.words_result)
+}
+
+function getOcrBlocks(ocrResult: unknown): TranslationBlock[] {
+  const parsed = asOcrResult(ocrResult)
+  const layoutBlocks = getLayoutOcrBlocks(parsed)
+  if (layoutBlocks.length > 0) return layoutBlocks
+
+  const ir = getOrBuildOcrPageIr(ocrResult)
+  if (ir) {
+    return deriveOcrReadingBlocksFromIr(ir).map((block) => block as TranslationBlock)
+  }
+
+  return getFallbackRecognizedOcrBlocks(parsed)
 }
 
 function getOrderedTranslationBlocks(ocrResult: unknown): TranslationBlock[] {

@@ -775,6 +775,37 @@ CREATE TABLE IF NOT EXISTS page_translation_cache (
   FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS page_translation_units (
+  id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  page_id TEXT NOT NULL,
+  page_num INTEGER,
+  unit_id TEXT NOT NULL,
+  block_id TEXT NOT NULL,
+  block_index INTEGER DEFAULT 0,
+  unit_order INTEGER DEFAULT 0,
+  block_type TEXT DEFAULT 'text',
+  source_text TEXT DEFAULT '',
+  source_hash TEXT DEFAULT '',
+  translation_text TEXT DEFAULT '',
+  target_language TEXT DEFAULT 'zh-CN',
+  mode TEXT DEFAULT 'balanced',
+  model_signature TEXT DEFAULT '',
+  glossary_signature TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  manual_override INTEGER DEFAULT 0,
+  stale INTEGER DEFAULT 0,
+  skipped INTEGER DEFAULT 0,
+  quality_json TEXT DEFAULT '{}',
+  source_rect_json TEXT DEFAULT '',
+  source_index INTEGER,
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE(page_id, unit_id, target_language),
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS document_toc_items (
   id TEXT PRIMARY KEY,
   doc_id TEXT NOT NULL,
@@ -935,6 +966,9 @@ CREATE INDEX IF NOT EXISTS idx_page_ai_layout_cache_doc ON page_ai_layout_cache(
 CREATE INDEX IF NOT EXISTS idx_page_ai_layout_cache_lookup ON page_ai_layout_cache(page_id, mode, source_hash);
 CREATE INDEX IF NOT EXISTS idx_page_translation_cache_doc ON page_translation_cache(doc_id, page_num);
 CREATE INDEX IF NOT EXISTS idx_page_translation_cache_lookup ON page_translation_cache(page_id, source_hash);
+CREATE INDEX IF NOT EXISTS idx_page_translation_units_doc ON page_translation_units(doc_id, page_num, unit_order);
+CREATE INDEX IF NOT EXISTS idx_page_translation_units_page ON page_translation_units(page_id, unit_order);
+CREATE INDEX IF NOT EXISTS idx_page_translation_units_status ON page_translation_units(doc_id, status);
 CREATE INDEX IF NOT EXISTS idx_document_toc_doc_order ON document_toc_items(doc_id, order_index);
 CREATE INDEX IF NOT EXISTS idx_document_toc_doc_page ON document_toc_items(doc_id, source_page_num);
 CREATE INDEX IF NOT EXISTS idx_document_toc_doc_source ON document_toc_items(doc_id, source);
@@ -1375,6 +1409,9 @@ function cleanupOrphanRows(sqlite: NativeDatabase): void {
   }
   if (hasTable(sqlite, 'page_translation_cache') && hasTable(sqlite, 'documents') && hasTable(sqlite, 'pages')) {
     statements.push('DELETE FROM page_translation_cache WHERE doc_id NOT IN (SELECT id FROM documents) OR page_id NOT IN (SELECT id FROM pages)')
+  }
+  if (hasTable(sqlite, 'page_translation_units') && hasTable(sqlite, 'documents') && hasTable(sqlite, 'pages')) {
+    statements.push('DELETE FROM page_translation_units WHERE doc_id NOT IN (SELECT id FROM documents) OR page_id NOT IN (SELECT id FROM pages)')
   }
   if (hasTable(sqlite, 'pages') && hasTable(sqlite, 'documents')) {
     statements.push('DELETE FROM pages WHERE doc_id NOT IN (SELECT id FROM documents)')

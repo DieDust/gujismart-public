@@ -54,6 +54,8 @@ interface TextEditorOcrWord {
 interface TextEditorOcrResult extends Record<string, unknown> {
   layout_result?: TextEditorOcrBlock[]
   words_result?: TextEditorOcrWord[]
+  text?: unknown
+  markdown?: unknown
 }
 
 interface TextEditorOcrBlock extends Record<string, unknown> {
@@ -97,6 +99,31 @@ function shouldShiftForDrag(index: number, sourceIndex: number, insertIndex: num
   return index > sourceIndex && index <= targetIndex
 }
 
+function getTextValue(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+function getMarkdownText(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>
+    return getTextValue(record.text || record.markdown || record.md || record.content)
+  }
+  return ''
+}
+
+function buildPlainTextWordsResult(ocrResult: TextEditorOcrResult | null | undefined): TextEditorOcrWord[] {
+  const directWords = Array.isArray(ocrResult?.words_result) ? ocrResult.words_result : []
+  if (directWords.length > 0) return directWords
+  const text = getMarkdownText(ocrResult?.markdown) || getTextValue(ocrResult?.text)
+  return text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => ({ words: line }))
+}
+
 type DragPreviewState = {
   sourceIndex: number
   clientX: number
@@ -135,7 +162,7 @@ export default function TextEditor({
   const lineRefs = useRef<(HTMLDivElement | null)[]>([])
 
   const layoutResult = useMemo<TextEditorOcrBlock[]>(() => getTextFlowOcrBlocks({ ocr_result: ocrResult }) as TextEditorOcrBlock[], [ocrResult])
-  const wordsResult = ocrResult?.words_result || []
+  const wordsResult = useMemo(() => buildPlainTextWordsResult(ocrResult), [ocrResult])
   const hasLayout = layoutResult.length > 0
 
   useEffect(() => {

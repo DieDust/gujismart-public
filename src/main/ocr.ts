@@ -18,6 +18,15 @@ type OcrResultPayload = OcrRecognizeResult & JsonRecord & {
   guji_processing?: JsonRecord
 }
 
+interface OcrUploadImage {
+  buffer: Buffer
+  width: number | null
+  height: number | null
+  originalWidth: number | null
+  originalHeight: number | null
+  resized: boolean
+}
+
 export interface OcrPageRecord {
   id: string
   image_path?: string | null
@@ -115,6 +124,7 @@ interface AsyncJobStatusPayload {
   waitingMs?: number
   retryingStatusQuery?: boolean
   statusQueryError?: string
+  awaitingResultFile?: boolean
   totalPages?: number
   completedPages?: number
   successPages?: number
@@ -166,7 +176,9 @@ const ASYNC_POLL_MIN_INTERVAL_MS = 1200
 const ASYNC_POLL_BASE_INTERVAL_MS = 5000
 const ASYNC_POLL_MAX_INTERVAL_MS = 12000
 const ASYNC_STATUS_QUERY_TIMEOUT_MS = 30 * 1000
-const ASYNC_RESULT_READY_GRACE_MS = 10 * 60 * 1000
+const ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
+const ASYNC_RESULT_READY_GRACE_MS = 3 * 60 * 1000
+const ASYNC_RESULT_DOWNLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
 const ASYNC_JOB_STALLED_TIMEOUT_MS = 10 * 60 * 1000
 const ASYNC_RESULT_PARSE_YIELD_LINE_INTERVAL = 100
 const ASYNC_RESULT_NORMALIZE_CHUNK_SIZE = 50
@@ -517,9 +529,18 @@ function getImageDimensions(filePath?: string | null): { width: number; height: 
   }
 }
 
-export async function prepareImageForOcrUpload(filePath: string): Promise<Buffer> {
+export async function prepareImageForOcrUpload(filePath: string): Promise<OcrUploadImage> {
   const image = nativeImage.createFromPath(filePath)
-  if (image.isEmpty()) return readFile(filePath)
+  if (image.isEmpty()) {
+    return {
+      buffer: await readFile(filePath),
+      width: null,
+      height: null,
+      originalWidth: null,
+      originalHeight: null,
+      resized: false,
+    }
+  }
 
   const settings = getOcrImageUploadSettings()
   const originalBytes = (await stat(filePath)).size
@@ -537,10 +558,27 @@ export async function prepareImageForOcrUpload(filePath: string): Promise<Buffer
       })
     : image
   const compressed = resized.toJPEG(settings.jpegQuality)
+  const resizedSize = resized.getSize()
 
-  return compressed.length > 0 && compressed.length < originalBytes
-    ? compressed
-    : readFile(filePath)
+  if (compressed.length > 0 && compressed.length < originalBytes) {
+    return {
+      buffer: compressed,
+      width: resizedSize.width,
+      height: resizedSize.height,
+      originalWidth: size.width,
+      originalHeight: size.height,
+      resized: resizedSize.width !== size.width || resizedSize.height !== size.height,
+    }
+  }
+
+  return {
+    buffer: await readFile(filePath),
+    width: size.width,
+    height: size.height,
+    originalWidth: size.width,
+    originalHeight: size.height,
+    resized: false,
+  }
 }
 
 function smoothSeries(values: number[], radius = 2): number[] {
@@ -644,6 +682,22 @@ function inferOrientation(box: { location?: { width: number; height: number }; w
   return height >= width * 1.2 ? 'vertical' : 'horizontal'
 }
 
+function inferGujiVerticalOrientation(box: { location?: { width: number; height: number }; words?: string; label?: string }): 'vertical' | 'horizontal' {
+  const label = String(box.label || '').toLowerCase()
+  const width = box.location?.width || 0
+  const height = box.location?.height || 0
+  const words = String(box.words || '')
+  const textLength = words.replace(/\s+/g, '').length
+  const tallBodyShape = width > 0 && height >= width * 1.28
+  const stronglyTallBodyShape = width > 0 && height >= width * 1.65
+  const naturalHorizontal = isNaturallyHorizontalLabel(label) || hasModernHorizontalParagraphSignals(box)
+  if (/vertical[_\s-]*text|col[_\s-]*text|column[_\s-]*text|vertical/i.test(label)) return 'vertical'
+  if (stronglyTallBodyShape && textLength >= 2) return 'vertical'
+  if (width > 0 && height >= width * 1.05 && textLength >= 24 && looksLikeCjkDominantText(words)) return 'vertical'
+  if ((stronglyTallBodyShape || (tallBodyShape && textLength >= 8)) && !naturalHorizontal) return 'vertical'
+  return inferOrientation(box)
+}
+
 function annotateReadingOrder<T extends {
   location: { left: number; top: number; width: number; height: number }
   score?: number
@@ -654,7 +708,10 @@ function annotateReadingOrder<T extends {
   column_index?: number
   line_index?: number
   label?: string
-}>(boxes: T[]): Array<T & {
+}>(
+  boxes: T[],
+  preferGujiVertical = false,
+): Array<T & {
   reading_order: number
   column_index: number
   line_index: number
@@ -685,7 +742,7 @@ function annotateReadingOrder<T extends {
         return left.index - right.index
       })
       .map(({ box }, index) => {
-        const orientation = inferOrientation(box)
+        const orientation = preferGujiVertical ? inferGujiVerticalOrientation(box) : inferOrientation(box)
         return {
           ...(box as T),
           reading_order: index,
@@ -743,7 +800,7 @@ function annotateReadingOrder<T extends {
     column.items
       .sort((left, right) => left.location.top - right.location.top || right.location.left - left.location.left)
       .forEach((box, lineIndex) => {
-        const orientation = inferOrientation(box)
+        const orientation = preferGujiVertical ? inferGujiVerticalOrientation(box) : inferOrientation(box)
         ordered.push({
           ...(box as T),
           reading_order: ordered.length,
@@ -792,6 +849,43 @@ function shouldSplitVerticalBlock(block: LayoutBlockResult): boolean {
   if (text.length < 12) return false
   if (width < 42 || height < 160) return false
   return width >= Math.max(48, height * 0.08)
+}
+
+function looksLikeCjkVerticalCandidateText(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '')
+  if (compact.length < 24) return false
+  const cjkCount = Array.from(compact).filter((char) => /[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef]/.test(char)).length
+  const latinCount = Array.from(compact).filter((char) => /[A-Za-z]/.test(char)).length
+  const bulletCount = Array.from(compact).filter((char) => /[○〇●◎・]/.test(char)).length
+  return cjkCount / Math.max(1, compact.length) >= 0.55
+    && latinCount / Math.max(1, compact.length) <= 0.28
+    && (bulletCount >= 2 || /[。．、，]/.test(compact))
+}
+
+function looksLikeCjkDominantText(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '')
+  if (compact.length < 24) return false
+  const cjkCount = Array.from(compact).filter((char) => /[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef]/.test(char)).length
+  const latinCount = Array.from(compact).filter((char) => /[A-Za-z]/.test(char)).length
+  return cjkCount / Math.max(1, compact.length) >= 0.5
+    && latinCount / Math.max(1, compact.length) <= 0.35
+}
+
+function shouldProbeHorizontalBlockForVerticalColumns(block: LayoutBlockResult, forceVerticalProfile = false): boolean {
+  if (inferOrientation(block) === 'vertical') return false
+  const text = String(block.words || '')
+  const compact = text.replace(/\s+/g, '')
+  const rect = block.location
+  if (!rect || compact.length < 36) return false
+  if (!/^(?:text|paragraph|body|paragraph_title|title)?$/i.test(String(block.label || 'text'))) return false
+  if (forceVerticalProfile) {
+    if (!looksLikeCjkDominantText(text)) return false
+  } else if (!looksLikeCjkVerticalCandidateText(text)) {
+    return false
+  }
+  if (rect.height < 90 || rect.width < 90) return false
+  if (rect.height >= rect.width * (forceVerticalProfile ? 0.55 : 1.08)) return true
+  return rect.width >= 180 && rect.height >= 90 && compact.length >= (forceVerticalProfile ? 36 : 60)
 }
 
 function getPixelLuminance(bitmap: Buffer, width: number, x: number, y: number): number {
@@ -907,11 +1001,135 @@ function sliceVerticalText(words: string, capacities: number[]): string[] {
   return segments
 }
 
+function getVerticalTextHardLines(text: string): string[] {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .split(/\n+/)
+    .map((line) => line.replace(/[ \t]+/g, '').trim())
+    .filter(Boolean)
+}
+
+function getMergedWideVerticalTextLines(block: LayoutBlockResult): string[] {
+  if (inferGujiVerticalOrientation(block) !== 'vertical') return []
+  if (isTableLabel(block.label) || isImageLabel(block.label) || isDecorativeOcrLabel(block.label)) return []
+  const rect = block.location
+  const lines = getVerticalTextHardLines(block.words || '')
+  if (lines.length < 2 || lines.length > 18) return []
+  const compactLength = lines.join('').length
+  if (compactLength < 48) return []
+  const longLineCount = lines.filter((line) => line.length >= 8).length
+  if (longLineCount < Math.min(2, lines.length)) return []
+  if (rect.width < 96 || rect.height < 120) return []
+  const columnWidth = rect.width / lines.length
+  if (columnWidth < 18 || columnWidth > Math.max(88, rect.width * 0.68)) return []
+  return lines
+}
+
+function isLikelyGujiTinyNoiseBlock(block: LayoutBlockResult): boolean {
+  if (!block.location) return false
+  if (isTableLabel(block.label) || isImageLabel(block.label)) return false
+  const text = String(block.words || '').trim()
+  if (!text) return false
+  const compact = text.replace(/\s+/g, '')
+  const width = Number(block.location.width || 0)
+  const height = Number(block.location.height || 0)
+  if (width <= 0 || height <= 0) return true
+  const minSide = Math.min(width, height)
+  const maxSide = Math.max(width, height)
+  if (minSide <= 2 && maxSide >= 20) return true
+  const hasCjkOrKana = /[\u3040-\u30ff\u3400-\u9fff]/.test(compact)
+  if (minSide < 8 && compact.length <= 3 && !hasCjkOrKana) return true
+  return false
+}
+
+function filterGujiTinyNoiseBlocks(
+  result: OcrResultPayload,
+  options: Required<PageOcrOptions>,
+): OcrResultPayload {
+  if (options.profile !== 'guji_print_vertical') return result
+  const blocks = asLayoutBlockResults(result.layout_result)
+  if (blocks.length === 0) return result
+  const nextBlocks = blocks.filter((block) => !isLikelyGujiTinyNoiseBlock(block))
+  const removedCount = blocks.length - nextBlocks.length
+  if (removedCount === 0 || nextBlocks.length === 0) return result
+  const orderedBlocks = annotateReadingOrder(nextBlocks, true)
+  return rebuildWordsResultFromLayout({
+    ...result,
+    layout_result: orderedBlocks,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      removed_tiny_noise_blocks: removedCount,
+    },
+  })
+}
+
+function splitMergedWideVerticalTextBlock(block: LayoutBlockResult): LayoutBlockResult[] {
+  const lines = getMergedWideVerticalTextLines(block)
+  if (lines.length <= 1) return [block]
+  const rect = block.location
+  const columnWidth = rect.width / lines.length
+  return lines.map((line, index) => {
+    const left = rect.left + rect.width - (index + 1) * columnWidth
+    const location = {
+      left: Math.round(left),
+      top: rect.top,
+      width: Math.max(1, Math.round(columnWidth)),
+      height: rect.height,
+    }
+    return {
+      ...block,
+      words: line,
+      raw_words: line,
+      location,
+      orientation: 'vertical',
+      segmentation_source: 'local_second_pass',
+      column_index: index,
+      line_index: 0,
+      slot_count: Math.max(1, line.length),
+      mask_polygon: createMaskPolygon(location),
+      needs_enhancement: true,
+      merged_vertical_line_split: true,
+    }
+  })
+}
+
+function splitMergedWideVerticalTextLineBlocks(
+  result: OcrResultPayload,
+  options: Required<PageOcrOptions>,
+): OcrResultPayload {
+  if (options.profile !== 'guji_print_vertical') return result
+  const blocks = asLayoutBlockResults(result.layout_result)
+  if (blocks.length === 0) return result
+  const nextBlocks: LayoutBlockResult[] = []
+  let splitBlockCount = 0
+  let splitColumnCount = 0
+  for (const block of blocks) {
+    const splitBlocks = splitMergedWideVerticalTextBlock(block)
+    if (splitBlocks.length > 1) {
+      splitBlockCount += 1
+      splitColumnCount += splitBlocks.length
+    }
+    nextBlocks.push(...splitBlocks)
+  }
+  if (splitBlockCount === 0) return result
+  const orderedBlocks = annotateReadingOrder(nextBlocks, true)
+  return rebuildWordsResultFromLayout({
+    ...result,
+    layout_result: orderedBlocks,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      merged_wide_vertical_line_blocks_split: splitBlockCount,
+      merged_wide_vertical_line_columns: splitColumnCount,
+    },
+  })
+}
+
 function attachProcessingMeta(result: OcrResultPayload, options: Required<PageOcrOptions>, imagePath?: string | null): OcrResultPayload {
   const dimensions = getImageDimensions(imagePath)
   return {
     ...result,
     guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
       profile: options.profile,
       second_pass: options.secondPass,
       source_image_fingerprint: getImageFingerprint(imagePath),
@@ -993,6 +1211,134 @@ function asSegmentationSource(value: unknown): LayoutBlockResult['segmentation_s
   return undefined
 }
 
+function scalePoint(value: unknown, scaleX: number, scaleY: number): unknown {
+  if (Array.isArray(value)) {
+    if (value.length >= 2 && typeof value[0] === 'number' && typeof value[1] === 'number') {
+      const next = [...value]
+      next[0] = Math.round(Number(value[0]) * scaleX)
+      next[1] = Math.round(Number(value[1]) * scaleY)
+      return next
+    }
+    return value.map((point) => scalePoint(point, scaleX, scaleY))
+  }
+  if (!isJsonRecord(value)) return value
+  const next = { ...value }
+  if (Number.isFinite(Number(next.x))) next.x = Math.round(Number(next.x) * scaleX)
+  if (Number.isFinite(Number(next.y))) next.y = Math.round(Number(next.y) * scaleY)
+  return next
+}
+
+function scaleCoordinateValue(value: unknown, scaleX: number, scaleY: number): unknown {
+  if (Array.isArray(value)) {
+    if (value.length >= 8 && value.every((item) => typeof item === 'number')) {
+      return value.map((item, index) => Math.round(Number(item) * (index % 2 === 0 ? scaleX : scaleY)))
+    }
+    if (value.length >= 4 && value.every((item) => typeof item === 'number')) {
+      return [
+        Math.round(Number(value[0]) * scaleX),
+        Math.round(Number(value[1]) * scaleY),
+        Math.round(Number(value[2]) * scaleX),
+        Math.round(Number(value[3]) * scaleY),
+        ...value.slice(4),
+      ]
+    }
+    return value.map((point) => scalePoint(point, scaleX, scaleY))
+  }
+  if (!isJsonRecord(value)) return value
+  const next = { ...value }
+  if (Number.isFinite(Number(next.left))) next.left = Math.round(Number(next.left) * scaleX)
+  if (Number.isFinite(Number(next.top))) next.top = Math.round(Number(next.top) * scaleY)
+  if (Number.isFinite(Number(next.width))) next.width = Math.round(Number(next.width) * scaleX)
+  if (Number.isFinite(Number(next.height))) next.height = Math.round(Number(next.height) * scaleY)
+  if (Number.isFinite(Number(next.x))) next.x = Math.round(Number(next.x) * scaleX)
+  if (Number.isFinite(Number(next.y))) next.y = Math.round(Number(next.y) * scaleY)
+  return next
+}
+
+function rotateClockwiseCoordinatePointToSource(point: { x: number; y: number }, sourceWidth: number): { x: number; y: number } {
+  return {
+    x: Math.round(sourceWidth - point.y),
+    y: Math.round(point.x),
+  }
+}
+
+function locationToCornerPoints(location: LayoutLocation): Array<{ x: number; y: number }> {
+  return [
+    { x: location.left, y: location.top },
+    { x: location.left + location.width, y: location.top },
+    { x: location.left + location.width, y: location.top + location.height },
+    { x: location.left, y: location.top + location.height },
+  ]
+}
+
+function boundingRectFromPoints(points: Array<{ x: number; y: number }>): LayoutLocation | null {
+  const finitePoints = points.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+  if (finitePoints.length === 0) return null
+  const xs = finitePoints.map((point) => point.x)
+  const ys = finitePoints.map((point) => point.y)
+  const left = Math.round(Math.min(...xs))
+  const top = Math.round(Math.min(...ys))
+  const right = Math.round(Math.max(...xs))
+  const bottom = Math.round(Math.max(...ys))
+  return {
+    left,
+    top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  }
+}
+
+function rotateClockwiseLocationToSource(location: LayoutLocation, sourceWidth: number): LayoutLocation {
+  return boundingRectFromPoints(
+    locationToCornerPoints(location).map((point) => rotateClockwiseCoordinatePointToSource(point, sourceWidth)),
+  ) || location
+}
+
+function rotateClockwiseCoordinateValueToSource(value: unknown, sourceWidth: number): unknown {
+  if (Array.isArray(value)) {
+    if (value.length >= 8 && value.every((item) => typeof item === 'number')) {
+      const points: Array<{ x: number; y: number }> = []
+      for (let index = 0; index + 1 < value.length; index += 2) {
+        points.push(rotateClockwiseCoordinatePointToSource({
+          x: Number(value[index]),
+          y: Number(value[index + 1]),
+        }, sourceWidth))
+      }
+      return points.flatMap((point) => [point.x, point.y])
+    }
+    if (value.length >= 4 && value.every((item) => typeof item === 'number')) {
+      const rect = toLocationRect(value)
+      const rotated = rect ? rotateClockwiseLocationToSource(rect, sourceWidth) : null
+      return rotated
+        ? [rotated.left, rotated.top, rotated.left + rotated.width, rotated.top + rotated.height, ...value.slice(4)]
+        : value
+    }
+    return value.map((point) => rotateClockwiseCoordinateValueToSource(point, sourceWidth))
+  }
+  if (!isJsonRecord(value)) return value
+  if (
+    Number.isFinite(Number(value.left))
+    || Number.isFinite(Number(value.top))
+    || Number.isFinite(Number(value.width))
+    || Number.isFinite(Number(value.height))
+  ) {
+    const rect = toLocationRect(value)
+    if (rect) {
+      return {
+        ...value,
+        ...rotateClockwiseLocationToSource(rect, sourceWidth),
+      }
+    }
+  }
+  if (Number.isFinite(Number(value.x)) && Number.isFinite(Number(value.y))) {
+    return {
+      ...value,
+      ...rotateClockwiseCoordinatePointToSource({ x: Number(value.x), y: Number(value.y) }, sourceWidth),
+    }
+  }
+  return value
+}
+
 function toLayoutBlockResult(block: unknown, index = 0): LayoutBlockResult | null {
   const location = toLocationRect(firstRecordValue(block, ['location', 'bbox', 'box', 'coordinate', 'points', 'block_bbox']))
   if (!location) return null
@@ -1016,6 +1362,286 @@ function toLayoutBlockResult(block: unknown, index = 0): LayoutBlockResult | nul
     line_index: lineIndex ?? undefined,
     confidence: confidence ?? undefined,
     segmentation_source: asSegmentationSource(readRecordValue(block, 'segmentation_source')),
+  }
+}
+
+function scaleLayoutLocation(location: LayoutLocation, scaleX: number, scaleY: number): LayoutLocation {
+  return {
+    left: Math.round(location.left * scaleX),
+    top: Math.round(location.top * scaleY),
+    width: Math.max(1, Math.round(location.width * scaleX)),
+    height: Math.max(1, Math.round(location.height * scaleY)),
+  }
+}
+
+function scaleLayoutBlockCoordinates(block: OcrRecognizeLayoutBlock, scaleX: number, scaleY: number): OcrRecognizeLayoutBlock {
+  const next = { ...block } as OcrRecognizeLayoutBlock & JsonRecord
+  const coordinateKeys = ['bbox', 'box', 'coordinate', 'coordinate_box', 'points', 'block_bbox']
+  coordinateKeys.forEach((key) => {
+    if (next[key] !== undefined) next[key] = scaleCoordinateValue(next[key], scaleX, scaleY)
+  })
+  if (block.location) next.location = scaleLayoutLocation(block.location as LayoutLocation, scaleX, scaleY)
+  if (next.mask_polygon !== undefined) next.mask_polygon = scaleCoordinateValue(next.mask_polygon, scaleX, scaleY)
+  if (Array.isArray(next.baseline) && next.baseline.length >= 4) {
+    next.baseline = [
+      Math.round(Number(next.baseline[0] || 0) * scaleX),
+      Math.round(Number(next.baseline[1] || 0) * scaleY),
+      Math.round(Number(next.baseline[2] || 0) * scaleX),
+      Math.round(Number(next.baseline[3] || 0) * scaleY),
+    ]
+  }
+  return next
+}
+
+function scaleWordCoordinates(word: OcrWordResult, scaleX: number, scaleY: number): OcrWordResult {
+  const next = { ...word }
+  const coordinateKeys = ['bbox', 'box', 'coordinate', 'points', 'location']
+  coordinateKeys.forEach((key) => {
+    if (next[key] !== undefined) next[key] = scaleCoordinateValue(next[key], scaleX, scaleY)
+  })
+  return next
+}
+
+function rotateClockwiseLayoutBlockCoordinatesToSource(block: OcrRecognizeLayoutBlock, sourceWidth: number): OcrRecognizeLayoutBlock {
+  const next = { ...block } as OcrRecognizeLayoutBlock & JsonRecord
+  const coordinateKeys = ['bbox', 'box', 'coordinate', 'coordinate_box', 'points', 'block_bbox']
+  coordinateKeys.forEach((key) => {
+    if (next[key] !== undefined) next[key] = rotateClockwiseCoordinateValueToSource(next[key], sourceWidth)
+  })
+  if (block.location) next.location = rotateClockwiseLocationToSource(block.location as LayoutLocation, sourceWidth)
+  if (next.mask_polygon !== undefined) next.mask_polygon = rotateClockwiseCoordinateValueToSource(next.mask_polygon, sourceWidth)
+  if (Array.isArray(next.baseline) && next.baseline.length >= 4) {
+    const first = rotateClockwiseCoordinatePointToSource({ x: Number(next.baseline[0] || 0), y: Number(next.baseline[1] || 0) }, sourceWidth)
+    const second = rotateClockwiseCoordinatePointToSource({ x: Number(next.baseline[2] || 0), y: Number(next.baseline[3] || 0) }, sourceWidth)
+    next.baseline = [first.x, first.y, second.x, second.y]
+  }
+  return next
+}
+
+function rotateClockwiseWordCoordinatesToSource(word: OcrWordResult, sourceWidth: number): OcrWordResult {
+  const next = { ...word }
+  const coordinateKeys = ['bbox', 'box', 'coordinate', 'points', 'location']
+  coordinateKeys.forEach((key) => {
+    if (next[key] !== undefined) next[key] = rotateClockwiseCoordinateValueToSource(next[key], sourceWidth)
+  })
+  return next
+}
+
+function getRectOutOfBoundsRatio(rect: LayoutLocation, pageWidth: number, pageHeight: number): number {
+  const clippedLeft = clamp(rect.left, 0, pageWidth)
+  const clippedTop = clamp(rect.top, 0, pageHeight)
+  const clippedRight = clamp(rect.left + rect.width, 0, pageWidth)
+  const clippedBottom = clamp(rect.top + rect.height, 0, pageHeight)
+  const clippedArea = Math.max(0, clippedRight - clippedLeft) * Math.max(0, clippedBottom - clippedTop)
+  return 1 - Math.min(1, clippedArea / Math.max(1, rect.width * rect.height))
+}
+
+function scoreOcrCoordinateFit(blocks: LayoutBlockResult[], pageWidth: number, pageHeight: number): {
+  score: number
+  outOfBoundsCount: number
+  verticalShapeCount: number
+  totalCount: number
+  maxBottom: number
+  maxRight: number
+} {
+  const textBlocks = blocks.filter((block) => getOcrBlockText(block).replace(/\s+/g, '').length > 0)
+  let score = 0
+  let outOfBoundsCount = 0
+  let verticalShapeCount = 0
+  let maxBottom = 0
+  let maxRight = 0
+  textBlocks.forEach((block) => {
+    const rect = block.location
+    const outOfBoundsRatio = getRectOutOfBoundsRatio(rect, pageWidth, pageHeight)
+    const textLength = getOcrBlockText(block).replace(/\s+/g, '').length
+    const textWeight = Math.min(4, Math.max(1, textLength / 32))
+    const verticalShape = rect.width > 0 && rect.height >= rect.width * 1.28
+    if (outOfBoundsRatio > 0.04) outOfBoundsCount += 1
+    if (verticalShape) verticalShapeCount += 1
+    maxBottom = Math.max(maxBottom, rect.top + rect.height)
+    maxRight = Math.max(maxRight, rect.left + rect.width)
+    score += textWeight * (1 - outOfBoundsRatio * 2.5)
+    if (verticalShape) score += 1.2
+    if (rect.left < -pageWidth * 0.03 || rect.top < -pageHeight * 0.03) score -= 2
+    if (rect.left + rect.width > pageWidth * 1.03 || rect.top + rect.height > pageHeight * 1.03) score -= 2
+  })
+  return {
+    score,
+    outOfBoundsCount,
+    verticalShapeCount,
+    totalCount: textBlocks.length,
+    maxBottom,
+    maxRight,
+  }
+}
+
+function normalizeGujiVerticalBlockOrientation(result: OcrResultPayload): OcrResultPayload {
+  const blocks = asLayoutBlockResults(result.layout_result)
+  if (blocks.length === 0) return result
+  let changedCount = 0
+  const nextBlocks = blocks.map((block) => {
+    const orientation = inferGujiVerticalOrientation(block)
+    if (orientation === block.orientation) return block
+    changedCount += 1
+    return {
+      ...block,
+      orientation,
+    }
+  })
+  if (changedCount === 0) return result
+  return {
+    ...result,
+    layout_result: nextBlocks,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      guji_orientation_normalized_blocks: changedCount,
+    },
+  }
+}
+
+function correctRotatedOcrCoordinatesForSourceImage(
+  result: OcrResultPayload,
+  imagePath: string | null | undefined,
+  options: Required<PageOcrOptions>,
+): OcrResultPayload {
+  if (options.profile !== 'guji_print_vertical') return result
+  const dimensions = getImageDimensions(imagePath)
+  if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) return result
+  if (readRecordValue(result.guji_processing, 'ocr_coordinate_rotation_corrected')) return result
+
+  const sourceBlocks = asLayoutBlockResults(result.layout_result)
+  if (sourceBlocks.length < 2) return result
+  const rotatedRawBlocks = Array.isArray(result.layout_result)
+    ? result.layout_result.map((block) => rotateClockwiseLayoutBlockCoordinatesToSource(block, dimensions.width))
+    : result.layout_result
+  const rotatedBlocks = asLayoutBlockResults(rotatedRawBlocks)
+  const originalFit = scoreOcrCoordinateFit(sourceBlocks, dimensions.width, dimensions.height)
+  const rotatedFit = scoreOcrCoordinateFit(rotatedBlocks, dimensions.width, dimensions.height)
+  const originalOutRatio = originalFit.outOfBoundsCount / Math.max(1, originalFit.totalCount)
+  const rotatedOutRatio = rotatedFit.outOfBoundsCount / Math.max(1, rotatedFit.totalCount)
+  const originalVerticalRatio = originalFit.verticalShapeCount / Math.max(1, originalFit.totalCount)
+  const rotatedVerticalRatio = rotatedFit.verticalShapeCount / Math.max(1, rotatedFit.totalCount)
+  const clearlyOutOfBounds = originalOutRatio >= 0.08
+    || originalFit.maxBottom > dimensions.height * 1.04
+    || originalFit.maxRight > dimensions.width * 1.04
+  const rotationImprovesBounds = rotatedOutRatio + 0.05 < originalOutRatio
+    || rotatedFit.score >= originalFit.score + Math.max(3, originalFit.totalCount * 0.35)
+  const rotationImprovesVerticalLayout = rotatedVerticalRatio >= originalVerticalRatio + 0.25
+    || (rotatedVerticalRatio >= 0.45 && originalVerticalRatio < 0.25)
+  if (!clearlyOutOfBounds || !rotationImprovesBounds || !rotationImprovesVerticalLayout) return result
+
+  return {
+    ...result,
+    layout_result: rotatedRawBlocks,
+    words_result: Array.isArray(result.words_result)
+      ? result.words_result.map((word) => rotateClockwiseWordCoordinatesToSource(word, dimensions.width))
+      : result.words_result,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ocr_coordinate_rotation_corrected: 'clockwise_to_source',
+      ocr_coordinate_rotation_original_score: Number(originalFit.score.toFixed(2)),
+      ocr_coordinate_rotation_corrected_score: Number(rotatedFit.score.toFixed(2)),
+      ocr_coordinate_rotation_original_out_of_bounds: originalFit.outOfBoundsCount,
+      ocr_coordinate_rotation_corrected_out_of_bounds: rotatedFit.outOfBoundsCount,
+    },
+  }
+}
+
+function clampLocationToImage(location: LayoutLocation, imageWidth: number, imageHeight: number): LayoutLocation {
+  const left = clamp(Math.round(location.left), 0, Math.max(0, imageWidth - 1))
+  const top = clamp(Math.round(location.top), 0, Math.max(0, imageHeight - 1))
+  const right = clamp(Math.round(location.left + location.width), left + 1, imageWidth)
+  const bottom = clamp(Math.round(location.top + location.height), top + 1, imageHeight)
+  return {
+    left,
+    top,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  }
+}
+
+function clampGujiOcrResultToSourceImage(
+  result: OcrResultPayload,
+  imagePath: string | null | undefined,
+): OcrResultPayload {
+  const dimensions = getImageDimensions(imagePath)
+  if (!dimensions || dimensions.width <= 0 || dimensions.height <= 0) return result
+  const blocks = asLayoutBlockResults(result.layout_result)
+  if (blocks.length === 0) return result
+  let clampedCount = 0
+  const nextBlocks = blocks.map((block) => {
+    const clampedLocation = clampLocationToImage(block.location, dimensions.width, dimensions.height)
+    if (
+      clampedLocation.left === block.location.left
+      && clampedLocation.top === block.location.top
+      && clampedLocation.width === block.location.width
+      && clampedLocation.height === block.location.height
+    ) {
+      return block
+    }
+    clampedCount += 1
+    return {
+      ...block,
+      location: clampedLocation,
+      mask_polygon: createMaskPolygon(clampedLocation),
+    }
+  })
+  if (clampedCount === 0) return result
+  return {
+    ...result,
+    layout_result: nextBlocks,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ocr_coordinate_clamped_to_source: clampedCount,
+    },
+  }
+}
+
+export function normalizeStoredGujiOcrResultForRead(
+  result: unknown,
+  imagePath: string | null | undefined,
+): OcrResultPayload | null {
+  if (!isOcrResultPayload(result)) return null
+  const meta = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  if (readRecordValue(meta, 'profile') !== 'guji_print_vertical') return result
+  const options: Required<PageOcrOptions> = {
+    profile: 'guji_print_vertical',
+    secondPass: readRecordValue(meta, 'second_pass') === 'cloud_column_ocr' ? 'cloud_column_ocr' : 'local_segmentation',
+  }
+  const coordinateCorrected = correctRotatedOcrCoordinatesForSourceImage(result, imagePath, options)
+  const orientationNormalized = normalizeGujiVerticalBlockOrientation(coordinateCorrected)
+  const pseudoTableDowngraded = downgradeVerticalPseudoTableBlocks(orientationNormalized, options)
+  const clamped = clampGujiOcrResultToSourceImage(pseudoTableDowngraded, imagePath)
+  return filterGujiTinyNoiseBlocks(splitMergedWideVerticalTextLineBlocks(clamped, options), options)
+}
+
+function scaleOcrResultToOriginalImage(result: OcrResultPayload, uploadImage?: OcrUploadImage | null): OcrResultPayload {
+  if (!uploadImage?.resized) return result
+  const uploadWidth = Number(uploadImage.width || 0)
+  const uploadHeight = Number(uploadImage.height || 0)
+  const originalWidth = Number(uploadImage.originalWidth || 0)
+  const originalHeight = Number(uploadImage.originalHeight || 0)
+  if (uploadWidth <= 0 || uploadHeight <= 0 || originalWidth <= 0 || originalHeight <= 0) return result
+  const scaleX = originalWidth / uploadWidth
+  const scaleY = originalHeight / uploadHeight
+  if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0) return result
+  if (Math.abs(scaleX - 1) < 0.001 && Math.abs(scaleY - 1) < 0.001) return result
+
+  return {
+    ...result,
+    layout_result: Array.isArray(result.layout_result)
+      ? result.layout_result.map((block) => scaleLayoutBlockCoordinates(block, scaleX, scaleY))
+      : result.layout_result,
+    words_result: Array.isArray(result.words_result)
+      ? result.words_result.map((word) => scaleWordCoordinates(word, scaleX, scaleY))
+      : result.words_result,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ocr_upload_image_width: uploadWidth,
+      ocr_upload_image_height: uploadHeight,
+      ocr_upload_resized: true,
+      ocr_coordinate_rescaled_to_source: true,
+    },
   }
 }
 
@@ -1106,6 +1732,110 @@ function parseMarkdownTableRows(value: string): string[][] {
 
 function tableRowsToText(rows: string[][]): string {
   return rows.map((row) => row.join('\t')).join('\n')
+}
+
+function tableRowsToVerticalColumnText(rows: string[][]): string {
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  const columns: string[] = []
+  for (let columnIndex = columnCount - 1; columnIndex >= 0; columnIndex -= 1) {
+    const columnText = rows.map((row) => String(row[columnIndex] || '').trim()).filter(Boolean).join('')
+    if (columnText) columns.push(columnText)
+  }
+  return columns.join('\n')
+}
+
+function getOcrVerticalScriptRatio(text: string): number {
+  const chars = Array.from(String(text || '').replace(/\s+/g, ''))
+  if (chars.length === 0) return 0
+  const verticalChars = chars.filter((char) => /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]/.test(char)).length
+  return verticalChars / chars.length
+}
+
+function getCompactTableCells(rows: string[][]): string[] {
+  return rows.flat().map((cell) => String(cell || '').replace(/\s+/g, '')).filter(Boolean)
+}
+
+function hasStructuredTableMarkup(block: unknown): boolean {
+  const html = String(firstRecordValue(block, ['html', 'table_html', 'tableHtml']) || '')
+  return /\b(?:rowspan|colspan|thead|tbody|tfoot)\b/i.test(html)
+}
+
+function hasNumericTableSignals(cells: string[]): boolean {
+  if (cells.length < 4) return false
+  const numericCells = cells.filter((cell) => /(?:\d|[０-９]|[一二三四五六七八九十百千万]+(?:年|月|日|時|时|分|円|元|割|％|%))/.test(cell)).length
+  return numericCells >= Math.max(3, Math.ceil(cells.length * 0.25))
+}
+
+function isLikelyVerticalPseudoTableBlock(block: LayoutBlockResult): boolean {
+  if (!isTableLabel(block.label)) return false
+  const rows = normalizeTableRows(firstRecordValue(block, ['rows', 'table_rows']))
+  if (rows.length < 2) return false
+
+  const compactCells = getCompactTableCells(rows)
+  const compactText = compactCells.join('')
+  if (compactCells.length < 6 || compactText.length < 16) return false
+  if (getOcrVerticalScriptRatio(compactText) < 0.55) return false
+  if (hasStructuredTableMarkup(block) || hasNumericTableSignals(compactCells)) return false
+
+  const rowCount = rows.length
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  const maxCellLength = Math.max(0, ...compactCells.map((cell) => cell.length))
+  const shortCellRatio = compactCells.filter((cell) => cell.length <= 8).length / Math.max(1, compactCells.length)
+  const rect = block.location
+  const gridLikeVerticalText = compactCells.length >= 12
+    && shortCellRatio >= 0.68
+    && maxCellLength <= 18
+    && (rowCount >= 5 || columnCount >= 4)
+  const oldStyleSparseColumns = rowCount <= 4
+    && columnCount >= 4
+    && shortCellRatio >= 0.72
+    && maxCellLength <= 14
+  const verticalPageShape = !rect || rect.height >= rect.width * 0.42 || columnCount >= 4
+  return verticalPageShape && (gridLikeVerticalText || oldStyleSparseColumns)
+}
+
+function downgradeVerticalPseudoTableBlocks(result: OcrResultPayload, options: Required<PageOcrOptions>): OcrResultPayload {
+  if (options.profile !== 'guji_print_vertical') return result
+  const blocks = asLayoutBlockResults(result.layout_result)
+  if (blocks.length === 0) return result
+  let downgradedCount = 0
+  const nextBlocks = blocks.map((block) => {
+    if (!isTableLabel(block.label)) return block
+    downgradedCount += 1
+    const rows = normalizeTableRows(firstRecordValue(block, ['rows', 'table_rows']))
+    const words = tableRowsToVerticalColumnText(rows) || tableRowsToText(rows) || getOcrBlockText(block)
+    const nextBlock: LayoutBlockResult = {
+      ...block,
+      words,
+      raw_words: words,
+      label: 'text',
+      rows: undefined,
+      table_rows: undefined,
+      tableRows: undefined,
+      cells: undefined,
+      table_cells: undefined,
+      tableCells: undefined,
+      html: undefined,
+      table_html: undefined,
+      tableHtml: undefined,
+      markdown: undefined,
+      md: undefined,
+      orientation: 'vertical',
+      segmentation_source: 'ocr',
+      pseudo_table_downgraded: true,
+    }
+    return nextBlock
+  })
+  if (downgradedCount === 0) return result
+  return rebuildWordsResultFromLayout({
+    ...result,
+    layout_result: nextBlocks,
+      guji_processing: {
+        ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+        downgraded_vertical_pseudo_tables: downgradedCount,
+        downgraded_vertical_tables: downgradedCount,
+      },
+  })
 }
 
 function normalizeOcrInlineText(value: string): string {
@@ -1544,18 +2274,22 @@ function applyLocalSecondPassSegmentation(result: OcrResultPayload, imagePath: s
   blocks.forEach((rawBlock) => {
     const block: LayoutBlockResult = {
       ...rawBlock,
-      orientation: inferOrientation(rawBlock),
+      orientation: options.profile === 'guji_print_vertical'
+        ? inferGujiVerticalOrientation(rawBlock)
+        : inferOrientation(rawBlock),
       segmentation_source: asSegmentationSource(rawBlock.segmentation_source) || 'ocr',
     }
 
-    if (!shouldSplitVerticalBlock(block)) {
+    const shouldSplitBlock = shouldSplitVerticalBlock(block)
+      || shouldProbeHorizontalBlockForVerticalColumns(block, options.profile === 'guji_print_vertical')
+    if (!shouldSplitBlock) {
       nextBlocks.push(block)
       return
     }
 
     const columns = analyzeVerticalColumns(imagePath, block)
     if (columns.length <= 1) {
-      nextBlocks.push(block)
+      nextBlocks.push(...splitMergedWideVerticalTextBlock(block))
       return
     }
 
@@ -1587,11 +2321,13 @@ function applyLocalSecondPassSegmentation(result: OcrResultPayload, imagePath: s
     })
   })
 
-  const orderedBlocks = annotateReadingOrder(nextBlocks)
-  return attachProcessingMeta(rebuildWordsResultFromLayout({
+  const orderedBlocks = annotateReadingOrder(nextBlocks, options.profile === 'guji_print_vertical')
+  const rebuilt = rebuildWordsResultFromLayout({
     ...result,
     layout_result: orderedBlocks,
-  }), options, imagePath)
+  })
+  const split = splitMergedWideVerticalTextLineBlocks(rebuilt, options)
+  return filterGujiTinyNoiseBlocks(attachProcessingMeta(split, options, imagePath), options)
 }
 
 function cropImageToDataUrl(filePath: string, location: LayoutLocation): string {
@@ -1701,11 +2437,12 @@ async function applyCloudColumnSecondPass(
   // narrow vertical columns. Keep the local column layout intact; text
   // dedupe happens when words_result is rebuilt below.
 
-  const orderedBlocks = annotateReadingOrder(nextBlocks)
-  return attachProcessingMeta(rebuildWordsResultFromLayout({
+  const orderedBlocks = annotateReadingOrder(nextBlocks, options.profile === 'guji_print_vertical')
+  const rebuilt = attachProcessingMeta(rebuildWordsResultFromLayout({
     ...locallySegmented,
     layout_result: orderedBlocks,
   }), options, imagePath)
+  return filterGujiTinyNoiseBlocks(rebuilt, options)
 }
 
 export async function postProcessRecognizedPageResult(
@@ -1716,8 +2453,17 @@ export async function postProcessRecognizedPageResult(
 ): Promise<OcrResultPayload> {
   throwIfAborted(runtimeOptions.signal)
   let resolved = resolveOcrOptions(options)
-  const autoVertical = imagePath && resolved.profile !== 'guji_print_vertical' && shouldAutoUseVerticalPostProcessing(result)
-  const workingResult = autoVertical ? normalizePageResult(result) : result
+  const normalizedInput = isOcrResultPayload(result) ? result : normalizePageResult(result)
+  const scaledInput = scaleOcrResultToOriginalImage(normalizedInput, runtimeOptions.uploadImage)
+  const coordinateCorrectedInput = correctRotatedOcrCoordinatesForSourceImage(scaledInput, imagePath, resolved)
+  const orientationNormalizedInput = resolved.profile === 'guji_print_vertical'
+    ? normalizeGujiVerticalBlockOrientation(coordinateCorrectedInput)
+    : coordinateCorrectedInput
+  const downgradedInput = downgradeVerticalPseudoTableBlocks(orientationNormalizedInput, resolved)
+  const workingResult = resolved.profile === 'guji_print_vertical'
+    ? clampGujiOcrResultToSourceImage(downgradedInput, imagePath)
+    : downgradedInput
+  const autoVertical = imagePath && resolved.profile !== 'guji_print_vertical' && shouldAutoUseVerticalPostProcessing(workingResult)
   if (autoVertical) {
     resolved = { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
   }
@@ -1979,6 +2725,7 @@ interface SyncRecognitionOptions {
 interface OcrRuntimeOptions {
   signal?: AbortSignal
   concurrency?: number
+  uploadImage?: OcrUploadImage | null
 }
 
 async function requestSyncRecognition(base64Image: string, options: SyncRecognitionOptions = {}): Promise<OcrResultPayload> {
@@ -1993,7 +2740,7 @@ async function requestSyncRecognition(base64Image: string, options: SyncRecognit
     useDocOrientationClassify: preferVertical,
     useTextlineOrientation: preferVertical,
     useDocUnwarping: false,
-    useChartRecognition: true,
+    useChartRecognition: !preferVertical,
     textDetLimitType: preferVertical ? 'max' : undefined,
     textDetLimitSideLen: preferVertical ? 2000 : undefined,
   }
@@ -2109,12 +2856,15 @@ export async function recognizePages(
 
       try {
         throwIfAborted(runtimeOptions.signal)
-        const imageBuffer = await prepareImageForOcrUpload(page.image_path)
+        const uploadImage = await prepareImageForOcrUpload(page.image_path)
         throwIfAborted(runtimeOptions.signal)
         const initialResult = resolvedOptions.profile === 'guji_print_vertical'
-          ? await recognizeTraditional(imageBuffer.toString('base64'), runtimeOptions)
-          : await recognizeImage(imageBuffer.toString('base64'), runtimeOptions)
-        const result = await postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions, runtimeOptions)
+          ? await recognizeTraditional(uploadImage.buffer.toString('base64'), runtimeOptions)
+          : await recognizeImage(uploadImage.buffer.toString('base64'), runtimeOptions)
+        const result = await postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions, {
+          ...runtimeOptions,
+          uploadImage,
+        })
         const text = result.words_result?.map((item) => item.words || '').join('\n') || ''
         const repeatedIssue = findSuspiciousRepeatedOcrText(result)
         if (repeatedIssue) {
@@ -2186,6 +2936,7 @@ interface PdfChunkPlan {
   wholePdfFallback?: boolean
   fallbackReason?: string
   fullFileUpload?: boolean
+  requireFullFileUpload?: boolean
   qpdfEnabled?: boolean
 }
 
@@ -2206,10 +2957,34 @@ interface RecognizePdfAsyncOptions {
   signal?: AbortSignal
   targetPageNums?: number[]
   fallbackPageCount?: number
+  ocrOptions?: PageOcrOptions
+  requireFullFileUpload?: boolean
+  pageRangeChunkSize?: number
 }
 
 interface AsyncPdfSubmitOptions {
   pageRanges?: string
+  optionalPayload?: JsonRecord
+}
+
+function getAsyncPdfOptionalPayload(_options?: PageOcrOptions, model?: AsyncOcrModel): JsonRecord | undefined {
+  if (model && !/^PaddleOCR-VL(?:-|$)/i.test(model) && !/^PP-Structure/i.test(model)) {
+    return undefined
+  }
+
+  return {
+    use_doc_preprocessor: false,
+    use_layout_detection: true,
+    use_doc_orientation_classify: false,
+    use_doc_unwarping: false,
+    use_chart_recognition: false,
+    use_seal_recognition: true,
+    use_ocr_for_image_block: false,
+    format_block_content: true,
+    merge_layout_blocks: true,
+    markdown_ignore_labels: ['number', 'footnote', 'header', 'header_image', 'footer', 'footer_image', 'aside_text'],
+    return_layout_polygon_points: true,
+  }
 }
 
 function getAsyncAuthHeaders(): Record<string, string> {
@@ -2282,6 +3057,13 @@ function normalizeTargetPageIndexes(totalPages: number, targetPageNums?: number[
   return indexes
 }
 
+function normalizeAsyncPdfPageRangeChunkSize(value: unknown, totalPages: number): number {
+  const pageCount = Math.max(0, Math.floor(Number(totalPages || 0)))
+  const requested = Math.floor(Number(value || 0))
+  if (!Number.isFinite(requested) || requested <= 0 || pageCount <= 0 || requested >= pageCount) return 0
+  return Math.max(1, Math.min(ASYNC_PDF_MAX_PAGES_PER_JOB, requested))
+}
+
 function isPdfStructureError(error: unknown): boolean {
   const message = String((error as Error)?.message || error || '')
   return /PDFDict|pdf-lib|copyPages|PDF 第 \d+ 页结构异常|Expected instance|instance of undefined/i.test(message)
@@ -2312,6 +3094,7 @@ function isLocalWholePdfUploadUnavailableError(error: unknown): boolean {
 }
 
 function shouldRetryWholePdfUploadWithChunking(error: unknown, plan: PdfChunkPlan): boolean {
+  if (plan.requireFullFileUpload) return false
   if (!plan.directFilePath || !(plan.fullFileUpload || plan.wholePdfFallback)) return false
   if (isOcrAbortError(error)) return false
   return isAsyncPdfUploadUnsupportedError(error) || isLocalWholePdfUploadUnavailableError(error)
@@ -2479,7 +3262,15 @@ async function ensurePlanSourcePdfLoaded(plan: PdfChunkPlan, signal?: AbortSigna
   return plan.sourcePdf
 }
 
-async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], signal?: AbortSignal, fallbackPageCount = 0, forceChunking = false): Promise<PdfChunkPlan> {
+async function createPdfChunkPlan(
+  filePath: string,
+  targetPageNums?: number[],
+  signal?: AbortSignal,
+  fallbackPageCount = 0,
+  forceChunking = false,
+  requireFullFileUpload = false,
+  pageRangeChunkSize = 0,
+): Promise<PdfChunkPlan> {
   throwIfAborted(signal)
   const stats = await stat(filePath)
   throwIfAborted(signal)
@@ -2489,17 +3280,23 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
     && canAttemptWholePdfUpload(stats.size, fallbackTotalPages)
   ) {
     const targetPageIndexes = normalizeTargetPageIndexes(fallbackTotalPages, targetPageNums)
+    const directPageRangeChunkSize = requireFullFileUpload ? 0 : normalizeAsyncPdfPageRangeChunkSize(pageRangeChunkSize, targetPageIndexes.length)
     return {
       sourcePdf: null,
       sourcePath: filePath,
       totalPages: fallbackTotalPages,
       targetPageIndexes,
       sourceSize: stats.size,
-      estimatedPagesPerChunk: fallbackTotalPages,
-      estimatedTotalChunks: targetPageIndexes.length > 0 ? 1 : 0,
+      estimatedPagesPerChunk: directPageRangeChunkSize || fallbackTotalPages,
+      estimatedTotalChunks: targetPageIndexes.length > 0
+        ? directPageRangeChunkSize
+          ? Math.ceil(targetPageIndexes.length / directPageRangeChunkSize)
+          : 1
+        : 0,
       tempRoot: null,
       directFilePath: filePath,
       fullFileUpload: true,
+      requireFullFileUpload,
       qpdfEnabled: false,
     }
   }
@@ -2531,6 +3328,7 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
       directFilePath: filePath,
       wholePdfFallback: true,
       fallbackReason,
+      requireFullFileUpload,
       qpdfEnabled,
     }
   }
@@ -2554,6 +3352,7 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
       directFilePath: filePath,
       wholePdfFallback: true,
       fallbackReason,
+      requireFullFileUpload,
       qpdfEnabled,
     }
   }
@@ -2570,6 +3369,7 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
       estimatedTotalChunks: 0,
       tempRoot: null,
       directFilePath: null,
+      requireFullFileUpload,
       qpdfEnabled,
     }
   }
@@ -2578,19 +3378,27 @@ async function createPdfChunkPlan(filePath: string, targetPageNums?: number[], s
     !forceChunking
     && canAttemptWholePdfUpload(stats.size, totalPages)
   ) {
+    const directPageRangeChunkSize = requireFullFileUpload ? 0 : normalizeAsyncPdfPageRangeChunkSize(pageRangeChunkSize, targetPageIndexes.length)
     return {
       sourcePdf,
       sourcePath: filePath,
       totalPages,
       targetPageIndexes,
       sourceSize: stats.size,
-      estimatedPagesPerChunk: totalPages,
-      estimatedTotalChunks: 1,
+      estimatedPagesPerChunk: directPageRangeChunkSize || totalPages,
+      estimatedTotalChunks: directPageRangeChunkSize
+        ? Math.ceil(targetPageIndexes.length / directPageRangeChunkSize)
+        : 1,
       tempRoot: null,
       directFilePath: filePath,
       fullFileUpload: true,
+      requireFullFileUpload,
       qpdfEnabled,
     }
+  }
+
+  if (requireFullFileUpload) {
+    throw new Error('古籍竖排 OCR 需要整本 PDF 原文件上传；当前 PDF 必须分片或选择页码上传，已停止以避免单页 PDF 坐标偏移。')
   }
 
   const tempRoot = join(tmpdir(), `gujismart-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
@@ -2634,7 +3442,17 @@ async function createPdfChunkFromPlan(plan: PdfChunkPlan, targetCursor: number, 
 
   if (plan.directFilePath) {
     const allPageIndexes = Array.from({ length: plan.totalPages }, (_, index) => index)
-    const sourcePageIndexes = plan.targetPageIndexes
+    const targetPageIndexes = plan.requireFullFileUpload ? allPageIndexes : plan.targetPageIndexes
+    const pagesPerChunk = plan.requireFullFileUpload
+      ? targetPageIndexes.length
+      : Math.min(
+        Math.max(1, plan.estimatedPagesPerChunk || targetPageIndexes.length),
+        ASYNC_PDF_MAX_PAGES_PER_JOB,
+        targetPageIndexes.length - targetCursor,
+      )
+    const sourcePageIndexes = plan.requireFullFileUpload
+      ? allPageIndexes
+      : targetPageIndexes.slice(targetCursor, targetCursor + Math.max(0, pagesPerChunk))
     const isFullPageSelection = sourcePageIndexes.length === allPageIndexes.length
       && sourcePageIndexes.every((pageIndex, index) => pageIndex === index)
     const pageRanges = isFullPageSelection ? undefined : toQpdfPageRange(sourcePageIndexes)
@@ -2651,7 +3469,7 @@ async function createPdfChunkFromPlan(plan: PdfChunkPlan, targetCursor: number, 
       resultPageIndexes,
       pageRanges,
       uploadPageCount: resultPageIndexes ? (pageRanges ? sourcePageIndexes.length : plan.totalPages) : undefined,
-      totalChunks: resultPageIndexes ? 1 : undefined,
+      totalChunks: resultPageIndexes ? Math.max(1, plan.estimatedTotalChunks || 1) : undefined,
       fallbackWholePdf: plan.wholePdfFallback,
       fallbackReason: plan.fallbackReason,
       fullFileUpload: Boolean(resultPageIndexes),
@@ -2836,6 +3654,9 @@ async function submitAsyncPdfJob(
         if (submitOptions.pageRanges) {
           formData.append('pageRanges', submitOptions.pageRanges)
         }
+        if (submitOptions.optionalPayload) {
+          formData.append('optionalPayload', JSON.stringify(submitOptions.optionalPayload))
+        }
         formData.append('file', fileBlob, getSafeOcrUploadFilename(filePath))
 
         const response = await fetchWithTimeout(ASYNC_OCR_ENDPOINT, {
@@ -2989,12 +3810,15 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
     } else if (Date.now() - lastProgressAt > ASYNC_JOB_STALLED_TIMEOUT_MS) {
       throw new Error('PaddleOCR 异步任务长时间没有进展。请稍后继续 OCR，已经保存的页面会自动跳过。')
     }
+    if (allPagesCompleted && !jsonUrl) {
+      statusPayload.awaitingResultFile = true
+    }
     statusPayload.pollCount = pollCount
     statusPayload.waitingMs = Date.now() - lastProgressAt
     onProgress?.(statusPayload)
     if (state === 'success' || state === 'completed' || state === 'succeeded' || state === 'done') {
       if (!jsonUrl) {
-        throw new Error('异步 OCR 已完成，但未返回结果地址')
+        throw new Error(`${ASYNC_RESULT_FILE_NOT_READY_PREFIX} 异步 OCR 已完成，但未返回结果地址`)
       }
       return jsonUrl
     }
@@ -3006,7 +3830,7 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
     if (allPagesCompleted) {
       allPagesCompletedAt = allPagesCompletedAt || Date.now()
       if (Date.now() - allPagesCompletedAt > ASYNC_RESULT_READY_GRACE_MS) {
-        throw new Error('PaddleOCR 已显示全部页面处理完成，但结果文件长时间未生成。请稍后点击“继续 OCR”重试，已保存的页面会自动跳过。')
+        throw new Error(`${ASYNC_RESULT_FILE_NOT_READY_PREFIX} PaddleOCR 已显示全部页面处理完成，但结果文件长时间未生成。请稍后点击“继续 OCR”重试，已保存的页面会自动跳过。`)
       }
     } else {
       allPagesCompletedAt = 0
@@ -3096,11 +3920,53 @@ function looksLikeWholeJsonFallback(value: string): boolean {
   return trimmed.startsWith('{') || trimmed.startsWith('[')
 }
 
+function getAsyncResultDownloadTimeoutError(): Error {
+  return new Error(`${ASYNC_RESULT_FILE_NOT_READY_PREFIX} 异步 OCR 结果下载长时间没有返回数据。请稍后点击“继续 OCR”重试，已保存的页面会自动跳过。`)
+}
+
+function readAsyncResultChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  throwIfAborted(signal)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      void reader.cancel().catch(() => undefined)
+      reject(error)
+    }
+    const timer = setTimeout(() => {
+      fail(getAsyncResultDownloadTimeoutError())
+    }, ASYNC_RESULT_DOWNLOAD_IDLE_TIMEOUT_MS)
+    const onAbort = () => {
+      fail(new OcrAbortError())
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    reader.read()
+      .then((chunk) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(chunk)
+      })
+      .catch((error) => {
+        fail(error instanceof Error ? error : new Error(String(error || '异步 OCR 结果下载失败')))
+      })
+  })
+}
+
 async function fetchAsyncPdfJsonLines(jsonUrl: string, model: AsyncOcrModel, signal?: AbortSignal): Promise<unknown[]> {
   throwIfAborted(signal)
-  const response = await fetchWithTimeout(jsonUrl, { signal }, getOcrUploadTimeoutMs(), '异步 OCR 结果下载超时，请稍后重试。')
+  const response = await fetchWithTimeout(jsonUrl, { signal }, ASYNC_RESULT_DOWNLOAD_IDLE_TIMEOUT_MS, `${ASYNC_RESULT_FILE_NOT_READY_PREFIX} 异步 OCR 结果下载超时，请稍后重试。`)
   if (!response.ok) {
-    throw new Error(`异步 OCR 结果下载失败，状态码 ${response.status}`)
+    throw new Error(`${ASYNC_RESULT_FILE_NOT_READY_PREFIX} 异步 OCR 结果下载失败，状态码 ${response.status}`)
   }
 
   const reader = response.body?.getReader()
@@ -3117,7 +3983,7 @@ async function fetchAsyncPdfJsonLines(jsonUrl: string, model: AsyncOcrModel, sig
 
   while (true) {
     throwIfAborted(signal)
-    const { value, done } = await reader.read()
+    const { value, done } = await readAsyncResultChunkWithTimeout(reader, signal)
     const chunk = value ? decoder.decode(value, { stream: !done }) : ''
     if (chunk) {
       buffer += chunk
@@ -3198,8 +4064,17 @@ async function normalizeAsyncPdfChunkResults(pagePayloads: unknown[], chunk: Pdf
 export async function recognizePdfAsync(filePath: string, onProgress?: (payload: AsyncJobStatusPayload) => void, options?: RecognizePdfAsyncOptions): Promise<Array<OcrResultPayload | null>> {
   const model = normalizeAsyncOcrModel(options?.model || getAsyncOcrModel())
   const signal = options?.signal
+  const optionalPayload = getAsyncPdfOptionalPayload(options?.ocrOptions, model)
   throwIfAborted(signal)
-  let plan = await createPdfChunkPlan(filePath, options?.targetPageNums, signal, options?.fallbackPageCount)
+  let plan = await createPdfChunkPlan(
+    filePath,
+    options?.targetPageNums,
+    signal,
+    options?.fallbackPageCount,
+    false,
+    Boolean(options?.requireFullFileUpload),
+    options?.pageRangeChunkSize,
+  )
   let retriedWholePdfUploadWithChunks = false
 
   while (true) {
@@ -3325,7 +4200,7 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
           uploadPageCount: chunk.uploadPageCount,
           progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
         })
-      }, { pageRanges: chunk.pageRanges })
+      }, { pageRanges: chunk.pageRanges, optionalPayload })
       const jsonUrl = await waitForAsyncPdfResult(jobId, (payload) => {
         const chunkCompleted = getChunkCompletedPages(chunk, payload)
         const chunkTotal = getTotalPages(payload, chunk.uploadPageCount || chunk.pageCount)
@@ -3397,7 +4272,15 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
         progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
         fallbackReason: '整本 PDF 上传失败，正在重新提交 PDF',
       })
-      retryPlan = await createPdfChunkPlan(filePath, options?.targetPageNums, signal, options?.fallbackPageCount, true)
+      retryPlan = await createPdfChunkPlan(
+        filePath,
+        options?.targetPageNums,
+        signal,
+        options?.fallbackPageCount,
+        true,
+        Boolean(options?.requireFullFileUpload),
+        options?.pageRangeChunkSize,
+      )
     } else {
       throw error
     }

@@ -18,7 +18,7 @@ import {
   SettingOutlined,
 } from '@ant-design/icons'
 import OpenCC from 'opencc-js'
-import type { AiLayoutCacheItem, Document, DocumentPage, ReaderTranslationOptions, ReaderTranslationPayload, ResearchNote, ResearchProject, SearchHitLocator, SearchSessionState, TocItemSource, TocItemV2 } from '@shared/types'
+import type { AiLayoutCacheItem, Document, DocumentPage, ReaderTranslationOptions, ReaderTranslationPayload, ResearchNote, ResearchProject, SearchHitLocator, SearchSessionState, TocItemSource, TocItemV2, TranslationMode, TranslationUnitV1 } from '@shared/types'
 import { getCitationPageNumber, getReadablePageElements, getReadablePageText, type ReadablePageElement } from '../utils/ocrText'
 import { renderOcrInlineText } from '../utils/ocrInlineRender'
 import { buildViewerSearchHits } from '../utils/searchHitCount'
@@ -157,6 +157,7 @@ interface SourcePageReaderProps {
   sourceLabel?: string
   searchSession?: SearchSessionState
   pageTranslations?: Record<string, string>
+  pageTranslationUnits?: Record<string, TranslationUnitV1[]>
   translatingPageIds?: Record<string, boolean>
   skippedTranslationPageIds?: Record<string, boolean>
   translationGlossaryProjectId?: string
@@ -164,6 +165,7 @@ interface SourcePageReaderProps {
   selectedTextForGlossary?: string
   displayScript?: ReaderDisplayScript
   bookTranslationRequest?: number
+  translationMode?: TranslationMode
   onDisplayScriptChange?: (script: ReaderDisplayScript) => void
   onPageIndexChange: (pageIndex: number) => void
   onSearchKeywordChange?: (keyword: string) => void
@@ -171,6 +173,9 @@ interface SourcePageReaderProps {
   onContextTextChange?: (text: string) => void
   onDocumentMetadataChange?: (metadata: JsonRecord) => void
   onTranslateCurrentPage?: (payload: ReaderTranslationPayload, options?: ReaderTranslationOptions) => void
+  onTranslationModeChange?: (mode: TranslationMode) => void
+  onUpdateTranslationUnit?: (pageId: string, unitId: string, translationText: string) => Promise<void> | void
+  onRetranslateTranslationUnit?: (payload: ReaderTranslationPayload, unitId: string) => Promise<void> | void
   onTranslationGlossaryProjectChange?: (projectId: string) => void
   onAddSelectedTerm?: () => void
   onReaderStateChange?: (state: {
@@ -2470,6 +2475,7 @@ export default function SourcePageReader({
   sourceLabel = '',
   searchSession,
   pageTranslations = {},
+  pageTranslationUnits = {},
   translatingPageIds = {},
   skippedTranslationPageIds = {},
   translationGlossaryProjectId = '',
@@ -2477,6 +2483,7 @@ export default function SourcePageReader({
   selectedTextForGlossary = '',
   displayScript = 'original',
   bookTranslationRequest = 0,
+  translationMode = 'balanced',
   onDisplayScriptChange,
   onPageIndexChange,
   onSearchKeywordChange,
@@ -2484,6 +2491,9 @@ export default function SourcePageReader({
   onContextTextChange,
   onDocumentMetadataChange,
   onTranslateCurrentPage,
+  onTranslationModeChange,
+  onUpdateTranslationUnit,
+  onRetranslateTranslationUnit,
   onTranslationGlossaryProjectChange,
   onAddSelectedTerm,
   onReaderStateChange,
@@ -4573,6 +4583,16 @@ export default function SourcePageReader({
           <span style={{ color: translationOpen ? '#d6a85f' : 'var(--gs-text-secondary)', fontSize: 12 }}>翻译模式</span>
           {translationOpen ? (
             <>
+              <Segmented
+                size="small"
+                value={translationMode}
+                onChange={(value) => onTranslationModeChange?.(value as TranslationMode)}
+                options={[
+                  { value: 'fast', label: '快速' },
+                  { value: 'balanced', label: '均衡' },
+                  { value: 'quality', label: '高质量' },
+                ]}
+              />
               <LlmProfileSelector width={170} />
               <Select
                 size="small"
@@ -4593,6 +4613,23 @@ export default function SourcePageReader({
                 onClick={() => onAddSelectedTerm?.()}
               >
                 加入术语
+              </Button>
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                disabled={!translationPageId || !translationPage || !translationSourceText}
+                onClick={() => {
+                  if (!translationPageId || !translationPage || !translationSourceText) return
+                  onTranslateCurrentPage?.({
+                    pageId: translationPageId,
+                    readerPageKey: translationPageId,
+                    cachePageId: getTranslationCachePageId(translationPage),
+                    pageNum: Number(translationPage.page_num || translationPageIndex + 1),
+                    text: translationSourceText,
+                  }, { priority: 'current', force: true })
+                }}
+              >
+                重译本页
               </Button>
             </>
           ) : null}
@@ -4658,6 +4695,7 @@ export default function SourcePageReader({
                   pageLabel={translationPageLabel}
                   sourceText={translationSourceText}
                   translationText={activeTranslationText}
+                  units={pageTranslationUnits[translationPageId || ''] || []}
                   loading={activeTranslationLoading}
                   skipped={activeTranslationSkipped}
                   themeName={theme}
@@ -4669,6 +4707,18 @@ export default function SourcePageReader({
                   activeSegmentId={activeParallelSegmentId}
                   onActiveSegmentChange={setActiveParallelSegmentId}
                   onSelectedTextChange={onSelectedTextChange}
+                  onUpdateUnit={onUpdateTranslationUnit
+                    ? (unitId, translationText) => onUpdateTranslationUnit(translationPageId || '', unitId, translationText)
+                    : undefined}
+                  onRetranslateUnit={onRetranslateTranslationUnit && translationPage
+                    ? (unitId) => onRetranslateTranslationUnit({
+                        pageId: translationPageId || '',
+                        readerPageKey: translationPageId || '',
+                        cachePageId: getTranslationCachePageId(translationPage),
+                        pageNum: Number(translationPage.page_num || translationPageIndex + 1),
+                        text: translationSourceText,
+                      }, unitId)
+                    : undefined}
                   onClose={() => setTranslationOpen(false)}
                 />
               ) : (

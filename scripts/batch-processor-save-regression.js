@@ -47,7 +47,11 @@ assert(
 assert(
   postProcessPdfResultsBatchedBody.includes('index += BATCH_RESULT_POSTPROCESS_CHUNK_SIZE')
     && postProcessPdfResultsBatchedBody.includes('await yieldToEventLoop()')
-    && postProcessPdfResultsBatchedBody.includes('postProcessRecognizedPageResult'),
+    && postProcessPdfResultsBatchedBody.includes('postProcessRecognizedPageResult')
+    && postProcessPdfResultsBatchedBody.includes('const postProcessOptions = getAsyncPdfPostProcessOptions(ocrOptions)')
+    && postProcessPdfResultsBatchedBody.includes('postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions')
+    && batchSource.includes('function getAsyncPdfPostProcessOptions')
+    && batchSource.includes("secondPass: 'none'"),
   'Legacy batch PDF OCR results should be post-processed in small chunks while yielding between chunks.',
 )
 assert(
@@ -124,6 +128,11 @@ assert(
   'Legacy batch processor should be able to resume persisted queue items and write terminal item status back to batch_queue.',
 )
 assert(
+  batchSource.includes("AND p.ocr_status = 'completed'\n               AND ${pageContentAvailableCondition('p')}")
+    && !batchSource.includes("p.ocr_status = 'completed'\n                 OR ${pageContentAvailableCondition('p')}"),
+  'Legacy batch queue reconciliation should not treat false-completed OCR error placeholders as finished pages.',
+)
+assert(
   batchSource.includes('private getPagesNeedingOcr')
     && processBatchBody.includes('let pagesForOcr = this.getPagesNeedingOcr(pages)')
     && processBatchBody.includes('recognizePages(pagesForOcr')
@@ -133,9 +142,16 @@ assert(
   'Legacy batch OCR resume should process only unfinished pages and pass target page numbers to async PDF OCR.',
 )
 assert(
-  asyncPdfBranchBody.includes('pagesForOcr.map((page, index) => ({ page, sourcePageIndex: Number(page.page_num || index + 1) - 1, resultIndex: index }))')
+  batchSource.includes('const BATCH_GUJI_ASYNC_PDF_PAGE_RANGE_CHUNK_SIZE = 25')
+    && asyncPdfBranchBody.includes('const requireFullFileUpload = false')
+    && asyncPdfBranchBody.includes("const pageRangeChunkSize = ocrOptions.profile === 'guji_print_vertical'")
+    && asyncPdfBranchBody.includes('pageRangeChunkSize,')
+    && asyncPdfBranchBody.includes('const targetPageNumSet = new Set(targetPageNums || [])')
+    && asyncPdfBranchBody.includes('resultIndex: requireFullFileUpload ? sourcePageIndex : resultIndex')
+    && asyncPdfBranchBody.includes('return targetPageNumSet.has(Number(item.page.page_num || item.sourcePageIndex + 1))')
+    && asyncPdfBranchBody.includes('return { page, sourcePageIndex, resultIndex: requireFullFileUpload ? sourcePageIndex : index }')
     && !asyncPdfBranchBody.includes('pages.map((page, index) => ({ page, sourcePageIndex: index, resultIndex: index }))'),
-  'Legacy batch async PDF fallback should not post-process already completed pages during resume.',
+  'Legacy batch async PDF resume should save only target pages and use Feijiang-compatible original-PDF pageRanges chunks for guji OCR.',
 )
 
 console.log('Batch processor OCR save regression passed.')

@@ -377,6 +377,7 @@ export type OcrIrOrientationSource =
   | 'coordinate'
   | 'page_consensus'
   | 'document_consensus'
+  | 'manual'
   | 'unknown'
 export type OcrReadingOrderSource = 'ocr' | 'coordinate' | 'source'
 export type OcrIrSourceEngine = OcrEngine | 'native_pdf_text' | 'imported' | 'unknown'
@@ -960,6 +961,90 @@ export interface BackgroundTaskProgressEvent {
 }
 
 export type TranslationStyle = 'academic_smooth' | (string & {})
+export type TranslationMode = 'fast' | 'balanced' | 'quality'
+export type TranslationUnitStatus = 'pending' | 'processing' | 'ready' | 'stale' | 'error' | 'skipped'
+export type TranslationSearchScope = 'all' | 'source' | 'translation'
+
+export interface TranslationUnitV1 {
+  id: string
+  docId: string
+  pageId: string
+  pageNum: number
+  blockId: string
+  blockIndex: number
+  order: number
+  blockType: string
+  sourceText: string
+  sourceHash: string
+  translationText: string
+  targetLanguage: 'zh-CN'
+  mode: TranslationMode
+  modelSignature: string
+  glossarySignature: string
+  status: TranslationUnitStatus
+  manualOverride: boolean
+  stale: boolean
+  skipped: boolean
+  quality: Record<string, unknown>
+  sourceRect?: {
+    left: number
+    top: number
+    width: number
+    height: number
+  } | null
+  sourceIndex?: number | null
+  createdAt?: string | null
+  updatedAt?: string | null
+}
+
+export interface PageTranslationRequest {
+  taskId?: string
+  docId: string
+  pageId: string
+  mode?: TranslationMode
+  glossaryProjectId?: string | null
+  style?: TranslationStyle
+  force?: boolean
+  unitIds?: string[]
+  priority?: ReaderTranslationPriority
+  documentTitle?: string
+  pageContextBefore?: string
+  pageContextAfter?: string
+}
+
+export interface PageTranslationProgressEvent {
+  taskId: string
+  docId: string
+  pageId: string
+  pageNum: number
+  mode: TranslationMode
+  completedBatches: number
+  totalBatches: number
+  units: TranslationUnitV1[]
+  sourceText: string
+  translationText: string
+}
+
+export interface PageTranslationResult {
+  taskId: string
+  docId: string
+  pageId: string
+  pageNum: number
+  mode: TranslationMode
+  units: TranslationUnitV1[]
+  sourceText: string
+  translationText: string
+  translatedCount: number
+  cachedCount: number
+  failedCount: number
+  skippedCount: number
+  complete: boolean
+}
+
+export interface TranslationUnitUpdatePayload {
+  translationText: string
+  manualOverride?: boolean
+}
 
 export interface TranslationCacheKeyOptions {
   docId?: string | null
@@ -993,6 +1078,7 @@ export interface BookTranslationProgressEvent {
 export interface BookTranslationOptions {
   glossaryProjectId?: string | null
   style?: TranslationStyle
+  mode?: TranslationMode
   concurrency?: number
   retryFailedOnly?: boolean
   clearCache?: boolean
@@ -1015,6 +1101,7 @@ export interface ReaderTranslationPayload {
 
 export interface ReaderTranslationOptions {
   priority?: ReaderTranslationPriority
+  force?: boolean
 }
 
 export interface MetadataReclassificationProgressEvent {
@@ -1214,6 +1301,7 @@ export interface OpenDocumentTarget {
   sourceLabel?: string
   highlightColor?: string
   startReaderBookTranslation?: boolean
+  openTranslation?: boolean
 }
 
 export interface Folder {
@@ -1829,6 +1917,9 @@ export interface SearchHitLocator {
   docId: string
   segmentId: string
   sourceType?: string
+  blockId?: string | null
+  translationUnitId?: string | null
+  translationSource?: boolean
   pageId?: string | null
   pageNum?: number | null
   pageIndex?: number | null
@@ -2257,6 +2348,10 @@ export interface AiTaskOptions {
   documentTitle?: string
   pageContextBefore?: string
   pageContextAfter?: string
+  translationUnits?: boolean
+  translationMode?: TranslationMode
+  translationReview?: boolean
+  previousTranslation?: string
   snippets?: string
   pageNum?: number
   [key: string]: unknown
@@ -2436,6 +2531,7 @@ export interface SearchOptions {
   citationStyleId?: string
   citationTemplateId?: string
   previewOnly?: boolean
+  translationScope?: TranslationSearchScope
 }
 
 export interface SearchExportOptions {

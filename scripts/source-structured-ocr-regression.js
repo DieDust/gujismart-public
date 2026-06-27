@@ -177,7 +177,28 @@ async function run() {
     assert(rawLayoutState.text.includes(rawLayoutMissingText), `Expected raw-only missing text in reader, saw ${JSON.stringify(rawLayoutState)}`)
 
     await win.evaluate((id) => window.__smokeOpenDocument({ docId: id, pageIndex: 2 }), docId)
-    await win.waitForFunction((marker) => (document.querySelector('main')?.textContent || '').includes(marker), repeatedOcrLine, { timeout: 12000 })
+    await win.waitForTimeout(300)
+    const pageThreeAlreadyVisible = await win.evaluate((marker) => (
+      (document.querySelector('main')?.textContent || '').includes(marker)
+    ), repeatedOcrLine)
+    if (!pageThreeAlreadyVisible) {
+      await win.evaluate(() => {
+        document.querySelector('[data-reader-page-next="true"]')?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      })
+    }
+    try {
+      await win.waitForFunction((marker) => (document.querySelector('main')?.textContent || '').includes(marker), repeatedOcrLine, { timeout: 12000 })
+    } catch (error) {
+      const debugState = await win.evaluate(() => ({
+        mainText: (document.querySelector('main')?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 1600),
+        sourcePages: Array.from(document.querySelectorAll('[data-source-reader-page="true"]')).map((node) => ({
+          pageNum: node.getAttribute('data-source-page-num'),
+          text: (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 500),
+        })),
+      }))
+      console.error('Structured OCR page 3 debug state:', JSON.stringify(debugState))
+      throw error
+    }
     const repeatedState = await win.evaluate((marker) => {
       const text = (document.querySelector('main')?.textContent || '').replace(/\s+/g, ' ').trim()
       const anchorText = Array.from(document.querySelectorAll('[data-source-anchor="true"]'))

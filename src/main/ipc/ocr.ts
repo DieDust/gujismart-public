@@ -1,15 +1,21 @@
-import { ipcMain, nativeImage } from 'electron'
-import { statSync } from 'fs'
+import { app, ipcMain, nativeImage } from 'electron'
+import { existsSync, mkdirSync, statSync } from 'fs'
+import { readdir, readFile, rm, writeFile } from 'fs/promises'
+import { basename, delimiter, dirname, join, parse } from 'path'
 import { nanoid } from 'nanoid'
 import { autoExtractAndApply } from '../ai'
-import { clearPageSearchIndexForDocuments, queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { clearPageSearchIndexForDocuments, getDataDir, queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { autoCleanupPdfAssetsIfEnabled, restorePdfAssetForDocument } from '../pdf-assets'
 import { analyzePdfTextLayer } from '../pdf-preflight'
+import { allowFileAccessPath } from '../file-access'
+import { markLibraryStateCacheDirty } from '../library-state-cache'
 import {
   findSuspiciousRepeatedOcrText,
   formatSuspiciousRepeatedOcrTextIssue,
   getOcrDocumentConcurrency,
+  type OcrRepeatedTextIssue,
   type OcrPageRecord,
+  type OcrPageProgressPayload,
   type OcrPageResult,
   type PageOcrOptions,
   postProcessRecognizedPageResult,
@@ -20,6 +26,7 @@ import {
   recognizePages,
   recognizePdfAsync,
   recognizeTraditional,
+  normalizePageResult,
   shouldUseAsyncPdfOcr,
 } from '../ocr'
 import { emitBackgroundTaskStatus } from '../background-tasks'
@@ -47,6 +54,10 @@ const AUTO_METADATA_START_DELAY_MS = 5_000
 const OCR_PAGE_INSERT_CHUNK_SIZE = 50
 const OCR_RESULT_SAVE_CHUNK_SIZE = 50
 const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = 50
+const OCR_ASYNC_PDF_PAGE_FALLBACK_LIMIT = 6
+const OCR_ASYNC_PDF_GUJI_PAGE_FALLBACK_CONCURRENCY = 1
+const OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE = 25
+const OCR_AUTO_FAILED_PAGE_RETRY_LIMIT = 24
 const OCR_FINALIZE_PAGE_CHUNK_SIZE = 250
 const OCR_FINALIZE_PAGE_LOOKUP_CHUNK_SIZE = 500
 const OCR_STATUS_EVENT_THROTTLE_MS = 250
@@ -55,12 +66,19 @@ const OCR_CANCELED_MESSAGE = 'OCR 已取消'
 const HEAVY_PDF_DOC_SIZE_BYTES = 200 * 1024 * 1024
 const HEAVY_PDF_DOC_PAGE_COUNT = 1000
 const RECOVERABLE_BATCH_OCR_PREFIX = 'recoverable_ocr'
+const OCR_LAYOUT_QUALITY_REJECTED_PREFIX = '[layout_quality_rejected]'
+const OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
+const OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX = '[async_pdf_quality_retryable]'
+const OCR_ORIGINAL_PDF_RETRY_ATTEMPTS = 3
+const OCR_FEIJIANG_REFERENCE_ENV = 'GUJISMART_OCR_REFERENCE_JSON_DIR'
 
 type JsonRecord = Record<string, unknown>
 type OcrDocumentRow = Document
 type OcrPageRow = DocumentPage
-type OcrPageWithImage = OcrPageRecord & { image_path: string }
+type OcrPageWithImage = OcrPageRow & { image_path: string }
+type OcrPageResultPayload = NonNullable<OcrPageResult['result']>
 type OcrVersionPageRow = Pick<DocumentPage, 'id' | 'doc_id' | 'page_num'>
+type QualityFailureOcrSaveResult = 'not_quality_failure' | 'saved_error' | 'recovered'
 type OcrSavePageSnapshot = OcrVersionPageRow & {
   image_path: string | null
   proofed_text: string | null
@@ -77,7 +95,34 @@ interface OcrVersionWrite {
   text: string
   status: string
 }
+interface FeijiangOcrReference {
+  path: string
+  pages: unknown[]
+}
 type OcrResultRecord = OcrRecognizeResult & JsonRecord
+type PdfJsDocument = {
+  numPages: number
+  getPage: (pageNumber: number) => Promise<PdfJsPage>
+  destroy?: () => Promise<void> | void
+}
+type PdfJsPage = {
+  getViewport: (options: { scale: number }) => { width: number; height: number }
+  render: (options: Record<string, unknown>) => { promise: Promise<void> }
+  cleanup?: () => void
+}
+type PdfJsModule = {
+  getDocument: (options: Record<string, unknown>) => { promise: Promise<PdfJsDocument> }
+  AnnotationMode?: { DISABLE?: number }
+}
+type CanvasLike = {
+  getContext: (context: '2d') => Record<string, unknown>
+  toBuffer: (mime: 'image/jpeg', quality?: number) => Buffer
+}
+type CanvasModule = {
+  createCanvas: (width: number, height: number) => CanvasLike
+}
+
+const feijiangOcrReferenceCache = new Map<string, Promise<FeijiangOcrReference | null>>()
 
 interface ActiveOcrTask {
   controller: AbortController
@@ -95,6 +140,34 @@ interface SavePageOcrResultsOptions {
   onTocDirtyDocIds?: (docIds: string[]) => void
   deferFinalize?: boolean
   deferDatabaseSave?: boolean
+}
+interface SavePageQualityFailureOptions {
+  pageOptions?: PageOcrOptions
+  ocrOptions?: Required<PageOcrOptions>
+  signal?: AbortSignal
+}
+
+interface AsyncPdfOcrRouteRisk {
+  reason: string
+  ocrOptions: Required<PageOcrOptions>
+  requireFullFileUpload?: boolean
+  pageRangeChunkSize?: number
+  preferPageImage?: boolean
+}
+
+interface RiskyPageImageOcrRouteOptions {
+  docType?: string | null
+  signal?: AbortSignal
+  onProgress?: (payload: OcrPageProgressPayload) => void
+}
+
+interface PageImageCropSpec {
+  id: string
+  x: number
+  y: number
+  width: number
+  height: number
+  readingOrder: number
 }
 
 const activeOcrTasks = new Map<string, ActiveOcrTask>()
@@ -356,6 +429,55 @@ function getOcrResultText(result: unknown): string {
     .join('\n')
 }
 
+function clearDocumentOcrRoutePreference(docId: string): void {
+  const currentMetadata = queryOne<Pick<OcrDocumentRow, 'metadata'>>(
+    'SELECT metadata FROM documents WHERE id = ?',
+    [docId],
+  )?.metadata
+  const metadata = parseMetadata(currentMetadata)
+  if (
+    !metadata.ocr_route_preference
+    && !metadata.ocr_route_reason
+    && !metadata.ocr_route_updated_at
+    && !metadata.ocr_last_quality_issue
+    && !metadata.ocr_last_quality_issue_updated_at
+  ) return
+  delete metadata.ocr_route_preference
+  delete metadata.ocr_route_reason
+  delete metadata.ocr_route_updated_at
+  delete metadata.ocr_last_quality_issue
+  delete metadata.ocr_last_quality_issue_updated_at
+  run('UPDATE documents SET metadata = ?, updated_at = ? WHERE id = ?', [
+    JSON.stringify(metadata),
+    new Date().toISOString(),
+    docId,
+  ])
+  markLibraryStateCacheDirty()
+  scheduleDatabaseSave()
+}
+
+function markDocumentPreferPageImageOcr(docId: string, reason: string): void {
+  const currentMetadata = queryOne<Pick<OcrDocumentRow, 'metadata'>>(
+    'SELECT metadata FROM documents WHERE id = ?',
+    [docId],
+  )?.metadata
+  const metadata = parseMetadata(currentMetadata)
+  const currentReason = String(metadata.ocr_last_quality_issue || '').trim()
+  if (currentReason === reason && !metadata.ocr_route_preference) return
+  metadata.ocr_last_quality_issue = reason
+  metadata.ocr_last_quality_issue_updated_at = new Date().toISOString()
+  delete metadata.ocr_route_preference
+  delete metadata.ocr_route_reason
+  delete metadata.ocr_route_updated_at
+  run('UPDATE documents SET metadata = ?, updated_at = ? WHERE id = ?', [
+    JSON.stringify(metadata),
+    new Date().toISOString(),
+    docId,
+  ])
+  markLibraryStateCacheDirty()
+  scheduleDatabaseSave()
+}
+
 function getPageResultRecord(pageResult: OcrPageResult): OcrResultRecord | null {
   return isJsonRecord(pageResult.result) ? pageResult.result as OcrResultRecord : null
 }
@@ -598,6 +720,15 @@ function formatDurationMs(value: number): string {
 function formatOcrError(error: unknown): string {
   if (isOcrAbortError(error)) return OCR_CANCELED_MESSAGE
   const message = (error as Error)?.message || String(error || '')
+  if (message.includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)) {
+    return message.replace(OCR_LAYOUT_QUALITY_REJECTED_PREFIX, '').trim()
+  }
+  if (message.includes(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX)) {
+    return message.replace(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX, '').trim()
+  }
+  if (message.includes(OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX)) {
+    return message.replace(OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX, '').trim()
+  }
   if (!message) return '处理失败：未知错误'
   if (message.includes('API Token') || message.includes('paddleocr_api_key')) {
     return '未配置 PaddleOCR API Token，请先到设置页填写 Token 后再重试。'
@@ -622,10 +753,14 @@ function formatOcrError(error: unknown): string {
 
 function isRetryableOcrError(error: unknown): boolean {
   if (isOcrAbortError(error)) return false
+  const rawMessage = (error as Error)?.message || String(error || '')
+  if (rawMessage.includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)) return false
+  if (rawMessage.includes(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX)) return false
   const message = formatOcrError(error)
   if (message.includes('vision') || message.includes('Vision') || message.includes('视觉模型')) return false
   if (message.includes('API Token') || message.includes('Token 无效') || message.includes('没有权限')) return false
   if (message.includes('单页超过')) return false
+  if (isOcrQualityFailureMessage(message) || message.includes('缺少可读取页图')) return false
   if (isPdfChunkStructureError(error)) return false
   return true
 }
@@ -653,6 +788,874 @@ function hasReadablePageImage(page: Pick<OcrPageRow, 'image_path'>): boolean {
 
 function findMissingReadablePageImage(pages: Array<Pick<OcrPageRow, 'page_num' | 'image_path'>>): Pick<OcrPageRow, 'page_num' | 'image_path'> | undefined {
   return pages.find((page) => !hasReadablePageImage(page))
+}
+
+async function loadPdfJs(): Promise<PdfJsModule> {
+  return await import('pdfjs-dist/legacy/build/pdf.mjs') as unknown as PdfJsModule
+}
+
+async function loadCanvas(): Promise<CanvasModule> {
+  return await import('@napi-rs/canvas') as unknown as CanvasModule
+}
+
+async function loadPdfForRendering(pdfPath: string): Promise<{ pdfjs: PdfJsModule; canvasModule: CanvasModule; pdf: PdfJsDocument }> {
+  const [pdfjs, canvasModule] = await Promise.all([loadPdfJs(), loadCanvas()])
+  const sourceBytes = await readFile(pdfPath)
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(sourceBytes),
+    disableWorker: true,
+    isEvalSupported: false,
+    useSystemFonts: true,
+  })
+  const pdf = await loadingTask.promise
+  return { pdfjs, canvasModule, pdf }
+}
+
+async function renderLoadedPdfPageToImageBuffer(
+  pdfjs: PdfJsModule,
+  canvasModule: CanvasModule,
+  pdf: PdfJsDocument,
+  pageNum: number,
+  scale = 2,
+  quality = 82,
+): Promise<Buffer> {
+  const safePageNum = Math.max(1, Math.min(pdf.numPages, Math.round(Number(pageNum || 1))))
+  const page = await pdf.getPage(safePageNum)
+  try {
+    const viewport = page.getViewport({ scale })
+    const width = Math.max(1, Math.ceil(viewport.width))
+    const height = Math.max(1, Math.ceil(viewport.height))
+    const canvas = canvasModule.createCanvas(width, height)
+    const canvasContext = canvas.getContext('2d')
+    await page.render({
+      canvasContext,
+      viewport,
+      annotationMode: pdfjs.AnnotationMode?.DISABLE ?? 0,
+      background: 'rgb(255,255,255)',
+    }).promise
+    return canvas.toBuffer('image/jpeg', quality)
+  } finally {
+    page.cleanup?.()
+  }
+}
+
+async function renderPdfPageToImageBuffer(pdfPath: string, pageNum: number, scale = 2, quality = 82): Promise<Buffer> {
+  const { pdfjs, canvasModule, pdf } = await loadPdfForRendering(pdfPath)
+
+  try {
+    return await renderLoadedPdfPageToImageBuffer(pdfjs, canvasModule, pdf, pageNum, scale, quality)
+  } finally {
+    await pdf.destroy?.()
+  }
+}
+
+async function ensurePageImageForOcrFallback(
+  page: OcrPageRow,
+  pdfPath?: string | null,
+  signal?: AbortSignal,
+): Promise<OcrPageWithImage | null> {
+  throwIfOcrCanceled(signal)
+  if (hasReadablePageImage(page)) return withRequiredImage(page)
+  const safePdfPath = String(pdfPath || '').trim()
+  const safePageNum = Math.round(Number(page.page_num || 0))
+  if (!safePdfPath || !existsSync(safePdfPath) || safePageNum <= 0) return null
+
+  const storageDir = join(getDataDir(), 'storage', page.doc_id)
+  if (!existsSync(storageDir)) mkdirSync(storageDir, { recursive: true })
+  const destPath = join(storageDir, `page_${safePageNum}.jpg`)
+  const imageBuffer = await renderPdfPageToImageBuffer(safePdfPath, safePageNum)
+  throwIfOcrCanceled(signal)
+  if (imageBuffer.length <= 0) return null
+  await writeFile(destPath, imageBuffer)
+  const writtenStat = statSync(destPath)
+  if (!writtenStat.isFile() || writtenStat.size <= 0) return null
+  allowFileAccessPath(destPath)
+  run('UPDATE pages SET image_path = ? WHERE id = ?', [destPath, page.id])
+  if (safePageNum === 1) {
+    run('UPDATE documents SET thumb_path = ?, updated_at = ? WHERE id = ?', [destPath, new Date().toISOString(), page.doc_id])
+  }
+  markLibraryStateCacheDirty()
+  return { ...page, image_path: destPath }
+}
+
+async function ensurePageImagesForOcrRoute(
+  pages: OcrPageRow[],
+  pdfPath?: string | null,
+  signal?: AbortSignal,
+): Promise<OcrPageWithImage[]> {
+  throwIfOcrCanceled(signal)
+  if (pages.length === 0) return []
+  const missingImagePage = findMissingReadablePageImage(pages)
+  if (!missingImagePage) return pages.map(withRequiredImage)
+
+  const safePdfPath = String(pdfPath || '').trim()
+  if (!safePdfPath || !existsSync(safePdfPath)) {
+    throw new Error(`第 ${missingImagePage.page_num || ''} 页缺少可读取页图，且当前文献没有可用 PDF 原文，无法继续 OCR。`)
+  }
+
+  const storageDir = join(getDataDir(), 'storage', pages[0].doc_id)
+  if (!existsSync(storageDir)) mkdirSync(storageDir, { recursive: true })
+  const renderedPages: OcrPageWithImage[] = []
+  const { pdfjs, canvasModule, pdf } = await loadPdfForRendering(safePdfPath)
+  let wroteImage = false
+
+  try {
+    for (let index = 0; index < pages.length; index += 1) {
+      throwIfOcrCanceled(signal)
+      const page = pages[index]
+      if (hasReadablePageImage(page)) {
+        renderedPages.push(withRequiredImage(page))
+        continue
+      }
+      const pageNum = Math.round(Number(page.page_num || 0))
+      if (pageNum <= 0) {
+        throw new Error('页码异常，无法从 PDF 渲染页图。')
+      }
+      const destPath = join(storageDir, `page_${pageNum}.jpg`)
+      const imageBuffer = await renderLoadedPdfPageToImageBuffer(pdfjs, canvasModule, pdf, pageNum)
+      throwIfOcrCanceled(signal)
+      if (imageBuffer.length <= 0) {
+        throw new Error(`第 ${pageNum} 页 PDF 渲染为空，无法继续 OCR。`)
+      }
+      await writeFile(destPath, imageBuffer)
+      const writtenStat = statSync(destPath)
+      if (!writtenStat.isFile() || writtenStat.size <= 0) {
+        throw new Error(`第 ${pageNum} 页页图写入失败，无法继续 OCR。`)
+      }
+      allowFileAccessPath(destPath)
+      run('UPDATE pages SET image_path = ? WHERE id = ?', [destPath, page.id])
+      if (pageNum === 1) {
+        run('UPDATE documents SET thumb_path = ?, updated_at = ? WHERE id = ?', [destPath, new Date().toISOString(), page.doc_id])
+      }
+      wroteImage = true
+      renderedPages.push({ ...page, image_path: destPath })
+      if ((index + 1) % 8 === 0) await yieldToEventLoop()
+    }
+  } finally {
+    await pdf.destroy?.()
+  }
+
+  if (wroteImage) {
+    markLibraryStateCacheDirty()
+    scheduleDatabaseSave()
+  }
+  return renderedPages
+}
+
+function addRepeatCandidate(candidates: Array<{ source: string; text: string }>, source: string, value: unknown): void {
+  const text = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    ? String(value).trim()
+    : ''
+  if (text) candidates.push({ source, text })
+}
+
+function getRunawayRepeatCandidates(value: unknown): Array<{ source: string; text: string }> {
+  const candidates: Array<{ source: string; text: string }> = []
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    addRepeatCandidate(candidates, 'text', value)
+    return candidates
+  }
+  if (!isJsonRecord(value)) return candidates
+
+  addRepeatCandidate(candidates, 'text', value.text)
+  const wordsResult = Array.isArray(value.words_result) ? value.words_result : []
+  addRepeatCandidate(
+    candidates,
+    'words_result',
+    wordsResult.map((item) => isJsonRecord(item) ? String(item.words || '') : '').filter(Boolean).join('\n'),
+  )
+  const layoutResult = Array.isArray(value.layout_result) ? value.layout_result : []
+  addRepeatCandidate(
+    candidates,
+    'layout_result.words',
+    layoutResult.map((item) => isJsonRecord(item) ? String(item.words || '') : '').filter(Boolean).join('\n'),
+  )
+  return candidates
+}
+
+function compactRunawayRepeatText(value: string): string {
+  return String(value || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, '')
+    .slice(0, 60_000)
+}
+
+function findRunawayRepeatInCandidate(candidate: { source: string; text: string }): OcrRepeatedTextIssue | null {
+  const compact = compactRunawayRepeatText(candidate.text)
+  if (compact.length < 360) return null
+  let bestIssue: OcrRepeatedTextIssue | null = null
+
+  for (let unitLength = 8; unitLength <= 64; unitLength += 1) {
+    let index = 0
+    while (index + unitLength * 3 <= compact.length) {
+      const unit = compact.slice(index, index + unitLength)
+      let cursor = index + unitLength
+      let repeatCount = 1
+      while (cursor + unitLength <= compact.length && compact.slice(cursor, cursor + unitLength) === unit) {
+        repeatCount += 1
+        cursor += unitLength
+      }
+      const repeatChars = repeatCount * unitLength
+      const ratio = repeatChars / Math.max(1, compact.length)
+      if (
+        repeatCount >= 8
+        && repeatChars >= 320
+        && (
+          ratio >= 0.62
+          || (repeatCount >= 16 && ratio >= 0.45)
+        )
+        && (!bestIssue || repeatChars > bestIssue.repeatChars)
+      ) {
+        bestIssue = {
+          source: candidate.source,
+          unit,
+          repeatCount,
+          repeatChars,
+          compactLength: compact.length,
+          ratio,
+          sample: compact.slice(index, Math.min(compact.length, index + 120)),
+        }
+      }
+      index = repeatCount >= 3 ? Math.max(cursor, index + 1) : index + 1
+    }
+  }
+
+  return bestIssue
+}
+
+function findLikelyRunawayRepeatedOcrText(value: unknown): OcrRepeatedTextIssue | null {
+  const strictIssue = findSuspiciousRepeatedOcrText(value)
+  if (strictIssue) return strictIssue
+  let bestIssue: OcrRepeatedTextIssue | null = null
+  for (const candidate of getRunawayRepeatCandidates(value)) {
+    const issue = findRunawayRepeatInCandidate(candidate)
+    if (!issue) continue
+    if (!bestIssue || issue.repeatChars > bestIssue.repeatChars) {
+      bestIssue = issue
+    }
+  }
+  return bestIssue
+}
+
+function getRecordFirstValue(record: JsonRecord, keys: string[]): unknown {
+  for (const key of keys) {
+    const value = record[key]
+    if (value !== undefined && value !== null) return value
+  }
+  return undefined
+}
+
+function getTextFromUnknown(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value).trim()
+  }
+  return ''
+}
+
+function getRawTextFromUnknown(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  return ''
+}
+
+function getMarkdownTextFromUnknown(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value).trim()
+  }
+  if (!isJsonRecord(value)) return ''
+  return getTextFromUnknown(getRecordFirstValue(value, ['text', 'markdown', 'md', 'content']))
+}
+
+function getRawMarkdownTextFromUnknown(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  if (!isJsonRecord(value)) return ''
+  return getRawTextFromUnknown(getRecordFirstValue(value, ['text', 'markdown', 'md', 'content']))
+}
+
+function isUnsafeGujiPreferredServiceText(text: string): boolean {
+  const value = String(text || '')
+  if (/<(?:table|img)\b/i.test(value)) return true
+  if (findLikelyRunawayRepeatedOcrText(value)) return true
+  return hasGujiWebMetadataHallucination(value)
+    || hasGujiModernDateHallucination(value)
+    || hasGujiMachineTokenHallucination(value)
+    || hasGujiUnexpectedScriptHallucination(value)
+    || hasGujiKanaPunctuationSubstitutionIssue(value)
+    || hasGujiVerticalQuestionPhrasePollution(value)
+}
+
+function getPreferredGujiServiceText(result: unknown): string {
+  if (!isJsonRecord(result)) return ''
+  const markdownText = cleanGujiPlaceholderText(getMarkdownTextFromUnknown(result.markdown))
+  if (markdownText && !isUnsafeGujiPreferredServiceText(markdownText)) return markdownText
+  const sourceText = cleanGujiPlaceholderText(getTextFromUnknown(getRecordFirstValue(result, [
+    'paddle_markdown_text',
+    'ocr_source_text',
+    'source_text',
+  ])))
+  return sourceText && !isUnsafeGujiPreferredServiceText(sourceText) ? sourceText : ''
+}
+
+function preservePreferredGujiServiceText<T extends OcrRecognizeResult>(result: T, preferredText: string): T {
+  const text = String(preferredText || '').trim()
+  if (!text) return result
+  return {
+    ...result,
+    text,
+    paddle_markdown_text: text,
+    normalization: {
+      ...(isJsonRecord(result.normalization) ? result.normalization : {}),
+      text_source: 'paddle_markdown',
+      preserved_paddle_markdown_text: true,
+    },
+  } as T
+}
+
+function getPositiveNumber(value: unknown): number | null {
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) && numberValue > 0 ? numberValue : null
+}
+
+function countArrayField(record: JsonRecord, path: readonly string[]): number {
+  let current: unknown = record
+  for (const key of path) {
+    if (!isJsonRecord(current)) return 0
+    current = current[key]
+  }
+  return Array.isArray(current) ? current.length : 0
+}
+
+function summarizeDiscardedFeijiangLayoutSources(source: JsonRecord): JsonRecord {
+  const summary: JsonRecord = {}
+  const candidates: Array<[string, readonly string[]]> = [
+    ['layout_result', ['layout_result']],
+    ['raw_layout_result', ['raw_layout_result']],
+    ['layout_blocks', ['layout_blocks']],
+    ['parsing_res_list', ['parsing_res_list']],
+    ['prunedResult.parsing_res_list', ['prunedResult', 'parsing_res_list']],
+    ['layout_det_res.boxes', ['layout_det_res', 'boxes']],
+    ['boxes', ['boxes']],
+    ['words_result', ['words_result']],
+    ['overall_ocr_res.rec_texts', ['overall_ocr_res', 'rec_texts']],
+    ['overall_ocr_res.rec_boxes', ['overall_ocr_res', 'rec_boxes']],
+    ['overall_ocr_res.rec_polys', ['overall_ocr_res', 'rec_polys']],
+    ['rec_texts', ['rec_texts']],
+    ['rec_boxes', ['rec_boxes']],
+    ['rec_polys', ['rec_polys']],
+  ]
+  for (const [key, path] of candidates) {
+    const count = countArrayField(source, path)
+    if (count > 0) summary[key] = count
+  }
+  return summary
+}
+
+function createFeijiangReferenceTextOnlyIr(
+  source: JsonRecord,
+  page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null | undefined,
+  generatedAt?: string,
+): NonNullable<OcrRecognizeResult['gujismart_ir']> {
+  const size = getFeijiangReferencePageSize(source, page)
+  return {
+    schemaVersion: OCR_IR_SCHEMA_VERSION,
+    generator: 'GujiSmart',
+    pipelineVersion: OCR_IR_PIPELINE_VERSION,
+    generatedAt: generatedAt || getOcrPageIr(page?.ocr_result)?.generatedAt || new Date().toISOString(),
+    page: {
+      pageIndex: Number(page?.page_num || source.page_num || 0) || 1,
+      width: size.width,
+      height: size.height,
+      orientation: 'unknown',
+      orientationSource: 'unknown',
+      blocks: [],
+      discardedBlocks: [],
+      paragraphs: [],
+      assets: [],
+      quality: {
+        score: 0,
+        coordinateCoverage: 0,
+        confidenceCoverage: 0,
+        lowConfidenceBlockCount: 0,
+        missingCoordinateBlockCount: 0,
+        discardedBlockCount: 0,
+        issues: [],
+      },
+    },
+  }
+}
+
+function getFeijiangReferencePageSize(
+  source: JsonRecord,
+  page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path'> | null | undefined,
+): { width: number; height: number } {
+  const imageSize = getPageImageSize(page?.image_path)
+  const gujiProcessing = isJsonRecord(source.guji_processing) ? source.guji_processing : {}
+  const width = imageSize?.width
+    || getPositiveNumber(source.page_width)
+    || getPositiveNumber(source.image_width)
+    || getPositiveNumber(source.width)
+    || getPositiveNumber(gujiProcessing.source_image_width)
+    || 1
+  const height = imageSize?.height
+    || getPositiveNumber(source.page_height)
+    || getPositiveNumber(source.image_height)
+    || getPositiveNumber(source.height)
+    || getPositiveNumber(gujiProcessing.source_image_height)
+    || 1
+  return { width, height }
+}
+
+function getFeijiangReferenceLayoutSafetyIssue(
+  source: JsonRecord,
+  page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path'> | null | undefined,
+): string | null {
+  const blocks = getOcrLayoutBlocks(source)
+  if (blocks.length === 0) return 'reference_layout_missing'
+  const size = getFeijiangReferencePageSize(source, page)
+  if (size.width <= 1 || size.height <= 1) return 'reference_page_size_missing'
+  let coordinateCount = 0
+  let outOfBoundsCount = 0
+  let readableBlockCount = 0
+  const margin = Math.max(8, Math.min(size.width, size.height) * 0.012)
+  for (const block of blocks) {
+    const rect = getOcrBlockRect(block)
+    const text = (getOcrBlockTableText(block) || getOcrBlockTextValue(block)).replace(/\s+/g, '')
+    if (text || isOcrImageLikeLabel(getOcrBlockLabel(block))) readableBlockCount += 1
+    if (!rect) continue
+    coordinateCount += 1
+    const right = rect.left + rect.width
+    const bottom = rect.top + rect.height
+    if (
+      rect.width <= 0
+      || rect.height <= 0
+      || rect.left < -margin
+      || rect.top < -margin
+      || right > size.width + margin
+      || bottom > size.height + margin
+    ) {
+      outOfBoundsCount += 1
+    }
+  }
+  if (readableBlockCount === 0) return 'reference_layout_empty_text'
+  const requiredCoordinates = blocks.length <= 2
+    ? blocks.length
+    : Math.max(2, Math.ceil(blocks.length * 0.7))
+  if (coordinateCount < requiredCoordinates) return 'reference_layout_low_coordinate_coverage'
+  if (outOfBoundsCount > 0) return 'reference_layout_out_of_bounds'
+  return null
+}
+
+function preserveTrustedFeijiangReferenceLayout(
+  result: OcrRecognizeResult,
+  rawText: string,
+  options: {
+    page?: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null
+    generatedAt?: string
+  } = {},
+): OcrRecognizeResult {
+  const text = String(rawText || '')
+  const source: JsonRecord = isJsonRecord(result) ? result : {}
+  const normalization = isJsonRecord(source.normalization) ? source.normalization : {}
+  const gujiProcessing = isJsonRecord(source.guji_processing) ? source.guji_processing : {}
+  const size = getFeijiangReferencePageSize(source, options.page)
+  const pageNum = getPositiveNumber(source.page_num) || getPositiveNumber(options.page?.page_num) || undefined
+  const layoutSource = {
+    ...source,
+    text,
+    markdown: { text },
+    paddle_markdown_text: text,
+    page_num: pageNum,
+    page_width: size.width,
+    page_height: size.height,
+    image_width: size.width,
+    image_height: size.height,
+  }
+  const envelope = buildOcrPageIr(layoutSource, {
+    pageIndex: Number(pageNum || 0) || 1,
+    pageWidth: size.width,
+    pageHeight: size.height,
+    engine: 'paddle',
+    generatedAt: options.generatedAt || getOcrPageIr(options.page?.ocr_result)?.generatedAt,
+    forceRebuild: true,
+  })
+  const irText = deriveOcrTextFromIr(envelope)
+  return {
+    ...layoutSource,
+    source_type: String(source.source_type || 'feijiang_reference_layout'),
+    words_result: deriveOcrWordsResultFromIr(envelope),
+    gujismart_ir: envelope,
+    ir_text: irText,
+    gujismart_async_pdf_result: source.gujismart_async_pdf_result === true,
+    gujismart_recovered_from_feijiang_json: true,
+    gujismart_feijiang_reference_path: source.gujismart_feijiang_reference_path,
+    guji_processing: {
+      ...gujiProcessing,
+      source: 'feijiang_reference_json',
+      reference_layout_preserved: true,
+    },
+    normalization: {
+      ...normalization,
+      text_source: 'feijiang_reference_markdown',
+      preserved_feijiang_reference_text: true,
+      preserved_feijiang_reference_layout: true,
+      discarded_untrusted_feijiang_reference_layout: false,
+      schema_version: OCR_IR_SCHEMA_VERSION,
+      pipeline_version: OCR_IR_PIPELINE_VERSION,
+      generated_at: envelope.generatedAt,
+    },
+  }
+}
+
+function preserveRawGujiReferenceText(
+  result: OcrRecognizeResult,
+  rawText: string,
+  options: {
+    page?: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null
+    generatedAt?: string
+  } = {},
+): OcrRecognizeResult {
+  const text = String(rawText || '')
+  if (!text) return result
+  const source: JsonRecord = isJsonRecord(result) ? result : {}
+  const layoutSafetyIssue = getFeijiangReferenceLayoutSafetyIssue(source, options.page)
+  if (!layoutSafetyIssue) {
+    return preserveTrustedFeijiangReferenceLayout(result, text, options)
+  }
+  const normalization = isJsonRecord(source.normalization) ? source.normalization : {}
+  const gujiProcessing = isJsonRecord(source.guji_processing) ? source.guji_processing : {}
+  const discardedLayoutSummary = summarizeDiscardedFeijiangLayoutSources(source)
+  const textOnlyIr = createFeijiangReferenceTextOnlyIr(source, options.page, options.generatedAt)
+  return {
+    source_type: String(source.source_type || 'feijiang_reference_text'),
+    text,
+    markdown: { text },
+    paddle_markdown_text: text,
+    page_num: getPositiveNumber(source.page_num) || getPositiveNumber(options.page?.page_num) || undefined,
+    page_width: textOnlyIr.page.width,
+    page_height: textOnlyIr.page.height,
+    image_width: textOnlyIr.page.width,
+    image_height: textOnlyIr.page.height,
+    layout_result: [],
+    words_result: [],
+    gujismart_ir: textOnlyIr,
+    ir_text: '',
+    gujismart_async_pdf_result: source.gujismart_async_pdf_result === true,
+    gujismart_recovered_from_feijiang_json: true,
+    gujismart_feijiang_reference_path: source.gujismart_feijiang_reference_path,
+    guji_processing: {
+      ...gujiProcessing,
+      source: 'feijiang_reference_json',
+    },
+    normalization: {
+      ...normalization,
+      text_source: 'feijiang_reference_markdown',
+      preserved_feijiang_reference_text: true,
+      discarded_untrusted_feijiang_reference_layout: true,
+      discarded_untrusted_feijiang_reference_layout_issue: layoutSafetyIssue,
+      discarded_untrusted_feijiang_reference_layout_summary: discardedLayoutSummary,
+      schema_version: OCR_IR_SCHEMA_VERSION,
+      pipeline_version: OCR_IR_PIPELINE_VERSION,
+      generated_at: textOnlyIr.generatedAt,
+    },
+  }
+}
+
+function normalizeFeijiangReferenceTextOnlyResult(
+  result: unknown,
+  rawText: string,
+  page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null | undefined,
+  engine: OcrEngine,
+): OcrRecognizeResult {
+  const source = isJsonRecord(result) ? result : {}
+  const generatedAt = getOcrPageIr(page?.ocr_result)?.generatedAt
+  return preserveRawGujiReferenceText({
+    ...source,
+    text: rawText,
+    markdown: { text: rawText },
+    guji_processing: {
+      ...(isJsonRecord(source.guji_processing) ? source.guji_processing : {}),
+      source: 'feijiang_reference_json',
+      engine,
+    },
+  } as OcrRecognizeResult, rawText, { page, generatedAt })
+}
+
+function isFeijiangReferenceRecoveredResult(result: unknown): result is OcrPageResultPayload {
+  return isJsonRecord(result) && result.gujismart_recovered_from_feijiang_json === true
+}
+
+function getRawFeijiangReferenceText(result: unknown): string {
+  if (!isJsonRecord(result)) return ''
+  return getRawMarkdownTextFromUnknown(result.markdown) || getRawTextFromUnknown(result.text)
+}
+
+function hasSafeGujiPreferredServiceText(result: unknown, minCompactLength = 12): boolean {
+  return getPreferredGujiServiceText(result).replace(/\s+/g, '').length >= minCompactLength
+}
+
+function stripOcrHtml(value: string): string {
+  return String(value || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function getUsableGujiAsyncPdfServiceText(result: unknown, minCompactLength = 12): string {
+  if (!isJsonRecord(result)) return ''
+  const markdownText = cleanGujiPlaceholderText(getMarkdownTextFromUnknown(result.markdown))
+  const sourceText = cleanGujiPlaceholderText(getTextFromUnknown(getRecordFirstValue(result, [
+    'text',
+    'paddle_markdown_text',
+    'ocr_source_text',
+    'source_text',
+  ])))
+  const candidate = markdownText || sourceText
+  const visibleText = stripOcrHtml(candidate)
+  if (visibleText.replace(/\s+/g, '').length < minCompactLength) return ''
+  if (findLikelyRunawayRepeatedOcrText(candidate)) return ''
+  if (hasGujiWebMetadataHallucination(candidate)) return ''
+  if (hasGujiModernDateHallucination(candidate)) return ''
+  if (hasGujiMachineTokenHallucination(candidate)) return ''
+  return candidate
+}
+
+function getOcrBlockLabel(block: JsonRecord): string {
+  return getTextFromUnknown(getRecordFirstValue(block, ['label', 'block_label', 'type', 'block_type', 'category'])).toLowerCase()
+}
+
+function getOcrBlockTextValue(block: JsonRecord): string {
+  return getTextFromUnknown(getRecordFirstValue(block, ['words', 'text', 'content', 'block_content', 'raw_words', 'raw_text']))
+}
+
+function getOcrBlockHtmlValue(block: JsonRecord): string {
+  return getTextFromUnknown(getRecordFirstValue(block, ['html', 'table_html', 'tableHtml', 'markdown']))
+}
+
+function getOcrBlockRows(block: JsonRecord): string[][] {
+  const rawRows = getRecordFirstValue(block, ['rows', 'table_rows', 'tableRows'])
+  if (!Array.isArray(rawRows)) return []
+  return rawRows
+    .map((row) => Array.isArray(row) ? row.map((cell) => getTextFromUnknown(cell)).filter(Boolean) : [])
+    .filter((row) => row.length > 0)
+}
+
+function getOcrBlockCellCount(block: JsonRecord): number {
+  const cells = getRecordFirstValue(block, ['cells', 'table_cells', 'tableCells'])
+  return Array.isArray(cells) ? cells.length : 0
+}
+
+function countHtmlMatches(value: string, pattern: RegExp): number {
+  return (value.match(pattern) || []).length
+}
+
+function extractHtmlTableCellTexts(value: string): string[] {
+  const cells = String(value || '').match(/<t[dh][\s\S]*?<\/t[dh]>/gi) || []
+  return cells.map(stripOcrHtml).filter(Boolean)
+}
+
+function getRowsText(rows: string[][]): string {
+  return rows.flat().join('')
+}
+
+function getOcrBlockTableText(block: JsonRecord): string {
+  const rows = getOcrBlockRows(block)
+  if (rows.length > 0) return getRowsText(rows)
+  const html = getOcrBlockHtmlValue(block)
+  const htmlCells = extractHtmlTableCellTexts(html)
+  if (htmlCells.length > 0) return htmlCells.join('')
+  return getOcrBlockTextValue(block)
+}
+
+function hasNarrativeTableCells(block: JsonRecord): boolean {
+  const rows = getOcrBlockRows(block)
+  const html = getOcrBlockHtmlValue(block)
+  const cells = rows.length > 0 ? rows.flat() : extractHtmlTableCellTexts(html)
+  if (cells.length < 2) return false
+  const compactCells = cells.map((cell) => String(cell || '').replace(/\s+/g, '')).filter(Boolean)
+  if (compactCells.length < 2) return false
+  const longCellCount = compactCells.filter((cell) => cell.length >= 24).length
+  const maxCellLength = Math.max(...compactCells.map((cell) => cell.length), 0)
+  const punctuationText = compactCells.join('')
+  const punctuationCount = (punctuationText.match(/[。．、，；：？！「」『』（）()]/g) || []).length
+  return longCellCount >= 2 || maxCellLength >= 80 || punctuationCount >= 8
+}
+
+function hasCjkOrKanaText(value: string): boolean {
+  return /[\u3040-\u30ff\u3400-\u9fff]/.test(value)
+}
+
+function isLikelyBookishPdfTableResult(blocks: JsonRecord[], totalText: string): boolean {
+  const compactText = totalText.replace(/\s+/g, '')
+  if (compactText.length < 80 || !hasCjkOrKanaText(compactText)) return false
+  const tableBlocks = blocks.filter((block) => /table|sheet|excel/.test(getOcrBlockLabel(block)))
+  if (tableBlocks.length === 0) return false
+  const hasNarrativeTable = tableBlocks.some(hasNarrativeTableCells)
+  return hasNarrativeTable
+}
+
+function getOcrBlockRect(block: JsonRecord): { left: number; top: number; width: number; height: number } | null {
+  const rect = getRecordFirstValue(block, ['location', 'bbox', 'box', 'block_bbox', 'coordinate'])
+  if (Array.isArray(rect) && rect.length >= 4) {
+    const numbers = rect.map(Number)
+    if (numbers.every(Number.isFinite)) {
+      if (numbers.length >= 8) {
+        const xs = [numbers[0], numbers[2], numbers[4], numbers[6]]
+        const ys = [numbers[1], numbers[3], numbers[5], numbers[7]]
+        const left = Math.min(...xs)
+        const top = Math.min(...ys)
+        const width = Math.max(...xs) - left
+        const height = Math.max(...ys) - top
+        return width > 0 && height > 0 ? { left, top, width, height } : null
+      }
+      const [left, top, right, bottom] = numbers
+      const width = right - left
+      const height = bottom - top
+      return width > 0 && height > 0 ? { left, top, width, height } : null
+    }
+    const points = rect.filter(isJsonRecord)
+    if (points.length >= 2) {
+      const xs = points.map((point) => Number(point.x ?? point.left ?? 0))
+      const ys = points.map((point) => Number(point.y ?? point.top ?? 0))
+      if (xs.every(Number.isFinite) && ys.every(Number.isFinite)) {
+        const left = Math.min(...xs)
+        const top = Math.min(...ys)
+        const width = Math.max(...xs) - left
+        const height = Math.max(...ys) - top
+        return width > 0 && height > 0 ? { left, top, width, height } : null
+      }
+    }
+    return null
+  }
+  if (!isJsonRecord(rect)) return null
+  const left = Number(rect.left ?? rect.x ?? 0)
+  const top = Number(rect.top ?? rect.y ?? 0)
+  const width = Number(rect.width ?? (rect.right !== undefined ? Number(rect.right) - left : 0))
+  const height = Number(rect.height ?? (rect.bottom !== undefined ? Number(rect.bottom) - top : 0))
+  if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return null
+  return { left, top, width, height }
+}
+
+function getOcrLayoutBlocks(result: unknown): JsonRecord[] {
+  if (!isJsonRecord(result)) return []
+  const blocks = getRecordFirstValue(result, ['layout_result', 'layout_blocks', 'parsing_res_list'])
+  return Array.isArray(blocks) ? blocks.filter(isJsonRecord) : []
+}
+
+function getOcrPageSizeForResult(result: unknown, imagePath?: string | null): { width: number; height: number } | null {
+  const imageSize = getPageImageSize(imagePath)
+  if (imageSize) return imageSize
+  if (!isJsonRecord(result)) return null
+  const width = Number(getRecordFirstValue(result, ['page_width', 'image_width', 'width']))
+  const height = Number(getRecordFirstValue(result, ['page_height', 'image_height', 'height']))
+  if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+    return { width, height }
+  }
+  return null
+}
+
+function getLikelyGujiPdfTableMisclassification(
+  result: unknown,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  if (ocrOptions.profile !== 'guji_print_vertical') return null
+  const blocks = getOcrLayoutBlocks(result)
+  if (blocks.length === 0) return null
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  const pageArea = pageSize ? pageSize.width * pageSize.height : 0
+  const totalTextLength = Math.max(1, blocks.map(getOcrBlockTextValue).join('').replace(/\s+/g, '').length)
+  let bestTableTextLength = 0
+
+  for (const block of blocks) {
+    const label = getOcrBlockLabel(block)
+    const rows = getOcrBlockRows(block)
+    const cellCount = getOcrBlockCellCount(block)
+    const html = getTextFromUnknown(getRecordFirstValue(block, ['html', 'table_html', 'tableHtml', 'markdown']))
+    const looksTable = /table|表格|sheet|excel/.test(label)
+      || rows.length >= 4
+      || cellCount >= 8
+      || /<table|<tr|<td|<th/i.test(html)
+    if (!looksTable) continue
+
+    const rect = getOcrBlockRect(block)
+    const widthRatio = rect && pageSize ? rect.width / Math.max(1, pageSize.width) : 0
+    const heightRatio = rect && pageSize ? rect.height / Math.max(1, pageSize.height) : 0
+    const areaRatio = rect && pageArea > 0 ? (rect.width * rect.height) / pageArea : 0
+    const textLength = (rows.length > 0 ? rows.flat().join('') : getOcrBlockTextValue(block)).replace(/\s+/g, '').length
+    bestTableTextLength = Math.max(bestTableTextLength, textLength)
+    const rowCount = Math.max(rows.length, String(getOcrBlockTextValue(block) || html).split(/\r?\n/).filter((line) => line.trim()).length)
+    const dominantText = textLength / totalTextLength >= 0.45
+    const largePageBlock = areaRatio >= 0.22 || (widthRatio >= 0.5 && heightRatio >= 0.3)
+    const manyTableRows = rowCount >= 8 || cellCount >= 16 || /<tr[\s\S]*<tr[\s\S]*<tr[\s\S]*<tr/i.test(html)
+    if (dominantText && largePageBlock && manyTableRows) {
+      return 'PDF 异步 OCR 疑似把古籍竖排版面误判成表格，已改用本页图片 OCR 回退。'
+    }
+  }
+
+  if (bestTableTextLength / totalTextLength >= 0.75 && blocks.length <= 3) {
+    return 'PDF 异步 OCR 疑似把整页古籍文本误判成表格，已改用本页图片 OCR 回退。'
+  }
+  return null
+}
+
+function getLikelyAsyncPdfTableMisclassification(
+  result: unknown,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  const legacyGujiIssue = getLikelyGujiPdfTableMisclassification(result, imagePath, ocrOptions)
+  if (legacyGujiIssue) return legacyGujiIssue
+
+  const blocks = getOcrLayoutBlocks(result)
+  if (blocks.length === 0) return null
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  const pageArea = pageSize ? pageSize.width * pageSize.height : 0
+  const totalText = blocks.map((block) => getOcrBlockTableText(block) || getOcrBlockTextValue(block)).join('\n')
+  const totalTextLength = Math.max(1, totalText.replace(/\s+/g, '').length)
+  if (!isLikelyBookishPdfTableResult(blocks, totalText)) return null
+
+  let bestTableTextLength = 0
+  for (const block of blocks) {
+    const label = getOcrBlockLabel(block)
+    const rows = getOcrBlockRows(block)
+    const cellCount = getOcrBlockCellCount(block)
+    const html = getOcrBlockHtmlValue(block)
+    const htmlCellCount = extractHtmlTableCellTexts(html).length
+    const htmlRowCount = countHtmlMatches(html, /<tr\b/gi)
+    const looksTable = /table|sheet|excel/.test(label)
+      || rows.length >= 4
+      || cellCount >= 8
+      || htmlCellCount >= 8
+      || /<table|<tr|<td|<th/i.test(html)
+    if (!looksTable) continue
+
+    const rect = getOcrBlockRect(block)
+    const widthRatio = rect && pageSize ? rect.width / Math.max(1, pageSize.width) : 0
+    const heightRatio = rect && pageSize ? rect.height / Math.max(1, pageSize.height) : 0
+    const areaRatio = rect && pageArea > 0 ? (rect.width * rect.height) / pageArea : 0
+    const textLength = getOcrBlockTableText(block).replace(/\s+/g, '').length
+    bestTableTextLength = Math.max(bestTableTextLength, textLength)
+    const rowCount = Math.max(
+      rows.length,
+      htmlRowCount,
+      String(getOcrBlockTextValue(block) || stripOcrHtml(html)).split(/\r?\n/).filter((line) => line.trim()).length,
+    )
+    const dominantText = textLength / totalTextLength >= 0.45
+    const largePageBlock = areaRatio >= 0.22 || (widthRatio >= 0.5 && heightRatio >= 0.3) || !pageSize
+    const manyTableRows = rowCount >= 8 || cellCount >= 16 || htmlCellCount >= 16 || /<tr[\s\S]*<tr[\s\S]*<tr[\s\S]*<tr/i.test(html)
+    if (dominantText && largePageBlock && manyTableRows) {
+      return 'PDF 异步 OCR 疑似把书页误判成表格，已改用本页图片 OCR 回退。'
+    }
+  }
+
+  if (bestTableTextLength / totalTextLength >= 0.75 && blocks.length <= 6) {
+    return 'PDF 异步 OCR 疑似把整页文字误判成表格，已改用本页图片 OCR 回退。'
+  }
+  return null
 }
 
 function canFallbackToImageOcr(pages: OcrPageRow[]): boolean {
@@ -734,37 +1737,704 @@ function resolveDocOcrOptions(docType?: string | null, overrides?: PageOcrOption
   }
 }
 
+function getVerticalFallbackOcrOptions(ocrOptions: Required<PageOcrOptions>): Required<PageOcrOptions> {
+  if (ocrOptions.profile === 'guji_print_vertical') return ocrOptions
+  return { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
+}
+
+function getPageOcrResultRecord(page: Pick<OcrPageRow, 'ocr_result'>): JsonRecord | null {
+  return parseJsonRecord(page.ocr_result)
+}
+
+function hasVerticalGujiProcessingMeta(result: JsonRecord | null): boolean {
+  if (!result) return false
+  const processing = result.guji_processing
+  if (!isJsonRecord(processing)) return false
+  return String(processing.profile || '') === 'guji_print_vertical'
+}
+
+function hasVerticalBlockLayoutSignals(result: JsonRecord | null, imagePath?: string | null): boolean {
+  if (!result) return false
+  const blocks = getOcrLayoutBlocks(result)
+  if (blocks.length < 3) return false
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  const textBlocks = blocks.filter((block) => getOcrBlockTextValue(block).replace(/\s+/g, '').length >= 2)
+  if (textBlocks.length < 3) return false
+  const verticalBlocks = textBlocks.filter((block) => {
+    const orientation = String(block.orientation || '').toLowerCase()
+    if (orientation === 'vertical') return true
+    const label = getOcrBlockLabel(block)
+    if (/vertical|column|col_text|竖排|豎排|直排|縦書き|縦組み/.test(label)) return true
+    const rect = getOcrBlockRect(block)
+    if (!rect) return false
+    const heightRatio = pageSize ? rect.height / Math.max(1, pageSize.height) : 0
+    return rect.width > 0 && rect.height >= rect.width * 1.25 && heightRatio >= 0.08
+  })
+  return verticalBlocks.length >= 3 && verticalBlocks.length / textBlocks.length >= 0.45
+}
+
+function hasExistingVerticalPageOcrSignals(pages: OcrPageRow[]): boolean {
+  const sampledPages = pages.filter((page) => page.ocr_result || page.image_path).slice(0, 24)
+  if (sampledPages.length === 0) return false
+  let verticalPages = 0
+  let explicitVerticalPages = 0
+
+  for (const page of sampledPages) {
+    const result = getPageOcrResultRecord(page)
+    if (hasVerticalGujiProcessingMeta(result)) {
+      explicitVerticalPages += 1
+      verticalPages += 1
+      continue
+    }
+    if (hasVerticalBlockLayoutSignals(result, page.image_path)) {
+      verticalPages += 1
+    }
+  }
+
+  if (explicitVerticalPages > 0) return true
+  return verticalPages >= 2 && verticalPages / sampledPages.length >= 0.35
+}
+
+function hasBookFacsimileImageSignals(pages: OcrPageRow[]): boolean {
+  const imagePages = pages
+    .map((page) => getPageImageSize(page.image_path))
+    .filter((size): size is { width: number; height: number } => Boolean(size))
+    .slice(0, 12)
+  if (imagePages.length === 0) return false
+  const landscapePages = imagePages.filter((size) => size.width >= size.height * 1.12).length
+  const portraitTallPages = imagePages.filter((size) => size.height >= size.width * 1.18).length
+  return landscapePages >= 2 || portraitTallPages >= Math.max(3, Math.ceil(imagePages.length * 0.6))
+}
+
+function getDocumentRouteHintText(doc: Pick<OcrDocumentRow, 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>): string {
+  const metadata = parseMetadata(doc.metadata)
+  return [
+    doc.title,
+    doc.author,
+    doc.source,
+    doc.doc_type,
+    metadata.title,
+    metadata.original_title,
+    metadata.filename,
+    metadata.file_name,
+  ].map((value) => String(value || '')).join(' ')
+}
+
+function hasOldBookRouteHints(doc: Pick<OcrDocumentRow, 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>): boolean {
+  const text = getDocumentRouteHintText(doc)
+  if (/古籍|影印|善本|刻本|鈔本|抄本|線裝|线装|竪排|豎排|縦書|縦組/.test(text)) return true
+  const earlyYear = (text.match(/(?:18|19)\d{2}/g) || [])
+    .map((year) => Number(year))
+    .some((year) => Number.isFinite(year) && year <= 1955)
+  const oldOrthography = /[學國讀會卷舊舆臺]|假名|尋常|初等|小學|小学|文部省/.test(text)
+  const oldSchoolBookSignals = /(?:學校|学校|小學|小学|初等|尋常|教本|教科書|讀本|読本|國語|国語|日本語|漢文|修身|地理|歴史|历史|算術|算术)/.test(text)
+  return (earlyYear || oldOrthography) && oldSchoolBookSignals
+}
+
+function getAsyncPdfOcrRouteRisk(
+  doc: Pick<OcrDocumentRow, 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
+  pages: OcrPageRow[],
+  pagesForOcr: OcrPageRow[],
+  ocrOptions: Required<PageOcrOptions>,
+): AsyncPdfOcrRouteRisk | null {
+  if (ocrOptions.profile === 'guji_print_vertical') {
+    return {
+      reason: '\u6587\u732e\u7c7b\u578b\u4e3a\u53e4\u7c4d\uff0c\u4f7f\u7528\u6574\u672c\u539f PDF \u7684 25 \u9875 pageRanges \u5f02\u6b65 OCR\uff0c\u5bf9\u9f50\u98de\u5c06\u7f51\u9875\u5bfc\u51fa\u7684\u4efb\u52a1\u5f62\u6001\u3002',
+      ocrOptions,
+      pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE,
+    }
+  }
+  if (hasExistingVerticalPageOcrSignals(pages)) {
+    return {
+      reason: '\u5df2\u68c0\u6d4b\u5230\u9875\u9762\u5b58\u5728\u7ad6\u6392/\u53e4\u7c4d OCR \u4fe1\u53f7\uff0c\u4f7f\u7528\u6574\u672c\u539f PDF \u7684 25 \u9875 pageRanges \u5f02\u6b65 OCR\u3002',
+      ocrOptions: getVerticalFallbackOcrOptions(ocrOptions),
+      pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE,
+    }
+  }
+  if (hasOldBookRouteHints(doc) && (hasBookFacsimileImageSignals(pages) || pages.length === 0 || pagesForOcr.length === pages.length)) {
+    return {
+      reason: '\u6587\u732e\u6807\u9898\u6216\u5143\u6570\u636e\u50cf\u65e7\u5f0f\u5f71\u5370\u4e66\uff0c\u4f7f\u7528\u6574\u672c\u539f PDF \u7684 25 \u9875 pageRanges \u5f02\u6b65 OCR\u3002',
+      ocrOptions: getVerticalFallbackOcrOptions(ocrOptions),
+      pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE,
+    }
+  }
+  return null
+}
+
+function resolveFallbackPdfPathForPostProcess(
+  pages: Array<{ page: OcrPageRow; sourcePageIndex: number; resultIndex: number }>,
+): string | null {
+  const firstPage = pages.find((item) => item.page?.doc_id)?.page
+  if (!firstPage) return null
+  const maxPage = Math.max(0, ...pages.map((item) => Number(item.page?.page_num || 0)).filter(Number.isFinite))
+  const doc = queryOne<Pick<OcrDocumentRow, 'id' | 'file_path' | 'metadata'>>(
+    'SELECT id, file_path, metadata FROM documents WHERE id = ?',
+    [firstPage.doc_id],
+  )
+  return doc ? resolveUsablePdfPath(doc, maxPage) : null
+}
+
+function getAsyncPdfPostProcessOptions(ocrOptions: Required<PageOcrOptions>): Required<PageOcrOptions> {
+  if (ocrOptions.profile !== 'guji_print_vertical') return ocrOptions
+  return {
+    ...ocrOptions,
+    secondPass: 'none',
+  }
+}
+
+function formatAsyncPdfRetryableQualityIssue(message: string): string {
+  return `${OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX} ${message}`
+}
+
+function getGujiAsyncPdfRetryableQualityIssue(
+  result: OcrPageResultPayload,
+  _imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  if (ocrOptions.profile !== 'guji_print_vertical') return null
+  const repeatedIssue = findLikelyRunawayRepeatedOcrText(result)
+  if (repeatedIssue) return formatAsyncPdfRetryableQualityIssue(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))
+  return null
+}
+
+function uniqueExistingDirectories(paths: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const item of paths) {
+    const dir = String(item || '').trim()
+    if (!dir || seen.has(dir) || !existsSync(dir)) continue
+    try {
+      if (!statSync(dir).isDirectory()) continue
+    } catch {
+      continue
+    }
+    seen.add(dir)
+    result.push(dir)
+  }
+  return result
+}
+
+function getFeijiangReferenceSearchDirectories(pdfPath: string | null | undefined): string[] {
+  const envDirs = String(process.env[OCR_FEIJIANG_REFERENCE_ENV] || '')
+    .split(delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean)
+  let downloadsDir = ''
+  try {
+    downloadsDir = app.getPath('downloads')
+  } catch {
+    downloadsDir = ''
+  }
+  return uniqueExistingDirectories([
+    pdfPath ? dirname(pdfPath) : null,
+    ...envDirs,
+    downloadsDir,
+    downloadsDir ? join(downloadsDir, 'edge') : null,
+  ])
+}
+
+function isLikelyFeijiangReferenceJsonName(fileName: string, pdfPath: string | null | undefined): boolean {
+  const lowerName = fileName.toLowerCase()
+  if (!lowerName.endsWith('.json') || !lowerName.includes('paddleocr')) return false
+  const pdfName = pdfPath ? basename(pdfPath).toLowerCase() : ''
+  if (pdfName && lowerName.startsWith(`${pdfName}_by_paddleocr`)) return true
+  if (pdfName && lowerName.includes(pdfName) && lowerName.includes('_by_paddleocr')) return true
+  const parsed = pdfPath ? parse(pdfPath) : null
+  const stem = parsed?.name?.toLowerCase() || ''
+  return Boolean(stem && lowerName.includes(stem) && lowerName.includes('_by_paddleocr'))
+}
+
+async function findFeijiangReferenceJsonPath(pdfPath: string | null | undefined): Promise<string | null> {
+  if (!pdfPath) return null
+  const candidates: Array<{ path: string; mtimeMs: number }> = []
+  for (const dir of getFeijiangReferenceSearchDirectories(pdfPath)) {
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isFile() || !isLikelyFeijiangReferenceJsonName(entry.name, pdfPath)) continue
+        const fullPath = join(dir, entry.name)
+        try {
+          candidates.push({ path: fullPath, mtimeMs: statSync(fullPath).mtimeMs })
+        } catch {
+          candidates.push({ path: fullPath, mtimeMs: 0 })
+        }
+      }
+    } catch {
+      continue
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return candidates[0]?.path || null
+}
+
+function extractFeijiangReferencePages(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload
+  if (!isJsonRecord(payload)) return []
+  const result = payload.result
+  if (Array.isArray(result)) return result
+  const pages = payload.pages
+  if (Array.isArray(pages)) return pages
+  const pagePayloads = payload.pagePayloads
+  if (Array.isArray(pagePayloads)) return pagePayloads
+  const data = payload.data
+  if (Array.isArray(data)) return data
+  if (isJsonRecord(data)) return extractFeijiangReferencePages(data)
+  const numericKeys = Object.keys(payload)
+    .filter((key) => /^\d+$/.test(key))
+    .sort((left, right) => Number(left) - Number(right))
+  if (numericKeys.length > 0) {
+    const numericPages = numericKeys
+      .map((key) => payload[key])
+      .filter((item) => item !== undefined && item !== null)
+    if (numericPages.length > 0) return numericPages
+  }
+  return []
+}
+
+function attachGujiReferenceProcessingMeta(
+  payload: OcrPageResultPayload,
+  ocrOptions: Required<PageOcrOptions>,
+  referencePath: string,
+): OcrPageResultPayload {
+  return {
+    ...payload,
+    gujismart_async_pdf_result: true,
+    gujismart_recovered_from_feijiang_json: true,
+    gujismart_feijiang_reference_path: referencePath,
+    guji_processing: {
+      ...(isJsonRecord(payload.guji_processing) ? payload.guji_processing : {}),
+      profile: ocrOptions.profile,
+      second_pass: 'none',
+      source: 'feijiang_reference_json',
+    },
+  }
+}
+
+function normalizeFeijiangReferencePayloadForRecovery(
+  payload: unknown,
+  ocrOptions: Required<PageOcrOptions>,
+  referencePath: string,
+): OcrPageResultPayload | null {
+  if (!isJsonRecord(payload)) return null
+  const normalized = normalizePageResult(payload) as OcrPageResultPayload
+  return attachGujiReferenceProcessingMeta(normalized, ocrOptions, referencePath)
+}
+
+async function loadFeijiangOcrReference(pdfPath: string | null | undefined): Promise<FeijiangOcrReference | null> {
+  const normalizedPdfPath = String(pdfPath || '').trim()
+  if (!normalizedPdfPath) return null
+  const cached = feijiangOcrReferenceCache.get(normalizedPdfPath)
+  if (cached) return cached
+  const loadPromise = (async () => {
+    const referencePath = await findFeijiangReferenceJsonPath(normalizedPdfPath)
+    if (!referencePath) return null
+    try {
+      const parsed = JSON.parse(await readFile(referencePath, 'utf8')) as unknown
+      const pages = extractFeijiangReferencePages(parsed)
+      return pages.length > 0 ? { path: referencePath, pages } : null
+    } catch (error) {
+      console.warn('[OCR] Failed to read PaddleOCR reference JSON:', referencePath, error)
+      return null
+    }
+  })()
+  feijiangOcrReferenceCache.set(normalizedPdfPath, loadPromise)
+  return loadPromise
+}
+
+function getFeijiangReferencePagePayload(reference: FeijiangOcrReference, pageNum: number): unknown | null {
+  const index = Math.max(0, Math.round(pageNum) - 1)
+  return reference.pages[index] ?? null
+}
+
+function getQualityFailureReferenceRecoveryOptions(
+  doc: Pick<OcrDocumentRow, 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
+  options?: SavePageQualityFailureOptions,
+): Required<PageOcrOptions> {
+  const resolved = options?.ocrOptions || resolveDocOcrOptions(doc.doc_type, options?.pageOptions)
+  return resolved.profile === 'guji_print_vertical' || hasOldBookRouteHints(doc)
+    ? getVerticalFallbackOcrOptions(resolved)
+    : resolved
+}
+
+async function recoverPageQualityFailureFromFeijiangReference(
+  page: OcrPageRow,
+  doc: Pick<OcrDocumentRow, 'id' | 'title' | 'author' | 'source' | 'doc_type' | 'metadata'> & Partial<Pick<OcrDocumentRow, 'file_path'>>,
+  options: SavePageQualityFailureOptions = {},
+): Promise<OcrPageResult | null> {
+  const recoveryOptions = getQualityFailureReferenceRecoveryOptions(doc, options)
+  if (recoveryOptions.profile !== 'guji_print_vertical') return null
+  const docPathInfo = typeof doc.file_path === 'string'
+    ? { id: doc.id, file_path: doc.file_path, metadata: doc.metadata }
+    : queryOne<Pick<OcrDocumentRow, 'id' | 'file_path' | 'metadata'>>('SELECT id, file_path, metadata FROM documents WHERE id = ?', [doc.id])
+  const pdfPath = docPathInfo ? resolveUsablePdfPath(docPathInfo, Number(page.page_num || 0)) : null
+  const reference = await loadFeijiangOcrReference(pdfPath)
+  return recoverGujiPageFromFeijiangReference(page, reference, recoveryOptions, options.signal)
+}
+
+function normalizeFeijiangComparableText(value: string): string {
+  return stripOcrHtml(value)
+    .replace(/&(?:nbsp|ensp|emsp);/gi, '')
+    .replace(/\s+/g, '')
+    .trim()
+}
+
+function getGujiReferenceComparableText(result: unknown): string {
+  const text = getPreferredGujiServiceText(result)
+    || getUsableGujiAsyncPdfServiceText(result, 1)
+    || getOcrResultText(result)
+  return normalizeFeijiangComparableText(text)
+}
+
+function getCharNgrams(value: string, size = 2, maxLength = 6000): Set<string> {
+  const text = value.slice(0, maxLength)
+  const grams = new Set<string>()
+  if (text.length <= size) {
+    if (text) grams.add(text)
+    return grams
+  }
+  for (let index = 0; index + size <= text.length; index += 1) {
+    grams.add(text.slice(index, index + size))
+  }
+  return grams
+}
+
+function getNgramContainment(left: string, right: string, size = 2): number {
+  const leftGrams = getCharNgrams(left, size)
+  const rightGrams = getCharNgrams(right, size)
+  const smaller = leftGrams.size <= rightGrams.size ? leftGrams : rightGrams
+  const larger = leftGrams.size <= rightGrams.size ? rightGrams : leftGrams
+  if (smaller.size === 0 && larger.size === 0) return 1
+  if (smaller.size === 0 || larger.size === 0) return 0
+  let shared = 0
+  smaller.forEach((gram) => {
+    if (larger.has(gram)) shared += 1
+  })
+  return shared / Math.max(1, smaller.size)
+}
+
+function hasLikelyForeignFormulaLeadIn(value: string): boolean {
+  return /(?:\$[^$]{0,30}\$|\\(?:frac|begin|sum|int)\b|[a-z]_\{?\d)/i.test(value.slice(0, 240))
+}
+
+function getGujiFeijiangReferenceMismatchIssue(candidate: unknown, reference: unknown): string | null {
+  const candidateText = getGujiReferenceComparableText(candidate)
+  const referenceText = getGujiReferenceComparableText(reference)
+  const candidateLength = candidateText.length
+  const referenceLength = referenceText.length
+  if (referenceLength === 0 && candidateLength === 0) return null
+  if (referenceLength < 80 && candidateLength < 80) return null
+  if (referenceLength >= 120 && candidateLength === 0) {
+    return 'PaddleOCR async PDF result is empty while the same-name PaddleOCR reference JSON has page text.'
+  }
+  if (referenceLength >= 200 && candidateLength < referenceLength * 0.45) {
+    return 'PaddleOCR async PDF result is much shorter than the same-name PaddleOCR reference JSON page.'
+  }
+  if (candidateLength >= 200 && referenceLength > 0 && candidateLength > referenceLength * 1.8 && candidateLength - referenceLength > 300) {
+    return 'PaddleOCR async PDF result is much longer than the same-name PaddleOCR reference JSON page.'
+  }
+  const containment = getNgramContainment(candidateText, referenceText)
+  if (Math.max(candidateLength, referenceLength) >= 180 && containment < 0.42) {
+    return 'PaddleOCR async PDF result has low text agreement with the same-name PaddleOCR reference JSON page.'
+  }
+  const prefixContainment = getNgramContainment(candidateText.slice(0, 220), referenceText.slice(0, 220))
+  if (
+    referenceLength >= 250
+    && candidateLength >= 250
+    && prefixContainment < 0.18
+    && containment < 0.62
+  ) {
+    return 'PaddleOCR async PDF result appears to start with text from a different page than the same-name PaddleOCR reference JSON.'
+  }
+  if (
+    hasLikelyForeignFormulaLeadIn(candidateText)
+    && !hasLikelyForeignFormulaLeadIn(referenceText)
+    && prefixContainment < 0.35
+  ) {
+    return 'PaddleOCR async PDF result appears to contain formula or foreign-page lead-in text that is absent from the same-name PaddleOCR reference JSON.'
+  }
+  return null
+}
+
+async function recoverGujiPageFromFeijiangReference(
+  page: OcrPageRow,
+  reference: FeijiangOcrReference | null,
+  ocrOptions: Required<PageOcrOptions>,
+  signal?: AbortSignal,
+): Promise<OcrPageResult | null> {
+  if (!reference || ocrOptions.profile !== 'guji_print_vertical') return null
+  throwIfOcrCanceled(signal)
+  const pageNum = Number(page.page_num || 0)
+  if (!Number.isFinite(pageNum) || pageNum <= 0) return null
+  const payload = getFeijiangReferencePagePayload(reference, pageNum)
+  if (!payload) return null
+  try {
+    const result = normalizeFeijiangReferencePayloadForRecovery(payload, ocrOptions, reference.path)
+    if (!result) return null
+    const rawReferenceText = getRawFeijiangReferenceText(result)
+    return {
+      pageId: page.id,
+      result,
+      text: rawReferenceText || getOcrResultText(result),
+      status: 'completed',
+    } satisfies OcrPageResult
+  } catch (error) {
+    if (isOcrAbortError(error)) throw error
+    console.warn('[OCR] Failed to recover page from PaddleOCR reference JSON:', pageNum, reference.path, error)
+    return null
+  }
+}
+
+async function recoverGujiPagesFromFeijiangReference(
+  pages: OcrPageRow[],
+  pdfPath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+  signal?: AbortSignal,
+): Promise<OcrPageResult[]> {
+  if (ocrOptions.profile !== 'guji_print_vertical' || pages.length === 0) return []
+  const reference = await loadFeijiangOcrReference(pdfPath)
+  if (!reference) return []
+  const results: OcrPageResult[] = []
+  for (const page of pages) {
+    throwIfOcrCanceled(signal)
+    const recovered = await recoverGujiPageFromFeijiangReference(page, reference, ocrOptions, signal)
+    if (recovered) results.push(recovered)
+    if (results.length % OCR_RESULT_POSTPROCESS_CHUNK_SIZE === 0) {
+      await yieldToEventLoop()
+    }
+  }
+  return results
+}
+
+async function recoverCompletedGujiPagesWithReferenceMismatch(
+  docId: string,
+  pdfPath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+  signal?: AbortSignal,
+): Promise<OcrPageResult[]> {
+  if (ocrOptions.profile !== 'guji_print_vertical') return []
+  const reference = await loadFeijiangOcrReference(pdfPath)
+  if (!reference) return []
+  const rows = hydratePagePayloadRows(queryAll<OcrPageRow>(
+    `SELECT *
+     FROM pages
+     WHERE doc_id = ? AND ocr_status = 'completed'
+     ORDER BY page_num`,
+    [docId],
+  ))
+  const recoverPages: OcrPageRow[] = []
+  for (const page of rows) {
+    throwIfOcrCanceled(signal)
+    const current = getPageOcrResultRecord(page)
+    if (!current) continue
+    if (current.gujismart_recovered_from_feijiang_json === true) continue
+    const pageNum = Number(page.page_num || 0)
+    const referencePayload = getFeijiangReferencePagePayload(reference, pageNum)
+    if (!referencePayload) continue
+    const mismatchIssue = getGujiFeijiangReferenceMismatchIssue(current, referencePayload)
+    if (!mismatchIssue) continue
+    recoverPages.push(page)
+  }
+  if (recoverPages.length === 0) return []
+  const results: OcrPageResult[] = []
+  for (const page of recoverPages) {
+    const recovered = await recoverGujiPageFromFeijiangReference(page, reference, ocrOptions, signal)
+    if (recovered) results.push(recovered)
+    if (results.length % OCR_RESULT_POSTPROCESS_CHUNK_SIZE === 0) {
+      await yieldToEventLoop()
+    }
+  }
+  return results
+}
+
+async function recoverCompletedGujiPagesFromFeijiangReference(
+  docId: string,
+  pdfPath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+  signal?: AbortSignal,
+): Promise<OcrPageResult[]> {
+  if (ocrOptions.profile !== 'guji_print_vertical') return []
+  const reference = await loadFeijiangOcrReference(pdfPath)
+  if (!reference) return []
+  const rows = hydratePagePayloadRows(queryAll<OcrPageRow>(
+    `SELECT *
+     FROM pages
+     WHERE doc_id = ?
+     ORDER BY page_num`,
+    [docId],
+  ))
+  if (rows.length === 0) return []
+  const maxPageNum = Math.max(0, ...rows.map((page) => Number(page.page_num || 0)).filter(Number.isFinite))
+  if (reference.pages.length < maxPageNum) return []
+  const results: OcrPageResult[] = []
+  for (const page of rows) {
+    throwIfOcrCanceled(signal)
+    const recovered = await recoverGujiPageFromFeijiangReference(page, reference, ocrOptions, signal)
+    if (recovered) results.push(recovered)
+    if (results.length % OCR_RESULT_POSTPROCESS_CHUNK_SIZE === 0) {
+      await yieldToEventLoop()
+    }
+  }
+  return results
+}
+
 async function postProcessPdfOcrResultsBatched(
   pages: Array<{ page: OcrPageRow; sourcePageIndex: number; resultIndex: number }>,
   rawResults: unknown[],
   ocrOptions: Required<PageOcrOptions>,
   signal?: AbortSignal,
   getMissingResultError?: (item: { sourcePageIndex: number; resultIndex: number }) => string,
+  pdfPath?: string | null,
 ): Promise<OcrPageResult[]> {
   const pageResults: OcrPageResult[] = []
+  const fallbackPdfPath = pdfPath || resolveFallbackPdfPathForPostProcess(pages)
+  const postProcessOptions = getAsyncPdfPostProcessOptions(ocrOptions)
+  const feijiangReference = ocrOptions.profile === 'guji_print_vertical'
+    ? await loadFeijiangOcrReference(fallbackPdfPath)
+    : null
+  const pageImageFallbackLimit = createLimiter(
+    ocrOptions.profile === 'guji_print_vertical'
+      ? OCR_ASYNC_PDF_GUJI_PAGE_FALLBACK_CONCURRENCY
+      : Math.max(1, Math.min(2, OCR_ASYNC_PDF_PAGE_FALLBACK_LIMIT)),
+  )
+  let fallbackAttempts = 0
+  const tryPageImageFallback = async (item: { page: OcrPageRow; sourcePageIndex: number }): Promise<OcrPageResult | null> => {
+    return pageImageFallbackLimit(async () => {
+      const fallbackLimit = ocrOptions.profile === 'guji_print_vertical'
+        ? Number.POSITIVE_INFINITY
+        : OCR_ASYNC_PDF_PAGE_FALLBACK_LIMIT
+      if (fallbackAttempts >= fallbackLimit) return null
+      fallbackAttempts += 1
+      const fallbackOptions = getVerticalFallbackOcrOptions(ocrOptions)
+      const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)
+      if (!fallbackPage) return null
+      item.page.image_path = fallbackPage.image_path
+      try {
+        const fallbackResult = sanitizeGujiNonBookHallucinations(
+          await recognizeSinglePageWithResolvedOptions(fallbackPage, fallbackOptions, signal),
+          fallbackOptions,
+          fallbackPage.image_path,
+        )
+        const fallbackIssue = findLikelyRunawayRepeatedOcrText(fallbackResult)
+          ? formatSuspiciousRepeatedOcrTextIssue(findLikelyRunawayRepeatedOcrText(fallbackResult) as OcrRepeatedTextIssue)
+          : getRiskyPageImageNonTableHardIssue(fallbackResult, fallbackPage.image_path, fallbackOptions)
+        if (fallbackIssue) {
+          const splitFallbackResult = await recognizeSplitPageImageFallback(fallbackPage, fallbackOptions, signal, fallbackIssue)
+          if (splitFallbackResult) {
+            return {
+              pageId: item.page.id,
+              result: splitFallbackResult,
+              text: getOcrResultText(splitFallbackResult),
+              status: 'completed',
+            } satisfies OcrPageResult
+          }
+          return null
+        }
+        return {
+          pageId: item.page.id,
+          result: fallbackResult,
+          text: getOcrResultText(fallbackResult),
+          status: 'completed',
+        } satisfies OcrPageResult
+      } catch (error) {
+        if (isOcrAbortError(error)) throw error
+      }
+      return null
+    })
+  }
   for (let index = 0; index < pages.length; index += OCR_RESULT_POSTPROCESS_CHUNK_SIZE) {
     const batch = pages.slice(index, index + OCR_RESULT_POSTPROCESS_CHUNK_SIZE)
     const batchResults = await Promise.all(batch.map(async (item) => {
       throwIfOcrCanceled(signal)
       const rawResult = rawResults[item.resultIndex]
-      const result = rawResult ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, ocrOptions, { signal }) : null
+      const result = rawResult ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, { signal }) : null
       if (!result) {
+        const recovered = await recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)
+        if (recovered) return recovered
+        const missingResultError = getMissingResultError?.(item) || `PaddleOCR async result missing for page ${item.sourcePageIndex + 1}`
         return {
           pageId: item.page.id,
           result: null,
           text: '',
           status: 'error',
-          error: getMissingResultError?.(item) || `PaddleOCR async result missing for page ${item.sourcePageIndex + 1}`,
+          error: ocrOptions.profile === 'guji_print_vertical'
+            ? formatAsyncPdfRetryableQualityIssue(missingResultError)
+            : missingResultError,
         } satisfies OcrPageResult
       }
-      const repeatedIssue = findSuspiciousRepeatedOcrText(result)
-      if (repeatedIssue) {
+      if (ocrOptions.profile === 'guji_print_vertical') {
+        const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)
+        if (qualityIssue) {
+          const recovered = await recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)
+          if (recovered) return recovered
+          return {
+            pageId: item.page.id,
+            result: null,
+            text: '',
+            status: 'error',
+            error: qualityIssue,
+          } satisfies OcrPageResult
+        }
+        const referencePayload = feijiangReference
+          ? getFeijiangReferencePagePayload(feijiangReference, Number(item.page.page_num || item.sourcePageIndex + 1))
+          : null
+        const referenceMismatchIssue = referencePayload
+          ? getGujiFeijiangReferenceMismatchIssue(result, referencePayload)
+          : null
+        if (referenceMismatchIssue) {
+          const recovered = await recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)
+          if (recovered) return recovered
+          return {
+            pageId: item.page.id,
+            result: null,
+            text: '',
+            status: 'error',
+            error: formatAsyncPdfRetryableQualityIssue(referenceMismatchIssue),
+          } satisfies OcrPageResult
+        }
+        const asyncPdfResult = isJsonRecord(result)
+          ? {
+            ...result,
+            gujismart_async_pdf_result: true,
+          }
+          : result
+        return {
+          pageId: item.page.id,
+          result: asyncPdfResult,
+          text: getOcrResultText(asyncPdfResult),
+          status: 'completed',
+        } satisfies OcrPageResult
+      }
+      const safePreferredText = hasSafeGujiPreferredServiceText(result)
+      const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification(result, item.page.image_path, ocrOptions)
+      const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue(result, item.page.image_path, ocrOptions)
+      const underSegmented = !safePreferredText
+        && !tableMisclassification
+        && !hardQualityIssue
+        && isLikelyUnderSegmentedRiskyPageImageResult(result, item.page.image_path, ocrOptions)
+      if (tableMisclassification || hardQualityIssue || underSegmented) {
+        const qualityIssue = tableMisclassification
+          || hardQualityIssue
+          || getUnderSegmentedRiskyPageImageMessage()
+        markDocumentPreferPageImageOcr(
+          item.page.doc_id,
+          qualityIssue,
+        )
+        const fallbackPageResult = await tryPageImageFallback(item)
+        if (fallbackPageResult) return fallbackPageResult
+        if (underSegmented) {
+          return {
+            pageId: item.page.id,
+            result,
+            text: getOcrResultText(result),
+            status: 'completed',
+          } satisfies OcrPageResult
+        }
         return {
           pageId: item.page.id,
           result: null,
           text: '',
           status: 'error',
-          error: formatSuspiciousRepeatedOcrTextIssue(repeatedIssue),
+          error: qualityIssue,
         } satisfies OcrPageResult
       }
 
@@ -783,22 +2453,1472 @@ async function postProcessPdfOcrResultsBatched(
   return pageResults
 }
 
+async function recognizeSinglePageWithResolvedOptions(
+  page: OcrPageWithImage,
+  resolvedOptions: Required<PageOcrOptions>,
+  signal?: AbortSignal,
+): Promise<OcrRecognizeResult> {
+  throwIfOcrCanceled(signal)
+  const uploadImage = await prepareImageForOcrUpload(page.image_path)
+  throwIfOcrCanceled(signal)
+  const base64Image = uploadImage.buffer.toString('base64')
+  const initialResult = resolvedOptions.profile === 'guji_print_vertical'
+    ? await recognizeTraditional(base64Image, { signal })
+    : await recognizeImage(base64Image, { signal })
+  return postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions, { signal, uploadImage })
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function getSplitPageCropSpecs(imagePath?: string | null): PageImageCropSpec[] {
+  const size = getPageImageSize(imagePath)
+  if (!size || size.width < 900 || size.width < size.height * 1.05) return []
+  const centerX = Math.round(size.width / 2)
+  const overlap = clampNumber(Math.round(size.width * 0.025), 16, Math.max(16, Math.round(size.width * 0.08)))
+  const rightX = clampNumber(centerX - overlap, 0, Math.max(0, size.width - 1))
+  const leftWidth = clampNumber(centerX + overlap, 1, size.width)
+  const rightWidth = clampNumber(size.width - rightX, 1, size.width)
+  return [
+    { id: 'right', x: rightX, y: 0, width: rightWidth, height: size.height, readingOrder: 0 },
+    { id: 'left', x: 0, y: 0, width: leftWidth, height: size.height, readingOrder: 1 },
+  ]
+}
+
+function getSplitPageCropSpecSets(imagePath?: string | null): PageImageCropSpec[][] {
+  const size = getPageImageSize(imagePath)
+  const halves = getSplitPageCropSpecs(imagePath)
+  if (!size || halves.length < 2) return halves.length > 0 ? [halves] : []
+  const centerY = Math.round(size.height / 2)
+  const verticalOverlap = clampNumber(Math.round(size.height * 0.025), 16, Math.max(16, Math.round(size.height * 0.08)))
+  const topHeight = clampNumber(centerY + verticalOverlap, 1, size.height)
+  const bottomY = clampNumber(centerY - verticalOverlap, 0, Math.max(0, size.height - 1))
+  const bottomHeight = clampNumber(size.height - bottomY, 1, size.height)
+  const right = halves.find((item) => item.id === 'right') || halves[0]
+  const left = halves.find((item) => item.id === 'left') || halves[1]
+  const quadrants: PageImageCropSpec[] = [
+    { id: 'right-top', x: right.x, y: 0, width: right.width, height: topHeight, readingOrder: 0 },
+    { id: 'right-bottom', x: right.x, y: bottomY, width: right.width, height: bottomHeight, readingOrder: 1 },
+    { id: 'left-top', x: left.x, y: 0, width: left.width, height: topHeight, readingOrder: 2 },
+    { id: 'left-bottom', x: left.x, y: bottomY, width: left.width, height: bottomHeight, readingOrder: 3 },
+  ]
+  return [halves, quadrants]
+}
+
+async function writeTemporaryOcrCropImage(page: OcrPageWithImage, spec: PageImageCropSpec): Promise<string> {
+  const source = nativeImage.createFromPath(page.image_path)
+  if (source.isEmpty()) throw new Error('无法读取页图，不能执行半页 OCR 兜底。')
+  const cropped = source.crop({
+    x: spec.x,
+    y: spec.y,
+    width: spec.width,
+    height: spec.height,
+  })
+  const jpeg = cropped.toJPEG(86)
+  if (jpeg.length <= 0) throw new Error('半页 OCR 兜底切图失败。')
+  const storageDir = join(getDataDir(), 'storage', page.doc_id, 'ocr-fallback')
+  if (!existsSync(storageDir)) mkdirSync(storageDir, { recursive: true })
+  const pageNum = Math.max(1, Math.round(Number(page.page_num || 1)))
+  const destPath = join(storageDir, `page_${pageNum}_${spec.id}_${nanoid(8)}.jpg`)
+  await writeFile(destPath, jpeg)
+  return destPath
+}
+
+function shiftOcrCoordinateValue(value: unknown, offsetX: number, offsetY: number): unknown {
+  if (Array.isArray(value)) {
+    if (value.every((item) => typeof item === 'number' && Number.isFinite(item))) {
+      return value.map((item, index) => Number(item) + (index % 2 === 0 ? offsetX : offsetY))
+    }
+    return value.map((item) => shiftOcrCoordinateValue(item, offsetX, offsetY))
+  }
+  if (!isJsonRecord(value)) return value
+  const next: JsonRecord = { ...value }
+  for (const key of ['x', 'left', 'right']) {
+    if (typeof next[key] === 'number' && Number.isFinite(next[key])) {
+      next[key] = Number(next[key]) + offsetX
+    }
+  }
+  for (const key of ['y', 'top', 'bottom']) {
+    if (typeof next[key] === 'number' && Number.isFinite(next[key])) {
+      next[key] = Number(next[key]) + offsetY
+    }
+  }
+  return next
+}
+
+function shiftOcrItemCoordinates(item: JsonRecord, spec: PageImageCropSpec, readingOrder: number): JsonRecord {
+  const next: JsonRecord = {
+    ...item,
+    reading_order: readingOrder,
+  }
+  if (typeof next.block_order === 'number') next.block_order = readingOrder + 1
+  if (typeof next.source_reading_order === 'number') next.source_reading_order = readingOrder + 1
+  for (const key of ['location', 'bbox', 'block_bbox', 'box', 'coordinate', 'points', 'text_region', 'mask_polygon']) {
+    if (next[key] !== undefined) {
+      next[key] = shiftOcrCoordinateValue(next[key], spec.x, spec.y)
+    }
+  }
+  delete next.normalized_location
+  delete next.ir_block_id
+  return next
+}
+
+function downgradeSplitFallbackTableBlock(item: JsonRecord): { block: JsonRecord; downgraded: boolean } {
+  if (!/table|sheet|excel/.test(getOcrBlockLabel(item))) {
+    return { block: item, downgraded: false }
+  }
+  const text = getOcrBlockTableText(item) || getOcrBlockTextValue(item)
+  return {
+    block: {
+      ...item,
+      words: text,
+      raw_words: getTextFromUnknown(item.raw_words) || text,
+      label: 'text',
+      block_label: 'text',
+      type: 'text',
+      rows: undefined,
+      table_rows: undefined,
+      tableRows: undefined,
+      cells: undefined,
+      table_cells: undefined,
+      tableCells: undefined,
+      html: undefined,
+      table_html: undefined,
+      tableHtml: undefined,
+      markdown: undefined,
+      split_fallback_table_downgraded: true,
+    },
+    downgraded: true,
+  }
+}
+
+function getResultRecordArray(result: OcrPageResultPayload, key: 'layout_result' | 'words_result'): JsonRecord[] {
+  const value = result[key]
+  return Array.isArray(value) ? value.filter(isJsonRecord) : []
+}
+
+function mergeSplitPageOcrResults(
+  page: OcrPageWithImage,
+  parts: Array<{ spec: PageImageCropSpec; result: OcrPageResultPayload; text: string }>,
+  ocrOptions: Required<PageOcrOptions>,
+  reason: string,
+): OcrPageResultPayload {
+  const orderedParts = [...parts].sort((a, b) => a.spec.readingOrder - b.spec.readingOrder)
+  const layoutBlocks: JsonRecord[] = []
+  const wordBlocks: JsonRecord[] = []
+  let layoutOrder = 0
+  let wordOrder = 0
+  let downgradedTableCount = 0
+
+  for (const part of orderedParts) {
+    for (const block of getResultRecordArray(part.result, 'layout_result')) {
+      const shifted = shiftOcrItemCoordinates(block, part.spec, layoutOrder)
+      const downgraded = downgradeSplitFallbackTableBlock(shifted)
+      if (downgraded.downgraded) downgradedTableCount += 1
+      layoutBlocks.push(downgraded.block)
+      layoutOrder += 1
+    }
+    for (const word of getResultRecordArray(part.result, 'words_result')) {
+      const shifted = shiftOcrItemCoordinates(word, part.spec, wordOrder)
+      const downgraded = downgradeSplitFallbackTableBlock(shifted)
+      if (downgraded.downgraded) downgradedTableCount += 1
+      wordBlocks.push(downgraded.block)
+      wordOrder += 1
+    }
+  }
+
+  const pageSize = getPageImageSize(page.image_path)
+  const text = orderedParts.map((part) => part.text).filter(Boolean).join('\n')
+  const markdown = orderedParts
+    .map((part) => getTextFromUnknown(isJsonRecord(part.result) ? part.result.markdown : ''))
+    .filter(Boolean)
+    .join('\n\n')
+  const base = orderedParts[0]?.result || {}
+  const baseMeta = isJsonRecord(base.guji_processing) ? base.guji_processing : {}
+  const merged: OcrPageResultPayload = {
+    ...base,
+    source_type: 'page_image_split_fallback',
+    markdown: markdown || text,
+    text,
+    layout_result: layoutBlocks,
+    words_result: wordBlocks.length > 0
+      ? wordBlocks
+      : layoutBlocks.map((block) => ({ words: getOcrBlockTextValue(block), location: block.location })),
+    guji_processing: {
+      ...baseMeta,
+      profile: ocrOptions.profile,
+      second_pass: ocrOptions.secondPass,
+      split_page_image_fallback: true,
+      split_page_image_reason: reason,
+      split_page_image_parts: orderedParts.map((part) => ({
+        id: part.spec.id,
+        x: part.spec.x,
+        y: part.spec.y,
+        width: part.spec.width,
+        height: part.spec.height,
+      })),
+      split_page_image_downgraded_tables: downgradedTableCount,
+      source_image_width: pageSize?.width,
+      source_image_height: pageSize?.height,
+      updated_at: new Date().toISOString(),
+    },
+  }
+  delete merged.gujismart_ir
+  delete merged.ir_text
+  return merged
+}
+
+async function recognizeSplitPageImageFallback(
+  page: OcrPageWithImage,
+  ocrOptions: Required<PageOcrOptions>,
+  signal: AbortSignal | undefined,
+  reason: string,
+): Promise<OcrPageResultPayload | null> {
+  if (ocrOptions.profile !== 'guji_print_vertical') return null
+  const specSets = getSplitPageCropSpecSets(page.image_path)
+  if (specSets.length === 0) return null
+
+  for (const specs of specSets) {
+    const parts: Array<{ spec: PageImageCropSpec; result: OcrPageResultPayload; text: string }> = []
+    let setFailed = false
+    for (const spec of [...specs].sort((a, b) => a.readingOrder - b.readingOrder)) {
+      throwIfOcrCanceled(signal)
+      const cropPath = await writeTemporaryOcrCropImage(page, spec)
+      try {
+        const cropPage: OcrPageWithImage = { ...page, image_path: cropPath }
+        const result = sanitizeGujiNonBookHallucinations(
+          await recognizeSinglePageWithResolvedOptions(cropPage, ocrOptions, signal),
+          ocrOptions,
+          cropPath,
+        )
+        const hardIssue = getRiskyPageImageNonTableHardIssue(result, cropPath, ocrOptions)
+        const text = getOcrResultText(result)
+        if (hardIssue || text.replace(/\s+/g, '').length < 4) {
+          setFailed = true
+          break
+        }
+        parts.push({ spec, result, text })
+      } catch (error) {
+        if (isOcrAbortError(error)) throw error
+        setFailed = true
+        break
+      } finally {
+        await rm(cropPath, { force: true }).catch(() => undefined)
+      }
+    }
+
+    if (setFailed) continue
+    const totalTextLength = parts.map((part) => part.text).join('').replace(/\s+/g, '').length
+    if (totalTextLength < 20) continue
+    const merged = sanitizeGujiNonBookHallucinations(
+      mergeSplitPageOcrResults(page, parts, ocrOptions, reason),
+      ocrOptions,
+      page.image_path,
+    )
+    const repeatedIssue = findLikelyRunawayRepeatedOcrText(merged)
+    if (repeatedIssue) continue
+    if (getRiskyPageImageNonTableHardIssue(merged, page.image_path, ocrOptions)) continue
+    return merged
+  }
+  return null
+}
+
 async function recognizeSinglePage(page: OcrPageWithImage, doc: Pick<OcrDocumentRow, 'doc_type'>, options?: PageOcrOptions): Promise<OcrRecognizeResult> {
   const resolvedOptions = resolveDocOcrOptions(doc.doc_type, options)
-  const imageBuffer = await prepareImageForOcrUpload(page.image_path)
-  const base64Image = imageBuffer.toString('base64')
-  const initialResult = resolvedOptions.profile === 'guji_print_vertical'
-    ? await recognizeTraditional(base64Image)
-    : await recognizeImage(base64Image)
-  return postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions)
+  const result = await recognizeSinglePageWithResolvedOptions(page, resolvedOptions)
+  const hardIssue = getRiskyPageImageHardIssue(result, page.image_path, resolvedOptions)
+  if (!hardIssue) return result
+  const splitFallback = await recognizeSplitPageImageFallback(page, resolvedOptions, undefined, hardIssue)
+  if (splitFallback) return splitFallback
+  throw new Error(hardIssue)
+}
+
+function getAutomaticSinglePageRetryOptions(
+  doc: Pick<OcrDocumentRow, 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
+  page: Pick<OcrPageRow, 'image_path'>,
+): Required<PageOcrOptions> {
+  const baseOptions = resolveDocOcrOptions(doc.doc_type)
+  const pageSize = getPageImageSize(page.image_path)
+  const facsimilePageShape = pageSize
+    ? pageSize.width >= pageSize.height * 1.08 || pageSize.height >= pageSize.width * 1.18
+    : false
+  if (
+    baseOptions.profile === 'guji_print_vertical'
+    || hasOldBookRouteHints(doc)
+    || facsimilePageShape
+  ) {
+    return getVerticalFallbackOcrOptions(baseOptions)
+  }
+  return baseOptions
+}
+
+function getIncompletePagesForSinglePageRetry(docId: string, excludedPageIds: Set<string> = new Set()): OcrPageRow[] {
+  const excludedIds = [...excludedPageIds].map((pageId) => String(pageId || '').trim()).filter(Boolean)
+  const exclusionClause = excludedIds.length > 0
+    ? `AND id NOT IN (${excludedIds.map(() => '?').join(', ')})`
+    : ''
+  return hydratePagePayloadRows(queryAll<OcrPageRow>(
+    `SELECT *
+     FROM pages
+     WHERE doc_id = ?
+       ${exclusionClause}
+       AND (
+          ocr_status = 'error'
+          OR ocr_status IS NULL
+         OR ocr_status IN ('pending', 'queued', 'processing')
+         OR (
+           ocr_status = 'completed'
+           AND NOT (${completedPageContentPredicate('pages')})
+         )
+        )
+      ORDER BY page_num
+      LIMIT ?`,
+    [docId, ...excludedIds, OCR_AUTO_FAILED_PAGE_RETRY_LIMIT],
+  ))
+}
+
+function getAutomaticRetryFallbackPageCount(
+  doc: Pick<OcrDocumentRow, 'metadata'>,
+  pages: Array<Pick<OcrPageRow, 'page_num'>>,
+): number {
+  const metadata = parseMetadata(doc.metadata)
+  const metadataPageCount = Math.max(
+    Number(metadata.pdf_page_count || 0),
+    Number(metadata.page_count || 0),
+  )
+  const maxPageNum = Math.max(0, ...pages
+    .map((page) => Number(page.page_num || 0))
+    .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0))
+  return Math.max(
+    Number.isFinite(metadataPageCount) ? Math.floor(metadataPageCount) : 0,
+    maxPageNum,
+  )
+}
+
+function getOriginalPdfRetryPageRangeTargetNums(
+  pageNums: number[],
+  fallbackPageCount: number,
+  pageRangeChunkSize?: number,
+): number[] {
+  const normalizedPageNums = [...new Set(pageNums
+    .map((pageNum) => Math.floor(Number(pageNum)))
+    .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0))]
+    .sort((left, right) => left - right)
+  const chunkSize = Math.floor(Number(pageRangeChunkSize || 0))
+  if (chunkSize <= 1) return normalizedPageNums
+  const maxPageNum = Math.max(
+    Math.floor(Number(fallbackPageCount || 0)),
+    ...normalizedPageNums,
+  )
+  const expanded = new Set<number>()
+  normalizedPageNums.forEach((pageNum) => {
+    const start = Math.floor((pageNum - 1) / chunkSize) * chunkSize + 1
+    const end = Math.min(maxPageNum, start + chunkSize - 1)
+    for (let current = start; current <= end; current += 1) {
+      expanded.add(current)
+    }
+  })
+  return [...expanded].sort((left, right) => left - right)
+}
+
+interface OriginalPdfRetryStrategy {
+  targetPageNums: number[]
+  pageRangeChunkSize?: number
+  requireFullFileUpload?: boolean
+}
+
+function getOriginalPdfRetryStrategies(
+  targetPageNums: number[],
+  fallbackPageCount: number,
+  pageRangeChunkSize?: number,
+  gujiProfile = false,
+): OriginalPdfRetryStrategy[] {
+  const normalizedTargetPageNums = [...new Set(targetPageNums
+    .map((pageNum) => Math.floor(Number(pageNum)))
+    .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0))]
+    .sort((left, right) => left - right)
+  if (!gujiProfile) {
+    return [{ targetPageNums: normalizedTargetPageNums, pageRangeChunkSize }]
+  }
+  return [
+    {
+      targetPageNums: getOriginalPdfRetryPageRangeTargetNums(normalizedTargetPageNums, fallbackPageCount, pageRangeChunkSize),
+      pageRangeChunkSize,
+    },
+    {
+      targetPageNums: normalizedTargetPageNums,
+    },
+    {
+      targetPageNums: normalizedTargetPageNums,
+      requireFullFileUpload: true,
+    },
+  ].filter((strategy) => strategy.targetPageNums.length > 0)
+}
+
+async function retryIncompletePagesWithOriginalPdfOcr(
+  doc: Pick<OcrDocumentRow, 'id' | 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
+  pdfPath: string | null,
+  signal?: AbortSignal,
+  onProgress?: (payload: { pageNum?: number; completedPages: number; totalPages: number; error?: string }) => void,
+): Promise<OcrPageResult[] | null> {
+  if (!pdfPath || !shouldUseAsyncPdfOcr(pdfPath)) return null
+  const resultsByPageId = new Map<string, OcrPageResult>()
+  const attemptedPageIds = new Set<string>()
+  const initialSummary = summarizeDocumentOcrPages(doc.id)
+  const totalPages = Math.max(1, initialSummary.failed + initialSummary.pending)
+  let completedPages = 0
+
+  while (true) {
+    const pages = getIncompletePagesForSinglePageRetry(doc.id, attemptedPageIds)
+    if (pages.length === 0) break
+    pages.forEach((page) => attemptedPageIds.add(page.id))
+    const pageNums = pages
+      .map((page) => Number(page.page_num || 0))
+      .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0)
+    if (pageNums.length === 0) break
+
+    transaction(() => {
+      pages.forEach((page) => {
+        run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = NULL, proofed_text_ref = NULL WHERE id = ?', [
+          'processing',
+          'pending',
+          page.id,
+        ])
+      })
+    })
+    scheduleDatabaseSave()
+
+    const baseRetryOptions = resolveDocOcrOptions(doc.doc_type)
+    const retryOptions = baseRetryOptions.profile === 'guji_print_vertical' || hasOldBookRouteHints(doc)
+      ? getVerticalFallbackOcrOptions(baseRetryOptions)
+      : baseRetryOptions
+    const fallbackPageCount = getAutomaticRetryFallbackPageCount(doc, pages)
+    const pageRangeChunkSize = retryOptions.profile === 'guji_print_vertical'
+      ? OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE
+      : undefined
+    let remainingPages = pages
+    const lastRetryErrorsByPageId = new Map<string, string>()
+
+    const maxAttempts = retryOptions.profile === 'guji_print_vertical' ? OCR_ORIGINAL_PDF_RETRY_ATTEMPTS : 1
+    for (let attempt = 1; attempt <= maxAttempts && remainingPages.length > 0; attempt += 1) {
+      const targetPageNums = remainingPages
+        .map((page) => Number(page.page_num || 0))
+        .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0)
+      const retryStrategy = getOriginalPdfRetryStrategies(
+        targetPageNums,
+        fallbackPageCount,
+        pageRangeChunkSize,
+        retryOptions.profile === 'guji_print_vertical',
+      )[Math.min(attempt - 1, maxAttempts - 1)]
+      if (!retryStrategy) break
+      const resultIndexByPageNum = new Map(retryStrategy.targetPageNums.map((pageNum, index) => [pageNum, index]))
+      try {
+        const rawResults = await recognizePdfAsync(pdfPath, (payload) => {
+          throwIfOcrCanceled(signal)
+          const chunkCompleted = Math.min(remainingPages.length, Number(payload.completedPages || 0))
+          onProgress?.({
+            completedPages: Math.min(totalPages, completedPages + chunkCompleted),
+            totalPages,
+          })
+        }, {
+          signal,
+          ocrOptions: retryOptions,
+          targetPageNums: retryStrategy.targetPageNums,
+          fallbackPageCount,
+          pageRangeChunkSize: retryStrategy.pageRangeChunkSize,
+          requireFullFileUpload: retryStrategy.requireFullFileUpload,
+        })
+        const pageItems = remainingPages.map((page, index) => {
+          const pageNum = Number(page.page_num || index + 1)
+          return {
+            page,
+            sourcePageIndex: pageNum - 1,
+            resultIndex: retryStrategy.requireFullFileUpload
+              ? pageNum - 1
+              : resultIndexByPageNum.get(pageNum) ?? index,
+          }
+        })
+        const pageResults = await postProcessPdfOcrResultsBatched(
+          pageItems,
+          rawResults,
+          retryOptions,
+          signal,
+          (item) => `PaddleOCR 异步原 PDF 补跑结果页数不足：第 ${item.sourcePageIndex + 1} 页缺少结果。`,
+          pdfPath,
+        )
+        const nextRemainingPages: OcrPageRow[] = []
+        pageResults.forEach((pageResult, index) => {
+          const page = remainingPages[index]
+          const pageNum = Number(page?.page_num || 0) || undefined
+          if (pageResult.status === 'error' && (attempt < maxAttempts || retryOptions.profile === 'guji_print_vertical')) {
+            if (page) {
+              nextRemainingPages.push(page)
+              lastRetryErrorsByPageId.set(page.id, pageResult.error || `PaddleOCR async original PDF retry failed for page ${pageNum || '?'}`)
+            }
+            return
+          }
+          completedPages += 1
+          lastRetryErrorsByPageId.delete(pageResult.pageId)
+          resultsByPageId.set(pageResult.pageId, pageResult)
+          onProgress?.({
+            pageNum,
+            completedPages: Math.min(totalPages, completedPages),
+            totalPages,
+            error: pageResult.status === 'error' ? pageResult.error : undefined,
+          })
+        })
+        remainingPages = nextRemainingPages
+      } catch (error) {
+        if (isOcrAbortError(error)) throw error
+        const message = (error as Error)?.message || String(error || 'OCR failed')
+        if (attempt < maxAttempts) continue
+        if (retryOptions.profile !== 'guji_print_vertical') {
+          remainingPages.forEach((page) => {
+            completedPages += 1
+            onProgress?.({
+              pageNum: Number(page.page_num || 0) || undefined,
+              completedPages: Math.min(totalPages, completedPages),
+              totalPages,
+              error: message,
+            })
+            resultsByPageId.set(page.id, {
+              pageId: page.id,
+              result: null,
+              text: '',
+              status: 'error',
+              error: message,
+            })
+          })
+          remainingPages = []
+          continue
+        }
+        remainingPages.forEach((page) => {
+          lastRetryErrorsByPageId.set(page.id, message)
+        })
+      }
+    }
+
+    if (remainingPages.length > 0 && retryOptions.profile === 'guji_print_vertical') {
+      const recoveredResults = await recoverGujiPagesFromFeijiangReference(remainingPages, pdfPath, retryOptions, signal)
+      if (recoveredResults.length > 0) {
+        const recoveredPageIds = new Set(recoveredResults.map((item) => item.pageId))
+        recoveredResults.forEach((pageResult) => {
+          const page = remainingPages.find((item) => item.id === pageResult.pageId)
+          completedPages += 1
+          resultsByPageId.set(pageResult.pageId, pageResult)
+          onProgress?.({
+            pageNum: Number(page?.page_num || 0) || undefined,
+            completedPages: Math.min(totalPages, completedPages),
+            totalPages,
+          })
+        })
+        remainingPages = remainingPages.filter((page) => !recoveredPageIds.has(page.id))
+      }
+    }
+
+    remainingPages.forEach((page) => {
+      const pageNum = Number(page.page_num || 0) || undefined
+      const message = formatAsyncPdfRetryableQualityIssue(`PaddleOCR 寮傛鍘?PDF 琛ヨ窇鍚庝粛鏈兘寰楀埌鍙繚瀛樼粨鏋滐細绗?${pageNum || '?'} 椤?`)
+      completedPages += 1
+      resultsByPageId.set(page.id, {
+        pageId: page.id,
+        result: null,
+        text: '',
+        status: 'error',
+        error: message,
+      })
+      onProgress?.({
+        pageNum,
+        completedPages: Math.min(totalPages, completedPages),
+        totalPages,
+        error: message,
+      })
+    })
+  }
+
+  return [...resultsByPageId.values()]
+}
+
+async function retryIncompletePagesWithSinglePageOcr(
+  doc: Pick<OcrDocumentRow, 'id' | 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
+  pdfPath: string | null,
+  signal?: AbortSignal,
+  onProgress?: (payload: { pageNum?: number; completedPages: number; totalPages: number; error?: string }) => void,
+): Promise<OcrPageResult[]> {
+  const resultsByPageId = new Map<string, OcrPageResult>()
+  const originalPdfRetryResults = await retryIncompletePagesWithOriginalPdfOcr(doc, pdfPath, signal, onProgress)
+  if (originalPdfRetryResults) {
+    originalPdfRetryResults.forEach((pageResult) => {
+      resultsByPageId.set(pageResult.pageId, pageResult)
+    })
+    if (originalPdfRetryResults.length > 0 && originalPdfRetryResults.every((pageResult) => pageResult.status === 'completed')) {
+      return [...resultsByPageId.values()]
+    }
+  }
+
+  const attemptedPageIds = new Set(
+    [...resultsByPageId.values()]
+      .filter((pageResult) => pageResult.status === 'completed')
+      .map((pageResult) => pageResult.pageId),
+  )
+  const initialSummary = summarizeDocumentOcrPages(doc.id)
+  const totalPages = Math.max(1, initialSummary.failed + initialSummary.pending)
+  let completedPages = 0
+  while (true) {
+    const pages = getIncompletePagesForSinglePageRetry(doc.id, attemptedPageIds)
+    if (pages.length === 0) break
+    for (const originalPage of pages) {
+    throwIfOcrCanceled(signal)
+    attemptedPageIds.add(originalPage.id)
+    const pageNum = typeof originalPage.page_num === 'number' ? originalPage.page_num : undefined
+    let page = originalPage
+    if (!page.image_path || !existsSync(page.image_path)) {
+      const fallbackPage = await ensurePageImageForOcrFallback(page, pdfPath, signal)
+      if (fallbackPage) page = fallbackPage
+    }
+    if (!page.image_path || !existsSync(page.image_path)) {
+      completedPages += 1
+      const error = `第 ${pageNum || '?'} 页缺少可读取页图，无法自动单页补跑 OCR。`
+      onProgress?.({ pageNum, completedPages, totalPages, error })
+      resultsByPageId.set(originalPage.id, {
+        pageId: originalPage.id,
+        result: null,
+        text: '',
+        status: 'error',
+        error,
+      })
+      continue
+    }
+
+    run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = NULL, proofed_text_ref = NULL WHERE id = ?', [
+      'processing',
+      'pending',
+      originalPage.id,
+    ])
+    scheduleDatabaseSave()
+
+    try {
+      const retryOptions = getAutomaticSinglePageRetryOptions(doc, page)
+      const result = await recognizeSinglePage(withRequiredImage(page), doc, retryOptions)
+      const text = getOcrResultText(result)
+      completedPages += 1
+      onProgress?.({ pageNum, completedPages, totalPages })
+      resultsByPageId.set(originalPage.id, {
+        pageId: originalPage.id,
+        result,
+        text,
+        status: 'completed',
+      })
+    } catch (error) {
+      if (isOcrAbortError(error)) throw error
+      const message = (error as Error)?.message || String(error || 'OCR failed')
+      completedPages += 1
+      if (isOcrQualityFailureMessage(message)) {
+        const retryOptions = getAutomaticSinglePageRetryOptions(doc, page)
+        const recovered = await recoverPageQualityFailureFromFeijiangReference(originalPage, doc, {
+          ocrOptions: retryOptions,
+          signal,
+        })
+        if (recovered) {
+          onProgress?.({ pageNum, completedPages, totalPages })
+          resultsByPageId.set(originalPage.id, recovered)
+          continue
+        }
+      }
+      onProgress?.({ pageNum, completedPages, totalPages, error: message })
+      resultsByPageId.set(originalPage.id, {
+        pageId: originalPage.id,
+        result: null,
+        text: '',
+        status: 'error',
+        error: message,
+      })
+    }
+  }
+  }
+  return [...resultsByPageId.values()]
+}
+
+function getRiskyPageImageRetryOptions(
+  primaryOptions: Required<PageOcrOptions>,
+  docType?: string | null,
+): Required<PageOcrOptions> | null {
+  if (primaryOptions.profile === 'guji_print_vertical') return null
+  return { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
+}
+
+function getRiskyPageImageResultScore(result: OcrPageResultPayload, imagePath?: string | null): number {
+  const blocks = getOcrLayoutBlocks(result)
+  const textBlocks = blocks.filter((block) => getOcrBlockTextValue(block).replace(/\s+/g, '').length > 0)
+  const totalTextLength = textBlocks
+    .map((block) => getOcrBlockTextValue(block))
+    .join('')
+    .replace(/\s+/g, '')
+    .length
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  const pageArea = pageSize ? pageSize.width * pageSize.height : 0
+  const verticalBlocks = textBlocks.filter((block) => {
+    const orientation = String(block.orientation || '').toLowerCase()
+    const label = getOcrBlockLabel(block)
+    const rect = getOcrBlockRect(block)
+    return orientation === 'vertical'
+      || /vertical|column|col_text/.test(label)
+      || Boolean(rect && rect.width > 0 && rect.height >= rect.width * 1.28)
+  }).length
+  const largeBlockPenalty = textBlocks.filter((block) => {
+    const rect = getOcrBlockRect(block)
+    if (!rect || pageArea <= 0) return false
+    const textLength = getOcrBlockTextValue(block).replace(/\s+/g, '').length
+    return textLength >= 80 && (rect.width * rect.height) / pageArea >= 0.18
+  }).length
+  const tablePenalty = textBlocks.filter((block) => /table|sheet|excel/.test(getOcrBlockLabel(block))).length
+  return Math.min(40, textBlocks.length)
+    + Math.min(30, totalTextLength / 40)
+    + verticalBlocks * 1.5
+    - largeBlockPenalty * 8
+    - tablePenalty * 10
+}
+
+function getRiskyPageImagePageOptions(
+  page: OcrPageWithImage,
+  primaryOptions: Required<PageOcrOptions>,
+): Required<PageOcrOptions> {
+  if (primaryOptions.profile === 'guji_print_vertical') return primaryOptions
+  const pageResult = getPageOcrResultRecord(page)
+  if (hasVerticalGujiProcessingMeta(pageResult) || hasVerticalBlockLayoutSignals(pageResult, page.image_path)) {
+    return getVerticalFallbackOcrOptions(primaryOptions)
+  }
+  const imageSize = getPageImageSize(page.image_path)
+  if (imageSize && imageSize.width >= imageSize.height * 1.12) {
+    return getVerticalFallbackOcrOptions(primaryOptions)
+  }
+  return primaryOptions
+}
+
+function getRiskyPageImageHardIssue(
+  result: OcrPageResultPayload,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  return getRiskyPageImageNonTableHardIssue(result, imagePath, ocrOptions)
+    || getLikelyAsyncPdfTableMisclassification(result, imagePath, ocrOptions)
+}
+
+function getRiskyPageImageNonTableHardIssue(
+  result: OcrPageResultPayload,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  const repeatedIssue = findLikelyRunawayRepeatedOcrText(result)
+  if (repeatedIssue) return formatSuspiciousRepeatedOcrTextIssue(repeatedIssue)
+  const hallucinationIssue = getLikelyGujiNonBookHallucinationIssue(result, imagePath, ocrOptions)
+  if (hallucinationIssue) return hallucinationIssue
+  return getRiskyPageImageLayoutQualityIssue(result, imagePath, ocrOptions)
+}
+
+function formatLayoutQualityRejected(message: string): string {
+  return `${OCR_LAYOUT_QUALITY_REJECTED_PREFIX} ${message}`
+}
+
+function getGujiCjkKanaRatio(text: string): number {
+  const chars = Array.from(String(text || '').replace(/\s+/g, ''))
+  if (chars.length === 0) return 0
+  const cjkKanaChars = chars.filter((char) => /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]/.test(char)).length
+  return cjkKanaChars / chars.length
+}
+
+function getAsciiDigitRatio(text: string): number {
+  const chars = Array.from(String(text || '').replace(/\s+/g, ''))
+  if (chars.length === 0) return 0
+  const asciiDigitChars = chars.filter((char) => /[A-Za-z0-9]/.test(char)).length
+  return asciiDigitChars / chars.length
+}
+
+function hasGujiWebMetadataHallucination(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '')
+  if (!compact) return false
+  const metadataSignals = [
+    /\u9875\u7801/.test(compact),
+    /\u7f51\u5740/.test(compact),
+    /\u53d1\u5e03\u673a\u6784/.test(compact),
+    /\u9898\u540d/.test(compact),
+    /\u5e8f\u53f7/.test(compact),
+  ].filter(Boolean).length
+  const governmentTemplate = /\u836f\u54c1\u76d1\u7763|\u56fd\u5bb6\u836f\u54c1|\u4e2d\u534e\u4eba\u6c11\u5171\u548c\u56fd\u836f\u54c1/.test(compact)
+  return governmentTemplate || (metadataSignals >= 3 && /[\u4e00-\u9fff]/.test(compact))
+}
+
+function hasGujiModernDateHallucination(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '')
+  if (!compact) return false
+  if (/20\d{2}\u5e74\d{1,2}\u6708\d{1,2}\u65e5/.test(compact)) return true
+  const modernYearCount = (compact.match(/20\d{2}\u5e74/g) || []).length
+  if (modernYearCount >= 2) return true
+  const modernMeasureCount = (compact.match(/(?:20\d{2}\u5e74|\d{1,3}\u5206\u4ee5\u4e0b|\d{1,3}\u6642|\d{1,3}\u65f6|\d{1,3}\u00b0)/g) || []).length
+  return modernYearCount >= 1 && modernMeasureCount >= 3
+}
+
+function hasGujiMachineTokenHallucination(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '')
+  if (compact.length < 10) return false
+  const hasLongMachineToken = /[A-Z]{2,}[A-Z0-9]{5,}\d{3,}/.test(compact)
+    || /\d{3,}[A-Z]{2,}[A-Z0-9]{3,}/.test(compact)
+  if (hasLongMachineToken) return true
+  if (/(?:OAS|OCR|API|AI)[A-Z0-9]{3,}/i.test(compact) && /\d{3,}/.test(compact)) return true
+  return compact.length >= 16
+    && getAsciiDigitRatio(compact) >= 0.45
+    && getGujiCjkKanaRatio(compact) < 0.45
+    && /[A-Z]/i.test(compact)
+    && /\d/.test(compact)
+}
+
+function hasGujiUnexpectedScriptHallucination(text: string): boolean {
+  const compact = String(text || '').replace(/\s+/g, '')
+  if (compact.length < 4) return false
+  const unexpectedScriptCount = (compact.match(/[\u0590-\u05ff\u0600-\u06ff\u0e00-\u0e7f\u0400-\u04ff\uac00-\ud7af]/g) || []).length
+  if (unexpectedScriptCount === 0) return false
+  const cjkKanaCount = (compact.match(/[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]/g) || []).length
+  const unexpectedRatio = unexpectedScriptCount / Math.max(1, compact.length)
+  if (cjkKanaCount < 2 || unexpectedRatio < 0.03) return false
+  return unexpectedScriptCount >= 4 || (unexpectedScriptCount >= 2 && unexpectedRatio >= 0.08)
+}
+
+function hasGujiKanaPunctuationSubstitutionIssue(text: string): boolean {
+  const value = String(text || '')
+  const compact = value.replace(/\s+/g, '')
+  if (compact.length < 120) return false
+  const kanaCount = (compact.match(/[\u3040-\u30ff]/g) || []).length
+  if (kanaCount < 80) return false
+  const inlineMarkerCount = (value.match(/[\u3040-\u30ff\u3400-\u9fff][D=][\u3040-\u30ff\u3400-\u9fff]/g) || []).length
+  if (inlineMarkerCount >= 2) return true
+  const substitutedSentenceEndCount = (compact.match(/(?:\u30de\u30b7\u30bf|\u30a4\u30de\u30b9|\u30b7\u30bf|\u30c6\u30b9|\u30c7\u30b9|\u30b7\u30e7\u30aa|\u30e8\u30aa)[\u30cb\u30ed]/g) || []).length
+  return substitutedSentenceEndCount >= 12
+}
+
+function hasGujiVerticalQuestionPhrasePollution(text: string): boolean {
+  const value = String(text || '')
+  const compact = value.replace(/\s+/g, '')
+  if (compact.length < 180) return false
+  const questionLineCount = (value.match(/[○〇][^\n]{0,80}(?:か|すか|ですか|ますか|せうか|しょうか)/g) || []).length
+  const malformedQuotePhraseCount = (compact.match(/と「(?:いる|ある|する|なる)のは/g) || []).length
+  const repeatedBarePhraseCount = (compact.match(/「(?:いる|ある|する|なる)のは/g) || []).length
+  if (questionLineCount >= 4 && malformedQuotePhraseCount >= 2 && repeatedBarePhraseCount >= 4) return true
+
+  const phraseCounts = new Map<string, number>()
+  const kanaRuns = compact.match(/[\u3040-\u30ffー]{3,6}/g) || []
+  kanaRuns.forEach((phrase) => {
+    if (!/(?:いる|ある|する|なる|です|ます|せう|しょう|のは)/.test(phrase)) return
+    phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1)
+  })
+  const repeatedQuestionPhrase = [...phraseCounts.entries()].some(([phrase, count]) => {
+    if (count < 6) return false
+    const quotedCount = (compact.match(new RegExp(`「${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'g')) || []).length
+    return quotedCount >= 3
+  })
+  return questionLineCount >= 5 && repeatedQuestionPhrase
+}
+
+function getLikelyGujiNonBookHallucinationIssue(
+  result: OcrPageResultPayload,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  if (ocrOptions.profile !== 'guji_print_vertical') return null
+  const blocks = getOcrLayoutBlocks(result)
+  const textBlocks = blocks.filter((block) => getOcrBlockTextValue(block).replace(/\s+/g, '').length > 0)
+  if (textBlocks.length === 0) return null
+  const totalText = textBlocks.map((block) => getOcrBlockTextValue(block)).join('\n')
+  if (hasGujiWebMetadataHallucination(totalText)) {
+    return formatLayoutQualityRejected('\u53e4\u7c4d OCR \u8fd4\u56de\u4e86\u7f51\u9875\u5143\u6570\u636e\u6216\u653f\u52a1\u7f51\u7ad9\u5b57\u6bb5\uff0c\u8fd9\u4e9b\u6587\u5b57\u4e0d\u5e94\u5199\u5165\u672c\u9875\u6b63\u6587\uff1b\u5df2\u6539\u7528\u9875\u56fe/\u62c6\u56fe OCR \u515c\u5e95\u3002')
+  }
+  if (hasGujiModernDateHallucination(totalText)) {
+    return formatLayoutQualityRejected('\u53e4\u7c4d OCR \u8fd4\u56de\u4e86\u7591\u4f3c\u73b0\u4ee3\u65e5\u671f/\u6570\u503c\u6a21\u677f\u7684\u6587\u5b57\u5757\uff0c\u8fd9\u4e9b\u6587\u5b57\u4e0d\u5e94\u5199\u5165\u672c\u9875\u6b63\u6587\uff1b\u5df2\u6539\u7528\u9875\u56fe/\u62c6\u56fe OCR \u515c\u5e95\u3002')
+  }
+  if (hasGujiUnexpectedScriptHallucination(totalText)) {
+    return formatLayoutQualityRejected('\u53e4\u7c4d OCR \u8fd4\u56de\u4e86\u7591\u4f3c\u5f02\u79cd\u8bed\u6587\u5b57\u6216\u9519\u8bfb\u5b57\u7b26\uff0c\u8fd9\u4e9b\u6587\u5b57\u4e0d\u5e94\u5199\u5165\u672c\u9875\u6b63\u6587\uff1b\u672c\u9875\u7ed3\u679c\u672a\u6309\u6b63\u5e38 OCR \u4fdd\u5b58\u3002')
+  }
+  if (hasGujiKanaPunctuationSubstitutionIssue(totalText)) {
+    return formatLayoutQualityRejected('\u53e4\u7c4d OCR \u8fd4\u56de\u4e86\u7591\u4f3c\u7247\u5047\u540d\u7ec6\u5b57\u574f\u8bfb\u7ed3\u679c\uff0c\u5b58\u5728\u5927\u91cf\u53e5\u8bfb\u70b9/\u5b57\u7b26\u66ff\u6362\u8bef\u8bfb\uff1b\u672c\u9875\u7ed3\u679c\u672a\u6309\u6b63\u5e38 OCR \u4fdd\u5b58\u3002')
+  }
+  if (hasGujiVerticalQuestionPhrasePollution(totalText)) {
+    return formatLayoutQualityRejected('古籍 OCR 返回了疑似竖排问答坏读结果，短语被反复插入并把原句切碎；本页结果未按正常 OCR 保存。')
+  }
+
+  const suspiciousBlocks = textBlocks.filter((block) => {
+    const text = getOcrBlockTextValue(block)
+    if (!hasGujiMachineTokenHallucination(text) && !hasGujiUnexpectedScriptHallucination(text) && !hasGujiKanaPunctuationSubstitutionIssue(text)) return false
+    const rect = getOcrBlockRect(block)
+    if (!rect) return true
+    const pageSize = getOcrPageSizeForResult(result, imagePath)
+    const heightRatio = pageSize ? rect.height / Math.max(1, pageSize.height) : 0
+    return heightRatio >= 0.08 || text.replace(/\s+/g, '').length >= 16
+  })
+  if (suspiciousBlocks.length > 0) {
+    return formatLayoutQualityRejected('\u53e4\u7c4d OCR \u8fd4\u56de\u4e86\u7591\u4f3c\u673a\u5668\u7801/\u7f51\u9875\u6b8b\u7247\u7684\u6587\u5b57\u5757\uff0c\u8fd9\u4e9b\u6587\u5b57\u4e0d\u5e94\u5199\u5165\u672c\u9875\u6b63\u6587\uff1b\u5df2\u6539\u7528\u9875\u56fe/\u62c6\u56fe OCR \u515c\u5e95\u3002')
+  }
+  return null
+}
+
+function isOcrImageLikeLabel(label: string): boolean {
+  return /^(?:image|figure|picture|chart|diagram|photo|illustration)$/i.test(String(label || ''))
+}
+
+function stripOcrMarkupText(value: string): string {
+  return stripOcrHtml(String(value || '')).replace(/\s+/g, '')
+}
+
+function isEmptyTableMarkupPlaceholder(text: string): boolean {
+  const value = String(text || '').trim()
+  return /^<table[\s\S]*<\/table>$/i.test(value) && stripOcrMarkupText(value).length === 0
+}
+
+function isGujiNonBookHallucinatedBlock(block: JsonRecord): boolean {
+  const text = getOcrBlockTextValue(block)
+  const compact = text.replace(/\s+/g, '')
+  if (compact.length < 4) return false
+  if (isEmptyTableMarkupPlaceholder(text)) return true
+  return hasGujiWebMetadataHallucination(text)
+    || hasGujiModernDateHallucination(text)
+    || hasGujiMachineTokenHallucination(text)
+    || hasGujiUnexpectedScriptHallucination(text)
+    || hasGujiKanaPunctuationSubstitutionIssue(text)
+}
+
+function normalizeGujiDuplicateBlockText(text: string): string {
+  return String(text || '')
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[、。，．,.·・:：;；'"“”‘’「」『』（）()［］\[\]【】]/g, '')
+}
+
+function getRectIntersectionArea(
+  left: { left: number; top: number; width: number; height: number },
+  right: { left: number; top: number; width: number; height: number },
+): number {
+  const x1 = Math.max(left.left, right.left)
+  const y1 = Math.max(left.top, right.top)
+  const x2 = Math.min(left.left + left.width, right.left + right.width)
+  const y2 = Math.min(left.top + left.height, right.top + right.height)
+  return Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+}
+
+function isGujiHeaderLikeLabel(label: string): boolean {
+  return /(?:^|[_\s-])header$|^header$|page_header|running_header/.test(label)
+}
+
+function isGujiDuplicateHeaderBlock(block: JsonRecord, allBlocks: JsonRecord[]): boolean {
+  const label = getOcrBlockLabel(block)
+  if (!isGujiHeaderLikeLabel(label)) return false
+  const text = normalizeGujiDuplicateBlockText(getOcrBlockTextValue(block))
+  if (text.length < 4) return false
+  const rect = getOcrBlockRect(block)
+  if (!rect) return false
+  const rectArea = Math.max(1, rect.width * rect.height)
+  return allBlocks.some((candidate) => {
+    if (candidate === block) return false
+    if (isGujiHeaderLikeLabel(getOcrBlockLabel(candidate))) return false
+    const candidateText = normalizeGujiDuplicateBlockText(getOcrBlockTextValue(candidate))
+    if (candidateText !== text) return false
+    const candidateRect = getOcrBlockRect(candidate)
+    if (!candidateRect) return false
+    const candidateArea = Math.max(1, candidateRect.width * candidateRect.height)
+    const overlap = getRectIntersectionArea(rect, candidateRect)
+    return overlap / Math.min(rectArea, candidateArea) >= 0.72
+  })
+}
+
+function isGujiPageNumberLikeLabel(label: string): boolean {
+  return /^(?:number|page[_\s-]*number|page-no|pageno|folio)$/i.test(label)
+}
+
+function normalizeGujiPageMarkerText(text: string): string {
+  return String(text || '')
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[、。，．,.·・:：;；'"“”‘’「」『』（）()［］\[\]【】]/g, '')
+}
+
+function stripGujiPageMarkerLineNoise(text: string): string {
+  return text.replace(/[\|\uFF5C\u4E28\u2500-\u257F\u2010-\u2015_\-=＝]+/g, '')
+}
+
+function isGujiLineOnlyPageMarkerText(text: string): boolean {
+  const compact = normalizeGujiPageMarkerText(text)
+  return compact.length > 0 && compact.length <= 12 && stripGujiPageMarkerLineNoise(compact).length === 0
+}
+
+function isGujiPageMarkerLikeText(text: string): boolean {
+  const compact = normalizeGujiPageMarkerText(text)
+  if (!compact || compact.length > 12) return false
+  const withoutLineNoise = stripGujiPageMarkerLineNoise(compact)
+  if (!withoutLineNoise) return true
+  return /^[0-9\uFF10-\uFF19\u3007\u96F6\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341\u767E\u5343\u4E07\u842C\u5EFF\u5344\u5345\u534C\u58F9\u8D30\u8CB3\u53C1\u8086\u4F0D\u9678\u67D2\u634C\u7396\u62FE\u4F70\u4EDF]+$/.test(withoutLineNoise)
+}
+
+function isGujiNoisyPageMarkerLikeText(text: string): boolean {
+  const compact = normalizeGujiPageMarkerText(text)
+  if (!compact || compact.length > 10) return false
+  const withoutLineNoise = stripGujiPageMarkerLineNoise(compact)
+  if (isGujiPageMarkerLikeText(withoutLineNoise)) return true
+  const match = /^([0-9\uFF10-\uFF19\u3007\u96F6\u4E00\u4E8C\u4E09\u56DB\u4E94\u516D\u4E03\u516B\u4E5D\u5341\u767E\u5343\u4E07\u842C\u5EFF\u5344\u5345\u534C]+)([\u3040-\u30ff\u3400-\u9fff]{1,4})$/.exec(withoutLineNoise)
+  if (!match) return false
+  const numeric = match[1]
+  const numericLooksLikePage = numeric.length >= 2 || /[\u5341\u767E\u5343\u4E07\u842C]/.test(numeric)
+  return numericLooksLikePage
+}
+
+function isGujiPageEdgeMarkerBlock(
+  block: JsonRecord,
+  pageSize: { width: number; height: number } | null,
+): boolean {
+  const label = getOcrBlockLabel(block)
+  const pageNumberLabel = isGujiPageNumberLikeLabel(label)
+  const text = getOcrBlockTextValue(block)
+  if (!pageNumberLabel && !isGujiNoisyPageMarkerLikeText(text)) return false
+  if (pageNumberLabel && !isGujiPageMarkerLikeText(text) && !isGujiNoisyPageMarkerLikeText(text)) return false
+  if (isGujiLineOnlyPageMarkerText(text)) return true
+  const rect = getOcrBlockRect(block)
+  if (!rect || !pageSize) return true
+  const centerX = rect.left + rect.width / 2
+  const centerY = rect.top + rect.height / 2
+  const horizontalMargin = Math.max(64, pageSize.width * (pageNumberLabel ? 0.2 : 0.17))
+  const verticalMargin = Math.max(48, pageSize.height * (pageNumberLabel ? 0.14 : 0.11))
+  return centerX <= horizontalMargin
+    || centerX >= pageSize.width - horizontalMargin
+    || centerY <= verticalMargin
+    || centerY >= pageSize.height - verticalMargin
+}
+
+function isGujiTinyNoiseBlock(block: JsonRecord): boolean {
+  const label = getOcrBlockLabel(block)
+  if (isOcrImageLikeLabel(label) || /table|sheet|excel/.test(label)) return false
+  const text = getOcrBlockTextValue(block).trim()
+  if (!text) return false
+  const rect = getOcrBlockRect(block)
+  if (!rect) return false
+  const width = Number(rect.width || 0)
+  const height = Number(rect.height || 0)
+  if (width <= 0 || height <= 0) return true
+  const minSide = Math.min(width, height)
+  const maxSide = Math.max(width, height)
+  if (minSide <= 2 && maxSide >= 20) return true
+  const compact = text.replace(/\s+/g, '')
+  const hasCjkOrKana = /[\u3040-\u30ff\u3400-\u9fff]/.test(compact)
+  return minSide < 8 && compact.length <= 3 && !hasCjkOrKana
+}
+
+function getReadableGujiBlockText(block: JsonRecord): string {
+  const label = getOcrBlockLabel(block)
+  const text = getOcrBlockTextValue(block).trim()
+  if (!text) return ''
+  if (isOcrImageLikeLabel(label) && /^image$/i.test(text)) return ''
+  if (isEmptyTableMarkupPlaceholder(text)) return ''
+  const compact = text.replace(/\s+/g, '')
+  if (isGujiPageNumberLikeLabel(label) && isGujiPageMarkerLikeText(compact)) return ''
+  return text
+}
+
+function rebuildGujiResultTextFromLayout(result: OcrPageResultPayload, blocks: JsonRecord[]): OcrPageResultPayload {
+  const text = blocks.map(getReadableGujiBlockText).filter(Boolean).join('\n')
+  return {
+    ...result,
+    text,
+    markdown: text || getMarkdownTextFromUnknown(result.markdown),
+    layout_result: blocks,
+    words_result: blocks
+      .filter((block) => !isOcrImageLikeLabel(getOcrBlockLabel(block)))
+      .map((block) => ({
+        words: getReadableGujiBlockText(block),
+        location: block.location,
+        orientation: block.orientation,
+        label: block.label,
+      }))
+      .filter((word) => String(word.words || '').trim()),
+  }
+}
+
+function sanitizeGujiNonBookHallucinations(
+  result: OcrPageResultPayload,
+  ocrOptions: Required<PageOcrOptions>,
+  imagePath?: string | null,
+): OcrPageResultPayload {
+  if (ocrOptions.profile !== 'guji_print_vertical') return result
+  const blocks = getOcrLayoutBlocks(result)
+  if (blocks.length === 0) return result
+  let removedNonBookBlocks = 0
+  let removedDuplicateHeaderBlocks = 0
+  let removedPageMarkerBlocks = 0
+  let removedTinyNoiseBlocks = 0
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  const nextBlocks = blocks.filter((block) => {
+    if (isGujiNonBookHallucinatedBlock(block)) {
+      removedNonBookBlocks += 1
+      return false
+    }
+    if (isGujiDuplicateHeaderBlock(block, blocks)) {
+      removedDuplicateHeaderBlocks += 1
+      return false
+    }
+    if (isGujiPageEdgeMarkerBlock(block, pageSize)) {
+      removedPageMarkerBlocks += 1
+      return false
+    }
+    if (isGujiTinyNoiseBlock(block)) {
+      removedTinyNoiseBlocks += 1
+      return false
+    }
+    return true
+  })
+  const removedCount = blocks.length - nextBlocks.length
+  if (nextBlocks.length === 0) return result
+  const nextText = nextBlocks.map(getReadableGujiBlockText).filter(Boolean).join('\n').trim()
+  const preferredText = getPreferredGujiServiceText(result)
+  const currentText = getTextFromUnknown(result.text).trim() || preferredText
+  const placeholderTextChanged = nextText !== currentText
+  if (removedCount === 0 && !placeholderTextChanged) return result
+  const rebuilt = rebuildGujiResultTextFromLayout({
+    ...result,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ...(removedNonBookBlocks > 0 ? { removed_non_book_hallucination_blocks: removedNonBookBlocks } : {}),
+      ...(removedDuplicateHeaderBlocks > 0 ? { removed_duplicate_header_blocks: removedDuplicateHeaderBlocks } : {}),
+      ...(removedPageMarkerBlocks > 0 ? { removed_page_marker_blocks: removedPageMarkerBlocks } : {}),
+      ...(removedTinyNoiseBlocks > 0 ? { removed_tiny_noise_blocks: removedTinyNoiseBlocks } : {}),
+      ...(placeholderTextChanged ? { rebuilt_text_without_ocr_placeholders: true } : {}),
+    },
+  }, nextBlocks)
+  return preferredText ? preservePreferredGujiServiceText(rebuilt, preferredText) : rebuilt
+}
+
+function isGujiPlaceholderWord(item: unknown): boolean {
+  if (!isJsonRecord(item)) return false
+  const label = getOcrBlockLabel(item)
+  const text = getOcrBlockTextValue(item)
+  return (isOcrImageLikeLabel(label) && /^image$/i.test(text.trim()))
+    || isEmptyTableMarkupPlaceholder(text)
+}
+
+function filterGujiPlaceholderBlocks<T>(items: T[] | undefined): T[] | undefined {
+  if (!Array.isArray(items)) return items
+  return items.filter((item) => !isGujiPlaceholderWord(item))
+}
+
+function cleanGujiPlaceholderText(text: string): string {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^image$/i.test(line) && !isEmptyTableMarkupPlaceholder(line))
+    .join('\n')
+}
+
+function stripGujiStoragePlaceholders(result: OcrRecognizeResult): OcrRecognizeResult {
+  const nextLayout = filterGujiPlaceholderBlocks(result.layout_result)
+  const nextWords = filterGujiPlaceholderBlocks(result.words_result)
+  const nextText = cleanGujiPlaceholderText(getTextFromUnknown(result.text))
+  const currentMarkdownText = getMarkdownTextFromUnknown(result.markdown)
+  const nextMarkdown = cleanGujiPlaceholderText(currentMarkdownText)
+  const layoutChanged = Array.isArray(result.layout_result) && Array.isArray(nextLayout) && nextLayout.length !== result.layout_result.length
+  const wordsChanged = Array.isArray(result.words_result) && Array.isArray(nextWords) && nextWords.length !== result.words_result.length
+  const textChanged = nextText !== getTextFromUnknown(result.text).trim()
+  const markdownChanged = nextMarkdown !== currentMarkdownText.trim()
+  if (!layoutChanged && !wordsChanged && !textChanged && !markdownChanged) return result
+  const nextMarkdownValue = isJsonRecord(result.markdown)
+    ? { ...result.markdown, text: nextMarkdown }
+    : nextMarkdown
+  return {
+    ...result,
+    layout_result: nextLayout,
+    text: nextText,
+    markdown: nextMarkdownValue,
+    words_result: nextWords,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      rebuilt_text_without_ocr_placeholders: true,
+    },
+  }
+}
+
+function getGujiOcrOptionsForResult(result: OcrRecognizeResult): Required<PageOcrOptions> | null {
+  const meta = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  if (String(meta.profile || '') !== 'guji_print_vertical') return null
+  const secondPass = String(meta.second_pass || '')
+  return {
+    profile: 'guji_print_vertical',
+    secondPass: secondPass === 'cloud_column_ocr'
+      ? 'cloud_column_ocr'
+      : secondPass === 'none'
+        ? 'none'
+        : 'local_segmentation',
+  }
+}
+
+function isLikelyMergedWideVerticalGujiBlock(
+  block: JsonRecord,
+  pageSize: { width: number; height: number },
+): boolean {
+  const text = getOcrBlockTextValue(block)
+  const compact = text.replace(/\s+/g, '')
+  if (compact.length < 72 || getGujiCjkKanaRatio(compact) < 0.55) return false
+  const label = getOcrBlockLabel(block)
+  if (/table|sheet|excel|image|figure|picture|chart|diagram|photo|illustration|header|footer|number|folio/.test(label)) return false
+  const rect = getOcrBlockRect(block)
+  if (!rect) return false
+  const orientation = String(block.orientation || '').toLowerCase()
+  const verticalSignal = orientation === 'vertical'
+    || /vertical|column|col_text/.test(label)
+    || rect.height >= rect.width * 0.72
+  if (!verticalSignal) return false
+  const hardLines = text
+    .replace(/\r\n?/g, '\n')
+    .split(/\n+/)
+    .map((line) => line.replace(/[ \t]+/g, '').trim())
+    .filter(Boolean)
+  const columnWidthFromLines = hardLines.length > 1 ? rect.width / hardLines.length : rect.width
+  const widthThreshold = Math.max(140, pageSize.width * 0.07)
+  const tooWideForSingleColumn = rect.width >= widthThreshold
+    && rect.width >= Math.max(90, rect.height * 0.26)
+  const stillTooWideAfterLineSplit = hardLines.length > 1
+    && columnWidthFromLines >= 76
+    && compact.length / hardLines.length >= 18
+  return tooWideForSingleColumn || stillTooWideAfterLineSplit
+}
+
+function getRiskyPageImageLayoutQualityIssue(
+  result: OcrPageResultPayload,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): string | null {
+  if (ocrOptions.profile !== 'guji_print_vertical') return null
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  if (!pageSize) return null
+  const blocks = getOcrLayoutBlocks(result)
+  const textBlocks = blocks.filter((block) => getOcrBlockTextValue(block).replace(/\s+/g, '').length > 0)
+  if (textBlocks.length === 0) return null
+  const pageArea = Math.max(1, pageSize.width * pageSize.height)
+  const outOfBoundsCount = textBlocks.filter((block) => {
+    const rect = getOcrBlockRect(block)
+    if (!rect) return false
+    const right = rect.left + rect.width
+    const bottom = rect.top + rect.height
+    return rect.left < -pageSize.width * 0.04
+      || rect.top < -pageSize.height * 0.04
+      || right > pageSize.width * 1.04
+      || bottom > pageSize.height * 1.04
+  }).length
+  if (outOfBoundsCount >= Math.max(2, Math.ceil(textBlocks.length * 0.18))) {
+    return formatLayoutQualityRejected('安全页图 OCR 返回的版面坐标明显超出页图范围，本页结果未写入正文；请重新 OCR 本页。')
+  }
+
+  const largeHorizontalBlocks = textBlocks.filter((block) => {
+    const rect = getOcrBlockRect(block)
+    if (!rect) return false
+    const textLength = getOcrBlockTextValue(block).replace(/\s+/g, '').length
+    const label = getOcrBlockLabel(block)
+    const orientation = String(block.orientation || '').toLowerCase()
+    const areaRatio = (rect.width * rect.height) / pageArea
+    return textLength >= 48
+      && orientation !== 'vertical'
+      && !/vertical|column|col_text/.test(label)
+      && rect.width >= Math.max(160, rect.height * 1.35)
+      && areaRatio >= 0.04
+  }).length
+  const verticalBlocks = textBlocks.filter((block) => {
+    const rect = getOcrBlockRect(block)
+    const orientation = String(block.orientation || '').toLowerCase()
+    const label = getOcrBlockLabel(block)
+    return orientation === 'vertical'
+      || /vertical|column|col_text/.test(label)
+      || Boolean(rect && rect.width > 0 && rect.height >= rect.width * 1.28)
+  }).length
+  if (largeHorizontalBlocks >= 2 && verticalBlocks / Math.max(1, textBlocks.length) < 0.55) {
+    return formatLayoutQualityRejected('安全页图 OCR 仍把竖排页面识别成横排大块，本页结果未写入正文；请重新 OCR 本页。')
+  }
+  return null
+}
+
+function isLikelyUnderSegmentedRiskyPageImageResult(
+  result: OcrPageResultPayload,
+  imagePath: string | null | undefined,
+  ocrOptions: Required<PageOcrOptions>,
+): boolean {
+  if (ocrOptions.profile !== 'guji_print_vertical') return false
+  const blocks = getOcrLayoutBlocks(result)
+  const textBlocks = blocks.filter((block) => getOcrBlockTextValue(block).replace(/\s+/g, '').length > 0)
+  const totalTextLength = textBlocks
+    .map((block) => getOcrBlockTextValue(block))
+    .join('')
+    .replace(/\s+/g, '')
+    .length
+  if (totalTextLength < 120 || textBlocks.length === 0) return false
+
+  const pageSize = getOcrPageSizeForResult(result, imagePath)
+  const pageArea = pageSize ? pageSize.width * pageSize.height : 0
+  const mergedWideVerticalBlocks = pageSize
+    ? textBlocks.filter((block) => isLikelyMergedWideVerticalGujiBlock(block, pageSize)).length
+    : 0
+  const verticalBlocks = textBlocks.filter((block) => {
+    const orientation = String(block.orientation || '').toLowerCase()
+    const label = getOcrBlockLabel(block)
+    const rect = getOcrBlockRect(block)
+    return orientation === 'vertical'
+      || /vertical|column|col_text/.test(label)
+      || Boolean(rect && rect.width > 0 && rect.height >= rect.width * 1.28)
+  }).length
+  const largeTextBlocks = textBlocks.filter((block) => {
+    const rect = getOcrBlockRect(block)
+    if (!rect || pageArea <= 0) return false
+    const textLength = getOcrBlockTextValue(block).replace(/\s+/g, '').length
+    return textLength >= 80 && (rect.width * rect.height) / pageArea >= 0.18
+  }).length
+  const verticalRatio = verticalBlocks / Math.max(1, textBlocks.length)
+  const horizontalDominatedBookPage = textBlocks.length <= 24
+    && totalTextLength >= 420
+    && verticalRatio < 0.12
+    && Boolean(pageSize && pageSize.width >= pageSize.height * 1.05)
+  return (textBlocks.length <= 5 && totalTextLength >= 180)
+    || (largeTextBlocks > 0 && textBlocks.length <= 8 && verticalRatio < 0.45)
+    || mergedWideVerticalBlocks > 0
+    || horizontalDominatedBookPage
+}
+
+function getUnderSegmentedRiskyPageImageMessage(): string {
+  return 'OCR 结果疑似把竖排/双页影印书页切成少量横排大块，本页结果未写入正文；请用“重新 OCR 本页”或切换 OCR 模型后重试。'
+}
+
+async function recognizeRiskyPageImageOcrPages(
+  pages: OcrPageWithImage[],
+  primaryOptions: Required<PageOcrOptions>,
+  options: RiskyPageImageOcrRouteOptions = {},
+): Promise<OcrPageResult[]> {
+  const totalPages = pages.length
+  let completedPages = 0
+
+  const reportProgress = (
+    page: OcrPageWithImage,
+    status: 'completed' | 'error',
+    error?: string,
+    result?: OcrPageResultPayload | null,
+    text?: string,
+  ) => {
+    completedPages += 1
+    options.onProgress?.({
+      pageId: page.id,
+      pageNum: typeof page.page_num === 'number' ? page.page_num : undefined,
+      completedPages,
+      totalPages,
+      status,
+      error,
+      result,
+      text,
+    })
+  }
+
+  const pageResults: OcrPageResult[] = []
+  for (const page of pages) {
+    try {
+      throwIfOcrCanceled(options.signal)
+      const pageOptions = getRiskyPageImagePageOptions(page, primaryOptions)
+      const primaryResult = await recognizeSinglePageWithResolvedOptions(page, pageOptions, options.signal)
+      const hardIssue = getRiskyPageImageHardIssue(primaryResult, page.image_path, pageOptions)
+      const underSegmented = isLikelyUnderSegmentedRiskyPageImageResult(primaryResult, page.image_path, pageOptions)
+      const retryOptions = hardIssue || underSegmented
+        ? getRiskyPageImageRetryOptions(pageOptions, options.docType)
+        : null
+
+      if (retryOptions) {
+        try {
+          const retryResult = await recognizeSinglePageWithResolvedOptions(page, retryOptions, options.signal)
+          const retryHardIssue = getRiskyPageImageHardIssue(retryResult, page.image_path, retryOptions)
+          const primaryScore = getRiskyPageImageResultScore(primaryResult, page.image_path)
+          const retryScore = getRiskyPageImageResultScore(retryResult, page.image_path)
+          if (!retryHardIssue && (hardIssue || retryScore >= primaryScore + 6)) {
+            const retryText = getOcrResultText(retryResult)
+            reportProgress(page, 'completed', undefined, retryResult, retryText)
+            pageResults.push({
+              pageId: page.id,
+              result: retryResult,
+              text: retryText,
+              status: 'completed',
+            })
+            continue
+          }
+        } catch (error) {
+          if (isOcrAbortError(error)) throw error
+        }
+      }
+
+      if (hardIssue || underSegmented) {
+        const splitReason = hardIssue || getUnderSegmentedRiskyPageImageMessage()
+        const splitFallbackResult = await recognizeSplitPageImageFallback(page, pageOptions, options.signal, splitReason)
+        if (splitFallbackResult) {
+          const splitText = getOcrResultText(splitFallbackResult)
+          reportProgress(page, 'completed', undefined, splitFallbackResult, splitText)
+          pageResults.push({
+            pageId: page.id,
+            result: splitFallbackResult,
+            text: splitText,
+            status: 'completed',
+          })
+          continue
+        }
+      }
+
+      if (hardIssue) {
+        reportProgress(page, 'error', hardIssue)
+        pageResults.push({
+          pageId: page.id,
+          result: null,
+          text: '',
+          status: 'error',
+          error: hardIssue,
+        })
+        continue
+      }
+
+      if (underSegmented) {
+        const message = getUnderSegmentedRiskyPageImageMessage()
+        reportProgress(page, 'error', message)
+        pageResults.push({
+          pageId: page.id,
+          result: null,
+          text: '',
+          status: 'error',
+          error: message,
+        })
+        continue
+      }
+
+      const text = getOcrResultText(primaryResult)
+      reportProgress(page, 'completed', undefined, primaryResult, text)
+      pageResults.push({
+        pageId: page.id,
+        result: primaryResult,
+        text,
+        status: 'completed',
+      })
+    } catch (error) {
+      if (isOcrAbortError(error)) throw error
+      const message = (error as Error)?.message || String(error || 'OCR failed')
+      reportProgress(page, 'error', message)
+      pageResults.push({
+        pageId: page.id,
+        result: null,
+        text: '',
+        status: 'error',
+        error: message,
+      })
+    }
+    await yieldToEventLoop()
+  }
+  return pageResults
 }
 
 async function rerunPageLayoutOnly(
-  page: Pick<OcrPageRow, 'ocr_result' | 'image_path'>,
+  page: Pick<OcrPageRow, 'ocr_result' | 'ocr_result_ref' | 'image_path'>,
   doc: Pick<OcrDocumentRow, 'doc_type'>,
   options?: PageOcrOptions,
 ): Promise<OcrRecognizeResult> {
-  let currentResult = page.ocr_result
+  const hydratedPage = hydratePagePayloadRows([page])[0]
+  let currentResult = hydratedPage.ocr_result
   if (typeof currentResult === 'string') {
     currentResult = JSON.parse(currentResult)
   }
@@ -806,7 +3926,7 @@ async function rerunPageLayoutOnly(
     throw new Error('当前页面尚无 OCR 结果，无法重做版面切分')
   }
   const resolvedOptions = resolveDocOcrOptions(doc.doc_type, options)
-  return postProcessRecognizedPageResult(currentResult, page.image_path, {
+  return postProcessRecognizedPageResult(currentResult, hydratedPage.image_path, {
     ...resolvedOptions,
     secondPass: 'local_segmentation',
   })
@@ -940,6 +4060,13 @@ function normalizeOcrResultForStorage(
   page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null | undefined,
   engine: OcrEngine,
 ): { result: OcrRecognizeResult; text: string } {
+  const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)
+  if (isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText) {
+    return {
+      result: normalizeFeijiangReferenceTextOnlyResult(result, rawFeijiangReferenceText, page, engine),
+      text: rawFeijiangReferenceText,
+    }
+  }
   const imageSize = getPageImageSize(page?.image_path)
   const normalized = ensureOcrResultIr(result, {
     pageIndex: Number(page?.page_num || 0) || 1,
@@ -949,9 +4076,36 @@ function normalizeOcrResultForStorage(
     generatedAt: getOcrPageIr(page?.ocr_result)?.generatedAt,
     forceRebuild: true,
   })
+  const gujiOptions = getGujiOcrOptionsForResult(normalized)
+  const preferredGujiText = gujiOptions
+    ? getPreferredGujiServiceText(result)
+      || getPreferredGujiServiceText(normalized)
+      || getUsableGujiAsyncPdfServiceText(result)
+      || getUsableGujiAsyncPdfServiceText(normalized)
+    : ''
+  const storageResultBase = gujiOptions
+    ? ensureOcrResultIr(stripGujiStoragePlaceholders(sanitizeGujiNonBookHallucinations(normalized, gujiOptions, page?.image_path)), {
+        pageIndex: Number(page?.page_num || 0) || 1,
+        pageWidth: imageSize?.width,
+        pageHeight: imageSize?.height,
+        engine,
+        generatedAt: getOcrPageIr(page?.ocr_result)?.generatedAt,
+        forceRebuild: true,
+      })
+    : normalized
+  const storageResult = gujiOptions && preferredGujiText
+    ? preservePreferredGujiServiceText(storageResultBase, preferredGujiText)
+    : storageResultBase
+  const storageText = gujiOptions && preferredGujiText
+    ? preferredGujiText
+    : gujiOptions
+      ? getOcrResultText(storageResult)
+      : storageResult.gujismart_ir
+        ? deriveOcrTextFromIr(storageResult.gujismart_ir)
+        : getOcrResultText(storageResult)
   return {
-    result: normalized,
-    text: normalized.gujismart_ir ? deriveOcrTextFromIr(normalized.gujismart_ir) : getOcrResultText(normalized),
+    result: storageResult,
+    text: storageText,
   }
 }
 
@@ -1079,8 +4233,14 @@ function reprocessDocumentOcrStructure(docId: string): string[] {
   if (pagesWithResults.length === 0) return []
 
   const generatedAt = new Date().toISOString()
+  const structureResults = pagesWithResults.map(({ page, result }) => {
+    const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)
+    return isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText
+      ? preserveRawGujiReferenceText(result as OcrRecognizeResult, rawFeijiangReferenceText, { page, generatedAt })
+      : result
+  })
   const documentIr = buildOcrDocumentV1(
-    pagesWithResults.map((item) => item.result),
+    structureResults,
     { forceRebuild: true, generatedAt },
   )
   const changedPageIds: string[] = []
@@ -1089,6 +4249,7 @@ function reprocessDocumentOcrStructure(docId: string): string[] {
     pagesWithResults.forEach(({ page, result }, index) => {
       const irPage = documentIr.pages[index]
       if (!irPage) return
+      const sourceResult = structureResults[index] || result
       const envelope = {
         schemaVersion: OCR_IR_SCHEMA_VERSION,
         generator: 'GujiSmart' as const,
@@ -1099,13 +4260,20 @@ function reprocessDocumentOcrStructure(docId: string): string[] {
           pageIndex: Number(page.page_num || irPage.pageIndex || index + 1),
         },
       }
-      const text = deriveOcrTextFromIr(envelope)
-      const nextResult: OcrResultRecord = {
-        ...result,
+      const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)
+      const preferredGujiText = isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText
+        ? rawFeijiangReferenceText
+        : getGujiOcrOptionsForResult(sourceResult)
+          ? getPreferredGujiServiceText(sourceResult)
+          : ''
+      const irText = deriveOcrTextFromIr(envelope)
+      const text = preferredGujiText || irText
+      const nextResultBase: OcrResultRecord = {
+        ...sourceResult,
         text,
         words_result: deriveOcrWordsResultFromIr(envelope),
         gujismart_ir: envelope,
-        ir_text: text,
+        ir_text: irText,
         normalization: {
           ...(isJsonRecord(result.normalization) ? result.normalization : {}),
           schema_version: OCR_IR_SCHEMA_VERSION,
@@ -1114,6 +4282,11 @@ function reprocessDocumentOcrStructure(docId: string): string[] {
           document_postprocessed: true,
         },
       }
+      const nextResult = preferredGujiText
+        ? isFeijiangReferenceRecoveredResult(result)
+          ? preserveRawGujiReferenceText(nextResultBase, preferredGujiText, { page, generatedAt })
+          : preservePreferredGujiServiceText(nextResultBase, preferredGujiText)
+        : nextResultBase
       const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', JSON.stringify(nextResult))
       const preparedText = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_text', text)
       run(
@@ -1149,6 +4322,55 @@ function updatePageOcrState(pageId: string, result: OcrRecognizeResult, engine: 
   )
   upsertPageOcrVersion(pageId, engine, normalized.result, text, 'completed', page)
   markDocumentTocDirty(page.doc_id)
+}
+
+async function savePageQualityFailureOcrError(
+  pageId: string,
+  error: unknown,
+  fallbackMessage: string,
+  engine: OcrEngine = 'paddle',
+  options: SavePageQualityFailureOptions = {},
+): Promise<QualityFailureOcrSaveResult> {
+  const message = (error as Error)?.message || String(error || fallbackMessage)
+  if (!isOcrQualityFailureMessage(message)) return 'not_quality_failure'
+  const rawPage = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+  const page = rawPage ? hydratePagePayloadRows([rawPage])[0] : null
+  const doc = page
+    ? queryOne<OcrDocumentRow>('SELECT * FROM documents WHERE id = ?', [page.doc_id])
+    : null
+  if (page && doc) {
+    try {
+      const recovered = await recoverPageQualityFailureFromFeijiangReference(page, doc, options)
+      if (recovered) {
+        savePageOcrResults([recovered], engine)
+        return 'recovered'
+      }
+    } catch (recoveryError) {
+      if (isOcrAbortError(recoveryError)) throw recoveryError
+      console.warn('[OCR] Failed to recover quality-rejected page from PaddleOCR reference JSON:', page.page_num, recoveryError)
+    }
+  }
+  savePageOcrResults([{
+    pageId,
+    result: null,
+    text: '',
+    status: 'error',
+    error: message,
+  }], engine)
+  return 'saved_error'
+}
+
+function finishRecoveredPageQualityFailure(
+  event: Electron.IpcMainInvokeEvent,
+  page: Pick<OcrPageRow, 'id' | 'doc_id'>,
+): void {
+  updateDocumentStatusFromPages(page.doc_id)
+  run('UPDATE documents SET metadata_status = ?, updated_at = ? WHERE id = ?', ['pending', new Date().toISOString(), page.doc_id])
+  syncDocumentProofStatus(page.doc_id)
+  scheduleOcrFinalizeForPages([page.id])
+  scheduleDatabaseSave()
+  const currentDocStatus = queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [page.doc_id])?.ocr_status || 'completed'
+  emitOcrStatus(event, { docId: page.doc_id, status: currentDocStatus, progress: 1 })
 }
 
 function parseMetadata(value: unknown): JsonRecord {
@@ -1354,8 +4576,53 @@ function getExpectedPdfPageCount(doc: Pick<OcrDocumentRow, 'page_count' | 'metad
   )
 }
 
-function isPageOcrCompleted(page: Pick<OcrPageRow, 'ocr_status'>): boolean {
-  return String(page?.ocr_status || '') === 'completed'
+function isOcrErrorPlaceholderResult(value: unknown): boolean {
+  const text = String(value || '').trim()
+  if (!text) return false
+  try {
+    const parsed = JSON.parse(text)
+    if (!isJsonRecord(parsed)) return false
+    return Boolean(parsed.error && parsed.failed_at)
+  } catch {
+    return /"error"\s*:/.test(text) && /"failed_at"\s*:/.test(text)
+  }
+}
+
+function hasUsablePageOcrContent(page: Pick<OcrPageRow, 'proofed_text' | 'ocr_text' | 'ocr_result' | 'proofed_text_ref' | 'ocr_text_ref' | 'ocr_result_ref'> & { ocr_status?: string | null }): boolean {
+  const inlineText = String(page.proofed_text || page.ocr_text || '').trim()
+  if (inlineText && inlineText !== '{"externalized":true}') return true
+  if (String(page.proofed_text_ref || page.ocr_text_ref || '').trim()) return true
+  if (String(page.ocr_status || '') === 'completed' && String(page.ocr_result_ref || '').trim()) return true
+  const resultText = String(page.ocr_result || '').trim()
+  if (!resultText || resultText === '{"externalized":true}') return false
+  return !isOcrErrorPlaceholderResult(resultText)
+}
+
+function completedPageContentPredicate(alias = 'pages'): string {
+  return `(
+    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
+    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
+    OR (
+      COALESCE(${alias}.ocr_status, '') = 'completed'
+      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
+    )
+    OR (
+      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
+      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
+      AND NOT (
+        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
+        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
+      )
+    )
+  )`
+}
+
+function isPageOcrCompleted(page: Pick<OcrPageRow, 'ocr_status' | 'proofed_text' | 'ocr_text' | 'ocr_result' | 'proofed_text_ref' | 'ocr_text_ref' | 'ocr_result_ref'>): boolean {
+  return String(page?.ocr_status || '') === 'completed' && hasUsablePageOcrContent(page)
+}
+
+function isOcrPageSummaryComplete(stats: { total: number; completed: number; failed: number; pending: number }): boolean {
+  return stats.total > 0 && stats.completed === stats.total && stats.failed === 0 && stats.pending === 0
 }
 
 function getCompletedOcrPageCount(pages: OcrPageRow[]): number {
@@ -1367,14 +4634,15 @@ function getPagesNeedingOcr(pages: OcrPageRow[], resumeExisting: boolean): OcrPa
   return pages.filter((page) => !isPageOcrCompleted(page))
 }
 
+function getPagesForOcrAttempt(pages: OcrPageRow[], resumeExisting: boolean, attempt: number): OcrPageRow[] {
+  return getPagesNeedingOcr(pages, resumeExisting || attempt > 1)
+}
+
 function resetPagesForFullOcrRerun(docId: string): void {
+  clearDocumentOcrRoutePreference(docId)
   run(
     `UPDATE pages
-     SET ocr_result = NULL,
-         ocr_result_ref = NULL,
-         ocr_text = NULL,
-         ocr_text_ref = NULL,
-         proofed_text = NULL,
+     SET proofed_text = NULL,
          proofed_text_ref = NULL,
          ocr_status = ?,
          proof_status = ?
@@ -1391,7 +4659,7 @@ function hasIncompleteOcrPages(docId: string): boolean {
   const stats = queryOne<{ total: number; completed: number }>(
     `SELECT
        COUNT(*) as total,
-       SUM(CASE WHEN ocr_status = 'completed' THEN 1 ELSE 0 END) as completed
+       SUM(CASE WHEN ocr_status = 'completed' AND ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed
      FROM pages
      WHERE doc_id = ?`,
     [docId],
@@ -1405,9 +4673,9 @@ function summarizeDocumentOcrPages(docId: string): { total: number; completed: n
   const stats = queryOne<{ total: number; completed: number; failed: number; pending: number }>(
     `SELECT
        COUNT(*) as total,
-       SUM(CASE WHEN ocr_status = 'completed' THEN 1 ELSE 0 END) as completed,
+       SUM(CASE WHEN ocr_status = 'completed' AND ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed,
        SUM(CASE WHEN ocr_status = 'error' THEN 1 ELSE 0 END) as failed,
-       SUM(CASE WHEN ocr_status IS NULL OR ocr_status IN ('pending', 'queued', 'processing') THEN 1 ELSE 0 END) as pending
+       SUM(CASE WHEN ocr_status IS NULL OR ocr_status IN ('pending', 'queued', 'processing') OR (ocr_status = 'completed' AND NOT (${completedPageContentPredicate('pages')})) THEN 1 ELSE 0 END) as pending
      FROM pages
      WHERE doc_id = ?`,
     [docId],
@@ -1422,7 +4690,7 @@ function summarizeDocumentOcrPages(docId: string): { total: number; completed: n
 
 function isDocumentOcrCompleteFromPages(docId: string): boolean {
   const stats = summarizeDocumentOcrPages(docId)
-  return stats.total > 0 && stats.completed === stats.total
+  return isOcrPageSummaryComplete(stats)
 }
 
 function getDocumentTotalPages(docId: string, pageSummary?: { total: number }): number | undefined {
@@ -1434,7 +4702,7 @@ function getDocumentTotalPages(docId: string, pageSummary?: { total: number }): 
 function emitOcrAlreadyRunningStatus(event: Electron.IpcMainInvokeEvent, docId: string): void {
   const stats = summarizeDocumentOcrPages(docId)
   const totalPages = getDocumentTotalPages(docId, stats)
-  if (stats.total > 0 && stats.completed === stats.total) {
+  if (isOcrPageSummaryComplete(stats)) {
     updateDocumentStatus(docId, 'completed', 'processed', null)
     emitOcrStatus(event, {
       docId,
@@ -1465,7 +4733,7 @@ function emitOcrCanceledOrCompletedStatus(
   totalPages?: number,
 ): boolean {
   const stats = summarizeDocumentOcrPages(docId)
-  const completed = stats.total > 0 && stats.completed === stats.total
+  const completed = isOcrPageSummaryComplete(stats)
   const resolvedTotalPages = totalPages || getDocumentTotalPages(docId, stats)
   emitOcrStatus(event, {
     docId,
@@ -1505,7 +4773,7 @@ function getDocumentOcrFailureMessage(docId: string): string {
 function updateDocumentStatusFromPages(docId: string, errorMessage?: string | null): void {
   const stats = summarizeDocumentOcrPages(docId)
   const now = new Date().toISOString()
-  const nextStatus = stats.total > 0 && stats.completed === stats.total
+  const nextStatus = isOcrPageSummaryComplete(stats)
     ? 'completed'
     : stats.failed > 0
       ? 'error'
@@ -1523,7 +4791,7 @@ function updateDocumentStatusFromPages(docId: string, errorMessage?: string | nu
 
 function updateDocumentCanceledStatus(docId: string): void {
   const stats = summarizeDocumentOcrPages(docId)
-  const nextStatus = stats.total > 0 && stats.completed === stats.total ? 'completed' : 'pending'
+  const nextStatus = isOcrPageSummaryComplete(stats) ? 'completed' : 'pending'
   const importStatus = nextStatus === 'completed' ? 'processed' : 'stored'
   const errorMessage = nextStatus === 'completed' ? null : OCR_CANCELED_MESSAGE
   run(
@@ -1544,7 +4812,8 @@ function markDocumentTocDirty(docId: string): void {
 
 function guardRepeatedOcrPageResult(pageResult: OcrPageResult): OcrPageResult {
   if (pageResult.status !== 'completed') return pageResult
-  const repeatedIssue = findSuspiciousRepeatedOcrText(pageResult.result || pageResult.text)
+  if (isJsonRecord(pageResult.result) && pageResult.result.gujismart_async_pdf_result === true) return pageResult
+  const repeatedIssue = findLikelyRunawayRepeatedOcrText(pageResult.result || pageResult.text)
   if (!repeatedIssue) return pageResult
   const message = formatSuspiciousRepeatedOcrTextIssue(repeatedIssue)
   return {
@@ -1554,6 +4823,12 @@ function guardRepeatedOcrPageResult(pageResult: OcrPageResult): OcrPageResult {
     status: 'error',
     error: message,
   }
+}
+
+function isOcrQualityFailureMessage(message?: string): boolean {
+  if (String(message || '').includes(OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX)) return true
+  if (String(message || '').includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)) return true
+  return /疑似.*(?:误判|重复|少量横排大块|竖排\/双页影印)|误判成表格|重复 OCR|重复文本|版面误判|本页结果未写入正文/.test(String(message || ''))
 }
 
 function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'paddle', options: SavePageOcrResultsOptions = {}): string[] {
@@ -1571,9 +4846,24 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
     for (const pageResult of guardedPageResults) {
       const existingPage = pageSnapshots.get(pageResult.pageId)
       const hasProofedText = String(existingPage?.proofed_text || '').trim().length > 0
-      const hasExistingCompletedText = String(existingPage?.ocr_status || '') === 'completed'
-        && String(existingPage?.ocr_text || '').trim().length > 0
-      if (pageResult.status === 'error' && hasExistingCompletedText) {
+      const hasExistingOcrText = String(existingPage?.ocr_text || '').trim().length > 0
+      if (pageResult.status === 'error' && existingPage && hasExistingOcrText && !isOcrQualityFailureMessage(pageResult.error)) {
+        if (String(existingPage.ocr_status || '') !== 'completed') {
+          run(
+            `UPDATE pages
+             SET ocr_status = ?,
+                 proof_status = CASE WHEN ? THEN proof_status ELSE ? END
+             WHERE id = ?`,
+            [
+              'completed',
+              hasProofedText ? 1 : 0,
+              'pending',
+              pageResult.pageId,
+            ],
+          )
+          changedPageIds.push(pageResult.pageId)
+          changedDocIds.add(existingPage.doc_id)
+        }
         continue
       }
       const normalizedCompleted = pageResult.status === 'completed' && pageResult.result
@@ -1636,7 +4926,11 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
           || existingResult !== nextResult
       )
       if (shouldInvalidateToc) tocDirtyDocIds.add(existingPage.doc_id)
-      if (pageResult.status === 'completed' && resultPayload && existingPage) {
+      const shouldWriteOcrVersion = resultPayload && existingPage && (
+        pageResult.status === 'completed'
+        || (pageResult.status === 'error' && isOcrQualityFailureMessage(pageResult.error))
+      )
+      if (shouldWriteOcrVersion) {
         versionWrites.push({
           pageId: pageResult.pageId,
           page: existingPage,
@@ -1754,6 +5048,17 @@ async function processDocumentOcr(
   const ocrOptions = resolveDocOcrOptions(doc.doc_type)
   const engine = resolveOcrEngine(doc, requestedEngine)
   updateDocumentOcrEngine(doc, engine)
+  let asyncPdfRouteRisk: AsyncPdfOcrRouteRisk | null = canUsePdfAsync
+    ? getAsyncPdfOcrRouteRisk(doc, pages, pagesForOcr, ocrOptions)
+    : null
+  if (asyncPdfRouteRisk && pdfPath && pages.length === 0) {
+    const expectedPdfPageCount = getExpectedPdfPageCount(doc, pages)
+    if (expectedPdfPageCount > 0) {
+      pages = await ensurePageRecordsIfNeeded(docId, pages, expectedPdfPageCount)
+      pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
+      completedBefore = resumeExisting ? getCompletedOcrPageCount(pages) : 0
+    }
+  }
 
   if (pages.length === 0 && !canUsePdfAsync && engine !== 'vision_model') {
     const errorMessage = '文献没有可处理的页面。若这是 PDF，请先重新导入或点击“重试处理”让软件重新读取页数。'
@@ -1822,10 +5127,40 @@ async function processDocumentOcr(
     if (changedPageIds.length > 0) deferredDatabaseSaveNeeded = true
     return changedPageIds
   }
+  const syncGujiPaddleReferenceResults = async (
+    currentSummary: { total: number; completed: number; failed: number; pending: number },
+  ): Promise<{ total: number; completed: number; failed: number; pending: number }> => {
+    const referenceRecoveryOptions = asyncPdfRouteRisk?.ocrOptions || ocrOptions
+    if (engine !== 'paddle' || !pdfPath || referenceRecoveryOptions.profile !== 'guji_print_vertical') {
+      return currentSummary
+    }
+    const recoveredReferenceResults = await recoverCompletedGujiPagesFromFeijiangReference(
+      docId,
+      pdfPath,
+      referenceRecoveryOptions,
+      signal,
+    )
+    if (recoveredReferenceResults.length > 0) {
+      await savePageOcrResultsBatchedDeferred(recoveredReferenceResults, 'paddle', { refreshSearch: false })
+      return summarizeDocumentOcrPages(docId)
+    }
+    const recoveredMismatchResults = await recoverCompletedGujiPagesWithReferenceMismatch(
+      docId,
+      pdfPath,
+      referenceRecoveryOptions,
+      signal,
+    )
+    if (recoveredMismatchResults.length > 0) {
+      await savePageOcrResultsBatchedDeferred(recoveredMismatchResults, 'paddle', { refreshSearch: false })
+      return summarizeDocumentOcrPages(docId)
+    }
+    return currentSummary
+  }
 
   try {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     throwIfOcrCanceled(signal)
+    const resumeThisAttempt = resumeExisting || attempt > 1
     if (attempt > 1) {
       const previousReason = lastErrorMessage || queryOne<{ error_message: string | null }>(
         'SELECT error_message FROM documents WHERE id = ?',
@@ -1849,10 +5184,21 @@ async function processDocumentOcr(
     }
 
     pages = queryAll<OcrPageRow>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])
-    pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
-    completedBefore = resumeExisting ? getCompletedOcrPageCount(pages) : 0
+    pagesForOcr = getPagesForOcrAttempt(pages, resumeExisting, attempt)
+    completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
     pdfPath = resolveUsablePdfPath(doc, Math.max(pages.length, Number(doc.page_count || 0) || 0))
     canUsePdfAsync = shouldUsePdfOcrForWork(pdfPath, pages, pagesForOcr, Number(doc.page_count || 0) || 0)
+    asyncPdfRouteRisk = canUsePdfAsync
+      ? getAsyncPdfOcrRouteRisk(doc, pages, pagesForOcr, ocrOptions)
+      : null
+    if (asyncPdfRouteRisk && pdfPath && pages.length === 0) {
+      const expectedPdfPageCount = getExpectedPdfPageCount(doc, pages)
+      if (expectedPdfPageCount > 0) {
+        pages = await ensurePageRecordsIfNeeded(docId, pages, expectedPdfPageCount)
+        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
+      }
+    }
     if (pages.length > 0 && pagesForOcr.length === 0 && hasSequentialPageRecords(pages, getExpectedPdfPageCount(doc, pages))) {
       updateDocumentStatus(docId, 'completed', 'processed', null)
       syncDocumentProofStatus(docId)
@@ -1873,7 +5219,7 @@ async function processDocumentOcr(
         persistPdfTextLayerSummary(doc, preflight)
         if (preflight.mode !== 'ocr') {
           pages = await ensurePageRecordsIfNeeded(docId, pages, preflight.pageCount)
-          pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
+          pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
           const pendingPageNumbers = new Set(pagesForOcr.map((page) => Number(page.page_num || 0)).filter((pageNum) => pageNum > 0))
           const nativeAnalysisByPage = new Map(
             preflight.pages
@@ -1909,7 +5255,7 @@ async function processDocumentOcr(
             } else {
               await savePageOcrResultsBatchedDeferred(nativeResults, 'paddle', { refreshSearch: false })
               pages = queryAll<OcrPageRow>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])
-              pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
+              pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
               completedBefore = getCompletedOcrPageCount(pages)
               canUsePdfAsync = false
             }
@@ -1997,8 +5343,8 @@ async function processDocumentOcr(
       }
       if (pages.length === 0) {
         pages = await ensurePageRecords(docId, Number(doc.page_count || 0) || 0)
-        pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
-        completedBefore = resumeExisting ? getCompletedOcrPageCount(pages) : 0
+        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
       }
       if (pagesForOcr.length === 0) {
         throw new Error('文献已导入但没有可恢复的页记录或页图，无法继续视觉 OCR。请先重新打开文献生成页图，或重新导入该文件后再重试。')
@@ -2040,17 +5386,65 @@ async function processDocumentOcr(
           message: `大模型 OCR ${actionText}：${combinedPages}/${totalPages} 页${activeNote}${sizeNote}${elapsedNote}`,
         })
       })
+    } else if (engine === 'paddle' && asyncPdfRouteRisk?.preferPageImage && pdfPath && pagesForOcr.length > 0) {
+      const expectedPdfPageCount = getExpectedPdfPageCount(doc, pages)
+      if (!hasSequentialPageRecords(pages, expectedPdfPageCount)) {
+        pages = await ensurePageRecordsIfNeeded(docId, pages, expectedPdfPageCount)
+        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
+      }
+      emitOcrStatus(event, {
+        docId,
+        status: 'processing',
+        phase: 'ocr',
+        progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
+        completedPages: completedBefore,
+        totalPages: getDocTotalPages(),
+        message: '检测到影印/竖排风险，使用安全页图 OCR',
+        errorMessage: asyncPdfRouteRisk.reason,
+      })
+      const pageImageOcrPages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)
+      pageResults = await recognizeRiskyPageImageOcrPages(pageImageOcrPages, asyncPdfRouteRisk.ocrOptions, {
+        signal,
+        docType: doc.doc_type,
+        onProgress: (payload) => {
+        throwIfOcrCanceled(signal)
+        const combinedPages = getCombinedPageCount(payload.completedPages)
+        const totalPages = getDocTotalPages() || payload.totalPages
+        const docFraction = getCombinedDocFraction(payload.completedPages, payload.totalPages)
+        if (payload.status === 'completed' && payload.result) {
+          savePageOcrResultsDeferred([{
+            pageId: payload.pageId,
+            result: payload.result,
+            text: payload.text || getOcrResultText(payload.result),
+            status: 'completed',
+          }], 'paddle', { refreshSearch: false })
+        }
+        emitOcrStatus(event, {
+          docId,
+          status: 'processing',
+          phase: 'ocr',
+          progress: getDocProgress(getCompleted(), totalDocs, docFraction),
+          completedPages: combinedPages,
+          totalPages,
+          pageNum: payload.pageNum,
+          errorMessage: payload.error,
+          message: `安全页图 OCR：${combinedPages}/${totalPages} 页`,
+        })
+        },
+      })
     } else if (canUsePdfAsync && pdfPath) {
       const expectedPdfPageCount = getExpectedPdfPageCount(doc, pages)
       if (!hasSequentialPageRecords(pages, expectedPdfPageCount)) {
         pages = await ensurePageRecordsIfNeeded(docId, pages, expectedPdfPageCount)
-        pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
-        completedBefore = resumeExisting ? getCompletedOcrPageCount(pages) : 0
+        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
       }
       let savedAsyncPageCount = completedBefore
       let lastAsyncDisplayedPageCount = completedBefore
+      const asyncPdfOcrOptions = asyncPdfRouteRisk?.ocrOptions || ocrOptions
       const savedAsyncPageIds = new Set(
-        resumeExisting
+        resumeThisAttempt
           ? pages.filter(isPageOcrCompleted).map((page) => page.id)
           : [],
       )
@@ -2062,6 +5456,7 @@ async function processDocumentOcr(
           .map((page) => Number(page.page_num))
           .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0)
         : undefined
+      const targetPageNumSet = new Set(targetPageNums || [])
       const fallbackPageCount = Math.max(getDocTotalPages(), pages.length, Number(doc.page_count || 0) || 0)
       const willPreferWholePdfUpload = fallbackPageCount > 0
       emitOcrStatus(event, {
@@ -2093,11 +5488,15 @@ async function processDocumentOcr(
           const isWaitingForServerQueue = String(payload.status || payload.state || '').toLowerCase() === 'queued'
           const isWholePdfFallback = Boolean(payload.fallbackWholePdf)
           const isFullFileUpload = Boolean(payload.fullFileUpload)
-          const isAwaitingAsyncResult = totalPages > 0 && finishedPages >= totalPages
+          const awaitingResultFile = Boolean(payload.awaitingResultFile)
+          const isAwaitingAsyncResult = totalPages > 0 && finishedPages >= totalPages && !awaitingResultFile
           const hasServerProgress = newlyFinishedPages > 0 || Number(payload.progress || 0) > 0
           const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''
           const waitingText = payload.waitingMs ? `，已等待 ${formatDurationMs(payload.waitingMs)}` : ''
           const pollText = payload.pollCount ? `，第 ${payload.pollCount} 次查询` : ''
+          const waitingResultFileMessage = awaitingResultFile
+            ? `OCR 服务已处理完成 ${finishedPages}/${totalPages} 页，正在等待结果文件生成${waitingText}${pollText}`
+            : ''
           const statusQueryRetryMessage = payload.retryingStatusQuery
             ? isFullFileUpload
               ? `PDF 已提交，正在重新查询处理进度${waitingText}${pollText}：${formatBytes(sourcePdfBytes)} / ${totalPages} 页`
@@ -2138,7 +5537,7 @@ async function processDocumentOcr(
             progress: getDocProgress(getCompleted(), totalDocs, isAwaitingAsyncResult ? 0.97 : docFraction),
             completedPages: finishedPages,
             totalPages,
-            message: fallbackRetryMessage || statusQueryRetryMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue
+            message: fallbackRetryMessage || statusQueryRetryMessage || waitingResultFileMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue
               ? `排队中：${finishedPages}/${totalPages} 页`
               : isWholePdfFallback && isPreparing
               ? `正在重新提交 PDF：${formatBytes(sourcePdfBytes)}`
@@ -2158,6 +5557,9 @@ async function processDocumentOcr(
           })
         }, {
           signal,
+          ocrOptions: asyncPdfOcrOptions,
+          requireFullFileUpload: Boolean(asyncPdfRouteRisk?.requireFullFileUpload),
+          pageRangeChunkSize: asyncPdfRouteRisk?.pageRangeChunkSize,
           targetPageNums,
           fallbackPageCount,
           collectChunkResults: false,
@@ -2165,17 +5567,23 @@ async function processDocumentOcr(
             throwIfOcrCanceled(signal)
             pages = await ensurePageRecordsIfNeeded(docId, pages, Math.max(pages.length, chunk.totalPages))
             const chunkPages = chunk.sourcePageIndexes
-              .map((sourcePageIndex) => ({
+              .map((sourcePageIndex, resultIndex) => ({
                 page: pages[sourcePageIndex],
                 sourcePageIndex,
+                resultIndex,
               }))
-              .filter((item): item is { page: OcrPageRow; sourcePageIndex: number } => Boolean(item.page))
+              .filter((item): item is { page: OcrPageRow; sourcePageIndex: number; resultIndex: number } => {
+                if (!item.page) return false
+                if (!asyncPdfRouteRisk?.requireFullFileUpload) return true
+                return targetPageNumSet.has(Number(item.page.page_num || item.sourcePageIndex + 1))
+              })
             const chunkPageResults = await postProcessPdfOcrResultsBatched(
-              chunkPages.map((item, index) => ({ ...item, resultIndex: index })),
+              chunkPages,
               chunk.results,
-              ocrOptions,
+              asyncPdfOcrOptions,
               signal,
               (item) => `PaddleOCR 异步结果页数不足：第 ${item.sourcePageIndex + 1} 页缺少结果。`,
+              pdfPath,
             )
             await savePageOcrResultsBatchedDeferred(chunkPageResults, 'paddle', { refreshSearch: false })
             savedAsyncChunksToDatabase = true
@@ -2205,8 +5613,8 @@ async function processDocumentOcr(
       } catch (error) {
         if (isOcrAbortError(error)) throw error
         pages = queryAll<OcrPageRow>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])
-        pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
-        completedBefore = resumeExisting ? getCompletedOcrPageCount(pages) : 0
+        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
         if (!isPdfChunkStructureError(error) || !canFallbackToImageOcr(pagesForOcr)) throw error
         emitOcrStatus(event, {
           docId,
@@ -2262,13 +5670,19 @@ async function processDocumentOcr(
             throw new Error(getZeroPageOcrError('paddle'))
           }
           pages = await ensurePageRecordsIfNeeded(docId, pages, Math.max(pages.length, asyncResults.length))
-          pagesForOcr = getPagesNeedingOcr(pages, resumeExisting)
+          pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+          const asyncResultPageItems = pagesForOcr.map((page, index) => {
+            const sourcePageIndex = Number(page.page_num || index + 1) - 1
+            const resultIndex = asyncPdfRouteRisk?.requireFullFileUpload ? sourcePageIndex : index
+            return { page, sourcePageIndex, resultIndex }
+          })
           pageResults = await postProcessPdfOcrResultsBatched(
-            pagesForOcr.map((page, index) => ({ page, sourcePageIndex: Number(page.page_num || index + 1) - 1, resultIndex: index })),
+            asyncResultPageItems,
             asyncResults,
-            ocrOptions,
+            asyncPdfOcrOptions,
             signal,
             () => `PaddleOCR 异步结果页数不足：预期 ${pages.length} 页，实际返回 ${asyncResults.length} 页。可能是接口未完整处理该 PDF，建议稍后重试或切换 PP-StructureV3。`,
+            pdfPath,
           )
         }
       }
@@ -2327,9 +5741,6 @@ async function processDocumentOcr(
     })
 
     const failedPages = pageResultsPersistedInChunks ? [] : pageResults.filter((item) => item.status === 'error')
-    const hasPageFailure = pageResultsPersistedInChunks
-      ? Number(dbPageSummary?.failed || 0) > 0 || Number(dbPageSummary?.pending || 0) > 0
-      : failedPages.length > 0
     if (!pageResultsPersistedInChunks) {
       await savePageOcrResultsBatchedDeferred(pageResults, engine, { refreshSearch: false })
     }
@@ -2337,9 +5748,60 @@ async function processDocumentOcr(
       mergeVisionTocIntoMetadata(doc, pageResults)
     }
 
+    let persistedPageSummary = summarizeDocumentOcrPages(docId)
+    persistedPageSummary = await syncGujiPaddleReferenceResults(persistedPageSummary)
+    if (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0) {
+      emitOcrStatus(event, {
+        docId,
+        status: 'processing',
+        phase: 'ocr',
+        progress: getDocProgress(getCompleted(), totalDocs, 0.97),
+        completedPages: persistedPageSummary.completed,
+        totalPages: getDocTotalPages() || persistedPageSummary.total || totalPagesForStatus,
+        message: `正在自动单页补跑失败页：${persistedPageSummary.completed}/${getDocTotalPages() || persistedPageSummary.total || totalPagesForStatus} 页`,
+      })
+      const retryResults = await retryIncompletePagesWithSinglePageOcr(
+        {
+          id: doc.id,
+          title: doc.title,
+          author: doc.author,
+          source: doc.source,
+          doc_type: doc.doc_type,
+          metadata: doc.metadata,
+        },
+        pdfPath,
+        signal,
+        (payload) => {
+          emitOcrStatus(event, {
+            docId,
+            status: 'processing',
+            phase: 'ocr',
+            progress: getDocProgress(getCompleted(), totalDocs, 0.97),
+            completedPages: Math.min(
+              getDocTotalPages() || persistedPageSummary.total || totalPagesForStatus,
+              persistedPageSummary.completed + payload.completedPages,
+            ),
+            totalPages: getDocTotalPages() || persistedPageSummary.total || totalPagesForStatus,
+            pageNum: payload.pageNum,
+            errorMessage: payload.error,
+            message: `正在自动单页补跑失败页：${payload.completedPages}/${payload.totalPages} 页`,
+          })
+        },
+      )
+      if (retryResults.length > 0) {
+        await savePageOcrResultsBatchedDeferred(retryResults, 'paddle', { refreshSearch: false })
+        persistedPageSummary = summarizeDocumentOcrPages(docId)
+        persistedPageSummary = await syncGujiPaddleReferenceResults(persistedPageSummary)
+      }
+    }
+
+    const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0
+    const persistedTotalPagesForStatus = getDocTotalPages() || persistedPageSummary.total || totalPagesForStatus
+    const persistedCompletedPagesForStatus = persistedPageSummary.completed || completedPagesForStatus
+
     if (hasPageFailure) {
       throw new Error(
-        pageResultsPersistedInChunks
+        pageResultsPersistedInChunks || persistedPageSummary.failed > 0
           ? getDocumentOcrFailureMessage(docId)
           : failedPages.map((item) => item.error).filter(Boolean).slice(0, 3).join('；') || '部分页面 OCR 失败',
       )
@@ -2348,6 +5810,13 @@ async function processDocumentOcr(
     const reprocessedPageIds = reprocessDocumentOcrStructure(docId)
     reprocessedPageIds.forEach((pageId) => deferredFinalizePageIds.add(pageId))
     if (reprocessedPageIds.length > 0) deferredDatabaseSaveNeeded = true
+
+    persistedPageSummary = summarizeDocumentOcrPages(docId)
+    if (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0) {
+      const finalErrorMessage = getDocumentOcrFailureMessage(docId)
+      updateDocumentStatusFromPages(docId, finalErrorMessage)
+      throw new Error(finalErrorMessage)
+    }
 
     updateDocumentStatus(docId, 'completed', 'processed', null)
     syncDocumentProofStatus(docId)
@@ -2364,8 +5833,8 @@ async function processDocumentOcr(
         phase: 'ai',
         aiStatus: 'processing',
         progress: getDocProgress(getCompleted(), totalDocs, 1),
-        completedPages: totalPagesForStatus,
-        totalPages: totalPagesForStatus,
+        completedPages: persistedCompletedPagesForStatus,
+        totalPages: persistedTotalPagesForStatus,
         message: 'OCR 完成，正在 AI 提取元数据',
       })
       void withTimeout(
@@ -2381,8 +5850,8 @@ async function processDocumentOcr(
             phase: 'ai',
             aiStatus: 'completed',
             progress: getDocProgress(getCompleted(), totalDocs, 1),
-            completedPages: totalPagesForStatus,
-            totalPages: totalPagesForStatus,
+            completedPages: persistedCompletedPagesForStatus,
+            totalPages: persistedTotalPagesForStatus,
             message: 'AI 元数据提取完成',
           })
         })
@@ -2394,8 +5863,8 @@ async function processDocumentOcr(
             phase: 'ai',
             aiStatus: 'error',
             progress: getDocProgress(getCompleted(), totalDocs, 1),
-            completedPages: totalPagesForStatus,
-            totalPages: totalPagesForStatus,
+            completedPages: persistedCompletedPagesForStatus,
+            totalPages: persistedTotalPagesForStatus,
             errorMessage: (error as Error)?.message || 'AI 元数据提取失败',
             message: 'AI 元数据提取失败',
           })
@@ -2406,8 +5875,8 @@ async function processDocumentOcr(
         status: 'completed',
         phase: 'completed',
         progress: getDocProgress(getCompleted(), totalDocs, 1),
-        completedPages: totalPagesForStatus,
-        totalPages: totalPagesForStatus,
+        completedPages: persistedCompletedPagesForStatus,
+        totalPages: persistedTotalPagesForStatus,
         errorMessage: '混合 OCR 第二轮视觉整理失败，已使用飞桨版面生成临时阅读结构；请稍后重试大模型整理。',
         message: '混合 OCR 第二轮失败，已保留临时结构',
       })
@@ -2701,6 +6170,12 @@ export function registerOcrIpc(): void {
       })
       return true
     } catch (error) {
+      const qualityFailureMessage = (error as Error)?.message || String(error || 'OCR failed')
+      const qualityFailureSaveResult = await savePageQualityFailureOcrError(pageId, error, qualityFailureMessage, 'paddle', { pageOptions: options })
+      if (qualityFailureSaveResult === 'recovered') {
+        finishRecoveredPageQualityFailure(event, page)
+        return true
+      }
       run('UPDATE pages SET ocr_status = ? WHERE id = ?', ['error', pageId])
       updateDocumentStatusFromPages(page.doc_id, (error as Error)?.message || String(error || 'OCR 失败'))
       syncDocumentProofStatus(page.doc_id)
@@ -2722,7 +6197,8 @@ export function registerOcrIpc(): void {
   )
 
   ipcMain.handle('pages:rerunVisionOcr', async (event, pageId: string) => {
-    const page = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const rawPage = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const page = rawPage ? hydratePagePayloadRows([rawPage])[0] : null
     if (!page?.image_path) {
       throw new Error('当前页缺少图像，无法重新进行视觉 OCR')
     }
@@ -2762,6 +6238,18 @@ export function registerOcrIpc(): void {
       emitOcrStatus(event, { docId: page.doc_id, status: currentDocStatus, progress: 1 })
       return true
     } catch (error) {
+      const previousPageStatus = String(page.ocr_status || '').trim() || 'pending'
+      const hasExistingOcr = String(page.ocr_text || '').trim().length > 0 || String(page.ocr_result || '').trim().length > 0
+      if (hasExistingOcr) {
+        run('UPDATE pages SET ocr_status = ? WHERE id = ?', [previousPageStatus === 'processing' ? 'completed' : previousPageStatus, pageId])
+        updateDocumentStatusFromPages(page.doc_id)
+        syncDocumentProofStatus(page.doc_id)
+        scheduleDatabaseSave()
+        const currentDocStatus = queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [page.doc_id])?.ocr_status || 'completed'
+        emitOcrStatus(event, { docId: page.doc_id, status: currentDocStatus, progress: 1 })
+        console.error('[OCR] Rerun current page vision OCR failed:', error)
+        throw error
+      }
       run('UPDATE pages SET ocr_status = ? WHERE id = ?', ['error', pageId])
       updateDocumentStatusFromPages(page.doc_id, (error as Error)?.message || String(error || '视觉 OCR 失败'))
       syncDocumentProofStatus(page.doc_id)
@@ -2773,7 +6261,8 @@ export function registerOcrIpc(): void {
   })
 
   ipcMain.handle('pages:enhanceGuji', async (event, pageId: string, options?: PageOcrOptions) => {
-    const page = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const rawPage = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const page = rawPage ? hydratePagePayloadRows([rawPage])[0] : null
     if (!page?.image_path) {
       throw new Error('当前页面缺少图像，无法增强古籍识别')
     }
@@ -2821,6 +6310,12 @@ export function registerOcrIpc(): void {
       emitOcrStatus(event, { docId: page.doc_id, status: 'completed', progress: 1 })
       return true
     } catch (error) {
+      const qualityFailureMessage = (error as Error)?.message || String(error || 'Enhance guji page failed')
+      const qualityFailureSaveResult = await savePageQualityFailureOcrError(pageId, error, qualityFailureMessage, 'paddle', { ocrOptions: resolvedOptions })
+      if (qualityFailureSaveResult === 'recovered') {
+        finishRecoveredPageQualityFailure(event, page)
+        return true
+      }
       run('UPDATE pages SET ocr_status = ? WHERE id = ?', ['error', pageId])
       run('UPDATE documents SET ocr_status = ?, import_status = ?, updated_at = ? WHERE id = ?', [
         'error',
@@ -2837,7 +6332,8 @@ export function registerOcrIpc(): void {
   })
 
   ipcMain.handle('pages:rerunLayout', async (event, pageId: string, options?: PageOcrOptions) => {
-    const page = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const rawPage = queryOne<OcrPageRow>('SELECT * FROM pages WHERE id = ?', [pageId])
+    const page = rawPage ? hydratePagePayloadRows([rawPage])[0] : null
     if (!page?.image_path) {
       throw new Error('当前页面缺少图像，无法重做版面切分')
     }
@@ -2861,6 +6357,17 @@ export function registerOcrIpc(): void {
       emitOcrStatus(event, { docId: page.doc_id, status: 'completed', progress: 1 })
       return true
     } catch (error) {
+      const qualityFailureMessage = (error as Error)?.message || String(error || 'Rerun page layout failed')
+      const qualityFailureSaveResult = await savePageQualityFailureOcrError(pageId, error, qualityFailureMessage, 'paddle', { pageOptions: options })
+      if (qualityFailureSaveResult === 'recovered') {
+        finishRecoveredPageQualityFailure(event, page)
+        return true
+      }
+      if (qualityFailureSaveResult === 'saved_error') {
+        updateDocumentStatusFromPages(page.doc_id, qualityFailureMessage)
+        syncDocumentProofStatus(page.doc_id)
+        scheduleDatabaseSave()
+      }
       console.error('[OCR] Rerun page layout failed:', error)
       throw error
     }

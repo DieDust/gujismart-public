@@ -35,6 +35,12 @@ function asOcrResult(value: unknown): OcrTextResult | null {
   return isRecord(parsed) ? parsed as OcrTextResult : null
 }
 
+function shouldSuppressUntrustedFeijiangReferenceLayout(result: OcrTextResult | null): boolean {
+  if (!result || result.gujismart_recovered_from_feijiang_json !== true) return false
+  const normalization = isRecord(result.normalization) ? result.normalization : {}
+  return normalization.discarded_untrusted_feijiang_reference_layout === true
+}
+
 function asBlock(value: unknown): OcrTextBlock {
   return isRecord(value) ? value as OcrTextBlock : {}
 }
@@ -923,6 +929,7 @@ function getLayoutBlockType(block: unknown, text: string): 'heading' | 'paragrap
 function getLayoutAwareBlocks(page: OcrTextPage): OcrTextBlock[] {
   const parsed = asOcrResult(page.ocr_result)
   if (!parsed) return []
+  if (shouldSuppressUntrustedFeijiangReferenceLayout(parsed)) return []
   const withMarkdownImages = (blocks: OcrTextBlock[]): OcrTextBlock[] => {
     const markdown = getMarkdownTextAndImages(parsed)
     const markdownText = markdown.text || String(page.ocr_text || '')
@@ -1030,6 +1037,7 @@ function recognizedTextBlocksFrom(source: unknown): OcrTextBlock[] {
 function getOcrTextBlocks(page: OcrTextPage): OcrTextBlock[] {
   const parsed = asOcrResult(page.ocr_result)
   if (!parsed) return []
+  if (shouldSuppressUntrustedFeijiangReferenceLayout(parsed)) return []
 
   const directBlocks = firstBlockArray(
     parsed.layout_result,
