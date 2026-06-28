@@ -7,6 +7,7 @@ import { app, nativeImage } from 'electron'
 import { PDFDocument } from 'pdf-lib'
 import { queryOne } from './database'
 import { isAbortError } from '../shared/errors'
+import { ensureOcrResultIr } from '../shared/ocr-ir'
 import type { OcrBoundingBox, OcrProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult, OcrRecognizeWordResult, OcrSecondPass, PageOcrOptions } from '../shared/types'
 export type { OcrProfile, OcrSecondPass, PageOcrOptions } from '../shared/types'
 
@@ -39,6 +40,8 @@ interface LayoutLocation {
   width: number
   height: number
 }
+
+type OcrRect = LayoutLocation
 
 interface LayoutBlockResult {
   [key: string]: unknown
@@ -177,9 +180,12 @@ const ASYNC_POLL_BASE_INTERVAL_MS = 5000
 const ASYNC_POLL_MAX_INTERVAL_MS = 12000
 const ASYNC_STATUS_QUERY_TIMEOUT_MS = 30 * 1000
 const ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
+const ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'
 const ASYNC_RESULT_READY_GRACE_MS = 3 * 60 * 1000
 const ASYNC_RESULT_DOWNLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
 const ASYNC_JOB_STALLED_TIMEOUT_MS = 10 * 60 * 1000
+const ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS = 3 * 60 * 1000
+const ASYNC_PDF_STALLED_PAGE_RANGE_CHUNK_SIZE = 10
 const ASYNC_RESULT_PARSE_YIELD_LINE_INTERVAL = 100
 const ASYNC_RESULT_NORMALIZE_CHUNK_SIZE = 50
 const OCR_REPEATED_TEXT_SCAN_LIMIT = 60_000
@@ -270,7 +276,12 @@ function nonNegativeIntField(source: unknown, keys: string[], fallback = 0): num
 }
 
 function isOcrResultPayload(value: unknown): value is OcrResultPayload {
-  return isJsonRecord(value)
+  if (!isJsonRecord(value)) return false
+  return Array.isArray(value.layout_result)
+    || Array.isArray(value.words_result)
+    || isJsonRecord(value.gujismart_ir)
+    || typeof value.text === 'string'
+    || typeof value.ir_text === 'string'
 }
 
 function createLimiter(concurrency: number) {
@@ -482,6 +493,12 @@ function isAsyncPdfUploadUnsupportedError(error: unknown): boolean {
   return /async pdf|pdf job|job upload|unsupported.*pdf|file too large|too many pages|payload too large|status(?: code)? 4(?:00|04|13|15|22)|状态码 4(?:00|04|13|15|22)/i.test(message)
 }
 
+function isAsyncJobStalledError(error: unknown): boolean {
+  const message = String((error as Error)?.message || error || '')
+  return message.includes(ASYNC_JOB_STALLED_PREFIX)
+    || /异步任务长时间没有进展|状态查询长时间没有进展|long time without progress|stalled/i.test(message)
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
@@ -526,6 +543,119 @@ function getImageDimensions(filePath?: string | null): { width: number; height: 
     return image.getSize()
   } catch {
     return null
+  }
+}
+
+export function getPageImageSize(imagePath?: string | null): { width: number; height: number } | null {
+  return getImageDimensions(imagePath)
+}
+
+function mergeNumericRuns(runs: Array<[number, number]>, maxGap: number): Array<[number, number]> {
+  if (runs.length === 0) return []
+  const merged: Array<[number, number]> = [[runs[0][0], runs[0][1]]]
+  for (let index = 1; index < runs.length; index += 1) {
+    const current = runs[index]
+    const previous = merged[merged.length - 1]
+    if (current[0] - previous[1] <= maxGap) {
+      previous[1] = Math.max(previous[1], current[1])
+    } else {
+      merged.push([current[0], current[1]])
+    }
+  }
+  return merged
+}
+
+function findNumericRuns(values: number[], threshold: number, minLength: number, maxGap = 2): Array<[number, number]> {
+  const runs: Array<[number, number]> = []
+  let start = -1
+  for (let index = 0; index < values.length; index += 1) {
+    if (values[index] >= threshold) {
+      if (start < 0) start = index
+    } else if (start >= 0) {
+      if (index - start >= minLength) runs.push([start, index])
+      start = -1
+    }
+  }
+  if (start >= 0 && values.length - start >= minLength) runs.push([start, values.length])
+  return mergeNumericRuns(runs, maxGap)
+}
+
+function getBitmapLuminance(bitmap: Buffer, imageWidth: number, x: number, y: number): number {
+  const index = (y * imageWidth + x) * 4
+  const b = bitmap[index]
+  const g = bitmap[index + 1]
+  const r = bitmap[index + 2]
+  return r * 0.299 + g * 0.587 + b * 0.114
+}
+
+export function detectLocalLargeImageRegions(imagePath?: string | null): OcrRect[] {
+  const path = String(imagePath || '').trim()
+  if (!path) return []
+  try {
+    const image = nativeImage.createFromPath(path)
+    if (image.isEmpty()) return []
+    const size = image.getSize()
+    if (size.width <= 0 || size.height <= 0) return []
+    const bitmap = image.toBitmap()
+    const sampleStep = Math.max(1, Math.ceil(Math.max(size.width, size.height) / 1400))
+    const sampleWidth = Math.ceil(size.width / sampleStep)
+    const sampleHeight = Math.ceil(size.height / sampleStep)
+    const rowInk = new Array<number>(sampleHeight).fill(0)
+
+    for (let sampleY = 0; sampleY < sampleHeight; sampleY += 1) {
+      const y = Math.min(size.height - 1, sampleY * sampleStep)
+      let count = 0
+      for (let sampleX = 0; sampleX < sampleWidth; sampleX += 1) {
+        const x = Math.min(size.width - 1, sampleX * sampleStep)
+        if (getBitmapLuminance(bitmap, size.width, x, y) < 210) count += 1
+      }
+      rowInk[sampleY] = count
+    }
+
+    const rowRuns = findNumericRuns(
+      rowInk,
+      Math.max(10, Math.round(sampleWidth * 0.2)),
+      Math.max(8, Math.round(sampleHeight * 0.035)),
+      Math.max(2, Math.round(sampleHeight * 0.006)),
+    )
+    const regions: OcrRect[] = []
+
+    for (const [rowStart, rowEnd] of rowRuns) {
+      const bandSampleHeight = Math.max(1, rowEnd - rowStart)
+      const colInk = new Array<number>(sampleWidth).fill(0)
+      for (let sampleX = 0; sampleX < sampleWidth; sampleX += 1) {
+        const x = Math.min(size.width - 1, sampleX * sampleStep)
+        let count = 0
+        for (let sampleY = rowStart; sampleY < rowEnd; sampleY += 1) {
+          const y = Math.min(size.height - 1, sampleY * sampleStep)
+          if (getBitmapLuminance(bitmap, size.width, x, y) < 210) count += 1
+        }
+        colInk[sampleX] = count
+      }
+
+      const colRuns = findNumericRuns(
+        colInk,
+        Math.max(4, Math.round(bandSampleHeight * 0.12)),
+        Math.max(8, Math.round(sampleWidth * 0.06)),
+        Math.max(2, Math.round(sampleWidth * 0.006)),
+      )
+      const widestColRun = colRuns
+        .map((run) => ({ run, width: run[1] - run[0] }))
+        .sort((left, right) => right.width - left.width)[0]?.run
+      if (!widestColRun) continue
+
+      const left = Math.max(0, widestColRun[0] * sampleStep)
+      const top = Math.max(0, rowStart * sampleStep)
+      const right = Math.min(size.width, widestColRun[1] * sampleStep)
+      const bottom = Math.min(size.height, rowEnd * sampleStep)
+      const rect = { left, top, width: right - left, height: bottom - top }
+      if (rect.width < size.width * 0.18 || rect.height < size.height * 0.08) continue
+      regions.push(rect)
+    }
+
+    return regions.sort((left, right) => left.top - right.top || left.left - right.left)
+  } catch {
+    return []
   }
 }
 
@@ -1124,15 +1254,33 @@ function splitMergedWideVerticalTextLineBlocks(
   })
 }
 
-function attachProcessingMeta(result: OcrResultPayload, options: Required<PageOcrOptions>, imagePath?: string | null): OcrResultPayload {
-  const dimensions = getImageDimensions(imagePath)
+function getCoordinateSourceDimensions(result: OcrResultPayload): { width?: number; height?: number } {
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+  const width = finiteNumber(firstRecordValue(result, ['page_width', 'image_width', 'source_image_width', 'width']))
+    ?? (!preserveServiceCoordinates ? finiteNumber(readRecordValue(gujiProcessing, 'source_image_width')) : null)
+  const height = finiteNumber(firstRecordValue(result, ['page_height', 'image_height', 'source_image_height', 'height']))
+    ?? (!preserveServiceCoordinates ? finiteNumber(readRecordValue(gujiProcessing, 'source_image_height')) : null)
+  return {
+    width: width && width > 0 ? width : undefined,
+    height: height && height > 0 ? height : undefined,
+  }
+}
+
+function attachProcessingMeta(
+  result: OcrResultPayload,
+  options: Required<PageOcrOptions>,
+  imagePath?: string | null,
+  metaOptions: { preserveServiceCoordinates?: boolean } = {},
+): OcrResultPayload {
+  const dimensions = metaOptions.preserveServiceCoordinates ? getCoordinateSourceDimensions(result) : getImageDimensions(imagePath)
   return {
     ...result,
     guji_processing: {
       ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
       profile: options.profile,
       second_pass: options.secondPass,
-      source_image_fingerprint: getImageFingerprint(imagePath),
+      source_image_fingerprint: metaOptions.preserveServiceCoordinates ? '' : getImageFingerprint(imagePath),
       source_image_width: dimensions?.width || null,
       source_image_height: dimensions?.height || null,
       updated_at: new Date().toISOString(),
@@ -1259,6 +1407,20 @@ function rotateClockwiseCoordinatePointToSource(point: { x: number; y: number },
   return {
     x: Math.round(sourceWidth - point.y),
     y: Math.round(point.x),
+  }
+}
+
+function markServiceCoordinatesPreserved(result: OcrResultPayload): OcrResultPayload {
+  const dimensions = getCoordinateSourceDimensions(result)
+  return {
+    ...result,
+    source_image_width: dimensions.width || readRecordValue(result, 'source_image_width') || null,
+    source_image_height: dimensions.height || readRecordValue(result, 'source_image_height') || null,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ocr_service_coordinates_preserved: true,
+      service_coordinate_source: 'paddle_async_pdf',
+    },
   }
 }
 
@@ -1560,6 +1722,570 @@ function clampLocationToImage(location: LayoutLocation, imageWidth: number, imag
   }
 }
 
+interface LocalInkBounds {
+  location: LayoutLocation
+  inkPixels: number
+}
+
+interface LocalInkBitmap {
+  bitmap: Buffer
+  width: number
+  height: number
+}
+
+function createLocalInkBitmap(imagePath: string | null | undefined): LocalInkBitmap | null {
+  const path = String(imagePath || '').trim()
+  if (!path) return null
+  try {
+    const image = nativeImage.createFromPath(path)
+    if (image.isEmpty()) return null
+    const size = image.getSize()
+    if (size.width <= 0 || size.height <= 0) return null
+    return {
+      bitmap: image.toBitmap(),
+      width: size.width,
+      height: size.height,
+    }
+  } catch {
+    return null
+  }
+}
+
+function findActiveExtent(values: number[], threshold: number): { start: number; end: number } | null {
+  let start = -1
+  let end = -1
+  values.forEach((value, index) => {
+    if (value >= threshold) {
+      if (start < 0) start = index
+      end = index + 1
+    }
+  })
+  return start >= 0 && end > start ? { start, end } : null
+}
+
+interface ActiveInkRun {
+  start: number
+  end: number
+  total: number
+  max: number
+}
+
+function findActiveInkRuns(values: number[], threshold: number, minLength = 2, maxGap = 2): ActiveInkRun[] {
+  const runs = findNumericRuns(values, threshold, minLength, maxGap)
+  return runs.map(([start, end]) => {
+    const slice = values.slice(start, end)
+    return {
+      start,
+      end,
+      total: slice.reduce((sum, value) => sum + value, 0),
+      max: Math.max(...slice, 0),
+    }
+  })
+}
+
+function trimDetachedWeakEdgeRuns(runs: ActiveInkRun[], fullHeight: number): ActiveInkRun[] {
+  if (runs.length <= 1) return runs
+  const nextRuns = runs.map((run) => ({ ...run }))
+  const strongestMax = Math.max(...nextRuns.map((run) => run.max), 0)
+  const strongestTotal = Math.max(...nextRuns.map((run) => run.total), 0)
+  if (strongestMax <= 0 || strongestTotal <= 0) return nextRuns
+
+  const isWeakDetachedRun = (candidate: ActiveInkRun, neighbor: ActiveInkRun, edge: 'start' | 'end'): boolean => {
+    const gap = edge === 'start' ? neighbor.start - candidate.end : candidate.start - neighbor.end
+    const weakInk = candidate.max <= strongestMax * 0.34 && candidate.total <= strongestTotal * 0.28
+    const detached = gap >= Math.max(12, fullHeight * 0.045)
+    return weakInk && detached
+  }
+
+  while (nextRuns.length > 1 && isWeakDetachedRun(nextRuns[0], nextRuns[1], 'start')) {
+    nextRuns.shift()
+  }
+  while (nextRuns.length > 1 && isWeakDetachedRun(nextRuns[nextRuns.length - 1], nextRuns[nextRuns.length - 2], 'end')) {
+    nextRuns.pop()
+  }
+  return nextRuns
+}
+
+function findDominantActiveExtent(values: number[], threshold: number): { start: number; end: number } | null {
+  const runs = trimDetachedWeakEdgeRuns(findActiveInkRuns(values, threshold, 2, 2), values.length)
+  if (runs.length === 0) return findActiveExtent(values, threshold)
+  return {
+    start: Math.min(...runs.map((run) => run.start)),
+    end: Math.max(...runs.map((run) => run.end)),
+  }
+}
+
+function getLocalInkBoundsForLocation(source: LocalInkBitmap, location: LayoutLocation): LocalInkBounds | null {
+  const left = clamp(Math.floor(location.left), 0, Math.max(0, source.width - 1))
+  const top = clamp(Math.floor(location.top), 0, Math.max(0, source.height - 1))
+  const right = clamp(Math.ceil(location.left + location.width), left + 1, source.width)
+  const bottom = clamp(Math.ceil(location.top + location.height), top + 1, source.height)
+  const width = right - left
+  const height = bottom - top
+  if (width <= 1 || height <= 1) return null
+
+  const rowInk = new Array<number>(height).fill(0)
+  const columnInk = new Array<number>(width).fill(0)
+  let inkPixels = 0
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+        rowInk[y] += 1
+        columnInk[x] += 1
+        inkPixels += 1
+      }
+    }
+  }
+  if (inkPixels < Math.max(12, Math.min(width, height))) return null
+
+  const smoothedRows = smoothSeries(rowInk, 1)
+  const smoothedColumns = smoothSeries(columnInk, 1)
+  const rowMax = Math.max(...smoothedRows, 0)
+  const columnMax = Math.max(...smoothedColumns, 0)
+  if (rowMax <= 0 || columnMax <= 0) return null
+
+  const rowExtent = findDominantActiveExtent(smoothedRows, Math.max(2, rowMax * 0.08))
+  const columnExtent = findActiveExtent(smoothedColumns, Math.max(2, columnMax * 0.08))
+  if (!rowExtent || !columnExtent) return null
+
+  const padX = Math.max(2, Math.min(10, Math.round(width * 0.012)))
+  const padY = Math.max(2, Math.min(8, Math.round(height * 0.01)))
+  const inkLeft = clamp(left + columnExtent.start - padX, left, right - 1)
+  const inkTop = clamp(top + rowExtent.start - padY, top, bottom - 1)
+  const inkRight = clamp(left + columnExtent.end + padX, inkLeft + 1, right)
+  const inkBottom = clamp(top + rowExtent.end + padY, inkTop + 1, bottom)
+  return {
+    location: {
+      left: inkLeft,
+      top: inkTop,
+      width: Math.max(1, inkRight - inkLeft),
+      height: Math.max(1, inkBottom - inkTop),
+    },
+    inkPixels,
+  }
+}
+
+function isTightenableTextCoordinateBlock(block: LayoutBlockResult): boolean {
+  if (!block.location) return false
+  if (isTableLabel(block.label) || isImageLabel(block.label)) return false
+  if (normalizeTableRows(firstRecordValue(block, ['rows', 'table_rows'])).length > 0) return false
+  const text = getOcrBlockText(block).replace(/\s+/g, '')
+  const decorative = isDecorativeOcrLabel(block.label)
+  const shortFootnote = isShortFootnoteCoordinateBlock(block)
+  if (text.length < (decorative || shortFootnote ? 1 : 12)) return false
+  const label = String(block.label || '').toLowerCase()
+  if (decorative || shortFootnote) return text.length <= 120
+  if (!label) return true
+  return /text|paragraph|body|note|footnote|reference|abstract|title/i.test(label)
+}
+
+function isShortFootnoteCoordinateBlock(block: LayoutBlockResult): boolean {
+  if (!block.location) return false
+  if (!/footnote/.test(String(block.label || '').toLowerCase())) return false
+  if (block.location.height >= 40) return false
+  const compactTextLength = getOcrBlockText(block).replace(/\s+/g, '').length
+  return compactTextLength > 0 && compactTextLength <= 80
+}
+
+function getDecorativeInkSearchLocation(source: LocalInkBitmap, location: LayoutLocation, label: unknown): LayoutLocation {
+  const lowerLabel = String(label || '').toLowerCase()
+  const shortFootnote = /footnote/.test(lowerLabel) && location.height < 40
+  const padX = Math.max(18, Math.round(location.width * (/number|page/.test(lowerLabel) ? 0.9 : /header/.test(lowerLabel) ? 1.25 : shortFootnote ? 0.8 : 0.75)))
+  const upwardPad = /footer/.test(lowerLabel)
+    ? Math.max(48, Math.round(location.height * 3))
+    : shortFootnote
+      ? Math.max(6, Math.round(location.height * 0.35))
+      : Math.max(12, Math.round(location.height * 0.8))
+  const downwardPad = /footer/.test(lowerLabel)
+    ? Math.max(40, Math.round(location.height * 2))
+    : Math.max(/number|page/.test(lowerLabel) ? 54 : shortFootnote ? 44 : 72, Math.round(location.height * (/number|page/.test(lowerLabel) ? 2.2 : shortFootnote ? 2 : 3)))
+  const left = clamp(Math.round(location.left - padX), 0, Math.max(0, source.width - 1))
+  const top = clamp(Math.round(location.top - upwardPad), 0, Math.max(0, source.height - 1))
+  const right = clamp(Math.round(location.left + location.width + padX), left + 1, source.width)
+  const bottom = clamp(Math.round(location.top + location.height + downwardPad), top + 1, source.height)
+  return {
+    left,
+    top,
+    width: right - left,
+    height: bottom - top,
+  }
+}
+
+function shouldUseDecorativeLocalInkLocation(
+  original: LayoutLocation,
+  tightened: LayoutLocation,
+  source: LocalInkBitmap,
+  label: unknown,
+  compactTextLength = 0,
+): boolean {
+  const lowerLabel = String(label || '').toLowerCase()
+  const originalCenterX = original.left + original.width / 2
+  const originalCenterY = original.top + original.height / 2
+  const tightenedCenterX = tightened.left + tightened.width / 2
+  const tightenedCenterY = tightened.top + tightened.height / 2
+  const maxCenterDx = Math.max(36, original.width * 1.35, source.width * 0.12)
+  const maxCenterDy = /number|page/.test(lowerLabel)
+    ? Math.max(28, original.height * 1.6, source.height * 0.025)
+    : /footnote/.test(lowerLabel) && original.height < 40
+      ? Math.max(38, original.height * 2.2, source.height * 0.055)
+    : Math.max(72, original.height * 4.5, source.height * 0.1)
+  if (Math.abs(tightenedCenterX - originalCenterX) > maxCenterDx) return false
+  if (Math.abs(tightenedCenterY - originalCenterY) > maxCenterDy) return false
+  const maxWidth = /number|page/.test(lowerLabel)
+    ? Math.max(22, Math.min(original.width * 1.7, source.width * 0.12))
+    : /header/.test(lowerLabel)
+      ? Math.max(40, Math.min(
+        source.width * 0.34,
+        Math.max(original.width * 2.5, compactTextLength * 14),
+      ))
+      : /footnote/.test(lowerLabel) && original.height < 40
+        ? Math.max(24, Math.min(source.width * 0.28, Math.max(original.width * 1.4, compactTextLength * 10)))
+      : Math.max(original.width * 3.4, source.width * 0.36)
+  const maxHeight = /number|page/.test(lowerLabel)
+    ? Math.max(20, Math.min(original.height * 1.45, source.height * 0.05))
+    : /header/.test(lowerLabel)
+      ? Math.max(18, Math.min(original.height * 1.7, source.height * 0.055))
+      : /footnote/.test(lowerLabel) && original.height < 40
+        ? Math.max(12, Math.min(original.height * 1.5, source.height * 0.045))
+      : Math.max(original.height * 3.2, source.height * 0.075)
+  if (tightened.width > maxWidth) return false
+  if (tightened.height > maxHeight) return false
+  return tightened.width >= 3 && tightened.height >= 3
+}
+
+function getDecorativeLocalInkBoundsForBlock(source: LocalInkBitmap, block: LayoutBlockResult): LocalInkBounds | null {
+  const search = getDecorativeInkSearchLocation(source, block.location, block.label)
+  const left = clamp(Math.floor(search.left), 0, Math.max(0, source.width - 1))
+  const top = clamp(Math.floor(search.top), 0, Math.max(0, source.height - 1))
+  const right = clamp(Math.ceil(search.left + search.width), left + 1, source.width)
+  const bottom = clamp(Math.ceil(search.top + search.height), top + 1, source.height)
+  const width = right - left
+  const height = bottom - top
+  if (width <= 1 || height <= 1) return null
+
+  const rowInk = new Array<number>(height).fill(0)
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+        rowInk[y] += 1
+      }
+    }
+  }
+  const smoothedRows = smoothSeries(rowInk, 1)
+  const rowMax = Math.max(...smoothedRows, 0)
+  if (rowMax <= 0) return null
+  const rowRuns = findNumericRuns(
+    smoothedRows,
+    Math.max(1, Math.min(8, rowMax * 0.1)),
+    3,
+    2,
+  )
+  if (rowRuns.length === 0) return null
+
+  const originalCenterX = block.location.left + block.location.width / 2
+  const originalCenterY = block.location.top + block.location.height / 2
+  let best: (LocalInkBounds & { score: number }) | null = null
+
+  for (const [rawRowStart, rawRowEnd] of rowRuns) {
+    const rowStart = clamp(rawRowStart - 1, 0, height - 1)
+    const rowEnd = clamp(rawRowEnd + 1, rowStart + 1, height)
+    const colInk = new Array<number>(width).fill(0)
+    let inkPixels = 0
+    for (let y = rowStart; y < rowEnd; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+          colInk[x] += 1
+          inkPixels += 1
+        }
+      }
+    }
+    if (inkPixels < 4) continue
+    const smoothedColumns = smoothSeries(colInk, 1)
+    const colMax = Math.max(...smoothedColumns, 0)
+    if (colMax <= 0) continue
+    const columnRuns = findNumericRuns(
+      smoothedColumns,
+      Math.max(1, Math.min(5, colMax * 0.08)),
+      3,
+      /footer/.test(String(block.label || '').toLowerCase()) ? 8 : 2,
+    )
+    if (columnRuns.length === 0) continue
+
+    const lowerLabel = String(block.label || '').toLowerCase()
+    const candidateRuns = /footer/.test(lowerLabel)
+      ? [[columnRuns[0][0], columnRuns[columnRuns.length - 1][1]]]
+      : /header/.test(lowerLabel) || (/footnote/.test(lowerLabel) && block.location.height < 40)
+        ? columnRuns.flatMap((_, runIndex) => {
+          const groups: Array<[number, number]> = []
+          const compactTextLength = getOcrBlockText(block).replace(/\s+/g, '').length
+          const headerLike = /header/.test(lowerLabel)
+          const maxGroupWidth = Math.max(
+            block.location.width * (headerLike ? 2.4 : 1.4),
+            Math.min(
+              source.width * (headerLike ? 0.34 : 0.28),
+              Math.max(headerLike ? 140 : 34, compactTextLength * (headerLike ? 14 : 10)),
+            ),
+          )
+          const maxGroupGap = Math.max(headerLike ? 24 : 8, Math.min(headerLike ? 72 : 28, block.location.width * 0.42))
+          for (let endIndex = runIndex; endIndex < columnRuns.length; endIndex += 1) {
+            if (endIndex > runIndex && columnRuns[endIndex][0] - columnRuns[endIndex - 1][1] > maxGroupGap) break
+            const group: [number, number] = [columnRuns[runIndex][0], columnRuns[endIndex][1]]
+            if (group[1] - group[0] > maxGroupWidth) break
+            groups.push(group)
+          }
+          return groups
+        })
+        : columnRuns
+
+    for (const [columnStart, columnEnd] of candidateRuns) {
+      const padX = 2
+      const padY = 2
+      const location = clampLocationToImage({
+        left: left + columnStart - padX,
+        top: top + rowStart - padY,
+        width: columnEnd - columnStart + padX * 2,
+        height: rowEnd - rowStart + padY * 2,
+      }, source.width, source.height)
+      const compactTextLength = getOcrBlockText(block).replace(/\s+/g, '').length
+      const shortFootnote = /footnote/.test(lowerLabel) && block.location.height < 40
+      if (shortFootnote) {
+        const locationCenterY = location.top + location.height / 2
+        const maxCenterShiftY = Math.max(16, block.location.height * 0.85)
+        if (Math.abs(locationCenterY - originalCenterY) > maxCenterShiftY) continue
+      }
+      if (!shouldUseDecorativeLocalInkLocation(block.location, location, source, block.label, compactTextLength)) continue
+      const centerX = location.left + location.width / 2
+      const centerY = location.top + location.height / 2
+      const expectedHeaderWidth = /header/.test(lowerLabel)
+        ? Math.min(source.width * 0.34, Math.max(0, compactTextLength * 10))
+        : 0
+      const expectedShortFootnoteWidth = /footnote/.test(lowerLabel) && block.location.height < 40
+        ? Math.min(source.width * 0.28, Math.max(0, compactTextLength * 7))
+        : 0
+      const shortFootnoteCenterWeight = shortFootnote ? 4.5 : 1.45
+      const score = Math.abs(centerX - originalCenterX)
+        + Math.abs(centerY - originalCenterY) * shortFootnoteCenterWeight
+        + Math.max(0, expectedHeaderWidth - location.width) * 1.6
+        + Math.max(0, expectedShortFootnoteWidth - location.width) * (shortFootnote ? 0.12 : 1.2)
+        + Math.max(0, location.width - block.location.width) * 0.08
+        + Math.max(0, location.height - block.location.height) * 0.25
+      if (!best || score < best.score) {
+        best = { location, inkPixels, score }
+      }
+    }
+  }
+
+  return best ? { location: best.location, inkPixels: best.inkPixels } : null
+}
+
+function getLocalInkBoundsForBlock(source: LocalInkBitmap, block: LayoutBlockResult): LocalInkBounds | null {
+  const localBounds = getLocalInkBoundsForLocation(source, block.location)
+  const shouldSearchNearbyInk = isDecorativeOcrLabel(block.label) || isShortFootnoteCoordinateBlock(block)
+  if (!shouldSearchNearbyInk) return localBounds
+
+  return getDecorativeLocalInkBoundsForBlock(source, block) || localBounds
+}
+
+function getShortFootnoteLocalLineBounds(source: LocalInkBitmap, search: LayoutLocation): LayoutLocation[] {
+  const left = clamp(Math.floor(search.left), 0, Math.max(0, source.width - 1))
+  const top = clamp(Math.floor(search.top), 0, Math.max(0, source.height - 1))
+  const right = clamp(Math.ceil(search.left + search.width), left + 1, source.width)
+  const bottom = clamp(Math.ceil(search.top + search.height), top + 1, source.height)
+  const width = right - left
+  const height = bottom - top
+  if (width <= 1 || height <= 1) return []
+
+  const rowInk = new Array<number>(height).fill(0)
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+        rowInk[y] += 1
+      }
+    }
+  }
+  const smoothedRows = smoothSeries(rowInk, 1)
+  const rowMax = Math.max(...smoothedRows, 0)
+  if (rowMax <= 0) return []
+  const rowRuns = findNumericRuns(
+    smoothedRows,
+    Math.max(2, Math.min(12, rowMax * 0.12)),
+    3,
+    2,
+  )
+
+  return rowRuns.flatMap(([rawRowStart, rawRowEnd]) => {
+    const rowStart = clamp(rawRowStart - 2, 0, height - 1)
+    const rowEnd = clamp(rawRowEnd + 2, rowStart + 1, height)
+    const rowHeight = rowEnd - rowStart
+    if (rowHeight > Math.max(30, height * 0.55)) return []
+    const columnInk = new Array<number>(width).fill(0)
+    let inkPixels = 0
+    for (let y = rowStart; y < rowEnd; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+          columnInk[x] += 1
+          inkPixels += 1
+        }
+      }
+    }
+    if (inkPixels < 6) return []
+    const smoothedColumns = smoothSeries(columnInk, 1)
+    const columnMax = Math.max(...smoothedColumns, 0)
+    if (columnMax <= 0) return []
+    const columnRuns = findNumericRuns(
+      smoothedColumns,
+      Math.max(1, Math.min(5, columnMax * 0.08)),
+      2,
+      14,
+    )
+    if (columnRuns.length === 0) return []
+    const columnStart = columnRuns[0][0]
+    const columnEnd = columnRuns[columnRuns.length - 1][1]
+    const location = clampLocationToImage({
+      left: left + columnStart - 2,
+      top: top + rowStart - 2,
+      width: columnEnd - columnStart + 4,
+      height: rowEnd - rowStart + 4,
+    }, source.width, source.height)
+    return [location]
+  }).sort((leftLocation, rightLocation) => leftLocation.top - rightLocation.top || leftLocation.left - rightLocation.left)
+}
+
+function getShortFootnoteGroupLocalInkLocations(source: LocalInkBitmap, blocks: LayoutBlockResult[]): Map<number, LayoutLocation> {
+  const candidates = blocks
+    .map((block, index) => ({ block, index }))
+    .filter((item) => isShortFootnoteCoordinateBlock(item.block))
+    .sort((left, right) => left.block.location.top - right.block.location.top || left.index - right.index)
+  const locations = new Map<number, LayoutLocation>()
+  if (candidates.length < 2) return locations
+
+  const groups: Array<Array<{ block: LayoutBlockResult; index: number }>> = []
+  for (const item of candidates) {
+    const previousGroup = groups[groups.length - 1]
+    const previousItem = previousGroup?.[previousGroup.length - 1]
+    const itemCenterX = item.block.location.left + item.block.location.width / 2
+    const itemCenterY = item.block.location.top + item.block.location.height / 2
+    const previousCenterX = previousItem ? previousItem.block.location.left + previousItem.block.location.width / 2 : 0
+    const previousCenterY = previousItem ? previousItem.block.location.top + previousItem.block.location.height / 2 : 0
+    const closeEnough = previousItem
+      && Math.abs(itemCenterY - previousCenterY) <= Math.max(62, (item.block.location.height + previousItem.block.location.height) * 1.8)
+      && Math.abs(itemCenterX - previousCenterX) <= Math.max(96, Math.max(item.block.location.width, previousItem.block.location.width) * 1.2)
+    if (!previousGroup || !closeEnough) {
+      groups.push([item])
+    } else {
+      previousGroup.push(item)
+    }
+  }
+
+  for (const group of groups) {
+    if (group.length < 2) continue
+    const groupLeft = Math.min(...group.map((item) => item.block.location.left))
+    const groupTop = Math.min(...group.map((item) => item.block.location.top))
+    const groupRight = Math.max(...group.map((item) => item.block.location.left + item.block.location.width))
+    const groupBottom = Math.max(...group.map((item) => item.block.location.top + item.block.location.height))
+    const averageHeight = group.reduce((sum, item) => sum + item.block.location.height, 0) / group.length
+    const search = {
+      left: groupLeft - Math.max(24, (groupRight - groupLeft) * 0.35),
+      top: groupTop - Math.max(34, averageHeight * 1.6),
+      width: (groupRight - groupLeft) + Math.max(48, (groupRight - groupLeft) * 0.7),
+      height: (groupBottom - groupTop) + Math.max(48, averageHeight * 2.2),
+    }
+    const lineBounds = getShortFootnoteLocalLineBounds(source, search)
+      .filter((location) => {
+        const centerY = location.top + location.height / 2
+        return centerY >= groupTop - Math.max(38, averageHeight * 1.9)
+          && centerY <= groupBottom + Math.max(20, averageHeight * 0.9)
+      })
+    if (lineBounds.length < group.length) continue
+    const selected = lineBounds.slice(0, group.length)
+    group
+      .slice()
+      .sort((leftItem, rightItem) => leftItem.index - rightItem.index)
+      .forEach((item, index) => {
+        locations.set(item.index, selected[index])
+      })
+  }
+
+  return locations
+}
+
+function shouldUseLocalInkLocation(
+  original: LayoutLocation,
+  tightened: LayoutLocation,
+  compactTextLength: number,
+): boolean {
+  const originalArea = Math.max(1, original.width * original.height)
+  const tightenedArea = Math.max(1, tightened.width * tightened.height)
+  const areaRatio = tightenedArea / originalArea
+  if (areaRatio < (compactTextLength >= 80 ? 0.2 : 0.08)) return false
+  const shrinkLeft = tightened.left - original.left
+  const shrinkTop = tightened.top - original.top
+  const shrinkRight = original.left + original.width - tightened.left - tightened.width
+  const shrinkBottom = original.top + original.height - tightened.top - tightened.height
+  const meaningfulShrink = Math.max(shrinkLeft, shrinkTop, shrinkRight, shrinkBottom)
+    >= Math.max(6, Math.min(original.width, original.height) * 0.025)
+  if (!meaningfulShrink) return false
+  return tightened.width >= Math.max(8, original.width * 0.28)
+    && tightened.height >= Math.max(8, original.height * 0.08)
+}
+
+function isOverTightenedSmallTextBlock(
+  block: LayoutBlockResult,
+  tightened: LayoutLocation,
+): boolean {
+  const label = String(block.label || '').toLowerCase()
+  if (/title/.test(label)) {
+    return tightened.height < Math.max(16, block.location.height * 0.3)
+  }
+  if (/footnote|reference|caption/.test(label) && block.location.height >= 40) {
+    return tightened.height < Math.max(24, block.location.height * 0.38)
+  }
+  return false
+}
+
+export function tightenOcrTextCoordinatesToLocalInk(
+  result: OcrResultPayload,
+  imagePath: string | null | undefined,
+): OcrResultPayload {
+  const source = createLocalInkBitmap(imagePath)
+  if (!source) return result
+  const blocks = asLayoutBlockResults(result.layout_result)
+  if (blocks.length === 0) return result
+  const shortFootnoteGroupLocations = getShortFootnoteGroupLocalInkLocations(source, blocks)
+
+  let tightenedCount = 0
+  const nextBlocks = blocks.map((block, index) => {
+    if (!isTightenableTextCoordinateBlock(block)) return block
+    const groupedLocation = shortFootnoteGroupLocations.get(index)
+    const inkBounds = groupedLocation ? { location: groupedLocation, inkPixels: 0 } : getLocalInkBoundsForBlock(source, block)
+    if (!inkBounds) return block
+    const tightenedLocation = clampLocationToImage(inkBounds.location, source.width, source.height)
+    const compactTextLength = getOcrBlockText(block).replace(/\s+/g, '').length
+    if (isOverTightenedSmallTextBlock(block, tightenedLocation)) return block
+    if (!groupedLocation && (isDecorativeOcrLabel(block.label) || isShortFootnoteCoordinateBlock(block))) {
+      if (!shouldUseDecorativeLocalInkLocation(block.location, tightenedLocation, source, block.label, compactTextLength)) return block
+    } else if (!shouldUseLocalInkLocation(block.location, tightenedLocation, compactTextLength)) {
+      return block
+    }
+    tightenedCount += 1
+    return {
+      ...block,
+      location: tightenedLocation,
+      mask_polygon: createMaskPolygon(tightenedLocation),
+      coordinate_source: 'local_ink_tightened',
+    }
+  })
+  if (tightenedCount === 0) return result
+  return rebuildWordsResultFromLayout({
+    ...result,
+    layout_result: nextBlocks,
+    guji_processing: {
+      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ocr_coordinate_tightened_to_local_ink: tightenedCount,
+    },
+  })
+}
+
 function clampGujiOcrResultToSourceImage(
   result: OcrResultPayload,
   imagePath: string | null | undefined,
@@ -1597,23 +2323,23 @@ function clampGujiOcrResultToSourceImage(
   }
 }
 
-export function normalizeStoredGujiOcrResultForRead(
+export function normalizeStoredOcrResultForRead(
   result: unknown,
   imagePath: string | null | undefined,
+  pageIndex = 1,
 ): OcrResultPayload | null {
   if (!isOcrResultPayload(result)) return null
-  const meta = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
-  if (readRecordValue(meta, 'profile') !== 'guji_print_vertical') return result
-  const options: Required<PageOcrOptions> = {
-    profile: 'guji_print_vertical',
-    secondPass: readRecordValue(meta, 'second_pass') === 'cloud_column_ocr' ? 'cloud_column_ocr' : 'local_segmentation',
-  }
-  const coordinateCorrected = correctRotatedOcrCoordinatesForSourceImage(result, imagePath, options)
-  const orientationNormalized = normalizeGujiVerticalBlockOrientation(coordinateCorrected)
-  const pseudoTableDowngraded = downgradeVerticalPseudoTableBlocks(orientationNormalized, options)
-  const clamped = clampGujiOcrResultToSourceImage(pseudoTableDowngraded, imagePath)
-  return filterGujiTinyNoiseBlocks(splitMergedWideVerticalTextLineBlocks(clamped, options), options)
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+  const dimensions = preserveServiceCoordinates ? undefined : getImageDimensions(imagePath)
+  return ensureOcrResultIr(result, {
+    pageIndex,
+    pageWidth: dimensions?.width,
+    pageHeight: dimensions?.height,
+  }) as OcrResultPayload
 }
+
+export const normalizeStoredGujiOcrResultForRead = normalizeStoredOcrResultForRead
 
 function scaleOcrResultToOriginalImage(result: OcrResultPayload, uploadImage?: OcrUploadImage | null): OcrResultPayload {
   if (!uploadImage?.resized) return result
@@ -2045,6 +2771,78 @@ function isImageLabel(label: unknown): boolean {
   return /^(?:image|figure|picture|chart|diagram|photo|illustration)$/i.test(String(label || ''))
 }
 
+function getLargeOcrImageBlocks(result: unknown, pageSize: { width: number; height: number }): OcrRect[] {
+  const pageArea = Math.max(1, pageSize.width * pageSize.height)
+  const layoutResult = isJsonRecord(result) ? result.layout_result : undefined
+  return asLayoutBlockResults(layoutResult)
+    .filter((block) => isImageLabel(block.label))
+    .map((block) => block.location)
+    .filter((rect) => {
+      const areaRatio = (rect.width * rect.height) / pageArea
+      const widthRatio = rect.width / Math.max(1, pageSize.width)
+      const heightRatio = rect.height / Math.max(1, pageSize.height)
+      return areaRatio >= 0.1 || (widthRatio >= 0.45 && heightRatio >= 0.1)
+    })
+    .sort((left, right) => left.top - right.top || left.left - right.left)
+}
+
+function getRectBoundaryDelta(left: OcrRect, right: OcrRect): number {
+  return Math.abs(left.left - right.left)
+    + Math.abs(left.top - right.top)
+    + Math.abs(left.left + left.width - right.left - right.width)
+    + Math.abs(left.top + left.height - right.top - right.height)
+}
+
+function findNearestLocalImageRegion(source: OcrRect, regions: OcrRect[]): OcrRect | null {
+  let best: { region: OcrRect; distance: number } | null = null
+  const sourceCenterY = source.top + source.height / 2
+  const sourceCenterX = source.left + source.width / 2
+  for (const region of regions) {
+    const regionCenterY = region.top + region.height / 2
+    const regionCenterX = region.left + region.width / 2
+    const distance = Math.abs(sourceCenterY - regionCenterY) * 2 + Math.abs(sourceCenterX - regionCenterX)
+    if (!best || distance < best.distance) best = { region, distance }
+  }
+  return best?.region || null
+}
+
+export function getLikelyAsyncPdfImageCoordinateMismatchIssue(
+  result: unknown,
+  imagePath: string | null | undefined,
+): string | null {
+  if (!isJsonRecord(result)) return null
+  const pageSize = getPageImageSize(imagePath)
+  if (!pageSize) return null
+  const ocrImageBlocks = getLargeOcrImageBlocks(result, pageSize)
+  if (ocrImageBlocks.length === 0) return null
+  const localImageRegions = detectLocalLargeImageRegions(imagePath)
+  if (localImageRegions.length === 0) return null
+
+  const pageWidth = Math.max(1, pageSize.width)
+  const pageHeight = Math.max(1, pageSize.height)
+  for (const blockRect of ocrImageBlocks.slice(0, 6)) {
+    const localRegion = findNearestLocalImageRegion(blockRect, localImageRegions)
+    if (!localRegion) continue
+    const boundaryDelta = getRectBoundaryDelta(blockRect, localRegion)
+    const touchesPageWidth = blockRect.left <= pageWidth * 0.025
+      && blockRect.width >= pageWidth * 0.86
+    const localHasVisibleMargins = localRegion.left >= pageWidth * 0.035
+      && localRegion.left + localRegion.width <= pageWidth * 0.965
+    const horizontalDelta = Math.abs(blockRect.left - localRegion.left)
+      + Math.abs(blockRect.left + blockRect.width - localRegion.left - localRegion.width)
+    const verticalDelta = Math.abs(blockRect.top - localRegion.top)
+      + Math.abs(blockRect.top + blockRect.height - localRegion.top - localRegion.height)
+    const largeBoundaryDelta = boundaryDelta >= Math.max(60, Math.min(pageWidth, pageHeight) * 0.11)
+    const croppedPdfImageBlock = touchesPageWidth
+      && localHasVisibleMargins
+      && (horizontalDelta >= pageWidth * 0.07 || verticalDelta >= pageHeight * 0.06)
+    if (largeBoundaryDelta && croppedPdfImageBlock) {
+      return 'Async PDF OCR image block coordinates do not match the local page image; rerunning this page with page-image OCR.'
+    }
+  }
+  return null
+}
+
 function isDecorativeOcrLabel(label: unknown): boolean {
   return /header|footer|number|page/i.test(String(label || ''))
 }
@@ -2454,24 +3252,41 @@ export async function postProcessRecognizedPageResult(
   throwIfAborted(runtimeOptions.signal)
   let resolved = resolveOcrOptions(options)
   const normalizedInput = isOcrResultPayload(result) ? result : normalizePageResult(result)
-  const scaledInput = scaleOcrResultToOriginalImage(normalizedInput, runtimeOptions.uploadImage)
-  const coordinateCorrectedInput = correctRotatedOcrCoordinatesForSourceImage(scaledInput, imagePath, resolved)
-  const orientationNormalizedInput = resolved.profile === 'guji_print_vertical'
+  const preserveServiceCoordinates = runtimeOptions.preserveServiceCoordinates === true
+  const scaledInput = preserveServiceCoordinates
+    ? normalizedInput
+    : scaleOcrResultToOriginalImage(normalizedInput, runtimeOptions.uploadImage)
+  const coordinateCorrectedInput = preserveServiceCoordinates
+    ? scaledInput
+    : correctRotatedOcrCoordinatesForSourceImage(scaledInput, imagePath, resolved)
+  const orientationNormalizedInput = !preserveServiceCoordinates && resolved.profile === 'guji_print_vertical'
     ? normalizeGujiVerticalBlockOrientation(coordinateCorrectedInput)
     : coordinateCorrectedInput
-  const downgradedInput = downgradeVerticalPseudoTableBlocks(orientationNormalizedInput, resolved)
-  const workingResult = resolved.profile === 'guji_print_vertical'
+  const downgradedInput = preserveServiceCoordinates
+    ? orientationNormalizedInput
+    : downgradeVerticalPseudoTableBlocks(orientationNormalizedInput, resolved)
+  const clampedInput = !preserveServiceCoordinates && resolved.profile === 'guji_print_vertical'
     ? clampGujiOcrResultToSourceImage(downgradedInput, imagePath)
     : downgradedInput
-  const autoVertical = imagePath && resolved.profile !== 'guji_print_vertical' && shouldAutoUseVerticalPostProcessing(workingResult)
+  const workingResult = clampedInput
+  const coordinateTightenedInput = !preserveServiceCoordinates && runtimeOptions.tightenTextCoordinatesToLocalInk
+    ? tightenOcrTextCoordinatesToLocalInk(workingResult, imagePath)
+    : workingResult
+  const autoVertical = !preserveServiceCoordinates && imagePath && resolved.profile !== 'guji_print_vertical' && shouldAutoUseVerticalPostProcessing(coordinateTightenedInput)
   if (autoVertical) {
     resolved = { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
   }
+  if (preserveServiceCoordinates) {
+    const serviceCoordinateResult = isOcrResultPayload(coordinateTightenedInput) ? coordinateTightenedInput : normalizePageResult(coordinateTightenedInput)
+    return markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateResult, resolved, imagePath, {
+      preserveServiceCoordinates: true,
+    }))
+  }
   if (!imagePath || resolved.profile !== 'guji_print_vertical') {
-    return attachProcessingMeta(isOcrResultPayload(workingResult) ? workingResult : normalizePageResult(workingResult), resolved, imagePath)
+    return attachProcessingMeta(isOcrResultPayload(coordinateTightenedInput) ? coordinateTightenedInput : normalizePageResult(coordinateTightenedInput), resolved, imagePath)
   }
 
-  const normalizedWorkingResult = isOcrResultPayload(workingResult) ? workingResult : normalizePageResult(workingResult)
+  const normalizedWorkingResult = isOcrResultPayload(coordinateTightenedInput) ? coordinateTightenedInput : normalizePageResult(coordinateTightenedInput)
   const existingMeta = normalizedWorkingResult.guji_processing
   const currentFingerprint = getImageFingerprint(imagePath)
   if (
@@ -2726,6 +3541,8 @@ interface OcrRuntimeOptions {
   signal?: AbortSignal
   concurrency?: number
   uploadImage?: OcrUploadImage | null
+  tightenTextCoordinatesToLocalInk?: boolean
+  preserveServiceCoordinates?: boolean
 }
 
 async function requestSyncRecognition(base64Image: string, options: SyncRecognitionOptions = {}): Promise<OcrResultPayload> {
@@ -3097,7 +3914,7 @@ function shouldRetryWholePdfUploadWithChunking(error: unknown, plan: PdfChunkPla
   if (plan.requireFullFileUpload) return false
   if (!plan.directFilePath || !(plan.fullFileUpload || plan.wholePdfFallback)) return false
   if (isOcrAbortError(error)) return false
-  return isAsyncPdfUploadUnsupportedError(error) || isLocalWholePdfUploadUnavailableError(error)
+  return isAsyncPdfUploadUnsupportedError(error) || isLocalWholePdfUploadUnavailableError(error) || isAsyncJobStalledError(error)
 }
 
 function shouldAvoidPdfLibChunkPlanFallback(sourceSize: number): boolean {
@@ -3587,6 +4404,30 @@ function createWholePdfFallbackChunk(plan: PdfChunkPlan, filePath: string, targe
   }
 }
 
+function createPageRangeRetryPlanFromWholePdf(plan: PdfChunkPlan): PdfChunkPlan | null {
+  if (!plan.directFilePath || plan.requireFullFileUpload || plan.targetPageIndexes.length <= 0) return null
+  const pagesPerChunk = Math.max(
+    1,
+    Math.min(
+      ASYNC_PDF_MAX_PAGES_PER_JOB,
+      ASYNC_PDF_STALLED_PAGE_RANGE_CHUNK_SIZE,
+      plan.targetPageIndexes.length,
+    ),
+  )
+  return {
+    ...plan,
+    sourcePdf: null,
+    sourcePath: plan.sourcePath,
+    estimatedPagesPerChunk: pagesPerChunk,
+    estimatedTotalChunks: Math.ceil(plan.targetPageIndexes.length / pagesPerChunk),
+    directFilePath: plan.directFilePath,
+    wholePdfFallback: false,
+    fallbackReason: undefined,
+    fullFileUpload: true,
+    requireFullFileUpload: false,
+  }
+}
+
 async function cleanupPdfChunk(chunk: PdfChunk): Promise<void> {
   if (!chunk.cleanup) return
   try {
@@ -3769,7 +4610,7 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
       if (!isRetryableNetworkFailure(failure)) throw failure
       const waitingMs = Date.now() - lastProgressAt
       if (waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS) {
-        throw new Error(`PaddleOCR 状态查询长时间没有进展：${failure.message || '服务端未返回处理状态'}。请稍后点击“继续 OCR”重试，已经保存的页面会自动跳过。`)
+        throw new Error(`${ASYNC_JOB_STALLED_PREFIX} PaddleOCR 状态查询长时间没有进展：${failure.message || '服务端未返回处理状态'}。软件会自动改用原 PDF 分段补跑未完成页。`)
       }
       onProgress?.({
         status: 'queued',
@@ -3807,8 +4648,8 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
     if (progressChanged) {
       lastProgressSignature = progressSignature
       lastProgressAt = Date.now()
-    } else if (Date.now() - lastProgressAt > ASYNC_JOB_STALLED_TIMEOUT_MS) {
-      throw new Error('PaddleOCR 异步任务长时间没有进展。请稍后继续 OCR，已经保存的页面会自动跳过。')
+    } else if (Date.now() - lastProgressAt > (completedPages > 0 ? ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS : ASYNC_JOB_STALLED_TIMEOUT_MS)) {
+      throw new Error(`${ASYNC_JOB_STALLED_PREFIX} PaddleOCR 异步任务长时间没有进展，已停在 ${completedPages}/${totalPages || '?'} 页。软件会自动改用原 PDF 分段补跑未完成页。`)
     }
     if (allPagesCompleted && !jsonUrl) {
       statusPayload.awaitingResultFile = true
@@ -4264,23 +5105,29 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
   } catch (error) {
     if (!retriedWholePdfUploadWithChunks && shouldRetryWholePdfUploadWithChunking(error, plan)) {
       retriedWholePdfUploadWithChunks = true
+      const stalledWholePdfJob = isAsyncJobStalledError(error)
       onProgress?.({
         status: 'preparing',
         state: 'preparing',
         completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
         totalPages,
         progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
-        fallbackReason: '整本 PDF 上传失败，正在重新提交 PDF',
+        fallbackReason: stalledWholePdfJob
+          ? '整本 PDF 处理进度停住，正在改用原 PDF 分段提交'
+          : '整本 PDF 上传失败，正在重新提交 PDF',
       })
-      retryPlan = await createPdfChunkPlan(
-        filePath,
-        options?.targetPageNums,
-        signal,
-        options?.fallbackPageCount,
-        true,
-        Boolean(options?.requireFullFileUpload),
-        options?.pageRangeChunkSize,
-      )
+      retryPlan = stalledWholePdfJob
+        ? createPageRangeRetryPlanFromWholePdf(plan)
+        : null
+      retryPlan = retryPlan || await createPdfChunkPlan(
+          filePath,
+          options?.targetPageNums,
+          signal,
+          options?.fallbackPageCount,
+          true,
+          Boolean(options?.requireFullFileUpload),
+          options?.pageRangeChunkSize,
+        )
     } else {
       throw error
     }

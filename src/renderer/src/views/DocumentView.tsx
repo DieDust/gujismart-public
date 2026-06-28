@@ -233,6 +233,54 @@ function getNumericRecordValue(source: unknown, key: string): number | null {
   return Number.isFinite(numberValue) ? numberValue : null
 }
 
+function getNestedNumericRecordValue(source: unknown, path: string[]): number | null {
+  let current = source
+  for (const key of path) {
+    current = readRecordValue(current, key)
+    if (current === undefined || current === null) return null
+  }
+  const numberValue = Number(current)
+  return Number.isFinite(numberValue) ? numberValue : null
+}
+
+function getOcrCoordinateSourceSize(ocrResult: unknown): { width?: number | null; height?: number | null; preserveServiceCoordinates?: boolean } {
+  const parsed = parseMaybeJson(ocrResult)
+  const gujiProcessing = readRecordValue(parsed, 'guji_processing')
+  const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+  const irPage = readRecordValue(readRecordValue(parsed, 'gujismart_ir'), 'page')
+  const width = preserveServiceCoordinates
+    ? getNumericRecordValue(parsed, 'page_width')
+      ?? getNumericRecordValue(parsed, 'image_width')
+      ?? getNumericRecordValue(parsed, 'source_image_width')
+      ?? getNumericRecordValue(gujiProcessing, 'source_image_width')
+      ?? getNumericRecordValue(irPage, 'width')
+      ?? getNestedNumericRecordValue(parsed, ['normalization', 'page_width'])
+    : getNumericRecordValue(gujiProcessing, 'source_image_width')
+      ?? getNumericRecordValue(parsed, 'source_image_width')
+      ?? getNumericRecordValue(parsed, 'image_width')
+      ?? getNumericRecordValue(parsed, 'page_width')
+      ?? getNumericRecordValue(irPage, 'width')
+      ?? getNestedNumericRecordValue(parsed, ['normalization', 'page_width'])
+  const height = preserveServiceCoordinates
+    ? getNumericRecordValue(parsed, 'page_height')
+      ?? getNumericRecordValue(parsed, 'image_height')
+      ?? getNumericRecordValue(parsed, 'source_image_height')
+      ?? getNumericRecordValue(gujiProcessing, 'source_image_height')
+      ?? getNumericRecordValue(irPage, 'height')
+      ?? getNestedNumericRecordValue(parsed, ['normalization', 'page_height'])
+    : getNumericRecordValue(gujiProcessing, 'source_image_height')
+      ?? getNumericRecordValue(parsed, 'source_image_height')
+      ?? getNumericRecordValue(parsed, 'image_height')
+      ?? getNumericRecordValue(parsed, 'page_height')
+      ?? getNumericRecordValue(irPage, 'height')
+      ?? getNestedNumericRecordValue(parsed, ['normalization', 'page_height'])
+  return {
+    width,
+    height,
+    preserveServiceCoordinates,
+  }
+}
+
 function isReaderViewMode(value: unknown): value is ReaderViewMode {
   return value === 'single' || value === 'spread'
 }
@@ -830,6 +878,24 @@ function getTranslationModelSignatureFromState(state: LlmProfileSyncDetail): str
 
 function getTranslationSourceText(page: TranslationSourcePage | null | undefined): string {
   return getCanonicalPageTranslationSourceText(page)
+}
+
+function isReadyTranslationUnit(unit: TranslationUnitV1): boolean {
+  if (unit.skipped) return true
+  return unit.status === 'ready' && !unit.stale && Boolean(String(unit.translationText || '').trim())
+}
+
+function getReadyTranslationTextFromUnits(units: TranslationUnitV1[]): string {
+  if (units.length === 0 || !units.every(isReadyTranslationUnit)) return ''
+  return units
+    .map((unit) => String(unit.translationText || (unit.skipped ? unit.sourceText : '')).trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim()
+}
+
+function areAllTranslationUnitsSkipped(units: TranslationUnitV1[]): boolean {
+  return units.length > 0 && units.every((unit) => unit.skipped)
 }
 
 function getPageDisplayText(page?: DocumentViewPage | null): string {
@@ -1441,7 +1507,7 @@ export default function DocumentView({
 
   const hasReadyTranslationForSource = useCallback((pageId: string, sourceText: string) => {
     const units = pageTranslationUnits[pageId] || []
-    if (units.length > 0 && units.every((unit) => unit.skipped || Boolean(unit.translationText.trim()))) return true
+    if (getReadyTranslationTextFromUnits(units)) return true
     const translationText = pageTranslations[pageId]
     if (!pageId || !sourceText || !translationText) return false
     if (pageTranslationHashes[pageId] !== getTranslationSourceHash(pageId, sourceText)) return false
@@ -1614,13 +1680,14 @@ export default function DocumentView({
     }
     setActiveBoxIndex(getMappedBoxIndex(textFlowToLayoutBoxIndex, textFlowIndex))
   }, [layoutBoxes, textFlowToLayoutBoxIndex])
-  const coordinateSourceSize = useMemo(() => {
-    const gujiProcessing = readRecordValue(ocrResultObj, 'guji_processing')
-    return {
-      width: getNumericRecordValue(gujiProcessing, 'source_image_width') ?? getNumericRecordValue(ocrResultObj, 'image_width') ?? getNumericRecordValue(ocrResultObj, 'page_width'),
-      height: getNumericRecordValue(gujiProcessing, 'source_image_height') ?? getNumericRecordValue(ocrResultObj, 'image_height') ?? getNumericRecordValue(ocrResultObj, 'page_height'),
-    }
-  }, [ocrResultObj])
+  const imageCoordinateSourceSize = useMemo(
+    () => getOcrCoordinateSourceSize(proofingOcrResultObj || ocrResultObj),
+    [ocrResultObj, proofingOcrResultObj],
+  )
+  const facsimileCoordinateSourceSize = useMemo(
+    () => getOcrCoordinateSourceSize(facsimileOcrResultObj),
+    [facsimileOcrResultObj],
+  )
   const resultText = currentPage?.ocr_text || ''
   const shouldPreferSourcePageReader = documentMode === 'read' && (
     readRecordValue(ocrResultObj, 'source_type') === 'ebook_section'
@@ -2145,14 +2212,21 @@ export default function DocumentView({
         window.api.getPagesTranslationUnits(pageIds),
       ])
       if (activeDocumentIdRef.current !== targetDocId) return
-      setPageTranslationUnits((current) => ({ ...unitsByPage, ...current }))
-      if (!Array.isArray(rows) || rows.length === 0) return
+      setPageTranslationUnits((current) => ({ ...current, ...unitsByPage }))
       const nextTranslations: Record<string, string> = {}
       const nextHashes: Record<string, string> = {}
       const nextSkipped: Record<string, boolean> = {}
       for (const page of candidates) {
         const pageId = String(page.id || '')
         const sourceText = getTranslationSourceText(page)
+        const readyUnitText = getReadyTranslationTextFromUnits(unitsByPage[pageId] || [])
+        if (readyUnitText) {
+          nextTranslations[pageId] = readyUnitText
+          nextHashes[pageId] = getTranslationSourceHash(pageId, sourceText)
+          if (areAllTranslationUnitsSkipped(unitsByPage[pageId] || [])) nextSkipped[pageId] = true
+          continue
+        }
+        if (!Array.isArray(rows) || rows.length === 0) continue
         const match = findTranslationCacheMatch(rows, pageId, sourceText)
         if (!match) continue
         nextTranslations[pageId] = String(match.translationText || match.row.translation_text)
@@ -2185,6 +2259,18 @@ export default function DocumentView({
       if (activeDocumentIdRef.current !== targetDocId) return false
       if (units.length > 0) {
         setPageTranslationUnits((current) => ({ ...current, [pageId]: units }))
+      }
+      const readyUnitText = getReadyTranslationTextFromUnits(units)
+      if (readyUnitText) {
+        setPageTranslations((current) => ({ ...current, [pageId]: readyUnitText }))
+        setPageTranslationHashes((current) => ({ ...current, [pageId]: getTranslationSourceHash(pageId, sourceText) }))
+        setSkippedTranslationPageIds((current) => {
+          const next = { ...current }
+          if (areAllTranslationUnitsSkipped(units)) next[pageId] = true
+          else delete next[pageId]
+          return next
+        })
+        return true
       }
       const match = Array.isArray(rows) ? findTranslationCacheMatch(rows, cachePageId, sourceText) : null
       if (!match) return false
@@ -2909,6 +2995,46 @@ export default function DocumentView({
     }
   }, [doc, documentId])
 
+  const forceRenderCurrentPageImageFromPdf = useCallback(async (page: DocumentViewPage | undefined): Promise<boolean> => {
+    if (!doc?.id || !page?.id || !page.page_num) return false
+    const sourceFilePath = String(doc.file_path || '').trim()
+    if (!sourceFilePath.toLowerCase().endsWith('.pdf')) {
+      return ensureCurrentPageImageCached(page)
+    }
+
+    const cacheKey = getPageImageCacheKey(page, doc.id, documentId)
+    const messageKey = `page-image-rerender-${page.id}`
+    try {
+      message.loading({ content: '正在重新生成当前页原图…', key: messageKey, duration: 0 })
+      pageImageCacheRef.current.delete(cacheKey)
+      releaseCachedPdfDocument(sourceFilePath)
+      const rendered = await renderPdfFilePageToImage(sourceFilePath, page.page_num)
+      const imagePath = await window.api.cachePageImage(doc.id, page.page_num, rendered.dataUrl)
+      putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
+      await window.api.updatePage(page.id, { image_path: imagePath })
+      setDoc((previous) => {
+        if (!previous?.pages) return previous
+        return {
+          ...previous,
+          pages: previous.pages.map((item) => (
+            item.id === page.id || item.page_num === page.page_num
+              ? { ...item, image_path: imagePath }
+              : item
+          )),
+        }
+      })
+      if (page.id === currentPage?.id || page.page_num === currentPage?.page_num) {
+        setImageDataUrl(rendered.dataUrl)
+      }
+      return true
+    } catch (error) {
+      console.warn('[DocumentView] failed to force-render current PDF page image', error)
+      return ensureCurrentPageImageCached(page)
+    } finally {
+      message.destroy(messageKey)
+    }
+  }, [currentPage?.id, currentPage?.page_num, doc?.file_path, doc?.id, documentId, ensureCurrentPageImageCached])
+
   useEffect(() => {
     const filePath = doc?.file_path
     return () => {
@@ -3245,7 +3371,8 @@ export default function DocumentView({
     if (!doc?.pages?.length) return
     setOcrProcessing(true)
     try {
-      if (doc.ocr_status === 'completed') {
+      const forceFullRerun = doc.ocr_status === 'completed'
+      if (forceFullRerun) {
         await window.api.updateDocument(doc.id, { ocr_status: 'pending' })
       }
       const storedEngine = parseMaybeJson(doc.metadata)?.ocr_engine
@@ -3263,7 +3390,10 @@ export default function DocumentView({
           message.destroy(messageKey)
         }
       }
-      const count = await window.api.batchOcr([doc.id], targetEngine ? { engine: targetEngine } : undefined)
+      const count = await window.api.batchOcr([doc.id], {
+        ...(targetEngine ? { engine: targetEngine } : {}),
+        forceFullRerun,
+      })
       if (count > 0) {
         message.success('OCR 识别成功')
       } else {
@@ -3569,7 +3699,7 @@ export default function DocumentView({
     const targetPageId = currentPage.id
     setOcrProcessing(true)
     try {
-      const hasPageImage = await ensureCurrentPageImageCached(currentPage)
+      const hasPageImage = await forceRenderCurrentPageImageFromPdf(currentPage)
       if (!hasPageImage) {
         throw new Error('当前页缺少图像，且没有可用于重建页图的 PDF 原稿')
       }
@@ -3603,7 +3733,7 @@ export default function DocumentView({
     const targetPageId = currentPage.id
     setOcrProcessing(true)
     try {
-      const hasPageImage = await ensureCurrentPageImageCached(currentPage)
+      const hasPageImage = await forceRenderCurrentPageImageFromPdf(currentPage)
       if (!hasPageImage) {
         throw new Error('当前页缺少图像，且没有可用于重建页图的 PDF 原稿')
       }
@@ -3654,7 +3784,7 @@ export default function DocumentView({
     const targetPageId = currentPage.id
     setOcrProcessing(true)
     try {
-      const hasPageImage = await ensureCurrentPageImageCached(currentPage)
+      const hasPageImage = await forceRenderCurrentPageImageFromPdf(currentPage)
       if (!hasPageImage) {
         throw new Error('当前页缺少图像，且没有可用于局部重识别的 PDF 原稿')
       }
@@ -3709,7 +3839,7 @@ export default function DocumentView({
     const targetPageId = currentPage.id
     setOcrProcessing(true)
     try {
-      const hasPageImage = await ensureCurrentPageImageCached(currentPage)
+      const hasPageImage = await forceRenderCurrentPageImageFromPdf(currentPage)
       if (!hasPageImage) {
         throw new Error('当前页缺少图像，且没有可用于重建页图的 PDF 原稿')
       }
@@ -3743,7 +3873,7 @@ export default function DocumentView({
     const targetPageId = currentPage.id
     setOcrProcessing(true)
     try {
-      const hasPageImage = await ensureCurrentPageImageCached(currentPage)
+      const hasPageImage = await forceRenderCurrentPageImageFromPdf(currentPage)
       if (!hasPageImage) {
         throw new Error('当前页缺少图像，且没有可用于重建页图的 PDF 原稿')
       }
@@ -4159,9 +4289,10 @@ export default function DocumentView({
     if (!updated) throw new Error('翻译单元不存在')
     setPageTranslationUnits((current) => {
       const nextUnits = (current[pageId] || []).map((unit) => unit.id === unitId ? updated : unit)
+      const readyText = getReadyTranslationTextFromUnits(nextUnits)
       setPageTranslations((translations) => ({
         ...translations,
-        [pageId]: nextUnits.map((unit) => unit.translationText || (unit.skipped ? unit.sourceText : '')).filter(Boolean).join('\n'),
+        [pageId]: readyText,
       }))
       return { ...current, [pageId]: nextUnits }
     })
@@ -4187,7 +4318,7 @@ export default function DocumentView({
         pageContextAfter: getAdjacentTranslationContext(cachePageId, 1),
       })
       setPageTranslationUnits((current) => ({ ...current, [translationKey]: result.units }))
-      setPageTranslations((current) => ({ ...current, [translationKey]: result.translationText }))
+      setPageTranslations((current) => ({ ...current, [translationKey]: getReadyTranslationTextFromUnits(result.units) || result.translationText }))
       setPageTranslationHashes((current) => ({
         ...current,
         [translationKey]: getTranslationSourceHash(translationKey, payload.text),
@@ -5279,7 +5410,7 @@ export default function DocumentView({
               <ImageViewer
                 src={imageDataUrl}
                 ocrBoxes={layoutBoxes}
-                coordinateSourceSize={coordinateSourceSize}
+                coordinateSourceSize={imageCoordinateSourceSize}
                 activeBoxIndex={activeBoxIndex}
                 searchKeyword={effectiveSearchKeyword}
                 viewport={sharedViewport}
@@ -5495,7 +5626,7 @@ export default function DocumentView({
                 activeBoxIndex={activeBoxIndex}
                 activeSearchHitOrdinal={activeProofSearchHitOrdinal}
                 searchKeyword={effectiveSearchKeyword}
-                coordinateSourceSize={coordinateSourceSize}
+                coordinateSourceSize={facsimileCoordinateSourceSize}
                 preferVerticalLayout={shouldUseVerticalOcr}
                 translationText={currentFacsimileTranslationText}
                 translationUnits={currentPage?.id ? pageTranslationUnits[currentPage.id] || [] : []}

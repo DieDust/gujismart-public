@@ -2,7 +2,14 @@ import { BrowserWindow } from 'electron'
 import { nanoid } from 'nanoid'
 import { autoExtractAndApply } from './ai'
 import { queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
-import { OcrAbortError, isOcrAbortError, postProcessRecognizedPageResult, recognizePages, recognizePdfAsync, shouldUseAsyncPdfOcr } from './ocr'
+import {
+  OcrAbortError,
+  isOcrAbortError,
+  postProcessRecognizedPageResult,
+  recognizePages,
+  recognizePdfAsync,
+  shouldUseAsyncPdfOcr,
+} from './ocr'
 import { markSearchIndexStaleForPages, notifySearchContentChanged } from './semantic-search'
 import { preparePagePayloadUpdate } from './page-payload-store'
 import type { OcrPageResult } from './ocr'
@@ -274,14 +281,21 @@ class BatchProcessor {
     pages: Array<{ page: BatchPageRow; sourcePageIndex: number; resultIndex: number }>,
     results: Array<unknown | null>,
     ocrOptions: Required<PageOcrOptions>,
+    signal?: AbortSignal,
   ): Promise<OcrPageResult[]> {
     const pageResults: OcrPageResult[] = []
     const postProcessOptions = getAsyncPdfPostProcessOptions(ocrOptions)
     for (let index = 0; index < pages.length; index += BATCH_RESULT_POSTPROCESS_CHUNK_SIZE) {
       const chunk = pages.slice(index, index + BATCH_RESULT_POSTPROCESS_CHUNK_SIZE)
       const chunkResults = await Promise.all(chunk.map(async (item) => {
+        if (signal?.aborted) throw new OcrAbortError()
         const rawResult = results[item.resultIndex] || null
-        const result = rawResult ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions) : null
+        const result = rawResult
+          ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {
+            signal,
+            preserveServiceCoordinates: true,
+          })
+          : null
         return {
           pageId: item.page.id,
           result,
@@ -625,6 +639,7 @@ class BatchProcessor {
                 chunkPages,
                 chunk.results,
                 ocrOptions,
+                controller.signal,
               )
               if (controller.signal.aborted) throw new OcrAbortError()
               const changedPageIds = await this.savePageResults(chunkPageResults, {
@@ -661,6 +676,7 @@ class BatchProcessor {
               }),
               results,
               ocrOptions,
+              controller.signal,
             )
           }
         } else {

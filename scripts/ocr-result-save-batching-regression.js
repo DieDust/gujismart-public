@@ -105,6 +105,12 @@ const processDocumentOcrBody = sliceBetween(
   'export function registerOcrIpc',
   'OCR document process body',
 )
+const batchOcrBody = sliceBetween(
+  ocrIpcSource,
+  "ipcMain.handle('documents:batchOcr'",
+  "ipcMain.handle('pages:rerunOcr'",
+  'batch OCR IPC body',
+)
 const postProcessPdfOcrResultsBatchedBody = sliceBetween(
   ocrIpcSource,
   'async function postProcessPdfOcrResultsBatched',
@@ -250,7 +256,6 @@ assert(
   ocrIpcSource.includes('function getPreferredGujiServiceText')
     && ocrIpcSource.includes('function preservePreferredGujiServiceText')
     && ocrIpcSource.includes('function isUnsafeGujiPreferredServiceText')
-    && ocrIpcSource.includes('function hasSafeGujiPreferredServiceText')
     && ocrIpcSource.includes('/<(?:table|img)\\b/i.test(value)')
     && ocrIpcSource.includes('findLikelyRunawayRepeatedOcrText(value)')
     && ocrIpcSource.includes('hasGujiWebMetadataHallucination(value)')
@@ -268,8 +273,7 @@ assert(
   'Guji OCR saves should preserve PaddleOCR markdown text as the page text instead of overwriting it with IR paragraph reconstruction.',
 )
 assert(
-  postProcessPdfOcrResultsBatchedBody.includes('const safePreferredText = hasSafeGujiPreferredServiceText(result)')
-    && ocrIpcSource.includes('function getUsableGujiAsyncPdfServiceText')
+  ocrIpcSource.includes('function getUsableGujiAsyncPdfServiceText')
     && ocrIpcSource.includes('function getGujiAsyncPdfRetryableQualityIssue')
     && ocrIpcSource.includes('formatAsyncPdfRetryableQualityIssue(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))')
     && ocrIpcSource.includes('delete metadata.ocr_last_quality_issue')
@@ -281,12 +285,11 @@ assert(
     && postProcessPdfOcrResultsBatchedBody.includes("if (ocrOptions.profile === 'guji_print_vertical') {")
     && postProcessPdfOcrResultsBatchedBody.includes('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)')
     && postProcessPdfOcrResultsBatchedBody.includes("status: 'error'")
-    && postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification')
-    && postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue')
-    && postProcessPdfOcrResultsBatchedBody.includes('const underSegmented = !safePreferredText')
     && postProcessPdfOcrResultsBatchedBody.indexOf('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)') < postProcessPdfOcrResultsBatchedBody.indexOf('gujismart_async_pdf_result: true')
-    && postProcessPdfOcrResultsBatchedBody.indexOf("if (ocrOptions.profile === 'guji_print_vertical') {") < postProcessPdfOcrResultsBatchedBody.indexOf('const safePreferredText = hasSafeGujiPreferredServiceText(result)'),
-  'Guji async PDF OCR should preserve good PaddleOCR PDF results, but reject retryable runaway or hallucinated PDF results before saving them as completed.',
+    && !postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const underSegmented = !safePreferredText'),
+  'Guji async PDF OCR should preserve PaddleOCR PDF coordinates and only reject retryable runaway or hallucinated PDF results before saving them as completed.',
 )
 assert(
   ocrIpcSource.includes("const OCR_FEIJIANG_REFERENCE_ENV = 'GUJISMART_OCR_REFERENCE_JSON_DIR'")
@@ -455,32 +458,34 @@ assert(
   'Async PDF OCR should show the result-file wait state and must not automatically rerun the whole document when the service never returns a result URL.',
 )
 assert(
+  ocrIpcSource.includes("const OCR_ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'")
+    && ocrIpcSource.includes('function isAsyncPdfRecoverableStallError')
+    && ocrIpcSource.includes('rawMessage.includes(OCR_ASYNC_JOB_STALLED_PREFIX)')
+    && processDocumentOcrBody.includes('if (isAsyncPdfRecoverableStallError(error))')
+    && processDocumentOcrBody.includes('异步 PDF OCR 进度停住，正在自动补跑未完成页')
+    && processDocumentOcrBody.includes('pageResults = await retryIncompletePagesWithSinglePageOcr(')
+    && processDocumentOcrBody.includes('正在自动补跑未完成页')
+    && ocrIpcSource.includes('const OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE = 10')
+    && ocrIpcSource.includes('pageRangeChunkSize: pageRangeChunkSize || OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE'),
+  'Document OCR should recover from async PDF jobs stuck at a partial page count by auto-rerunning incomplete pages with original-PDF pageRanges, not full-document retries.',
+)
+assert(
   ocrIpcSource.includes('function getLikelyGujiPdfTableMisclassification')
     && ocrIpcSource.includes('PDF 异步 OCR 疑似把古籍竖排版面误判成表格')
     && ocrIpcSource.includes('function getLikelyAsyncPdfTableMisclassification')
     && ocrIpcSource.includes('function ensurePageImageForOcrFallback')
     && ocrIpcSource.includes('function renderPdfPageToImageBuffer')
     && ocrIpcSource.includes('function getVerticalFallbackOcrOptions')
-    && ocrIpcSource.includes('function markDocumentPreferPageImageOcr')
-    && ocrIpcSource.includes('metadata.ocr_last_quality_issue = reason')
     && ocrIpcSource.includes('delete metadata.ocr_route_preference')
     && ocrIpcSource.includes('function clearDocumentOcrRoutePreference')
     && ocrIpcSource.includes('function resolveFallbackPdfPathForPostProcess')
     && postProcessPdfOcrResultsBatchedBody.includes('const fallbackPdfPath = pdfPath || resolveFallbackPdfPathForPostProcess(pages)')
-    && postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification(result, item.page.image_path, ocrOptions)')
-    && postProcessPdfOcrResultsBatchedBody.includes('const underSegmented = !safePreferredText')
-    && postProcessPdfOcrResultsBatchedBody.includes('markDocumentPreferPageImageOcr(')
-    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackOptions = getVerticalFallbackOcrOptions(ocrOptions)')
-    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)')
-    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackResult = sanitizeGujiNonBookHallucinations(')
-    && postProcessPdfOcrResultsBatchedBody.includes('await recognizeSinglePageWithResolvedOptions(fallbackPage, fallbackOptions, signal)')
-    && postProcessPdfOcrResultsBatchedBody.includes('getRiskyPageImageNonTableHardIssue(fallbackResult, fallbackPage.image_path, fallbackOptions)')
-    && postProcessPdfOcrResultsBatchedBody.includes('recognizeSplitPageImageFallback(fallbackPage, fallbackOptions, signal, fallbackIssue)')
-    && postProcessPdfOcrResultsBatchedBody.includes('Number.POSITIVE_INFINITY')
-    && postProcessPdfOcrResultsBatchedBody.includes('if (underSegmented)')
-    && postProcessPdfOcrResultsBatchedBody.includes("status: 'completed'")
-    && postProcessPdfOcrResultsBatchedBody.includes('error: qualityIssue'),
-  'PDF async OCR should detect likely book-page table/repetition/under-segmentation quality issues and fall back to vertical page-image OCR before saving, rendering a missing page image from the source PDF when possible.',
+    && postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const imageCoordinateMismatchIssue = getLikelyAsyncPdfImageCoordinateMismatchIssue(result, item.page.image_path)')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification(result, item.page.image_path, ocrOptions)')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const fallbackOptions = getRiskyPageImagePageOptions(fallbackPage, ocrOptions)')
+    && !postProcessPdfOcrResultsBatchedBody.includes('recognizeSplitPageImageFallback(fallbackPage, fallbackOptions, signal, fallbackIssue)'),
+  'PDF async OCR should preserve service-returned page coordinates and not fall back to vertical page-image OCR before saving returned results.',
 )
 assert(
   isLikelyBookishPdfTableResultBody.includes('tableBlocks.length === 0')
@@ -543,7 +548,7 @@ assert(
     && ocrIpcSource.includes('rebuilt_text_without_ocr_placeholders')
     && ocrIpcSource.includes('function getRiskyPageImageLayoutQualityIssue')
     && ocrIpcSource.includes('const hallucinationIssue = getLikelyGujiNonBookHallucinationIssue(result, imagePath, ocrOptions)')
-    && postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue(result, item.page.image_path, ocrOptions)')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue(result, item.page.image_path, ocrOptions)')
     && ocrIpcSource.includes('message.includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)')
     && ocrIpcSource.includes('String(message || \'\').includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)')
     && ocrIpcSource.includes('return message.replace(OCR_LAYOUT_QUALITY_REJECTED_PREFIX, \'\').trim()'),
@@ -559,8 +564,9 @@ assert(
     && ocrCoreSource.includes('merged_wide_vertical_line_blocks_split')
     && ocrCoreSource.includes('removed_tiny_noise_blocks')
     && ocrCoreSource.includes('nextBlocks.push(...splitMergedWideVerticalTextBlock(block))')
-    && ocrCoreSource.includes('filterGujiTinyNoiseBlocks(splitMergedWideVerticalTextLineBlocks(clamped, options), options)'),
-  'Guji vertical OCR should treat merged wide vertical blocks as a soft fallback signal, split line-delimited wide blocks, and remove tiny OCR noise before storage/readback.',
+    && ocrCoreSource.includes('filterGujiTinyNoiseBlocks(rebuilt, options)')
+    && !ocrCoreSource.includes('filterGujiTinyNoiseBlocks(splitMergedWideVerticalTextLineBlocks(tightened, options), options)'),
+  'Guji vertical page-image OCR may split line-delimited wide blocks and remove tiny noise, while async PDF readback/storage must not silently move saved coordinates.',
 )
 assert(
   !savePageOcrResultsBody.includes("queryOne<{")
@@ -780,7 +786,8 @@ assert(
 assert(
   drainReindexQueueBody.includes('let processedThisDrain = 0')
     && drainReindexQueueBody.includes('processedThisDrain < BACKGROUND_REINDEX_DRAIN_BATCH_SIZE')
-    && drainReindexQueueBody.includes('processedThisDrain += 1'),
+    && drainReindexQueueBody.includes('processedThisDrain += 1')
+    && drainReindexQueueBody.includes('!isBackgroundReindexPaused()'),
   'search background reindexing should process a bounded number of documents per drain cycle.',
 )
 assert(
@@ -788,6 +795,28 @@ assert(
     && scheduleBackgroundReindexBody.includes('options: { activeResolved?: boolean; delayMs?: number; reason?: SearchIndexReindexReason }')
     && scheduleBackgroundReindexBody.includes('options.delayMs ?? BACKGROUND_REINDEX_DELAY_MS'),
   'search background reindexing should pause before continuing a non-empty queue after each drain batch.',
+)
+assert(
+  semanticSearchSource.includes('export function pauseBackgroundSearchReindex')
+    && semanticSearchSource.includes('export function resumeBackgroundSearchReindex')
+    && semanticSearchSource.includes('let backgroundReindexPauseDepth = 0')
+    && scheduleBackgroundReindexBody.includes('if (isBackgroundReindexPaused()) return')
+    && drainReindexQueueBody.includes('if (isBackgroundReindexPaused())'),
+  'search background reindexing should support an explicit pause gate for heavy foreground work.',
+)
+assert(
+  batchOcrBody.includes('pauseBackgroundSearchReindex()')
+    && batchOcrBody.includes('try {')
+    && batchOcrBody.includes("resumeBackgroundSearchReindex({ reason: 'ocr-batch-deferred' })")
+    && batchOcrBody.indexOf('pauseBackgroundSearchReindex()') < batchOcrBody.indexOf('createRecoverableBatchOcrItems')
+    && batchOcrBody.indexOf('resumeBackgroundSearchReindex') > batchOcrBody.indexOf('await Promise.all('),
+  'batch OCR should pause background search reindexing before recovery/status writes and resume it after the batch settles.',
+)
+assert(
+  ocrIpcSource.includes('function createRecoverableBatchOcrItems')
+    && sliceBetween(ocrIpcSource, 'function createRecoverableBatchOcrItems', 'function updateRecoverableBatchOcrItem', 'recoverable batch OCR item body').includes('scheduleDatabaseSave()')
+    && !sliceBetween(ocrIpcSource, 'function createRecoverableBatchOcrItems', 'function updateRecoverableBatchOcrItem', 'recoverable batch OCR item body').includes('saveDatabase()'),
+  'batch OCR recovery queue creation should defer checkpoints instead of synchronously blocking upload startup.',
 )
 assert(
   semanticSearchSource.includes('let reindexDrainCompletedCount = 0')

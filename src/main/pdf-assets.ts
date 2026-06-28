@@ -142,13 +142,22 @@ function getBlockRect(block: OcrLayoutBlock): Rect | null {
 }
 
 function getCoordinateSourceSize(parsed: JsonRecord, imageSize: { width: number; height: number }): { width: number; height: number } {
-  const candidates = [
-    { width: getPathValue(parsed, ['guji_processing', 'source_image_width']), height: getPathValue(parsed, ['guji_processing', 'source_image_height']) },
-    { width: parsed.source_image_width, height: parsed.source_image_height },
-    { width: parsed.image_width, height: parsed.image_height },
-    { width: parsed.page_width, height: parsed.page_height },
-    { width: parsed.width, height: parsed.height },
-  ]
+  const preserveServiceCoordinates = getPathValue(parsed, ['guji_processing', 'ocr_service_coordinates_preserved']) === true
+  const candidates = preserveServiceCoordinates
+    ? [
+      { width: parsed.page_width, height: parsed.page_height },
+      { width: parsed.image_width, height: parsed.image_height },
+      { width: parsed.source_image_width, height: parsed.source_image_height },
+      { width: getPathValue(parsed, ['guji_processing', 'source_image_width']), height: getPathValue(parsed, ['guji_processing', 'source_image_height']) },
+      { width: parsed.width, height: parsed.height },
+    ]
+    : [
+      { width: getPathValue(parsed, ['guji_processing', 'source_image_width']), height: getPathValue(parsed, ['guji_processing', 'source_image_height']) },
+      { width: parsed.source_image_width, height: parsed.source_image_height },
+      { width: parsed.image_width, height: parsed.image_height },
+      { width: parsed.page_width, height: parsed.page_height },
+      { width: parsed.width, height: parsed.height },
+    ]
   for (const candidate of candidates) {
     const width = Number(candidate.width || 0)
     const height = Number(candidate.height || 0)

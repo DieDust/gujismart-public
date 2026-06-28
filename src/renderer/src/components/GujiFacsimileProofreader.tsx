@@ -131,7 +131,7 @@ interface GujiFacsimileProofreaderProps {
   activeBoxIndex?: number
   activeSearchHitOrdinal?: number
   searchKeyword?: string
-  coordinateSourceSize?: { width?: number | null; height?: number | null }
+  coordinateSourceSize?: { width?: number | null; height?: number | null; preserveServiceCoordinates?: boolean }
   preferVerticalLayout?: boolean
   translationText?: string
   translationUnits?: TranslationUnitV1[]
@@ -146,6 +146,10 @@ interface GujiFacsimileProofreaderProps {
   onSelectBox?: (index: number) => void
   onSave: (pageId: string, data: PageUpdatePayload) => void
   onTextSelectionChange?: (text: string) => void
+}
+
+function isUsableTranslationUnit(unit: TranslationUnitV1): boolean {
+  return unit.skipped || (unit.status === 'ready' && !unit.stale && Boolean(String(unit.translationText || '').trim()))
 }
 
 const FONT_FAMILY = "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif"
@@ -944,6 +948,62 @@ function getLayoutBounds(blocks: LayoutBlock[], coordinateSourceSize?: { width?:
   return { width: maxRight - minLeft + padX * 2, height: maxBottom - minTop + padY * 2, offsetLeft: minLeft - padX, offsetTop: minTop - padY }
 }
 
+function getCoordinateExtent(blocks: LayoutBlock[]): { minLeft: number; minTop: number; maxRight: number; maxBottom: number } | null {
+  const rects = blocks.map((block) => block.__rect).filter(Boolean) as BlockRect[]
+  if (rects.length === 0) return null
+  return {
+    minLeft: Math.min(...rects.map((rect) => rect.left)),
+    minTop: Math.min(...rects.map((rect) => rect.top)),
+    maxRight: Math.max(...rects.map((rect) => rect.left + rect.width)),
+    maxBottom: Math.max(...rects.map((rect) => rect.top + rect.height)),
+  }
+}
+
+function isPositiveSize(value?: { width?: number | null; height?: number | null } | null): value is { width: number; height: number } {
+  return Number(value?.width || 0) > 0 && Number(value?.height || 0) > 0
+}
+
+function sizeDeltaRatio(left: { width: number; height: number }, right: { width: number; height: number }): number {
+  return Math.max(
+    Math.abs(left.width - right.width) / Math.max(1, right.width),
+    Math.abs(left.height - right.height) / Math.max(1, right.height),
+  )
+}
+
+function coordinateExtentFitsSize(
+  extent: { minLeft: number; minTop: number; maxRight: number; maxBottom: number } | null,
+  size: { width: number; height: number },
+): boolean {
+  if (!extent) return false
+  return extent.minLeft >= -size.width * 0.04
+    && extent.minTop >= -size.height * 0.04
+    && extent.maxRight <= size.width * 1.08
+    && extent.maxBottom <= size.height * 1.08
+}
+
+function resolveCoordinateSourceSizeForImage(
+  coordinateSourceSize: { width?: number | null; height?: number | null; preserveServiceCoordinates?: boolean } | undefined,
+  pageImageNaturalSize: { width: number; height: number } | null,
+  coordinateExtent: { minLeft: number; minTop: number; maxRight: number; maxBottom: number } | null,
+): { width?: number | null; height?: number | null } | undefined {
+  const explicitSize = isPositiveSize(coordinateSourceSize)
+    ? { width: Number(coordinateSourceSize.width), height: Number(coordinateSourceSize.height) }
+    : null
+  if (coordinateSourceSize?.preserveServiceCoordinates) {
+    return explicitSize || pageImageNaturalSize || coordinateSourceSize
+  }
+  if (!pageImageNaturalSize) return explicitSize || coordinateSourceSize
+  if (!explicitSize) return pageImageNaturalSize
+  if (sizeDeltaRatio(explicitSize, pageImageNaturalSize) <= 0.02) return pageImageNaturalSize
+
+  const fitsImage = coordinateExtentFitsSize(coordinateExtent, pageImageNaturalSize)
+  const fitsExplicit = coordinateExtentFitsSize(coordinateExtent, explicitSize)
+  if (fitsImage && !fitsExplicit) return pageImageNaturalSize
+  if (!fitsImage && fitsExplicit) return explicitSize
+  if (fitsImage && fitsExplicit) return explicitSize
+  return explicitSize
+}
+
 function buildSyntheticRects(blocks: LayoutBlock[], bounds: { width: number; height: number }): LayoutBlock[] {
   const marginX = bounds.width * 0.09
   const marginY = bounds.height * 0.08
@@ -1113,6 +1173,7 @@ function buildFacsimileTranslationOverlaysFromUnits(
 ): FacsimileTranslationOverlay[] {
   const pageVerticalMode = preferVerticalLayout || isVerticalPage(pageBlocks)
   return units.flatMap((unit, unitIndex) => {
+    if (!isUsableTranslationUnit(unit)) return []
     const text = String(unit.translationText || (unit.skipped ? unit.sourceText : '')).trim()
     const rect = unit.sourceRect
     if (!text || !rect || rect.width <= 0 || rect.height <= 0) return []
@@ -1912,12 +1973,11 @@ export default function GujiFacsimileProofreader({
     return () => observer.disconnect()
   }, [blocks.length])
 
-  const effectiveCoordinateSourceSize = useMemo(() => {
-    const explicitWidth = Number(coordinateSourceSize?.width || 0)
-    const explicitHeight = Number(coordinateSourceSize?.height || 0)
-    if (explicitWidth > 0 && explicitHeight > 0) return coordinateSourceSize
-    return pageImageNaturalSize || coordinateSourceSize
-  }, [coordinateSourceSize, pageImageNaturalSize])
+  const coordinateExtent = useMemo(() => getCoordinateExtent(blocks), [blocks])
+  const effectiveCoordinateSourceSize = useMemo(
+    () => resolveCoordinateSourceSizeForImage(coordinateSourceSize, pageImageNaturalSize, coordinateExtent),
+    [coordinateExtent, coordinateSourceSize, pageImageNaturalSize],
+  )
   const baseBounds = useMemo(() => getLayoutBounds(blocks, effectiveCoordinateSourceSize), [blocks, effectiveCoordinateSourceSize])
   const hasOriginalLayoutCoordinates = useMemo(() => blocks.some((block) => block.__rect), [blocks])
   const pageBlocks = useMemo(() => hasOriginalLayoutCoordinates ? blocks : buildSyntheticRects(blocks, baseBounds), [baseBounds, blocks, hasOriginalLayoutCoordinates])

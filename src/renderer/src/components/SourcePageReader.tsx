@@ -784,16 +784,28 @@ function getReaderPageHeaderTitle(page: ReaderSourcePage, pageIndex: number): st
 function getPageSourceSize(page?: ReaderSourcePage): { width: number; height: number } | null {
   const parsed = parseMaybeRecord(page?.ocr_result)
   const gujiProcessing = readRecordValue(parsed, 'guji_processing')
-  const candidates = [
-    {
-      width: readRecordValue(gujiProcessing, 'source_image_width'),
-      height: readRecordValue(gujiProcessing, 'source_image_height'),
-    },
-    { width: parsed.source_image_width, height: parsed.source_image_height },
-    { width: parsed.image_width, height: parsed.image_height },
-    { width: parsed.page_width, height: parsed.page_height },
-    { width: parsed.width, height: parsed.height },
-  ]
+  const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+  const candidates = preserveServiceCoordinates
+    ? [
+      { width: parsed.page_width, height: parsed.page_height },
+      { width: parsed.image_width, height: parsed.image_height },
+      { width: parsed.source_image_width, height: parsed.source_image_height },
+      {
+        width: readRecordValue(gujiProcessing, 'source_image_width'),
+        height: readRecordValue(gujiProcessing, 'source_image_height'),
+      },
+      { width: parsed.width, height: parsed.height },
+    ]
+    : [
+      {
+        width: readRecordValue(gujiProcessing, 'source_image_width'),
+        height: readRecordValue(gujiProcessing, 'source_image_height'),
+      },
+      { width: parsed.source_image_width, height: parsed.source_image_height },
+      { width: parsed.image_width, height: parsed.image_height },
+      { width: parsed.page_width, height: parsed.page_height },
+      { width: parsed.width, height: parsed.height },
+    ]
   for (const candidate of candidates) {
     const width = Number(candidate.width || 0)
     const height = Number(candidate.height || 0)

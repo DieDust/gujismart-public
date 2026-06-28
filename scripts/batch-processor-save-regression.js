@@ -55,8 +55,18 @@ assert(
   'Legacy batch PDF OCR results should be post-processed in small chunks while yielding between chunks.',
 )
 assert(
+  postProcessPdfResultsBatchedBody.includes('signal?: AbortSignal')
+    && postProcessPdfResultsBatchedBody.includes('postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {')
+    && postProcessPdfResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && !postProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
+    && !postProcessPdfResultsBatchedBody.includes('getLikelyAsyncPdfImageCoordinateMismatchIssue')
+    && !batchSource.includes('private async recognizePageImageFallback'),
+  'Legacy batch PDF OCR should preserve service-returned async PDF coordinates instead of rerunning page-image OCR.',
+)
+assert(
   asyncPdfBranchBody.includes('onChunkComplete: async (chunk) => {')
     && asyncPdfBranchBody.includes('await this.postProcessPdfResultsBatched(')
+    && asyncPdfBranchBody.includes('controller.signal')
     && asyncPdfBranchBody.includes('await this.savePageResults(chunkPageResults,')
     && asyncPdfBranchBody.includes('pageResultsPersistedInChunks = true')
     && asyncPdfBranchBody.includes('collectChunkResults: false'),

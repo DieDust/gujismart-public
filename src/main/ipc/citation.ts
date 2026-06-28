@@ -5,6 +5,7 @@ import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { nanoid } from 'nanoid'
 import { callLLM } from '../ai'
 import JSZip from 'jszip'
+import { getPdfJsNodeDocumentOptions } from '../pdfjs-assets'
 import {
   CITATION_FORMAT_ORDER,
   CITATION_FORMAT_LABELS,
@@ -301,12 +302,10 @@ function normalizeWhitespace(value: string): string {
 
 async function extractPdfText(filePath: string): Promise<string> {
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
-  const loadingTask = pdfjs.getDocument({
+  const loadingTask = pdfjs.getDocument(getPdfJsNodeDocumentOptions({
     data: new Uint8Array(readFileSync(filePath)),
-    useWorkerFetch: false,
-    isEvalSupported: false,
     disableFontFace: true,
-  })
+  }))
   const pdf = await loadingTask.promise
   const pages: string[] = []
   const maxPages = Math.min(pdf.numPages, 40)

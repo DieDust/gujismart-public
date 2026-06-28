@@ -11,6 +11,12 @@ const fileAccessSource = fs.readFileSync(path.join(root, 'src', 'main', 'file-ac
 const mainPdfInfoSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-info.ts'), 'utf8')
 const preloadSource = fs.readFileSync(path.join(root, 'src', 'preload', 'index.ts'), 'utf8')
 const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
+const mainOcrSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
+const pdfCompressionSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-compression.ts'), 'utf8')
+const pdfPreflightSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-preflight.ts'), 'utf8')
+const citationSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'citation.ts'), 'utf8')
+const mainPdfjsAssetsSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdfjs-assets.ts'), 'utf8')
+const pdfTextRenderFallbackSource = fs.readFileSync(path.join(root, 'src', 'shared', 'pdf-text-render-fallback.ts'), 'utf8')
 
 const getPdfFileInfoStart = rendererPdfSource.indexOf('export async function getPdfFileInfo')
 assert(getPdfFileInfoStart >= 0, 'renderer getPdfFileInfo not found')
@@ -27,6 +33,11 @@ assert(convertPdfFileToImagesStart >= 0, 'renderer convertPdfFileToImages not fo
 const convertPdfFileToImagesEnd = rendererPdfSource.indexOf('export async function getPdfFileInfo', convertPdfFileToImagesStart)
 assert(convertPdfFileToImagesEnd > convertPdfFileToImagesStart, 'renderer convertPdfFileToImages end marker not found')
 const convertPdfFileToImagesBody = rendererPdfSource.slice(convertPdfFileToImagesStart, convertPdfFileToImagesEnd)
+const buildPdfLoadParamsStart = rendererPdfSource.indexOf('function buildPdfLoadParams')
+assert(buildPdfLoadParamsStart >= 0, 'renderer buildPdfLoadParams not found')
+const buildPdfLoadParamsEnd = rendererPdfSource.indexOf('function toLocalResourceUrl', buildPdfLoadParamsStart)
+assert(buildPdfLoadParamsEnd > buildPdfLoadParamsStart, 'renderer buildPdfLoadParams end marker not found')
+const buildPdfLoadParamsBody = rendererPdfSource.slice(buildPdfLoadParamsStart, buildPdfLoadParamsEnd)
 
 assert(
   getPdfFileInfoBody.includes('window.api.getPdfInfo(normalizedPath)'),
@@ -76,6 +87,60 @@ assert(
   convertPdfFileToImagesBody.includes('loadPdfDocumentFromFile(filePath'),
   'renderer file-path PDF conversion should use the same local-resource-with-fallback loader',
 )
+assert(
+  rendererPdfSource.includes("const PDFJS_ASSET_BASE_PATH = 'pdfjs'")
+    && buildPdfLoadParamsBody.includes('getRendererAssetUrl(`${PDFJS_ASSET_BASE_PATH}/cmaps/`)')
+    && buildPdfLoadParamsBody.includes('getRendererAssetUrl(`${PDFJS_ASSET_BASE_PATH}/standard_fonts/`)')
+    && buildPdfLoadParamsBody.includes('useWorkerFetch: false')
+    && buildPdfLoadParamsBody.includes('useSystemFonts: true')
+    && buildPdfLoadParamsBody.includes('isEvalSupported: false')
+    && !buildPdfLoadParamsBody.includes('cdn.jsdelivr.net'),
+  'renderer PDF image rendering should load CMaps and standard fonts from bundled local pdfjs assets, not a version-pinned CDN.',
+)
+assert(
+  !rendererPdfSource.includes('pdfjs-dist@3.11.174'),
+  'renderer PDF rendering must not pin old pdfjs-dist CDN resources that can drop Chinese glyphs.',
+)
+assert(
+  mainPdfjsAssetsSource.includes("require.resolve('pdfjs-dist/package.json')")
+    && mainPdfjsAssetsSource.includes("join(pdfjsDistRoot, 'cmaps')")
+    && mainPdfjsAssetsSource.includes("join(pdfjsDistRoot, 'standard_fonts')")
+    && mainPdfjsAssetsSource.includes('cMapPacked: true')
+    && mainPdfjsAssetsSource.includes('useWorkerFetch: false')
+    && mainPdfjsAssetsSource.includes('useSystemFonts: true')
+    && mainPdfjsAssetsSource.includes('isEvalSupported: false'),
+  'main-process PDF.js rendering should use bundled CMaps and standard fonts from the installed pdfjs-dist version.',
+)
+assert(
+  pdfTextRenderFallbackSource.includes('applyCjkTextRenderFallback')
+    && pdfTextRenderFallbackSource.includes('getTextContent({ normalizeWhitespace: false, disableCombineTextItems: false })')
+    && pdfTextRenderFallbackSource.includes('BLANK_TEXT_REGION_DARK_RATIO')
+    && pdfTextRenderFallbackSource.includes('fillText(text, baselineX, baselineY'),
+  'PDF page-image rendering should include a conservative CJK text fallback for PDFs whose embedded Chinese fonts fail in PDF.js.',
+)
+assert(
+  rendererPdfSource.includes('applyCjkTextRenderFallback(page, viewport, ctx, canvas.width, canvas.height)'),
+  'renderer PDF page-image generation should restore missing CJK text from the PDF text layer.',
+)
+assert(
+  mainOcrSource.includes('applyCjkTextRenderFallback(page, viewport, canvasContext, width, height)'),
+  'main-process OCR page-image generation should restore missing CJK text before uploading page images.',
+)
+assert(
+  pdfCompressionSource.includes('applyCjkTextRenderFallback(page, renderViewport, canvasContext, width, height)'),
+  'PDF raster compression should restore missing CJK text before rebuilding page images.',
+)
+for (const [label, source] of [
+  ['OCR PDF page rendering', mainOcrSource],
+  ['PDF raster compression', pdfCompressionSource],
+  ['PDF text-layer preflight', pdfPreflightSource],
+  ['citation PDF text extraction', citationSource],
+]) {
+  assert(
+    source.includes('getPdfJsNodeDocumentOptions('),
+    `${label} should load PDF.js documents with the shared local asset options.`,
+  )
+}
 assert(
   mainPdfInfoSource.includes("'--show-npages'"),
   'main PDF info should use qpdf --show-npages as the fast path',

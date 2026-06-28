@@ -34,3 +34,4 @@ toc-active*.png
 scripts/.tmp-*/
 scripts/*-bundle.cjs
 scripts/*-entry.js
+src/renderer/public/pdfjs/

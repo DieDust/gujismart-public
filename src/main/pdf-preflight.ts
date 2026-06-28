@@ -1,6 +1,7 @@
 import { stat } from 'fs/promises'
 import { readFile } from 'fs/promises'
 import type { PDFDocumentProxy } from 'pdfjs-dist/types/src/display/api'
+import { getPdfJsNodeDocumentOptions } from './pdfjs-assets'
 import type { OcrRecognizeLayoutBlock, PdfTextLayerAnalysis, PdfTextLayerPageAnalysis } from '../shared/types'
 
 interface PdfTextItem {
@@ -240,12 +241,9 @@ export async function analyzePdfTextLayer(
 
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
   const data = new Uint8Array(await readFile(filePath))
-  const loadingTask = pdfjs.getDocument({
+  const loadingTask = pdfjs.getDocument(getPdfJsNodeDocumentOptions({
     data,
-    useWorkerFetch: false,
-    useSystemFonts: true,
-    isEvalSupported: false,
-  })
+  }))
   const pdf = await loadingTask.promise
   try {
     const sampledPageNums = samplePageNumbers(pdf.numPages, options.maxSamplePages || 10)

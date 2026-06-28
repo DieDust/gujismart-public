@@ -3,6 +3,7 @@
 
 import * as pdfjsLib from 'pdfjs-dist'
 import type { DocumentInitParameters, PDFDocumentProxy } from 'pdfjs-dist/types/src/display/api'
+import { applyCjkTextRenderFallback } from '../../../shared/pdf-text-render-fallback'
 
 // 设置 worker 的路径
 // Vite 环境下可以使用 ?url 来获取资源路径
@@ -12,6 +13,12 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
   import.meta.url
 ).toString()
+
+const PDFJS_ASSET_BASE_PATH = 'pdfjs'
+
+function getRendererAssetUrl(path: string): string {
+  return new URL(path.replace(/^\/+/, ''), window.location.href).toString()
+}
 
 export interface PdfExtractResult {
   title: string
@@ -70,9 +77,12 @@ async function readPdfFileBuffer(filePath: unknown): Promise<ArrayBuffer> {
 function buildPdfLoadParams(source: PdfLoadSource): DocumentInitParameters {
   return {
     ...source,
-    cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
+    cMapUrl: getRendererAssetUrl(`${PDFJS_ASSET_BASE_PATH}/cmaps/`),
     cMapPacked: true,
-    standardFontDataUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/'
+    standardFontDataUrl: getRendererAssetUrl(`${PDFJS_ASSET_BASE_PATH}/standard_fonts/`),
+    useWorkerFetch: false,
+    useSystemFonts: true,
+    isEvalSupported: false,
   }
 }
 
@@ -204,6 +214,9 @@ export async function renderPdfFilePageToImage(filePath: unknown, pageNum: numbe
   canvas.height = viewport.height
   canvas.width = viewport.width
   await withTimeout(page.render({ canvasContext: ctx, viewport }).promise, 30000, 'PDF 首页预览生成超时，稍后可再次重试。')
+  await applyCjkTextRenderFallback(page, viewport, ctx, canvas.width, canvas.height).catch((error) => {
+    console.warn('PDF CJK text render fallback failed', error)
+  })
   const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
   canvas.width = 1
   canvas.height = 1
@@ -259,6 +272,9 @@ async function convertPdfDocumentToImages(pdf: PDFDocumentProxy, scaleOrOptions:
     }
 
     await withTimeout(page.render(renderContext).promise, 30000, 'PDF 页面渲染超时，请确认文件未损坏后重试。')
+    await applyCjkTextRenderFallback(page, viewport, ctx, canvas.width, canvas.height).catch((error) => {
+      console.warn('PDF CJK text render fallback failed', error)
+    })
     
     // 转换为 JPEG Base64
     const base64 = canvas.toDataURL('image/jpeg', 0.8)

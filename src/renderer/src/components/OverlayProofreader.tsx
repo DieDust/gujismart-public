@@ -44,6 +44,7 @@ interface OverlayProofreaderProps {
   pageId: string
   ocrResult: OverlayOcrResult | null | undefined
   pageProofStatus?: 'completed' | 'pending'
+  coordinateSourceSize?: { width?: number | null; height?: number | null; preserveServiceCoordinates?: boolean }
   activeBoxIndex?: number
   searchKeyword?: string
   viewport?: ViewerViewport
@@ -64,6 +65,11 @@ interface VerticalColumnSlice {
 interface VerticalColumnLayout {
   columns: VerticalColumnSlice[]
   fontSize: number
+}
+
+interface CoordinateScale {
+  scaleX: number
+  scaleY: number
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -164,6 +170,15 @@ function getRect(box: OverlayBlock | null | undefined): Rect | null {
     }
   }
   return null
+}
+
+function scaleRect(rect: Rect, coordinateScale: CoordinateScale): Rect {
+  return {
+    left: rect.left * coordinateScale.scaleX,
+    top: rect.top * coordinateScale.scaleY,
+    width: rect.width * coordinateScale.scaleX,
+    height: rect.height * coordinateScale.scaleY,
+  }
 }
 
 function inferOrientation(box: OverlayBlock | null | undefined): OverlayOrientation {
@@ -558,6 +573,7 @@ export default function OverlayProofreader({
   pageId,
   ocrResult,
   pageProofStatus = 'pending',
+  coordinateSourceSize,
   activeBoxIndex = -1,
   searchKeyword = '',
   viewport,
@@ -582,6 +598,24 @@ export default function OverlayProofreader({
   const lastFocusedBoxRef = useRef(-1)
   const controlledViewport = viewport !== undefined
   const currentViewport = controlledViewport ? viewport : viewportState
+
+  const coordinateScale = useMemo<CoordinateScale>(() => {
+    const imageWidth = imageSize.current.width
+    const imageHeight = imageSize.current.height
+    const sourceWidth = Number(coordinateSourceSize?.width || 0)
+    const sourceHeight = Number(coordinateSourceSize?.height || 0)
+    if (!imageWidth || !imageHeight || !sourceWidth || !sourceHeight) {
+      return { scaleX: 1, scaleY: 1 }
+    }
+    const widthRatio = sourceWidth / imageWidth
+    const heightRatio = sourceHeight / imageHeight
+    const shouldScale = widthRatio > 1.08 || heightRatio > 1.08 || widthRatio < 0.92 || heightRatio < 0.92
+    if (!shouldScale) return { scaleX: 1, scaleY: 1 }
+    return {
+      scaleX: imageWidth / sourceWidth,
+      scaleY: imageHeight / sourceHeight,
+    }
+  }, [blocks, coordinateSourceSize, coordinateSourceSize?.height, coordinateSourceSize?.preserveServiceCoordinates, coordinateSourceSize?.width, imageReadyKey, src])
 
   useEffect(() => {
     latestViewportRef.current = currentViewport
@@ -630,14 +664,15 @@ export default function OverlayProofreader({
     if (activeBoxIndex === lastFocusedBoxRef.current) return
     lastFocusedBoxRef.current = activeBoxIndex
     if (activeBoxIndex < 0 || !blocks[activeBoxIndex]) return
-    const rect = getRect(blocks[activeBoxIndex])
+    const sourceRect = getRect(blocks[activeBoxIndex])
+    const rect = sourceRect ? scaleRect(sourceRect, coordinateScale) : null
     if (!rect) return
     updateViewport({
       ...latestViewportRef.current,
       centerX: rect.left + rect.width / 2,
       centerY: rect.top + rect.height / 2,
     })
-  }, [activeBoxIndex, blocks, updateViewport])
+  }, [activeBoxIndex, blocks, coordinateScale, updateViewport])
 
   useEffect(() => {
     if (!isDragging) return undefined
@@ -669,7 +704,8 @@ export default function OverlayProofreader({
     if (!imageElementRef.current) return new Map<number, VerticalColumnLayout>()
     const nextMap = new Map<number, VerticalColumnLayout>()
     blocks.forEach((block, index) => {
-      const rect = getRect(block)
+      const sourceRect = getRect(block)
+      const rect = sourceRect ? scaleRect(sourceRect, coordinateScale) : null
       if (!rect) return
       const orientation = block.orientation || inferOrientation(block)
       if (orientation !== 'vertical') return
@@ -681,7 +717,7 @@ export default function OverlayProofreader({
       }
     })
     return nextMap
-  }, [blocks, imageReadyKey, src])
+  }, [blocks, coordinateScale, imageReadyKey, src])
 
   const imageTransform = useMemo(() => {
     const container = containerRef.current
@@ -973,7 +1009,8 @@ export default function OverlayProofreader({
           />
 
           {blocks.map((block, index) => {
-            const rect = getRect(block)
+            const sourceRect = getRect(block)
+            const rect = sourceRect ? scaleRect(sourceRect, coordinateScale) : null
             if (!rect) return null
 
             const isActive = index === activeBoxIndex

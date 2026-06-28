@@ -167,7 +167,7 @@ function getStoredRows(pageId: string): TranslationUnitRow[] {
 }
 
 function importLegacyPageTranslation(page: DocumentPage, units: TranslationUnitV1[]): boolean {
-  if (units.some((unit) => unit.translationText.trim())) return false
+  if (units.some((unit) => unit.manualOverride || (!unit.skipped && unit.status === 'ready' && !unit.stale && unit.translationText.trim()))) return false
   const legacyRows = hydratePagePayloadRows(queryAll<LegacyTranslationCacheRow>(
     `SELECT source_text, source_text_ref, translation_text, translation_text_ref, skipped, status
      FROM page_translation_cache

@@ -932,14 +932,24 @@ function withActiveOcrVersions(docId: string, pages: ExportPage[]): ExportPage[]
 
 function getCoordinateSourceSize(page: ExportPage, fallback?: { width: number; height: number }): { width: number; height: number } | null {
   const parsed = parseMaybeJson<OcrResultPayload>(page.ocr_result, {})
-  const candidates = [
-    { width: parsed?.guji_processing?.source_image_width, height: parsed?.guji_processing?.source_image_height },
-    { width: parsed?.source_image_width, height: parsed?.source_image_height },
-    { width: parsed?.image_width, height: parsed?.image_height },
-    { width: parsed?.page_width, height: parsed?.page_height },
-    { width: parsed?.width, height: parsed?.height },
-    fallback,
-  ]
+  const preserveServiceCoordinates = parsed?.guji_processing?.ocr_service_coordinates_preserved === true
+  const candidates = preserveServiceCoordinates
+    ? [
+      { width: parsed?.page_width, height: parsed?.page_height },
+      { width: parsed?.image_width, height: parsed?.image_height },
+      { width: parsed?.source_image_width, height: parsed?.source_image_height },
+      { width: parsed?.guji_processing?.source_image_width, height: parsed?.guji_processing?.source_image_height },
+      { width: parsed?.width, height: parsed?.height },
+      fallback,
+    ]
+    : [
+      { width: parsed?.guji_processing?.source_image_width, height: parsed?.guji_processing?.source_image_height },
+      { width: parsed?.source_image_width, height: parsed?.source_image_height },
+      { width: parsed?.image_width, height: parsed?.image_height },
+      { width: parsed?.page_width, height: parsed?.page_height },
+      { width: parsed?.width, height: parsed?.height },
+      fallback,
+    ]
   for (const candidate of candidates) {
     const width = Number(candidate?.width || 0)
     const height = Number(candidate?.height || 0)

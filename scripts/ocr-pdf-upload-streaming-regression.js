@@ -16,6 +16,7 @@ function sliceBetween(source, startMarker, endMarker, label) {
 const root = path.join(__dirname, '..')
 const ocrSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr.ts'), 'utf8')
 const ocrIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
+const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
 const librarySource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
 const batchProcessorSource = fs.readFileSync(path.join(root, 'src', 'main', 'batch-processor.ts'), 'utf8')
 const uploadBlobHelper = sliceBetween(
@@ -164,6 +165,22 @@ assert(
   'Async PDF OCR should not run local guji column segmentation over already structured PaddleOCR PDF results.',
 )
 assert(
+  postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && batchPostProcessPdfResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && !postProcessPdfOcrResultsBatchedBody.includes('const imageCoordinateMismatchIssue = getLikelyAsyncPdfImageCoordinateMismatchIssue(result, item.page.image_path)')
+    && !postProcessPdfOcrResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
+    && !batchPostProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true'),
+  'Async PDF post-processing should preserve service-returned coordinates and must not rerun page-image OCR for coordinate repair.',
+)
+assert(
+  postProcessPdfOcrResultsBatchedBody.includes('if (!hasReadablePageImage(item.page))')
+    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)')
+    && postProcessPdfOcrResultsBatchedBody.includes('if (fallbackPage) item.page.image_path = fallbackPage.image_path')
+    && postProcessPdfOcrResultsBatchedBody.indexOf('if (!hasReadablePageImage(item.page))') < postProcessPdfOcrResultsBatchedBody.indexOf('postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions')
+    && postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true'),
+  'Async PDF OCR may materialize missing local page-image metadata before saving, but should keep the service coordinate basis.',
+)
+assert(
   submitAsyncPdfJobBody.includes("formData.append('pageRanges', submitOptions.pageRanges)")
     && createPdfChunkFromPlanBody.includes('const pageRanges = isFullPageSelection ? undefined : toQpdfPageRange(sourcePageIndexes)')
     && createPdfChunkFromPlanBody.includes('targetPageIndexes.slice(targetCursor, targetCursor + Math.max(0, pagesPerChunk))')
@@ -238,6 +255,26 @@ assert(
   'Document OCR should pass resolved OCR profile options into async PDF OCR jobs for normal PDFs that still use the async route.',
 )
 assert(
+  documentViewSource.includes("const forceFullRerun = doc.ocr_status === 'completed'")
+    && documentViewSource.includes("if (targetEngine === 'vision_model' || targetEngine === 'hybrid') {")
+    && documentViewSource.includes('await ensureOcrPageImages(doc, {')
+    && !documentViewSource.includes("targetEngine === 'paddle' || targetEngine === 'vision_model'")
+    && documentViewSource.includes('forceFullRerun,'),
+  'Document detail Paddle OCR should not pre-render full-document page images; page images are only required for vision/hybrid OCR.',
+)
+assert(
+  librarySource.includes('const runOcrInConfiguredBatches = async')
+    && librarySource.includes('const batches = chunkArray(uniqueDocIds, ocrBatchSize)')
+    && librarySource.includes("const requiresPageImagesBeforeOcr = engine === 'vision_model' || engine === 'hybrid'")
+    && librarySource.includes('let ocrBatch = batch')
+    && librarySource.includes('if (requiresPageImagesBeforeOcr) {')
+    && librarySource.includes('const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {')
+    && librarySource.includes("console.warn('[Library] OCR 前补齐 PDF 页图失败', docId, error)")
+    && librarySource.includes('successCount += await window.api.batchOcr(ocrBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })')
+    && !librarySource.includes('successCount = await window.api.batchOcr(ocrBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })'),
+  'Library Paddle OCR should upload PDFs directly with the configured document concurrency; local page-image caching must not block async PDF OCR.',
+)
+assert(
   batchProcessorSource.includes('ocrOptions,')
     && batchProcessorSource.includes('const BATCH_GUJI_ASYNC_PDF_PAGE_RANGE_CHUNK_SIZE = 25')
     && batchProcessorSource.includes('const requireFullFileUpload = false')
@@ -279,7 +316,7 @@ assert(
     && !ocrIpcSource.includes('逐页图片 OCR')
     && !ocrIpcSource.includes('上传设置')
     && !ocrIpcSource.includes('getOcrImageUploadSettingsText')
-    && ocrIpcSource.includes("const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''")
+    && ocrIpcSource.includes('String(payload.fallbackReason || \'正在重新提交 PDF\')')
     && ocrIpcSource.includes('const waitingResultFileMessage = awaitingResultFile')
     && ocrIpcSource.includes('正在等待结果文件生成')
     && ocrIpcSource.includes('message: fallbackRetryMessage || statusQueryRetryMessage || waitingResultFileMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue'),
@@ -289,8 +326,9 @@ assert(
   ocrSource.includes('function shouldRetryWholePdfUploadWithChunking')
     && recognizePdfAsyncBody.includes('let retriedWholePdfUploadWithChunks = false')
     && recognizePdfAsyncBody.includes('shouldRetryWholePdfUploadWithChunking(error, plan)')
-    && recognizePdfAsyncBody.includes('true,\n        Boolean(options?.requireFullFileUpload),\n        options?.pageRangeChunkSize,'),
-  'Async PDF OCR should retry with chunking only after a whole-PDF upload is actually rejected.',
+    && recognizePdfAsyncBody.includes('createPageRangeRetryPlanFromWholePdf(plan)')
+    && recognizePdfAsyncBody.includes('true,\n          Boolean(options?.requireFullFileUpload),\n          options?.pageRangeChunkSize,'),
+  'Async PDF OCR should retry with chunking only after a whole-PDF upload is rejected or the server-side whole-PDF job stalls.',
 )
 assert(
   librarySource.includes("if (info.phase === 'saving') return info.message || '正在保存 OCR 结果'")
@@ -355,6 +393,16 @@ assert(
   ocrSource.includes('function scaleOcrResultToOriginalImage')
     && ocrSource.includes('ocr_coordinate_rescaled_to_source: true'),
   'OCR post-processing should rescale coordinates from resized upload images back to the source page image.',
+)
+assert(
+  ocrSource.includes('tightenTextCoordinatesToLocalInk?: boolean')
+    && ocrSource.includes('preserveServiceCoordinates?: boolean')
+    && ocrSource.includes('!preserveServiceCoordinates && runtimeOptions.tightenTextCoordinatesToLocalInk')
+    && postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && batchPostProcessPdfResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && !postProcessPdfOcrResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
+    && !batchPostProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true'),
+  'Async PDF OCR should preserve service-returned coordinates instead of tightening saved text blocks against the local page image.',
 )
 assert(
   ocrSource.includes('const uploadImage = await prepareImageForOcrUpload(page.image_path)')
@@ -432,6 +480,19 @@ assert(
     && waitForAsyncPdfResultBody.includes('waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS')
     && waitForAsyncPdfResultBody.includes('await sleep(getAsyncPollDelayMs({'),
   'Async PDF polling should retry transient status-query failures and fail recoverably after a real no-progress stall.',
+)
+assert(
+  ocrSource.includes("const ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'")
+    && ocrSource.includes('const ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS = 3 * 60 * 1000')
+    && ocrSource.includes('const ASYNC_PDF_STALLED_PAGE_RANGE_CHUNK_SIZE = 10')
+    && waitForAsyncPdfResultBody.includes('completedPages > 0 ? ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS : ASYNC_JOB_STALLED_TIMEOUT_MS')
+    && waitForAsyncPdfResultBody.includes('ASYNC_JOB_STALLED_PREFIX')
+    && ocrSource.includes('function isAsyncJobStalledError')
+    && ocrSource.includes('function createPageRangeRetryPlanFromWholePdf')
+    && recognizePdfAsyncBody.includes('const stalledWholePdfJob = isAsyncJobStalledError(error)')
+    && recognizePdfAsyncBody.includes('createPageRangeRetryPlanFromWholePdf(plan)')
+    && recognizePdfAsyncBody.includes('整本 PDF 处理进度停住，正在改用原 PDF 分段提交'),
+  'Async PDF OCR should recover from whole-PDF jobs stuck at a partial page count by retrying original-PDF pageRanges chunks.',
 )
 assert(
   ocrIpcSource.includes('function formatDurationMs')

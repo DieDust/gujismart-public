@@ -673,12 +673,14 @@ function buildQualityReport(blocks: OcrBlockV1[], discardedBlocks: OcrBlockV1[])
 }
 
 function resolvePageSize(result: JsonRecord, blocks: JsonRecord[], options: BuildOcrIrOptions): { width: number; height: number } {
+  const gujiProcessing = isRecord(result.guji_processing) ? result.guji_processing : null
+  const preserveServiceCoordinates = gujiProcessing?.ocr_service_coordinates_preserved === true
   const width = options.pageWidth
     || finiteNumber(firstValue(result, ['page_width', 'image_width', 'width']))
-    || (isRecord(result.guji_processing) ? finiteNumber(result.guji_processing.source_image_width) : null)
+    || (!preserveServiceCoordinates && gujiProcessing ? finiteNumber(gujiProcessing.source_image_width) : null)
   const height = options.pageHeight
     || finiteNumber(firstValue(result, ['page_height', 'image_height', 'height']))
-    || (isRecord(result.guji_processing) ? finiteNumber(result.guji_processing.source_image_height) : null)
+    || (!preserveServiceCoordinates && gujiProcessing ? finiteNumber(gujiProcessing.source_image_height) : null)
   if (width && height && width > 0 && height > 0) return { width, height }
   const boxes = blocks.map(getBlockBbox).filter((bbox): bbox is OcrBoundingBox => bbox !== undefined)
   return {

@@ -13,6 +13,13 @@ const batchProcessor = readSource('src', 'main', 'batch-processor.ts')
 const libraryView = readSource('src', 'renderer', 'src', 'views', 'LibraryView.tsx')
 const startupRecovery = readSource('src', 'main', 'startup-recovery.ts')
 const metadataReclassifier = readSource('src', 'main', 'metadata-reclassifier.ts')
+function sliceBetween(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker)
+  assert(start >= 0, `Missing start marker: ${startMarker}`)
+  const end = source.indexOf(endMarker, start + startMarker.length)
+  assert(end > start, `Missing end marker: ${endMarker}`)
+  return source.slice(start, end)
+}
 const initDatabaseStart = database.indexOf('export async function initDatabase(): Promise<void>')
 const initDatabaseEnd = database.indexOf('export function runDeferredStartupDatabaseMaintenance', initDatabaseStart)
 const initDatabaseBody = initDatabaseStart >= 0 && initDatabaseEnd > initDatabaseStart
@@ -25,6 +32,11 @@ const recoverOcrJobs = startupRecovery.indexOf('ocr = recoverInterruptedOcrJobs(
 const resumeDeletes = startupRecovery.indexOf('deletingDocuments = resumeInterruptedDocumentDeletes()', runStartupRecoveryStart)
 const resumeBatchQueue = startupRecovery.indexOf('resumedBatchQueue = batchProcessor.resumePendingQueueFromDatabase()', runStartupRecoveryStart)
 const finalPreResumeCheckpoint = startupRecovery.lastIndexOf('if (await startupRecoveryCheckpoint()) return finishCanceled()', resumeDeletes)
+const recoverableBatchOcrItemsBody = sliceBetween(
+  ocrIpc,
+  'function createRecoverableBatchOcrItems',
+  'function updateRecoverableBatchOcrItem',
+)
 
 assert(
   mainIndex.includes("import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'"),
@@ -245,8 +257,10 @@ assert(
     && ocrIpc.includes("engine === 'paddle' && options?.forceFullRerun !== true")
     && ocrIpc.includes('function createRecoverableBatchOcrItems')
     && ocrIpc.includes('INSERT INTO batch_queue')
-    && ocrIpc.includes('saveDatabase()')
-    && ocrIpc.includes('const recoverableQueueItemIdsByDocId = persistForRecovery')
+    && recoverableBatchOcrItemsBody.includes('scheduleDatabaseSave()')
+    && !recoverableBatchOcrItemsBody.includes('saveDatabase()')
+    && ocrIpc.includes('let recoverableQueueItemIdsByDocId = new Map<string, string>()')
+    && ocrIpc.includes('recoverableQueueItemIdsByDocId = persistForRecovery')
     && ocrIpc.includes("updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
     && ocrIpc.includes('!ocrRuntimeShuttingDown')
     && ocrIpc.includes("result.success ? 'completed' : 'failed'"),

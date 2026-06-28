@@ -9,6 +9,7 @@ import { autoCleanupPdfAssetsIfEnabled, restorePdfAssetForDocument } from '../pd
 import { analyzePdfTextLayer } from '../pdf-preflight'
 import { allowFileAccessPath } from '../file-access'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { getPdfJsNodeDocumentOptions } from '../pdfjs-assets'
 import {
   findSuspiciousRepeatedOcrText,
   formatSuspiciousRepeatedOcrTextIssue,
@@ -30,10 +31,17 @@ import {
   shouldUseAsyncPdfOcr,
 } from '../ocr'
 import { emitBackgroundTaskStatus } from '../background-tasks'
-import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged } from '../semantic-search'
+import {
+  markSearchIndexStaleForDocuments,
+  markSearchIndexStaleForPages,
+  notifySearchContentChanged,
+  pauseBackgroundSearchReindex,
+  resumeBackgroundSearchReindex,
+} from '../semantic-search'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { hasVisionOcrConfig, recognizePagesWithVisionModel, refinePagesWithVisionModel } from '../vision-ocr'
+import { applyCjkTextRenderFallback } from '../../shared/pdf-text-render-fallback'
 import {
   OCR_IR_PIPELINE_VERSION,
   OCR_IR_SCHEMA_VERSION,
@@ -54,9 +62,8 @@ const AUTO_METADATA_START_DELAY_MS = 5_000
 const OCR_PAGE_INSERT_CHUNK_SIZE = 50
 const OCR_RESULT_SAVE_CHUNK_SIZE = 50
 const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = 50
-const OCR_ASYNC_PDF_PAGE_FALLBACK_LIMIT = 6
-const OCR_ASYNC_PDF_GUJI_PAGE_FALLBACK_CONCURRENCY = 1
 const OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE = 25
+const OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE = 10
 const OCR_AUTO_FAILED_PAGE_RETRY_LIMIT = 24
 const OCR_FINALIZE_PAGE_CHUNK_SIZE = 250
 const OCR_FINALIZE_PAGE_LOOKUP_CHUNK_SIZE = 500
@@ -68,6 +75,7 @@ const HEAVY_PDF_DOC_PAGE_COUNT = 1000
 const RECOVERABLE_BATCH_OCR_PREFIX = 'recoverable_ocr'
 const OCR_LAYOUT_QUALITY_REJECTED_PREFIX = '[layout_quality_rejected]'
 const OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
+const OCR_ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'
 const OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX = '[async_pdf_quality_retryable]'
 const OCR_ORIGINAL_PDF_RETRY_ATTEMPTS = 3
 const OCR_FEIJIANG_REFERENCE_ENV = 'GUJISMART_OCR_REFERENCE_JSON_DIR'
@@ -107,6 +115,7 @@ type PdfJsDocument = {
 }
 type PdfJsPage = {
   getViewport: (options: { scale: number }) => { width: number; height: number }
+  getTextContent?: (options?: Record<string, unknown>) => Promise<{ items?: unknown[] }>
   render: (options: Record<string, unknown>) => { promise: Promise<void> }
   cleanup?: () => void
 }
@@ -341,7 +350,7 @@ function createRecoverableBatchOcrItems(docIds: string[], batchSize: number): Ma
       itemIdsByDocId.set(docId, itemId)
     })
   })
-  saveDatabase()
+  scheduleDatabaseSave()
   return itemIdsByDocId
 }
 
@@ -447,28 +456,6 @@ function clearDocumentOcrRoutePreference(docId: string): void {
   delete metadata.ocr_route_updated_at
   delete metadata.ocr_last_quality_issue
   delete metadata.ocr_last_quality_issue_updated_at
-  run('UPDATE documents SET metadata = ?, updated_at = ? WHERE id = ?', [
-    JSON.stringify(metadata),
-    new Date().toISOString(),
-    docId,
-  ])
-  markLibraryStateCacheDirty()
-  scheduleDatabaseSave()
-}
-
-function markDocumentPreferPageImageOcr(docId: string, reason: string): void {
-  const currentMetadata = queryOne<Pick<OcrDocumentRow, 'metadata'>>(
-    'SELECT metadata FROM documents WHERE id = ?',
-    [docId],
-  )?.metadata
-  const metadata = parseMetadata(currentMetadata)
-  const currentReason = String(metadata.ocr_last_quality_issue || '').trim()
-  if (currentReason === reason && !metadata.ocr_route_preference) return
-  metadata.ocr_last_quality_issue = reason
-  metadata.ocr_last_quality_issue_updated_at = new Date().toISOString()
-  delete metadata.ocr_route_preference
-  delete metadata.ocr_route_reason
-  delete metadata.ocr_route_updated_at
   run('UPDATE documents SET metadata = ?, updated_at = ? WHERE id = ?', [
     JSON.stringify(metadata),
     new Date().toISOString(),
@@ -726,6 +713,9 @@ function formatOcrError(error: unknown): string {
   if (message.includes(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX)) {
     return message.replace(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX, '').trim()
   }
+  if (message.includes(OCR_ASYNC_JOB_STALLED_PREFIX)) {
+    return message.replace(OCR_ASYNC_JOB_STALLED_PREFIX, '').trim()
+  }
   if (message.includes(OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX)) {
     return message.replace(OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX, '').trim()
   }
@@ -756,6 +746,7 @@ function isRetryableOcrError(error: unknown): boolean {
   const rawMessage = (error as Error)?.message || String(error || '')
   if (rawMessage.includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)) return false
   if (rawMessage.includes(OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX)) return false
+  if (rawMessage.includes(OCR_ASYNC_JOB_STALLED_PREFIX)) return false
   const message = formatOcrError(error)
   if (message.includes('vision') || message.includes('Vision') || message.includes('视觉模型')) return false
   if (message.includes('API Token') || message.includes('Token 无效') || message.includes('没有权限')) return false
@@ -763,6 +754,11 @@ function isRetryableOcrError(error: unknown): boolean {
   if (isOcrQualityFailureMessage(message) || message.includes('缺少可读取页图')) return false
   if (isPdfChunkStructureError(error)) return false
   return true
+}
+
+function isAsyncPdfRecoverableStallError(error: unknown): boolean {
+  const message = String((error as Error)?.message || error || '')
+  return message.includes(OCR_ASYNC_JOB_STALLED_PREFIX)
 }
 
 function throwIfOcrCanceled(signal?: AbortSignal): void {
@@ -801,12 +797,10 @@ async function loadCanvas(): Promise<CanvasModule> {
 async function loadPdfForRendering(pdfPath: string): Promise<{ pdfjs: PdfJsModule; canvasModule: CanvasModule; pdf: PdfJsDocument }> {
   const [pdfjs, canvasModule] = await Promise.all([loadPdfJs(), loadCanvas()])
   const sourceBytes = await readFile(pdfPath)
-  const loadingTask = pdfjs.getDocument({
+  const loadingTask = pdfjs.getDocument(getPdfJsNodeDocumentOptions({
     data: new Uint8Array(sourceBytes),
     disableWorker: true,
-    isEvalSupported: false,
-    useSystemFonts: true,
-  })
+  }))
   const pdf = await loadingTask.promise
   return { pdfjs, canvasModule, pdf }
 }
@@ -833,6 +827,9 @@ async function renderLoadedPdfPageToImageBuffer(
       annotationMode: pdfjs.AnnotationMode?.DISABLE ?? 0,
       background: 'rgb(255,255,255)',
     }).promise
+    await applyCjkTextRenderFallback(page, viewport, canvasContext, width, height).catch((error) => {
+      console.warn('[OCR] PDF CJK text render fallback failed', error)
+    })
     return canvas.toBuffer('image/jpeg', quality)
   } finally {
     page.cleanup?.()
@@ -1390,10 +1387,6 @@ function isFeijiangReferenceRecoveredResult(result: unknown): result is OcrPageR
 function getRawFeijiangReferenceText(result: unknown): string {
   if (!isJsonRecord(result)) return ''
   return getRawMarkdownTextFromUnknown(result.markdown) || getRawTextFromUnknown(result.text)
-}
-
-function hasSafeGujiPreferredServiceText(result: unknown, minCompactLength = 12): boolean {
-  return getPreferredGujiServiceText(result).replace(/\s+/g, '').length >= minCompactLength
 }
 
 function stripOcrHtml(value: string): string {
@@ -2291,62 +2284,21 @@ async function postProcessPdfOcrResultsBatched(
   const feijiangReference = ocrOptions.profile === 'guji_print_vertical'
     ? await loadFeijiangOcrReference(fallbackPdfPath)
     : null
-  const pageImageFallbackLimit = createLimiter(
-    ocrOptions.profile === 'guji_print_vertical'
-      ? OCR_ASYNC_PDF_GUJI_PAGE_FALLBACK_CONCURRENCY
-      : Math.max(1, Math.min(2, OCR_ASYNC_PDF_PAGE_FALLBACK_LIMIT)),
-  )
-  let fallbackAttempts = 0
-  const tryPageImageFallback = async (item: { page: OcrPageRow; sourcePageIndex: number }): Promise<OcrPageResult | null> => {
-    return pageImageFallbackLimit(async () => {
-      const fallbackLimit = ocrOptions.profile === 'guji_print_vertical'
-        ? Number.POSITIVE_INFINITY
-        : OCR_ASYNC_PDF_PAGE_FALLBACK_LIMIT
-      if (fallbackAttempts >= fallbackLimit) return null
-      fallbackAttempts += 1
-      const fallbackOptions = getVerticalFallbackOcrOptions(ocrOptions)
-      const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)
-      if (!fallbackPage) return null
-      item.page.image_path = fallbackPage.image_path
-      try {
-        const fallbackResult = sanitizeGujiNonBookHallucinations(
-          await recognizeSinglePageWithResolvedOptions(fallbackPage, fallbackOptions, signal),
-          fallbackOptions,
-          fallbackPage.image_path,
-        )
-        const fallbackIssue = findLikelyRunawayRepeatedOcrText(fallbackResult)
-          ? formatSuspiciousRepeatedOcrTextIssue(findLikelyRunawayRepeatedOcrText(fallbackResult) as OcrRepeatedTextIssue)
-          : getRiskyPageImageNonTableHardIssue(fallbackResult, fallbackPage.image_path, fallbackOptions)
-        if (fallbackIssue) {
-          const splitFallbackResult = await recognizeSplitPageImageFallback(fallbackPage, fallbackOptions, signal, fallbackIssue)
-          if (splitFallbackResult) {
-            return {
-              pageId: item.page.id,
-              result: splitFallbackResult,
-              text: getOcrResultText(splitFallbackResult),
-              status: 'completed',
-            } satisfies OcrPageResult
-          }
-          return null
-        }
-        return {
-          pageId: item.page.id,
-          result: fallbackResult,
-          text: getOcrResultText(fallbackResult),
-          status: 'completed',
-        } satisfies OcrPageResult
-      } catch (error) {
-        if (isOcrAbortError(error)) throw error
-      }
-      return null
-    })
-  }
   for (let index = 0; index < pages.length; index += OCR_RESULT_POSTPROCESS_CHUNK_SIZE) {
     const batch = pages.slice(index, index + OCR_RESULT_POSTPROCESS_CHUNK_SIZE)
     const batchResults = await Promise.all(batch.map(async (item) => {
       throwIfOcrCanceled(signal)
+      if (!hasReadablePageImage(item.page)) {
+        const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)
+        if (fallbackPage) item.page.image_path = fallbackPage.image_path
+      }
       const rawResult = rawResults[item.resultIndex]
-      const result = rawResult ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, { signal }) : null
+      const result = rawResult
+        ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {
+          signal,
+          preserveServiceCoordinates: true,
+        })
+        : null
       if (!result) {
         const recovered = await recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)
         if (recovered) return recovered
@@ -2404,40 +2356,6 @@ async function postProcessPdfOcrResultsBatched(
           status: 'completed',
         } satisfies OcrPageResult
       }
-      const safePreferredText = hasSafeGujiPreferredServiceText(result)
-      const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification(result, item.page.image_path, ocrOptions)
-      const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue(result, item.page.image_path, ocrOptions)
-      const underSegmented = !safePreferredText
-        && !tableMisclassification
-        && !hardQualityIssue
-        && isLikelyUnderSegmentedRiskyPageImageResult(result, item.page.image_path, ocrOptions)
-      if (tableMisclassification || hardQualityIssue || underSegmented) {
-        const qualityIssue = tableMisclassification
-          || hardQualityIssue
-          || getUnderSegmentedRiskyPageImageMessage()
-        markDocumentPreferPageImageOcr(
-          item.page.doc_id,
-          qualityIssue,
-        )
-        const fallbackPageResult = await tryPageImageFallback(item)
-        if (fallbackPageResult) return fallbackPageResult
-        if (underSegmented) {
-          return {
-            pageId: item.page.id,
-            result,
-            text: getOcrResultText(result),
-            status: 'completed',
-          } satisfies OcrPageResult
-        }
-        return {
-          pageId: item.page.id,
-          result: null,
-          text: '',
-          status: 'error',
-          error: qualityIssue,
-        } satisfies OcrPageResult
-      }
-
       return {
         pageId: item.page.id,
         result,
@@ -2839,7 +2757,10 @@ function getOriginalPdfRetryStrategies(
     .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0))]
     .sort((left, right) => left - right)
   if (!gujiProfile) {
-    return [{ targetPageNums: normalizedTargetPageNums, pageRangeChunkSize }]
+    return [{
+      targetPageNums: normalizedTargetPageNums,
+      pageRangeChunkSize: pageRangeChunkSize || OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE,
+    }]
   }
   return [
     {
@@ -4055,6 +3976,24 @@ function getPageImageSize(imagePath?: string | null): { width: number; height: n
   }
 }
 
+function isServiceCoordinatePreservedResult(result: unknown): boolean {
+  if (!isJsonRecord(result)) return false
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  return gujiProcessing.ocr_service_coordinates_preserved === true
+}
+
+function getStoredOcrIrSize(
+  result: unknown,
+  imagePath?: string | null,
+): { width?: number; height?: number } {
+  if (isServiceCoordinatePreservedResult(result)) return {}
+  const imageSize = getPageImageSize(imagePath)
+  return {
+    width: imageSize?.width,
+    height: imageSize?.height,
+  }
+}
+
 function normalizeOcrResultForStorage(
   result: unknown,
   page: Pick<OcrSavePageSnapshot, 'page_num' | 'image_path' | 'ocr_result'> | null | undefined,
@@ -4067,11 +4006,11 @@ function normalizeOcrResultForStorage(
       text: rawFeijiangReferenceText,
     }
   }
-  const imageSize = getPageImageSize(page?.image_path)
+  const irSize = getStoredOcrIrSize(result, page?.image_path)
   const normalized = ensureOcrResultIr(result, {
     pageIndex: Number(page?.page_num || 0) || 1,
-    pageWidth: imageSize?.width,
-    pageHeight: imageSize?.height,
+    pageWidth: irSize.width,
+    pageHeight: irSize.height,
     engine,
     generatedAt: getOcrPageIr(page?.ocr_result)?.generatedAt,
     forceRebuild: true,
@@ -4086,8 +4025,8 @@ function normalizeOcrResultForStorage(
   const storageResultBase = gujiOptions
     ? ensureOcrResultIr(stripGujiStoragePlaceholders(sanitizeGujiNonBookHallucinations(normalized, gujiOptions, page?.image_path)), {
         pageIndex: Number(page?.page_num || 0) || 1,
-        pageWidth: imageSize?.width,
-        pageHeight: imageSize?.height,
+        pageWidth: irSize.width,
+        pageHeight: irSize.height,
         engine,
         generatedAt: getOcrPageIr(page?.ocr_result)?.generatedAt,
         forceRebuild: true,
@@ -5491,7 +5430,9 @@ async function processDocumentOcr(
           const awaitingResultFile = Boolean(payload.awaitingResultFile)
           const isAwaitingAsyncResult = totalPages > 0 && finishedPages >= totalPages && !awaitingResultFile
           const hasServerProgress = newlyFinishedPages > 0 || Number(payload.progress || 0) > 0
-          const fallbackRetryMessage = isPreparing && payload.fallbackReason ? '正在重新提交 PDF' : ''
+          const fallbackRetryMessage = isPreparing && payload.fallbackReason
+            ? String(payload.fallbackReason || '正在重新提交 PDF')
+            : ''
           const waitingText = payload.waitingMs ? `，已等待 ${formatDurationMs(payload.waitingMs)}` : ''
           const pollText = payload.pollCount ? `，第 ${payload.pollCount} 次查询` : ''
           const waitingResultFileMessage = awaitingResultFile
@@ -5615,7 +5556,47 @@ async function processDocumentOcr(
         pages = queryAll<OcrPageRow>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])
         pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
         completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
-        if (!isPdfChunkStructureError(error) || !canFallbackToImageOcr(pagesForOcr)) throw error
+        if (isAsyncPdfRecoverableStallError(error)) {
+          const stalledMessage = formatOcrError(error)
+          emitOcrStatus(event, {
+            docId,
+            status: 'processing',
+            phase: 'ocr',
+            progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
+            completedPages: completedBefore,
+            totalPages: getDocTotalPages(),
+            message: `异步 PDF OCR 进度停住，正在自动补跑未完成页：${completedBefore}/${getDocTotalPages()} 页`,
+            errorMessage: stalledMessage,
+          })
+          pageResults = await retryIncompletePagesWithSinglePageOcr(
+            {
+              id: doc.id,
+              title: doc.title,
+              author: doc.author,
+              source: doc.source,
+              doc_type: doc.doc_type,
+              metadata: doc.metadata,
+            },
+            pdfPath,
+            signal,
+            (payload) => {
+              emitOcrStatus(event, {
+                docId,
+                status: 'processing',
+                phase: 'ocr',
+                progress: getDocProgress(getCompleted(), totalDocs, 0.97),
+                completedPages: Math.min(getDocTotalPages() || payload.totalPages, completedBefore + payload.completedPages),
+                totalPages: getDocTotalPages() || payload.totalPages,
+                pageNum: payload.pageNum,
+                errorMessage: payload.error,
+                message: `正在自动补跑未完成页：${payload.completedPages}/${payload.totalPages} 页`,
+              })
+            },
+          )
+          canUsePdfAsync = false
+        } else if (!isPdfChunkStructureError(error) || !canFallbackToImageOcr(pagesForOcr)) {
+          throw error
+        } else {
         emitOcrStatus(event, {
           docId,
           status: 'processing',
@@ -5651,6 +5632,7 @@ async function processDocumentOcr(
             message: `OCR 处理中：${combinedPages}/${totalPages} 页`,
           })
         }, { signal, concurrency: processOptions.pageConcurrency })
+        }
       }
 
       if (asyncResults) {
@@ -6029,7 +6011,14 @@ export function registerOcrIpc(): void {
         if (isHeavyPdfOcrDocument(docId)) heavyPdfDocIds.add(docId)
       }
     }
-    const recoverableQueueItemIdsByDocId = persistForRecovery
+    const shouldPauseSearchReindexForBatch = queuedDocIds.length > 0
+    if (shouldPauseSearchReindexForBatch) {
+      pauseBackgroundSearchReindex()
+    }
+    let recoverableQueueItemIdsByDocId = new Map<string, string>()
+
+    try {
+    recoverableQueueItemIdsByDocId = persistForRecovery
       ? createRecoverableBatchOcrItems(queuedDocIds, documentConcurrency)
       : new Map<string, string>()
 
@@ -6053,6 +6042,7 @@ export function registerOcrIpc(): void {
           message: '已加入本批 OCR 队列，等待空闲识别通道',
         })
       }
+      await yieldToEventLoop()
     }
 
     await Promise.all(
@@ -6089,6 +6079,7 @@ export function registerOcrIpc(): void {
             totalPages: Number(doc?.page_count || 0) || undefined,
             message: 'OCR 识别中',
           })
+          await yieldToEventLoop()
           const result = await processDocumentOcr(
             event,
             docId,
@@ -6127,6 +6118,11 @@ export function registerOcrIpc(): void {
       })
       }),
     )
+    } finally {
+      if (shouldPauseSearchReindexForBatch) {
+        resumeBackgroundSearchReindex({ reason: 'ocr-batch-deferred' })
+      }
+    }
 
     return successCount
   })

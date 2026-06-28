@@ -6,6 +6,8 @@ import { copyFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'fs
 import { basename, dirname, extname, join, resolve } from 'path'
 import { PDFDocument } from 'pdf-lib'
 import { getDataDir, queryOne, run, scheduleDatabaseSave } from './database'
+import { getPdfJsNodeDocumentOptions } from './pdfjs-assets'
+import { applyCjkTextRenderFallback } from '../shared/pdf-text-render-fallback'
 import type { DocumentMetadataResult, PdfCompressionSummary } from '../shared/types'
 
 export const PDF_COMPRESSION_ENABLED_KEY = 'pdf_compression_enabled'
@@ -32,6 +34,7 @@ type PdfJsDocument = {
 }
 type PdfJsPage = {
   getViewport: (options: { scale: number }) => { width: number; height: number }
+  getTextContent?: (options?: Record<string, unknown>) => Promise<{ items?: unknown[] }>
   render: (options: Record<string, unknown>) => { promise: Promise<void> }
   cleanup?: () => void
 }
@@ -330,12 +333,10 @@ async function tryCompressWithQpdf(sourcePath: string, outputPath: string, setti
 async function tryCompressWithRasterRebuild(sourcePath: string, outputPath: string, settings: PdfCompressionSettings): Promise<CompressionToolResult> {
   const [pdfjs, canvasModule] = await Promise.all([loadPdfJs(), loadCanvas()])
   const sourceBytes = await readFile(sourcePath)
-  const loadingTask = pdfjs.getDocument({
+  const loadingTask = pdfjs.getDocument(getPdfJsNodeDocumentOptions({
     data: new Uint8Array(sourceBytes),
     disableWorker: true,
-    isEvalSupported: false,
-    useSystemFonts: true,
-  })
+  }))
   const sourcePdf = await loadingTask.promise
   const outputPdf = await PDFDocument.create()
 
@@ -361,6 +362,9 @@ async function tryCompressWithRasterRebuild(sourcePath: string, outputPath: stri
         annotationMode: pdfjs.AnnotationMode?.DISABLE ?? 0,
         background: 'rgb(255,255,255)',
       }).promise
+      await applyCjkTextRenderFallback(page, renderViewport, canvasContext, width, height).catch((error) => {
+        console.warn('[PDF Compression] PDF CJK text render fallback failed', error)
+      })
 
       const jpegBytes = canvas.toBuffer('image/jpeg', settings.quality)
       const embeddedPage = await outputPdf.embedJpg(jpegBytes)

@@ -3708,51 +3708,42 @@ export default function LibraryView({
     const batches = chunkArray(uniqueDocIds, ocrBatchSize)
     let successCount = 0
     let shouldRefreshAfterBatches = false
-
-    if (engine === 'paddle') {
-      message.loading({
-        content: getOcrBatchProgressMessage(getOcrEngineLabel(engine), 1, Math.max(1, batches.length), ocrBatchSize, documentConcurrency),
-        key: messageKey,
-        duration: 0,
-      })
-      successCount = await window.api.batchOcr(uniqueDocIds, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })
-      scheduleImportListRefresh()
-      cancelScheduledImportListRefresh()
-      await loadDocuments(filter, { silent: true })
-      return successCount
-    }
+    const requiresPageImagesBeforeOcr = engine === 'vision_model' || engine === 'hybrid'
 
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
       const batch = batches[batchIndex]
-      const preparedBatch: string[] = []
-      for (let docIndex = 0; docIndex < batch.length; docIndex += 1) {
-        const docId = batch[docIndex]
-        try {
-          const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {
-            fileIndex: batchIndex * ocrBatchSize + docIndex,
-            totalFiles: uniqueDocIds.length,
-            engine,
-          })
-          if (ready) preparedBatch.push(docId)
-        } catch (error) {
-          const reason = getErrorMessage(error, '未知错误')
-          console.warn('[Library] OCR 前补齐 PDF 页图失败', docId, error)
-          const errorMessage = `OCR 页图补齐失败：${reason}。请确认该文献所属数据库包含 PDF/页图资源，或把原 PDF 加入“PDF 原件仓库”后重试。`
-          await window.api.updateDocument(docId, {
-            ocr_status: 'error',
-            import_status: 'error',
-            error_message: errorMessage,
-          })
-          updateDocumentInList(docId, {
-            ocr_status: 'error',
-            import_status: 'error',
-            error_message: errorMessage,
-          })
-          shouldRefreshAfterBatches = true
+      let ocrBatch = batch
+      if (requiresPageImagesBeforeOcr) {
+        ocrBatch = []
+        for (let docIndex = 0; docIndex < batch.length; docIndex += 1) {
+          const docId = batch[docIndex]
+          try {
+            const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {
+              fileIndex: batchIndex * ocrBatchSize + docIndex,
+              totalFiles: uniqueDocIds.length,
+              engine,
+            })
+            if (ready) ocrBatch.push(docId)
+          } catch (error) {
+            const reason = getErrorMessage(error, '未知错误')
+            console.warn('[Library] OCR 前补齐 PDF 页图失败', docId, error)
+            const errorMessage = `OCR 页图补齐失败：${reason}。请确认该文献所属数据库包含 PDF/页图资源，或把原 PDF 加入“PDF 原件仓库”后重试。`
+            await window.api.updateDocument(docId, {
+              ocr_status: 'error',
+              import_status: 'error',
+              error_message: errorMessage,
+            })
+            updateDocumentInList(docId, {
+              ocr_status: 'error',
+              import_status: 'error',
+              error_message: errorMessage,
+            })
+            shouldRefreshAfterBatches = true
+          }
+          await delay(0)
         }
-        await delay(0)
       }
-      if (preparedBatch.length === 0) {
+      if (ocrBatch.length === 0) {
         scheduleImportListRefresh()
         continue
       }
@@ -3761,7 +3752,7 @@ export default function LibraryView({
         key: messageKey,
         duration: 0,
       })
-      successCount += await window.api.batchOcr(preparedBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })
+      successCount += await window.api.batchOcr(ocrBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })
       shouldRefreshAfterBatches = true
       scheduleImportListRefresh()
       await delay(0)

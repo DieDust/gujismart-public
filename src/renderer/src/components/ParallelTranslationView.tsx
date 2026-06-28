@@ -13,6 +13,12 @@ export type { ParallelTranslationSegment }
 
 const { Text } = Typography
 
+function getDisplayTranslationForUnit(unit: TranslationUnitV1): string {
+  if (unit.skipped) return unit.sourceText
+  if (unit.status !== 'ready' || unit.stale) return ''
+  return unit.translationText
+}
+
 type ParallelTranslationTheme = {
   page: string
   text: string
@@ -74,7 +80,7 @@ export default function ParallelTranslationView({
       ? units.map((unit) => ({
           id: unit.id,
           source: unit.sourceText,
-          translation: unit.translationText || (unit.skipped ? unit.sourceText : ''),
+          translation: getDisplayTranslationForUnit(unit),
         }))
       : buildParallelTranslationSegments(sourceText, loading ? '' : effectiveTranslationText),
     [effectiveTranslationText, loading, sourceText, units],

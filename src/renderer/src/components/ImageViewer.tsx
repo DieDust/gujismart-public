@@ -20,7 +20,7 @@ export interface ViewerViewport {
 interface ImageViewerProps {
   src: string
   ocrBoxes?: ImageViewerOcrBox[]
-  coordinateSourceSize?: { width?: number | null; height?: number | null }
+  coordinateSourceSize?: { width?: number | null; height?: number | null; preserveServiceCoordinates?: boolean }
   activeBoxIndex?: number
   searchKeyword?: string
   onBoxClick?: (index: number) => void
@@ -173,7 +173,7 @@ export default function ImageViewer({
       scaleX: imageWidth / sourceWidth,
       scaleY: imageHeight / sourceHeight,
     }
-  }, [coordinateSourceSize?.height, coordinateSourceSize?.width, ocrBoxes, renderedImageSize.height, renderedImageSize.width, src])
+  }, [coordinateSourceSize?.height, coordinateSourceSize?.preserveServiceCoordinates, coordinateSourceSize?.width, ocrBoxes, renderedImageSize.height, renderedImageSize.width, src])
 
   useEffect(() => {
     latestViewportRef.current = currentViewport

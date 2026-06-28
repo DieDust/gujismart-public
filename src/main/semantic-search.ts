@@ -95,6 +95,7 @@ type CurrentSearchIndexStatus = Pick<SearchIndexStatus, 'status' | 'source_hash'
 type SearchIndexReindexReason =
   | 'manual'
   | 'content-changed'
+  | 'ocr-batch-deferred'
   | 'search-scope-stale'
   | 'search-managed-text-stale'
   | 'search-hit-locator'
@@ -300,6 +301,7 @@ let reindexDrainCompletedCount = 0
 let reindexDrainErrorCount = 0
 let reindexDrainLastErrorMessage = ''
 let reindexDrainTotalCount = 0
+let backgroundReindexPauseDepth = 0
 const MAX_PREVIEW_HITS_PER_DOC = 24
 const MAX_DOCUMENT_SEARCH_SESSION_HITS = 20000
 const SHORT_QUERY_PREVIEW_SEGMENTS_PER_DOC = 6
@@ -1088,6 +1090,8 @@ function getSearchIndexReindexReasonLabel(reason?: SearchIndexReindexReason): st
       return '手动重建'
     case 'content-changed':
       return '文献内容已更新'
+    case 'ocr-batch-deferred':
+      return 'OCR 完成后更新'
     case 'search-scope-stale':
       return '当前检索范围索引待更新'
     case 'search-managed-text-stale':
@@ -1103,6 +1107,28 @@ function getSearchIndexReindexReasonLabel(reason?: SearchIndexReindexReason): st
 
 function getSearchIndexReindexMessage(reason?: SearchIndexReindexReason): string {
   return `正在后台更新搜索索引（${getSearchIndexReindexReasonLabel(reason)}），不影响阅读和浏览`
+}
+
+function isBackgroundReindexPaused(): boolean {
+  return backgroundReindexPauseDepth > 0
+}
+
+export function pauseBackgroundSearchReindex(): void {
+  backgroundReindexPauseDepth += 1
+  if (reindexTimer) {
+    clearTimeout(reindexTimer)
+    reindexTimer = null
+  }
+}
+
+export function resumeBackgroundSearchReindex(options: { delayMs?: number; reason?: SearchIndexReindexReason } = {}): void {
+  backgroundReindexPauseDepth = Math.max(0, backgroundReindexPauseDepth - 1)
+  if (backgroundReindexPauseDepth > 0) return
+  if (!AUTO_BACKGROUND_REINDEX_ENABLED || queuedReindexDocIds.size === 0 || reindexTimer || reindexWorkerRunning) return
+  scheduleBackgroundReindex([], {
+    delayMs: options.delayMs ?? BACKGROUND_REINDEX_DRAIN_PAUSE_MS,
+    reason: options.reason ?? 'ocr-batch-deferred',
+  })
 }
 
 function updateSearchIndexStatus(
@@ -1546,6 +1572,9 @@ async function reindexDocumentThroughWorker(docId: string, totalCount: number, c
 
 async function drainReindexQueue(): Promise<void> {
   reindexTimer = null
+  if (isBackgroundReindexPaused()) {
+    return
+  }
   if (reindexWorkerRunning || queuedReindexDocIds.size === 0) return
 
   reindexWorkerRunning = true
@@ -1566,7 +1595,7 @@ async function drainReindexQueue(): Promise<void> {
     })
 
     let processedThisDrain = 0
-    while (queuedReindexDocIds.size > 0 && processedThisDrain < BACKGROUND_REINDEX_DRAIN_BATCH_SIZE) {
+    while (queuedReindexDocIds.size > 0 && processedThisDrain < BACKGROUND_REINDEX_DRAIN_BATCH_SIZE && !isBackgroundReindexPaused()) {
       const totalCount = Math.max(reindexDrainCompletedCount + queuedReindexDocIds.size, reindexDrainTotalCount, 1)
       const docId = queuedReindexDocIds.values().next().value as string | undefined
       if (!docId) break
@@ -1629,6 +1658,7 @@ function scheduleBackgroundReindex(docIds: string[], options: { activeResolved?:
     })
   }
   if (!AUTO_BACKGROUND_REINDEX_ENABLED) return
+  if (isBackgroundReindexPaused()) return
   if (queuedReindexDocIds.size === 0 || reindexTimer || reindexWorkerRunning) return
   reindexTimer = setTimeout(drainReindexQueue, options.delayMs ?? BACKGROUND_REINDEX_DELAY_MS)
 }
@@ -3002,6 +3032,9 @@ function buildTranslationSearchIndexSegmentDrafts(docId: string): SearchIndexSeg
     `SELECT page_id, page_num, unit_id, block_id, unit_order, translation_text
      FROM page_translation_units
      WHERE doc_id = ?
+       AND status = 'ready'
+       AND stale = 0
+       AND skipped = 0
        AND TRIM(COALESCE(translation_text, '')) <> ''
      ORDER BY page_num, unit_order`,
     [docId],

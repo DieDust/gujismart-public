@@ -32,6 +32,7 @@ import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
 import { buildFolderTree, flattenVisibleFolders, isFolderDescendant, sortFolders, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import { getPdfFileInfo, renderPdfFilePageToImage } from '../utils/pdf'
+import { ensurePdfPageImagesForOcr as ensureOcrPageImages } from '../utils/ocrPageImages'
 
 const { Sider, Content } = Layout
 const { Title, Text } = Typography
@@ -170,6 +171,27 @@ function chunkArray<T>(items: T[], size: number): T[][] {
     chunks.push(items.slice(index, index + safeSize))
   }
   return chunks
+}
+
+function getFolderOcrEngineLabel(engine: OcrEngine | string): string {
+  return engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
+}
+
+function getFolderOcrBatchProgressMessage(engineLabel: string, batchIndex: number, totalBatches: number, batchSize: number, documentConcurrency: number): string {
+  const concurrencyText = documentConcurrency > 1 ? `，并行 ${documentConcurrency} 篇` : ''
+  return `正在用${engineLabel}处理第 ${batchIndex}/${totalBatches} 批（每批 ${batchSize} 篇${concurrencyText}）…`
+}
+
+async function getConfiguredFolderBatchSize(): Promise<number> {
+  try {
+    const rawValue = await window.api.getSetting('batch_size')
+    const parsed = Number.parseInt(String(rawValue || ''), 10)
+    const batchSize = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_IMPORT_BATCH_SIZE
+    return Math.max(1, Math.min(MAX_IMPORT_BATCH_SIZE, batchSize))
+  } catch (error) {
+    console.warn('[FoldersView] 读取批量处理数量失败，使用默认值', error)
+    return DEFAULT_IMPORT_BATCH_SIZE
+  }
 }
 
 function isFolderDocumentSortValue(value: string): value is FolderDocumentSortValue {
@@ -672,6 +694,78 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     return selectedDocumentIdSet.has(docId) && selectedDocumentIds.length > 0 ? selectedDocumentIds : [docId]
   }, [selectedDocumentIdSet, selectedDocumentIds])
 
+  const runFolderOcrInConfiguredBatches = useCallback(async (
+    docIds: string[],
+    engine: OcrEngine,
+    messageKey: string,
+    options?: { forceFullRerun?: boolean },
+  ) => {
+    const uniqueDocIds = Array.from(new Set(docIds.filter(Boolean)))
+    if (uniqueDocIds.length === 0) return 0
+
+    const ocrBatchSize = await getConfiguredFolderBatchSize()
+    const documentConcurrency = ocrBatchSize
+    const batches = chunkArray(uniqueDocIds, ocrBatchSize)
+    let successCount = 0
+    let shouldRefreshAfterBatches = false
+    const requiresPageImagesBeforeOcr = engine === 'vision_model' || engine === 'hybrid'
+
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      const batch = batches[batchIndex]
+      let ocrBatch = batch
+      if (requiresPageImagesBeforeOcr) {
+        ocrBatch = []
+        for (let docIndex = 0; docIndex < batch.length; docIndex += 1) {
+          const docId = batch[docIndex]
+          try {
+            const result = await ensureOcrPageImages(docId, {
+              fileIndex: batchIndex * ocrBatchSize + docIndex,
+              totalFiles: uniqueDocIds.length,
+              engine,
+              messageKey,
+              getEngineLabel: getFolderOcrEngineLabel,
+              onProgress: (content, key) => {
+                setImportProgressText(content)
+                if (key) message.loading({ content, key, duration: 0 })
+              },
+            })
+            if (result.ready) ocrBatch.push(docId)
+          } catch (error) {
+            const reason = getErrorMessage(error, '未知错误')
+            console.warn('[FoldersView] OCR 前补齐 PDF 页图失败', docId, error)
+            await window.api.updateDocument(docId, {
+              ocr_status: 'error',
+              import_status: 'error',
+              error_message: `OCR 页图补齐失败：${reason}。请确认该文献所属数据库包含 PDF/页图资源，或把原 PDF 加入“PDF 原件仓库”后重试。`,
+            })
+            shouldRefreshAfterBatches = true
+          }
+          await delay(0)
+        }
+      }
+      if (ocrBatch.length === 0) continue
+
+      message.loading({
+        content: getFolderOcrBatchProgressMessage(getFolderOcrEngineLabel(engine), batchIndex + 1, batches.length, ocrBatchSize, documentConcurrency),
+        key: messageKey,
+        duration: 0,
+      })
+      successCount += await window.api.batchOcr(ocrBatch, {
+        engine,
+        forceFullRerun: options?.forceFullRerun,
+        concurrency: documentConcurrency,
+      })
+      shouldRefreshAfterBatches = true
+      await delay(0)
+    }
+
+    if (shouldRefreshAfterBatches) {
+      await loadOverview()
+      await loadFolderContent(selectedFolderId)
+    }
+    return successCount
+  }, [loadFolderContent, loadOverview, selectedFolderId])
+
   const handleFolderBatchOcr = useCallback(async (docIds: string[], engine: OcrEngine, forceFullRerun = false) => {
     const uniqueDocIds = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
     if (uniqueDocIds.length === 0) {
@@ -692,7 +786,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       return
     }
 
-    const engineLabel = engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
+    const engineLabel = getFolderOcrEngineLabel(engine)
     message.loading({
       content: forceFullRerun
         ? `正在用${engineLabel}重新 OCR ${uniqueDocIds.length} 篇文献…`
@@ -701,7 +795,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       duration: 0,
     })
     try {
-      const successCount = await window.api.batchOcr(uniqueDocIds, { engine, forceFullRerun })
+      const successCount = await runFolderOcrInConfiguredBatches(uniqueDocIds, engine, FOLDERS_BATCH_OCR_MESSAGE_KEY, { forceFullRerun })
       message.success({
         content: forceFullRerun
           ? `${engineLabel}重新 OCR 已加入队列，成功处理 ${successCount} 篇`
@@ -714,7 +808,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     } catch (error) {
       message.error({ content: getErrorMessage(error, 'OCR 操作失败'), key: FOLDERS_BATCH_OCR_MESSAGE_KEY })
     }
-  }, [loadFolderContent, loadOverview, selectedFolderId])
+  }, [loadFolderContent, loadOverview, runFolderOcrInConfiguredBatches, selectedFolderId])
 
   const handleFolderBatchMetadataExtract = useCallback(async (docIds: string[]) => {
     const uniqueDocIds = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
@@ -920,8 +1014,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         key: FOLDERS_AUTO_OCR_MESSAGE_KEY,
         duration: 0,
       })
-      const concurrency = await getConfiguredImportBatchSize()
-      const successCount = await window.api.batchOcr(uniqueDocIds, { engine: 'paddle' as OcrEngine, concurrency })
+      const successCount = await runFolderOcrInConfiguredBatches(uniqueDocIds, 'paddle' as OcrEngine, FOLDERS_AUTO_OCR_MESSAGE_KEY)
       message.success({
         content: `OCR 已完成，成功处理 ${successCount} 篇文献`,
         key: FOLDERS_AUTO_OCR_MESSAGE_KEY,
@@ -936,7 +1029,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         duration: 6,
       })
     }
-  }, [getConfiguredImportBatchSize, loadFolderContent, loadOverview, selectedFolderId])
+  }, [loadFolderContent, loadOverview, runFolderOcrInConfiguredBatches, selectedFolderId])
 
   const importSourcePathsToFolder = useCallback(async (sourcePaths: string[], folderId?: string | null) => {
     const uniqueSourcePaths = Array.from(new Set(sourcePaths.map((filePath) => String(filePath || '').trim()).filter(Boolean)))

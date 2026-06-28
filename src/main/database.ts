@@ -2128,6 +2128,96 @@ export function rebuildSearchTables(): void {
   }
 }
 
+export function resetRebuildableSearchTables(): void {
+  const database = getDatabase()
+  runWithBusyRetry(() => {
+    database.exec(`
+      DROP TABLE IF EXISTS search_segments_trigram;
+      DROP TABLE IF EXISTS search_segments_fts;
+      DROP TABLE IF EXISTS pages_fts;
+      DROP TABLE IF EXISTS search_ngram_index_staging;
+      DROP TABLE IF EXISTS search_index_segments_staging;
+      DROP TABLE IF EXISTS search_ngram_index;
+      DROP TABLE IF EXISTS search_index_segments;
+      DROP TABLE IF EXISTS search_index_status;
+
+      CREATE TABLE IF NOT EXISTS search_index_segments (
+        segment_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL,
+        page_id TEXT,
+        page_num INTEGER,
+        source_kind TEXT DEFAULT 'page',
+        href TEXT,
+        title TEXT,
+        ordinal INTEGER DEFAULT 0,
+        source_start INTEGER DEFAULT 0,
+        text TEXT DEFAULT '',
+        normalized_text TEXT DEFAULT '',
+        offset_map TEXT DEFAULT '',
+        text_hash TEXT DEFAULT '',
+        updated_at TEXT,
+        FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+        FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS search_ngram_index (
+        gram TEXT NOT NULL,
+        segment_id TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        positions TEXT NOT NULL,
+        hit_count INTEGER DEFAULT 0,
+        PRIMARY KEY (gram, segment_id),
+        FOREIGN KEY (segment_id) REFERENCES search_index_segments(segment_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS search_index_segments_staging (
+        job_id TEXT NOT NULL,
+        segment_id TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        page_id TEXT,
+        page_num INTEGER,
+        source_kind TEXT DEFAULT 'page',
+        href TEXT,
+        title TEXT,
+        ordinal INTEGER DEFAULT 0,
+        source_start INTEGER DEFAULT 0,
+        text TEXT DEFAULT '',
+        normalized_text TEXT DEFAULT '',
+        offset_map TEXT DEFAULT '',
+        text_hash TEXT DEFAULT '',
+        updated_at TEXT,
+        PRIMARY KEY (job_id, segment_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS search_ngram_index_staging (
+        job_id TEXT NOT NULL,
+        gram TEXT NOT NULL,
+        segment_id TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        positions TEXT NOT NULL,
+        hit_count INTEGER DEFAULT 0,
+        PRIMARY KEY (job_id, gram, segment_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS search_index_status (
+        doc_id TEXT PRIMARY KEY,
+        status TEXT DEFAULT 'pending',
+        source_hash TEXT DEFAULT '',
+        segment_count INTEGER DEFAULT 0,
+        error_message TEXT,
+        indexed_at TEXT,
+        updated_at TEXT,
+        FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+      );
+    `)
+  })
+  ensureIndexes(database)
+  ensureFts(database)
+  rebuildFts(database)
+  searchSegmentsFtsNeedsRebuild = false
+  saveDatabase()
+}
+
 export function refreshSearchSegmentsFtsForDocument(docId: string): void {
   if (!ftsAvailable || !docId) return
   const database = getDatabase()

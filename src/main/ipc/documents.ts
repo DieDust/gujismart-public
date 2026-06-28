@@ -11,7 +11,7 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { normalizePageResult, normalizeStoredGujiOcrResultForRead } from '../ocr'
@@ -33,7 +33,7 @@ import {
   restorePdfAssetForDocumentAsync,
   setPdfRepositoryPaths,
 } from '../pdf-assets'
-import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged } from '../semantic-search'
+import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
@@ -139,6 +139,14 @@ interface DeleteDocumentsResult {
   deletedIds: string[]
   failedIds: string[]
   successCount: number
+}
+
+interface DeleteDocumentDataResult {
+  recoveredSearchIndexIssue: boolean
+}
+
+interface DeleteStepOptions {
+  recoverableSearchIndexMalformed?: boolean
 }
 
 interface PageOcrMetaRow {
@@ -271,12 +279,35 @@ async function runForIdChunksAsync(ids: string[], callback: (chunkIds: string[],
   }
 }
 
-async function timeDeleteStepAsync(label: string, callback: () => Promise<void>): Promise<void> {
+function isDatabaseMalformedError(error: unknown): boolean {
+  const record = typeof error === 'object' && error !== null ? error as { code?: unknown; message?: unknown } : {}
+  const code = String(record.code || '')
+  const message = String(record.message || error || '')
+  return code === 'SQLITE_CORRUPT'
+    || /database disk image is malformed|database malformed|malformed database/i.test(message)
+}
+
+function formatDocumentDeleteFailureMessage(error: unknown): string {
+  const message = (error as Error)?.message || String(error || '删除失败')
+  if (!isDatabaseMalformedError(error)) return message
+  return `数据库访问异常，删除未完成。通常是搜索索引或数据库页在上一次后台任务中断后进入异常状态；请重启软件后重试删除，若仍失败请到设置里执行数据库诊断/压缩或从自动备份恢复。原始错误：${message}`
+}
+
+async function timeDeleteStepAsync(label: string, callback: () => Promise<void>, options?: DeleteStepOptions): Promise<boolean> {
   const startedAt = Date.now()
-  await callback()
-  const elapsed = Date.now() - startedAt
-  if (elapsed >= DELETE_SLOW_STEP_MS) {
-    console.warn(`[Documents] Slow delete step: ${label} took ${elapsed}ms`)
+  try {
+    await callback()
+    const elapsed = Date.now() - startedAt
+    if (elapsed >= DELETE_SLOW_STEP_MS) {
+      console.warn(`[Documents] Slow delete step: ${label} took ${elapsed}ms`)
+    }
+    return true
+  } catch (error) {
+    if (options?.recoverableSearchIndexMalformed && isDatabaseMalformedError(error)) {
+      console.warn(`[Documents] Ignoring malformed rebuildable search index during delete step: ${label}`, error)
+      return false
+    }
+    throw error
   }
 }
 
@@ -298,40 +329,35 @@ async function deleteRowsByDocIdsAsync(tableName: string, docIds: string[]): Pro
 async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
   if (!isFtsAvailable()) return
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
-    const tableSelectors = [
-      {
-        tableName: 'pages_fts',
-        selectSql: `SELECT rowid FROM pages_fts WHERE doc_id IN (${placeholders}) LIMIT ?`,
-      },
-      {
-        tableName: 'search_segments_fts',
-        selectSql: `SELECT f.rowid
-                    FROM search_segments_fts f
-                    INNER JOIN search_index_segments s ON s.rowid = f.rowid
-                    WHERE s.doc_id IN (${placeholders})
-                    LIMIT ?`,
-      },
-      ...(isSearchTrigramFtsAvailable()
-        ? [{
-            tableName: 'search_segments_trigram',
-            selectSql: `SELECT f.rowid
-                        FROM search_segments_trigram f
-                        INNER JOIN search_index_segments s ON s.rowid = f.rowid
-                        WHERE s.doc_id IN (${placeholders})
-                        LIMIT ?`,
-          }]
-        : []),
-    ]
-    for (const { tableName, selectSql } of tableSelectors) {
-      while (true) {
-        const rows = queryAll<{ rowid: number }>(
-          selectSql,
-          [...chunkIds, DELETE_ROW_CHUNK_SIZE],
+    while (true) {
+      const rows = queryAll<{ rowid: number }>(
+        `SELECT rowid FROM pages_fts WHERE doc_id IN (${placeholders}) LIMIT ?`,
+        [...chunkIds, DELETE_ROW_CHUNK_SIZE],
+      )
+      if (rows.length === 0) break
+      const rowPlaceholders = rows.map(() => '?').join(', ')
+      run(`DELETE FROM pages_fts WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      await yieldToEventLoop()
+    }
+
+    if (!isSearchSegmentsFtsRebuildNeeded()) {
+      run(
+        `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+         SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id IN (${placeholders})
+           AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        chunkIds,
+      )
+      if (isSearchTrigramFtsAvailable()) {
+        run(
+          `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+           SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+           FROM search_index_segments
+           WHERE doc_id IN (${placeholders})
+             AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+          chunkIds,
         )
-        if (rows.length === 0) break
-        const rowPlaceholders = rows.map(() => '?').join(', ')
-        run(`DELETE FROM ${tableName} WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
-        await yieldToEventLoop()
       }
     }
   })
@@ -410,7 +436,7 @@ function markDocumentsDeleting(docIds: string[]): void {
 }
 
 function markDocumentsDeleteFailed(docIds: string[], error: unknown): void {
-  const message = (error as Error)?.message || String(error || '删除失败')
+  const message = formatDocumentDeleteFailureMessage(error)
   const now = new Date().toISOString()
   runForIdChunks(docIds, (chunkIds, placeholders) => {
     run(
@@ -423,12 +449,26 @@ function markDocumentsDeleteFailed(docIds: string[], error: unknown): void {
   scheduleDatabaseSave()
 }
 
-async function deleteDocumentData(docIds: string[]): Promise<void> {
-  await timeDeleteStepAsync('search_ngram_index', () => deleteRowsByDocIdsAsync('search_ngram_index', docIds))
+async function deleteDocumentData(docIds: string[]): Promise<DeleteDocumentDataResult> {
+  let recoveredSearchIndexIssue = false
+  let resetSearchIndexTables = false
+  const runSearchIndexStep = async (label: string, callback: () => Promise<void>) => {
+    let completed = await timeDeleteStepAsync(label, callback, { recoverableSearchIndexMalformed: true })
+    if (!completed && !resetSearchIndexTables) {
+      recoveredSearchIndexIssue = true
+      resetRebuildableSearchTables()
+      resetSearchIndexTables = true
+      completed = await timeDeleteStepAsync(`${label}:after-search-index-reset`, callback, { recoverableSearchIndexMalformed: true })
+    }
+    recoveredSearchIndexIssue = recoveredSearchIndexIssue || !completed
+  }
+
+  await runSearchIndexStep('search_ngram_index', () => deleteRowsByDocIdsAsync('search_ngram_index', docIds))
   await timeDeleteStepAsync('metadata_candidates', () => deleteRowsByDocIdsAsync('metadata_candidates', docIds))
   await timeDeleteStepAsync('page_ocr_versions', () => deleteRowsByDocIdsAsync('page_ocr_versions', docIds))
   await timeDeleteStepAsync('page_ai_layout_cache', () => deleteRowsByDocIdsAsync('page_ai_layout_cache', docIds))
   await timeDeleteStepAsync('page_translation_cache', () => deleteRowsByDocIdsAsync('page_translation_cache', docIds))
+  await timeDeleteStepAsync('page_translation_units', () => deleteRowsByDocIdsAsync('page_translation_units', docIds))
   await timeDeleteStepAsync('document_toc_items', () => deleteRowsByDocIdsAsync('document_toc_items', docIds))
   await timeDeleteStepAsync('reader_state', () => deleteRowsByDocIdsAsync('reader_state', docIds))
   await timeDeleteStepAsync('ai_document_summaries', () => deleteRowsByDocIdsAsync('ai_document_summaries', docIds))
@@ -438,9 +478,9 @@ async function deleteDocumentData(docIds: string[]): Promise<void> {
   await timeDeleteStepAsync('ai_chat_turns', () => deleteAiChatTurnsByDocIdsAsync(docIds))
   await timeDeleteStepAsync('ai_chat_sessions', () => deleteRowsByDocIdsAsync('ai_chat_sessions', docIds))
   await timeDeleteStepAsync('batch_queue', () => deleteRowsByDocIdsAsync('batch_queue', docIds))
-  await timeDeleteStepAsync('fts', () => deleteFtsRowsByDocIdsAsync(docIds))
-  await timeDeleteStepAsync('search_index_segments', () => deleteRowsByDocIdsAsync('search_index_segments', docIds))
-  await timeDeleteStepAsync('search_index_status', () => deleteRowsByDocIdsAsync('search_index_status', docIds))
+  await runSearchIndexStep('fts', () => deleteFtsRowsByDocIdsAsync(docIds))
+  await runSearchIndexStep('search_index_segments', () => deleteRowsByDocIdsAsync('search_index_segments', docIds))
+  await runSearchIndexStep('search_index_status', () => deleteRowsByDocIdsAsync('search_index_status', docIds))
   await timeDeleteStepAsync('pages', () => deleteRowsByDocIdsAsync('pages', docIds))
   await timeDeleteStepAsync('document_folders', () => deleteRowsByDocIdsAsync('document_folders', docIds))
   await timeDeleteStepAsync('document_tags', () => deleteRowsByDocIdsAsync('document_tags', docIds))
@@ -449,6 +489,7 @@ async function deleteDocumentData(docIds: string[]): Promise<void> {
       run(`DELETE FROM documents WHERE id IN (${placeholders})`, chunkIds)
     })
   })
+  return { recoveredSearchIndexIssue }
 }
 
 function refreshDeletedDocumentTags(tagIds: string[]): void {
@@ -469,7 +510,10 @@ function scheduleDocumentDeleteJob(docIds: string[], cleanupTasks: DeletePathTas
     setImmediate(() => {
       void (async () => {
         try {
-          await deleteDocumentData(docIds)
+          const deleteResult = await deleteDocumentData(docIds)
+          if (deleteResult.recoveredSearchIndexIssue) {
+            queueAllDocumentsReindex()
+          }
           notifySearchContentChanged()
           refreshDeletedDocumentTags(tagIds)
           cleanupDeletedDocumentFilesInBackground(cleanupTasks)
@@ -2898,7 +2942,7 @@ function repairStoredGujiOcrPageForRead(page: DocumentPage): boolean {
   if (!page.image_path || !page.ocr_result) return false
   const parsed = parseJsonRecord(page.ocr_result)
   if (!parsed) return false
-  const repaired = normalizeStoredGujiOcrResultForRead(parsed, page.image_path)
+  const repaired = normalizeStoredGujiOcrResultForRead(parsed, page.image_path, Number(page.page_num || 0) || 1)
   if (!repaired) return false
   const before = JSON.stringify(parsed)
   const after = JSON.stringify(repaired)
@@ -2908,6 +2952,12 @@ function repairStoredGujiOcrPageForRead(page: DocumentPage): boolean {
   run(
     'UPDATE pages SET ocr_result = ?, ocr_result_ref = ? WHERE id = ?',
     [prepared.value, prepared.ref, page.id],
+  )
+  run(
+    `UPDATE page_ocr_versions
+     SET ocr_result = ?, ocr_result_ref = ?, updated_at = ?
+     WHERE page_id = ? AND is_active = 1`,
+    [prepared.value, prepared.ref, new Date().toISOString(), page.id],
   )
   return true
 }
@@ -4577,6 +4627,18 @@ export function registerDocumentIpc(): void {
       ],
     )
     scheduleDatabaseSave()
+    if (nextStatus === 'ready') {
+      try {
+        ensurePageTranslationUnits(pageId)
+      } catch (error) {
+        console.warn('[Translation] Failed to migrate saved legacy cache into units', error)
+        markSearchIndexStaleForPages([pageId])
+        notifySearchContentChanged()
+      }
+    } else {
+      markSearchIndexStaleForPages([pageId])
+      notifySearchContentChanged()
+    }
     const saved = queryOne<PageTranslationCacheItem>(
       `SELECT id, doc_id, page_id, page_num, source_hash, source_text, source_text_ref, translation_text, translation_text_ref, skipped, status, error_message, model, created_at, updated_at
        FROM page_translation_cache

@@ -4,6 +4,10 @@
 
 ## 界面预览
 
+| 翻译模式：版式还原 | 翻译模式：阅读模式 |
+| --- | --- |
+| ![翻译模式版式还原](docs/images/screenshot-08-translation-layout.png) | ![翻译模式阅读模式](docs/images/screenshot-09-translation-reader.png) |
+
 ![首页](docs/images/screenshot-01-home.png)
 
 | 文件夹 | 摘录 |

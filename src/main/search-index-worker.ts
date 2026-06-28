@@ -753,6 +753,9 @@ function buildTranslationSearchIndexSegmentDrafts(sqlite: NativeDatabase, docId:
     `SELECT page_id, page_num, unit_id, block_id, unit_order, translation_text
      FROM page_translation_units
      WHERE doc_id = ?
+       AND status = 'ready'
+       AND stale = 0
+       AND skipped = 0
        AND TRIM(COALESCE(translation_text, '')) <> ''
      ORDER BY page_num, unit_order`,
     [docId],
