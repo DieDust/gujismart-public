@@ -6,25 +6,22 @@
 
 #### 改进
 
-- 优化整本 PDF 异步 OCR 流程：古籍纵排文献会优先保留飞桨/PaddleOCR 返回的安全正文，避免在保存阶段被本地结构重排误改成碎句、空白页或错误表格。
-- 增强整本 OCR 的失败页恢复：遇到缺页、失败页或质量拦截页时，会先按原 PDF 页码范围重试，再对仍失败的页面执行单页补救。
-- 增加同名飞将/PaddleOCR 参考 JSON 恢复能力，用于在质量检查命中时恢复正确页面结果，再写入数据库。
-- 改进古籍 OCR 质量检查，拦截网页元数据、机器 Token、重复短语污染、错误表格化和明显不属于当前页的内容。
-- 改进 OCR 结果保存与状态统计，整本 OCR 只有在全部页完成、且没有失败或待处理页时才标记为完成。
-- 改进标签页拥挤时的布局，打开较多页面时标签会压缩在可视区域内。
-- 新增按 OCR 块保存和展示翻译单元的基础能力，保留人工译文，并支持译文检索范围。
+- 优化整本 PDF 异步 OCR 的上传、回写和状态统计流程，减少整本处理时出现缺页、空白页、重复重试或结果未正确落库的情况。
+- 调整 OCR 结果保存逻辑，尽量保留飞桨 OCR / PaddleOCR 返回的页码、文本块和坐标信息，减少保存阶段对坐标或正文的额外改写。
+- 改进古籍 OCR 的异常内容拦截和阅读方向处理，减少纵排正文被误并入表格、横排块或无关内容的情况。
+- 改进重新 OCR 与失败页补救流程，异常页会记录到任务状态中，便于继续补跑和排查。
+- 改进翻译模式和整本翻译：按 OCR 块保存译文，翻译模式再次打开时可复用已有译文，并支持在检索中搜索译文内容。
+- 版式还原翻译改为在原 OCR 块位置显示译文，关闭翻译模式后恢复原文显示。
+- 改进标签页拥挤时的压缩显示，打开较多页面时仍尽量保留在可视区域内。
+- 改进 PDF 原图、页图资源加载与后台任务关闭流程，降低重启、退出或删除文献时的状态残留。
 
 #### 修复
 
-- 修复整本异步 OCR 后可能出现空白页、缺页、坐标错位、无意义识别内容混入正文的问题。
-- 修复古籍纵排页面被误判为表格、或局部突然变成横排后污染正文流的问题。
-- 修复 OCR 失败页只显示整本处理失败、但没有自动补救单页的问题。
-- 修复整本 OCR 结果与飞将原始返回结果不一致时，保存阶段继续写入错误结果的问题。
+- 修复已定位的整本 OCR 回写问题，包括部分页面缺失、失败状态不准确、任务进度回跳、重复补跑和无关识别内容混入正文。
+- 修复部分纵排古籍页面被误判为表格或局部横排后影响正文阅读顺序的问题。
+- 修复文献删除后搜索索引残留可能导致删除失败、检索异常或库状态不一致的问题。
+- 修复翻译模式下版式还原显示为额外译文页，而不是替换原 OCR 块的问题。
 - 修复关闭或退出应用时，OCR、批处理、导入、删除、翻译等后台任务可能在数据库关闭后继续写入的问题。
-
-#### 验证
-
-- 已用 124 页古籍样本文献完成整本 OCR 回归验证，检查无空白页、无坐标偏移、无错误表格标签，并与飞将/PaddleOCR 参考结果保持一致。
 
 #### 下载
 
@@ -35,25 +32,22 @@
 
 #### Improvements
 
-- Improved whole-PDF asynchronous OCR for vertical classic books by preserving safe PaddleOCR service text and avoiding local save-time restructuring that could create fragmented sentences, blank pages, or false tables.
-- Strengthened whole-document OCR recovery. Missing, failed, or quality-rejected pages are retried first through original-PDF page ranges, then through single-page fallback for pages that still fail.
-- Added same-name Feijiang/PaddleOCR reference JSON recovery so quality-rejected pages can be restored before database persistence.
-- Expanded classic-book OCR quality checks for web metadata, machine tokens, repeated phrase pollution, false tables, and text that clearly does not belong to the current page.
-- Improved OCR save and status accounting so a whole-document run is marked complete only when every page is completed with no failed or pending pages.
-- Improved crowded tab layout so many open tabs compress inside the visible tab bar.
-- Added a foundation for OCR-block-based translation units, preserving manual translations and supporting translation-scoped search.
+- Improved whole-PDF asynchronous OCR upload, persistence, and status accounting to reduce missing pages, blank pages, repeated retries, and unsaved page results during full-document runs.
+- Adjusted OCR persistence to preserve page numbers, text blocks, and coordinates returned by PaddleOCR as much as possible, reducing extra coordinate or text rewriting during save.
+- Improved classic-book OCR handling for anomalous content and reading direction, reducing vertical body text being merged into tables, horizontal blocks, or unrelated content.
+- Improved re-OCR and failed-page recovery tracking so affected pages are recorded for follow-up processing and diagnosis.
+- Improved translation mode and whole-book translation with OCR-block translation units. Saved translations can be reused when translation mode is reopened and included in translation-scoped search.
+- Facsimile translation now displays translated text in place on the original OCR blocks, then restores the source text when translation mode is disabled.
+- Improved crowded tab compression so more open tabs stay inside the visible area.
+- Improved PDF source/page-image resource loading and background-task shutdown to reduce stale states after restart, exit, or document deletion.
 
 #### Fixes
 
-- Fixed whole asynchronous OCR runs that could save blank pages, missing pages, shifted coordinates, or meaningless text mixed into the body.
-- Fixed vertical classic-book pages being misclassified as tables, or isolated horizontal blocks polluting the reading flow.
-- Fixed failed OCR pages showing the whole document as failed without automatically retrying the affected page.
-- Fixed save-time handling where results could diverge from the original Feijiang/PaddleOCR output and still be persisted.
+- Fixed identified whole-document OCR persistence issues around missing pages, inaccurate failed states, progress resets, duplicate recovery, and unrelated OCR text leaking into body text.
+- Fixed some vertical classic-book pages being treated as tables or local horizontal blocks that affected the reading order.
+- Fixed stale search-index entries after document deletion that could cause delete failures, search anomalies, or inconsistent library state.
+- Fixed facsimile translation rendering as an extra translated page instead of replacing the original OCR blocks.
 - Fixed shutdown handling so OCR, batch processing, import, delete, and translation jobs stop before the database is closed.
-
-#### Verification
-
-- Re-ran whole-document OCR on the 124-page classic-book sample and verified no blank pages, no coordinate drift, no false table labels, and consistency with the Feijiang/PaddleOCR reference result.
 
 #### Downloads
 
@@ -67,19 +61,11 @@
 #### 改进
 
 - 校对模式的右侧文本块列表支持拖拽重排，适合修正 OCR 在多栏、插图或复杂版式下产生的阅读顺序问题。
-- 扩大文本块拖拽热区为左侧整列，并增加行间插入提示和拖动过渡反馈，让手动重排更容易命中、更顺滑。
-- 拖放后会立即保存当前页新的阅读顺序，并同步刷新普通阅读模式、搜索和摘录读取到的文本顺序。
-- 手动顺序写入独立的 `manual_reading_order` 字段，不改 OCR 块坐标，也不影响版式还原视图的坐标排版。
-- 新增 GujiSmart OCR IR v1，将不同 OCR 引擎的结果统一为 span、line、block、paragraph、page 和 document 层级，同时保留原始坐标、来源、置信度和质量原因。
-- PDF 导入增加文本层质量预检，可区分文本型、扫描型和混合型页面，优先保留可信原生文本，并仅对需要的页面继续 OCR。
-- 阅读、搜索、翻译和纯文本导出统一从结构化 OCR 正文流派生；页眉、页脚和页码会保留在独立层，不再默认混入正文。
-- 支持在不重新调用 OCR、也不覆盖人工校对文本的情况下重建全文结构、阅读顺序和跨页关系。
-- 改进横排同栏、竖排相邻列和跨页正文的段落连续性判断，并补充图片、表格、公式、题注与脚注的父子关系。
-- OCR 质量检查现在可只裁剪并重识别低置信度、异常字符或待增强文本块，正常区域、原坐标和人工校对文本保持不变。
-- OCR 阅读流会优先采用引擎返回的方向与阅读顺序，并按整篇正文的主方向统一横排或竖排；竖排在缺少明确顺序时按从右到左排列，单个误判块不再打乱全文。
-- 旧版结构化 OCR 会在阅读时惰性转换到当前 IR，无需批量迁移；OCR IR 管线升级到 1.2.0，旧管线结果可按新规则重新派生。
-- 阅读、翻译、搜索和纯文本导出统一使用段落级阅读流，校对编辑和版式还原仍保留原始块与坐标。
-- 新增 Paddle、视觉模型和混合 OCR 的固定基准样本，持续检查横排、竖排、富内容关系、正文流和质量报告。
+- 扩大文本块拖拽热区，并增加行间插入提示和拖动反馈，让手动重排更容易命中。
+- 拖放后会保存当前页新的阅读顺序，并同步刷新普通阅读模式、搜索和摘录读取到的文本顺序。
+- 手动顺序写入独立字段，不改 OCR 块坐标，也不影响版式还原视图的坐标排版。
+- PDF 导入增加文本层质量预检，优先保留可用原生文本，扫描页再进入 OCR 流程。
+- 阅读、搜索、翻译和纯文本导出统一使用结构化正文流；校对编辑和版式还原仍保留原始块与坐标。
 - 首页新增“文件夹”入口卡片，可直接进入文件夹页面，让欢迎页功能入口形成完整两行布局。
 - 优化文件夹页和文献库的框选多选体验：多选框会跟随滚动内容移动，拖到边缘时会自动滚动，空白处点击可退出多选。
 - 文件夹页新增“全选已加载”“反选”和 Ctrl/Shift 多选提示，使操作更接近系统文件管理器。
@@ -90,29 +76,20 @@
 
 - 修复文本块拖拽完成后高亮可能落到目标位置原有文本块的问题；现在高亮会继续跟随被拖动的同一个文本块。
 
-#### 下载
+#### 发布说明
 
-- `GujiSmart-1.0.6-Setup-x64.exe`：适合普通 Windows 安装。
-- `GujiSmart-1.0.6-Portable-x64.exe`：适合免安装便携使用。
+- 1.0.6 未单独上传发行包；以上改动随 1.0.7 的安装版和便携版一并提供。
 
 ### English
 
 #### Improvements
 
 - Added drag-and-drop reordering for OCR text blocks in the proofing text list, useful for correcting reading-order issues from multi-column pages, figures, or complex layouts.
-- Expanded the drag hit area to a full left-side lane with insertion indicators and smoother row transitions.
-- Dropping a block now immediately saves the current page's reading order and refreshes the text order used by normal reading mode, search, and excerpts.
-- Manual order is stored in a separate `manual_reading_order` field, leaving OCR block coordinates and the facsimile/layout restoration view unchanged.
-- Added GujiSmart OCR IR v1, normalizing OCR engines into span, line, block, paragraph, page, and document layers while retaining coordinates, provenance, confidence, and quality reasons.
-- Added PDF text-layer quality preflight to distinguish native-text, scanned, and mixed pages, preserving trustworthy native text and OCRing only pages that need it.
-- Reading, search, translation, and plain-text export now derive from the same structured OCR body flow; headers, footers, and page numbers remain available without entering the default body text.
-- Added full-document structure rebuilding without another OCR request and without overwriting manually proofread text.
-- Improved paragraph continuity for same-column horizontal text, adjacent vertical columns, and cross-page body text, with richer parent-child links among images, tables, formulas, captions, and footnotes.
-- OCR quality checks can now crop and rerecognize only low-confidence, invalid-character, or enhancement-needed text blocks while preserving unaffected regions, source coordinates, and proofread text.
-- OCR reading flow now prioritizes engine-provided orientation and reading order, then normalizes body text to the document's dominant horizontal or vertical direction. Vertical fallback runs right to left, so isolated misclassified blocks no longer disrupt the document.
-- Legacy structured OCR is now lazily converted to the current IR during reading without a bulk migration; OCR IR pipeline 1.2.0 can rederive older pipeline output with current rules.
-- Reading, translation, search, and plain-text export now share a paragraph-level reading flow, while proofing and facsimile restoration retain original blocks and coordinates.
-- Added fixed Paddle, vision-model, and hybrid OCR benchmarks covering horizontal text, vertical columns, rich-content relationships, body flow, and quality reports.
+- Expanded the drag hit area with insertion hints and drag feedback so manual reordering is easier to target.
+- Dropping a block saves the current page's reading order and refreshes the text order used by normal reading mode, search, and excerpts.
+- Manual order is stored separately, leaving OCR block coordinates and the facsimile/layout restoration view unchanged.
+- Added PDF text-layer quality preflight, preserving usable native text first and sending scanned pages through OCR.
+- Reading, search, translation, and plain-text export now share the structured body flow, while proofing and facsimile restoration retain original blocks and coordinates.
 - Added a Folders entry card to the welcome page, linking directly to the folder overview and completing the two-row shortcut layout.
 - Improved drag multi-select in the Folders page and Library: the marquee is anchored to the scrolling content, edge-dragging auto-scrolls, and blank-space clicks exit multi-select.
 - Added "select loaded", invert selection, and Ctrl/Shift selection hints in the Folders page for a more Explorer-like workflow.
@@ -123,10 +100,9 @@
 
 - Fixed the active highlight after dragging a text block so it stays on the dragged block instead of the block that previously occupied the drop position.
 
-#### Downloads
+#### Release Note
 
-- `GujiSmart-1.0.6-Setup-x64.exe` for normal Windows installation.
-- `GujiSmart-1.0.6-Portable-x64.exe` for portable use.
+- 1.0.6 was not published as a separate package. These changes are included in the 1.0.7 installer and portable builds.
 
 ## 1.0.5 - 2026-06-23
 
