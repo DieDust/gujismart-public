@@ -13,6 +13,7 @@
 - 改进翻译模式和整本翻译：按 OCR 块保存译文，翻译模式再次打开时可复用已有译文，并支持在检索中搜索译文内容。
 - 版式还原翻译改为在原 OCR 块位置显示译文，关闭翻译模式后恢复原文显示。
 - 改进标签页拥挤时的压缩显示，打开较多页面时仍尽量保留在可视区域内。
+- 补充首页文件夹入口、文件夹页框选多选和工作区恢复等体验调整，这些改动随 1.0.7 一并进入公开发行版。
 - 改进 PDF 原图、页图资源加载与后台任务关闭流程，降低重启、退出或删除文献时的状态残留。
 
 #### 修复
@@ -39,6 +40,7 @@
 - Improved translation mode and whole-book translation with OCR-block translation units. Saved translations can be reused when translation mode is reopened and included in translation-scoped search.
 - Facsimile translation now displays translated text in place on the original OCR blocks, then restores the source text when translation mode is disabled.
 - Improved crowded tab compression so more open tabs stay inside the visible area.
+- Included home-folder entry, folder multi-select, and workspace restoration improvements in the 1.0.7 public release.
 - Improved PDF source/page-image resource loading and background-task shutdown to reduce stale states after restart, exit, or document deletion.
 
 #### Fixes
@@ -64,13 +66,8 @@
 - 扩大文本块拖拽热区，并增加行间插入提示和拖动反馈，让手动重排更容易命中。
 - 拖放后会保存当前页新的阅读顺序，并同步刷新普通阅读模式、搜索和摘录读取到的文本顺序。
 - 手动顺序写入独立字段，不改 OCR 块坐标，也不影响版式还原视图的坐标排版。
-- PDF 导入增加文本层质量预检，优先保留可用原生文本，扫描页再进入 OCR 流程。
-- 阅读、搜索、翻译和纯文本导出统一使用结构化正文流；校对编辑和版式还原仍保留原始块与坐标。
-- 首页新增“文件夹”入口卡片，可直接进入文件夹页面，让欢迎页功能入口形成完整两行布局。
-- 优化文件夹页和文献库的框选多选体验：多选框会跟随滚动内容移动，拖到边缘时会自动滚动，空白处点击可退出多选。
-- 文件夹页新增“全选已加载”“反选”和 Ctrl/Shift 多选提示，使操作更接近系统文件管理器。
-- 新增工作区自动保存与恢复：退出软件后重新打开，会恢复此前打开的标签页、标签顺序、当前标签、文献目标、文件夹位置和侧栏折叠状态。
-- 工作区只保存轻量导航信息，不写入 OCR 全文或检索结果大对象；文献阅读进度继续使用现有阅读状态单独恢复。
+- PDF 导入增加文本层预检基础能力，优先保留可用原生文本，扫描页再进入 OCR 流程。
+- 阅读、搜索和纯文本导出改为使用更稳定的结构化正文流；校对编辑和版式还原仍保留原始块与坐标。
 
 #### 修复
 
@@ -78,7 +75,7 @@
 
 #### 发布说明
 
-- 1.0.6 未单独上传发行包；以上改动随 1.0.7 的安装版和便携版一并提供。
+- 1.0.6 是 1.0.7 之前的过渡版本，未单独上传发行包；以上核心改动随 1.0.7 的安装版和便携版一并提供。
 
 ### English
 
@@ -88,13 +85,8 @@
 - Expanded the drag hit area with insertion hints and drag feedback so manual reordering is easier to target.
 - Dropping a block saves the current page's reading order and refreshes the text order used by normal reading mode, search, and excerpts.
 - Manual order is stored separately, leaving OCR block coordinates and the facsimile/layout restoration view unchanged.
-- Added PDF text-layer quality preflight, preserving usable native text first and sending scanned pages through OCR.
-- Reading, search, translation, and plain-text export now share the structured body flow, while proofing and facsimile restoration retain original blocks and coordinates.
-- Added a Folders entry card to the welcome page, linking directly to the folder overview and completing the two-row shortcut layout.
-- Improved drag multi-select in the Folders page and Library: the marquee is anchored to the scrolling content, edge-dragging auto-scrolls, and blank-space clicks exit multi-select.
-- Added "select loaded", invert selection, and Ctrl/Shift selection hints in the Folders page for a more Explorer-like workflow.
-- Added automatic workspace persistence and restoration. Reopening the app restores open tabs, tab order, the active tab, document targets, folder context, and sidebar collapse state.
-- Workspace snapshots store only lightweight navigation data, excluding OCR text and large search-result objects; document reading progress continues to restore through the existing reader-state storage.
+- Added the foundation for PDF text-layer preflight, preserving usable native text first and sending scanned pages through OCR.
+- Reading, search, and plain-text export now use a more stable structured body flow, while proofing and facsimile restoration retain original blocks and coordinates.
 
 #### Fixes
 
@@ -102,7 +94,7 @@
 
 #### Release Note
 
-- 1.0.6 was not published as a separate package. These changes are included in the 1.0.7 installer and portable builds.
+- 1.0.6 was a transitional version before 1.0.7 and was not published as a separate package. These core changes are included in the 1.0.7 installer and portable builds.
 
 ## 1.0.5 - 2026-06-23
 
