@@ -17,16 +17,20 @@ function hasLikelyHardcodedPrivateDocId(source) {
   return /\b(?:docId|documentId|pageId|sourceId|id)\b\s*[:=]\s*['"][A-Za-z0-9_-]{20,}['"]/.test(source)
 }
 
+function readSource(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n')
+}
+
 const root = path.join(__dirname, '..')
-const ocrIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
-const ocrCoreSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr.ts'), 'utf8')
-const ocrTextSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'utils', 'ocrText.ts'), 'utf8')
-const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
-const libraryViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
-const textEditorSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'TextEditor.tsx'), 'utf8')
-const semanticSearchSource = fs.readFileSync(path.join(root, 'src', 'main', 'semantic-search.ts'), 'utf8')
-const searchIndexConstantsSource = fs.readFileSync(path.join(root, 'src', 'main', 'search-index-constants.ts'), 'utf8')
-const pdfAssetsSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-assets.ts'), 'utf8')
+const ocrIpcSource = readSource(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'))
+const ocrCoreSource = readSource(path.join(root, 'src', 'main', 'ocr.ts'))
+const ocrTextSource = readSource(path.join(root, 'src', 'renderer', 'src', 'utils', 'ocrText.ts'))
+const documentViewSource = readSource(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'))
+const libraryViewSource = readSource(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'))
+const textEditorSource = readSource(path.join(root, 'src', 'renderer', 'src', 'components', 'TextEditor.tsx'))
+const semanticSearchSource = readSource(path.join(root, 'src', 'main', 'semantic-search.ts'))
+const searchIndexConstantsSource = readSource(path.join(root, 'src', 'main', 'search-index-constants.ts'))
+const pdfAssetsSource = readSource(path.join(root, 'src', 'main', 'pdf-assets.ts'))
 const markSearchIndexStaleForDocumentsBody = sliceBetween(
   semanticSearchSource,
   'export function markSearchIndexStaleForDocuments',

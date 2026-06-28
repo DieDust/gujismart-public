@@ -13,8 +13,12 @@ function sliceBetween(source, startMarker, endMarker, label) {
   return source.slice(start, end)
 }
 
+function readSource(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n')
+}
+
 const root = path.join(__dirname, '..')
-const batchSource = fs.readFileSync(path.join(root, 'src', 'main', 'batch-processor.ts'), 'utf8')
+const batchSource = readSource(path.join(root, 'src', 'main', 'batch-processor.ts'))
 const savePageResultsBody = sliceBetween(
   batchSource,
   'private async savePageResults',

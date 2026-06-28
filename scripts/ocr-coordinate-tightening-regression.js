@@ -13,18 +13,22 @@ function sliceBetween(source, startMarker, endMarker, label) {
   return source.slice(start, end)
 }
 
+function readSource(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n')
+}
+
 const root = path.resolve(__dirname, '..')
-const ocrSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr.ts'), 'utf8')
-const ocrIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
-const batchSource = fs.readFileSync(path.join(root, 'src', 'main', 'batch-processor.ts'), 'utf8')
-const ocrIrSource = fs.readFileSync(path.join(root, 'src', 'shared', 'ocr-ir.ts'), 'utf8')
-const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
-const imageViewerSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'ImageViewer.tsx'), 'utf8')
-const overlayProofreaderSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'OverlayProofreader.tsx'), 'utf8')
-const facsimileProofreaderSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'GujiFacsimileProofreader.tsx'), 'utf8')
-const sourcePageReaderSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'SourcePageReader.tsx'), 'utf8')
-const exportSource = fs.readFileSync(path.join(root, 'src', 'main', 'export.ts'), 'utf8')
-const pdfAssetsSource = fs.readFileSync(path.join(root, 'src', 'main', 'pdf-assets.ts'), 'utf8')
+const ocrSource = readSource(path.join(root, 'src', 'main', 'ocr.ts'))
+const ocrIpcSource = readSource(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'))
+const batchSource = readSource(path.join(root, 'src', 'main', 'batch-processor.ts'))
+const ocrIrSource = readSource(path.join(root, 'src', 'shared', 'ocr-ir.ts'))
+const documentViewSource = readSource(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'))
+const imageViewerSource = readSource(path.join(root, 'src', 'renderer', 'src', 'components', 'ImageViewer.tsx'))
+const overlayProofreaderSource = readSource(path.join(root, 'src', 'renderer', 'src', 'components', 'OverlayProofreader.tsx'))
+const facsimileProofreaderSource = readSource(path.join(root, 'src', 'renderer', 'src', 'components', 'GujiFacsimileProofreader.tsx'))
+const sourcePageReaderSource = readSource(path.join(root, 'src', 'renderer', 'src', 'components', 'SourcePageReader.tsx'))
+const exportSource = readSource(path.join(root, 'src', 'main', 'export.ts'))
+const pdfAssetsSource = readSource(path.join(root, 'src', 'main', 'pdf-assets.ts'))
 
 const postProcessBody = sliceBetween(
   ocrSource,
