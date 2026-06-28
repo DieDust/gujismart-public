@@ -13,12 +13,16 @@ function sliceBetween(source, startMarker, endMarker, label) {
   return source.slice(start, end)
 }
 
+function readSource(filePath) {
+  return fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n')
+}
+
 const root = path.join(__dirname, '..')
-const ocrSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr.ts'), 'utf8')
-const ocrIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'), 'utf8')
-const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
-const librarySource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
-const batchProcessorSource = fs.readFileSync(path.join(root, 'src', 'main', 'batch-processor.ts'), 'utf8')
+const ocrSource = readSource(path.join(root, 'src', 'main', 'ocr.ts'))
+const ocrIpcSource = readSource(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'))
+const documentViewSource = readSource(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'))
+const librarySource = readSource(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'))
+const batchProcessorSource = readSource(path.join(root, 'src', 'main', 'batch-processor.ts'))
 const uploadBlobHelper = sliceBetween(
   ocrSource,
   'async function createPdfUploadBlob',
