@@ -785,8 +785,18 @@ function getPageSourceSize(page?: ReaderSourcePage): { width: number; height: nu
   const parsed = parseMaybeRecord(page?.ocr_result)
   const gujiProcessing = readRecordValue(parsed, 'guji_processing')
   const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+  const imageFallbackAllowed = readRecordValue(gujiProcessing, 'service_coordinate_size_source') === 'page_image_fallback'
   const candidates = preserveServiceCoordinates
-    ? [
+    ? (imageFallbackAllowed ? [
+      {
+        width: readRecordValue(gujiProcessing, 'source_image_width'),
+        height: readRecordValue(gujiProcessing, 'source_image_height'),
+      },
+      { width: parsed.source_image_width, height: parsed.source_image_height },
+      { width: parsed.page_width, height: parsed.page_height },
+      { width: parsed.image_width, height: parsed.image_height },
+      { width: parsed.width, height: parsed.height },
+    ] : [
       { width: parsed.page_width, height: parsed.page_height },
       { width: parsed.image_width, height: parsed.image_height },
       { width: parsed.source_image_width, height: parsed.source_image_height },
@@ -795,7 +805,7 @@ function getPageSourceSize(page?: ReaderSourcePage): { width: number; height: nu
         height: readRecordValue(gujiProcessing, 'source_image_height'),
       },
       { width: parsed.width, height: parsed.height },
-    ]
+    ])
     : [
       {
         width: readRecordValue(gujiProcessing, 'source_image_width'),

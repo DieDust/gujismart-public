@@ -61,6 +61,12 @@ const savePageOcrResultsBody = sliceBetween(
   'async function savePageOcrResultsBatched',
   'OCR page result save body',
 )
+const normalizeOcrResultForStorageBody = sliceBetween(
+  ocrIpcSource,
+  'function normalizeOcrResultForStorage',
+  'function getRegionResultText',
+  'OCR storage normalization body',
+)
 const savePageQualityFailureOcrErrorBody = sliceBetween(
   ocrIpcSource,
   'async function savePageQualityFailureOcrError',
@@ -267,7 +273,7 @@ assert(
     && ocrIpcSource.includes("text_source: 'paddle_markdown'")
     && ocrIpcSource.includes('const preferredGujiText = gujiOptions')
     && ocrIpcSource.includes('|| getPreferredGujiServiceText(normalized)')
-    && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(result)')
+    && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(sizeNormalizedResult)')
     && ocrIpcSource.includes('const storageResult = gujiOptions && preferredGujiText')
     && reprocessDocumentOcrStructureBody.includes('getGujiOcrOptionsForResult(sourceResult)')
     && reprocessDocumentOcrStructureBody.includes('? getPreferredGujiServiceText(sourceResult)')
@@ -277,13 +283,26 @@ assert(
   'Guji OCR saves should preserve PaddleOCR markdown text as the page text instead of overwriting it with IR paragraph reconstruction.',
 )
 assert(
+  ocrCoreSource.includes('serviceCoordinateFallbackSize?: { width: number; height: number } | null')
+    && ocrCoreSource.includes('service_coordinate_fallback_width: fallbackSize.width')
+    && ocrCoreSource.includes('service_coordinate_size_source: hasServiceSize ? \'service\' : hasFallbackSize ? \'page_image_fallback\' : \'missing\'')
+    && ocrCoreSource.includes('source_image_width: sourceImageWidth')
+    && ocrCoreSource.includes('source_image_height: sourceImageHeight')
+    && ocrIpcSource.includes('function ensureServiceCoordinatePageSizeForStorage')
+    && normalizeOcrResultForStorageBody.includes('const sizeNormalizedResult = isJsonRecord(result)')
+    && normalizeOcrResultForStorageBody.includes('const irSize = getStoredOcrIrSize(sizeNormalizedResult, page?.image_path)')
+    && normalizeOcrResultForStorageBody.includes('ensureOcrResultIr(sizeNormalizedResult')
+    && normalizeOcrResultForStorageBody.includes('getUsableGujiAsyncPdfServiceText(sizeNormalizedResult)'),
+  'Async PDF OCR storage should preserve service coordinates while writing an explicit page-image coordinate size when PaddleOCR omits one.',
+)
+assert(
   ocrIpcSource.includes('function getUsableGujiAsyncPdfServiceText')
     && ocrIpcSource.includes('function getGujiAsyncPdfRetryableQualityIssue')
     && ocrIpcSource.includes('formatAsyncPdfRetryableQualityIssue(formatSuspiciousRepeatedOcrTextIssue(repeatedIssue))')
     && ocrIpcSource.includes('delete metadata.ocr_last_quality_issue')
     && ocrIpcSource.includes('hasGujiWebMetadataHallucination(candidate)')
     && ocrIpcSource.includes('hasGujiMachineTokenHallucination(candidate)')
-    && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(result)')
+    && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(sizeNormalizedResult)')
     && ocrIpcSource.includes('gujismart_async_pdf_result: true')
     && ocrIpcSource.includes('pageResult.result.gujismart_async_pdf_result === true')
     && postProcessPdfOcrResultsBatchedBody.includes("if (ocrOptions.profile === 'guji_print_vertical') {")

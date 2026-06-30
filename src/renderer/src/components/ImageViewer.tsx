@@ -9,6 +9,16 @@ import {
   LeftOutlined,
   RightOutlined,
 } from '@ant-design/icons'
+import {
+  getInkAdjustedOcrRect,
+  getOcrBlockRect,
+  getOcrBoxSourceDimension,
+  getOcrCoordinateExtent,
+  getOcrCoordinateScale,
+  resolveOcrCoordinateSourceSizeForImage,
+  scaleOcrBlockRect,
+  type OcrCoordinateScale,
+} from '../utils/ocrCoordinates'
 
 export interface ViewerViewport {
   scale: number
@@ -32,10 +42,7 @@ interface ImageViewerProps {
   onViewportChange?: (viewport: ViewerViewport) => void
 }
 
-interface BoxCoordinateScale {
-  scaleX: number
-  scaleY: number
-}
+type BoxCoordinateScale = OcrCoordinateScale
 
 type JsonRecord = Record<string, unknown>
 type ImageViewerOcrBox = JsonRecord
@@ -54,67 +61,11 @@ const DEFAULT_VIEWPORT: ViewerViewport = {
   rotation: 0,
 }
 
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function getPointCoordinate(point: unknown, key: 'x' | 'y', tupleIndex: number): number {
-  if (isRecord(point)) return Number(point[key])
-  if (Array.isArray(point)) return Number(point[tupleIndex])
-  return Number.NaN
-}
-
-function getBoxSourceDimension(boxes: ImageViewerOcrBox[], keys: string[]): number {
-  for (const box of boxes) {
-    for (const key of keys) {
-      const value = Number(box[key] || 0)
-      if (Number.isFinite(value) && value > 0) return value
-    }
-  }
-  return 0
-}
-
 function getBoxRect(box: ImageViewerOcrBox, coordinateScale: BoxCoordinateScale = { scaleX: 1, scaleY: 1 }): BoxRect | null {
-  const loc = box?.location || box?.rect || box?.points || box?.block_bbox || box?.bbox || box?.box || box?.coordinate || box?.coordinate_box || box?.poly || box?.polygon
-  if (!loc) return null
-
-  if (isRecord(loc) && (loc.left !== undefined || loc.top !== undefined || loc.width !== undefined || loc.height !== undefined)) {
-    return {
-      x: Number(loc.left ?? loc.x ?? 0) * coordinateScale.scaleX,
-      y: Number(loc.top ?? loc.y ?? 0) * coordinateScale.scaleY,
-      width: Number(loc.width ?? 0) * coordinateScale.scaleX,
-      height: Number(loc.height ?? 0) * coordinateScale.scaleY,
-    }
-  }
-
-  if (Array.isArray(loc) && loc.length >= 4) {
-    if (typeof loc[0] === 'number') {
-      const numbers = loc.map(Number)
-      const xs = numbers.length >= 8 ? [numbers[0], numbers[2], numbers[4], numbers[6]] : [numbers[0], numbers[2]]
-      const ys = numbers.length >= 8 ? [numbers[1], numbers[3], numbers[5], numbers[7]] : [numbers[1], numbers[3]]
-      const x = Math.min(...xs) * coordinateScale.scaleX
-      const y = Math.min(...ys) * coordinateScale.scaleY
-      return {
-        x,
-        y,
-        width: (Math.max(...xs) - Math.min(...xs)) * coordinateScale.scaleX,
-        height: (Math.max(...ys) - Math.min(...ys)) * coordinateScale.scaleY,
-      }
-    }
-    const xs = loc.map((point) => getPointCoordinate(point, 'x', 0) * coordinateScale.scaleX).filter(Number.isFinite)
-    const ys = loc.map((point) => getPointCoordinate(point, 'y', 1) * coordinateScale.scaleY).filter(Number.isFinite)
-    if (xs.length === 0 || ys.length === 0) return null
-    const x = Math.min(...xs)
-    const y = Math.min(...ys)
-    return {
-      x,
-      y,
-      width: Math.max(...xs) - x,
-      height: Math.max(...ys) - y,
-    }
-  }
-
-  return null
+  const rect = getOcrBlockRect(box)
+  if (!rect) return null
+  const scaled = scaleOcrBlockRect(rect, coordinateScale)
+  return { x: scaled.left, y: scaled.top, width: scaled.width, height: scaled.height }
 }
 
 export default function ImageViewer({
@@ -135,6 +86,7 @@ export default function ImageViewer({
   const [viewportState, setViewportState] = useState<ViewerViewport>(DEFAULT_VIEWPORT)
   const [isDragging, setIsDragging] = useState(false)
   const [renderedImageSize, setRenderedImageSize] = useState({ width: 0, height: 0 })
+  const [inkAdjustedBoxRects, setInkAdjustedBoxRects] = useState<Record<number, BoxRect>>({})
   const dragStart = useRef({ x: 0, y: 0, centerX: 0, centerY: 0 })
   const mouseDownPos = useRef({ x: 0, y: 0 })
   const imageSize = useRef({ width: 0, height: 0 })
@@ -151,28 +103,28 @@ export default function ImageViewer({
 
     const explicitWidth = Number(
       coordinateSourceSize?.width
-      || getBoxSourceDimension(ocrBoxes, ['source_image_width', 'image_width', 'page_width'])
+      || getOcrBoxSourceDimension(ocrBoxes, ['source_image_width', 'image_width', 'page_width'])
       || 0
     )
     const explicitHeight = Number(
       coordinateSourceSize?.height
-      || getBoxSourceDimension(ocrBoxes, ['source_image_height', 'image_height', 'page_height'])
+      || getOcrBoxSourceDimension(ocrBoxes, ['source_image_height', 'image_height', 'page_height'])
       || 0
     )
+    const resolvedSourceSize = resolveOcrCoordinateSourceSizeForImage(
+      {
+        width: explicitWidth,
+        height: explicitHeight,
+        preserveServiceCoordinates: coordinateSourceSize?.preserveServiceCoordinates,
+      },
+      { width: imageWidth, height: imageHeight },
+      getOcrCoordinateExtent(ocrBoxes),
+    )
 
-    const sourceWidth = explicitWidth > 0 ? explicitWidth : 0
-    const sourceHeight = explicitHeight > 0 ? explicitHeight : 0
-    if (!sourceWidth || !sourceHeight) return { scaleX: 1, scaleY: 1 }
-
-    const widthRatio = sourceWidth / imageWidth
-    const heightRatio = sourceHeight / imageHeight
-    const shouldScale = widthRatio > 1.08 || heightRatio > 1.08 || widthRatio < 0.92 || heightRatio < 0.92
-    if (!shouldScale) return { scaleX: 1, scaleY: 1 }
-
-    return {
-      scaleX: imageWidth / sourceWidth,
-      scaleY: imageHeight / sourceHeight,
-    }
+    return getOcrCoordinateScale(
+      { width: imageWidth, height: imageHeight },
+      resolvedSourceSize,
+    )
   }, [coordinateSourceSize?.height, coordinateSourceSize?.preserveServiceCoordinates, coordinateSourceSize?.width, ocrBoxes, renderedImageSize.height, renderedImageSize.width, src])
 
   useEffect(() => {
@@ -211,18 +163,59 @@ export default function ImageViewer({
   }, [fitToScreen, src])
 
   useEffect(() => {
+    let canceled = false
+    setInkAdjustedBoxRects({})
+    if (!src || !hasCoordinates || !renderedImageSize.width || !renderedImageSize.height || ocrBoxes.length === 0) return undefined
+    if (renderedImageSize.width * renderedImageSize.height > 16_000_000) return undefined
+
+    const img = new Image()
+    img.onload = () => {
+      if (canceled) return
+      const canvas = document.createElement('canvas')
+      canvas.width = img.width
+      canvas.height = img.height
+      const context = canvas.getContext('2d', { willReadFrequently: true })
+      if (!context) return
+      context.drawImage(img, 0, 0)
+      const imageData = context.getImageData(0, 0, canvas.width, canvas.height)
+      const nextRects: Record<number, BoxRect> = {}
+      ocrBoxes.forEach((box, index) => {
+        const rect = getBoxRect(box, boxCoordinateScale)
+        if (!rect) return
+        const adjusted = getInkAdjustedOcrRect(
+          { data: imageData.data, width: imageData.width, height: imageData.height },
+          { left: rect.x, top: rect.y, width: rect.width, height: rect.height },
+          {
+            label: box.label || box.block_label || box.type,
+            text: box.words || box.word || box.text,
+          },
+        )
+        if (!adjusted) return
+        nextRects[index] = { x: adjusted.left, y: adjusted.top, width: adjusted.width, height: adjusted.height }
+      })
+      if (!canceled) setInkAdjustedBoxRects(nextRects)
+      canvas.width = 1
+      canvas.height = 1
+    }
+    img.src = src
+    return () => {
+      canceled = true
+    }
+  }, [boxCoordinateScale.scaleX, boxCoordinateScale.scaleY, hasCoordinates, ocrBoxes, renderedImageSize.height, renderedImageSize.width, src])
+
+  useEffect(() => {
     if (activeBoxIndex === lastFocusedBoxRef.current) return
     lastFocusedBoxRef.current = activeBoxIndex
     if (activeBoxIndex < 0 || !imageSize.current.width || !ocrBoxes[activeBoxIndex]) return
     const box = ocrBoxes[activeBoxIndex]
-    const rect = getBoxRect(box, boxCoordinateScale)
+    const rect = inkAdjustedBoxRects[activeBoxIndex] || getBoxRect(box, boxCoordinateScale)
     if (!rect) return
     updateViewport({
       ...latestViewportRef.current,
       centerX: rect.x + rect.width / 2,
       centerY: rect.y + rect.height / 2,
     })
-  }, [activeBoxIndex, ocrBoxes, updateViewport])
+  }, [activeBoxIndex, boxCoordinateScale, inkAdjustedBoxRects, ocrBoxes, updateViewport])
 
   useEffect(() => {
     if (!isDragging) return undefined
@@ -304,7 +297,7 @@ export default function ImageViewer({
 
     if (hasCoordinates) {
       return ocrBoxes.map((box, index) => {
-        const rect = getBoxRect(box, boxCoordinateScale)
+        const rect = inkAdjustedBoxRects[index] || getBoxRect(box, boxCoordinateScale)
         if (!rect) return null
 
         const isActive = activeBoxIndex === index

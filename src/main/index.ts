@@ -158,7 +158,12 @@ app.setPath('userData', profileRoot)
 app.commandLine.appendSwitch('disable-logging')
 app.commandLine.appendSwitch('log-level', '3')
 
-if (process.platform === 'win32' || process.env.GUJISMART_SMOKE === '1') {
+const enableGpuOnWindows = process.env.GUJISMART_ENABLE_GPU === '1'
+const forceDisableGpu = process.env.GUJISMART_SMOKE === '1'
+  || process.env.GUJISMART_DISABLE_GPU === '1'
+  || (process.platform === 'win32' && !enableGpuOnWindows)
+
+if (forceDisableGpu) {
   app.disableHardwareAcceleration()
   app.commandLine.appendSwitch('disable-gpu')
   app.commandLine.appendSwitch('disable-gpu-compositing')

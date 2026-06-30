@@ -13,6 +13,7 @@ let autoBackupTimer: ReturnType<typeof setInterval> | null = null
 let autoBackupRunning = false
 const MIN_AUTO_BACKUP_SLOT_COUNT = 1
 const AUTO_BACKUP_SLOT_COUNT = 3
+const AUTO_BACKUP_CHECK_INTERVAL_MS = 10 * 60 * 1000
 const BACKUP_ARCHIVE_EXTENSION = '.zip'
 
 interface DocumentListCsvRow {
@@ -276,6 +277,14 @@ function getAutoBackupSlotCount(): number {
 
 function getAutoBackupIncludeStorage(): boolean {
   return readSetting('auto_backup_include_storage', 'true') !== 'false'
+}
+
+function getAutoBackupScheduleState(): { enabled: boolean; intervalHours: number; lastBackupAt: string | null } {
+  return {
+    enabled: readSetting('auto_backup_enabled', 'true') !== 'false',
+    intervalHours: Number.parseInt(readSetting('auto_backup_interval_hours', '24'), 10) || 24,
+    lastBackupAt: readSetting('auto_backup_last_at', '') || null,
+  }
 }
 
 function copyStorageForBackup(dataDir: string, backupDir: string, includeFullStorage: boolean): void {
@@ -563,8 +572,14 @@ export function startAutoBackupScheduler(): void {
     autoBackupTimer = null
   }
 
+  const initialStatus = getAutoBackupScheduleState()
+  if (initialStatus.enabled && !initialStatus.lastBackupAt) {
+    writeSetting('auto_backup_last_at', new Date().toISOString())
+    saveDatabase()
+  }
+
   const tick = () => {
-    const status = getBackupStatus()
+    const status = getAutoBackupScheduleState()
     if (!status.enabled) return
     if (!status.lastBackupAt) {
       writeSetting('auto_backup_last_at', new Date().toISOString())
@@ -578,8 +593,7 @@ export function startAutoBackupScheduler(): void {
     }
   }
 
-  tick()
-  autoBackupTimer = setInterval(tick, 10 * 60 * 1000)
+  autoBackupTimer = setInterval(tick, AUTO_BACKUP_CHECK_INTERVAL_MS)
 }
 
 export function stopAutoBackupScheduler(): void {

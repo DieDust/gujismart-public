@@ -170,6 +170,7 @@ const DEFAULT_OCR_MAX_IMAGE_SIDE = 2200
 const MAX_OCR_MAX_IMAGE_SIDE = 4096
 const DEFAULT_OCR_JPEG_QUALITY = 82
 const ASYNC_PDF_PAGE_THRESHOLD = 1
+const OCR_LOCAL_IMAGE_COORDINATE_ALIGNMENT_VERSION = 1
 const ASYNC_PDF_MAX_FILE_SIZE = 50 * 1024 * 1024
 const ASYNC_PDF_TARGET_CHUNK_SIZE = 49 * 1024 * 1024
 const ASYNC_PDF_HEAVY_TARGET_CHUNK_SIZE = 32 * 1024 * 1024
@@ -1412,14 +1413,145 @@ function rotateClockwiseCoordinatePointToSource(point: { x: number; y: number },
 
 function markServiceCoordinatesPreserved(result: OcrResultPayload): OcrResultPayload {
   const dimensions = getCoordinateSourceDimensions(result)
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  const fallbackWidth = finiteNumber(readRecordValue(gujiProcessing, 'service_coordinate_fallback_width'))
+  const fallbackHeight = finiteNumber(readRecordValue(gujiProcessing, 'service_coordinate_fallback_height'))
+  const hasServiceSize = Boolean(dimensions.width && dimensions.height)
+  const hasFallbackSize = Boolean(fallbackWidth && fallbackHeight && fallbackWidth > 0 && fallbackHeight > 0)
+  const sourceImageWidth = dimensions.width || readRecordValue(result, 'source_image_width') || fallbackWidth || null
+  const sourceImageHeight = dimensions.height || readRecordValue(result, 'source_image_height') || fallbackHeight || null
   return {
     ...result,
-    source_image_width: dimensions.width || readRecordValue(result, 'source_image_width') || null,
-    source_image_height: dimensions.height || readRecordValue(result, 'source_image_height') || null,
+    source_image_width: sourceImageWidth,
+    source_image_height: sourceImageHeight,
     guji_processing: {
-      ...(isJsonRecord(result.guji_processing) ? result.guji_processing : {}),
+      ...gujiProcessing,
+      source_image_width: sourceImageWidth,
+      source_image_height: sourceImageHeight,
       ocr_service_coordinates_preserved: true,
       service_coordinate_source: 'paddle_async_pdf',
+      service_coordinate_size_source: hasServiceSize ? 'service' : hasFallbackSize ? 'page_image_fallback' : 'missing',
+    },
+  }
+}
+
+function getPositiveCoordinateNumber(value: unknown): number | null {
+  const numberValue = finiteNumber(value)
+  return numberValue && numberValue > 0 ? numberValue : null
+}
+
+function getServiceCoordinateSize(result: OcrResultPayload): { width?: number; height?: number; source: string } {
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  const explicitWidth = getPositiveCoordinateNumber(readRecordValue(result, 'page_width'))
+    ?? getPositiveCoordinateNumber(readRecordValue(result, 'image_width'))
+    ?? getPositiveCoordinateNumber(readRecordValue(result, 'source_image_width'))
+    ?? getPositiveCoordinateNumber(readRecordValue(gujiProcessing, 'source_image_width'))
+  const explicitHeight = getPositiveCoordinateNumber(readRecordValue(result, 'page_height'))
+    ?? getPositiveCoordinateNumber(readRecordValue(result, 'image_height'))
+    ?? getPositiveCoordinateNumber(readRecordValue(result, 'source_image_height'))
+    ?? getPositiveCoordinateNumber(readRecordValue(gujiProcessing, 'source_image_height'))
+  if (explicitWidth && explicitHeight) {
+    return {
+      width: explicitWidth,
+      height: explicitHeight,
+      source: String(readRecordValue(gujiProcessing, 'service_coordinate_size_source') || 'service'),
+    }
+  }
+
+  const fallbackWidth = getPositiveCoordinateNumber(readRecordValue(gujiProcessing, 'service_coordinate_fallback_width'))
+  const fallbackHeight = getPositiveCoordinateNumber(readRecordValue(gujiProcessing, 'service_coordinate_fallback_height'))
+  if (fallbackWidth && fallbackHeight) {
+    return {
+      width: fallbackWidth,
+      height: fallbackHeight,
+      source: 'page_image_fallback',
+    }
+  }
+
+  return { source: 'missing' }
+}
+
+function isServiceCoordinatePreservedPayload(result: OcrResultPayload): boolean {
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  return readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+}
+
+function scaleOcrResultCoordinates(
+  result: OcrResultPayload,
+  scaleX: number,
+  scaleY: number,
+): OcrResultPayload {
+  return {
+    ...result,
+    layout_result: Array.isArray(result.layout_result)
+      ? result.layout_result.map((block) => scaleLayoutBlockCoordinates(block, scaleX, scaleY))
+      : result.layout_result,
+    words_result: Array.isArray(result.words_result)
+      ? result.words_result.map((word) => scaleWordCoordinates(word, scaleX, scaleY))
+      : result.words_result,
+  }
+}
+
+function alignServiceCoordinatesToLocalImage(
+  result: OcrResultPayload,
+  imagePath: string | null | undefined,
+): OcrResultPayload {
+  if (!isServiceCoordinatePreservedPayload(result)) return result
+  const localImageSize = getImageDimensions(imagePath)
+  if (!localImageSize || localImageSize.width <= 0 || localImageSize.height <= 0) return result
+
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  const alreadyAligned = readRecordValue(gujiProcessing, 'service_coordinates_aligned_to_local_image') === OCR_LOCAL_IMAGE_COORDINATE_ALIGNMENT_VERSION
+  const storedWidth = getPositiveCoordinateNumber(readRecordValue(gujiProcessing, 'source_image_width'))
+    ?? getPositiveCoordinateNumber(readRecordValue(result, 'source_image_width'))
+  const storedHeight = getPositiveCoordinateNumber(readRecordValue(gujiProcessing, 'source_image_height'))
+    ?? getPositiveCoordinateNumber(readRecordValue(result, 'source_image_height'))
+  if (
+    alreadyAligned
+    && storedWidth === localImageSize.width
+    && storedHeight === localImageSize.height
+  ) {
+    return result
+  }
+
+  const serviceSize = getServiceCoordinateSize(result)
+  const sourceWidth = serviceSize.width || localImageSize.width
+  const sourceHeight = serviceSize.height || localImageSize.height
+  const scaleX = localImageSize.width / Math.max(1, sourceWidth)
+  const scaleY = localImageSize.height / Math.max(1, sourceHeight)
+  const shouldScale = Math.abs(scaleX - 1) > 0.002 || Math.abs(scaleY - 1) > 0.002
+  const scaled = shouldScale ? scaleOcrResultCoordinates(result, scaleX, scaleY) : result
+  const alignedBase: OcrResultPayload = {
+    ...scaled,
+    source_image_width: localImageSize.width,
+    source_image_height: localImageSize.height,
+    guji_processing: {
+      ...(isJsonRecord(scaled.guji_processing) ? scaled.guji_processing : {}),
+      source_image_width: localImageSize.width,
+      source_image_height: localImageSize.height,
+      service_coordinate_original_width: sourceWidth,
+      service_coordinate_original_height: sourceHeight,
+      service_coordinate_original_size_source: serviceSize.source,
+      service_coordinate_aligned_width: localImageSize.width,
+      service_coordinate_aligned_height: localImageSize.height,
+      service_coordinate_align_scale_x: Number(scaleX.toFixed(6)),
+      service_coordinate_align_scale_y: Number(scaleY.toFixed(6)),
+      service_coordinates_aligned_to_local_image: OCR_LOCAL_IMAGE_COORDINATE_ALIGNMENT_VERSION,
+      service_coordinate_size_source: 'local_page_image',
+    },
+  }
+  const tightened = tightenOcrTextCoordinatesToLocalInk(alignedBase, imagePath, { searchNearbyTextInk: true })
+  if (tightened === alignedBase) return alignedBase
+  return {
+    ...tightened,
+    source_image_width: localImageSize.width,
+    source_image_height: localImageSize.height,
+    guji_processing: {
+      ...(isJsonRecord(tightened.guji_processing) ? tightened.guji_processing : {}),
+      source_image_width: localImageSize.width,
+      source_image_height: localImageSize.height,
+      service_coordinate_size_source: 'local_page_image',
+      service_coordinates_aligned_to_local_image: OCR_LOCAL_IMAGE_COORDINATE_ALIGNMENT_VERSION,
     },
   }
 }
@@ -1865,6 +1997,120 @@ function getLocalInkBoundsForLocation(source: LocalInkBitmap, location: LayoutLo
   }
 }
 
+function shouldSearchNearbyTextInk(source: LocalInkBitmap, block: LayoutBlockResult): boolean {
+  if (!isTightenableTextCoordinateBlock(block)) return false
+  if (isDecorativeOcrLabel(block.label) || isShortFootnoteCoordinateBlock(block)) return false
+  const rect = block.location
+  const compactTextLength = getOcrBlockText(block).replace(/\s+/g, '').length
+  if (compactTextLength < 12) return false
+  if (rect.height > Math.max(112, source.height * 0.08)) return false
+  if (rect.height > 96 && compactTextLength > 160) return false
+  return true
+}
+
+function getNearbyTextLocalInkBoundsForBlock(source: LocalInkBitmap, block: LayoutBlockResult): LocalInkBounds | null {
+  const rect = block.location
+  const padX = Math.max(10, Math.min(72, Math.round(rect.width * 0.08)))
+  const padTop = Math.max(18, Math.min(74, Math.round(rect.height * 0.95)))
+  const padBottom = Math.max(22, Math.min(92, Math.round(rect.height * 1.3)))
+  const left = clamp(Math.floor(rect.left - padX), 0, Math.max(0, source.width - 1))
+  const top = clamp(Math.floor(rect.top - padTop), 0, Math.max(0, source.height - 1))
+  const right = clamp(Math.ceil(rect.left + rect.width + padX), left + 1, source.width)
+  const bottom = clamp(Math.ceil(rect.top + rect.height + padBottom), top + 1, source.height)
+  const width = right - left
+  const height = bottom - top
+  if (width <= 1 || height <= 1) return null
+
+  const rowInk = new Array<number>(height).fill(0)
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+        rowInk[y] += 1
+      }
+    }
+  }
+  const smoothedRows = smoothSeries(rowInk, 1)
+  const rowMax = Math.max(...smoothedRows, 0)
+  if (rowMax <= 0) return null
+  const rowRuns = findActiveInkRuns(
+    smoothedRows,
+    Math.max(2, rowMax * 0.08),
+    2,
+    2,
+  )
+  if (rowRuns.length === 0) return null
+
+  const originalCenterY = rect.top + rect.height / 2
+  const maxCenterDy = Math.max(42, rect.height * 1.35, source.height * 0.038)
+  const candidateRows = rowRuns.filter((run) => {
+    const runTop = top + run.start
+    const runBottom = top + run.end
+    const runCenterY = (runTop + runBottom) / 2
+    return Math.abs(runCenterY - originalCenterY) <= maxCenterDy
+      && runBottom >= rect.top - maxCenterDy
+      && runTop <= rect.top + rect.height + maxCenterDy
+  })
+  if (candidateRows.length === 0) return null
+  const anchorRow = candidateRows
+    .slice()
+    .sort((leftRun, rightRun) => {
+      const leftCenterY = top + (leftRun.start + leftRun.end) / 2
+      const rightCenterY = top + (rightRun.start + rightRun.end) / 2
+      return Math.abs(leftCenterY - originalCenterY) - Math.abs(rightCenterY - originalCenterY)
+        || rightRun.total - leftRun.total
+    })[0]
+  const anchorCenterY = top + (anchorRow.start + anchorRow.end) / 2
+  const rowMergeSlack = Math.max(10, Math.min(34, rect.height * 0.42))
+  const selectedRows = candidateRows.filter((run) => {
+    const runTop = top + run.start
+    const runBottom = top + run.end
+    const runCenterY = (runTop + runBottom) / 2
+    const gapToAnchor = run.end < anchorRow.start
+      ? anchorRow.start - run.end
+      : run.start > anchorRow.end
+        ? run.start - anchorRow.end
+        : 0
+    return Math.abs(runCenterY - anchorCenterY) <= Math.max(rowMergeSlack, rect.height * 0.58)
+      || gapToAnchor <= rowMergeSlack
+  })
+  if (selectedRows.length === 0) return null
+
+  const rowStart = clamp(Math.min(...selectedRows.map((run) => run.start)) - 2, 0, height - 1)
+  const rowEnd = clamp(Math.max(...selectedRows.map((run) => run.end)) + 2, rowStart + 1, height)
+  const columnInk = new Array<number>(width).fill(0)
+  let inkPixels = 0
+  for (let y = rowStart; y < rowEnd; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (getPixelLuminance(source.bitmap, source.width, left + x, top + y) < 214) {
+        columnInk[x] += 1
+        inkPixels += 1
+      }
+    }
+  }
+  if (inkPixels < Math.max(10, Math.min(rect.width, rect.height) * 0.55)) return null
+  const smoothedColumns = smoothSeries(columnInk, 1)
+  const columnMax = Math.max(...smoothedColumns, 0)
+  if (columnMax <= 0) return null
+  const columnRuns = findActiveInkRuns(
+    smoothedColumns,
+    Math.max(1, columnMax * 0.08),
+    2,
+    8,
+  )
+  if (columnRuns.length === 0) return null
+  const columnStart = clamp(Math.min(...columnRuns.map((run) => run.start)) - 2, 0, width - 1)
+  const columnEnd = clamp(Math.max(...columnRuns.map((run) => run.end)) + 2, columnStart + 1, width)
+  return {
+    location: clampLocationToImage({
+      left: left + columnStart,
+      top: top + rowStart,
+      width: columnEnd - columnStart,
+      height: rowEnd - rowStart,
+    }, source.width, source.height),
+    inkPixels,
+  }
+}
+
 function isTightenableTextCoordinateBlock(block: LayoutBlockResult): boolean {
   if (!block.location) return false
   if (isTableLabel(block.label) || isImageLabel(block.label)) return false
@@ -1872,9 +2118,11 @@ function isTightenableTextCoordinateBlock(block: LayoutBlockResult): boolean {
   const text = getOcrBlockText(block).replace(/\s+/g, '')
   const decorative = isDecorativeOcrLabel(block.label)
   const shortFootnote = isShortFootnoteCoordinateBlock(block)
-  if (text.length < (decorative || shortFootnote ? 1 : 12)) return false
   const label = String(block.label || '').toLowerCase()
+  const titleLike = /title|author|doc_title/.test(label)
+  if (text.length < (decorative || shortFootnote || titleLike ? 1 : 12)) return false
   if (decorative || shortFootnote) return text.length <= 120
+  if (titleLike) return text.length <= 120
   if (!label) return true
   return /text|paragraph|body|note|footnote|reference|abstract|title/i.test(label)
 }
@@ -2078,9 +2326,16 @@ function getDecorativeLocalInkBoundsForBlock(source: LocalInkBitmap, block: Layo
   return best ? { location: best.location, inkPixels: best.inkPixels } : null
 }
 
-function getLocalInkBoundsForBlock(source: LocalInkBitmap, block: LayoutBlockResult): LocalInkBounds | null {
+function getLocalInkBoundsForBlock(
+  source: LocalInkBitmap,
+  block: LayoutBlockResult,
+  options: { searchNearbyTextInk?: boolean } = {},
+): LocalInkBounds | null {
   const localBounds = getLocalInkBoundsForLocation(source, block.location)
   const shouldSearchNearbyInk = isDecorativeOcrLabel(block.label) || isShortFootnoteCoordinateBlock(block)
+  if (options.searchNearbyTextInk && shouldSearchNearbyTextInk(source, block)) {
+    return getNearbyTextLocalInkBoundsForBlock(source, block) || localBounds
+  }
   if (!shouldSearchNearbyInk) return localBounds
 
   return getDecorativeLocalInkBoundsForBlock(source, block) || localBounds
@@ -2235,10 +2490,12 @@ function isOverTightenedSmallTextBlock(
 ): boolean {
   const label = String(block.label || '').toLowerCase()
   if (/title/.test(label)) {
-    return tightened.height < Math.max(16, block.location.height * 0.3)
+    return tightened.height < Math.max(10, block.location.height * 0.16)
+      || tightened.width < Math.max(24, block.location.width * 0.32)
   }
   if (/footnote|reference|caption/.test(label) && block.location.height >= 40) {
-    return tightened.height < Math.max(24, block.location.height * 0.38)
+    return tightened.height < Math.max(8, block.location.height * 0.12)
+      || tightened.width < Math.max(48, block.location.width * 0.28)
   }
   return false
 }
@@ -2246,6 +2503,7 @@ function isOverTightenedSmallTextBlock(
 export function tightenOcrTextCoordinatesToLocalInk(
   result: OcrResultPayload,
   imagePath: string | null | undefined,
+  options: { searchNearbyTextInk?: boolean } = {},
 ): OcrResultPayload {
   const source = createLocalInkBitmap(imagePath)
   if (!source) return result
@@ -2257,7 +2515,7 @@ export function tightenOcrTextCoordinatesToLocalInk(
   const nextBlocks = blocks.map((block, index) => {
     if (!isTightenableTextCoordinateBlock(block)) return block
     const groupedLocation = shortFootnoteGroupLocations.get(index)
-    const inkBounds = groupedLocation ? { location: groupedLocation, inkPixels: 0 } : getLocalInkBoundsForBlock(source, block)
+    const inkBounds = groupedLocation ? { location: groupedLocation, inkPixels: 0 } : getLocalInkBoundsForBlock(source, block, options)
     if (!inkBounds) return block
     const tightenedLocation = clampLocationToImage(inkBounds.location, source.width, source.height)
     const compactTextLength = getOcrBlockText(block).replace(/\s+/g, '').length
@@ -2331,11 +2589,15 @@ export function normalizeStoredOcrResultForRead(
   if (!isOcrResultPayload(result)) return null
   const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
   const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
+  const coordinateAligned = preserveServiceCoordinates
+    ? alignServiceCoordinatesToLocalImage(result, imagePath)
+    : result
   const dimensions = preserveServiceCoordinates ? undefined : getImageDimensions(imagePath)
-  return ensureOcrResultIr(result, {
+  return ensureOcrResultIr(coordinateAligned, {
     pageIndex,
     pageWidth: dimensions?.width,
     pageHeight: dimensions?.height,
+    forceRebuild: coordinateAligned !== result,
   }) as OcrResultPayload
 }
 
@@ -3278,9 +3540,23 @@ export async function postProcessRecognizedPageResult(
   }
   if (preserveServiceCoordinates) {
     const serviceCoordinateResult = isOcrResultPayload(coordinateTightenedInput) ? coordinateTightenedInput : normalizePageResult(coordinateTightenedInput)
-    return markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateResult, resolved, imagePath, {
+    const fallbackSize = runtimeOptions.serviceCoordinateFallbackSize || getImageDimensions(imagePath)
+    const serviceCoordinateWithFallback = fallbackSize && fallbackSize.width > 0 && fallbackSize.height > 0
+      ? {
+        ...serviceCoordinateResult,
+        guji_processing: {
+          ...(isJsonRecord(serviceCoordinateResult.guji_processing) ? serviceCoordinateResult.guji_processing : {}),
+          service_coordinate_fallback_width: fallbackSize.width,
+          service_coordinate_fallback_height: fallbackSize.height,
+        },
+      }
+      : serviceCoordinateResult
+    const preserved = markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateWithFallback, resolved, imagePath, {
       preserveServiceCoordinates: true,
     }))
+    return runtimeOptions.alignServiceCoordinatesToLocalImage === false
+      ? preserved
+      : alignServiceCoordinatesToLocalImage(preserved, imagePath)
   }
   if (!imagePath || resolved.profile !== 'guji_print_vertical') {
     return attachProcessingMeta(isOcrResultPayload(coordinateTightenedInput) ? coordinateTightenedInput : normalizePageResult(coordinateTightenedInput), resolved, imagePath)
@@ -3543,6 +3819,8 @@ interface OcrRuntimeOptions {
   uploadImage?: OcrUploadImage | null
   tightenTextCoordinatesToLocalInk?: boolean
   preserveServiceCoordinates?: boolean
+  serviceCoordinateFallbackSize?: { width: number; height: number } | null
+  alignServiceCoordinatesToLocalImage?: boolean
 }
 
 async function requestSyncRecognition(base64Image: string, options: SyncRecognitionOptions = {}): Promise<OcrResultPayload> {

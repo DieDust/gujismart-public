@@ -62,10 +62,11 @@ assert(
   postProcessPdfResultsBatchedBody.includes('signal?: AbortSignal')
     && postProcessPdfResultsBatchedBody.includes('postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {')
     && postProcessPdfResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && postProcessPdfResultsBatchedBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
     && !postProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
     && !postProcessPdfResultsBatchedBody.includes('getLikelyAsyncPdfImageCoordinateMismatchIssue')
     && !batchSource.includes('private async recognizePageImageFallback'),
-  'Legacy batch PDF OCR should preserve service-returned async PDF coordinates instead of rerunning page-image OCR.',
+  'Legacy batch PDF OCR should align service-returned async PDF coordinates with the local page-image size instead of rerunning page-image OCR.',
 )
 assert(
   asyncPdfBranchBody.includes('onChunkComplete: async (chunk) => {')

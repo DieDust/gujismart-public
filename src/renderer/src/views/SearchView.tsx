@@ -537,6 +537,8 @@ async function applyViewerHitCounts(
 
   return {
     ...response,
+    totalDocuments: groups.length,
+    totalHits: groups.reduce((sum, group) => sum + group.totalHits, 0),
     groups,
   }
 }
@@ -622,6 +624,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const pendingScrollRestoreRef = useRef<PendingSearchScrollRestore | null>(null)
   const returnStateRestoredRef = useRef(false)
+  const viewerHitCountRefreshSignatureRef = useRef<string | null>(null)
 
   const filterSignature = useMemo(() => JSON.stringify({ filters: compactFilterOptions(filters), sort: searchSort, contextMode }), [filters, searchSort, contextMode])
   const selectedDocIds = filters.docIds || []
@@ -807,6 +810,32 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     })
   }
 
+  const refreshViewerHitCountsInBackground = (
+    response: SearchGroupedResponse,
+    activeKeyword: string,
+    activeSort: SearchSort,
+    activeSignature: string,
+    mode: SearchMode,
+    filterSnapshot: SearchFilters,
+    resultSnapshot: FlatSearchResult[],
+    aiSnapshot: AiSearchState | null,
+  ) => {
+    viewerHitCountRefreshSignatureRef.current = activeSignature
+    void applyViewerHitCounts(response, activeKeyword, activeSort)
+      .then((readerCountedGrouped) => {
+        if (viewerHitCountRefreshSignatureRef.current !== activeSignature) return
+        const nextResults = mode === 'fulltext'
+          ? flattenGroupedResults(readerCountedGrouped, 'fulltext').slice(0, 360)
+          : resultSnapshot
+        setGroupedResponse(readerCountedGrouped)
+        if (mode === 'fulltext') setResults(nextResults)
+        persistHistoryEntry(activeKeyword, mode, filterSnapshot, nextResults, aiSnapshot, readerCountedGrouped)
+      })
+      .catch((error) => {
+        console.warn('[Search] Failed to refresh viewer-visible hit counts', error)
+      })
+  }
+
   const loadFilterOptions = async () => {
     try {
       const [docs, tags, folders] = await Promise.all([
@@ -927,6 +956,9 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     setDocumentHitPages({})
     clearSearchReturnState()
     addHistory(activeKeyword)
+    const activeSort = searchSort
+    const activeSignature = buildSearchSignature(activeKeyword, overrideFilters, overrideMode, activeSort, contextMode)
+    viewerHitCountRefreshSignatureRef.current = activeSignature
 
     try {
       if (overrideMode === 'ai') {
@@ -939,21 +971,31 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         }
         const nextResults = payload?.results || []
         const grouped = payload?.grouped || groupFlatResults(nextResults, activeKeyword, nextAiState.warnings || [])
-        const readerCountedGrouped = await applyViewerHitCounts(grouped, activeKeyword, searchSort)
+        const readerCountedGrouped = activeSort === 'hitCount'
+          ? await applyViewerHitCounts(grouped, activeKeyword, activeSort)
+          : grouped
         setAiSearchState(nextAiState)
         setResults(nextResults)
         setGroupedResponse(readerCountedGrouped)
-        setExecutedSearchSignature(buildSearchSignature(activeKeyword, overrideFilters, 'ai', searchSort, contextMode))
+        setExecutedSearchSignature(activeSignature)
         persistHistoryEntry(activeKeyword, 'ai', overrideFilters, nextResults, nextAiState, readerCountedGrouped)
+        if (activeSort !== 'hitCount') {
+          refreshViewerHitCountsInBackground(grouped, activeKeyword, activeSort, activeSignature, 'ai', overrideFilters, nextResults, nextAiState)
+        }
       } else {
         const grouped = await window.api.querySearchV2(activeKeyword, buildSearchOptions(overrideFilters, { paged: true, page: overridePage }))
-        const readerCountedGrouped = await applyViewerHitCounts(grouped, activeKeyword, searchSort)
+        const readerCountedGrouped = activeSort === 'hitCount'
+          ? await applyViewerHitCounts(grouped, activeKeyword, activeSort)
+          : grouped
         const nextResults = flattenGroupedResults(readerCountedGrouped, 'fulltext').slice(0, 360)
         setGroupedResponse(readerCountedGrouped)
         setAiSearchState(null)
         setResults(nextResults)
-        setExecutedSearchSignature(buildSearchSignature(activeKeyword, overrideFilters, 'fulltext', searchSort, contextMode))
+        setExecutedSearchSignature(activeSignature)
         persistHistoryEntry(activeKeyword, 'fulltext', overrideFilters, nextResults, null, readerCountedGrouped)
+        if (activeSort !== 'hitCount') {
+          refreshViewerHitCountsInBackground(grouped, activeKeyword, activeSort, activeSignature, 'fulltext', overrideFilters, nextResults, null)
+        }
       }
     } catch (error) {
       console.error(error)
@@ -1021,13 +1063,13 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     replaceFilters(entry.filters)
     setAiSearchState(entry.aiSearchState)
     const restoredGrouped = entry.groupedResponse || (entry.results?.length ? groupFlatResults(entry.results, entry.keyword, entry.aiSearchState?.warnings || []) : null)
+    const restoredResults = entry.results || []
+    const restoredSignature = buildSearchSignature(entry.keyword, entry.filters, entry.mode, searchSort, contextMode)
     setGroupedResponse(restoredGrouped)
-    setResults(entry.results || [])
-    setExecutedSearchSignature(buildSearchSignature(entry.keyword, entry.filters, entry.mode, searchSort, contextMode))
+    setResults(restoredResults)
+    setExecutedSearchSignature(restoredSignature)
     if (restoredGrouped) {
-      void applyViewerHitCounts(restoredGrouped, entry.keyword, searchSort).then((readerCountedGrouped) => {
-        setGroupedResponse(readerCountedGrouped)
-      })
+      refreshViewerHitCountsInBackground(restoredGrouped, entry.keyword, searchSort, restoredSignature, entry.mode, entry.filters, restoredResults, entry.aiSearchState)
     }
     message.success('已恢复历史检索')
   }

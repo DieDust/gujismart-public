@@ -20,6 +20,7 @@ function readSource(filePath) {
 const root = path.resolve(__dirname, '..')
 const ocrSource = readSource(path.join(root, 'src', 'main', 'ocr.ts'))
 const ocrIpcSource = readSource(path.join(root, 'src', 'main', 'ipc', 'ocr.ts'))
+const documentsIpcSource = readSource(path.join(root, 'src', 'main', 'ipc', 'documents.ts'))
 const batchSource = readSource(path.join(root, 'src', 'main', 'batch-processor.ts'))
 const ocrIrSource = readSource(path.join(root, 'src', 'shared', 'ocr-ir.ts'))
 const documentViewSource = readSource(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'))
@@ -48,6 +49,24 @@ const batchPostProcessPdfBody = sliceBetween(
   'setMainWindow',
   'batch async PDF result post-processing',
 )
+const pagesUpdateBody = sliceBetween(
+  documentsIpcSource,
+  "ipcMain.handle('pages:update'",
+  "ipcMain.handle('pages:resetOcr'",
+  'page update OCR save',
+)
+const pagesResetBody = sliceBetween(
+  documentsIpcSource,
+  "ipcMain.handle('pages:resetOcr'",
+  "ipcMain.handle('pages:listOcrVersions'",
+  'page OCR reset',
+)
+const pagesSwitchVersionBody = sliceBetween(
+  documentsIpcSource,
+  "ipcMain.handle('pages:switchOcrVersion'",
+  '\n}\n',
+  'page OCR version switch',
+)
 
 assert(
   ocrSource.includes('export function tightenOcrTextCoordinatesToLocalInk')
@@ -64,6 +83,9 @@ assert(
     && ocrSource.includes('function markServiceCoordinatesPreserved')
     && ocrSource.includes('ocr_service_coordinates_preserved: true')
     && ocrSource.includes('service_coordinate_source')
+    && ocrSource.includes('function alignServiceCoordinatesToLocalImage')
+    && ocrSource.includes('service_coordinates_aligned_to_local_image')
+    && ocrSource.includes("service_coordinate_size_source: 'local_page_image'")
     && postProcessBody.includes('const scaledInput = preserveServiceCoordinates')
     && postProcessBody.includes('const coordinateCorrectedInput = preserveServiceCoordinates')
     && postProcessBody.includes('const downgradedInput = preserveServiceCoordinates')
@@ -71,10 +93,11 @@ assert(
     && postProcessBody.indexOf('const workingResult = clampedInput') < postProcessBody.indexOf('!preserveServiceCoordinates && runtimeOptions.tightenTextCoordinatesToLocalInk')
     && postProcessBody.includes('if (preserveServiceCoordinates) {')
     && postProcessBody.indexOf('if (preserveServiceCoordinates) {') < postProcessBody.indexOf("if (resolved.secondPass === 'cloud_column_ocr')")
-    && postProcessBody.includes('markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateResult, resolved, imagePath, {')
+    && postProcessBody.includes('const preserved = markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateWithFallback, resolved, imagePath, {')
     && postProcessBody.includes('preserveServiceCoordinates: true')
+    && postProcessBody.includes('alignServiceCoordinatesToLocalImage(preserved, imagePath)')
     && postProcessBody.includes('attachProcessingMeta(isOcrResultPayload(coordinateTightenedInput)'),
-  'OCR post-processing should only tighten coordinates when the caller explicitly enables it, and async PDF saves must return before any guji second-pass coordinate/layout rewriting.',
+  'OCR post-processing should keep page-image OCR tightening opt-in while aligning async PDF service coordinates to the local page image before saving.',
 )
 
 assert(
@@ -82,32 +105,41 @@ assert(
     && ocrSource.includes('metaOptions.preserveServiceCoordinates ? getCoordinateSourceDimensions(result) : getImageDimensions(imagePath)')
     && ocrSource.includes("source_image_fingerprint: metaOptions.preserveServiceCoordinates ? '' : getImageFingerprint(imagePath)")
     && ocrSource.includes('const preserveServiceCoordinates = readRecordValue(gujiProcessing, \'ocr_service_coordinates_preserved\') === true')
-    && ocrSource.includes('const dimensions = preserveServiceCoordinates ? undefined : getImageDimensions(imagePath)'),
-  'Async PDF service-coordinate OCR must not overwrite the service coordinate basis with the local page-image dimensions during post-processing or read hydration.',
+    && ocrSource.includes('const dimensions = preserveServiceCoordinates ? undefined : getImageDimensions(imagePath)')
+    && ocrSource.includes('const coordinateAligned = preserveServiceCoordinates')
+    && ocrSource.includes('? alignServiceCoordinatesToLocalImage(result, imagePath)')
+    && ocrSource.includes('forceRebuild: coordinateAligned !== result'),
+  'Async PDF service-coordinate OCR should preserve the service-origin marker, then repair legacy reads onto the local page-image coordinate basis and rebuild IR only when coordinates changed.',
 )
 
 assert(
   ocrIpcSource.includes('function isServiceCoordinatePreservedResult(result: unknown): boolean')
-    && ocrIpcSource.includes('if (isServiceCoordinatePreservedResult(result)) return {}')
-    && ocrIpcSource.includes('const irSize = getStoredOcrIrSize(result, page?.image_path)')
+    && ocrIpcSource.includes('const irSize = getStoredOcrIrSize(sizeNormalizedResult, page?.image_path)')
     && ocrIpcSource.includes('pageWidth: irSize.width')
-    && ocrIpcSource.includes('pageHeight: irSize.height'),
-  'Saving async PDF service-coordinate OCR results must not rebuild OCR IR with local page-image dimensions.',
+    && ocrIpcSource.includes('pageHeight: irSize.height')
+    && ocrIpcSource.includes('function ensureServiceCoordinatePageSizeForStorage')
+    && ocrIpcSource.includes("service_coordinate_size_source: gujiProcessing.service_coordinate_size_source || 'page_image_fallback'"),
+  'Saving async PDF service-coordinate OCR results should store an explicit coordinate size for IR instead of falling back to coordinate extents.',
 )
 
 assert(
   ipcPostProcessPdfBody.includes('preserveServiceCoordinates: true')
     && batchPostProcessPdfBody.includes('preserveServiceCoordinates: true')
+    && ipcPostProcessPdfBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
+    && batchPostProcessPdfBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
     && !ipcPostProcessPdfBody.includes('tightenTextCoordinatesToLocalInk: true')
     && !batchPostProcessPdfBody.includes('tightenTextCoordinatesToLocalInk: true'),
-  'Both foreground and background async PDF OCR result saves should preserve service-returned coordinates instead of tightening them against the local page image.',
+  'Both foreground and background async PDF OCR result saves should preserve service provenance while writing a local page-image fallback size.',
 )
 
 assert(
   ocrIrSource.includes('const preserveServiceCoordinates = gujiProcessing?.ocr_service_coordinates_preserved === true')
-    && ocrIrSource.includes('|| (!preserveServiceCoordinates && gujiProcessing ? finiteNumber(gujiProcessing.source_image_width) : null)')
-    && ocrIrSource.includes('|| (!preserveServiceCoordinates && gujiProcessing ? finiteNumber(gujiProcessing.source_image_height) : null)'),
-  'OCR IR rebuilds must not resurrect stale guji_processing source-image dimensions for preserved async PDF service coordinates.',
+    && ocrIrSource.includes('const localImageAlignedServiceCoordinates = preserveServiceCoordinates')
+    && ocrIrSource.includes("gujiProcessing?.service_coordinate_size_source === 'local_page_image'")
+    && ocrIrSource.includes('service_coordinates_aligned_to_local_image')
+    && ocrIrSource.includes('|| ((!preserveServiceCoordinates || localImageAlignedServiceCoordinates) && gujiProcessing ? finiteNumber(gujiProcessing.source_image_width) : null)')
+    && ocrIrSource.includes('|| ((!preserveServiceCoordinates || localImageAlignedServiceCoordinates) && gujiProcessing ? finiteNumber(gujiProcessing.source_image_height) : null)'),
+  'OCR IR rebuilds should trust guji_processing source-image dimensions after preserved async PDF coordinates have been aligned to the local page image.',
 )
 
 assert(
@@ -138,15 +170,22 @@ assert(
 )
 
 assert(
-  !ocrSource.includes('normalizeStoredOcrResultForRead(\n  result')
-    || (
-      !ocrSource.includes('const tightened = tightenOcrTextCoordinatesToLocalInk(result, imagePath)')
-      && !ocrSource.includes('const coordinateCorrected = correctRotatedOcrCoordinatesForSourceImage(result, imagePath, options)')
-      && !ocrSource.includes('const clamped = clampGujiOcrResultToSourceImage(pseudoTableDowngraded, imagePath)')
-      && !ocrSource.includes('splitMergedWideVerticalTextLineBlocks(clamped, options)')
-      && !ocrSource.includes('forceRebuild: true,\n  }) as OcrResultPayload')
-    ),
-  'Opening already stored OCR results should not silently move, clamp, rotate, split, or rebuild coordinates at read time.',
+  ocrSource.includes('export function normalizeStoredOcrResultForRead')
+    && ocrSource.includes('const coordinateAligned = preserveServiceCoordinates')
+    && ocrSource.includes('? alignServiceCoordinatesToLocalImage(result, imagePath)')
+    && !ocrSource.includes('const coordinateCorrected = correctRotatedOcrCoordinatesForSourceImage(result, imagePath, options)')
+    && !ocrSource.includes('const clamped = clampGujiOcrResultToSourceImage(pseudoTableDowngraded, imagePath)')
+    && !ocrSource.includes('splitMergedWideVerticalTextLineBlocks(clamped, options)'),
+  'Opening stored OCR results may run the idempotent async-PDF coordinate alignment repair, but must not rerun broader layout rewrites at read time.',
+)
+
+assert(
+  documentsIpcSource.includes('normalizeStoredGujiOcrResultForRead')
+    && pagesUpdateBody.includes('normalizeStoredGujiOcrResultForRead(normalizedData.ocr_result, imagePath, pageIndex)')
+    && pagesUpdateBody.includes('forceRebuild: true')
+    && pagesResetBody.includes('normalizeStoredGujiOcrResultForRead(ocrResult, page.image_path, pageIndex)')
+    && pagesSwitchVersionBody.includes('normalizeStoredGujiOcrResultForRead(hydratedVersion.ocr_result, page.image_path, pageIndex)'),
+  'Page update, reset, and OCR-version switch saves should normalize stored OCR coordinates before rebuilding IR so legacy async-PDF offsets are not persisted again.',
 )
 
 console.log('OCR coordinate tightening regression passed')

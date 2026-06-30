@@ -16,6 +16,12 @@ import OpenCC from 'opencc-js'
 import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
 import { renderOcrInlineText } from '../utils/ocrInlineRender'
 import {
+  getOcrBlockRect,
+  getOcrCoordinateExtent,
+  getOcrLayoutBounds,
+  scaleOcrRectToWidth,
+} from '../utils/ocrCoordinates'
+import {
   buildParallelTranslationSegments,
   isParallelTranslationDisplayReady,
   normalizeParallelSegmentForMatch,
@@ -322,35 +328,8 @@ function pointCoordinate(point: unknown, key: 'x' | 'y', tupleIndex: number): nu
 }
 
 function getRect(block: unknown): BlockRect | null {
-  const loc = firstRecordValue(block, ['location', 'rect', 'points', 'block_bbox', 'bbox', 'box', 'coordinate', 'coordinate_box', 'poly', 'polygon'])
-  if (!loc) return null
-  if (isJsonRecord(loc) && (loc.left !== undefined || loc.top !== undefined)) {
-    const left = Number(loc.left)
-    const top = Number(loc.top)
-    const width = Number(loc.width)
-    const height = Number(loc.height)
-    if ([left, top, width, height].every(Number.isFinite) && width > 0 && height > 0) return { left, top, width, height }
-  }
-  if (Array.isArray(loc) && loc.length >= 4) {
-    if (typeof loc[0] === 'number') {
-      const numbers = loc.map(Number)
-      const xs = numbers.length >= 8 ? [numbers[0], numbers[2], numbers[4], numbers[6]] : [numbers[0], numbers[2]]
-      const ys = numbers.length >= 8 ? [numbers[1], numbers[3], numbers[5], numbers[7]] : [numbers[1], numbers[3]]
-      if ([...xs, ...ys].every(Number.isFinite)) {
-        const left = Math.min(...xs)
-        const top = Math.min(...ys)
-        return { left, top, width: Math.max(...xs) - left, height: Math.max(...ys) - top }
-      }
-    }
-    const xs = loc.map((point) => pointCoordinate(point, 'x', 0)).filter((value): value is number => value !== null && Number.isFinite(value))
-    const ys = loc.map((point) => pointCoordinate(point, 'y', 1)).filter((value): value is number => value !== null && Number.isFinite(value))
-    if (xs.length > 0 && ys.length > 0) {
-      const left = Math.min(...xs)
-      const top = Math.min(...ys)
-      return { left, top, width: Math.max(...xs) - left, height: Math.max(...ys) - top }
-    }
-  }
-  return null
+  const rect = getOcrBlockRect(block)
+  return rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null
 }
 
 function getBlockText(block: unknown): string {
@@ -934,29 +913,11 @@ function getBlockSourceIndex(block: LayoutBlock, fallbackIndex: number): number 
 }
 
 function getLayoutBounds(blocks: LayoutBlock[], coordinateSourceSize?: { width?: number | null; height?: number | null }) {
-  const explicitWidth = Number(coordinateSourceSize?.width || 0)
-  const explicitHeight = Number(coordinateSourceSize?.height || 0)
-  if (explicitWidth > 0 && explicitHeight > 0) return { width: explicitWidth, height: explicitHeight, offsetLeft: 0, offsetTop: 0 }
-  const rects = blocks.map((block) => block.__rect).filter(Boolean) as BlockRect[]
-  if (rects.length === 0) return { width: 900, height: 1280, offsetLeft: 0, offsetTop: 0 }
-  const minLeft = Math.min(...rects.map((rect) => rect.left))
-  const minTop = Math.min(...rects.map((rect) => rect.top))
-  const maxRight = Math.max(...rects.map((rect) => rect.left + rect.width))
-  const maxBottom = Math.max(...rects.map((rect) => rect.top + rect.height))
-  const padX = Math.max(24, (maxRight - minLeft) * 0.06)
-  const padY = Math.max(24, (maxBottom - minTop) * 0.05)
-  return { width: maxRight - minLeft + padX * 2, height: maxBottom - minTop + padY * 2, offsetLeft: minLeft - padX, offsetTop: minTop - padY }
+  return getOcrLayoutBounds(blocks, coordinateSourceSize)
 }
 
 function getCoordinateExtent(blocks: LayoutBlock[]): { minLeft: number; minTop: number; maxRight: number; maxBottom: number } | null {
-  const rects = blocks.map((block) => block.__rect).filter(Boolean) as BlockRect[]
-  if (rects.length === 0) return null
-  return {
-    minLeft: Math.min(...rects.map((rect) => rect.left)),
-    minTop: Math.min(...rects.map((rect) => rect.top)),
-    maxRight: Math.max(...rects.map((rect) => rect.left + rect.width)),
-    maxBottom: Math.max(...rects.map((rect) => rect.top + rect.height)),
-  }
+  return getOcrCoordinateExtent(blocks)
 }
 
 function isPositiveSize(value?: { width?: number | null; height?: number | null } | null): value is { width: number; height: number } {
@@ -1614,8 +1575,7 @@ function renderFacsimileTable(rows: string[][], keyword: string, highlight: bool
 }
 
 function getScaledRect(rect: BlockRect, bounds: { width: number; height: number; offsetLeft: number; offsetTop: number }, pagePixelWidth: number): BlockRect {
-  const scale = pagePixelWidth / Math.max(1, bounds.width)
-  return { left: (rect.left - bounds.offsetLeft) * scale, top: (rect.top - bounds.offsetTop) * scale, width: rect.width * scale, height: rect.height * scale }
+  return scaleOcrRectToWidth(rect, bounds, pagePixelWidth)
 }
 
 function clampZoom(value: number): number {

@@ -25,7 +25,7 @@ import type {
 type JsonRecord = Record<string, unknown>
 
 export const OCR_IR_SCHEMA_VERSION = 'gujismart-ocr-ir/v1' as const
-export const OCR_IR_PIPELINE_VERSION = '1.2.0'
+export const OCR_IR_PIPELINE_VERSION = '1.2.1'
 
 export interface BuildOcrIrOptions {
   pageIndex?: number
@@ -675,12 +675,18 @@ function buildQualityReport(blocks: OcrBlockV1[], discardedBlocks: OcrBlockV1[])
 function resolvePageSize(result: JsonRecord, blocks: JsonRecord[], options: BuildOcrIrOptions): { width: number; height: number } {
   const gujiProcessing = isRecord(result.guji_processing) ? result.guji_processing : null
   const preserveServiceCoordinates = gujiProcessing?.ocr_service_coordinates_preserved === true
+  const localImageAlignedServiceCoordinates = preserveServiceCoordinates && (
+    gujiProcessing?.service_coordinate_size_source === 'local_page_image'
+    || Number(gujiProcessing?.service_coordinates_aligned_to_local_image || 0) > 0
+  )
   const width = options.pageWidth
     || finiteNumber(firstValue(result, ['page_width', 'image_width', 'width']))
-    || (!preserveServiceCoordinates && gujiProcessing ? finiteNumber(gujiProcessing.source_image_width) : null)
+    || ((!preserveServiceCoordinates || localImageAlignedServiceCoordinates) && gujiProcessing ? finiteNumber(gujiProcessing.source_image_width) : null)
+    || finiteNumber(result.source_image_width)
   const height = options.pageHeight
     || finiteNumber(firstValue(result, ['page_height', 'image_height', 'height']))
-    || (!preserveServiceCoordinates && gujiProcessing ? finiteNumber(gujiProcessing.source_image_height) : null)
+    || ((!preserveServiceCoordinates || localImageAlignedServiceCoordinates) && gujiProcessing ? finiteNumber(gujiProcessing.source_image_height) : null)
+    || finiteNumber(result.source_image_height)
   if (width && height && width > 0 && height > 0) return { width, height }
   const boxes = blocks.map(getBlockBbox).filter((bbox): bbox is OcrBoundingBox => bbox !== undefined)
   return {

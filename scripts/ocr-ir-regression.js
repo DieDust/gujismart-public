@@ -84,7 +84,7 @@ try {
   const ir = ocrIr.getOcrPageIr(normalized)
   assert.ok(ir)
   assert.strictEqual(ir.schemaVersion, 'gujismart-ocr-ir/v1')
-  assert.strictEqual(ir.pipelineVersion, '1.2.0')
+  assert.strictEqual(ir.pipelineVersion, '1.2.1')
   assert.strictEqual(ir.page.discardedBlocks.length, 1)
   assert.strictEqual(ir.page.discardedBlocks[0].type, 'page_header')
   assert.deepStrictEqual(ir.page.blocks.slice(0, 2).map((block) => block.text), [
@@ -109,7 +109,7 @@ try {
       pipelineVersion: '1.0.0',
     },
   }
-  assert.strictEqual(ocrIr.getOrBuildOcrPageIr(oldPipelineResult).pipelineVersion, '1.2.0')
+  assert.strictEqual(ocrIr.getOrBuildOcrPageIr(oldPipelineResult).pipelineVersion, '1.2.1')
 
   const nativeResult = ocrIr.ensureOcrResultIr({
     source_type: 'native_pdf_text',

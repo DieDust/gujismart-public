@@ -103,7 +103,7 @@ assertMainOcrIncludes('ocr_coordinate_clamped_to_source', 'main OCR should recor
 assertMainOcrIncludes('function tightenOcrTextCoordinatesToLocalInk', 'main OCR may keep local-ink coordinate repair code for explicit diagnostics')
 assertMainOcrIncludes('ocr_coordinate_tightened_to_local_ink', 'main OCR should record local-ink coordinate tightening when explicitly applied for diagnostics')
 assertMainOcrIncludes('if (preserveServiceCoordinates) {', 'async PDF OCR post-processing should return before any guji second-pass coordinate/layout rewriting')
-assertMainOcrIncludes('markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateResult, resolved, imagePath, {', 'async PDF OCR saves should mark service-returned coordinates as preserved')
+assertMainOcrIncludes('markServiceCoordinatesPreserved(attachProcessingMeta(serviceCoordinateWithFallback, resolved, imagePath, {', 'async PDF OCR saves should mark service-returned coordinates as preserved after attaching a local page-image fallback size')
 assertMainOcrIncludes('preserveServiceCoordinates: true', 'async PDF OCR saves should not overwrite the service coordinate basis with local page-image dimensions')
 assertMainOcrIncludes('const workingResult = clampedInput', 'default page-image OCR post-processing should keep coordinate tightening opt-in')
 assertMainOcrIncludes('return result', 'stored non-guji OCR reads should not dynamically tighten OCR coordinates against local ink')

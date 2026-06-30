@@ -4965,8 +4965,11 @@ export function registerDocumentIpc(): void {
           imageSize = null
         }
       }
-      const normalizedResult = ensureOcrResultIr(normalizedData.ocr_result, {
-        pageIndex: Number(page.page_num || 0) || 1,
+      const pageIndex = Number(page.page_num || 0) || 1
+      const repairedResult = normalizeStoredGujiOcrResultForRead(normalizedData.ocr_result, imagePath, pageIndex)
+        || normalizedData.ocr_result
+      const normalizedResult = ensureOcrResultIr(repairedResult, {
+        pageIndex,
         pageWidth: imageSize?.width,
         pageHeight: imageSize?.height,
         forceRebuild: true,
@@ -5024,9 +5027,13 @@ export function registerDocumentIpc(): void {
       }
     }
 
-    const normalizedOcrResult = ocrResult
-      ? ensureOcrResultIr(ocrResult, {
-          pageIndex: Number(page.page_num || 0) || 1,
+    const pageIndex = Number(page.page_num || 0) || 1
+    const repairedOcrResult = ocrResult
+      ? normalizeStoredGujiOcrResultForRead(ocrResult, page.image_path, pageIndex) || ocrResult
+      : null
+    const normalizedOcrResult = repairedOcrResult
+      ? ensureOcrResultIr(repairedOcrResult, {
+          pageIndex,
           generatedAt: getOcrPageIr(page.ocr_result)?.generatedAt,
           forceRebuild: true,
         })
@@ -5079,7 +5086,11 @@ export function registerDocumentIpc(): void {
     run('UPDATE page_ocr_versions SET is_active = 1, updated_at = ? WHERE id = ?', [new Date().toISOString(), version.id])
     const hydratedVersion = hydratePagePayloadRow(version)
     const nextOcrText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', hydratedVersion.ocr_text || '')
-    const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', hydratedVersion.ocr_result || null)
+    const pageIndex = Number(page.page_num || 0) || 1
+    const normalizedVersionResult = hydratedVersion.ocr_result
+      ? normalizeStoredGujiOcrResultForRead(hydratedVersion.ocr_result, page.image_path, pageIndex) || hydratedVersion.ocr_result
+      : null
+    const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', normalizedVersionResult)
     run(
       'UPDATE pages SET ocr_text = ?, ocr_text_ref = ?, ocr_result = ?, ocr_result_ref = ?, proofed_text = ?, proofed_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
       [nextOcrText.value, nextOcrText.ref, nextOcrResult.value, nextOcrResult.ref, null, null, 'completed', 'pending', pageId],

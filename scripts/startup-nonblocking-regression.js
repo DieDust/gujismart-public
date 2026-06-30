@@ -5,6 +5,7 @@ const { join } = require('path')
 const root = join(__dirname, '..')
 const readSource = (...parts) => readFileSync(join(root, ...parts), 'utf8').replace(/\r\n?/g, '\n')
 const mainIndex = readSource('src', 'main', 'index.ts')
+const backupSource = readSource('src', 'main', 'backup.ts')
 const database = readSource('src', 'main', 'database.ts')
 const documentsIpc = readSource('src', 'main', 'ipc', 'documents.ts')
 const ocrIpc = readSource('src', 'main', 'ipc', 'ocr.ts')
@@ -37,6 +38,11 @@ const recoverableBatchOcrItemsBody = sliceBetween(
   'function createRecoverableBatchOcrItems',
   'function updateRecoverableBatchOcrItem',
 )
+const autoBackupSchedulerBody = sliceBetween(
+  backupSource,
+  'export function startAutoBackupScheduler()',
+  'export function stopAutoBackupScheduler()',
+)
 
 assert(
   mainIndex.includes("import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'"),
@@ -66,8 +72,28 @@ assert(
   'Renderer console forwarding should be limited to dev and smoke runs so packaged apps do not spam broken stdout pipes.',
 )
 assert(
+  mainIndex.includes("const enableGpuOnWindows = process.env.GUJISMART_ENABLE_GPU === '1'")
+    && mainIndex.includes("process.env.GUJISMART_DISABLE_GPU === '1'")
+    && mainIndex.includes("process.platform === 'win32' && !enableGpuOnWindows")
+    && !mainIndex.includes("process.platform === 'win32' || process.env.GUJISMART_SMOKE === '1'"),
+  'Windows startup should keep the stable software-rendering default, with GUJISMART_ENABLE_GPU available for explicit GPU trials.',
+)
+assert(
   mainIndex.includes('listStoredLocalResourcePaths({ includePageImages: false })'),
   'Startup resource allow-list should not scan all page images.',
+)
+assert(
+  backupSource.includes('function getAutoBackupScheduleState()')
+    && autoBackupSchedulerBody.includes('const status = getAutoBackupScheduleState()')
+    && autoBackupSchedulerBody.includes('const initialStatus = getAutoBackupScheduleState()')
+    && autoBackupSchedulerBody.includes('autoBackupTimer = setInterval(tick, AUTO_BACKUP_CHECK_INTERVAL_MS)')
+    && !autoBackupSchedulerBody.includes('getBackupStatus()'),
+  'Auto-backup scheduler startup checks should not call getBackupStatus or immediately run due backups on large libraries.',
+)
+assert(
+  backupSource.includes('const AUTO_BACKUP_CHECK_INTERVAL_MS = 10 * 60 * 1000')
+    && !/\n\s*tick\(\)\s*\n\s*autoBackupTimer = setInterval/.test(autoBackupSchedulerBody),
+  'Auto-backup scheduler should defer the first due-backup check instead of copying backup data during startup.',
 )
 assert(
   mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 15_000')

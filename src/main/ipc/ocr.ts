@@ -2297,6 +2297,7 @@ async function postProcessPdfOcrResultsBatched(
         ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {
           signal,
           preserveServiceCoordinates: true,
+          serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path),
         })
         : null
       if (!result) {
@@ -3986,12 +3987,57 @@ function getStoredOcrIrSize(
   result: unknown,
   imagePath?: string | null,
 ): { width?: number; height?: number } {
-  if (isServiceCoordinatePreservedResult(result)) return {}
   const imageSize = getPageImageSize(imagePath)
+  if (isServiceCoordinatePreservedResult(result)) {
+    if (!isJsonRecord(result)) return {}
+    const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+    const explicitWidth = getPositiveNumber(result.page_width)
+      || getPositiveNumber(result.image_width)
+      || getPositiveNumber(result.source_image_width)
+      || getPositiveNumber(gujiProcessing.source_image_width)
+    const explicitHeight = getPositiveNumber(result.page_height)
+      || getPositiveNumber(result.image_height)
+      || getPositiveNumber(result.source_image_height)
+      || getPositiveNumber(gujiProcessing.source_image_height)
+    return {
+      width: explicitWidth || imageSize?.width,
+      height: explicitHeight || imageSize?.height,
+    }
+  }
   return {
     width: imageSize?.width,
     height: imageSize?.height,
   }
+}
+
+function ensureServiceCoordinatePageSizeForStorage<T extends OcrRecognizeResult>(
+  result: T,
+  imagePath?: string | null,
+): T {
+  if (!isServiceCoordinatePreservedResult(result)) return result
+  const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
+  const explicitWidth = getPositiveNumber(result.page_width)
+    || getPositiveNumber(result.image_width)
+    || getPositiveNumber(result.source_image_width)
+    || getPositiveNumber(gujiProcessing.source_image_width)
+  const explicitHeight = getPositiveNumber(result.page_height)
+    || getPositiveNumber(result.image_height)
+    || getPositiveNumber(result.source_image_height)
+    || getPositiveNumber(gujiProcessing.source_image_height)
+  if (explicitWidth && explicitHeight) return result
+  const imageSize = getPageImageSize(imagePath)
+  if (!imageSize) return result
+  return {
+    ...result,
+    source_image_width: imageSize.width,
+    source_image_height: imageSize.height,
+    guji_processing: {
+      ...gujiProcessing,
+      source_image_width: imageSize.width,
+      source_image_height: imageSize.height,
+      service_coordinate_size_source: gujiProcessing.service_coordinate_size_source || 'page_image_fallback',
+    },
+  } as T
 }
 
 function normalizeOcrResultForStorage(
@@ -4006,8 +4052,11 @@ function normalizeOcrResultForStorage(
       text: rawFeijiangReferenceText,
     }
   }
-  const irSize = getStoredOcrIrSize(result, page?.image_path)
-  const normalized = ensureOcrResultIr(result, {
+  const sizeNormalizedResult = isJsonRecord(result)
+    ? ensureServiceCoordinatePageSizeForStorage(result as OcrRecognizeResult, page?.image_path)
+    : result
+  const irSize = getStoredOcrIrSize(sizeNormalizedResult, page?.image_path)
+  const normalized = ensureOcrResultIr(sizeNormalizedResult, {
     pageIndex: Number(page?.page_num || 0) || 1,
     pageWidth: irSize.width,
     pageHeight: irSize.height,
@@ -4017,9 +4066,9 @@ function normalizeOcrResultForStorage(
   })
   const gujiOptions = getGujiOcrOptionsForResult(normalized)
   const preferredGujiText = gujiOptions
-    ? getPreferredGujiServiceText(result)
+    ? getPreferredGujiServiceText(sizeNormalizedResult)
       || getPreferredGujiServiceText(normalized)
-      || getUsableGujiAsyncPdfServiceText(result)
+      || getUsableGujiAsyncPdfServiceText(sizeNormalizedResult)
       || getUsableGujiAsyncPdfServiceText(normalized)
     : ''
   const storageResultBase = gujiOptions

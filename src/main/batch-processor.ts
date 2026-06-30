@@ -4,6 +4,7 @@ import { autoExtractAndApply } from './ai'
 import { queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import {
   OcrAbortError,
+  getPageImageSize,
   isOcrAbortError,
   postProcessRecognizedPageResult,
   recognizePages,
@@ -294,6 +295,7 @@ class BatchProcessor {
           ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {
             signal,
             preserveServiceCoordinates: true,
+            serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path),
           })
           : null
         return {

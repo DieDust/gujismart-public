@@ -171,10 +171,12 @@ assert(
 assert(
   postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true')
     && batchPostProcessPdfResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && postProcessPdfOcrResultsBatchedBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
+    && batchPostProcessPdfResultsBatchedBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
     && !postProcessPdfOcrResultsBatchedBody.includes('const imageCoordinateMismatchIssue = getLikelyAsyncPdfImageCoordinateMismatchIssue(result, item.page.image_path)')
     && !postProcessPdfOcrResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
     && !batchPostProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true'),
-  'Async PDF post-processing should preserve service-returned coordinates and must not rerun page-image OCR for coordinate repair.',
+  'Async PDF post-processing should preserve service provenance, attach the local page-image size as fallback, and must not rerun page-image OCR for coordinate repair.',
 )
 assert(
   postProcessPdfOcrResultsBatchedBody.includes('if (!hasReadablePageImage(item.page))')
@@ -401,12 +403,18 @@ assert(
 assert(
   ocrSource.includes('tightenTextCoordinatesToLocalInk?: boolean')
     && ocrSource.includes('preserveServiceCoordinates?: boolean')
+    && ocrSource.includes('alignServiceCoordinatesToLocalImage?: boolean')
+    && ocrSource.includes('function alignServiceCoordinatesToLocalImage')
+    && ocrSource.includes("service_coordinate_size_source: 'local_page_image'")
+    && ocrSource.includes('service_coordinates_aligned_to_local_image')
     && ocrSource.includes('!preserveServiceCoordinates && runtimeOptions.tightenTextCoordinatesToLocalInk')
     && postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true')
     && batchPostProcessPdfResultsBatchedBody.includes('preserveServiceCoordinates: true')
+    && postProcessPdfOcrResultsBatchedBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
+    && batchPostProcessPdfResultsBatchedBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
     && !postProcessPdfOcrResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
     && !batchPostProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true'),
-  'Async PDF OCR should preserve service-returned coordinates instead of tightening saved text blocks against the local page image.',
+  'Async PDF OCR should align preserved service coordinates onto the local page-image basis without enabling the page-image OCR tightening flag.',
 )
 assert(
   ocrSource.includes('const uploadImage = await prepareImageForOcrUpload(page.image_path)')
