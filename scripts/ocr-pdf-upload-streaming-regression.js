@@ -142,21 +142,20 @@ assert(
 )
 assert(
   ocrSource.includes('function getAsyncPdfOptionalPayload')
-    && asyncPdfOptionalPayloadBody.includes('use_doc_preprocessor: false')
-    && asyncPdfOptionalPayloadBody.includes('use_layout_detection: true')
-    && asyncPdfOptionalPayloadBody.includes('use_doc_orientation_classify: false')
-    && asyncPdfOptionalPayloadBody.includes('use_doc_unwarping: false')
-    && asyncPdfOptionalPayloadBody.includes('use_chart_recognition: false')
-    && asyncPdfOptionalPayloadBody.includes('use_seal_recognition: true')
-    && asyncPdfOptionalPayloadBody.includes('use_ocr_for_image_block: false')
-    && asyncPdfOptionalPayloadBody.includes('format_block_content: true')
-    && asyncPdfOptionalPayloadBody.includes('merge_layout_blocks: true')
-    && asyncPdfOptionalPayloadBody.includes('markdown_ignore_labels:')
-    && asyncPdfOptionalPayloadBody.includes('return_layout_polygon_points: true')
+    && asyncPdfOptionalPayloadBody.includes('useDocOrientationClassify: false')
+    && asyncPdfOptionalPayloadBody.includes('useDocUnwarping: false')
+    && asyncPdfOptionalPayloadBody.includes('useLayoutDetection: true')
+    && asyncPdfOptionalPayloadBody.includes('useChartRecognition: false')
+    && asyncPdfOptionalPayloadBody.includes("layoutMergeBboxesMode: 'small'")
+    && asyncPdfOptionalPayloadBody.includes('markdownIgnoreLabels:')
+    && asyncPdfOptionalPayloadBody.includes('returnLayoutPolygonPoints: true')
+    && !asyncPdfOptionalPayloadBody.includes('use_doc_preprocessor')
+    && !asyncPdfOptionalPayloadBody.includes('use_doc_unwarping')
+    && !asyncPdfOptionalPayloadBody.includes('merge_layout_blocks')
     && submitAsyncPdfJobBody.includes("formData.append('optionalPayload', JSON.stringify(submitOptions.optionalPayload))")
     && recognizePdfAsyncBody.includes('const optionalPayload = getAsyncPdfOptionalPayload(options?.ocrOptions, model)')
     && recognizePdfAsyncBody.includes('}, { pageRanges: chunk.pageRanges, optionalPayload })'),
-  'Async PDF OCR should send the same stable PaddleOCR web settings that avoid document-preprocessor table pollution.',
+  'Async PDF OCR should send official camelCase PaddleOCR web settings that avoid ignored options and document-preprocessor coordinate drift.',
 )
 assert(
   ocrIpcSource.includes('function getAsyncPdfPostProcessOptions')

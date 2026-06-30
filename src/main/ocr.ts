@@ -4077,18 +4077,17 @@ function getAsyncPdfOptionalPayload(_options?: PageOcrOptions, model?: AsyncOcrM
     return undefined
   }
 
+  // PaddleOCR official API expects camelCase request fields. Snake-case fields
+  // are silently ignored by the async PDF endpoint, leaving doc preprocessing on
+  // and causing block boxes to drift on some scanned PDFs.
   return {
-    use_doc_preprocessor: false,
-    use_layout_detection: true,
-    use_doc_orientation_classify: false,
-    use_doc_unwarping: false,
-    use_chart_recognition: false,
-    use_seal_recognition: true,
-    use_ocr_for_image_block: false,
-    format_block_content: true,
-    merge_layout_blocks: true,
-    markdown_ignore_labels: ['number', 'footnote', 'header', 'header_image', 'footer', 'footer_image', 'aside_text'],
-    return_layout_polygon_points: true,
+    useDocOrientationClassify: false,
+    useDocUnwarping: false,
+    useLayoutDetection: true,
+    useChartRecognition: false,
+    layoutMergeBboxesMode: 'small',
+    markdownIgnoreLabels: ['number', 'footnote', 'header', 'header_image', 'footer', 'footer_image', 'aside_text'],
+    returnLayoutPolygonPoints: true,
   }
 }
 
