@@ -1,5 +1,43 @@
 # 更新日志 / Changelog
 
+## 1.0.8 - 2026-06-30
+
+### 中文
+
+#### 改进
+
+- 改进整本 PDF 异步 OCR 的坐标保存方式，优先保留 PaddleOCR 返回的每页坐标尺寸，减少版式还原、校对和源图叠加时的上下偏移。
+- 优化整本 OCR 结果回写流程，保存阶段不再为了坐标兜底批量渲染缺失页面图，恢复大文件异步 OCR 的快速处理路径。
+- 补充 OCR 坐标与异步 PDF 上传回归检查，防止后续修改重新引入坐标漂移或整本 OCR 保存变慢的问题。
+
+#### 修复
+
+- 修复整本异步 OCR 后 OCR 块在部分文献中整体上移或下移的问题。
+- 修复整本 OCR 完成后结果保存阶段额外生成大量页面图，导致看起来像上传或 OCR 过程从十几秒变成数分钟的问题。
+
+#### 下载
+
+- `GujiSmart-1.0.8-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.0.8-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Improvements
+
+- Improved coordinate persistence for whole-PDF asynchronous OCR by preserving PaddleOCR's per-page coordinate dimensions, reducing vertical drift in layout restoration, proofing, and source-image overlays.
+- Optimized whole-document OCR result saving so missing local page images are no longer rendered in bulk during persistence, restoring the fast asynchronous PDF OCR path for larger files.
+- Added OCR coordinate and asynchronous PDF upload regression checks to guard against future coordinate drift and save-time slowdowns.
+
+#### Fixes
+
+- Fixed OCR blocks shifting upward or downward after whole-document asynchronous OCR on some documents.
+- Fixed an OCR result-save regression that generated many page images after whole-PDF OCR, making upload/OCR appear to take minutes instead of seconds.
+
+#### Downloads
+
+- `GujiSmart-1.0.8-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.0.8-Portable-x64.exe` for portable use.
+
 ## 1.0.7 - 2026-06-27
 
 ### 中文

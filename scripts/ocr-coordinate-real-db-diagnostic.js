@@ -14,7 +14,7 @@ process.env.NODE_PATH = [
 require('module').Module._initPaths()
 
 const dbPath = path.join(root, 'data', 'db', 'gujismart.db')
-const outputRoot = path.join(root, 'data', 'temp', 'ocr-coordinate-real-db')
+const outputRoot = path.join(root, 'data', 'temp', 'ocr-coordinate-local-db')
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-real-ocr-coordinates-'))
 const entryPath = path.join(tempRoot, 'entry.js')
 const bundlePath = path.join(tempRoot, 'bundle.cjs')
@@ -277,7 +277,7 @@ for spec_path in sys.argv[1:]:
   if (result.status !== 0) throw new Error(result.stderr || result.stdout || `Python overlay drawing failed with ${result.status}`)
 }
 
-function loadRealDatabaseSample(requestedIds, options = {}) {
+function loadLocalDatabaseSample(requestedIds, options = {}) {
   const python = String.raw`
 import gzip
 import json
@@ -384,7 +384,7 @@ function run() {
   ensureDir(outputRoot)
   const { normalizeStoredOcrResultForRead, getOcrPageIr, OCR_IR_PIPELINE_VERSION } = require(bundlePath)
   const requestedIds = process.argv.slice(2).filter((arg) => !arg.startsWith('--'))
-  const docs = loadRealDatabaseSample(requestedIds, { includeAllPages }).documents || []
+  const docs = loadLocalDatabaseSample(requestedIds, { includeAllPages }).documents || []
   const report = {
     generatedAt: new Date().toISOString(),
     dbPath,
