@@ -276,6 +276,11 @@ function nonNegativeIntField(source: unknown, keys: string[], fallback = 0): num
   return value === null ? fallback : Math.max(0, Math.floor(value))
 }
 
+function positiveNumber(value: unknown): number | null {
+  const numberValue = finiteNumber(value)
+  return numberValue && numberValue > 0 ? numberValue : null
+}
+
 function isOcrResultPayload(value: unknown): value is OcrResultPayload {
   if (!isJsonRecord(value)) return false
   return Array.isArray(value.layout_result)
@@ -1258,13 +1263,13 @@ function splitMergedWideVerticalTextLineBlocks(
 function getCoordinateSourceDimensions(result: OcrResultPayload): { width?: number; height?: number } {
   const gujiProcessing = isJsonRecord(result.guji_processing) ? result.guji_processing : {}
   const preserveServiceCoordinates = readRecordValue(gujiProcessing, 'ocr_service_coordinates_preserved') === true
-  const width = finiteNumber(firstRecordValue(result, ['page_width', 'image_width', 'source_image_width', 'width']))
-    ?? (!preserveServiceCoordinates ? finiteNumber(readRecordValue(gujiProcessing, 'source_image_width')) : null)
-  const height = finiteNumber(firstRecordValue(result, ['page_height', 'image_height', 'source_image_height', 'height']))
-    ?? (!preserveServiceCoordinates ? finiteNumber(readRecordValue(gujiProcessing, 'source_image_height')) : null)
+  const width = positiveNumber(firstRecordValue(result, ['page_width', 'image_width', 'width', 'source_image_width']))
+    ?? (!preserveServiceCoordinates ? positiveNumber(readRecordValue(gujiProcessing, 'source_image_width')) : null)
+  const height = positiveNumber(firstRecordValue(result, ['page_height', 'image_height', 'height', 'source_image_height']))
+    ?? (!preserveServiceCoordinates ? positiveNumber(readRecordValue(gujiProcessing, 'source_image_height')) : null)
   return {
-    width: width && width > 0 ? width : undefined,
-    height: height && height > 0 ? height : undefined,
+    width: width || undefined,
+    height: height || undefined,
   }
 }
 
@@ -1436,8 +1441,7 @@ function markServiceCoordinatesPreserved(result: OcrResultPayload): OcrResultPay
 }
 
 function getPositiveCoordinateNumber(value: unknown): number | null {
-  const numberValue = finiteNumber(value)
-  return numberValue && numberValue > 0 ? numberValue : null
+  return positiveNumber(value)
 }
 
 function getServiceCoordinateSize(result: OcrResultPayload): { width?: number; height?: number; source: string } {
@@ -1523,6 +1527,10 @@ function alignServiceCoordinatesToLocalImage(
   const scaled = shouldScale ? scaleOcrResultCoordinates(result, scaleX, scaleY) : result
   const alignedBase: OcrResultPayload = {
     ...scaled,
+    page_width: localImageSize.width,
+    page_height: localImageSize.height,
+    image_width: localImageSize.width,
+    image_height: localImageSize.height,
     source_image_width: localImageSize.width,
     source_image_height: localImageSize.height,
     guji_processing: {
@@ -1540,20 +1548,7 @@ function alignServiceCoordinatesToLocalImage(
       service_coordinate_size_source: 'local_page_image',
     },
   }
-  const tightened = tightenOcrTextCoordinatesToLocalInk(alignedBase, imagePath, { searchNearbyTextInk: true })
-  if (tightened === alignedBase) return alignedBase
-  return {
-    ...tightened,
-    source_image_width: localImageSize.width,
-    source_image_height: localImageSize.height,
-    guji_processing: {
-      ...(isJsonRecord(tightened.guji_processing) ? tightened.guji_processing : {}),
-      source_image_width: localImageSize.width,
-      source_image_height: localImageSize.height,
-      service_coordinate_size_source: 'local_page_image',
-      service_coordinates_aligned_to_local_image: OCR_LOCAL_IMAGE_COORDINATE_ALIGNMENT_VERSION,
-    },
-  }
+  return alignedBase
 }
 
 function locationToCornerPoints(location: LayoutLocation): Array<{ x: number; y: number }> {
@@ -3591,6 +3586,12 @@ export function normalizePageResult(layoutPage: unknown): OcrResultPayload {
   const sourceRes = readRecordValue(sourcePage, 'res')
   const sourcePruned = readRecordValue(sourcePage, 'prunedResult')
   const resPruned = readRecordValue(sourceRes, 'prunedResult')
+  const servicePageWidth = positiveNumber(firstRecordValue(sourcePage, ['page_width', 'image_width', 'width', 'source_image_width']))
+    ?? positiveNumber(firstRecordValue(sourcePruned, ['page_width', 'image_width', 'width', 'source_image_width']))
+    ?? positiveNumber(firstRecordValue(resPruned, ['page_width', 'image_width', 'width', 'source_image_width']))
+  const servicePageHeight = positiveNumber(firstRecordValue(sourcePage, ['page_height', 'image_height', 'height', 'source_image_height']))
+    ?? positiveNumber(firstRecordValue(sourcePruned, ['page_height', 'image_height', 'height', 'source_image_height']))
+    ?? positiveNumber(firstRecordValue(resPruned, ['page_height', 'image_height', 'height', 'source_image_height']))
   const markdownValue = readRecordValue(sourcePage, 'markdown')
   const markdownText = typeof markdownValue === 'string'
     ? markdownValue
@@ -3793,7 +3794,16 @@ export function normalizePageResult(layoutPage: unknown): OcrResultPayload {
   }
 
   const lines = fullText.split('\n').map((line) => line.trim()).filter(Boolean)
+  const servicePageSize = servicePageWidth && servicePageHeight
+    ? {
+      page_width: servicePageWidth,
+      page_height: servicePageHeight,
+      image_width: servicePageWidth,
+      image_height: servicePageHeight,
+    }
+    : {}
   return {
+    ...servicePageSize,
     markdown: markdownValue || null,
     words_result: lines.map((line) => ({ words: line })),
     layout_result: orderedBoxes,

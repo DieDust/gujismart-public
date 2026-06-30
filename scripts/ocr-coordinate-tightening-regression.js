@@ -37,6 +37,18 @@ const postProcessBody = sliceBetween(
   'export function normalizePageResult',
   'OCR post-processing',
 )
+const alignServiceCoordinatesBody = sliceBetween(
+  ocrSource,
+  'function alignServiceCoordinatesToLocalImage',
+  'function locationToCornerPoints',
+  'async PDF service-coordinate alignment',
+)
+const normalizePageResultBody = sliceBetween(
+  ocrSource,
+  'export function normalizePageResult',
+  'interface SyncRecognitionOptions',
+  'OCR page result normalization',
+)
 const ipcPostProcessPdfBody = sliceBetween(
   ocrIpcSource,
   'async function postProcessPdfOcrResultsBatched',
@@ -98,6 +110,31 @@ assert(
     && postProcessBody.includes('alignServiceCoordinatesToLocalImage(preserved, imagePath)')
     && postProcessBody.includes('attachProcessingMeta(isOcrResultPayload(coordinateTightenedInput)'),
   'OCR post-processing should keep page-image OCR tightening opt-in while aligning async PDF service coordinates to the local page image before saving.',
+)
+
+assert(
+  alignServiceCoordinatesBody.includes('const shouldScale = Math.abs(scaleX - 1) > 0.002 || Math.abs(scaleY - 1) > 0.002')
+    && alignServiceCoordinatesBody.includes('const scaled = shouldScale ? scaleOcrResultCoordinates(result, scaleX, scaleY) : result')
+    && alignServiceCoordinatesBody.includes('page_width: localImageSize.width')
+    && alignServiceCoordinatesBody.includes('page_height: localImageSize.height')
+    && alignServiceCoordinatesBody.includes('image_width: localImageSize.width')
+    && alignServiceCoordinatesBody.includes('image_height: localImageSize.height')
+    && alignServiceCoordinatesBody.includes('return alignedBase')
+    && !alignServiceCoordinatesBody.includes('tightenOcrTextCoordinatesToLocalInk'),
+  'Async PDF service-coordinate alignment should only scale between service and local image sizes, never run local ink tightening that moves PaddleOCR boxes.',
+)
+
+assert(
+  normalizePageResultBody.includes('const servicePageWidth = positiveNumber')
+    && normalizePageResultBody.includes("firstRecordValue(sourcePruned, ['page_width', 'image_width', 'width', 'source_image_width'])")
+    && normalizePageResultBody.includes('const servicePageHeight = positiveNumber')
+    && normalizePageResultBody.includes('const servicePageSize = servicePageWidth && servicePageHeight')
+    && normalizePageResultBody.includes('page_width: servicePageWidth')
+    && normalizePageResultBody.includes('page_height: servicePageHeight')
+    && normalizePageResultBody.includes('image_width: servicePageWidth')
+    && normalizePageResultBody.includes('image_height: servicePageHeight')
+    && normalizePageResultBody.includes('...servicePageSize'),
+  'PaddleOCR async PDF normalization should preserve prunedResult width/height as the service coordinate page size.',
 )
 
 assert(

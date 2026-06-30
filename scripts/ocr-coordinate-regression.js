@@ -130,8 +130,8 @@ try {
 
   assert.ok(imageViewerSource.includes("from '../utils/ocrCoordinates'"), 'ImageViewer should use the shared OCR coordinate mapper')
   assert.ok(imageViewerSource.includes('resolveOcrCoordinateSourceSizeForImage'), 'ImageViewer should resolve legacy async PDF coordinate sizes against the rendered page image')
-  assert.ok(imageViewerSource.includes('getInkAdjustedOcrRect'), 'ImageViewer should apply display-only ink adjustment for loose OCR boxes')
-  assert.ok(imageViewerSource.includes("getContext('2d', { willReadFrequently: true })"), 'ImageViewer should read page pixels efficiently for OCR display adjustment')
+  assert.ok(!imageViewerSource.includes('getInkAdjustedOcrRect'), 'ImageViewer should render persisted OCR coordinates directly instead of applying display-only ink adjustment')
+  assert.ok(!imageViewerSource.includes("getContext('2d', { willReadFrequently: true })"), 'ImageViewer should not read page pixels to move OCR boxes at display time')
   assert.ok(facsimileSource.includes("from '../utils/ocrCoordinates'"), 'Guji facsimile proofreader should use the shared OCR coordinate mapper')
 
   console.log('OCR coordinate regression passed')

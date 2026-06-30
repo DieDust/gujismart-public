@@ -10,7 +10,6 @@ import {
   RightOutlined,
 } from '@ant-design/icons'
 import {
-  getInkAdjustedOcrRect,
   getOcrBlockRect,
   getOcrBoxSourceDimension,
   getOcrCoordinateExtent,
@@ -86,7 +85,6 @@ export default function ImageViewer({
   const [viewportState, setViewportState] = useState<ViewerViewport>(DEFAULT_VIEWPORT)
   const [isDragging, setIsDragging] = useState(false)
   const [renderedImageSize, setRenderedImageSize] = useState({ width: 0, height: 0 })
-  const [inkAdjustedBoxRects, setInkAdjustedBoxRects] = useState<Record<number, BoxRect>>({})
   const dragStart = useRef({ x: 0, y: 0, centerX: 0, centerY: 0 })
   const mouseDownPos = useRef({ x: 0, y: 0 })
   const imageSize = useRef({ width: 0, height: 0 })
@@ -163,59 +161,18 @@ export default function ImageViewer({
   }, [fitToScreen, src])
 
   useEffect(() => {
-    let canceled = false
-    setInkAdjustedBoxRects({})
-    if (!src || !hasCoordinates || !renderedImageSize.width || !renderedImageSize.height || ocrBoxes.length === 0) return undefined
-    if (renderedImageSize.width * renderedImageSize.height > 16_000_000) return undefined
-
-    const img = new Image()
-    img.onload = () => {
-      if (canceled) return
-      const canvas = document.createElement('canvas')
-      canvas.width = img.width
-      canvas.height = img.height
-      const context = canvas.getContext('2d', { willReadFrequently: true })
-      if (!context) return
-      context.drawImage(img, 0, 0)
-      const imageData = context.getImageData(0, 0, canvas.width, canvas.height)
-      const nextRects: Record<number, BoxRect> = {}
-      ocrBoxes.forEach((box, index) => {
-        const rect = getBoxRect(box, boxCoordinateScale)
-        if (!rect) return
-        const adjusted = getInkAdjustedOcrRect(
-          { data: imageData.data, width: imageData.width, height: imageData.height },
-          { left: rect.x, top: rect.y, width: rect.width, height: rect.height },
-          {
-            label: box.label || box.block_label || box.type,
-            text: box.words || box.word || box.text,
-          },
-        )
-        if (!adjusted) return
-        nextRects[index] = { x: adjusted.left, y: adjusted.top, width: adjusted.width, height: adjusted.height }
-      })
-      if (!canceled) setInkAdjustedBoxRects(nextRects)
-      canvas.width = 1
-      canvas.height = 1
-    }
-    img.src = src
-    return () => {
-      canceled = true
-    }
-  }, [boxCoordinateScale.scaleX, boxCoordinateScale.scaleY, hasCoordinates, ocrBoxes, renderedImageSize.height, renderedImageSize.width, src])
-
-  useEffect(() => {
     if (activeBoxIndex === lastFocusedBoxRef.current) return
     lastFocusedBoxRef.current = activeBoxIndex
     if (activeBoxIndex < 0 || !imageSize.current.width || !ocrBoxes[activeBoxIndex]) return
     const box = ocrBoxes[activeBoxIndex]
-    const rect = inkAdjustedBoxRects[activeBoxIndex] || getBoxRect(box, boxCoordinateScale)
+    const rect = getBoxRect(box, boxCoordinateScale)
     if (!rect) return
     updateViewport({
       ...latestViewportRef.current,
       centerX: rect.x + rect.width / 2,
       centerY: rect.y + rect.height / 2,
     })
-  }, [activeBoxIndex, boxCoordinateScale, inkAdjustedBoxRects, ocrBoxes, updateViewport])
+  }, [activeBoxIndex, boxCoordinateScale, ocrBoxes, updateViewport])
 
   useEffect(() => {
     if (!isDragging) return undefined
@@ -297,7 +254,7 @@ export default function ImageViewer({
 
     if (hasCoordinates) {
       return ocrBoxes.map((box, index) => {
-        const rect = inkAdjustedBoxRects[index] || getBoxRect(box, boxCoordinateScale)
+        const rect = getBoxRect(box, boxCoordinateScale)
         if (!rect) return null
 
         const isActive = activeBoxIndex === index
