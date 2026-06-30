@@ -2288,10 +2288,6 @@ async function postProcessPdfOcrResultsBatched(
     const batch = pages.slice(index, index + OCR_RESULT_POSTPROCESS_CHUNK_SIZE)
     const batchResults = await Promise.all(batch.map(async (item) => {
       throwIfOcrCanceled(signal)
-      if (!hasReadablePageImage(item.page)) {
-        const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)
-        if (fallbackPage) item.page.image_path = fallbackPage.image_path
-      }
       const rawResult = rawResults[item.resultIndex]
       const result = rawResult
         ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {

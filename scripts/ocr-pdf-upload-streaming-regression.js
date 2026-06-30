@@ -175,15 +175,14 @@ assert(
     && !postProcessPdfOcrResultsBatchedBody.includes('const imageCoordinateMismatchIssue = getLikelyAsyncPdfImageCoordinateMismatchIssue(result, item.page.image_path)')
     && !postProcessPdfOcrResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true')
     && !batchPostProcessPdfResultsBatchedBody.includes('tightenTextCoordinatesToLocalInk: true'),
-  'Async PDF post-processing should preserve service provenance, attach the local page-image size as fallback, and must not rerun page-image OCR for coordinate repair.',
+  'Async PDF post-processing should preserve service provenance, use any existing local page-image size as fallback, and must not rerun page-image OCR for coordinate repair.',
 )
 assert(
-  postProcessPdfOcrResultsBatchedBody.includes('if (!hasReadablePageImage(item.page))')
-    && postProcessPdfOcrResultsBatchedBody.includes('const fallbackPage = await ensurePageImageForOcrFallback(item.page, fallbackPdfPath, signal)')
-    && postProcessPdfOcrResultsBatchedBody.includes('if (fallbackPage) item.page.image_path = fallbackPage.image_path')
-    && postProcessPdfOcrResultsBatchedBody.indexOf('if (!hasReadablePageImage(item.page))') < postProcessPdfOcrResultsBatchedBody.indexOf('postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions')
+  !postProcessPdfOcrResultsBatchedBody.includes('ensurePageImageForOcrFallback(item.page')
+    && !postProcessPdfOcrResultsBatchedBody.includes('if (!hasReadablePageImage(item.page))')
+    && postProcessPdfOcrResultsBatchedBody.includes('postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions')
     && postProcessPdfOcrResultsBatchedBody.includes('preserveServiceCoordinates: true'),
-  'Async PDF OCR may materialize missing local page-image metadata before saving, but should keep the service coordinate basis.',
+  'Foreground async PDF OCR save must not materialize missing local page images before saving service-coordinate results.',
 )
 assert(
   submitAsyncPdfJobBody.includes("formData.append('pageRanges', submitOptions.pageRanges)")

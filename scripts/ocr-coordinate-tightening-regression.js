@@ -164,9 +164,10 @@ assert(
     && batchPostProcessPdfBody.includes('preserveServiceCoordinates: true')
     && ipcPostProcessPdfBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
     && batchPostProcessPdfBody.includes('serviceCoordinateFallbackSize: getPageImageSize(item.page.image_path)')
+    && !ipcPostProcessPdfBody.includes('ensurePageImageForOcrFallback(item.page')
     && !ipcPostProcessPdfBody.includes('tightenTextCoordinatesToLocalInk: true')
     && !batchPostProcessPdfBody.includes('tightenTextCoordinatesToLocalInk: true'),
-  'Both foreground and background async PDF OCR result saves should preserve service provenance while writing a local page-image fallback size.',
+  'Both foreground and background async PDF OCR result saves should preserve service provenance while using existing page-image fallback sizes when available.',
 )
 
 assert(
