@@ -63,6 +63,8 @@ const OCR_PAGE_INSERT_CHUNK_SIZE = 50
 const OCR_RESULT_SAVE_CHUNK_SIZE = 50
 const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = 50
 const OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE = 25
+const OCR_ASYNC_PDF_GUJI_LARGE_PAGE_RANGE_CHUNK_SIZE = 80
+const OCR_ASYNC_PDF_GUJI_LARGE_PAGE_THRESHOLD = 180
 const OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE = 10
 const OCR_AUTO_FAILED_PAGE_RETRY_LIMIT = 24
 const OCR_FINALIZE_PAGE_CHUNK_SIZE = 250
@@ -1824,31 +1826,41 @@ function hasOldBookRouteHints(doc: Pick<OcrDocumentRow, 'title' | 'author' | 'so
   return (earlyYear || oldOrthography) && oldSchoolBookSignals
 }
 
+function getGujiAsyncPdfPageRangeChunkSize(pageCount: number): number {
+  const safePageCount = Math.max(0, Math.floor(Number(pageCount || 0)))
+  if (safePageCount >= OCR_ASYNC_PDF_GUJI_LARGE_PAGE_THRESHOLD) {
+    return OCR_ASYNC_PDF_GUJI_LARGE_PAGE_RANGE_CHUNK_SIZE
+  }
+  return OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE
+}
+
 function getAsyncPdfOcrRouteRisk(
   doc: Pick<OcrDocumentRow, 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
   pages: OcrPageRow[],
   pagesForOcr: OcrPageRow[],
   ocrOptions: Required<PageOcrOptions>,
 ): AsyncPdfOcrRouteRisk | null {
+  const routePageCount = Math.max(pages.length, pagesForOcr.length)
+  const pageRangeChunkSize = getGujiAsyncPdfPageRangeChunkSize(routePageCount)
   if (ocrOptions.profile === 'guji_print_vertical') {
     return {
-      reason: '\u6587\u732e\u7c7b\u578b\u4e3a\u53e4\u7c4d\uff0c\u4f7f\u7528\u6574\u672c\u539f PDF \u7684 25 \u9875 pageRanges \u5f02\u6b65 OCR\uff0c\u5bf9\u9f50\u98de\u5c06\u7f51\u9875\u5bfc\u51fa\u7684\u4efb\u52a1\u5f62\u6001\u3002',
+      reason: `文献类型为古籍，使用整本原 PDF 的 ${pageRangeChunkSize} 页 pageRanges 异步 OCR，对齐飞桨网页导出的任务形态。`,
       ocrOptions,
-      pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE,
+      pageRangeChunkSize,
     }
   }
   if (hasExistingVerticalPageOcrSignals(pages)) {
     return {
-      reason: '\u5df2\u68c0\u6d4b\u5230\u9875\u9762\u5b58\u5728\u7ad6\u6392/\u53e4\u7c4d OCR \u4fe1\u53f7\uff0c\u4f7f\u7528\u6574\u672c\u539f PDF \u7684 25 \u9875 pageRanges \u5f02\u6b65 OCR\u3002',
+      reason: `已检测到页面存在竖排/古籍 OCR 信号，使用整本原 PDF 的 ${pageRangeChunkSize} 页 pageRanges 异步 OCR。`,
       ocrOptions: getVerticalFallbackOcrOptions(ocrOptions),
-      pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE,
+      pageRangeChunkSize,
     }
   }
   if (hasOldBookRouteHints(doc) && (hasBookFacsimileImageSignals(pages) || pages.length === 0 || pagesForOcr.length === pages.length)) {
     return {
-      reason: '\u6587\u732e\u6807\u9898\u6216\u5143\u6570\u636e\u50cf\u65e7\u5f0f\u5f71\u5370\u4e66\uff0c\u4f7f\u7528\u6574\u672c\u539f PDF \u7684 25 \u9875 pageRanges \u5f02\u6b65 OCR\u3002',
+      reason: `文献标题或元数据像旧式影印书，使用整本原 PDF 的 ${pageRangeChunkSize} 页 pageRanges 异步 OCR。`,
       ocrOptions: getVerticalFallbackOcrOptions(ocrOptions),
-      pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE,
+      pageRangeChunkSize,
     }
   }
   return null
@@ -1872,6 +1884,40 @@ function getAsyncPdfPostProcessOptions(ocrOptions: Required<PageOcrOptions>): Re
   return {
     ...ocrOptions,
     secondPass: 'none',
+  }
+}
+
+async function recoverGujiAsyncPdfQualityIssueWithPageImage(
+  page: OcrPageRow,
+  pdfPath: string | null,
+  ocrOptions: Required<PageOcrOptions>,
+  signal?: AbortSignal,
+): Promise<OcrPageResult | null> {
+  if (ocrOptions.profile !== 'guji_print_vertical') return null
+  const doc = queryOne<OcrDocumentRow>('SELECT * FROM documents WHERE id = ?', [page.doc_id])
+  if (!doc) return null
+  try {
+    const imagePage = await ensurePageImageForOcrFallback(page, pdfPath, signal)
+    if (!imagePage) return null
+    const retryOptions = getAutomaticSinglePageRetryOptions(doc, imagePage)
+    const result = await recognizeSinglePage(imagePage, doc, retryOptions)
+    const recoveredResult = isJsonRecord(result)
+      ? {
+        ...result,
+        gujismart_async_pdf_quality_fallback: true,
+        gujismart_async_pdf_quality_fallback_source: 'page_image_ocr',
+      }
+      : result
+    return {
+      pageId: page.id,
+      result: recoveredResult,
+      text: getOcrResultText(recoveredResult),
+      status: 'completed',
+    } satisfies OcrPageResult
+  } catch (error) {
+    if (isOcrAbortError(error)) throw error
+    console.warn('[OCR] Failed to recover async PDF quality issue with page-image OCR:', page.page_num, error)
+    return null
   }
 }
 
@@ -2315,6 +2361,8 @@ async function postProcessPdfOcrResultsBatched(
         if (qualityIssue) {
           const recovered = await recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)
           if (recovered) return recovered
+          const pageImageRecovered = await recoverGujiAsyncPdfQualityIssueWithPageImage(item.page, fallbackPdfPath, ocrOptions, signal)
+          if (pageImageRecovered) return pageImageRecovered
           return {
             pageId: item.page.id,
             result: null,

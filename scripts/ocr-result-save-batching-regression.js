@@ -304,15 +304,21 @@ assert(
     && ocrIpcSource.includes('hasGujiMachineTokenHallucination(candidate)')
     && ocrIpcSource.includes('|| getUsableGujiAsyncPdfServiceText(sizeNormalizedResult)')
     && ocrIpcSource.includes('gujismart_async_pdf_result: true')
+    && ocrIpcSource.includes('async function recoverGujiAsyncPdfQualityIssueWithPageImage')
+    && ocrIpcSource.includes('gujismart_async_pdf_quality_fallback_source')
     && ocrIpcSource.includes('pageResult.result.gujismart_async_pdf_result === true')
     && postProcessPdfOcrResultsBatchedBody.includes("if (ocrOptions.profile === 'guji_print_vertical') {")
     && postProcessPdfOcrResultsBatchedBody.includes('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)')
+    && postProcessPdfOcrResultsBatchedBody.includes('const pageImageRecovered = await recoverGujiAsyncPdfQualityIssueWithPageImage(item.page, fallbackPdfPath, ocrOptions, signal)')
+    && postProcessPdfOcrResultsBatchedBody.includes('if (pageImageRecovered) return pageImageRecovered')
     && postProcessPdfOcrResultsBatchedBody.includes("status: 'error'")
     && postProcessPdfOcrResultsBatchedBody.indexOf('const qualityIssue = getGujiAsyncPdfRetryableQualityIssue(result, item.page.image_path, ocrOptions)') < postProcessPdfOcrResultsBatchedBody.indexOf('gujismart_async_pdf_result: true')
+    && postProcessPdfOcrResultsBatchedBody.indexOf('recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)') < postProcessPdfOcrResultsBatchedBody.indexOf('recoverGujiAsyncPdfQualityIssueWithPageImage(item.page, fallbackPdfPath, ocrOptions, signal)')
+    && postProcessPdfOcrResultsBatchedBody.indexOf('recoverGujiAsyncPdfQualityIssueWithPageImage(item.page, fallbackPdfPath, ocrOptions, signal)') < postProcessPdfOcrResultsBatchedBody.indexOf('error: qualityIssue')
     && !postProcessPdfOcrResultsBatchedBody.includes('const tableMisclassification = safePreferredText ? null : getLikelyAsyncPdfTableMisclassification')
     && !postProcessPdfOcrResultsBatchedBody.includes('const hardQualityIssue = safePreferredText ? null : getRiskyPageImageNonTableHardIssue')
     && !postProcessPdfOcrResultsBatchedBody.includes('const underSegmented = !safePreferredText'),
-  'Guji async PDF OCR should preserve PaddleOCR PDF coordinates and only reject retryable runaway or hallucinated PDF results before saving them as completed.',
+  'Guji async PDF OCR should preserve PaddleOCR PDF coordinates and recover retryable quality-rejected pages with page-image OCR before saving them as errors.',
 )
 assert(
   ocrIpcSource.includes("const OCR_FEIJIANG_REFERENCE_ENV = 'GUJISMART_OCR_REFERENCE_JSON_DIR'")

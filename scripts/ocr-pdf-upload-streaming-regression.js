@@ -238,7 +238,10 @@ assert(
     && ocrIpcSource.includes('hasExistingVerticalPageOcrSignals(pages)')
     && ocrIpcSource.includes('hasOldBookRouteHints(doc)')
     && ocrIpcSource.includes('OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE = 25')
-    && ocrIpcSource.includes('pageRangeChunkSize: OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE')
+    && ocrIpcSource.includes('OCR_ASYNC_PDF_GUJI_LARGE_PAGE_RANGE_CHUNK_SIZE = 80')
+    && ocrIpcSource.includes('function getGujiAsyncPdfPageRangeChunkSize')
+    && ocrIpcSource.includes('const pageRangeChunkSize = getGujiAsyncPdfPageRangeChunkSize(routePageCount)')
+    && ocrIpcSource.includes('pageRangeChunkSize,')
     && processDocumentOcrBody.includes('asyncPdfRouteRisk = canUsePdfAsync')
     && processDocumentOcrBody.includes('const asyncPdfOcrOptions = asyncPdfRouteRisk?.ocrOptions || ocrOptions')
     && processDocumentOcrBody.includes('ocrOptions: asyncPdfOcrOptions')
@@ -249,7 +252,7 @@ assert(
     && ocrIpcSource.includes('const pageOptions = getRiskyPageImagePageOptions(page, primaryOptions)')
     && ocrIpcSource.includes('const primaryResult = await recognizeSinglePageWithResolvedOptions(page, pageOptions, options.signal)')
     && ocrIpcSource.includes('const retryOptions = hardIssue || underSegmented'),
-  'Risky facsimile or vertical-book PDFs should use Feijiang-compatible original-PDF pageRange chunks without stale page-image route preferences.',
+  'Risky facsimile or vertical-book PDFs should use adaptive Feijiang-compatible original-PDF pageRange chunks without stale page-image route preferences.',
 )
 assert(
   processDocumentOcrBody.includes('asyncResults = await recognizePdfAsync(pdfPath, (payload) =>')

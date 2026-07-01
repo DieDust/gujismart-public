@@ -79,6 +79,9 @@ const READER_SEARCH_RESULT_PAGE_SIZE = 10
 const PROOF_PAGE_WINDOW_RADIUS = 1
 const PROOF_IMAGE_PREFETCH_DELAY_MS = 260
 const PROOF_IMAGE_PREFETCH_OFFSETS = [1, -1]
+const PROOF_IMAGE_PREWARM_DELAY_MS = 650
+const PROOF_IMAGE_PREWARM_ALL_PAGE_LIMIT = 120
+const PROOF_IMAGE_PREWARM_WINDOW_RADIUS = 10
 const toSimplified = OpenCC.Converter({ from: 'tw', to: 'cn' })
 const toTraditional = OpenCC.Converter({ from: 'cn', to: 'tw' })
 
@@ -860,6 +863,29 @@ function getPageImageCacheKey(page: DocumentViewPage | null | undefined, docId: 
   return String(page?.id || `${docId || fallbackDocumentId}:${page?.page_num || ''}`)
 }
 
+function getProofImagePrewarmPageNums(
+  pages: DocumentViewPage[],
+  currentIndex: number,
+  pageCount: number,
+): number[] {
+  const normalizedPageCount = Math.max(0, Math.round(Number(pageCount || pages.length || 0)))
+  const sourcePages = pages
+    .map((page) => Math.round(Number(page.page_num || 0)))
+    .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0)
+  if (normalizedPageCount > 0 && normalizedPageCount <= PROOF_IMAGE_PREWARM_ALL_PAGE_LIMIT) {
+    return Array.from({ length: normalizedPageCount }, (_item, index) => index + 1)
+  }
+  if (sourcePages.length === 0) return []
+  const start = Math.max(0, currentIndex - PROOF_IMAGE_PREWARM_WINDOW_RADIUS)
+  const end = Math.min(pages.length - 1, currentIndex + PROOF_IMAGE_PREWARM_WINDOW_RADIUS)
+  return Array.from(new Set(
+    pages
+      .slice(start, end + 1)
+      .map((page) => Math.round(Number(page.page_num || 0)))
+      .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0),
+  )).sort((left, right) => left - right)
+}
+
 function getTranslationModelSignatureFromState(state: LlmProfileSyncDetail): string {
   const current = state?.current || (Array.isArray(state?.profiles)
     ? state.profiles.find((profile: LlmProviderProfile) => profile?.id === state?.activeId) || state.profiles[0]
@@ -1378,6 +1404,7 @@ export default function DocumentView({
   const translationWorkerActiveRef = useRef(false)
   const translationTaskIdsRef = useRef<Map<string, string>>(new Map())
   const pageImageCacheRef = useRef<Map<string, string>>(new Map())
+  const proofImagePrewarmKeyRef = useRef('')
   const readerVisiblePageIndexRef = useRef(initialPageIndex)
   const readerStateLoadedRef = useRef(false)
   const documentModeTouchedRef = useRef(false)
@@ -3124,6 +3151,50 @@ export default function DocumentView({
       window.clearTimeout(timer)
     }
   }, [currentPage, currentPageIndex, doc, getCachedPageImage, loadPageImage, shouldUseProofLayout, sortedPages])
+
+  useEffect(() => {
+    if (!doc?.id || !shouldUseProofLayout || proofViewMode !== 'facsimile') return undefined
+    const pageNums = getProofImagePrewarmPageNums(sortedPages, currentPageIndex, pageCount)
+    if (pageNums.length === 0) return undefined
+    const prewarmKey = `${doc.id}:${pageNums[0]}-${pageNums[pageNums.length - 1]}:${pageNums.length}`
+    if (proofImagePrewarmKeyRef.current === prewarmKey) return undefined
+    proofImagePrewarmKeyRef.current = prewarmKey
+
+    let canceled = false
+    const timer = window.setTimeout(() => {
+      void ensureOcrPageImages(doc, {
+        pageNums,
+        onPageCached: async (pageNum, imagePath, dataUrl) => {
+          if (canceled) return
+          const cachedPage = sortedPages.find((page) => Number(page.page_num || 0) === pageNum)
+          if (cachedPage) {
+            putLimitedPageImageCache(pageImageCacheRef.current, getPageImageCacheKey(cachedPage, doc.id, documentId), dataUrl)
+          }
+          setDoc((previous) => {
+            if (!previous?.pages) return previous
+            return {
+              ...previous,
+              pages: previous.pages.map((page) => (
+                Number(page.page_num || 0) === pageNum
+                  ? { ...page, image_path: imagePath }
+                  : page
+              )),
+            }
+          })
+          if (Number(currentPage?.page_num || 0) === pageNum) {
+            setImageDataUrl(dataUrl)
+          }
+        },
+      }).catch((error) => {
+        if (!canceled) console.warn('[DocumentView] failed to prewarm proof page images', error)
+      })
+    }, PROOF_IMAGE_PREWARM_DELAY_MS)
+
+    return () => {
+      canceled = true
+      window.clearTimeout(timer)
+    }
+  }, [currentPage?.page_num, currentPageIndex, doc, documentId, pageCount, proofViewMode, shouldUseProofLayout, sortedPages])
 
   useEffect(() => {
     if (!doc || !currentPage) return undefined
