@@ -85,8 +85,12 @@ assert(
     && asyncPdfBranchBody.includes('failedPageIds.delete(pageResult.pageId)')
     && asyncPdfBranchBody.includes('failedPageIds.add(pageResult.pageId)')
     && asyncPdfBranchBody.includes('streamedPageSummary = {')
-    && processBatchBody.includes('streamedPageSummary.failed > 0 || streamedPageSummary.pending > 0'),
-  'Legacy batch PDF OCR should keep streamed completion/failure counts instead of rescanning page rows after chunk saves.',
+    && processBatchBody.includes('const hasPendingPageFailure = pageResultsPersistedInChunks')
+    && processBatchBody.includes('streamedPageSummary.pending > 0')
+    && processBatchBody.includes('const hasReviewPageFailure = pageResultsPersistedInChunks')
+    && processBatchBody.includes('streamedPageSummary.pending === 0 && streamedPageSummary.failed > 0')
+    && processBatchBody.includes('const hasPageFailure = hasPendingPageFailure'),
+  'Legacy batch PDF OCR should keep streamed counts and distinguish pending hard failures from settled review pages.',
 )
 assert(
   !processBatchBody.includes("SELECT COUNT(*) as count FROM pages WHERE doc_id = ? AND ocr_status != 'completed'"),
@@ -141,6 +145,16 @@ assert(
     && batchSource.includes('queueItemIdsByJob')
     && batchSource.includes("UPDATE batch_queue SET status = ?, progress = ?"),
   'Legacy batch processor should be able to resume persisted queue items and write terminal item status back to batch_queue.',
+)
+assert(
+  batchSource.includes('function getBatchDocumentOcrReviewMessage')
+    && processBatchBody.includes('const reviewMessage = hasReviewPageFailure ? getBatchDocumentOcrReviewMessage(docId) : null')
+    && processBatchBody.includes("hasPageFailure ? 'error' : 'completed'")
+    && processBatchBody.includes("hasPageFailure ? 'error' : 'processed'")
+    && processBatchBody.includes("hasPageFailure ? 'OCR page processing failed' : reviewMessage")
+    && processBatchBody.includes('if (!hasPageFailure && !hasReviewPageFailure)')
+    && processBatchBody.includes("this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)"),
+  'Legacy batch OCR should save settled page-level OCR failures as completed documents with review warnings.',
 )
 assert(
   batchSource.includes("AND p.ocr_status = 'completed'\n               AND ${pageContentAvailableCondition('p')}")

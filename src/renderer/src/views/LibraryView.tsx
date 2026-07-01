@@ -657,7 +657,7 @@ function buildDocumentPatchForOcrProgress(data: OcrProgressEvent): Partial<Docum
   }
   if (data.status === 'completed') {
     patch.import_status = 'processed'
-    patch.error_message = null
+    patch.error_message = data.errorMessage || null
   }
   if (data.status === 'error') {
     patch.import_status = 'error'
@@ -1144,9 +1144,16 @@ function shouldShowOcrProgressForDocument(doc: DocumentItem, info?: OcrProgressI
 
 function shouldShowDocumentErrorMessage(doc: DocumentItem, info?: OcrProgressInfo): boolean {
   if (!doc.error_message) return false
+  if (shouldShowDocumentReviewMessage(doc, info)) return false
   if (isDocumentOcrTextComplete(doc)) return false
   if (isActiveOcrProgress(info)) return false
   return true
+}
+
+function shouldShowDocumentReviewMessage(doc: DocumentItem, info?: OcrProgressInfo): boolean {
+  if (!doc.error_message) return false
+  if (isActiveOcrProgress(info)) return false
+  return doc.ocr_status === 'completed' && doc.import_status === 'processed'
 }
 
 function renderDocumentHealthTags(doc: DocumentItem) {
@@ -1367,6 +1374,7 @@ function getDocumentListRowHeight(doc: DocumentItem | undefined, context: Docume
 
   if (folderCount > 0) height += 28
   if (shouldShowDocumentErrorMessage(doc, context.ocrProgressByDoc[doc.id])) height += 36
+  if (shouldShowDocumentReviewMessage(doc, context.ocrProgressByDoc[doc.id])) height += 36
   if (shouldShowOcrProgressForDocument(doc, context.ocrProgressByDoc[doc.id])) height += 48
   if (shouldShowBookTranslationProgress(context.bookTranslationProgressByDoc[doc.id])) height += 48
   if (tagCount > 0) height += 30
@@ -1689,6 +1697,25 @@ function DocumentVirtualRow({
                 }}
               >
                 失败原因：{doc.error_message}
+              </div>
+            ) : null}
+            {shouldShowDocumentReviewMessage(doc, progressInfo) ? (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: '6px 8px',
+                  borderRadius: 6,
+                  background: 'rgba(250, 173, 20, 0.12)',
+                  border: '1px solid rgba(250, 173, 20, 0.28)',
+                  color: '#ffd666',
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                页面待复核：{doc.error_message}
               </div>
             ) : null}
             {shouldShowOcrProgressForDocument(doc, progressInfo) ? renderOcrProgress(progressInfo, context.handleCancelOcr) : null}
@@ -2449,6 +2476,13 @@ export default function LibraryView({
         activeOcrToastKeysRef.current.delete(toastKey)
         message.destroy(toastKey)
         message.destroy(`ocr-error-${data.docId}`)
+        if (data.errorMessage) {
+          message.warning({
+            content: `OCR 已保存：${data.errorMessage}`,
+            key: `ocr-review-${data.docId}`,
+            duration: 8,
+          })
+        }
         window.setTimeout(() => {
           setOcrProgressByDoc((current) => {
             const existing = current[data.docId]
@@ -6273,7 +6307,7 @@ export default function LibraryView({
                       background: isSelected ? 'rgba(24, 144, 255, 0.15)' : 'rgba(255,255,255,0.03)',
                       cursor: 'pointer',
                       transition: 'background 0.15s ease',
-                      minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) ? 176 : 140,
+                      minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowDocumentReviewMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) ? 176 : 140,
                       overflow: 'hidden'
                     }}
                     onMouseEnter={(event) => {
@@ -6585,6 +6619,23 @@ export default function LibraryView({
                         }}
                       >
                         失败原因：{doc.error_message}
+                      </div>
+                    ) : null}
+
+                    {shouldShowDocumentReviewMessage(doc, progressInfo) ? (
+                      <div
+                        style={{
+                          marginTop: 8,
+                          padding: '6px 8px',
+                          borderRadius: 6,
+                          background: 'rgba(250, 173, 20, 0.12)',
+                          border: '1px solid rgba(250, 173, 20, 0.28)',
+                          color: '#ffd666',
+                          fontSize: 12,
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        页面待复核：{doc.error_message}
                       </div>
                     ) : null}
 

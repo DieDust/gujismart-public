@@ -78,6 +78,29 @@ function getTextFromUnknown(value: unknown): string {
   return ''
 }
 
+function getBatchDocumentOcrReviewMessage(docId: string): string {
+  const rows = queryAll<{ page_num: number | null; ocr_result: string | null }>(
+    `SELECT page_num, ocr_result
+     FROM pages
+     WHERE doc_id = ? AND ocr_status = 'error'
+     ORDER BY page_num
+     LIMIT 3`,
+    [docId],
+  )
+  const messages = rows
+    .map((row) => {
+      const parsed = parseJsonRecord(row.ocr_result)
+      const errorMessage = String(parsed?.error || parsed?.message || '').trim()
+      return errorMessage
+        ? `第 ${row.page_num || '?'} 页：${errorMessage}`
+        : `第 ${row.page_num || '?'} 页 OCR 需要复核`
+    })
+    .filter(Boolean)
+  return messages.length > 0
+    ? `部分页面 OCR 需要复核，文献已按识别完成保存：${messages.join('；')}`
+    : '部分页面 OCR 需要复核，文献已按识别完成保存。'
+}
+
 function getMarkdownTextFromUnknown(value: unknown): string {
   const directText = getTextFromUnknown(value)
   if (directText) return directText
@@ -688,9 +711,13 @@ class BatchProcessor {
         if (!pageResultsPersistedInChunks && pageResults.length === 0) {
           throw new Error(ZERO_PAGE_OCR_ERROR)
         }
-        const hasPageFailure = pageResultsPersistedInChunks
-          ? streamedPageSummary.failed > 0 || streamedPageSummary.pending > 0
+        const hasPendingPageFailure = pageResultsPersistedInChunks
+          ? streamedPageSummary.pending > 0
+          : false
+        const hasReviewPageFailure = pageResultsPersistedInChunks
+          ? streamedPageSummary.pending === 0 && streamedPageSummary.failed > 0
           : pageResults.some((item) => item.status === 'error')
+        const hasPageFailure = hasPendingPageFailure
         if (!pageResultsPersistedInChunks) {
           await this.savePageResults(pageResults)
         } else if (deferredChangedPageIds.size > 0) {
@@ -699,15 +726,17 @@ class BatchProcessor {
           if (deferredDatabaseSaveNeeded) scheduleDatabaseSave()
         }
 
-        run('UPDATE documents SET ocr_status = ?, import_status = ?, updated_at = ? WHERE id = ?', [
+        const reviewMessage = hasReviewPageFailure ? getBatchDocumentOcrReviewMessage(docId) : null
+        run('UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?', [
           hasPageFailure ? 'error' : 'completed',
           hasPageFailure ? 'error' : 'processed',
+          hasPageFailure ? 'OCR page processing failed' : reviewMessage,
           new Date().toISOString(),
           docId,
         ])
         scheduleDatabaseSave()
 
-        if (!hasPageFailure) {
+        if (!hasPageFailure && !hasReviewPageFailure) {
           void autoExtractAndApply(docId)
             .then(() => {
               scheduleDatabaseSave()
@@ -722,7 +751,7 @@ class BatchProcessor {
           this.updateQueueItemStatus(job, docId, 'failed', 'OCR page processing failed')
         } else {
           job.processedCount += 1
-          this.updateQueueItemStatus(job, docId, 'completed')
+          this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)
         }
       } catch (error) {
         if (this.shuttingDown || isOcrAbortError(error)) {

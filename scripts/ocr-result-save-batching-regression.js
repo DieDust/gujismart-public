@@ -251,16 +251,25 @@ assert(
     && ocrIpcSource.includes('hasOldBookRouteHints(doc)')
     && processDocumentOcrBody.includes('await retryIncompletePagesWithSinglePageOcr(')
     && processDocumentOcrBody.includes('await savePageOcrResultsBatchedDeferred(retryResults')
-    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0'),
+    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('const hasPendingPageFailure = persistedPageSummary.pending > 0'),
   'Document OCR should automatically retry failed or incomplete PDF pages with original-PDF pageRanges, then continue to single-page image OCR for pages that still failed.',
 )
 assert(
   ocrIpcSource.includes('function isOcrPageSummaryComplete')
     && ocrIpcSource.includes('stats.completed === stats.total && stats.failed === 0 && stats.pending === 0')
+    && ocrIpcSource.includes('function isOcrPageSummarySettled')
+    && ocrIpcSource.includes('function hasOcrReviewPages')
+    && ocrIpcSource.includes('function getDocumentOcrReviewMessage')
     && ocrIpcSource.includes('return isOcrPageSummaryComplete(stats)')
-    && ocrIpcSource.includes('const completed = isOcrPageSummaryComplete(stats)')
-    && ocrIpcSource.includes('const nextStatus = isOcrPageSummaryComplete(stats)'),
-  'Document OCR completion should require all pages completed and no failed or pending pages.',
+    && ocrIpcSource.includes('const settledWithReviewPages = hasOcrReviewPages(stats)')
+    && ocrIpcSource.includes('const nextStatus = completed || settledWithReviewPages')
+    && ocrIpcSource.includes('const reviewMessage = settledWithReviewPages ? (errorMessage || getDocumentOcrReviewMessage(docId)) : null')
+    && processDocumentOcrBody.includes('const hasPendingPageFailure = persistedPageSummary.pending > 0')
+    && processDocumentOcrBody.includes('const hasFinalPendingPageFailure = persistedPageSummary.pending > 0')
+    && processDocumentOcrBody.includes('const hasFinalReviewPageFailure = !hasFinalPendingPageFailure && persistedPageSummary.failed > 0')
+    && processDocumentOcrBody.includes('updateDocumentStatusFromPages(docId, hasFinalReviewPageFailure ? getDocumentOcrReviewMessage(docId) : null)')
+    && !processDocumentOcrBody.includes('const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0'),
+  'Document OCR should treat pending pages as blocking failures while saving settled failed pages as completed review warnings.',
 )
 assert(
   ocrIpcSource.includes('function getPreferredGujiServiceText')

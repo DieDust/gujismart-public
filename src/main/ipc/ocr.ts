@@ -4657,6 +4657,14 @@ function isOcrPageSummaryComplete(stats: { total: number; completed: number; fai
   return stats.total > 0 && stats.completed === stats.total && stats.failed === 0 && stats.pending === 0
 }
 
+function isOcrPageSummarySettled(stats: { total: number; completed: number; failed: number; pending: number }): boolean {
+  return stats.total > 0 && stats.pending === 0 && stats.completed + stats.failed >= stats.total
+}
+
+function hasOcrReviewPages(stats: { total: number; completed: number; failed: number; pending: number }): boolean {
+  return isOcrPageSummarySettled(stats) && !isOcrPageSummaryComplete(stats) && stats.failed > 0
+}
+
 function getCompletedOcrPageCount(pages: OcrPageRow[]): number {
   return pages.filter(isPageOcrCompleted).length
 }
@@ -4725,6 +4733,11 @@ function isDocumentOcrCompleteFromPages(docId: string): boolean {
   return isOcrPageSummaryComplete(stats)
 }
 
+function isDocumentOcrSettledFromPages(docId: string): boolean {
+  const stats = summarizeDocumentOcrPages(docId)
+  return isOcrPageSummaryComplete(stats) || hasOcrReviewPages(stats)
+}
+
 function getDocumentTotalPages(docId: string, pageSummary?: { total: number }): number | undefined {
   const doc = queryOne<{ page_count: number | null }>('SELECT page_count FROM documents WHERE id = ?', [docId])
   const totalPages = Number(doc?.page_count || 0) || Number(pageSummary?.total || 0)
@@ -4734,8 +4747,11 @@ function getDocumentTotalPages(docId: string, pageSummary?: { total: number }): 
 function emitOcrAlreadyRunningStatus(event: Electron.IpcMainInvokeEvent, docId: string): void {
   const stats = summarizeDocumentOcrPages(docId)
   const totalPages = getDocumentTotalPages(docId, stats)
-  if (isOcrPageSummaryComplete(stats)) {
-    updateDocumentStatus(docId, 'completed', 'processed', null)
+  const completed = isOcrPageSummaryComplete(stats)
+  const settledWithReviewPages = hasOcrReviewPages(stats)
+  if (completed || settledWithReviewPages) {
+    const reviewMessage = settledWithReviewPages ? getDocumentOcrReviewMessage(docId) : undefined
+    updateDocumentStatusFromPages(docId, reviewMessage)
     emitOcrStatus(event, {
       docId,
       status: 'completed',
@@ -4743,7 +4759,8 @@ function emitOcrAlreadyRunningStatus(event: Electron.IpcMainInvokeEvent, docId: 
       progress: 1,
       completedPages: stats.completed,
       totalPages,
-      message: 'OCR 已完成',
+      message: settledWithReviewPages ? 'OCR 已保存，部分页面需要复核' : 'OCR 已完成',
+      errorMessage: reviewMessage,
     })
     return
   }
@@ -4766,19 +4783,22 @@ function emitOcrCanceledOrCompletedStatus(
 ): boolean {
   const stats = summarizeDocumentOcrPages(docId)
   const completed = isOcrPageSummaryComplete(stats)
+  const settledWithReviewPages = hasOcrReviewPages(stats)
+  const settled = completed || settledWithReviewPages
+  const reviewMessage = settledWithReviewPages ? getDocumentOcrReviewMessage(docId) : undefined
   const resolvedTotalPages = totalPages || getDocumentTotalPages(docId, stats)
   emitOcrStatus(event, {
     docId,
-    status: completed ? 'completed' : 'canceled',
-    phase: completed ? 'completed' : 'canceled',
-    progress: completed ? 1 : progress,
+    status: settled ? 'completed' : 'canceled',
+    phase: settled ? 'completed' : 'canceled',
+    progress: settled ? 1 : progress,
     completedPages: stats.completed,
     totalPages: resolvedTotalPages,
-    message: completed ? 'OCR 已完成' : OCR_CANCELED_MESSAGE,
-    errorMessage: completed ? undefined : OCR_CANCELED_MESSAGE,
-    canceled: !completed,
+    message: settledWithReviewPages ? 'OCR 已保存，部分页面需要复核' : settled ? 'OCR 已完成' : OCR_CANCELED_MESSAGE,
+    errorMessage: settledWithReviewPages ? reviewMessage : settled ? undefined : OCR_CANCELED_MESSAGE,
+    canceled: !settled,
   })
-  return completed
+  return settled
 }
 
 function getDocumentOcrFailureMessage(docId: string): string {
@@ -4802,10 +4822,19 @@ function getDocumentOcrFailureMessage(docId: string): string {
   return messages.join('；') || '部分页面 OCR 未完成'
 }
 
+function getDocumentOcrReviewMessage(docId: string): string {
+  const detail = getDocumentOcrFailureMessage(docId)
+  return detail
+    ? `部分页面 OCR 需要复核，文献已按识别完成保存：${detail}`
+    : '部分页面 OCR 需要复核，文献已按识别完成保存。'
+}
+
 function updateDocumentStatusFromPages(docId: string, errorMessage?: string | null): void {
   const stats = summarizeDocumentOcrPages(docId)
   const now = new Date().toISOString()
-  const nextStatus = isOcrPageSummaryComplete(stats)
+  const completed = isOcrPageSummaryComplete(stats)
+  const settledWithReviewPages = hasOcrReviewPages(stats)
+  const nextStatus = completed || settledWithReviewPages
     ? 'completed'
     : stats.failed > 0
       ? 'error'
@@ -4813,7 +4842,12 @@ function updateDocumentStatusFromPages(docId: string, errorMessage?: string | nu
         ? 'processing'
         : 'pending'
   const importStatus = nextStatus === 'completed' ? 'processed' : nextStatus === 'error' ? 'error' : nextStatus
-  const errorValue = nextStatus === 'completed' ? null : errorMessage ? String(errorMessage).slice(0, 1000) : null
+  const reviewMessage = settledWithReviewPages ? (errorMessage || getDocumentOcrReviewMessage(docId)) : null
+  const errorValue = completed
+    ? null
+    : settledWithReviewPages
+      ? String(reviewMessage || '').slice(0, 1000) || null
+      : errorMessage ? String(errorMessage).slice(0, 1000) : null
   run(
     'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?',
     [nextStatus, importStatus, errorValue, now, docId],
@@ -4823,9 +4857,15 @@ function updateDocumentStatusFromPages(docId: string, errorMessage?: string | nu
 
 function updateDocumentCanceledStatus(docId: string): void {
   const stats = summarizeDocumentOcrPages(docId)
-  const nextStatus = isOcrPageSummaryComplete(stats) ? 'completed' : 'pending'
+  const completed = isOcrPageSummaryComplete(stats)
+  const settledWithReviewPages = hasOcrReviewPages(stats)
+  const nextStatus = completed || settledWithReviewPages ? 'completed' : 'pending'
   const importStatus = nextStatus === 'completed' ? 'processed' : 'stored'
-  const errorMessage = nextStatus === 'completed' ? null : OCR_CANCELED_MESSAGE
+  const errorMessage = completed
+    ? null
+    : settledWithReviewPages
+      ? getDocumentOcrReviewMessage(docId).slice(0, 1000)
+      : OCR_CANCELED_MESSAGE
   run(
     'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?',
     [nextStatus, importStatus, errorMessage, new Date().toISOString(), docId],
@@ -5870,11 +5910,11 @@ async function processDocumentOcr(
       }
     }
 
-    const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0
+    const hasPendingPageFailure = persistedPageSummary.pending > 0
     const persistedTotalPagesForStatus = getDocTotalPages() || persistedPageSummary.total || totalPagesForStatus
     const persistedCompletedPagesForStatus = persistedPageSummary.completed || completedPagesForStatus
 
-    if (hasPageFailure) {
+    if (hasPendingPageFailure) {
       throw new Error(
         pageResultsPersistedInChunks || persistedPageSummary.failed > 0
           ? getDocumentOcrFailureMessage(docId)
@@ -5887,20 +5927,22 @@ async function processDocumentOcr(
     if (reprocessedPageIds.length > 0) deferredDatabaseSaveNeeded = true
 
     persistedPageSummary = summarizeDocumentOcrPages(docId)
-    if (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0) {
+    const hasFinalPendingPageFailure = persistedPageSummary.pending > 0
+    const hasFinalReviewPageFailure = !hasFinalPendingPageFailure && persistedPageSummary.failed > 0
+    if (hasFinalPendingPageFailure) {
       const finalErrorMessage = getDocumentOcrFailureMessage(docId)
       updateDocumentStatusFromPages(docId, finalErrorMessage)
       throw new Error(finalErrorMessage)
     }
 
-    updateDocumentStatus(docId, 'completed', 'processed', null)
+    updateDocumentStatusFromPages(docId, hasFinalReviewPageFailure ? getDocumentOcrReviewMessage(docId) : null)
     syncDocumentProofStatus(docId)
     autoCleanupPdfAssetsIfEnabled(docId)
 
     const autoAi = queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'auto_ai_after_ocr'")
     const hybridReadyForAutoAi = engine !== 'hybrid' || (!pageResultsPersistedInChunks && hasCompletedHybridVisionRefine(pageResults))
     const hybridRefineFallback = engine === 'hybrid' && !pageResultsPersistedInChunks && hasHybridVisionRefineFallback(pageResults)
-    if (autoAi?.value !== 'false' && !hasPageFailure && hybridReadyForAutoAi) {
+    if (autoAi?.value !== 'false' && !hasFinalPendingPageFailure && !hasFinalReviewPageFailure && hybridReadyForAutoAi) {
       aiExtractionStarted = true
       emitOcrStatus(event, {
         docId,
@@ -6013,8 +6055,8 @@ async function processDocumentOcr(
       deferredDatabaseSaveNeeded = false
     }
     if (signal?.aborted) {
-      if (isDocumentOcrCompleteFromPages(docId)) {
-        updateDocumentStatus(docId, 'completed', 'processed', null)
+      if (isDocumentOcrSettledFromPages(docId)) {
+        updateDocumentStatusFromPages(docId)
         emitOcrCanceledOrCompletedStatus(event, docId, 1)
         return { success: true }
       }

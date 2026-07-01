@@ -12,7 +12,9 @@ async function run() {
   const profileDir = path.join(os.tmpdir(), 'gujismart-ocr-status-profile-' + Date.now())
   const dataDir = path.join(os.tmpdir(), 'gujismart-ocr-status-db-' + Date.now())
   const samplePath = path.join(userDataDir, 'library-ocr-status-reconcile.json')
+  const reviewSamplePath = path.join(userDataDir, 'library-ocr-review-reconcile.json')
   const title = 'library ocr status reconcile regression'
+  const reviewTitle = 'library ocr review reconcile regression'
 
   fs.mkdirSync(userDataDir, { recursive: true })
   fs.writeFileSync(samplePath, JSON.stringify({
@@ -34,6 +36,24 @@ async function run() {
             words: text,
             location: { left: 40, top: 40, width: 520, height: 80 },
           }],
+        },
+      }
+    }),
+  }), 'utf8')
+  fs.writeFileSync(reviewSamplePath, JSON.stringify({
+    title: reviewTitle,
+    doc_type: 'pdf',
+    pages: Array.from({ length: 3 }, (_item, index) => {
+      const pageNum = index + 1
+      const text = `ocr review reconcile page ${pageNum}`
+      return {
+        page_num: pageNum,
+        ocr_text: text,
+        proofed_text: text,
+        ocr_status: 'completed',
+        ocr_result: {
+          text,
+          words_result: [{ words: text }],
         },
       }
     }),
@@ -131,6 +151,58 @@ async function run() {
     const healthRow = healthReport.rows.find((row) => row.id === docId)
     assert(healthRow?.ocr_status === 'completed', `Expected health report to derive completed OCR status, saw ${JSON.stringify(healthRow)}`)
     assert(!healthReport.rows.some((row) => row.id === docId && row.ocr_status !== 'completed'), `Expected health report not to flag reconciled doc as incomplete: ${JSON.stringify(healthReport)}`)
+
+    const reviewImportResults = await win.evaluate(async (filePath) => window.api.importDocuments([filePath]), reviewSamplePath)
+    assert(Array.isArray(reviewImportResults) && reviewImportResults[0]?.success, `Review import failed: ${JSON.stringify(reviewImportResults)}`)
+    const reviewDocId = reviewImportResults[0].id
+    const reviewDetail = await win.evaluate(async (id) => window.api.getDocument(id), reviewDocId)
+    assert(reviewDetail?.pages?.length === 3, `Expected review imported pages, saw ${JSON.stringify(reviewDetail)}`)
+    const reviewPagePatchResults = await win.evaluate(async (pages) => {
+      const results = []
+      for (const page of pages) {
+        if (page.page_num === 3) {
+          results.push(await window.api.updatePage(page.id, {
+            ocr_text: '',
+            ocr_result: {
+              error: 'simulated page quality issue',
+              failed_at: new Date().toISOString(),
+            },
+            proofed_text: '',
+            ocr_status: 'error',
+          }))
+        }
+      }
+      return results
+    }, reviewDetail.pages)
+    assert(reviewPagePatchResults.every(Boolean), `Failed to patch review page status: ${JSON.stringify(reviewPagePatchResults)}`)
+
+    const reviewPatched = await win.evaluate(async (id) => window.api.updateDocument(id, {
+      ocr_status: 'error',
+      import_status: 'error',
+      error_message: '第 3 页：simulated page quality issue',
+    }), reviewDocId)
+    assert(reviewPatched, 'Failed to simulate old document-level OCR failure with settled page error')
+
+    const reviewListPage = await win.evaluate(async () => window.api.listDocumentsPage({
+      search: 'library ocr review reconcile',
+      searchFields: ['title'],
+      limit: 10,
+      offset: 0,
+    }))
+    const reviewListed = reviewListPage.items.find((item) => item.id === reviewDocId)
+    assert(reviewListed, `Expected review document in normal list, saw ${JSON.stringify(reviewListPage)}`)
+    assert(reviewListed.ocr_status === 'completed', `Expected review document to normalize to completed, saw ${JSON.stringify(reviewListed)}`)
+    assert(reviewListed.import_status === 'processed', `Expected review document to normalize to processed, saw ${JSON.stringify(reviewListed)}`)
+    assert(
+      String(reviewListed.error_message || '').includes('部分页面 OCR 需要复核')
+        && String(reviewListed.error_message || '').includes('simulated page quality issue'),
+      `Expected review warning to preserve page issue, saw ${JSON.stringify(reviewListed)}`,
+    )
+
+    const reviewPersistedDetail = await win.evaluate(async (id) => window.api.getDocument(id), reviewDocId)
+    assert(reviewPersistedDetail?.ocr_status === 'completed', `Expected review normalized status persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
+    assert(reviewPersistedDetail?.import_status === 'processed', `Expected review normalized import status persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
+    assert(String(reviewPersistedDetail?.error_message || '').includes('部分页面 OCR 需要复核'), `Expected review warning persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
 
     console.log('Library OCR status reconcile regression passed.')
   } finally {

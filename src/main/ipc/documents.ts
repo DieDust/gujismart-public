@@ -3383,21 +3383,95 @@ function isDocumentListOcrTextComplete(doc: Pick<DocumentListItem, 'page_count' 
   return completedPages >= pageCount || textPages >= pageCount
 }
 
+interface DocumentListOcrPageSummary {
+  doc_id: string
+  total: number
+  completed: number
+  failed: number
+  pending: number
+}
+
+function getDocumentListOcrPageSummaries(docIds: string[]): Map<string, DocumentListOcrPageSummary> {
+  const summaries = new Map<string, DocumentListOcrPageSummary>()
+  runForIdChunks(uniqueDocumentIds(docIds), (chunkIds, placeholders) => {
+    const rows = queryAll<DocumentListOcrPageSummary>(
+      `SELECT
+         doc_id,
+         COUNT(*) as total,
+         SUM(CASE WHEN ocr_status = 'completed' AND ${buildPageContentAvailableCondition('pages')} THEN 1 ELSE 0 END) as completed,
+         SUM(CASE WHEN ocr_status = 'error' THEN 1 ELSE 0 END) as failed,
+         SUM(CASE WHEN ocr_status IS NULL OR ocr_status IN ('pending', 'queued', 'processing') OR (ocr_status = 'completed' AND NOT (${buildPageContentAvailableCondition('pages')})) THEN 1 ELSE 0 END) as pending
+       FROM pages
+       WHERE doc_id IN (${placeholders})
+       GROUP BY doc_id`,
+      chunkIds,
+    )
+    rows.forEach((row) => {
+      summaries.set(row.doc_id, {
+        doc_id: row.doc_id,
+        total: Number(row.total || 0),
+        completed: Number(row.completed || 0),
+        failed: Number(row.failed || 0),
+        pending: Number(row.pending || 0),
+      })
+    })
+  })
+  return summaries
+}
+
+function isDocumentListOcrSettledWithReviewPages(doc: DocumentListItem, summary?: DocumentListOcrPageSummary): boolean {
+  if (!summary) return false
+  const expectedPages = Math.max(Number(doc.page_count || 0), Number(doc.actual_page_count || 0), summary.total)
+  return expectedPages > 0
+    && summary.pending === 0
+    && summary.failed > 0
+    && summary.completed + summary.failed >= expectedPages
+}
+
+function getDocumentListOcrReviewMessage(doc: DocumentListItem): string {
+  const existingMessage = String(doc.error_message || '').trim()
+  if (existingMessage.includes('部分页面 OCR 需要复核')) return existingMessage
+  return existingMessage
+    ? `部分页面 OCR 需要复核，文献已按识别完成保存：${existingMessage}`
+    : '部分页面 OCR 需要复核，文献已按识别完成保存。'
+}
+
 function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): DocumentListItem[] {
   const changedDocIds: string[] = []
+  const reviewCandidateDocs = documents.filter((doc) => {
+    if (isDocumentListOcrTextComplete(doc)) return false
+    if (doc.ocr_status === 'completed' && doc.import_status === 'processed') return false
+    return doc.ocr_status === 'error' || doc.import_status === 'error'
+  })
+  const reviewSummaries = getDocumentListOcrPageSummaries(reviewCandidateDocs.map((doc) => doc.id))
+  const reviewMessagesByDocId = new Map<string, string>()
   const normalized = documents.map((doc) => {
-    if (!isDocumentListOcrTextComplete(doc)) return doc
-    if (doc.ocr_status === 'completed' && doc.import_status === 'processed' && !doc.error_message) return doc
-    changedDocIds.push(doc.id)
-    return {
-      ...doc,
-      ocr_status: 'completed',
-      import_status: 'processed',
-      error_message: null,
+    if (isDocumentListOcrTextComplete(doc)) {
+      if (doc.ocr_status === 'completed' && doc.import_status === 'processed' && !doc.error_message) return doc
+      changedDocIds.push(doc.id)
+      return {
+        ...doc,
+        ocr_status: 'completed',
+        import_status: 'processed',
+        error_message: null,
+      }
     }
+
+    if (isDocumentListOcrSettledWithReviewPages(doc, reviewSummaries.get(doc.id))) {
+      const reviewMessage = getDocumentListOcrReviewMessage(doc)
+      reviewMessagesByDocId.set(doc.id, reviewMessage)
+      return {
+        ...doc,
+        ocr_status: 'completed',
+        import_status: 'processed',
+        error_message: reviewMessage,
+      }
+    }
+
+    return doc
   })
 
-  if (changedDocIds.length > 0) {
+  if (changedDocIds.length > 0 || reviewMessagesByDocId.size > 0) {
     const now = new Date().toISOString()
     try {
       runForIdChunks(changedDocIds, (chunkIds, placeholders) => {
@@ -3407,6 +3481,14 @@ function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): Document
            WHERE id IN (${placeholders})`,
           ['completed', 'processed', now, ...chunkIds],
         )
+      })
+      transaction(() => {
+        reviewMessagesByDocId.forEach((reviewMessage, docId) => {
+          run(
+            'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?',
+            ['completed', 'processed', reviewMessage.slice(0, 1000), now, docId],
+          )
+        })
       })
       markLibraryStateCacheDirty()
       scheduleDatabaseSave()

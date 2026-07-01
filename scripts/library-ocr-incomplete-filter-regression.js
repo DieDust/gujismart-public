@@ -17,6 +17,7 @@ const root = path.join(__dirname, '..')
 const databaseSource = fs.readFileSync(path.join(root, 'src', 'main', 'database.ts'), 'utf8')
 const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
 const libraryCacheSource = fs.readFileSync(path.join(root, 'src', 'main', 'library-state-cache.ts'), 'utf8')
+const libraryViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
 
 assert(
   databaseSource.includes('CREATE INDEX IF NOT EXISTS idx_pages_doc_ocr_status ON pages(doc_id, ocr_status);'),
@@ -69,6 +70,28 @@ assert(
     && documentsSource.includes('page_count: Math.max(storedPageCount, actualPageCount)')
     && documentsSource.includes('const pageCount = Math.max(Number(doc.page_count || 0), actualPageCount)'),
   'document list and health rows should use actual page rows as a fallback when legacy document page_count is zero.',
+)
+
+assert(
+  documentsSource.includes('function getDocumentListOcrPageSummaries')
+    && documentsSource.includes('function isDocumentListOcrSettledWithReviewPages')
+    && documentsSource.includes('function getDocumentListOcrReviewMessage')
+    && documentsSource.includes("return doc.ocr_status === 'error' || doc.import_status === 'error'")
+    && documentsSource.includes('summary.pending === 0')
+    && documentsSource.includes('summary.failed > 0')
+    && documentsSource.includes("ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?")
+    && documentsSource.includes('reviewMessage.slice(0, 1000)'),
+  'document list normalization should migrate old document-level OCR failures with only settled page errors into completed review warnings.',
+)
+
+assert(
+  libraryViewSource.includes('function shouldShowDocumentReviewMessage')
+    && libraryViewSource.includes("return doc.ocr_status === 'completed' && doc.import_status === 'processed'")
+    && libraryViewSource.includes('if (shouldShowDocumentReviewMessage(doc, info)) return false')
+    && libraryViewSource.includes('patch.error_message = data.errorMessage || null')
+    && libraryViewSource.includes('页面待复核：{doc.error_message}')
+    && libraryViewSource.includes('OCR 已保存：${data.errorMessage}'),
+  'Library cards should show completed OCR page-level issues as review warnings instead of clearing them or rendering failure banners.',
 )
 
 console.log('Library OCR incomplete filter regression passed.')
