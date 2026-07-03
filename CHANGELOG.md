@@ -4,10 +4,27 @@
 
 ### 中文
 
+#### 新增
+
+- 新增浏览器式标签页分组管理：右键标签页可关闭所有标签页、关闭其他标签页、新建分组并加入、移动到已有分组、关闭分组、取消分组。
+- 新增标签页分组设置面板，支持修改分组名称、选择分组颜色、展开/折叠分组、在组内添加首页标签页，并用分组色条和分组胶囊在标签栏中区分不同分组。
+- 新增标签页分组拖拽逻辑：拖入分组可直接加入，拖出分组会自动脱离，把两个未分组标签拖到一起会自动建立新分组；在选中分组内打开的新页面会自动继承该分组。
+- 新增标签栏空白处“重新打开刚关闭的标签页/分组”，关闭整组后可像浏览器一样恢复。
+
+#### 改进
+
+- 改进工作区恢复，保存并恢复标签页分组、分组颜色、折叠状态和标签归属，减少重启后工作上下文丢失。
+- 改进标签栏在大量标签和分组场景下的压缩、拖拽反馈和视觉连贯性，让分组边界更清晰且减少突兀高亮。
+- 改进 OCR、导入、搜索索引和 AI 研究等后台任务状态，统一进度状态封装并记录 OCR 运行元数据，便于排查任务卡住、重跑或失败原因。
+- 改进 AI、研究、引用、搜索、备份和设置链路的结构化校验：新增 AI 响应封装、研究完整性报告、引用字段解析诊断、搜索索引健康诊断、备份完整性报告和配置校验。
+- 改进元数据标签同步保护，降低自动清理标签关系时误删手动标签绑定的风险。
+- 扩展开源回归检查，覆盖函数契约、模块分层、状态封装、配置校验、OCR 运行元数据、搜索证据、备份完整性和研究完整性。
+
 #### 修复
 
 - 修复古籍 OCR 重新识别后，PaddleOCR 已返回的插图/图片块在保存阶段被当成纯文本占位内容清理，导致版式还原和阅读模式看不到图片的问题。
 - 修复古籍 OCR 文本清理时把带 `<img>` 的 markdown 结果重建为纯文本的问题，保留 OCR 返回的图片引用、坐标和后续本地图片资产生成链路。
+- 修复/加固部分后台任务在异常状态下只返回散乱错误信息的问题，让导入、OCR、搜索索引、AI 研究等状态更容易被前端和回归测试一致处理。
 
 #### 下载
 
@@ -16,10 +33,27 @@
 
 ### English
 
+#### Added
+
+- Added browser-like tab group management: right-click a tab to close all tabs, close other tabs, create a new group, move into an existing group, close a group, or ungroup tabs.
+- Added a tab group settings panel with group renaming, color selection, expand/collapse controls, adding a home tab inside a group, and clearer group chips/color bars in the tab strip.
+- Added richer tab group drag behavior: drag a tab into a group to join it, drag it out to ungroup it, drag two ungrouped tabs together to create a group, and open new pages inside the currently active group.
+- Added “reopen recently closed tab/group” from the blank tab-strip area, including restoring a whole closed group.
+
+#### Improvements
+
+- Improved workspace restore so tab groups, colors, collapsed state, and tab membership are preserved across restarts.
+- Improved tab-strip compression, drag feedback, and grouped-tab visuals for large numbers of tabs and groups.
+- Improved background task status for OCR, import, search indexing, and AI research with shared status envelopes and OCR run metadata for easier diagnosis.
+- Improved structured validation across AI, research, citation, search, backup, and settings with AI response envelopes, research integrity reports, citation field diagnostics, search-index health diagnostics, backup integrity reports, and config validation.
+- Improved metadata-tag synchronization safeguards to reduce the risk of removing manual tag bindings during automated cleanup.
+- Expanded open-source regression coverage for function contracts, module layering, status envelopes, config validation, OCR run metadata, search evidence, backup integrity, and research integrity.
+
 #### Fixes
 
 - Fixed a Guji OCR re-recognition issue where PaddleOCR-returned illustration/image blocks were treated as plain placeholder text during persistence, so layout restoration and reading mode no longer showed images.
 - Fixed Guji OCR text cleanup replacing image-bearing markdown with plain text, preserving OCR-returned image references, coordinates, and the downstream local image asset path.
+- Hardened task status/error handling so import, OCR, search indexing, and AI research states can be handled consistently by the UI and regression checks.
 
 #### Downloads
 
