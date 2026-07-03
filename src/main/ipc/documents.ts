@@ -1,6 +1,7 @@
 ﻿import { ipcMain, dialog } from 'electron'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
+import type { WebContents } from 'electron'
 import { nativeImage } from 'electron'
 import { nanoid } from 'nanoid'
 import { basename, dirname, extname, join } from 'path'
@@ -59,6 +60,8 @@ import { shouldTranslatePageText } from '../../shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '../../shared/translation-source'
 import { deriveOcrTextFromIr, ensureOcrResultIr, getOcrPageIr } from '../../shared/ocr-ir'
 import { allowFileAccessPath, allowFileAccessPaths, assertAllowedLocalFilePath } from '../file-access'
+import { documentPipelineDiagnosticsFromImportProgress } from '../../shared/document-pipeline-diagnostics'
+import { statusEnvelopeFromImportProgress } from '../../shared/status-envelope'
 import type {
   AiTaskOptions,
   AiLayoutCacheItem,
@@ -910,6 +913,15 @@ function emitBookTranslationProgress(payload: BookTranslationProgressEvent) {
   BrowserWindow.getAllWindows().forEach((window) => {
     window.webContents.send('documents:bookTranslationProgress', payload)
   })
+}
+
+function sendImportProgress(sender: WebContents, payload: ImportProgressEvent): void {
+  if (sender.isDestroyed()) return
+  sender.send('documents:importProgress', {
+    ...payload,
+    statusEnvelope: statusEnvelopeFromImportProgress(payload),
+    pipelineDiagnostics: documentPipelineDiagnosticsFromImportProgress(payload),
+  } satisfies ImportProgressEvent)
 }
 
 function writeBookTranslationFile(doc: Pick<Document, 'id' | 'title'>, pages: BookTranslationPageWorkItem[], outputPath: string) {
@@ -3681,8 +3693,7 @@ export function registerDocumentIpc(): void {
           )
           if (possibleDuplicate?.id) {
             pdfFingerprint = await getPdfFingerprintAsync(filePath, ({ bytesDone, totalBytes }) => {
-              if (event.sender.isDestroyed()) return
-              event.sender.send('documents:importProgress', {
+              sendImportProgress(event.sender, {
                 phase: 'hashing',
                 filePath,
                 fileName: basename(filePath),
@@ -3691,7 +3702,7 @@ export function registerDocumentIpc(): void {
                 bytesDone,
                 totalBytes,
                 progress: totalBytes > 0 ? bytesDone / totalBytes : undefined,
-              } satisfies ImportProgressEvent)
+              })
             })
           }
         }
@@ -3883,8 +3894,7 @@ export function registerDocumentIpc(): void {
 
         if (isPdfFile && !copiedPdf) {
           copiedPdf = await copyFileWithFingerprintAsync(filePath, destPath, pdfFingerprint || undefined, ({ bytesDone, totalBytes }) => {
-            if (event.sender.isDestroyed()) return
-            event.sender.send('documents:importProgress', {
+            sendImportProgress(event.sender, {
               phase: 'copying',
               filePath,
               fileName: basename(filePath),
@@ -3893,7 +3903,7 @@ export function registerDocumentIpc(): void {
               bytesDone,
               totalBytes,
               progress: totalBytes > 0 ? bytesDone / totalBytes : undefined,
-            } satisfies ImportProgressEvent)
+            })
           })
           if (!pdfFingerprint) {
             pdfFingerprint = {

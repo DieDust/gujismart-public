@@ -38,7 +38,7 @@ async function buildBundle() {
     platform: 'node',
     format: 'cjs',
     outfile: bundlePath,
-    external: ['better-sqlite3', 'pdf-lib'],
+    external: ['better-sqlite3', 'pdf-lib', '@napi-rs/canvas'],
     alias: {
       electron: join(__dirname, 'stubs', 'electron.js'),
     },

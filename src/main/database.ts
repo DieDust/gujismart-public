@@ -612,6 +612,7 @@ CREATE TABLE IF NOT EXISTS research_outputs (
   title TEXT NOT NULL,
   content TEXT NOT NULL,
   source_dataset_id TEXT,
+  input_snapshot_json TEXT DEFAULT '',
   created_at TEXT,
   FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE CASCADE
 );
@@ -1638,6 +1639,7 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'research_notes', "source_hash TEXT DEFAULT ''", 'source_hash')
   addColumnIfMissing(sqlite, 'research_notes', 'sort_order INTEGER DEFAULT 0', 'sort_order')
   addColumnIfMissing(sqlite, 'research_outputs', 'source_dataset_id TEXT', 'source_dataset_id')
+  addColumnIfMissing(sqlite, 'research_outputs', "input_snapshot_json TEXT DEFAULT ''", 'input_snapshot_json')
 
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS ai_research_tasks (

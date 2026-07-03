@@ -17,9 +17,20 @@ export type WorkspaceFoldersState = {
   scrollTop: number
 }
 
+export type WorkspaceTabGroup = {
+  id: string
+  title: string
+  color: string
+  collapsed: boolean
+}
+
+type WorkspaceTabGroupMembership = {
+  groupId?: string
+}
+
 export type WorkspaceAppTab =
-  | { id: string; kind: 'home'; title: string }
-  | {
+  | ({ id: string; kind: 'home'; title: string } & WorkspaceTabGroupMembership)
+  | ({
     id: string
     kind: 'view'
     view: WorkspaceViewKey
@@ -27,8 +38,8 @@ export type WorkspaceAppTab =
     singleton: boolean
     foldersState?: WorkspaceFoldersState | null
     initialSearchKeyword?: string
-  }
-  | {
+  } & WorkspaceTabGroupMembership)
+  | ({
     id: string
     kind: 'document'
     title: string
@@ -36,10 +47,11 @@ export type WorkspaceAppTab =
       docId: string
       target: OpenDocumentTarget
     }
-  }
+  } & WorkspaceTabGroupMembership)
 
 export interface AppWorkspaceState {
   tabs: WorkspaceAppTab[]
+  tabGroups: WorkspaceTabGroup[]
   activeTabId: string
   siderCollapsed: boolean
 }
@@ -56,16 +68,30 @@ interface PersistedAppWorkspaceV1 {
   activeTabId: string
   siderCollapsed: boolean
   tabs: WorkspaceAppTab[]
+  tabGroups?: WorkspaceTabGroup[]
 }
 
 export const APP_WORKSPACE_STORAGE_KEY = 'gujismart.app-workspace.v1'
 
 const HOME_TAB_ID = 'home'
 const MAX_RESTORED_TABS = 60
+const MAX_RESTORED_TAB_GROUPS = 40
 const MAX_ID_LENGTH = 320
 const MAX_TITLE_LENGTH = 300
+const MAX_GROUP_TITLE_LENGTH = 80
 const MAX_KEYWORD_LENGTH = 500
 const MAX_EXCERPT_LENGTH = 2000
+const TAB_GROUP_COLORS = [
+  '#d4ad84',
+  '#7cb7ff',
+  '#81c784',
+  '#f6c85f',
+  '#f28b82',
+  '#b39ddb',
+  '#4dd0e1',
+  '#ffab91',
+]
+const TAB_GROUP_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/
 const VIEW_KEYS = new Set<WorkspaceViewKey>([
   'library',
   'folders',
@@ -110,9 +136,18 @@ function cleanFiniteNumber(value: unknown, minimum = 0): number | undefined {
   return Number.isFinite(parsed) ? Math.max(minimum, parsed) : undefined
 }
 
+function getDefaultTabGroupColor(index: number): string {
+  return TAB_GROUP_COLORS[index % TAB_GROUP_COLORS.length]
+}
+
+function cleanTabGroupColor(value: unknown, index: number): string {
+  const color = cleanString(value, 24)
+  return TAB_GROUP_COLOR_PATTERN.test(color) ? color.toLowerCase() : getDefaultTabGroupColor(index)
+}
+
 function createDefaultWorkspace(): AppWorkspaceState {
   const home = { id: HOME_TAB_ID, kind: 'home' as const, title: '首页' }
-  return { tabs: [home], activeTabId: HOME_TAB_ID, siderCollapsed: false }
+  return { tabs: [home], tabGroups: [], activeTabId: HOME_TAB_ID, siderCollapsed: false }
 }
 
 function sanitizeLocator(value: unknown): SearchHitLocator | undefined {
@@ -211,14 +246,59 @@ function sanitizeFoldersState(value: unknown): WorkspaceFoldersState | null {
   }
 }
 
-function sanitizeTab(value: unknown): WorkspaceAppTab | null {
+function sanitizeTabGroups(value: unknown): WorkspaceTabGroup[] {
+  if (!Array.isArray(value)) return []
+  const groups: WorkspaceTabGroup[] = []
+  const seenIds = new Set<string>()
+
+  for (const candidate of value) {
+    if (groups.length >= MAX_RESTORED_TAB_GROUPS) break
+    if (!isRecord(candidate)) continue
+    const id = cleanString(candidate.id, MAX_ID_LENGTH)
+    if (!id || seenIds.has(id)) continue
+    seenIds.add(id)
+    groups.push({
+      id,
+      title: cleanString(candidate.title, MAX_GROUP_TITLE_LENGTH) || `分组 ${groups.length + 1}`,
+      color: cleanTabGroupColor(candidate.color, groups.length),
+      collapsed: candidate.collapsed === true,
+    })
+  }
+
+  return groups
+}
+
+function getAllowedTabGroupIds(tabGroups: WorkspaceTabGroup[]): Set<string> {
+  return new Set(tabGroups.map((group) => group.id))
+}
+
+function sanitizeTabGroupId(value: unknown, allowedGroupIds: Set<string>): string | undefined {
+  const groupId = cleanString(value, MAX_ID_LENGTH)
+  return groupId && allowedGroupIds.has(groupId) ? groupId : undefined
+}
+
+function withSanitizedTabGroup<T extends WorkspaceAppTab>(
+  tab: T,
+  source: Record<string, unknown>,
+  allowedGroupIds: Set<string>,
+): T {
+  const groupId = sanitizeTabGroupId(source.groupId, allowedGroupIds)
+  return groupId ? { ...tab, groupId } : tab
+}
+
+function pruneTabGroupsForTabs(tabGroups: WorkspaceTabGroup[], tabs: WorkspaceAppTab[]): WorkspaceTabGroup[] {
+  const usedGroupIds = new Set(tabs.map((tab) => tab.groupId).filter(Boolean))
+  return tabGroups.filter((group) => usedGroupIds.has(group.id))
+}
+
+function sanitizeTab(value: unknown, allowedGroupIds: Set<string>): WorkspaceAppTab | null {
   if (!isRecord(value)) return null
   const kind = cleanString(value.kind, 40)
   const id = cleanString(value.id, MAX_ID_LENGTH)
   if (!id) return null
 
   if (kind === 'home') {
-    return { id: HOME_TAB_ID, kind: 'home', title: '首页' }
+    return withSanitizedTabGroup({ id: HOME_TAB_ID, kind: 'home', title: '首页' }, value, allowedGroupIds)
   }
 
   if (kind === 'view') {
@@ -226,7 +306,7 @@ function sanitizeTab(value: unknown): WorkspaceAppTab | null {
     if (!VIEW_KEYS.has(view)) return null
     const title = cleanString(value.title, MAX_TITLE_LENGTH) || VIEW_TITLES[view]
     const initialSearchKeyword = cleanString(value.initialSearchKeyword, MAX_KEYWORD_LENGTH)
-    return {
+    return withSanitizedTabGroup({
       id,
       kind: 'view',
       view,
@@ -234,7 +314,7 @@ function sanitizeTab(value: unknown): WorkspaceAppTab | null {
       singleton: SINGLETON_VIEW_KEYS.has(view),
       foldersState: view === 'folders' ? sanitizeFoldersState(value.foldersState) : undefined,
       initialSearchKeyword: view === 'search' ? initialSearchKeyword : undefined,
-    }
+    }, value, allowedGroupIds)
   }
 
   if (kind === 'document' && isRecord(value.document)) {
@@ -242,26 +322,27 @@ function sanitizeTab(value: unknown): WorkspaceAppTab | null {
     if (!docId) return null
     const target = sanitizeDocumentTarget(value.document.target, docId)
     if (!target) return null
-    return {
+    return withSanitizedTabGroup({
       id,
       kind: 'document',
       title: cleanString(value.title, MAX_TITLE_LENGTH) || '文献',
       document: { docId, target: { ...target, docId } },
-    }
+    }, value, allowedGroupIds)
   }
 
   return null
 }
 
-function sanitizeTabs(value: unknown): WorkspaceAppTab[] {
+function sanitizeTabs(value: unknown, tabGroups: WorkspaceTabGroup[] = []): WorkspaceAppTab[] {
   if (!Array.isArray(value)) return []
   const tabs: WorkspaceAppTab[] = []
   const seenIds = new Set<string>()
   const seenSingletonViews = new Set<WorkspaceViewKey>()
+  const allowedGroupIds = getAllowedTabGroupIds(tabGroups)
 
   for (const candidate of value) {
     if (tabs.length >= MAX_RESTORED_TABS) break
-    const tab = sanitizeTab(candidate)
+    const tab = sanitizeTab(candidate, allowedGroupIds)
     if (!tab || seenIds.has(tab.id)) continue
     if (tab.kind === 'view' && tab.singleton) {
       if (seenSingletonViews.has(tab.view)) continue
@@ -282,17 +363,20 @@ export function loadAppWorkspace(storage: AppWorkspaceStorage): AppWorkspaceStat
       storage.removeItem(APP_WORKSPACE_STORAGE_KEY)
       return createDefaultWorkspace()
     }
-    const tabs = sanitizeTabs(parsed.tabs)
+    const tabGroups = sanitizeTabGroups(parsed.tabGroups)
+    const tabs = sanitizeTabs(parsed.tabs, tabGroups)
     if (tabs.length === 0) {
       storage.removeItem(APP_WORKSPACE_STORAGE_KEY)
       return createDefaultWorkspace()
     }
+    const safeTabGroups = pruneTabGroupsForTabs(tabGroups, tabs)
     const requestedActiveId = cleanString(parsed.activeTabId, MAX_ID_LENGTH)
     const activeTabId = tabs.some((tab) => tab.id === requestedActiveId)
       ? requestedActiveId
       : tabs[0].id
     return {
       tabs,
+      tabGroups: safeTabGroups,
       activeTabId,
       siderCollapsed: parsed.siderCollapsed === true,
     }
@@ -311,8 +395,10 @@ export function saveAppWorkspace(
   state: AppWorkspaceState,
 ): boolean {
   try {
-    const tabs = sanitizeTabs(state.tabs)
+    const tabGroups = sanitizeTabGroups(state.tabGroups)
+    const tabs = sanitizeTabs(state.tabs, tabGroups)
     const safeTabs = tabs.length > 0 ? tabs : createDefaultWorkspace().tabs
+    const safeTabGroups = pruneTabGroupsForTabs(tabGroups, safeTabs)
     const activeTabId = safeTabs.some((tab) => tab.id === state.activeTabId)
       ? state.activeTabId
       : safeTabs[0].id
@@ -322,6 +408,7 @@ export function saveAppWorkspace(
       activeTabId,
       siderCollapsed: state.siderCollapsed,
       tabs: safeTabs,
+      tabGroups: safeTabGroups,
     }
     storage.setItem(APP_WORKSPACE_STORAGE_KEY, JSON.stringify(payload))
     return true

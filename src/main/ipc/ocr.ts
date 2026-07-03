@@ -55,6 +55,8 @@ import {
   getOcrRegionRerecognitionCandidates,
 } from '../../shared/ocr-ir'
 import type { BatchOcrOptions, Document, DocumentPage, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, OcrRegionRerecognitionOptions, OcrRegionRerecognitionResult, PdfTextLayerAnalysis, PdfTextLayerPageAnalysis, TocItemV2 } from '../../shared/types'
+import { ocrRunMetadataFromProgress } from '../../shared/ocr-run-metadata'
+import { statusEnvelopeFromOcrProgress } from '../../shared/status-envelope'
 
 const AUTO_METADATA_TIMEOUT_MS = 120_000
 const AUTO_METADATA_QUEUE_TIMEOUT_MS = 30 * 60_000
@@ -564,7 +566,11 @@ function getMonotonicOcrStatusPayload(payload: OcrProgressEvent): OcrProgressEve
 
 function sendOcrStatus(sender: Electron.WebContents, payload: OcrProgressEvent): void {
   if (sender.isDestroyed()) return
-  sender.send('ocr:statusChanged', payload)
+  sender.send('ocr:statusChanged', {
+    ...payload,
+    statusEnvelope: statusEnvelopeFromOcrProgress(payload),
+    runMetadata: ocrRunMetadataFromProgress(payload),
+  } satisfies OcrProgressEvent)
 }
 
 function flushPendingOcrStatus(docId: string): void {
@@ -3483,12 +3489,26 @@ function getReadableGujiBlockText(block: JsonRecord): string {
   return text
 }
 
+function hasGujiMarkdownImageContent(markdown: unknown): boolean {
+  const markdownText = getMarkdownTextFromUnknown(markdown)
+  if (/<img\b/i.test(markdownText) || /!\[[^\]]*\]\([^)]+\)/.test(markdownText)) return true
+  if (!isJsonRecord(markdown)) return false
+  const images = markdown.images
+  return isJsonRecord(images) && Object.keys(images).length > 0
+}
+
+function getRebuiltGujiMarkdownValue(result: OcrPageResultPayload, text: string): unknown {
+  return hasGujiMarkdownImageContent(result.markdown)
+    ? result.markdown
+    : text || getMarkdownTextFromUnknown(result.markdown)
+}
+
 function rebuildGujiResultTextFromLayout(result: OcrPageResultPayload, blocks: JsonRecord[]): OcrPageResultPayload {
   const text = blocks.map(getReadableGujiBlockText).filter(Boolean).join('\n')
   return {
     ...result,
     text,
-    markdown: text || getMarkdownTextFromUnknown(result.markdown),
+    markdown: getRebuiltGujiMarkdownValue(result, text),
     layout_result: blocks,
     words_result: blocks
       .filter((block) => !isOcrImageLikeLabel(getOcrBlockLabel(block)))
@@ -3555,12 +3575,18 @@ function sanitizeGujiNonBookHallucinations(
   return preferredText ? preservePreferredGujiServiceText(rebuilt, preferredText) : rebuilt
 }
 
+function hasGujiImageBlockEvidence(item: JsonRecord): boolean {
+  if (getOcrBlockRect(item)) return true
+  const imagePath = String(getRecordFirstValue(item, ['image_asset_path', 'asset_path', 'image_path', 'crop_path', 'src']) || '').trim()
+  return Boolean(imagePath)
+}
+
 function isGujiPlaceholderWord(item: unknown): boolean {
   if (!isJsonRecord(item)) return false
   const label = getOcrBlockLabel(item)
   const text = getOcrBlockTextValue(item)
-  return (isOcrImageLikeLabel(label) && /^image$/i.test(text.trim()))
-    || isEmptyTableMarkupPlaceholder(text)
+  if (isOcrImageLikeLabel(label) && /^image$/i.test(text.trim())) return !hasGujiImageBlockEvidence(item)
+  return isEmptyTableMarkupPlaceholder(text)
 }
 
 function filterGujiPlaceholderBlocks<T>(items: T[] | undefined): T[] | undefined {
@@ -5511,6 +5537,23 @@ async function processDocumentOcr(
         pages = await ensurePageRecordsIfNeeded(docId, pages, expectedPdfPageCount)
         pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
         completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
+      }
+      const missingAsyncPdfImagePage = findMissingReadablePageImage(pagesForOcr)
+      if (missingAsyncPdfImagePage) {
+        emitOcrStatus(event, {
+          docId,
+          status: 'processing',
+          phase: 'ocr',
+          progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
+          completedPages: completedBefore,
+          totalPages: getDocTotalPages(),
+          pageNum: missingAsyncPdfImagePage.page_num || undefined,
+          message: `正在生成 OCR 页面图：${completedBefore}/${getDocTotalPages()} 页`,
+        })
+        const asyncPdfPageImagePages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)
+        const asyncPdfPageImagesById = new Map(asyncPdfPageImagePages.map((page) => [page.id, page]))
+        pages = pages.map((page) => asyncPdfPageImagesById.get(page.id) || page)
+        pagesForOcr = pagesForOcr.map((page) => asyncPdfPageImagesById.get(page.id) || page)
       }
       let savedAsyncPageCount = completedBefore
       let lastAsyncDisplayedPageCount = completedBefore

@@ -4,6 +4,7 @@ import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutl
 import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { getErrorMessage } from '@shared/errors'
+import { buildSearchExcerptSourceHashInput } from '@shared/search-evidence'
 import { resolveDocumentCitation } from '../utils/citations'
 import type {
   CitationStyle,
@@ -572,6 +573,29 @@ function buildSearchHitFromFlatResult(item: FlatSearchResult, query: string, fal
     },
     snippet: String(item.snippet || ''),
     score: Number(item.rank || 0),
+  }
+}
+
+async function sha1Hex(value: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return ''
+  const bytes = new TextEncoder().encode(value)
+  const digest = await subtle.digest('SHA-1', bytes)
+  return Array.from(new Uint8Array(digest))
+    .map((item) => item.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function buildSearchExcerptSourceHash(item: FlatSearchResult, excerpt: string): Promise<string> {
+  try {
+    const source = buildSearchExcerptSourceHashInput({
+      docId: item.doc_id,
+      pageNum: item.page_num || item.locator?.pageNum || '',
+      excerpt,
+    })
+    return (await sha1Hex(source)).slice(0, 16)
+  } catch {
+    return ''
   }
 }
 
@@ -1204,6 +1228,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
 
     try {
+      const sourceHash = await buildSearchExcerptSourceHash(item, excerpt)
       await window.api.createResearchNote({
         doc_id: item.doc_id,
         page_num: item.page_num || null,
@@ -1213,12 +1238,14 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         kind: 'quote',
         locator: item.locator || null,
         citation_text: citationText,
+        source_hash: sourceHash || undefined,
         source_id: JSON.stringify({
           sourceType: 'search',
           locator: item.locator || null,
           citation: citationText || null,
           page_num: item.page_num || null,
           pageNum: item.page_num || null,
+          paragraphHash: sourceHash || null,
           searchKeyword: inputValue,
           matchedQuery: item.matched_query || null,
           hitField: item.hit_field || null,

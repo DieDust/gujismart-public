@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import { lazy, Suspense, useLayoutEffect } from 'react'
-import { Alert, Button, Input, Layout, Menu, Modal, Popover, Progress, Spin, Tooltip, message } from 'antd'
+import { Alert, Button, Dropdown, Input, Layout, Menu, Modal, Popover, Progress, Spin, Tooltip, message } from 'antd'
 import {
   BookOutlined,
   CloseOutlined,
@@ -32,6 +32,7 @@ import {
   saveAppWorkspace,
   type WorkspaceAppTab,
   type WorkspaceFoldersState,
+  type WorkspaceTabGroup,
   type WorkspaceViewKey,
 } from './utils/appWorkspace'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
@@ -59,6 +60,9 @@ type AppTabPointerDrag = {
   top: number
   moved: boolean
   previewElement: HTMLElement | null
+  targetGroupId: string | null
+  targetTabId: string | null
+  targetDropPosition: TabDropPosition | null
 }
 type OpenDocumentDisposition = 'current-tab' | 'new-foreground-tab'
 type OpenDocumentOptions = {
@@ -73,6 +77,12 @@ type LibraryDroppedImportRequest = {
 }
 type FoldersViewState = WorkspaceFoldersState
 type AppTab = WorkspaceAppTab
+type AppTabStripItem =
+  | { type: 'group'; group: WorkspaceTabGroup; tabs: AppTab[]; tabCount: number; active: boolean }
+  | { type: 'tab'; tab: AppTab }
+type ClosedAppTabItem =
+  | { type: 'tab'; tab: AppTab; group?: WorkspaceTabGroup; closedAt: number }
+  | { type: 'group'; group: WorkspaceTabGroup; tabs: AppTab[]; activeTabId?: string; closedAt: number }
 
 const AiPanel = lazy(() => import('./components/AiPanel'))
 const OnboardingWizard = lazy(() => import('./components/OnboardingWizard'))
@@ -109,11 +119,13 @@ const FREELIST_RATIO_RECOMMEND_THRESHOLD = 0.1
 const HOME_TAB_ID = 'home'
 const TAB_DRAG_ACTIVATION_DISTANCE = 4
 const TAB_PREFERRED_WIDTH = 210
+const TAB_GROUP_CHIP_WIDTH = 96
 const TAB_COMPACT_SLOT_WIDTH = 118
 const TAB_TIGHT_SLOT_WIDTH = 74
 const TAB_ICON_SLOT_WIDTH = 46
 const TAB_STRIP_GAP = 6
 const TAB_STRIP_HORIZONTAL_PADDING = 16
+const MAX_CLOSED_TAB_HISTORY = 20
 const SINGLETON_VIEW_KEYS = new Set<AppViewKey>(['library', 'excerpts', 'citation', 'tags', 'dashboard', 'settings'])
 const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research'])
 const VIEW_TITLES: Record<AppViewKey, string> = {
@@ -127,9 +139,93 @@ const VIEW_TITLES: Record<AppViewKey, string> = {
   research: '研究',
   excerpts: '摘录',
 }
+const TAB_GROUP_COLORS = [
+  '#d4ad84',
+  '#7cb7ff',
+  '#81c784',
+  '#f6c85f',
+  '#f28b82',
+  '#b39ddb',
+  '#4dd0e1',
+  '#ffab91',
+]
 
 function createHomeTab(): AppTab {
   return { id: HOME_TAB_ID, kind: 'home', title: '首页' }
+}
+
+function createTabGroupId(): string {
+  return `tab-group:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
+}
+
+function getDefaultTabGroupTitle(index: number): string {
+  return `分组 ${index + 1}`
+}
+
+function getDefaultTabGroupColor(index: number): string {
+  return TAB_GROUP_COLORS[index % TAB_GROUP_COLORS.length]
+}
+
+function getNextDefaultTabGroupIndex(tabGroups: WorkspaceTabGroup[]): number {
+  const usedNumbers = new Set<number>()
+  tabGroups.forEach((group) => {
+    const match = String(group.title || '').trim().match(/^分组\s*(\d+)$/)
+    const number = match ? Number(match[1]) : 0
+    if (Number.isInteger(number) && number > 0) {
+      usedNumbers.add(number)
+    }
+  })
+  let nextNumber = 1
+  while (usedNumbers.has(nextNumber)) nextNumber += 1
+  return nextNumber - 1
+}
+
+function createDefaultTabGroup(currentGroups: WorkspaceTabGroup[], groupId: string): WorkspaceTabGroup {
+  const nextIndex = getNextDefaultTabGroupIndex(currentGroups)
+  return {
+    id: groupId,
+    title: getDefaultTabGroupTitle(nextIndex),
+    color: getDefaultTabGroupColor(nextIndex),
+    collapsed: false,
+  }
+}
+
+function pruneTabGroupsForTabs(tabGroups: WorkspaceTabGroup[], nextTabs: AppTab[]): WorkspaceTabGroup[] {
+  const usedGroupIds = new Set(nextTabs.map((tab) => tab.groupId).filter(Boolean))
+  return tabGroups.filter((group) => usedGroupIds.has(group.id))
+}
+
+function assignTabToGroupInTabs(current: AppTab[], tabId: string, groupId: string, appendToGroup = false): AppTab[] {
+  const source = current.find((tab) => tab.id === tabId)
+  if (!source) return current
+  const nextSource = { ...source, groupId }
+  if (!appendToGroup) {
+    return current.map((tab) => (tab.id === tabId ? nextSource : tab))
+  }
+
+  const withoutSource = current.filter((tab) => tab.id !== tabId)
+  const lastGroupIndex = withoutSource.reduce((lastIndex, tab, index) => (
+    tab.groupId === groupId ? index : lastIndex
+  ), -1)
+  const insertIndex = lastGroupIndex >= 0 ? lastGroupIndex + 1 : withoutSource.length
+  return [
+    ...withoutSource.slice(0, insertIndex),
+    nextSource,
+    ...withoutSource.slice(insertIndex),
+  ]
+}
+
+function appendTabWithGroupContext(current: AppTab[], tab: AppTab): AppTab[] {
+  if (!tab.groupId) return [...current, tab]
+  const lastGroupIndex = current.reduce((lastIndex, item, index) => (
+    item.groupId === tab.groupId ? index : lastIndex
+  ), -1)
+  if (lastGroupIndex < 0) return [...current, tab]
+  return [
+    ...current.slice(0, lastGroupIndex + 1),
+    tab,
+    ...current.slice(lastGroupIndex + 1),
+  ]
 }
 
 function normalizeOpenDocumentTarget(target: OpenDocumentTarget | string): OpenDocumentTarget {
@@ -271,12 +367,19 @@ export default function App() {
   }
   const initialWorkspace = initialWorkspaceRef.current
   const [tabs, setTabs] = useState<AppTab[]>(() => initialWorkspace.tabs)
+  const [tabGroups, setTabGroups] = useState<WorkspaceTabGroup[]>(() => initialWorkspace.tabGroups)
   const [activeTabId, setActiveTabId] = useState(() => initialWorkspace.activeTabId)
   const [tabMenuOpen, setTabMenuOpen] = useState(false)
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null)
+  const [dragOverTabGroupId, setDragOverTabGroupId] = useState<string | null>(null)
+  const [closedTabHistory, setClosedTabHistory] = useState<ClosedAppTabItem[]>([])
   const [shortcuts, setShortcuts] = useState<ShortcutMap | null>(null)
   const [siderCollapsed, setSiderCollapsed] = useState(() => initialWorkspace.siderCollapsed)
   const [tabSearchKey, setTabSearchKey] = useState('')
+  const [renamingTabGroupId, setRenamingTabGroupId] = useState<string | null>(null)
+  const [renamingTabGroupTitle, setRenamingTabGroupTitle] = useState('')
+  const [tabGroupSettingsOpenId, setTabGroupSettingsOpenId] = useState<string | null>(null)
+  const [tabGroupSettingsTitle, setTabGroupSettingsTitle] = useState('')
   const [libraryFilter, setLibraryFilter] = useState<LibraryFilter>({ type: 'all' })
   const [libraryFocusSection, setLibraryFocusSection] = useState<'tags' | 'folders' | 'smart' | undefined>(undefined)
   const [libraryAiOpen, setLibraryAiOpen] = useState(false)
@@ -297,6 +400,46 @@ export default function App() {
   const [tabDensity, setTabDensity] = useState<AppTabDensity>('normal')
   const onboardingVisible = useOnboardingStore((state) => state.visible)
   const activeTab = useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0] || createHomeTab(), [activeTabId, tabs])
+  const tabGroupsById = useMemo(() => new Map(tabGroups.map((group) => [group.id, group])), [tabGroups])
+  const tabGroupTabCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    tabs.forEach((tab) => {
+      if (!tab.groupId || !tabGroupsById.has(tab.groupId)) return
+      counts.set(tab.groupId, (counts.get(tab.groupId) || 0) + 1)
+    })
+    return counts
+  }, [tabGroupsById, tabs])
+  const tabStripItems = useMemo<AppTabStripItem[]>(() => {
+    const items: AppTabStripItem[] = []
+    const renderedGroupIds = new Set<string>()
+
+    tabs.forEach((tab) => {
+      const group = tab.groupId ? tabGroupsById.get(tab.groupId) : undefined
+      if (group && !renderedGroupIds.has(group.id)) {
+        const groupedTabs = tabs.filter((item) => item.groupId === group.id)
+        items.push({
+          type: 'group',
+          group,
+          tabs: groupedTabs,
+          tabCount: tabGroupTabCounts.get(group.id) || 0,
+          active: activeTab.groupId === group.id,
+        })
+        renderedGroupIds.add(group.id)
+      }
+      if (group) return
+      items.push({ type: 'tab', tab })
+    })
+
+    return items
+  }, [activeTab.groupId, tabGroupTabCounts, tabGroupsById, tabs])
+  const visibleTabCount = tabStripItems.reduce((count, item) => (
+    count + (item.type === 'tab' ? 1 : (item.group.collapsed ? 0 : item.tabs.length))
+  ), 0)
+  const tabStripGroupCount = tabStripItems.reduce((count, item) => count + (item.type === 'group' ? 1 : 0), 0)
+  const visibleTabUnitCount = visibleTabCount + tabStripGroupCount
+  const inheritedTabGroupId = activeTab.groupId && tabGroupsById.has(activeTab.groupId)
+    ? activeTab.groupId
+    : undefined
   const activeViewKey: ViewKey = activeTab.kind === 'home'
     ? 'welcome'
     : activeTab.kind === 'view'
@@ -306,8 +449,9 @@ export default function App() {
   const showFloatingActions = activeTab.kind !== 'document' && !libraryAiOpen
   const selectedMenuKeys = activeTab.kind === 'view' ? [activeTab.view] : []
   const tabStripIdealWidth = (
-    tabs.length * TAB_PREFERRED_WIDTH
-    + Math.max(0, tabs.length - 1) * TAB_STRIP_GAP
+    visibleTabCount * TAB_PREFERRED_WIDTH
+    + tabStripGroupCount * TAB_GROUP_CHIP_WIDTH
+    + Math.max(0, visibleTabUnitCount - 1) * TAB_STRIP_GAP
     + TAB_STRIP_HORIZONTAL_PADDING
   )
   const filteredTabs = useMemo(() => {
@@ -319,22 +463,24 @@ export default function App() {
   useEffect(() => {
     saveAppWorkspace(window.localStorage, {
       tabs,
+      tabGroups,
       activeTabId,
       siderCollapsed,
     })
-  }, [activeTabId, siderCollapsed, tabs])
+  }, [activeTabId, siderCollapsed, tabGroups, tabs])
 
   useEffect(() => {
     const saveBeforeUnload = () => {
       saveAppWorkspace(window.localStorage, {
         tabs,
+        tabGroups,
         activeTabId,
         siderCollapsed,
       })
     }
     window.addEventListener('beforeunload', saveBeforeUnload)
     return () => window.removeEventListener('beforeunload', saveBeforeUnload)
-  }, [activeTabId, siderCollapsed, tabs])
+  }, [activeTabId, siderCollapsed, tabGroups, tabs])
 
   const settingsViewRef = useRef<SettingsViewHandle>(null)
   const floatingPanelRef = useRef<HTMLDivElement>(null)
@@ -371,7 +517,7 @@ export default function App() {
     if (!strip) return
 
     const measure = () => {
-      const tabCount = Math.max(1, tabsRef.current.length)
+      const tabCount = Math.max(1, visibleTabUnitCount)
       const usableWidth = Math.max(
         1,
         strip.clientWidth
@@ -389,7 +535,7 @@ export default function App() {
       resizeObserver.disconnect()
       window.removeEventListener('resize', measure)
     }
-  }, [tabs.length, siderCollapsed])
+  }, [siderCollapsed, visibleTabUnitCount])
 
   useEffect(() => {
     window.api.listFolders()
@@ -680,10 +826,18 @@ export default function App() {
 
   const ensureHomeTab = () => {
     runWithSettingsLeaveGuard(() => {
+      const nextGroupId = inheritedTabGroupId
       setTabs((current) => {
-        if (current.some((tab) => tab.id === HOME_TAB_ID)) return current
-        return [createHomeTab(), ...current]
+        const existingHome = current.find((tab) => tab.id === HOME_TAB_ID)
+        if (existingHome) {
+          return nextGroupId
+            ? assignTabToGroupInTabs(current, HOME_TAB_ID, nextGroupId, true)
+            : current
+        }
+        const nextHomeTab = nextGroupId ? { ...createHomeTab(), groupId: nextGroupId } : createHomeTab()
+        return nextGroupId ? appendTabWithGroupContext(current, nextHomeTab) : [nextHomeTab, ...current]
       })
+      expandTabGroup(nextGroupId)
       setActiveTabId(HOME_TAB_ID)
     })
   }
@@ -693,14 +847,27 @@ export default function App() {
     options: { forceNew?: boolean; foldersState?: FoldersViewState | null; initialSearchKeyword?: string } = {},
   ) => {
     runWithSettingsLeaveGuard(() => {
+      const nextGroupId = inheritedTabGroupId
       const singleton = SINGLETON_VIEW_KEYS.has(view) && !options.forceNew
       if (singleton) {
         const tabId = `view:${view}`
-        setTabs((current) => (
-          current.some((tab) => tab.id === tabId)
-            ? current
-            : [...current, { id: tabId, kind: 'view', view, title: VIEW_TITLES[view], singleton: true }]
-        ))
+        setTabs((current) => {
+          if (current.some((tab) => tab.id === tabId)) {
+            return nextGroupId
+              ? assignTabToGroupInTabs(current, tabId, nextGroupId, true)
+              : current
+          }
+          const nextTab: AppTab = {
+            id: tabId,
+            kind: 'view',
+            view,
+            title: VIEW_TITLES[view],
+            singleton: true,
+            groupId: nextGroupId,
+          }
+          return appendTabWithGroupContext(current, nextTab)
+        })
+        expandTabGroup(nextGroupId)
         setActiveTabId(tabId)
         return
       }
@@ -717,19 +884,34 @@ export default function App() {
         singleton,
         foldersState: view === 'folders' ? options.foldersState || null : undefined,
         initialSearchKeyword: view === 'search' ? options.initialSearchKeyword || '' : undefined,
+        groupId: nextGroupId,
       }
-      setTabs((current) => [...current, nextTab])
+      setTabs((current) => appendTabWithGroupContext(current, nextTab))
+      expandTabGroup(nextGroupId)
       setActiveTabId(tabId)
     })
   }
 
   const focusOrCreateLibraryTab = () => {
     const tabId = 'view:library'
-    setTabs((current) => (
-      current.some((tab) => tab.id === tabId)
-        ? current
-        : [...current, { id: tabId, kind: 'view', view: 'library', title: VIEW_TITLES.library, singleton: true }]
-    ))
+    const nextGroupId = inheritedTabGroupId
+    setTabs((current) => {
+      if (current.some((tab) => tab.id === tabId)) {
+        return nextGroupId
+          ? assignTabToGroupInTabs(current, tabId, nextGroupId, true)
+          : current
+      }
+      const nextTab: AppTab = {
+        id: tabId,
+        kind: 'view',
+        view: 'library',
+        title: VIEW_TITLES.library,
+        singleton: true,
+        groupId: nextGroupId,
+      }
+      return appendTabWithGroupContext(current, nextTab)
+    })
+    expandTabGroup(nextGroupId)
     setActiveTabId(tabId)
   }
 
@@ -824,6 +1006,7 @@ export default function App() {
     }
     const disposition = options.disposition
       || (activeDocumentTab?.document.docId === normalized.docId ? 'current-tab' : 'new-foreground-tab')
+    const nextGroupId = inheritedTabGroupId
 
     if (disposition === 'current-tab' && activeDocumentTab) {
       setTabs((current) => current.map((tab) => (
@@ -844,8 +1027,10 @@ export default function App() {
         docId: normalized.docId,
         target: documentTarget,
       },
+      groupId: nextGroupId,
     }
-    setTabs((current) => [...current, nextTab])
+    setTabs((current) => appendTabWithGroupContext(current, nextTab))
+    expandTabGroup(nextGroupId)
     setActiveTabId(tabId)
     refreshDocumentTabTitle(tabId, normalized.docId)
   }
@@ -867,16 +1052,250 @@ export default function App() {
     )))
   }
 
+  const expandTabGroup = (groupId?: string) => {
+    if (!groupId) return
+    setTabGroups((current) => current.map((group) => (
+      group.id === groupId && group.collapsed
+        ? { ...group, collapsed: false }
+        : group
+    )))
+  }
+
+  const revealTabGroup = (tab: AppTab) => {
+    expandTabGroup(tab.groupId)
+  }
+
+  const rememberClosedItems = (items: ClosedAppTabItem[]) => {
+    if (items.length === 0) return
+    setClosedTabHistory((current) => [
+      ...items,
+      ...current,
+    ].slice(0, MAX_CLOSED_TAB_HISTORY))
+  }
+
+  const buildClosedItems = (currentTabs: AppTab[], closedTabs: AppTab[]): ClosedAppTabItem[] => {
+    const closedIds = new Set(closedTabs.map((tab) => tab.id))
+    const groupedIds = new Set<string>()
+    const closedAt = Date.now()
+    const items: ClosedAppTabItem[] = []
+
+    tabGroups.forEach((group) => {
+      const groupTabs = currentTabs.filter((tab) => tab.groupId === group.id)
+      if (groupTabs.length === 0 || !groupTabs.every((tab) => closedIds.has(tab.id))) return
+      groupTabs.forEach((tab) => groupedIds.add(tab.id))
+      items.push({
+        type: 'group',
+        group,
+        tabs: groupTabs,
+        activeTabId: groupTabs.some((tab) => tab.id === activeTabId) ? activeTabId : groupTabs[0]?.id,
+        closedAt,
+      })
+    })
+
+    closedTabs.forEach((tab) => {
+      if (groupedIds.has(tab.id)) return
+      const group = tab.groupId ? tabGroupsById.get(tab.groupId) : undefined
+      items.push({ type: 'tab', tab, group, closedAt })
+    })
+
+    return items.reverse()
+  }
+
+  const reopenClosedItem = () => {
+    const [item] = closedTabHistory
+    if (!item) return
+    setClosedTabHistory((current) => current.slice(1))
+
+    if (item.type === 'group') {
+      setTabGroups((current) => (
+        current.some((group) => group.id === item.group.id)
+          ? current
+          : pruneTabGroupsForTabs([...current, item.group], [...tabsRef.current, ...item.tabs])
+      ))
+      setTabs((current) => {
+        const existingIds = new Set(current.map((tab) => tab.id))
+        const nextTabs = item.tabs.filter((tab) => !existingIds.has(tab.id))
+        if (nextTabs.length === 0) return current
+        return [...current, ...nextTabs]
+      })
+      expandTabGroup(item.group.id)
+      setActiveTabId(item.activeTabId || item.tabs[0]?.id || HOME_TAB_ID)
+      return
+    }
+
+    if (item.group) {
+      setTabGroups((current) => (
+        current.some((group) => group.id === item.group?.id)
+          ? current
+          : [...current, item.group as WorkspaceTabGroup]
+      ))
+      expandTabGroup(item.group.id)
+    }
+    setTabs((current) => (
+      current.some((tab) => tab.id === item.tab.id)
+        ? current
+        : appendTabWithGroupContext(current, item.tab)
+    ))
+    setActiveTabId(item.tab.id)
+  }
+
+  const closeAllTabs = () => {
+    runWithSettingsLeaveGuard(() => {
+      const homeTab = createHomeTab()
+      rememberClosedItems(buildClosedItems(tabs, tabs))
+      setTabs([homeTab])
+      setTabGroups([])
+      setActiveTabId(HOME_TAB_ID)
+    })
+  }
+
+  const closeOtherTabs = (tabId: string) => {
+    const close = () => {
+      const selectedTab = tabs.find((tab) => tab.id === tabId)
+      const closedTabs = tabs.filter((tab) => tab.id !== tabId)
+      const nextTabs = selectedTab ? [selectedTab] : [createHomeTab()]
+      rememberClosedItems(buildClosedItems(tabs, closedTabs))
+      setTabs(nextTabs)
+      setTabGroups((current) => pruneTabGroupsForTabs(current, nextTabs))
+      setActiveTabId(nextTabs[0].id)
+    }
+
+    if (activeTabId !== tabId) {
+      runWithSettingsLeaveGuard(close)
+      return
+    }
+    close()
+  }
+
+  const createGroupForTab = (tabId: string) => {
+    const groupId = createTabGroupId()
+    setTabs((current) => {
+      const nextTabs = assignTabToGroupInTabs(current, tabId, groupId, false)
+      setTabGroups((currentGroups) => {
+        const nextGroup = createDefaultTabGroup(currentGroups, groupId)
+        return pruneTabGroupsForTabs([...currentGroups, nextGroup], nextTabs)
+      })
+      return nextTabs
+    })
+  }
+
+  const createGroupForTabs = (tabIds: string[]) => {
+    const uniqueTabIds = Array.from(new Set(tabIds.filter(Boolean)))
+    if (uniqueTabIds.length < 2) return
+    const groupId = createTabGroupId()
+    const tabIdSet = new Set(uniqueTabIds)
+    setTabs((current) => {
+      const groupableTabs = current.filter((tab) => tabIdSet.has(tab.id) && !tab.groupId)
+      if (groupableTabs.length < 2) return current
+      const nextTabs = current.map((tab) => (
+        tabIdSet.has(tab.id) ? { ...tab, groupId } : tab
+      ))
+      setTabGroups((currentGroups) => {
+        const nextGroup = createDefaultTabGroup(currentGroups, groupId)
+        return pruneTabGroupsForTabs([...currentGroups, nextGroup], nextTabs)
+      })
+      return nextTabs
+    })
+  }
+
+  const moveTabToGroup = (tabId: string, groupId: string) => {
+    if (!tabGroupsById.has(groupId)) return
+    setTabs((current) => {
+      const nextTabs = assignTabToGroupInTabs(current, tabId, groupId, true)
+      setTabGroups((currentGroups) => pruneTabGroupsForTabs(currentGroups, nextTabs))
+      return nextTabs
+    })
+  }
+
+  const removeTabFromGroup = (tabId: string) => {
+    setTabs((current) => {
+      const nextTabs = current.map((tab) => (
+        tab.id === tabId ? { ...tab, groupId: undefined } : tab
+      ))
+      setTabGroups((currentGroups) => pruneTabGroupsForTabs(currentGroups, nextTabs))
+      return nextTabs
+    })
+  }
+
+  const toggleTabGroupCollapsed = (groupId: string) => {
+    setTabGroups((current) => current.map((group) => (
+      group.id === groupId
+        ? { ...group, collapsed: !group.collapsed }
+        : group
+    )))
+  }
+
+  const openRenameTabGroup = (groupId: string) => {
+    const group = tabGroupsById.get(groupId)
+    if (!group) return
+    setRenamingTabGroupId(group.id)
+    setRenamingTabGroupTitle(group.title)
+  }
+
+  const updateTabGroupTitle = (groupId: string, title: string) => {
+    const nextTitle = title.trim()
+    if (!nextTitle) return
+    setTabGroups((current) => current.map((group) => (
+      group.id === groupId ? { ...group, title: nextTitle } : group
+    )))
+  }
+
+  const commitTabGroupSettingsTitle = (groupId: string) => {
+    updateTabGroupTitle(groupId, tabGroupSettingsTitle)
+  }
+
+  const confirmRenameTabGroup = () => {
+    const title = renamingTabGroupTitle.trim()
+    if (!renamingTabGroupId || !title) return
+    updateTabGroupTitle(renamingTabGroupId, title)
+    setRenamingTabGroupId(null)
+    setRenamingTabGroupTitle('')
+  }
+
+  const updateTabGroupColor = (groupId: string, color: string) => {
+    setTabGroups((current) => current.map((group) => (
+      group.id === groupId ? { ...group, color } : group
+    )))
+  }
+
+  const openHomeTabInGroup = (groupId: string) => {
+    if (!tabGroupsById.has(groupId)) return
+    setTabs((current) => {
+      if (current.some((tab) => tab.id === HOME_TAB_ID)) {
+        return assignTabToGroupInTabs(current, HOME_TAB_ID, groupId, true)
+      }
+      return appendTabWithGroupContext(current, { ...createHomeTab(), groupId })
+    })
+    expandTabGroup(groupId)
+    setActiveTabId(HOME_TAB_ID)
+    setTabGroupSettingsOpenId(null)
+  }
+
+  const ungroupTabGroup = (groupId: string) => {
+    setTabs((current) => {
+      const nextTabs = current.map((tab) => (
+        tab.groupId === groupId ? { ...tab, groupId: undefined } : tab
+      ))
+      setTabGroups((currentGroups) => pruneTabGroupsForTabs(currentGroups, nextTabs))
+      return nextTabs
+    })
+    setTabGroupSettingsOpenId(null)
+  }
+
   const closeTab = (tabId: string) => {
     const close = () => {
       setTabs((current) => {
         const closingIndex = current.findIndex((tab) => tab.id === tabId)
         if (closingIndex < 0) return current
+        const closingTab = current[closingIndex]
         const nextTabs = current.filter((tab) => tab.id !== tabId)
+        rememberClosedItems(buildClosedItems(current, closingTab ? [closingTab] : []))
         if (nextTabs.length === 0) {
+          setTabGroups([])
           setActiveTabId(HOME_TAB_ID)
           return [createHomeTab()]
         }
+        setTabGroups((currentGroups) => pruneTabGroupsForTabs(currentGroups, nextTabs))
         if (activeTabId === tabId) {
           const nextActive = nextTabs[Math.min(closingIndex, nextTabs.length - 1)] || nextTabs[0]
           setActiveTabId(nextActive.id)
@@ -890,6 +1309,52 @@ export default function App() {
       return
     }
     close()
+  }
+
+  const closeTabGroup = (groupId: string) => {
+    const close = () => {
+      const groupTabs = tabs.filter((tab) => tab.groupId === groupId)
+      if (groupTabs.length === 0) return
+      const firstClosingIndex = tabs.findIndex((tab) => tab.groupId === groupId)
+      const nextTabs = tabs.filter((tab) => tab.groupId !== groupId)
+      rememberClosedItems(buildClosedItems(tabs, groupTabs))
+      if (nextTabs.length === 0) {
+        setTabs([createHomeTab()])
+        setTabGroups([])
+        setActiveTabId(HOME_TAB_ID)
+        return
+      }
+      setTabs(nextTabs)
+      setTabGroups((current) => pruneTabGroupsForTabs(current, nextTabs))
+      if (activeTab.groupId === groupId) {
+        const nextActive = nextTabs[Math.min(firstClosingIndex, nextTabs.length - 1)] || nextTabs[0]
+        setActiveTabId(nextActive.id)
+      }
+    }
+
+    if (activeTab.kind === 'view' && activeTab.view === 'settings' && activeTab.groupId === groupId && settingsDirty) {
+      runWithSettingsLeaveGuard(close)
+      return
+    }
+    close()
+  }
+
+  const getTabGroupDropTarget = (strip: HTMLElement, clientX: number, clientY: number): string | null => {
+    const elements = Array.from(strip.querySelectorAll<HTMLElement>('[data-app-tab-group-drop-target]'))
+    for (const element of elements) {
+      const groupId = element.dataset.appTabGroupDropTarget
+      if (!groupId) continue
+      const bounds = element.getBoundingClientRect()
+      if (
+        clientX >= bounds.left
+        && clientX <= bounds.right
+        && clientY >= bounds.top
+        && clientY <= bounds.bottom
+      ) {
+        return groupId
+      }
+    }
+    return null
   }
 
   const captureTabLayout = () => {
@@ -922,6 +1387,12 @@ export default function App() {
         `translate3d(${previewLeft}px, ${previewTop}px, 0)`,
       )
 
+      const nextTargetGroupId = getTabGroupDropTarget(strip, drag.clientX, drag.top + drag.height / 2)
+      if (drag.targetGroupId !== nextTargetGroupId) {
+        drag.targetGroupId = nextTargetGroupId
+        setDragOverTabGroupId(nextTargetGroupId)
+      }
+
       const desiredCenter = drag.clientX - drag.grabOffsetX + drag.width / 2
       const otherTabs = Array.from(strip.querySelectorAll<HTMLElement>('[data-app-tab-id]'))
         .filter((element) => element.dataset.appTabId !== drag.tabId)
@@ -936,6 +1407,8 @@ export default function App() {
         }
         target = { tabId, position: 'after' }
       }
+      drag.targetTabId = target?.tabId || null
+      drag.targetDropPosition = target?.position || null
 
       if (target) {
         const currentTabs = tabsRef.current
@@ -963,17 +1436,73 @@ export default function App() {
     const targetElement = drag
       ? tabStripRef.current?.querySelector<HTMLElement>(`[data-app-tab-id="${CSS.escape(drag.tabId)}"]`)
       : null
+    const droppedGroupId = drag?.targetGroupId || null
+    const droppedTabId = drag?.tabId || ''
+    const droppedNearTabId = drag?.targetTabId || ''
     tabPointerDragRef.current = null
     document.body.classList.remove('is-app-tab-dragging')
 
     if (!drag?.moved) {
+      setDragOverTabGroupId(null)
       suppressTabClickRef.current = false
       return
+    }
+
+    const finishDrop = () => {
+      setDragOverTabGroupId(null)
+      const droppedTab = tabsRef.current.find((tab) => tab.id === droppedTabId)
+      if (droppedGroupId && droppedTabId && droppedTab?.groupId !== droppedGroupId) {
+        pendingTabLayoutRef.current = captureTabLayout()
+        moveTabToGroup(droppedTabId, droppedGroupId)
+        return
+      }
+      if (!droppedGroupId && droppedTab?.groupId) {
+        pendingTabLayoutRef.current = captureTabLayout()
+        removeTabFromGroup(droppedTabId)
+        return
+      }
+      const droppedNearTab = tabsRef.current.find((tab) => tab.id === droppedNearTabId)
+      if (!droppedGroupId && droppedTab && droppedNearTab && !droppedTab.groupId && !droppedNearTab.groupId) {
+        pendingTabLayoutRef.current = captureTabLayout()
+        createGroupForTabs([droppedTab.id, droppedNearTab.id])
+      }
     }
 
     const previewElement = drag.previewElement
     const targetBounds = targetElement?.getBoundingClientRect()
     const previewBounds = previewElement?.getBoundingClientRect()
+    const droppedTab = tabsRef.current.find((tab) => tab.id === droppedTabId)
+    const droppedNearTab = tabsRef.current.find((tab) => tab.id === droppedNearTabId)
+    const changesGroupMembership = !!(
+      (droppedGroupId && droppedTab?.groupId !== droppedGroupId)
+      || (!droppedGroupId && droppedTab?.groupId)
+      || (!droppedGroupId && droppedTab && droppedNearTab && !droppedTab.groupId && !droppedNearTab.groupId)
+    )
+    if (changesGroupMembership) {
+      setDraggedTabId(null)
+      finishDrop()
+      if (previewElement) {
+        const fadeAnimation = previewElement.animate(
+          [
+            { opacity: 1, transform: previewElement.style.transform },
+            { opacity: 0, transform: `${previewElement.style.transform} scale(0.98)` },
+          ],
+          { duration: 120, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
+        )
+        void fadeAnimation.finished
+          .catch(() => {})
+          .finally(() => {
+            previewElement.remove()
+          })
+      } else {
+        setDraggedTabId(null)
+      }
+      window.setTimeout(() => {
+        suppressTabClickRef.current = false
+      }, 0)
+      return
+    }
+
     if (previewElement && targetBounds && previewBounds) {
       const settleAnimation = previewElement.animate(
         [
@@ -987,10 +1516,12 @@ export default function App() {
         .finally(() => {
           previewElement.remove()
           setDraggedTabId(null)
+          finishDrop()
         })
     } else {
       previewElement?.remove()
       setDraggedTabId(null)
+      finishDrop()
     }
     window.setTimeout(() => {
       suppressTabClickRef.current = false
@@ -1014,6 +1545,9 @@ export default function App() {
       top: bounds.top,
       moved: false,
       previewElement: null,
+      targetGroupId: null,
+      targetTabId: null,
+      targetDropPosition: null,
     }
 
     const handlePointerMove = (pointerEvent: PointerEvent) => {
@@ -1223,13 +1757,118 @@ export default function App() {
   const selectTabFromMenu = (tab: AppTab) => {
     setTabMenuOpen(false)
     setTabSearchKey('')
-    if (tab.id === activeTabId) return
-    runWithSettingsLeaveGuard(() => setActiveTabId(tab.id))
+    if (tab.id === activeTabId) {
+      revealTabGroup(tab)
+      return
+    }
+    runWithSettingsLeaveGuard(() => {
+      revealTabGroup(tab)
+      setActiveTabId(tab.id)
+    })
   }
 
   const selectFirstFilteredTab = () => {
     const firstMatch = filteredTabs[0]
     if (firstMatch) selectTabFromMenu(firstMatch)
+  }
+
+  const getTabGroupColorItems = (group: WorkspaceTabGroup): MenuProps['items'] => (
+    TAB_GROUP_COLORS.map((color, index) => ({
+      key: `group:color:${color}`,
+      label: (
+        <span className="app-tab-context-color-item">
+          <span className="app-tab-context-color-dot" style={{ background: color }} />
+          颜色 {index + 1}
+        </span>
+      ),
+      disabled: group.color === color,
+    }))
+  )
+
+  const getClosedItemLabel = (item?: ClosedAppTabItem): string => {
+    if (!item) return '重新打开关闭的标签页'
+    return item.type === 'group'
+      ? `重新打开关闭的分组：${item.group.title}`
+      : `重新打开关闭的标签页：${item.tab.title}`
+  }
+
+  const getTabRailContextMenuItems = (): MenuProps['items'] => [
+    {
+      key: 'reopen-closed',
+      label: getClosedItemLabel(closedTabHistory[0]),
+      disabled: closedTabHistory.length === 0,
+    },
+  ]
+
+  const handleTabRailContextMenuClick: MenuProps['onClick'] = ({ key }) => {
+    if (key === 'reopen-closed') reopenClosedItem()
+  }
+
+  const getTabContextMenuItems = (tab: AppTab): MenuProps['items'] => {
+    const group = tab.groupId ? tabGroupsById.get(tab.groupId) : undefined
+    const groupItems = tabGroups.map((item) => ({
+      key: `group:assign:${item.id}`,
+      label: item.title,
+      disabled: item.id === tab.groupId,
+    }))
+
+    return [
+      { key: 'close-all', label: '关闭所有标签页' },
+      { key: 'close-others', label: '关闭其他标签页', disabled: tabs.length <= 1 },
+      { type: 'divider' },
+      { key: 'group-new', label: '新建分组并加入' },
+      groupItems.length > 0
+        ? { key: 'group-existing', label: '移动到分组', children: groupItems }
+        : null,
+      group ? { key: 'group-rename', label: '重命名当前分组' } : null,
+      group ? { key: 'group-color', label: '更改分组颜色', children: getTabGroupColorItems(group) } : null,
+      group
+        ? {
+          key: 'group-toggle',
+          label: group.collapsed ? '展开当前分组' : '折叠当前分组',
+        }
+        : null,
+      group ? { key: 'group-close', label: '关闭当前分组' } : null,
+      group ? { key: 'group-remove', label: '从分组移除' } : null,
+    ].filter(Boolean) as MenuProps['items']
+  }
+
+  const handleTabContextMenuClick = (tab: AppTab, key: string) => {
+    if (key === 'close-all') {
+      closeAllTabs()
+      return
+    }
+    if (key === 'close-others') {
+      closeOtherTabs(tab.id)
+      return
+    }
+    if (key === 'group-new') {
+      createGroupForTab(tab.id)
+      return
+    }
+    if (key.startsWith('group:assign:')) {
+      moveTabToGroup(tab.id, key.slice('group:assign:'.length))
+      return
+    }
+    if (key === 'group-rename' && tab.groupId) {
+      openRenameTabGroup(tab.groupId)
+      return
+    }
+    if (key.startsWith('group:color:') && tab.groupId) {
+      updateTabGroupColor(tab.groupId, key.slice('group:color:'.length))
+      return
+    }
+    if (key === 'group-toggle' && tab.groupId) {
+      toggleTabGroupCollapsed(tab.groupId)
+      return
+    }
+    if (key === 'group-close' && tab.groupId) {
+      closeTabGroup(tab.groupId)
+      return
+    }
+    if (key === 'group-remove') {
+      removeTabFromGroup(tab.id)
+    }
   }
 
   const tabMenuContent = (
@@ -1400,6 +2039,125 @@ export default function App() {
       ? '正在按需清理旧索引、升级新版全文索引，并迁移页面 OCR 大字段。已经完成的步骤会自动跳过。'
       : '正在把本次升级和迁移产生的空闲页真正释放到磁盘。大数据库可能需要较长时间。'
 
+  const renderTabButton = (tab: AppTab) => {
+    const active = tab.id === activeTabId
+    const closable = !(tab.kind === 'home' && tabs.length <= 1)
+    const dragging = tab.id === draggedTabId
+    return (
+      <Dropdown
+        key={tab.id}
+        trigger={['contextMenu']}
+        overlayClassName="app-tab-context-menu"
+        menu={{
+          items: getTabContextMenuItems(tab),
+          onClick: ({ key }) => handleTabContextMenuClick(tab, String(key)),
+        }}
+      >
+        <button
+          type="button"
+          className={`app-tab ${active ? 'is-active' : ''} ${dragging ? 'is-dragging-source' : ''}`}
+          data-app-tab-kind={tab.kind}
+          data-app-tab-id={tab.id}
+          data-app-tab-active={active ? 'true' : undefined}
+          data-app-tab-context-menu="true"
+          title={tab.title}
+          onContextMenu={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            if (suppressTabClickRef.current) {
+              event.preventDefault()
+              return
+            }
+            if (tab.id === activeTabId) return
+            runWithSettingsLeaveGuard(() => setActiveTabId(tab.id))
+          }}
+          onPointerDown={(event) => handleTabPointerDown(event, tab.id)}
+          onDragStart={(event) => event.preventDefault()}
+          onAuxClick={(event) => {
+            if (event.button === 1 && closable) closeTab(tab.id)
+          }}
+        >
+          <span className="app-tab-icon">{getTabIcon(tab)}</span>
+          <span className="app-tab-title">{tab.title}</span>
+          {closable ? (
+            <span
+              className="app-tab-close"
+              role="button"
+              aria-label={`关闭 ${tab.title}`}
+              draggable={false}
+              onClick={(event) => {
+                event.stopPropagation()
+                closeTab(tab.id)
+              }}
+            >
+              <CloseOutlined />
+            </span>
+          ) : null}
+        </button>
+      </Dropdown>
+    )
+  }
+
+  const renderTabGroupSettingsPanel = (group: WorkspaceTabGroup) => (
+    <div
+      className="app-tab-group-settings-panel"
+      data-app-tab-group-settings-panel="true"
+      onContextMenu={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <Input
+        className="app-tab-group-settings-name"
+        placeholder="为此组命名"
+        maxLength={80}
+        value={tabGroupSettingsOpenId === group.id ? tabGroupSettingsTitle : group.title}
+        onChange={(event) => setTabGroupSettingsTitle(event.target.value)}
+        onBlur={() => commitTabGroupSettingsTitle(group.id)}
+        onPressEnter={() => commitTabGroupSettingsTitle(group.id)}
+      />
+      <div className="app-tab-group-settings-colors">
+        {TAB_GROUP_COLORS.map((color) => (
+          <button
+            key={color}
+            type="button"
+            className={`app-tab-group-settings-color ${group.color === color ? 'is-active' : ''}`}
+            style={{ '--app-tab-group-color': color } as React.CSSProperties}
+            aria-label={`选择分组颜色 ${color}`}
+            onClick={() => updateTabGroupColor(group.id, color)}
+          />
+        ))}
+      </div>
+      <div className="app-tab-group-settings-divider" />
+      <button
+        type="button"
+        className="app-tab-group-settings-action"
+        onClick={() => openHomeTabInGroup(group.id)}
+      >
+        在组内添加首页标签
+      </button>
+      <button
+        type="button"
+        className="app-tab-group-settings-action"
+        onClick={() => toggleTabGroupCollapsed(group.id)}
+      >
+        {group.collapsed ? '展开分组' : '折叠分组'}
+      </button>
+      <button
+        type="button"
+        className="app-tab-group-settings-action"
+        onClick={() => closeTabGroup(group.id)}
+      >
+        关闭分组
+      </button>
+      <div className="app-tab-group-settings-divider" />
+      <button
+        type="button"
+        className="app-tab-group-settings-action"
+        onClick={() => ungroupTabGroup(group.id)}
+      >
+        取消分组
+      </button>
+    </div>
+  )
+
   return (
     <Layout className="app-layout">
       <Sider
@@ -1465,6 +2223,14 @@ export default function App() {
               />
             </Tooltip>
           </Popover>
+          <Dropdown
+            trigger={['contextMenu']}
+            overlayClassName="app-tab-context-menu"
+            menu={{
+              items: getTabRailContextMenuItems(),
+              onClick: handleTabRailContextMenuClick,
+            }}
+          >
           <div className="app-tab-rail">
             <div
               ref={tabStripRef}
@@ -1472,53 +2238,52 @@ export default function App() {
               data-app-tab-strip="true"
               data-app-tab-density={tabDensity}
               data-app-tab-count={tabs.length}
+              data-app-tab-visible-count={visibleTabCount}
               style={{ '--app-tab-strip-ideal-width': `${tabStripIdealWidth}px` } as React.CSSProperties}
             >
-              {tabs.map((tab) => {
-                const active = tab.id === activeTabId
-                const closable = !(tab.kind === 'home' && tabs.length <= 1)
-                const dragging = tab.id === draggedTabId
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    className={`app-tab ${active ? 'is-active' : ''} ${dragging ? 'is-dragging-source' : ''}`}
-                    data-app-tab-kind={tab.kind}
-                    data-app-tab-id={tab.id}
-                    data-app-tab-active={active ? 'true' : undefined}
-                    title={tab.title}
-                    onClick={(event) => {
-                      if (suppressTabClickRef.current) {
-                        event.preventDefault()
-                        return
-                      }
-                      if (tab.id === activeTabId) return
-                      runWithSettingsLeaveGuard(() => setActiveTabId(tab.id))
-                    }}
-                    onPointerDown={(event) => handleTabPointerDown(event, tab.id)}
-                    onDragStart={(event) => event.preventDefault()}
-                    onAuxClick={(event) => {
-                      if (event.button === 1 && closable) closeTab(tab.id)
-                    }}
-                  >
-                    <span className="app-tab-icon">{getTabIcon(tab)}</span>
-                    <span className="app-tab-title">{tab.title}</span>
-                    {closable ? (
-                      <span
-                        className="app-tab-close"
-                        role="button"
-                        aria-label={`关闭 ${tab.title}`}
-                        draggable={false}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          closeTab(tab.id)
+              {tabStripItems.map((item) => {
+                if (item.type === 'group') {
+                  return (
+                    <div
+                      key={`group:${item.group.id}`}
+                      className={`app-tab-group-segment ${item.group.collapsed ? 'is-collapsed' : ''} ${item.active ? 'is-active' : ''} ${dragOverTabGroupId === item.group.id ? 'is-drop-target' : ''}`}
+                      data-app-tab-group-drop-target={item.group.id}
+                      data-app-tab-group-id={item.group.id}
+                      data-app-tab-group-collapsed={item.group.collapsed ? 'true' : undefined}
+                      style={{ '--app-tab-group-color': item.group.color } as React.CSSProperties}
+                    >
+                      <Popover
+                        trigger="contextMenu"
+                        placement="bottomLeft"
+                        arrow={false}
+                        overlayClassName="app-tab-group-settings-popover"
+                        content={renderTabGroupSettingsPanel(item.group)}
+                        open={tabGroupSettingsOpenId === item.group.id}
+                        onOpenChange={(open) => {
+                          setTabGroupSettingsOpenId(open ? item.group.id : null)
+                          setTabGroupSettingsTitle(open ? item.group.title : '')
                         }}
                       >
-                        <CloseOutlined />
-                      </span>
-                    ) : null}
-                  </button>
-                )
+                        <button
+                          type="button"
+                          className={`app-tab-group-chip ${item.group.collapsed ? 'is-collapsed' : ''} ${item.active ? 'is-active' : ''}`}
+                          title={`${item.group.collapsed ? '展开' : '折叠'} ${item.group.title}`}
+                          aria-label={`${item.group.collapsed ? '展开' : '折叠'} ${item.group.title}`}
+                          onContextMenu={(event) => event.stopPropagation()}
+                          onClick={() => toggleTabGroupCollapsed(item.group.id)}
+                        >
+                          <span className="app-tab-group-toggle">
+                            {item.group.collapsed ? <RightOutlined /> : <DownOutlined />}
+                          </span>
+                          <span className="app-tab-group-title">{item.group.title}</span>
+                          <span className="app-tab-group-count">{item.tabCount}</span>
+                        </button>
+                      </Popover>
+                      {item.group.collapsed ? null : item.tabs.map((tab) => renderTabButton(tab))}
+                    </div>
+                  )
+                }
+                return renderTabButton(item.tab)
               })}
             </div>
             <Tooltip title="首页">
@@ -1532,6 +2297,7 @@ export default function App() {
               />
             </Tooltip>
           </div>
+          </Dropdown>
         </Header>
 
         <Content className="app-content">
@@ -1540,6 +2306,29 @@ export default function App() {
           </Suspense>
         </Content>
       </Layout>
+
+      <Modal
+        open={!!renamingTabGroupId}
+        title="重命名分组"
+        okText="保存"
+        cancelText="取消"
+        centered
+        destroyOnHidden
+        onOk={confirmRenameTabGroup}
+        okButtonProps={{ disabled: renamingTabGroupTitle.trim().length === 0 }}
+        onCancel={() => {
+          setRenamingTabGroupId(null)
+          setRenamingTabGroupTitle('')
+        }}
+      >
+        <Input
+          autoFocus
+          maxLength={80}
+          value={renamingTabGroupTitle}
+          onChange={(event) => setRenamingTabGroupTitle(event.target.value)}
+          onPressEnter={confirmRenameTabGroup}
+        />
+      </Modal>
 
       <Modal
         open={databaseUpgradeVisible}

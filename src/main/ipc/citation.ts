@@ -12,7 +12,9 @@ import {
   CITATION_PLACEHOLDER_LABELS,
   mapDocTypeToHistoryCitationFormat,
 } from '../../shared/history-citation'
+import { buildCitationFieldResolutionReport } from '../../shared/citation-field-resolver'
 import type {
+  CitationFieldResolutionReport,
   CitationStyle,
   CitationGenerateOptions,
   CitationStyleDraft,
@@ -31,6 +33,11 @@ import type {
 type CitationMetadata = Record<string, unknown>
 type CitationDocumentRow = Pick<Document, 'title' | 'author' | 'dynasty' | 'source' | 'metadata'>
 type CitationPageFieldKey = 'pages' | 'page_reference' | 'cite_pages'
+
+export interface CitationWithDiagnostics {
+  citation: string | null
+  fieldReport: CitationFieldResolutionReport | null
+}
 
 const CITATION_PAGE_FIELD_KEYS: CitationPageFieldKey[] = ['pages', 'page_reference', 'cite_pages']
 
@@ -558,23 +565,28 @@ async function inferCitationTemplateFromSample(
   }
 }
 
-export function buildCitation(docId: string, templateId: string, options?: CitationGenerateOptions): string | null {
+export function buildCitationWithDiagnostics(docId: string, templateId: string, options?: CitationGenerateOptions): CitationWithDiagnostics {
   ensureCitationSchema()
   const doc = queryOne<CitationDocumentRow>('SELECT title, author, dynasty, source, metadata FROM documents WHERE id = ?', [docId])
-  if (!doc) return null
+  if (!doc) return { citation: null, fieldReport: null }
 
   const template = queryOne<CitationTemplate>('SELECT * FROM citation_templates WHERE id = ?', [templateId])
-  if (!template) return null
+  if (!template) return { citation: null, fieldReport: null }
 
   const metadata = parseMetadata(doc.metadata)
 
   const fields = createCitationFields(doc, metadata, options)
 
   let result = normalizeTemplateText(template.template_text as string)
+  const fieldReport = buildCitationFieldResolutionReport(fields, result)
   for (const [key, value] of Object.entries(fields)) {
     result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value)
   }
-  return cleanupCitationOutput(result)
+  return { citation: cleanupCitationOutput(result), fieldReport }
+}
+
+export function buildCitation(docId: string, templateId: string, options?: CitationGenerateOptions): string | null {
+  return buildCitationWithDiagnostics(docId, templateId, options).citation
 }
 
 export function mapDocTypeToCitationFormat(docType: string): string {

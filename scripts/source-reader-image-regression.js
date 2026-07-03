@@ -61,6 +61,9 @@ assertIncludes(ocrMain, 'function getLayoutBlockImagePath', 'OCR post-processing
 assertIncludes(ocrMain, 'function isRenderableOcrImagePath', 'OCR post-processing should distinguish resolved image assets from unresolved relative OCR paths')
 assertIncludes(ocrMain, 'const overlappingImageBox = regionBoxes.find((box) => (', 'OCR post-processing should match markdown images to existing layout image blocks')
 assertIncludes(ocrMain, 'overlappingImageBox.image_asset_path = imagePath', 'OCR post-processing should enrich overlapping image layout blocks with resolved markdown image URLs')
+assertIncludes(ocrIpc, 'function hasGujiMarkdownImageContent', 'Guji OCR storage cleanup should detect OCR-returned markdown image refs')
+assertIncludes(ocrIpc, 'return hasGujiMarkdownImageContent(result.markdown)', 'Guji OCR storage cleanup should preserve image-bearing markdown instead of replacing it with plain text')
+assertIncludes(ocrIpc, 'return !hasGujiImageBlockEvidence(item)', 'Guji OCR placeholder cleanup should keep OCR-returned image blocks that carry coordinates or assets')
 
 assertIncludes(documentView, "if (engine === 'vision_model') return '大模型 OCR'", 'document view should label vision-model OCR consistently as large-model OCR')
 assertIncludes(documentView, 'const messageKey = `page-image-${page.id}`', 'current-page image cache repair should use a stable message key')

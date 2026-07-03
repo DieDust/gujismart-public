@@ -23,7 +23,7 @@ buildSync({
   platform: 'node',
   format: 'cjs',
   outfile: bundlePath,
-  external: ['better-sqlite3'],
+  external: ['better-sqlite3', '@napi-rs/canvas'],
   alias: {
     electron: join(__dirname, 'stubs', 'electron.js'),
     '@electron-toolkit/utils': join(__dirname, 'stubs', 'electron-toolkit-utils.js'),
@@ -91,6 +91,33 @@ function insertAiOnlyTag(database, docId) {
   )
 }
 
+function insertStaleDocTypeTags(database, docId) {
+  const now = new Date().toISOString()
+  database.run(
+    'INSERT INTO tags (id, name, color, parent_id, source, confidence, usage_count, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ['tag_manual_stale_type', 'Legacy Manual Type', '#1890ff', null, 'manual', null, 1, 'legacy manual type', now, now],
+  )
+  database.run(
+    'INSERT INTO document_tags (doc_id, tag_id, is_manual, is_metadata, source_field, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [docId, 'tag_manual_stale_type', 1, 1, '_doc_type', 0.85, now, now],
+  )
+  database.run(
+    'INSERT INTO tags (id, name, color, parent_id, source, confidence, usage_count, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ['tag_auto_stale_type', 'Legacy Auto Type', '#1890ff', null, '_doc_type', 0.85, 1, 'legacy auto type', now, now],
+  )
+  database.run(
+    'INSERT INTO document_tags (doc_id, tag_id, is_manual, is_metadata, source_field, confidence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [docId, 'tag_auto_stale_type', 0, 1, '_doc_type', 0.85, now, now],
+  )
+}
+
+function getTagRelation(database, docId, tagId) {
+  return database.queryOne(
+    'SELECT is_manual, is_metadata, source_field FROM document_tags WHERE doc_id = ? AND tag_id = ?',
+    [docId, tagId],
+  )
+}
+
 async function run() {
   let database
   try {
@@ -109,6 +136,19 @@ async function run() {
     })
     const initialRelations = getMetadataRelationCount(database, 'doc_metadata_tags')
     assert.ok(initialRelations >= 5, `Expected initial metadata relations, got ${initialRelations}`)
+
+    insertStaleDocTypeTags(database, 'doc_metadata_tags')
+    metadataTags.syncDocumentMetadataTags('doc_metadata_tags', metadata, 'book', {
+      author: metadata.author,
+      dynasty: metadata.dynasty,
+      source: null,
+    })
+    const protectedManualType = getTagRelation(database, 'doc_metadata_tags', 'tag_manual_stale_type')
+    assert.ok(protectedManualType, 'Manual stale doc-type tag relation should be preserved')
+    assert.strictEqual(Number(protectedManualType.is_manual), 1)
+    assert.strictEqual(Number(protectedManualType.is_metadata), 0)
+    assert.strictEqual(protectedManualType.source_field, null)
+    assert.strictEqual(getTagRelation(database, 'doc_metadata_tags', 'tag_auto_stale_type') == null, true)
 
     database.run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['metadata_tag_binding_enabled', 'false'])
     const cleanup = metadataTags.ensureDisabledMetadataTagBindingsCleared()

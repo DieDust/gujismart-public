@@ -1,5 +1,31 @@
 # 更新日志 / Changelog
 
+## 1.0.9 - 2026-07-03
+
+### 中文
+
+#### 修复
+
+- 修复古籍 OCR 重新识别后，PaddleOCR 已返回的插图/图片块在保存阶段被当成纯文本占位内容清理，导致版式还原和阅读模式看不到图片的问题。
+- 修复古籍 OCR 文本清理时把带 `<img>` 的 markdown 结果重建为纯文本的问题，保留 OCR 返回的图片引用、坐标和后续本地图片资产生成链路。
+
+#### 下载
+
+- `GujiSmart-1.0.9-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.0.9-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Fixes
+
+- Fixed a Guji OCR re-recognition issue where PaddleOCR-returned illustration/image blocks were treated as plain placeholder text during persistence, so layout restoration and reading mode no longer showed images.
+- Fixed Guji OCR text cleanup replacing image-bearing markdown with plain text, preserving OCR-returned image references, coordinates, and the downstream local image asset path.
+
+#### Downloads
+
+- `GujiSmart-1.0.9-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.0.9-Portable-x64.exe` for portable use.
+
 ## 1.0.8 - 2026-06-30
 
 ### 中文

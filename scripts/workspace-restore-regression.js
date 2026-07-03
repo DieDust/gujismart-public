@@ -45,6 +45,9 @@ async function main() {
   const saved = saveAppWorkspace(storage, {
     activeTabId: 'doc:example:1',
     siderCollapsed: true,
+    tabGroups: [
+      { id: 'group-reading', title: '阅读组', color: '#7cb7ff', collapsed: true },
+    ],
     tabs: [
       { id: 'home', kind: 'home', title: '首页' },
       {
@@ -53,6 +56,7 @@ async function main() {
         view: 'folders',
         title: '资料夹甲',
         singleton: false,
+        groupId: 'group-reading',
         foldersState: {
           selectedFolderId: 'folder-1',
           selectedFolderName: '资料夹甲',
@@ -62,6 +66,7 @@ async function main() {
       {
         id: 'doc:example:1',
         kind: 'document',
+        groupId: 'group-reading',
         title: '示例文献',
         document: {
           docId: 'doc-1',
@@ -92,6 +97,9 @@ async function main() {
     'home',
     'view:folders:1',
     'doc:example:1',
+  ])
+  assert.deepStrictEqual(restored.tabGroups, [
+    { id: 'group-reading', title: '阅读组', color: '#7cb7ff', collapsed: true },
   ])
   assert.strictEqual(restored.activeTabId, 'doc:example:1')
   assert.strictEqual(restored.siderCollapsed, true)

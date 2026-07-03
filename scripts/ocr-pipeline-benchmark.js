@@ -26,7 +26,7 @@ try {
     assert.ok(!fixture.result.gujismart_ir, `${fixture.name}: fixture must exercise lazy conversion`)
     const envelope = ocrIr.getOrBuildOcrPageIr(fixture.result, fixture.options)
     assert.ok(envelope, `${fixture.name}: expected lazy IR`)
-    assert.strictEqual(envelope.pipelineVersion, '1.2.0', `${fixture.name}: pipeline version`)
+    assert.strictEqual(envelope.pipelineVersion, ocrIr.OCR_IR_PIPELINE_VERSION, `${fixture.name}: pipeline version`)
     const readingBlocks = ocrIr.deriveOcrReadingBlocksFromIr(envelope)
     const text = ocrIr.deriveOcrTextFromIr(envelope)
     const firstTextBlock = envelope.page.blocks.find((block) => block.text)

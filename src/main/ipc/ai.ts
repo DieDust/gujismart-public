@@ -22,6 +22,7 @@ import { answerEvidenceStream, askDocumentWithEvidence, askWithEvidence, buildEv
 import { getActiveTranslationGlossary } from '../glossary-service'
 import { previewLibraryAiScope } from '../semantic-search'
 import { getErrorMessage } from '../../shared/errors'
+import { buildAiResponseEnvelope } from '../../shared/ai-response-envelope'
 import type {
   AiChatMode,
   AiChatSession,
@@ -80,6 +81,59 @@ function parseJsonObject(value: string | null | undefined): JsonRecord {
   }
 }
 
+function getActiveAiProviderContext(): { provider: string; model: string } {
+  return {
+    provider: String(queryOne<{ value?: string | null }>("SELECT value FROM settings WHERE key = 'llm_provider'")?.value || 'AI').trim() || 'AI',
+    model: String(queryOne<{ value?: string | null }>("SELECT value FROM settings WHERE key = 'llm_model'")?.value || 'deepseek-chat').trim() || 'deepseek-chat',
+  }
+}
+
+function makeAiResponseEnvelope(payload: {
+  taskType: string
+  prompt: string
+  resultText: unknown
+  sources?: EvidenceQaSource[] | null
+  warnings?: unknown[] | null
+  startedAt: string
+  startedMs: number
+  hashParts?: Array<string | undefined>
+}) {
+  const context = getActiveAiProviderContext()
+  return buildAiResponseEnvelope({
+    taskType: payload.taskType,
+    promptHash: hashPrompt(payload.taskType, payload.prompt, ...(payload.hashParts || [])),
+    resultText: payload.resultText,
+    sources: payload.sources || [],
+    warnings: payload.warnings || [],
+    startedAt: payload.startedAt,
+    elapsedMs: Date.now() - payload.startedMs,
+    ...context,
+  })
+}
+
+function withAiResponseEnvelope<T extends EvidenceQaResponse>(payload: {
+  response: T
+  taskType: string
+  prompt: string
+  startedAt: string
+  startedMs: number
+  hashParts?: Array<string | undefined>
+}): T {
+  return {
+    ...payload.response,
+    aiResponseEnvelope: makeAiResponseEnvelope({
+      taskType: payload.taskType,
+      prompt: payload.prompt,
+      resultText: payload.response.answer,
+      sources: payload.response.sources,
+      warnings: payload.response.warnings,
+      startedAt: payload.startedAt,
+      startedMs: payload.startedMs,
+      hashParts: payload.hashParts,
+    }),
+  }
+}
+
 function requireQueryResult<T>(row: T | null, message: string): T {
   if (!row) throw new Error(message)
   return row
@@ -128,6 +182,7 @@ function rowToChatTurn(row: JsonRecord | null): AiChatTurn {
   const metadataJson = getStringField(row, 'metadata_json')
   const metadata = parseJsonObject(metadataJson)
   const plan = metadata.plan
+  const aiResponseEnvelope = metadata.aiResponseEnvelope
   return {
     id: getStringField(row, 'id'),
     session_id: getStringField(row, 'session_id'),
@@ -141,6 +196,7 @@ function rowToChatTurn(row: JsonRecord | null): AiChatTurn {
     expandedQueries: getArrayField<string>(metadata, 'expandedQueries'),
     evidenceClusters: getArrayField<EvidenceQaCluster>(metadata, 'evidenceClusters'),
     warnings: getArrayField<string>(metadata, 'warnings'),
+    aiResponseEnvelope: isRecord(aiResponseEnvelope) ? aiResponseEnvelope as unknown as AiChatTurn['aiResponseEnvelope'] : undefined,
   }
 }
 
@@ -206,6 +262,7 @@ function appendChatTurn(sessionId: string, prompt: string, response: EvidenceQaR
     expandedQueries: response.expandedQueries || [],
     evidenceClusters: response.evidenceClusters || [],
     warnings: response.warnings || [],
+    aiResponseEnvelope: response.aiResponseEnvelope || null,
   }
   run(
     'INSERT INTO ai_chat_turns (id, session_id, prompt, result, task_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -497,6 +554,8 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:askDocument', async (_event, docId: string, question: string, options?: AiQuestionOptions): Promise<AiQuestionResponse> => {
+    const startedMs = Date.now()
+    const startedAt = new Date(startedMs).toISOString()
     const session = ensureChatSession({
       sessionId: options?.sessionId,
       mode: 'document',
@@ -504,7 +563,14 @@ export function registerAiIpc(): void {
       title: options?.sessionTitle || '文献对话',
     })
     const contextualQuestion = withConversationContext(question, session.id)
-    const response = await askDocumentWithEvidence(docId, contextualQuestion, options)
+    const response = withAiResponseEnvelope({
+      response: await askDocumentWithEvidence(docId, contextualQuestion, options),
+      taskType: 'document_qa',
+      prompt: question,
+      startedAt,
+      startedMs,
+      hashParts: [docId, contextualQuestion, JSON.stringify(options || {})],
+    })
     const turn = appendChatTurn(session.id, question, response, 'document_qa')
     return { ...response, session, turn }
   })
@@ -517,6 +583,8 @@ export function registerAiIpc(): void {
     options?: AiQuestionOptions,
   ): Promise<AiStreamStartResult> => {
     try {
+      const startedMs = Date.now()
+      const startedAt = new Date(startedMs).toISOString()
       const session = ensureChatSession({
         sessionId: options?.sessionId,
         mode: 'document',
@@ -557,9 +625,17 @@ export function registerAiIpc(): void {
         evidenceClusters: evidence.clusters,
         warnings: evidence.warnings,
       }
+      const responseWithEnvelope = withAiResponseEnvelope({
+        response,
+        taskType: 'document_qa',
+        prompt: question,
+        startedAt,
+        startedMs,
+        hashParts: [docId, contextualQuestion, JSON.stringify(options || {})],
+      })
       emitAiStream(event, requestId, 'phase', '保存历史中')
-      const turn = appendChatTurn(session.id, question, response, 'document_qa')
-      emitAiStream(event, requestId, 'done', { ...response, session, turn })
+      const turn = appendChatTurn(session.id, question, responseWithEnvelope, 'document_qa')
+      emitAiStream(event, requestId, 'done', { ...responseWithEnvelope, session, turn })
       return { requestId, sessionId: session.id }
     } catch (error) {
       const message = getErrorMessage(error, '文献 AI 问答失败')
@@ -570,6 +646,8 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:libraryAsk', async (_event, question: string, scope: LibraryAiScope, options?: AiQuestionOptions): Promise<AiQuestionResponse> => {
+    const startedMs = Date.now()
+    const startedAt = new Date(startedMs).toISOString()
     const session = ensureChatSession({
       sessionId: options?.sessionId,
       mode: 'library',
@@ -577,7 +655,14 @@ export function registerAiIpc(): void {
       scope,
     })
     const contextualQuestion = withConversationContext(question, session.id)
-    const response = await askWithEvidence(contextualQuestion, scope, options)
+    const response = withAiResponseEnvelope({
+      response: await askWithEvidence(contextualQuestion, scope, options),
+      taskType: 'library_qa',
+      prompt: question,
+      startedAt,
+      startedMs,
+      hashParts: [contextualQuestion, JSON.stringify(scope || {}), JSON.stringify(options || {})],
+    })
     const turn = appendChatTurn(session.id, question, response, 'library_qa')
     return { ...response, session, turn }
   })
@@ -590,6 +675,8 @@ export function registerAiIpc(): void {
     options?: AiQuestionOptions,
   ): Promise<AiStreamStartResult> => {
     try {
+      const startedMs = Date.now()
+      const startedAt = new Date(startedMs).toISOString()
       const session = ensureChatSession({
         sessionId: options?.sessionId,
         mode: 'library',
@@ -631,8 +718,16 @@ export function registerAiIpc(): void {
         warnings: evidence.warnings,
       }
       emitAiStream(event, requestId, 'phase', '保存历史中')
-      const turn = appendChatTurn(session.id, question, response, 'library_qa')
-      emitAiStream(event, requestId, 'done', { ...response, session, turn })
+      const responseWithEnvelope = withAiResponseEnvelope({
+        response,
+        taskType: 'library_qa',
+        prompt: question,
+        startedAt,
+        startedMs,
+        hashParts: [contextualQuestion, JSON.stringify(scope || {}), JSON.stringify(options || {})],
+      })
+      const turn = appendChatTurn(session.id, question, responseWithEnvelope, 'library_qa')
+      emitAiStream(event, requestId, 'done', { ...responseWithEnvelope, session, turn })
       return { requestId, sessionId: session.id }
     } catch (error) {
       const message = getErrorMessage(error, '全库 AI 问答失败')
@@ -643,6 +738,8 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:summarizeSelection', async (_event, payload?: AiSummaryPayload): Promise<AiSummaryResult> => {
+    const startedMs = Date.now()
+    const startedAt = new Date(startedMs).toISOString()
     const text = String(payload?.text || '').trim()
     if (!text) throw new Error('请先选择或提供需要摘要的文本')
     const scope = (payload?.scope || 'selection') as SummaryScope
@@ -658,13 +755,46 @@ export function registerAiIpc(): void {
           matched_query: '摘要选区',
         }]
       : []
-    return { markdown, sources, scope }
+    return {
+      markdown,
+      sources,
+      scope,
+      aiResponseEnvelope: makeAiResponseEnvelope({
+        taskType: 'summary',
+        prompt: JSON.stringify({
+          scope,
+          title: payload?.title || '',
+          instruction: payload?.instruction || '',
+          format: payload?.format || '',
+          text: text.slice(0, 6000),
+        }),
+        resultText: markdown,
+        sources,
+        warnings: [],
+        startedAt,
+        startedMs,
+      }),
+    }
   })
 
   ipcMain.handle('ai:synthesize', async (_event, docIds: string[], templateType: AiSynthesisTemplate, customPrompt?: string): Promise<AiSynthesisResult> => {
+    const startedMs = Date.now()
+    const startedAt = new Date(startedMs).toISOString()
     const uniqueDocIds = [...new Set((docIds || []).filter(Boolean))]
     if (uniqueDocIds.length > 0) {
-      return synthesizeDocumentIdsWithSources(uniqueDocIds, templateType, customPrompt)
+      const result = await synthesizeDocumentIdsWithSources(uniqueDocIds, templateType, customPrompt)
+      return {
+        ...result,
+        aiResponseEnvelope: makeAiResponseEnvelope({
+          taskType: 'synthesis',
+          prompt: JSON.stringify({ docIds: uniqueDocIds, templateType, customPrompt: customPrompt || '' }),
+          resultText: result.markdown,
+          sources: result.sources,
+          warnings: [],
+          startedAt,
+          startedMs,
+        }),
+      }
     }
 
     const texts: Array<{ title: string; text: string }> = []
@@ -686,6 +816,19 @@ export function registerAiIpc(): void {
       throw new Error('选中的文献中没有可用的 OCR 文本，请先完成 OCR 识别')
     }
 
-    return { markdown: await synthesizeDocuments(texts, templateType, customPrompt), sources: [] }
+    const markdown = await synthesizeDocuments(texts, templateType, customPrompt)
+    return {
+      markdown,
+      sources: [],
+      aiResponseEnvelope: makeAiResponseEnvelope({
+        taskType: 'synthesis',
+        prompt: JSON.stringify({ docIds: docIds || [], templateType, customPrompt: customPrompt || '' }),
+        resultText: markdown,
+        sources: [],
+        warnings: [],
+        startedAt,
+        startedMs,
+      }),
+    }
   })
 }

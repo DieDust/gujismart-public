@@ -45,6 +45,11 @@ import {
 import { assertAllowedLocalFilePath } from '../file-access'
 import { getResponseErrorMessage, isAbortError } from '../../shared/errors'
 import {
+  validateLlmProfileConfig,
+  validateTypesetEnvironmentConfig,
+  validateVisionOcrProfileConfig,
+} from '../../shared/config-validation'
+import {
   ensureDisabledMetadataTagBindingsCleared,
   ensureEnabledMetadataTagBindingsRebuilt,
   METADATA_TAG_BINDING_SETTING_KEY,
@@ -542,6 +547,26 @@ function getExportExtension(format: DocumentExportFormat): string {
   return DOCUMENT_EXPORT_EXTENSIONS[format] || format
 }
 
+function getLlmProfileValidation(profile: LlmProviderProfile) {
+  return validateLlmProfileConfig({
+    provider: profile.provider || profile.name,
+    name: profile.name,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+  })
+}
+
+function getVisionOcrProfileValidation(profile: LlmProviderProfile) {
+  return validateVisionOcrProfileConfig({
+    provider: profile.provider || profile.name,
+    name: profile.name,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+  })
+}
+
 function ensureUniqueExportPath(dirPath: string, fileName: string, usedPaths: Set<string>): string {
   const ext = extname(fileName)
   const base = ext ? fileName.slice(0, -ext.length) : fileName
@@ -604,6 +629,7 @@ export function registerSettingsIpc(): void {
       activeId: current.id,
       current,
       profiles: getLlmProviderProfiles(),
+      configValidation: getLlmProfileValidation(current),
     }
   })
 
@@ -623,7 +649,12 @@ export function registerSettingsIpc(): void {
     setSettingValue('llm_active_provider_id', profile.id)
     setSettingValue('llm_provider', profile.provider)
     saveDatabase()
-    return { activeId: profile.id, current: profile, profiles: getLlmProviderProfiles() }
+    return {
+      activeId: profile.id,
+      current: profile,
+      profiles: getLlmProviderProfiles(),
+      configValidation: getLlmProfileValidation(profile),
+    }
   })
 
   ipcMain.handle('settings:llmProfiles:upsert', async (_event, profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
@@ -639,13 +670,18 @@ export function registerSettingsIpc(): void {
       model,
       updatedAt: new Date().toISOString(),
     }
-    if (!next.id || !next.name || !next.baseUrl || !next.model) {
+    const configValidation = getLlmProfileValidation(next)
+    if (!next.id || configValidation.error_count > 0) {
       throw new Error('AI 服务商配置不完整')
     }
     const profiles = getLlmProviderProfiles().filter((item) => item.id !== next.id)
     saveLlmProviderProfiles([next, ...profiles])
     saveDatabase()
-    return { activeId: getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider') || next.id, profiles: getLlmProviderProfiles() }
+    return {
+      activeId: getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider') || next.id,
+      profiles: getLlmProviderProfiles(),
+      configValidation,
+    }
   })
 
   ipcMain.handle('settings:llmProfiles:switch', async (_event, profileId: string): Promise<LlmProviderProfileState> => {
@@ -659,7 +695,7 @@ export function registerSettingsIpc(): void {
     setSettingValue('llm_api_key', profile.apiKey)
     setSettingValue('llm_model', profile.model)
     saveDatabase()
-    return { activeId: profile.id, current: profile, profiles }
+    return { activeId: profile.id, current: profile, profiles, configValidation: getLlmProfileValidation(profile) }
   })
 
   ipcMain.handle('settings:llmProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
@@ -668,7 +704,7 @@ export function registerSettingsIpc(): void {
     if (id && id === activeId) throw new Error('不能删除当前正在使用的 AI 服务商')
     saveLlmProviderProfiles(getLlmProviderProfiles().filter((item) => item.id !== id))
     saveDatabase()
-    return { activeId, profiles: getLlmProviderProfiles() }
+    return { activeId, profiles: getLlmProviderProfiles(), configValidation: getLlmProfileValidation(getCurrentLlmProfile()) }
   })
 
   ipcMain.handle('settings:visionOcrProfiles:list', async (): Promise<LlmProviderProfileState> => {
@@ -677,6 +713,7 @@ export function registerSettingsIpc(): void {
       activeId: current.id,
       current,
       profiles: getVisionOcrProviderProfiles(),
+      configValidation: getVisionOcrProfileValidation(current),
     }
   })
 
@@ -693,13 +730,18 @@ export function registerSettingsIpc(): void {
       model,
       updatedAt: new Date().toISOString(),
     }
-    if (!next.id || !next.name || !next.baseUrl || !next.model) {
+    const configValidation = getVisionOcrProfileValidation(next)
+    if (!next.id || configValidation.error_count > 0) {
       throw new Error('视觉 OCR 服务商配置不完整')
     }
     const profiles = getVisionOcrProviderProfiles().filter((item) => item.id !== next.id)
     saveVisionOcrProviderProfiles([next, ...profiles])
     saveDatabase()
-    return { activeId: getSettingValue('vision_ocr_active_provider_id') || next.id, profiles: getVisionOcrProviderProfiles() }
+    return {
+      activeId: getSettingValue('vision_ocr_active_provider_id') || next.id,
+      profiles: getVisionOcrProviderProfiles(),
+      configValidation,
+    }
   })
 
   ipcMain.handle('settings:visionOcrProfiles:switch', async (_event, profileId: string): Promise<LlmProviderProfileState> => {
@@ -714,7 +756,7 @@ export function registerSettingsIpc(): void {
     setSettingValue('vision_ocr_api_key', profile.apiKey)
     setSettingValue('vision_ocr_model', profile.model)
     saveDatabase()
-    return { activeId: profile.id, current: profile, profiles }
+    return { activeId: profile.id, current: profile, profiles, configValidation: getVisionOcrProfileValidation(profile) }
   })
 
   ipcMain.handle('settings:visionOcrProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
@@ -723,7 +765,7 @@ export function registerSettingsIpc(): void {
     if (id && id === activeId) throw new Error('不能删除当前正在使用的视觉 OCR 服务商')
     saveVisionOcrProviderProfiles(getVisionOcrProviderProfiles().filter((item) => item.id !== id))
     saveDatabase()
-    return { activeId, profiles: getVisionOcrProviderProfiles() }
+    return { activeId, profiles: getVisionOcrProviderProfiles(), configValidation: getVisionOcrProfileValidation(getCurrentVisionOcrProfile()) }
   })
 }
 
@@ -814,7 +856,15 @@ export function registerExportIpc(): void {
 export function registerTypesetIpc(): void {
   ipcMain.handle('typeset:checkEnv', async (): Promise<TypesetEnvironmentStatus> => {
     const [luatex, luatexCn] = await Promise.all([checkLuaTeX(), checkLuatexCn()])
-    return { luatex, luatexCn }
+    return {
+      luatex,
+      luatexCn,
+      configValidation: validateTypesetEnvironmentConfig({
+        luatexAvailable: luatex.available,
+        luatexPath: luatex.path,
+        luatexCnInstalled: luatexCn.installed,
+      }),
+    }
   })
 
   ipcMain.handle('typeset:generateTeX', async (

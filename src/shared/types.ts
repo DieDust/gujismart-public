@@ -1,3 +1,10 @@
+import type { AiResponseEnvelope } from './ai-response-envelope'
+import type { BackupIntegrityReport } from './backup-integrity'
+import type { ConfigValidationReport } from './config-validation'
+import type { DocumentPipelineDiagnostics } from './document-pipeline-diagnostics'
+import type { OcrRunMetadata } from './ocr-run-metadata'
+import type { SearchIndexHealthDiagnostics } from './search-index-health'
+
 export type OcrStatus = 'pending' | 'queued' | 'processing' | 'completed' | 'error'
 export type ProofStatus = 'pending' | 'completed'
 export type ImportStatus = 'unstored' | 'stored' | 'processing' | 'processed' | 'error'
@@ -5,6 +12,18 @@ export type ReadStatus = 'unread' | 'reading' | 'read'
 export type MetadataStatus = 'pending' | 'review' | 'confirmed' | 'auto'
 export type DocumentMetadataResult = Record<string, unknown>
 export type AppPathName = 'userData' | 'home' | 'desktop'
+
+export interface StatusEnvelope {
+  status: string
+  phase?: string
+  progress?: number
+  error_code?: string
+  message?: string
+  recoverable: boolean
+  action_hint?: string
+  updated_at?: string
+}
+
 export interface AppUpdateAsset {
   name: string
   url: string
@@ -271,6 +290,7 @@ export interface TypesetPackageStatus {
 export interface TypesetEnvironmentStatus {
   luatex: TypesetLuaTeXStatus
   luatexCn: TypesetPackageStatus
+  configValidation?: ConfigValidationReport
 }
 
 export interface TypesetCompileResult {
@@ -310,6 +330,8 @@ export interface ImportProgressEvent {
   bytesDone?: number
   totalBytes?: number
   progress?: number
+  statusEnvelope?: StatusEnvelope
+  pipelineDiagnostics?: DocumentPipelineDiagnostics
 }
 
 export interface ResolvedImportSource {
@@ -582,6 +604,8 @@ export interface OcrProgressEvent {
   aiStatus?: 'processing' | 'completed' | 'error'
   errorMessage?: string
   canceled?: boolean
+  statusEnvelope?: StatusEnvelope
+  runMetadata?: OcrRunMetadata
 }
 
 export interface PageOcrVersion {
@@ -1486,6 +1510,7 @@ export interface AiResult {
   result: string
   model: string
   created_at: string
+  aiResponseEnvelope?: AiResponseEnvelope
 }
 
 export interface BatchQueueItem {
@@ -1605,11 +1630,13 @@ export interface LlmProviderProfileState {
   activeId: string
   current: LlmProviderProfile
   profiles: LlmProviderProfile[]
+  configValidation?: ConfigValidationReport
 }
 
 export interface LlmProviderProfilesResult {
   activeId: string
   profiles: LlmProviderProfile[]
+  configValidation?: ConfigValidationReport
 }
 
 export interface BackupResult {
@@ -1617,12 +1644,14 @@ export interface BackupResult {
   path?: string | null
   canceled?: boolean
   error?: string
+  integrityReport?: BackupIntegrityReport
 }
 
 export interface BackupImportResult extends BackupResult {
   importedBackupPath?: string | null
   safetyBackupPath?: string | null
   requiresRestart?: boolean
+  restoredIntegrityReport?: BackupIntegrityReport
 }
 
 export interface BackupSlot {
@@ -1632,6 +1661,7 @@ export interface BackupSlot {
   timestamp?: string
   sizeBytes?: number
   includesStorage?: boolean
+  integrityReport?: BackupIntegrityReport
 }
 
 export interface BackupStatus {
@@ -1644,6 +1674,7 @@ export interface BackupStatus {
   nextBackupAt: string | null
   autoBackupRoot: string
   slots: BackupSlot[]
+  configValidation?: ConfigValidationReport
 }
 
 export interface CompactAutoBackupResult {
@@ -1853,8 +1884,11 @@ export interface ResearchOutput {
   output_type: AiSynthesisTemplate
   title: string
   content: string
+  source_dataset_id?: string | null
+  input_snapshot_json?: string
   created_at: string
   sourceDatasetId?: string | null
+  inputSnapshotJson?: string
 }
 
 export interface ResearchOutputPayload {
@@ -1863,6 +1897,8 @@ export interface ResearchOutputPayload {
   title: string
   content: string
   source_dataset_id?: string | null
+  input_snapshot_json?: string
+  inputSnapshotJson?: string
 }
 
 export interface ResearchDashboardStats {
@@ -1889,6 +1925,67 @@ export interface ResearchProjectExportResult {
   outlineCount: number
   referenceCount: number
 }
+
+export type {
+  AiResponseEnvelope,
+  AiResponseEnvelopeStatus,
+  AiResponseSourceSummary,
+} from './ai-response-envelope'
+
+export type {
+  BackupIntegrityIssue,
+  BackupIntegrityMetrics,
+  BackupIntegrityReport,
+  BackupIntegritySeverity,
+  BackupIntegrityStatus,
+} from './backup-integrity'
+
+export type {
+  CitationFieldIssue,
+  CitationFieldIssueSeverity,
+  CitationFieldResolutionReport,
+} from './citation-field-resolver'
+
+export type {
+  ConfigValidationIssue,
+  ConfigValidationReport,
+  ConfigValidationSeverity,
+  ConfigValidationStatus,
+} from './config-validation'
+
+export type {
+  DocumentPipelineDiagnosticIssue,
+  DocumentPipelineDiagnosticSeverity,
+  DocumentPipelineDiagnostics,
+  DocumentPipelineStage,
+  DocumentPipelineStatus,
+  DocumentPipelineStatusSnapshot,
+} from './document-pipeline-diagnostics'
+
+export type {
+  OcrRunMetadata,
+  OcrRunPageSummary,
+  OcrRunQualityStatus,
+  OcrRunQualitySummary,
+} from './ocr-run-metadata'
+
+export type {
+  ResearchProjectIntegrityIssue,
+  ResearchProjectIntegrityReport,
+} from './research-integrity'
+
+export type {
+  MetadataTagCleanupAction,
+  MetadataTagCleanupDecision,
+  MetadataTagRelationGuardInput,
+} from './metadata-tag-guard'
+
+export type {
+  SearchIndexHealthDiagnostics,
+  SearchIndexHealthIssue,
+  SearchIndexHealthSeverity,
+  SearchIndexHealthStatus,
+} from './search-index-health'
 
 export interface SearchResult {
   doc_id: string
@@ -1994,6 +2091,7 @@ export interface EvidenceQaResponse {
   expandedQueries: string[]
   evidenceClusters: EvidenceQaCluster[]
   warnings: string[]
+  aiResponseEnvelope?: AiResponseEnvelope
 }
 
 export type AiStreamEventType = 'phase' | 'delta' | 'sources' | 'done' | 'error'
@@ -2010,11 +2108,13 @@ export interface AiSummaryResult {
   markdown: string
   sources: EvidenceQaSource[]
   scope: SummaryScope
+  aiResponseEnvelope?: AiResponseEnvelope
 }
 
 export interface AiSynthesisResult {
   markdown: string
   sources: EvidenceQaSource[]
+  aiResponseEnvelope?: AiResponseEnvelope
 }
 
 export type LibraryAiScope =
@@ -2074,6 +2174,7 @@ export interface AiChatTurn {
   expandedQueries?: string[]
   evidenceClusters?: EvidenceQaCluster[]
   warnings?: string[]
+  aiResponseEnvelope?: AiResponseEnvelope
   researchTaskId?: string
   datasetId?: string
 }
@@ -2257,6 +2358,7 @@ export interface AiResearchRunProgressEvent {
   pageCount?: number
   evidenceCount?: number
   progress: number
+  statusEnvelope?: StatusEnvelope
 }
 
 export interface AiResearchTaskStep {
@@ -2500,6 +2602,8 @@ export interface SearchIndexStatus {
   error_message: string | null
   indexed_at: string | null
   updated_at: string | null
+  statusEnvelope?: StatusEnvelope
+  healthDiagnostics?: SearchIndexHealthDiagnostics
 }
 
 export interface SearchOptions {

@@ -42,6 +42,7 @@ import type {
   SearchResult,
   SearchSessionState,
 } from '../../shared/types'
+import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
 import { buildCitation, buildCitationByStyle, mapDocTypeToCitationFormat } from './citation'
 
 interface SearchIndexSegmentRow {
@@ -1005,7 +1006,11 @@ function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExcerptsO
   let skippedCount = 0
 
   for (const record of records) {
-    const paragraphHash = stableHash(`${record.locator.docId}:${record.pageNum || ''}:${record.paragraph}`)
+    const paragraphHash = stableHash(buildSearchExcerptSourceHashInput({
+      docId: record.locator.docId,
+      pageNum: record.pageNum || '',
+      excerpt: record.paragraph,
+    }))
     const sourceId = JSON.stringify({
       sourceType: 'search',
       locator: record.locator,

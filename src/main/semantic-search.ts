@@ -3,6 +3,8 @@ import { nanoid } from 'nanoid'
 import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
 import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
+import { buildSearchIndexHealthDiagnostics } from '../shared/search-index-health'
+import { statusEnvelopeFromSearchIndexStatus } from '../shared/status-envelope'
 import { getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import { normalizeChineseSearchText, normalizeWhitespace } from './text-normalization'
 import { getErrorMessage } from '../shared/errors'
@@ -1815,8 +1817,14 @@ export function queueAllDocumentsReindex(): SearchReindexAllResult {
 }
 
 export function getSearchIndexStatus(docId?: string): SearchIndexStatus[] {
-  if (docId) return queryAll<SearchIndexStatus>('SELECT * FROM search_index_status WHERE doc_id = ?', [docId])
-  return queryAll<SearchIndexStatus>('SELECT * FROM search_index_status ORDER BY updated_at DESC LIMIT 200')
+  const rows = docId
+    ? queryAll<SearchIndexStatus>('SELECT * FROM search_index_status WHERE doc_id = ?', [docId])
+    : queryAll<SearchIndexStatus>('SELECT * FROM search_index_status ORDER BY updated_at DESC LIMIT 200')
+  return rows.map((row) => ({
+    ...row,
+    statusEnvelope: statusEnvelopeFromSearchIndexStatus(row),
+    healthDiagnostics: buildSearchIndexHealthDiagnostics(row),
+  }))
 }
 
 function ensureDocumentIndexed(docId: string): void {

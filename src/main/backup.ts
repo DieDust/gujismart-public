@@ -7,7 +7,9 @@ import { ZipArchive } from 'archiver'
 import extract from 'extract-zip'
 import Database from 'better-sqlite3'
 import { closeDatabase, getDataDir, queryAll, run, saveDatabase } from './database'
-import type { BackupImportResult, BackupResult, BackupSlot, BackupStatus, CompactAutoBackupResult } from '../shared/types'
+import type { BackupImportResult, BackupIntegrityReport, BackupResult, BackupSlot, BackupStatus, CompactAutoBackupResult } from '../shared/types'
+import { buildBackupIntegrityReport, compareBackupIntegrityReports } from '../shared/backup-integrity'
+import { validateBackupSettingsConfig } from '../shared/config-validation'
 
 let autoBackupTimer: ReturnType<typeof setInterval> | null = null
 let autoBackupRunning = false
@@ -28,6 +30,21 @@ interface DocumentListCsvRow {
   import_status: string | null
   created_at: string | null
   updated_at: string | null
+}
+
+interface FileTreeStats {
+  fileCount: number
+  totalBytes: number
+}
+
+interface BackupManifest {
+  version?: string
+  type?: 'manual' | 'auto'
+  slot?: number | null
+  includesStorage?: boolean
+  includesPagePayloads?: boolean
+  timestamp?: string
+  integrityReport?: BackupIntegrityReport
 }
 
 function normalizeAutoBackupSlotCount(value: unknown): number {
@@ -57,6 +74,24 @@ function getDirSize(dir: string): number {
     if (entry.isDirectory()) return sum + getDirSize(targetPath)
     return sum + statSync(targetPath).size
   }, 0)
+}
+
+function getFileTreeStats(dir: string): FileTreeStats {
+  if (!existsSync(dir)) return { fileCount: 0, totalBytes: 0 }
+  return readdirSync(dir, { withFileTypes: true }).reduce<FileTreeStats>((stats, entry) => {
+    const targetPath = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      const child = getFileTreeStats(targetPath)
+      return {
+        fileCount: stats.fileCount + child.fileCount,
+        totalBytes: stats.totalBytes + child.totalBytes,
+      }
+    }
+    return {
+      fileCount: stats.fileCount + 1,
+      totalBytes: stats.totalBytes + statSync(targetPath).size,
+    }
+  }, { fileCount: 0, totalBytes: 0 })
 }
 
 function readSetting(key: string, fallback: string): string {
@@ -140,6 +175,16 @@ function getStoragePagePayloadsDir(storageDir: string): string {
   return join(storageDir, 'page-payloads')
 }
 
+function readBackupManifest(backupDir: string): BackupManifest | null {
+  const manifestPath = join(backupDir, 'manifest.json')
+  if (!existsSync(manifestPath)) return null
+  try {
+    return JSON.parse(readFileSync(manifestPath, 'utf-8')) as BackupManifest
+  } catch {
+    return null
+  }
+}
+
 function hasBackupDatabase(backupDir: string): boolean {
   const dbDir = getBackupDbDir(backupDir)
   return existsSync(join(dbDir, 'gujismart.db')) || existsSync(join(dbDir, 'gujismart.json'))
@@ -211,7 +256,69 @@ function validateBackupPayloadCompleteness(backupDir: string): void {
   }
 }
 
-function validateBackupDirectory(backupDir: string): void {
+function countMissingBackupPayloadRefs(backupDir: string, refs: Set<string>): number {
+  if (refs.size === 0) return 0
+  const payloadRoot = getStoragePagePayloadsDir(getBackupStorageDir(backupDir))
+  let missing = 0
+  for (const ref of refs) {
+    const payloadPath = resolveBackupPayloadRefPath(payloadRoot, ref)
+    if (!payloadPath || !existsSync(payloadPath)) missing += 1
+  }
+  return missing
+}
+
+function collectBackupIntegrityReport(
+  backupDir: string,
+  options: { includesStorage?: boolean; generatedAt?: string } = {},
+): BackupIntegrityReport {
+  const manifest = readBackupManifest(backupDir)
+  const dbDir = getBackupDbDir(backupDir)
+  const storageDir = getBackupStorageDir(backupDir)
+  const payloadDir = getStoragePagePayloadsDir(storageDir)
+  const refs = collectBackupExternalPayloadRefs(backupDir)
+  const dbStats = getFileTreeStats(dbDir)
+  const storageStats = getFileTreeStats(storageDir)
+  const payloadStats = getFileTreeStats(payloadDir)
+  return buildBackupIntegrityReport({
+    db_present: hasBackupDatabase(backupDir),
+    storage_present: existsSync(storageDir),
+    includes_storage: options.includesStorage ?? manifest?.includesStorage ?? existsSync(storageDir),
+    includes_page_payloads: existsSync(payloadDir),
+    db_file_count: dbStats.fileCount,
+    db_total_bytes: dbStats.totalBytes,
+    storage_file_count: storageStats.fileCount,
+    storage_total_bytes: storageStats.totalBytes,
+    page_payload_file_count: payloadStats.fileCount,
+    page_payload_total_bytes: payloadStats.totalBytes,
+    page_payload_ref_count: refs.size,
+    missing_page_payload_ref_count: countMissingBackupPayloadRefs(backupDir, refs),
+  }, options.generatedAt)
+}
+
+function assertBackupIntegrityOk(report: BackupIntegrityReport, label: string): void {
+  if (report.error_count === 0) return
+  const codes = report.issues
+    .filter((issue) => issue.severity === 'error')
+    .map((issue) => issue.code)
+    .join(', ')
+  throw new Error(`${label}: ${codes || 'integrity_error'}`)
+}
+
+function validateBackupManifestIntegrity(backupDir: string): BackupIntegrityReport {
+  const manifest = readBackupManifest(backupDir)
+  const currentReport = collectBackupIntegrityReport(backupDir, {
+    includesStorage: manifest?.includesStorage,
+  })
+  assertBackupIntegrityOk(currentReport, 'Backup integrity check failed')
+  if (manifest?.integrityReport) {
+    const comparison = compareBackupIntegrityReports(manifest.integrityReport, currentReport)
+    assertBackupIntegrityOk(comparison, 'Backup manifest integrity check failed')
+    return comparison
+  }
+  return currentReport
+}
+
+function validateBackupDirectory(backupDir: string): BackupIntegrityReport {
   if (!existsSync(backupDir)) {
     throw new Error('备份目录不存在')
   }
@@ -226,6 +333,7 @@ function validateBackupDirectory(backupDir: string): void {
     throw new Error('这不是有效的备份目录：未找到 db/gujismart.db 或 db/gujismart.json')
   }
   validateBackupPayloadCompleteness(backupDir)
+  return validateBackupManifestIntegrity(backupDir)
 }
 
 function replaceManagedDirectory(dataDir: string, directoryName: 'db' | 'storage', sourceDir: string): void {
@@ -327,6 +435,7 @@ function writeManifest(backupDir: string, type: 'manual' | 'auto', slot?: number
     includesStorage,
     includesPagePayloads: existsSync(getStoragePagePayloadsDir(getBackupStorageDir(backupDir))),
     timestamp: new Date().toISOString(),
+    integrityReport: collectBackupIntegrityReport(backupDir, { includesStorage }),
   }
   writeFileSync(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
 }
@@ -404,7 +513,7 @@ export async function importBackupFromPath(inputPath: string): Promise<BackupImp
     const isArchive = statSync(selectedPath).isFile() || extname(selectedPath).toLowerCase() === BACKUP_ARCHIVE_EXTENSION
     extractedBackupDir = isArchive ? await extractBackupZip(selectedPath) : null
     const backupDir = extractedBackupDir || selectedPath
-    validateBackupDirectory(backupDir)
+    const integrityReport = validateBackupDirectory(backupDir)
 
     const dataDir = getDataDir()
     const safetyBackupPath = await createSafetyBackupBeforeImport(dataDir)
@@ -412,6 +521,8 @@ export async function importBackupFromPath(inputPath: string): Promise<BackupImp
     closeDatabase()
     replaceManagedDirectory(dataDir, 'db', getBackupDbDir(backupDir))
     replaceManagedDirectory(dataDir, 'storage', getBackupStorageDir(backupDir))
+    const restoredIntegrityReport = compareBackupIntegrityReports(integrityReport, collectBackupIntegrityReport(dataDir))
+    assertBackupIntegrityOk(restoredIntegrityReport, 'Restored backup integrity check failed')
 
     return {
       success: true,
@@ -419,6 +530,8 @@ export async function importBackupFromPath(inputPath: string): Promise<BackupImp
       importedBackupPath: selectedPath,
       safetyBackupPath,
       requiresRestart: true,
+      integrityReport,
+      restoredIntegrityReport,
     }
   } catch (error) {
     console.error('[Backup] 导入备份失败:', error)
@@ -452,7 +565,7 @@ export async function runAutoBackupNow(): Promise<BackupResult> {
     writeSetting('auto_backup_last_at', now)
     saveDatabase()
 
-    return { success: true, path: backupDir }
+    return { success: true, path: backupDir, integrityReport: collectBackupIntegrityReport(backupDir, { includesStorage: getAutoBackupIncludeStorage() }) }
   } catch (error) {
     console.error('[Backup] 自动备份失败:', error)
     return { success: false, error: (error as Error).message }
@@ -466,6 +579,7 @@ export function getBackupStatus(): BackupStatus {
   const intervalHours = Number.parseInt(readSetting('auto_backup_interval_hours', '24'), 10) || 24
   const slotCount = getAutoBackupSlotCount()
   const includeStorage = getAutoBackupIncludeStorage()
+  const autoBackupRoot = getAutoBackupRoot()
   cleanupExtraAutoBackupSlots(slotCount)
   const nextSlot = Math.max(1, Math.min(slotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
   const lastBackupAt = readSetting('auto_backup_last_at', '') || null
@@ -475,17 +589,14 @@ export function getBackupStatus(): BackupStatus {
   const slots: BackupSlot[] = Array.from({ length: slotCount }, (_, index) => {
     const slot = index + 1
     const path = getSlotPath(slot)
-    const manifestPath = join(path, 'manifest.json')
+    const manifest = readBackupManifest(path)
     let timestamp: string | undefined
     let includesStorage: boolean | undefined
-    if (existsSync(manifestPath)) {
-      try {
-        const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'))
-        timestamp = manifest.timestamp
-        includesStorage = manifest.includesStorage !== false
-      } catch {
-        timestamp = undefined
-      }
+    let integrityReport: BackupIntegrityReport | undefined
+    if (manifest) {
+      timestamp = manifest.timestamp
+      includesStorage = manifest.includesStorage !== false
+      integrityReport = manifest.integrityReport
     }
     return {
       slot,
@@ -494,6 +605,7 @@ export function getBackupStatus(): BackupStatus {
       timestamp,
       includesStorage: includesStorage ?? existsSync(getBackupStorageDir(path)),
       sizeBytes: existsSync(path) ? getDirSize(path) : 0,
+      integrityReport,
     }
   })
 
@@ -505,8 +617,14 @@ export function getBackupStatus(): BackupStatus {
     includeStorage,
     lastBackupAt,
     nextBackupAt,
-    autoBackupRoot: getAutoBackupRoot(),
+    autoBackupRoot,
     slots,
+    configValidation: validateBackupSettingsConfig({
+      enabled,
+      intervalHours,
+      slotCount,
+      autoBackupRoot,
+    }),
   }
 }
 

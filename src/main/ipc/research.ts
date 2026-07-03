@@ -24,6 +24,13 @@ import type {
   ResearchProjectUpdatePayload,
   ResearchReferenceExportFormat,
 } from '../../shared/types'
+import {
+  createResearchOutputInputSnapshot,
+  stringifyResearchOutputInputSnapshot,
+} from '../../shared/research-output-snapshot'
+import { buildResearchProjectIntegrityReport } from '../../shared/research-integrity'
+import { stringifyResearchLocator } from '../../shared/research-locator'
+import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
 
 type ResearchMetadata = Record<string, unknown>
 type ProjectRow = Pick<ResearchProject, 'id' | 'name' | 'description'>
@@ -64,6 +71,16 @@ function parseMetadata(raw: unknown): ResearchMetadata {
   }
 }
 
+function parseJsonRecord(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== 'string') return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return isRecord(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
 function requireQueryResult<T>(row: T | null, message: string): T {
   if (!row) throw new Error(message)
   return row
@@ -88,17 +105,50 @@ function stableHash(value: string): string {
   return createHash('sha1').update(value).digest('hex')
 }
 
-function stringifyLocator(data: ResearchNotePayload): string {
-  if (typeof data.locator_json === 'string' && data.locator_json.trim()) return data.locator_json.trim()
+function stableHashPrefix(value: string): string {
+  return createHash('sha1').update(value).digest('hex').slice(0, 16)
+}
+
+function previewText(value: unknown, limit = 180): string {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit)
+}
+
+function normalizeOutputInputSnapshotJson(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function stringifyLocator(data: ResearchNotePayload, defaults: { docId: string; pageNum: unknown; sourceType: string }): string {
+  const locatorDefaults = {
+    docId: defaults.docId,
+    pageNum: defaults.pageNum === null || defaults.pageNum === undefined ? null : String(defaults.pageNum),
+    sourceType: defaults.sourceType,
+  }
+  if (typeof data.locator_json === 'string' && data.locator_json.trim()) {
+    return stringifyResearchLocator(data.locator_json, locatorDefaults)
+  }
   if (data.locator !== undefined) {
-    try {
-      return JSON.stringify(data.locator)
-    } catch {
-      return ''
-    }
+    return stringifyResearchLocator(data.locator, locatorDefaults)
   }
   const legacy = data.source_id ?? data.sourceId
   return typeof legacy === 'string' ? legacy : ''
+}
+
+function getSearchExcerptSourceHash(data: ResearchNotePayload, docId: string, pageNum: unknown, excerpt: string): string {
+  const sourceType = String(data.source_type || data.sourceType || '').trim()
+  if (sourceType !== 'search') return ''
+
+  const rawSourceId = data.source_id ?? data.sourceId
+  if (typeof rawSourceId === 'string' && rawSourceId.trim()) {
+    const sourceMeta = parseJsonRecord(rawSourceId)
+    const paragraphHash = String(sourceMeta.paragraphHash || '').trim()
+    if (paragraphHash) return paragraphHash
+  }
+
+  return stableHashPrefix(buildSearchExcerptSourceHashInput({
+    docId,
+    pageNum: pageNum === null || pageNum === undefined ? '' : String(pageNum),
+    excerpt,
+  }))
 }
 
 function normalizeNotePayload(data: ResearchNotePayload) {
@@ -107,8 +157,10 @@ function normalizeNotePayload(data: ResearchNotePayload) {
   const outlineId = data.outline_id ?? data.outlineId ?? null
   const pageNum = data.page_num ?? data.pageNum ?? null
   const excerpt = String(data.excerpt || '').trim()
-  const locatorJson = stringifyLocator(data)
+  const sourceType = data.source_type || data.sourceType || 'manual'
+  const locatorJson = stringifyLocator(data, { docId, pageNum, sourceType })
   const sourceHash = String(data.source_hash || data.sourceHash || '').trim()
+    || getSearchExcerptSourceHash(data, docId, pageNum, excerpt)
     || stableHash([docId, pageNum || '', locatorJson || excerpt].join('|'))
   return {
     projectId: projectId ? String(projectId) : null,
@@ -117,7 +169,7 @@ function normalizeNotePayload(data: ResearchNotePayload) {
     excerpt,
     note: String(data.note || ''),
     tags: normalizeTags(data.tags),
-    sourceType: data.source_type || data.sourceType || 'manual',
+    sourceType,
     sourceId: data.source_id ?? data.sourceId ?? null,
     kind: normalizeKind(data.kind),
     outlineId: outlineId ? String(outlineId) : null,
@@ -313,6 +365,111 @@ function listNotes(projectId?: string | null): NoteRow[] {
      ORDER BY COALESCE(rn.sort_order, 0) ASC, rn.updated_at DESC`,
     params,
   )
+}
+
+function listProjectSnapshotDocuments(projectId: string) {
+  const docIds = getProjectDocIds(projectId)
+  if (docIds.length === 0) return []
+  const placeholders = docIds.map(() => '?').join(', ')
+  return queryAll<{ id: string; title?: string | null; author?: string | null; page_count?: number | null }>(
+    `SELECT id, title, author, page_count
+     FROM documents
+     WHERE id IN (${placeholders})
+     ORDER BY author, title`,
+    docIds,
+  ).map((doc) => ({
+    id: doc.id,
+    title: doc.title || '',
+    author: doc.author || null,
+    pageCount: doc.page_count == null ? null : Number(doc.page_count) || null,
+  }))
+}
+
+function listProjectSnapshotNotes(projectId: string) {
+  return listNotes(projectId).map((note) => ({
+    id: note.id,
+    docId: note.doc_id,
+    pageNum: note.page_num,
+    sourceType: note.source_type,
+    sourceHash: note.source_hash || '',
+    locatorJson: note.locator_json || '',
+    citationText: note.citation_text || '',
+    excerptHash: stableHashPrefix(note.excerpt || ''),
+    excerptPreview: previewText(note.excerpt),
+  }))
+}
+
+function getProjectIntegrityReport(projectId: string) {
+  const notes = listNotes(projectId)
+  const documentCount = Number(queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM research_project_documents WHERE project_id = ?',
+    [projectId],
+  )?.count || 0)
+  const missingDocumentCount = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(*) as count
+     FROM research_project_documents rpd
+     LEFT JOIN documents d ON d.id = rpd.doc_id
+     WHERE rpd.project_id = ? AND d.id IS NULL`,
+    [projectId],
+  )?.count || 0)
+  const outputCount = Number(queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM research_outputs WHERE project_id = ?',
+    [projectId],
+  )?.count || 0)
+  const aiDatasetCount = Number(queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM ai_research_datasets WHERE project_id = ?',
+    [projectId],
+  )?.count || 0)
+  const aiRecordCount = Number(queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM ai_research_records WHERE project_id = ?',
+    [projectId],
+  )?.count || 0)
+  const unconfirmedAiRecordCount = Number(queryOne<{ count: number }>(
+    "SELECT COUNT(*) as count FROM ai_research_records WHERE project_id = ? AND status NOT IN ('confirmed', 'excluded')",
+    [projectId],
+  )?.count || 0)
+  return buildResearchProjectIntegrityReport({
+    projectId,
+    documentCount,
+    missingDocumentCount,
+    outputCount,
+    aiDatasetCount,
+    aiRecordCount,
+    unconfirmedAiRecordCount,
+    notes: notes.map((note) => ({
+      id: note.id,
+      locatorJson: note.locator_json,
+      sourceHash: note.source_hash,
+      sourceAvailable: note.source_available,
+    })),
+  })
+}
+
+function buildResearchOutputSnapshotJson(options: {
+  source: 'research:synthesizeProject' | 'research:createOutput'
+  projectId: string
+  outputType: AiSynthesisTemplate
+  citationStyleId?: string | null
+  sourceDatasetId?: string | null
+  customPrompt?: string
+  metadata?: Record<string, unknown>
+}): string {
+  const customPrompt = String(options.customPrompt || '')
+  return stringifyResearchOutputInputSnapshot(createResearchOutputInputSnapshot({
+    source: options.source,
+    projectId: options.projectId,
+    outputType: options.outputType,
+    citationStyleId: options.citationStyleId || null,
+    sourceDatasetId: options.sourceDatasetId || null,
+    customPromptPresent: Boolean(customPrompt.trim()),
+    customPromptHash: customPrompt.trim() ? stableHashPrefix(customPrompt) : undefined,
+    documents: listProjectSnapshotDocuments(options.projectId),
+    notes: listProjectSnapshotNotes(options.projectId),
+    metadata: {
+      ...(options.metadata || {}),
+      projectIntegrity: getProjectIntegrityReport(options.projectId),
+    },
+  }))
 }
 
 function findDuplicateNote(note: ReturnType<typeof normalizeNotePayload>, excludeId?: string): { id: string } | null {
@@ -817,11 +974,19 @@ export function registerResearchIpc(): void {
     if (noteCount === 0) {
       const docIds = getProjectDocIds(projectId)
       if (docIds.length > 0) {
+        const inputSnapshotJson = buildResearchOutputSnapshotJson({
+          source: 'research:synthesizeProject',
+          projectId,
+          outputType: templateType,
+          customPrompt,
+          citationStyleId,
+          metadata: { mode: 'document_fallback', documentIds: docIds },
+        })
         const content = await synthesizeDocumentIds(docIds, templateType, customPrompt)
         const id = nanoid()
         run(
-          'INSERT INTO research_outputs (id, project_id, output_type, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-          [id, projectId, templateType, `${project.name} - AI 研究综述`, content, new Date().toISOString()],
+          'INSERT INTO research_outputs (id, project_id, output_type, title, content, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [id, projectId, templateType, `${project.name} - AI 研究综述`, content, inputSnapshotJson, new Date().toISOString()],
         )
         saveDatabase()
         return requireQueryResult(
@@ -835,11 +1000,19 @@ export function registerResearchIpc(): void {
     if (texts.length === 0) {
       throw new Error('专题中还没有可用于综述的 OCR 文本或研究摘录')
     }
+    const inputSnapshotJson = buildResearchOutputSnapshotJson({
+      source: 'research:synthesizeProject',
+      projectId,
+      outputType: templateType,
+      customPrompt,
+      citationStyleId,
+      metadata: { mode: 'project_sources', synthesisDocumentCount: texts.length },
+    })
     const content = await synthesizeProjectWithSources(texts, templateType, customPrompt)
     const id = nanoid()
     run(
-      'INSERT INTO research_outputs (id, project_id, output_type, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, projectId, templateType, `${project.name} - AI 研究综述`, content, new Date().toISOString()],
+      'INSERT INTO research_outputs (id, project_id, output_type, title, content, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, projectId, templateType, `${project.name} - AI 研究综述`, content, inputSnapshotJson, new Date().toISOString()],
     )
     saveDatabase()
     return requireQueryResult(
@@ -858,9 +1031,20 @@ export function registerResearchIpc(): void {
     const project = queryOne<ProjectRow>('SELECT * FROM research_projects WHERE id = ?', [projectId])
     if (!project) throw new Error('研究专题不存在')
     const id = nanoid()
+    const inputSnapshotJson = normalizeOutputInputSnapshotJson(payload.input_snapshot_json || payload.inputSnapshotJson)
+      || buildResearchOutputSnapshotJson({
+        source: 'research:createOutput',
+        projectId,
+        outputType: payload.output_type,
+        sourceDatasetId: payload.source_dataset_id || null,
+        metadata: {
+          contentHash: stableHashPrefix(content),
+          titleHash: stableHashPrefix(title),
+        },
+      })
     run(
-      'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [id, projectId, payload.output_type, title, content, payload.source_dataset_id || null, new Date().toISOString()],
+      'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, projectId, payload.output_type, title, content, payload.source_dataset_id || null, inputSnapshotJson, new Date().toISOString()],
     )
     saveDatabase()
     return requireQueryResult(
@@ -878,7 +1062,8 @@ export function registerResearchIpc(): void {
         title,
         substr(content, 1, 900) as content,
         created_at,
-        source_dataset_id
+        source_dataset_id,
+        input_snapshot_json
        FROM research_outputs
        WHERE project_id = ?
        ORDER BY created_at DESC`,

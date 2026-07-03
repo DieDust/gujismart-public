@@ -17,6 +17,10 @@ import {
   previewResearchRetrieval,
   runResearchRetrievalForTask,
 } from '../ai-research-retrieval'
+import {
+  createResearchOutputInputSnapshot,
+  stringifyResearchOutputInputSnapshot,
+} from '../../shared/research-output-snapshot'
 import type {
   AiResearchCreateTaskPayload,
   AiResearchDataset,
@@ -795,6 +799,58 @@ function buildReportContext(dataset: AiResearchDataset, records: AiResearchRecor
   ].filter(Boolean).join('\n')
 }
 
+function previewText(value: unknown, limit = 180): string {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit)
+}
+
+function buildAiResearchOutputSnapshotJson(
+  dataset: AiResearchDataset,
+  records: AiResearchRecord[],
+  templateType: AiSynthesisTemplate,
+  customPrompt?: string,
+): string {
+  const task = getTask(dataset.task_id)
+  const documentMap = new Map<string, { id: string; title?: string }>()
+  for (const record of records) {
+    if (!record.doc_id) continue
+    documentMap.set(record.doc_id, {
+      id: record.doc_id,
+      title: record.doc_title || record.doc_id,
+    })
+  }
+  const prompt = String(customPrompt || '')
+  return stringifyResearchOutputInputSnapshot(createResearchOutputInputSnapshot({
+    source: 'ai-research:generateReport',
+    projectId: dataset.project_id || '',
+    outputType: templateType,
+    sourceDatasetId: dataset.id,
+    customPromptPresent: Boolean(prompt.trim()),
+    customPromptHash: prompt.trim() ? makeSourceHash([prompt]) : undefined,
+    documents: [...documentMap.values()],
+    aiRecords: records.map((record) => ({
+      id: record.id,
+      datasetId: record.dataset_id,
+      taskId: record.task_id,
+      docId: record.doc_id,
+      pageNum: record.page_num,
+      sourceHash: record.source_hash || '',
+      locatorJson: record.locator_json || '',
+      confidence: Number(record.confidence || 0),
+      status: record.status,
+      excerptHash: makeSourceHash([record.excerpt || '']),
+      excerptPreview: previewText(record.excerpt),
+    })),
+    metadata: {
+      taskId: task.id,
+      taskKind: task.kind,
+      taskStatus: task.status,
+      datasetName: dataset.name,
+      includedRecordCount: records.length,
+      fieldCount: dataset.fieldSchema?.length || 0,
+    },
+  }))
+}
+
 async function generateReport(payload: AiResearchReportPayload): Promise<{ content: string; outputId: string | null }> {
   const dataset = getDataset(payload.datasetId)
   const records = listRecords(payload.datasetId).filter((record) => record.status !== 'excluded')
@@ -815,9 +871,11 @@ async function generateReport(payload: AiResearchReportPayload): Promise<{ conte
   let outputId: string | null = null
   if (dataset.project_id) {
     outputId = nanoid()
+    const outputType = payload.templateType || 'theme_analysis'
+    const inputSnapshotJson = buildAiResearchOutputSnapshotJson(dataset, records, outputType, payload.customPrompt)
     run(
-      'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [outputId, dataset.project_id, payload.templateType || 'theme_analysis', `${dataset.name} - AI 数据报告`, content, dataset.id, new Date().toISOString()],
+      'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [outputId, dataset.project_id, outputType, `${dataset.name} - AI 数据报告`, content, dataset.id, inputSnapshotJson, new Date().toISOString()],
     )
     saveDatabase()
   }

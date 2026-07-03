@@ -763,6 +763,12 @@ assert(
   'PDF OCR async fallback save path should post-process only unfinished resume pages and map whole-PDF guarded results by original page number.',
 )
 assert(
+  asyncPdfBranchBody.includes('const missingAsyncPdfImagePage = findMissingReadablePageImage(pagesForOcr)')
+    && asyncPdfBranchBody.includes('const asyncPdfPageImagePages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)')
+    && asyncPdfBranchBody.includes('pagesForOcr = pagesForOcr.map((page) => asyncPdfPageImagesById.get(page.id) || page)'),
+  'PDF async OCR should still generate and attach local page images before uploading the source PDF.',
+)
+assert(
   ocrIpcSource.includes('function hasSequentialPageRecords')
     && ocrIpcSource.includes('function ensurePageRecordsIfNeeded')
     && ocrIpcSource.includes('hasSequentialPageRecords(pages, pageCount) ? pages : ensurePageRecords(docId, pageCount)')

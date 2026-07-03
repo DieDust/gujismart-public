@@ -20,7 +20,7 @@ buildSync({
   platform: 'node',
   format: 'cjs',
   outfile: bundlePath,
-  external: ['better-sqlite3'],
+  external: ['better-sqlite3', '@napi-rs/canvas'],
   alias: {
     '@shared': join(__dirname, '..', 'src', 'shared'),
     electron: join(__dirname, 'stubs', 'electron.js'),

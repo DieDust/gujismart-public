@@ -42,6 +42,7 @@ assertIncludes(sharedTypes, "'ai_research'", 'research notes should support AI r
 
 assertIncludes(database, 'CREATE TABLE IF NOT EXISTS ai_research_tasks', 'database should create AI research task table')
 assertIncludes(database, 'CREATE TABLE IF NOT EXISTS ai_research_records', 'database should create AI research record table')
+assertIncludes(database, "input_snapshot_json TEXT DEFAULT ''", 'research outputs should persist input snapshots')
 
 assertIncludes(ipcIndex, 'registerAiResearchIpc()', 'main IPC registry should include AI research IPC')
 assertIncludes(aiResearchIpc, "ipcMain.handle('aiResearch:planTask'", 'AI research should expose plan task IPC')
@@ -52,11 +53,15 @@ assertIncludes(aiResearchIpc, 'normalizeRecordListOptions', 'AI research records
 assertIncludes(aiResearchIpc, 'LIMIT ? OFFSET ?', 'AI research record preview should not load every record into the UI')
 assertIncludes(aiResearchIpc, 'runResearchRetrievalForTask(task)', 'AI research should execute through the retrieval pipeline')
 assertIncludes(aiResearchIpc, 'buildReportContext', 'AI research reports should include retrieval scope and local statistics context')
+assertIncludes(aiResearchIpc, 'buildAiResearchOutputSnapshotJson', 'AI research reports should save their source dataset and records as an output snapshot')
+assertIncludes(aiResearchIpc, 'input_snapshot_json', 'AI research report outputs should persist input snapshots')
 assertIncludes(aiResearchIpc, '代表证据的来源数量', 'AI research reports should not confuse compressed evidence with the full research scope')
 assertIncludes(aiResearchIpc, '当前范围没有可读取 OCR 正文', 'AI research should distinguish OCR absence from keyword misses')
 assertIncludes(aiResearchIpc, '关键词未命中', 'AI research should explain keyword misses in Chinese')
 assertIncludes(researchIpc, 'substr(content, 1, 900) as content', 'Research output lists should return report previews instead of full report content')
 assertIncludes(researchIpc, "ipcMain.handle('research:getOutputContent'", 'Research output full content should be loaded on demand')
+assertIncludes(researchIpc, 'buildResearchOutputSnapshotJson', 'Research outputs should save document and note input snapshots')
+assertIncludes(researchIpc, 'input_snapshot_json', 'Research outputs should expose saved input snapshots')
 assertIncludes(researchIpc, 'outline_count', 'Research project list should include lightweight outline counts')
 assertIncludes(researchIpc, 'ai_dataset_count', 'Research project list should include lightweight AI dataset counts')
 

@@ -1,6 +1,11 @@
 import { nanoid } from 'nanoid'
 import { queryAll, queryOne, refreshTagUsage, run, saveDatabase, transaction } from './database'
 import { HISTORY_DOC_TYPE_OPTIONS, LEGACY_DOC_TYPE_MAP, normalizeHistoryDocType } from '../shared/history-citation'
+import {
+  decideMetadataTagRelationCleanup,
+  normalizeMetadataTagComparableName,
+  normalizeMetadataTagName,
+} from '../shared/metadata-tag-guard'
 import type { DocumentMetadataResult, MetadataTagBindingCleanupResult, MetadataTagBindingRebuildResult } from '../shared/types'
 
 export const METADATA_TAG_BINDING_SETTING_KEY = 'metadata_tag_binding_enabled'
@@ -103,7 +108,7 @@ export const FIELD_TAG_COLORS: Record<string, string> = {
 }
 
 function normalizeTagName(name: string): string {
-  return name.trim().toLowerCase()
+  return normalizeMetadataTagName(name)
 }
 
 function normalizeScalarValue(value: unknown): string | null {
@@ -128,7 +133,7 @@ function normalizeListValue(value: unknown): string[] {
 }
 
 function normalizeComparableTagName(name: string): string {
-  return normalizeTagName(name).replace(/\s+/g, '')
+  return normalizeMetadataTagComparableName(name)
 }
 
 function extractYear(value: unknown): string | null {
@@ -440,6 +445,17 @@ function detachStaleDocTypeTags(docId: string, nextDocType: string): void {
       || normalizeComparableTagName(normalizeHistoryDocType(tagName)) !== normalizeComparableTagName(tagName)
 
     if (!isDocTypeRelation) continue
+
+    const decision = decideMetadataTagRelationCleanup({
+      tagName,
+      nextName: normalizedNext,
+      tagSource: row.source,
+      relationSourceField: row.source_field,
+      isManual: row.is_manual,
+      isMetadata: row.is_metadata,
+      isCandidateRelation: isDocTypeRelation,
+    })
+    if (decision.action !== 'delete') continue
 
     run('DELETE FROM document_tags WHERE doc_id = ? AND tag_id = ?', [docId, row.tag_id])
   }
