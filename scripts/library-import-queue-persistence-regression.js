@@ -236,7 +236,9 @@ assert(
   'Failed-document retry success path should not await an extra list reload after runOcrInConfiguredBatches.',
 )
 assert(
-  handleBatchImportBody.includes("const count = await runOcrInConfiguredBatches(targetIds, 'paddle', 'batch-follow-ocr')")
+  handleBatchImportBody.includes('const followEngine = importOcrEngine')
+    && handleBatchImportBody.includes('const hasConfig = await hasOcrEngineConfig(followEngine)')
+    && handleBatchImportBody.includes("const count = await runOcrInConfiguredBatches(targetIds, followEngine, 'batch-follow-ocr')")
     && handleBatchImportBody.includes('} else {\n        await loadDocuments()\n      }')
     && !handleBatchImportBody.includes("message.success({ content: `OCR 完成，成功识别 ${count} 篇文献`, key: 'batch-follow-ocr' })\n      }\n\n      await loadDocuments()"),
   'Batch import should skip the extra final list reload when follow-up OCR already refreshed, while still refreshing when OCR is not started.',

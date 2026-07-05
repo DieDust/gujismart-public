@@ -41,6 +41,7 @@ import {
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { hasVisionOcrConfig, recognizePagesWithVisionModel, refinePagesWithVisionModel } from '../vision-ocr'
+import { getLocalPaddleOcrStatus, recognizePagesWithLocalPaddle } from '../local-paddle-ocr'
 import { applyCjkTextRenderFallback } from '../../shared/pdf-text-render-fallback'
 import {
   OCR_IR_PIPELINE_VERSION,
@@ -3925,6 +3926,7 @@ async function rerunPageLayoutOnly(
 }
 
 function getEngineLabel(engine: string): string {
+  if (engine === 'local_paddle') return '本地 OCR'
   if (engine === 'vision_model') return '视觉 OCR'
   if (engine === 'hybrid') return '混合 OCR'
   return '飞桨 OCR'
@@ -4437,9 +4439,15 @@ function parseMetadata(value: unknown): JsonRecord {
 }
 
 function resolveOcrEngine(doc: Pick<OcrDocumentRow, 'metadata'>, requested?: OcrEngine): OcrEngine {
-  if (requested === 'paddle' || requested === 'vision_model' || requested === 'hybrid') return requested
+  if (requested === 'local_paddle' || requested === 'paddle' || requested === 'vision_model' || requested === 'hybrid') return requested
   const storedEngine = parseMetadata(doc.metadata).ocr_engine
-  if (storedEngine === 'vision_model' || storedEngine === 'hybrid') return storedEngine
+  if (storedEngine === 'local_paddle' || storedEngine === 'paddle' || storedEngine === 'vision_model' || storedEngine === 'hybrid') {
+    return storedEngine
+  }
+  const configuredEngine = queryOne<{ value?: string | null }>('SELECT value FROM settings WHERE key = ?', ['ocr_default_engine'])?.value
+  if (configuredEngine === 'local_paddle' || configuredEngine === 'paddle' || configuredEngine === 'vision_model' || configuredEngine === 'hybrid') {
+    return configuredEngine
+  }
   return 'paddle'
 }
 
@@ -5158,7 +5166,7 @@ async function processDocumentOcr(
     }
   }
 
-  if (pages.length === 0 && !canUsePdfAsync && engine !== 'vision_model') {
+  if (pages.length === 0 && !canUsePdfAsync && engine !== 'vision_model' && engine !== 'local_paddle') {
     const errorMessage = '文献没有可处理的页面。若这是 PDF，请先重新导入或点击“重试处理”让软件重新读取页数。'
     updateDocumentStatus(docId, 'error', 'error', errorMessage)
     return { success: false, errorMessage }
@@ -5482,6 +5490,65 @@ async function processDocumentOcr(
           pageNum: payload.pageNum,
           errorMessage: payload.error,
           message: `大模型 OCR ${actionText}：${combinedPages}/${totalPages} 页${activeNote}${sizeNote}${elapsedNote}`,
+        })
+      })
+    } else if (engine === 'local_paddle') {
+      const localStatus = await getLocalPaddleOcrStatus()
+      if (!localStatus.installed) {
+        throw new Error(localStatus.message || '本地 PaddleOCR 尚未安装，请先在设置页下载或导入本地 OCR addon。')
+      }
+      if (pages.length === 0) {
+        pages = await ensurePageRecords(docId, Number(doc.page_count || 0) || 0)
+        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
+        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
+      }
+      if (pagesForOcr.length === 0) {
+        throw new Error('文献已导入，但没有可恢复的页记录或页图，无法继续本地 OCR。请重新导入或打开文献生成页图后再试。')
+      }
+      const missingImagePage = findMissingReadablePageImage(pagesForOcr)
+      if (missingImagePage && pdfPath) {
+        emitOcrStatus(event, {
+          docId,
+          status: 'processing',
+          phase: 'ocr',
+          progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
+          completedPages: completedBefore,
+          totalPages: getDocTotalPages(),
+          pageNum: missingImagePage.page_num || undefined,
+          message: `正在为本地 OCR 生成页面图：${completedBefore}/${getDocTotalPages()} 页`,
+        })
+        const localPageImagePages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)
+        const localPageImagesById = new Map(localPageImagePages.map((page) => [page.id, page]))
+        pages = pages.map((page) => localPageImagesById.get(page.id) || page)
+        pagesForOcr = pagesForOcr.map((page) => localPageImagesById.get(page.id) || page)
+      }
+      const stillMissingImagePage = findMissingReadablePageImage(pagesForOcr)
+      if (stillMissingImagePage) {
+        throw new Error(`第 ${stillMissingImagePage.page_num || ''} 页缺少可读取页图，无法使用本地 PaddleOCR。请先恢复 PDF 原文或重新导入。`)
+      }
+      pageResults = await recognizePagesWithLocalPaddle(pagesForOcr, (payload) => {
+        throwIfOcrCanceled(signal)
+        const combinedPages = getCombinedPageCount(payload.completedPages)
+        const totalPages = getDocTotalPages() || payload.totalPages
+        const docFraction = getCombinedDocFraction(payload.completedPages, payload.totalPages)
+        if (payload.status === 'completed' && payload.result) {
+          savePageOcrResultsDeferred([{
+            pageId: payload.pageId,
+            result: payload.result,
+            text: payload.text || getOcrResultText(payload.result),
+            status: 'completed',
+          }], 'local_paddle', { refreshSearch: false })
+        }
+        emitOcrStatus(event, {
+          docId,
+          status: 'processing',
+          phase: 'ocr',
+          progress: getDocProgress(getCompleted(), totalDocs, docFraction),
+          completedPages: combinedPages,
+          totalPages,
+          pageNum: payload.pageNum,
+          errorMessage: payload.error,
+          message: `本地 PaddleOCR 识别中：${combinedPages}/${totalPages} 页`,
         })
       })
     } else if (engine === 'paddle' && asyncPdfRouteRisk?.preferPageImage && pdfPath && pagesForOcr.length > 0) {
@@ -5908,7 +5975,7 @@ async function processDocumentOcr(
 
     let persistedPageSummary = summarizeDocumentOcrPages(docId)
     persistedPageSummary = await syncGujiPaddleReferenceResults(persistedPageSummary)
-    if (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0) {
+    if (engine !== 'local_paddle' && (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0)) {
       emitOcrStatus(event, {
         docId,
         status: 'processing',

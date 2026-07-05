@@ -404,14 +404,14 @@ const FACSIMILE_FONT_SCALE_MIN = 0.5
 const FACSIMILE_FONT_SCALE_MAX = 1.35
 
 function isOcrEngine(value: unknown): value is OcrEngine {
-  return value === 'paddle' || value === 'vision_model' || value === 'hybrid'
+  return value === 'local_paddle' || value === 'paddle' || value === 'vision_model' || value === 'hybrid'
 }
 
 function needsOcrWork(doc: DocumentItem, engine?: OcrEngine): boolean {
   if (isDocumentOcrTextComplete(doc)) return false
   if (doc.import_status === 'error' || doc.ocr_status === 'error') return true
   if (doc.ocr_status !== 'completed') return true
-  if ((engine === 'vision_model' || engine === 'hybrid') && getEffectivePageCount(doc) > Number(doc.image_page_count || 0)) return true
+  if ((engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid') && getEffectivePageCount(doc) > Number(doc.image_page_count || 0)) return true
   return false
 }
 
@@ -1437,6 +1437,7 @@ function DocumentVirtualRow({
       label: '重新 OCR 整本文献',
       icon: <ThunderboltOutlined />,
       children: [
+        { key: 'rerun_ocr_book:local_paddle', label: '用本地 OCR 覆盖' },
         { key: 'rerun_ocr_book:paddle', label: '用飞桨 OCR 覆盖' },
         { key: 'rerun_ocr_book:vision_model', label: '用大模型 OCR 覆盖' },
         { key: 'rerun_ocr_book:hybrid', label: '用混合 OCR 覆盖' },
@@ -1933,6 +1934,18 @@ export default function LibraryView({
     sort: librarySort,
     pageSize: libraryPageSize,
   }), [filter, libraryPageSize, librarySearchFields, librarySort, searchKey])
+
+  useEffect(() => {
+    let active = true
+    void window.api.getSetting('ocr_default_engine')
+      .then((value) => {
+        if (active && isOcrEngine(value)) setImportOcrEngine(value)
+      })
+      .catch((error) => console.warn('[LibraryView] 读取默认 OCR 引擎失败', error))
+    return () => {
+      active = false
+    }
+  }, [])
 
   useEffect(() => {
     documentsRef.current = documents
@@ -3742,7 +3755,7 @@ export default function LibraryView({
     const batches = chunkArray(uniqueDocIds, ocrBatchSize)
     let successCount = 0
     let shouldRefreshAfterBatches = false
-    const requiresPageImagesBeforeOcr = engine === 'vision_model' || engine === 'hybrid'
+    const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'
 
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
       const batch = batches[batchIndex]
@@ -4057,7 +4070,7 @@ export default function LibraryView({
             filePaths,
             folderId: typeof job.folderId === 'string' && job.folderId ? job.folderId : null,
             folderAssignments: folderAssignments && folderAssignments.size > 0 ? folderAssignments : undefined,
-            engine: job.engine === 'vision_model' || job.engine === 'hybrid' ? job.engine : 'paddle',
+            engine: isOcrEngine(job.engine) ? job.engine : 'paddle',
           } satisfies ImportQueueJob
         })
       return jobs.filter((job): job is ImportQueueJob => Boolean(job))
@@ -4140,7 +4153,7 @@ export default function LibraryView({
           if (pdfWorkPath.toLowerCase().endsWith('.pdf')) {
             importedCount += 1
             autoOcrQueue.push({ type: 'prepare-pdf', docId: result.id, filePath: pdfWorkPath, fileIndex, totalFiles: totalFileCount })
-            if (engine !== 'vision_model' && engine !== 'hybrid') {
+            if (engine !== 'local_paddle' && engine !== 'vision_model' && engine !== 'hybrid') {
               const previewItem = { docId: result.id, filePath: pdfWorkPath, fileIndex, totalFiles: totalFileCount, pageCount: result.pageCount }
               if (Number(result.pageCount || 0) >= LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT) {
                 deferredPdfPreviewQueue.push(previewItem)
@@ -4266,6 +4279,8 @@ export default function LibraryView({
               ? '已导入，但未配置视觉模型 OCR；请在设置页填写端点、API Key 和模型 ID 后再重试。'
               : engine === 'hybrid'
               ? '已导入，但混合 OCR 需要同时配置 PaddleOCR Token 和视觉模型 OCR。请在设置页补齐后再重试。'
+              : engine === 'local_paddle'
+              ? '已导入，但本地 OCR addon 尚未安装；请在设置页下载或导入本地 OCR 后再重试。'
               : '已导入，但未配置 PaddleOCR API Token；请在设置页填写后再点击“批量 OCR”或“重试处理”。',
             key: 'auto-ocr',
             duration: 6,
@@ -4464,6 +4479,10 @@ export default function LibraryView({
   }
 
   const hasOcrEngineConfig = async (engine: OcrEngine): Promise<boolean> => {
+    if (engine === 'local_paddle') {
+      const status = await window.api.getLocalPaddleOcrStatus()
+      return status.installed
+    }
     if (engine === 'paddle') return window.api.checkOcrToken()
     if (engine === 'hybrid') {
       const [paddleReady, visionReady] = await Promise.all([
@@ -4475,7 +4494,7 @@ export default function LibraryView({
     return window.api.checkVisionOcrConfig()
   }
 
-  const getOcrEngineLabel = (engine: OcrEngine): string => engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
+  const getOcrEngineLabel = (engine: OcrEngine): string => engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
 
   const getDroppedPaths = (event: DragEvent<HTMLElement>): string[] => {
     const paths = Array.from(event.dataTransfer.files)
@@ -4605,7 +4624,9 @@ export default function LibraryView({
 
     const hasConfig = await hasOcrEngineConfig(engine)
     if (!hasConfig) {
-      message.warning(engine === 'vision_model'
+      message.warning(engine === 'local_paddle'
+        ? '请先在设置页下载或导入本地 OCR addon。'
+        : engine === 'vision_model'
         ? '请先在设置页配置视觉模型 OCR 的端点、API Key 和模型 ID。'
         : engine === 'hybrid'
         ? '混合 OCR 需要同时配置 PaddleOCR Token 和视觉模型 OCR。'
@@ -4771,7 +4792,9 @@ export default function LibraryView({
   const handleForceRerunDocument = async (doc: DocumentItem, engine: OcrEngine) => {
     const hasConfig = await hasOcrEngineConfig(engine)
     if (!hasConfig) {
-      message.warning(engine === 'vision_model'
+      message.warning(engine === 'local_paddle'
+        ? '请先在设置页下载或导入本地 OCR addon。'
+        : engine === 'vision_model'
         ? '请先在设置页配置视觉模型 OCR 的端点、API Key 和模型 ID。'
         : engine === 'hybrid'
         ? '混合 OCR 需要同时配置 PaddleOCR Token 和视觉模型 OCR。'
@@ -4872,10 +4895,11 @@ export default function LibraryView({
 
       message.success({ content: `已入库 ${targetIds.length} 篇文献`, key: 'batch-import' })
 
-      const hasToken = await window.api.checkOcrToken()
-      if (hasToken) {
+      const followEngine = importOcrEngine
+      const hasConfig = await hasOcrEngineConfig(followEngine)
+      if (hasConfig) {
         message.loading({ content: '正在继续执行 OCR…', key: 'batch-follow-ocr', duration: 0 })
-        const count = await runOcrInConfiguredBatches(targetIds, 'paddle', 'batch-follow-ocr')
+        const count = await runOcrInConfiguredBatches(targetIds, followEngine, 'batch-follow-ocr')
         message.success({ content: `OCR 完成，成功识别 ${count} 篇文献`, key: 'batch-follow-ocr' })
       } else {
         await loadDocuments()
@@ -5095,6 +5119,7 @@ export default function LibraryView({
       label: '批量 OCR 识别',
       icon: <ThunderboltOutlined />,
       children: [
+        { key: 'ocr:local_paddle', label: '用本地 OCR' },
         { key: 'ocr:paddle', label: '用飞桨 OCR' },
         { key: 'ocr:vision_model', label: '用大模型 OCR' },
         { key: 'ocr:hybrid', label: '用混合 OCR（飞桨+大模型整理）' },
@@ -5105,6 +5130,7 @@ export default function LibraryView({
       label: '重新 OCR 已选文献',
       icon: <ReloadOutlined />,
       children: [
+        { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
         { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
         { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
         { key: 'ocr_force:hybrid', label: '用混合 OCR 覆盖' },
@@ -5139,12 +5165,8 @@ export default function LibraryView({
 
   const handleBatchMenu: MenuProps['onClick'] = ({ key }) => {
     if (key === 'import') void handleBatchImport()
-    if (key === 'ocr:paddle') void handleBatchOcr('paddle')
-    if (key === 'ocr:vision_model') void handleBatchOcr('vision_model')
-    if (key === 'ocr:hybrid') void handleBatchOcr('hybrid')
-    if (key === 'ocr_force:paddle') confirmBatchForceRerunOcr('paddle')
-    if (key === 'ocr_force:vision_model') confirmBatchForceRerunOcr('vision_model')
-    if (key === 'ocr_force:hybrid') confirmBatchForceRerunOcr('hybrid')
+    if (String(key).startsWith('ocr:')) void handleBatchOcr(String(key).replace('ocr:', '') as OcrEngine)
+    if (String(key).startsWith('ocr_force:')) confirmBatchForceRerunOcr(String(key).replace('ocr_force:', '') as OcrEngine)
     if (key === 'metadata_extract') void handleBatchMetadataExtract()
     if (key === 'add_tags') {
       if (selectedIds.length === 0) {
@@ -5953,6 +5975,7 @@ export default function LibraryView({
               value={importOcrEngine}
               onChange={(value) => setImportOcrEngine(value as OcrEngine)}
               options={[
+                { value: 'local_paddle', label: '本地 OCR' },
                 { value: 'paddle', label: '飞桨 OCR' },
                 { value: 'vision_model', label: '大模型 OCR' },
                 { value: 'hybrid', label: '混合 OCR' },
@@ -6136,6 +6159,7 @@ export default function LibraryView({
                   label: '重新 OCR 整本文献',
                   icon: <ThunderboltOutlined />,
                   children: [
+                    { key: 'rerun_ocr_book:local_paddle', label: '用本地 OCR 覆盖' },
                     { key: 'rerun_ocr_book:paddle', label: '用飞桨 OCR 覆盖' },
                     { key: 'rerun_ocr_book:vision_model', label: '用大模型 OCR 覆盖' },
                     { key: 'rerun_ocr_book:hybrid', label: '用混合 OCR 覆盖' },

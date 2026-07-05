@@ -174,7 +174,35 @@ function chunkArray<T>(items: T[], size: number): T[][] {
 }
 
 function getFolderOcrEngineLabel(engine: OcrEngine | string): string {
-  return engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
+  return engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
+}
+
+function isFolderOcrEngine(value: unknown): value is OcrEngine {
+  return value === 'local_paddle' || value === 'paddle' || value === 'vision_model' || value === 'hybrid'
+}
+
+async function getConfiguredDefaultFolderOcrEngine(): Promise<OcrEngine> {
+  const rawValue = await window.api.getSetting('ocr_default_engine')
+  return isFolderOcrEngine(rawValue) ? rawValue : 'paddle'
+}
+
+async function hasFolderOcrEngineConfig(engine: OcrEngine): Promise<boolean> {
+  if (engine === 'local_paddle') {
+    const status = await window.api.getLocalPaddleOcrStatus()
+    return status.installed
+  }
+  if (engine === 'paddle') return window.api.checkOcrToken()
+  if (engine === 'hybrid') {
+    return (await Promise.all([window.api.checkOcrToken(), window.api.checkVisionOcrConfig()])).every(Boolean)
+  }
+  return window.api.checkVisionOcrConfig()
+}
+
+function getFolderOcrConfigWarning(engine: OcrEngine): string {
+  if (engine === 'local_paddle') return '请先在设置页下载或导入本地 OCR addon。'
+  if (engine === 'vision_model') return '请先在设置页配置视觉模型 OCR。'
+  if (engine === 'hybrid') return '混合 OCR 需要同时配置飞桨 OCR 和视觉模型 OCR。'
+  return '请先在设置页配置 PaddleOCR API Token。'
 }
 
 function getFolderOcrBatchProgressMessage(engineLabel: string, batchIndex: number, totalBatches: number, batchSize: number, documentConcurrency: number): string {
@@ -708,7 +736,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     const batches = chunkArray(uniqueDocIds, ocrBatchSize)
     let successCount = 0
     let shouldRefreshAfterBatches = false
-    const requiresPageImagesBeforeOcr = engine === 'vision_model' || engine === 'hybrid'
+    const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'
 
     for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
       const batch = batches[batchIndex]
@@ -772,17 +800,9 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       message.info('请先选择文献')
       return
     }
-    const hasConfig = engine === 'paddle'
-      ? await window.api.checkOcrToken()
-      : engine === 'hybrid'
-        ? (await Promise.all([window.api.checkOcrToken(), window.api.checkVisionOcrConfig()])).every(Boolean)
-        : await window.api.checkVisionOcrConfig()
+    const hasConfig = await hasFolderOcrEngineConfig(engine)
     if (!hasConfig) {
-      message.warning(engine === 'vision_model'
-        ? '请先在设置页配置视觉模型 OCR。'
-        : engine === 'hybrid'
-          ? '混合 OCR 需要同时配置飞桨 OCR 和视觉模型 OCR。'
-          : '请先在设置页配置 PaddleOCR API Token。')
+      message.warning(getFolderOcrConfigWarning(engine))
       return
     }
 
@@ -1000,10 +1020,11 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     try {
       const autoOcr = await window.api.getSetting('auto_ocr_after_import')
       if (autoOcr === 'false') return
-      const ready = await window.api.checkOcrToken()
+      const engine = await getConfiguredDefaultFolderOcrEngine()
+      const ready = await hasFolderOcrEngineConfig(engine)
       if (!ready) {
         message.warning({
-          content: '已导入，但未配置 PaddleOCR API Token；请在设置页填写后再批量 OCR。',
+          content: `已导入，但${getFolderOcrEngineLabel(engine)}尚未配置完成；${getFolderOcrConfigWarning(engine)}`,
           key: FOLDERS_AUTO_OCR_MESSAGE_KEY,
           duration: 6,
         })
@@ -1014,7 +1035,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         key: FOLDERS_AUTO_OCR_MESSAGE_KEY,
         duration: 0,
       })
-      const successCount = await runFolderOcrInConfiguredBatches(uniqueDocIds, 'paddle' as OcrEngine, FOLDERS_AUTO_OCR_MESSAGE_KEY)
+      const successCount = await runFolderOcrInConfiguredBatches(uniqueDocIds, engine, FOLDERS_AUTO_OCR_MESSAGE_KEY)
       message.success({
         content: `OCR 已完成，成功处理 ${successCount} 篇文献`,
         key: FOLDERS_AUTO_OCR_MESSAGE_KEY,
@@ -1086,6 +1107,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
 
       const importBatchSize = await getConfiguredImportBatchSize()
       const importBatches = chunkArray(uniqueImportFiles, importBatchSize)
+      const defaultOcrEngine = await getConfiguredDefaultFolderOcrEngine()
       let importedCount = 0
       let duplicateCount = 0
       const failedResults: ImportDocumentResult[] = []
@@ -1107,7 +1129,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         setImportProgressText(progressText)
         message.loading({ content: progressText, key: FOLDERS_IMPORT_MESSAGE_KEY, duration: 0 })
 
-        const batchResults = await window.api.importDocuments(batch, { ocrEngine: 'paddle' })
+        const batchResults = await window.api.importDocuments(batch, { ocrEngine: defaultOcrEngine })
         for (let resultIndex = 0; resultIndex < batchResults.length; resultIndex += 1) {
           const result = batchResults[resultIndex]
           const originalPath = result.sourcePath || batch[resultIndex] || ''
@@ -1599,6 +1621,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         label: 'OCR 识别',
         icon: <ThunderboltOutlined />,
         children: [
+          { key: 'ocr:local_paddle', label: '用本地 OCR' },
           { key: 'ocr:paddle', label: '用飞桨 OCR' },
           { key: 'ocr:vision_model', label: '用大模型 OCR' },
           { key: 'ocr:hybrid', label: '用混合 OCR（飞桨+大模型整理）' },
@@ -1609,6 +1632,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         label: '重新 OCR 已选文献',
         icon: <ReloadOutlined />,
         children: [
+          { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
           { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
           { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
           { key: 'ocr_force:hybrid', label: '用混合 OCR 覆盖' },
@@ -1723,6 +1747,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                   label: 'OCR 识别',
                   icon: <ThunderboltOutlined />,
                   children: [
+                    { key: 'ocr:local_paddle', label: '用本地 OCR' },
                     { key: 'ocr:paddle', label: '用飞桨 OCR' },
                     { key: 'ocr:vision_model', label: '用大模型 OCR' },
                     { key: 'ocr:hybrid', label: '用混合 OCR' },
@@ -1733,6 +1758,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                   label: '重新 OCR 已选文献',
                   icon: <ReloadOutlined />,
                   children: [
+                    { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
                     { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
                     { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
                     { key: 'ocr_force:hybrid', label: '用混合 OCR 覆盖' },

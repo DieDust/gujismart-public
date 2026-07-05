@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Alert, AutoComplete, Button, Card, Checkbox, Input, Modal, Select, Space, Spin, Steps, Tag, Typography, message } from 'antd'
-import { ApiOutlined, CheckCircleOutlined, FileSearchOutlined, KeyOutlined, RobotOutlined } from '@ant-design/icons'
+import { ApiOutlined, CheckCircleOutlined, DownloadOutlined, FileSearchOutlined, KeyOutlined, RobotOutlined } from '@ant-design/icons'
 import type { SettingsMap } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
 import { useOnboardingStore } from '../stores/useOnboardingStore'
@@ -45,6 +45,8 @@ function isAiConfigured(settings: SettingsMap | null): boolean {
 }
 
 function isPaddleConfigured(settings: SettingsMap | null): boolean {
+  if (settings?.ocr_default_engine === 'local_paddle') return settings.local_paddle_ocr_status === 'installed'
+  if (settings?.ocr_default_engine === 'vision_model') return isVisionConfigured(settings)
   return hasText(settings?.paddleocr_api_key)
 }
 
@@ -169,12 +171,45 @@ export default function OnboardingWizard() {
     }
   }
 
+  const handleSelectOcrMode = async (mode: 'local' | 'cloud' | 'ai') => {
+    setSaving(true)
+    try {
+      if (mode === 'local') {
+        const status = await window.api.downloadLocalPaddleOcr({ source: 'auto' })
+        if (status.installed) {
+          await window.api.setDefaultOcrEngine('local_paddle', 'local_paddle')
+          await markStepComplete('paddle_ocr')
+          message.success('本地 OCR 已设为默认')
+          nextStep()
+        } else {
+          message.warning(status.message || '本地 OCR 尚未完整安装，可稍后在设置页手动导入 addon。')
+        }
+        return
+      }
+      if (mode === 'cloud') {
+        await window.api.setDefaultOcrEngine('paddle', 'paddle')
+        message.success('已选择飞桨云端 OCR，请继续填写 Token 或稍后补充。')
+        return
+      }
+      await window.api.setDefaultOcrEngine('vision_model', 'vision_model')
+      await markStepComplete('paddle_ocr')
+      message.success('已选择 AI OCR，请继续配置 AI 模型。')
+      nextStep()
+    } catch (error) {
+      console.error(error)
+      message.error('选择 OCR 模式失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const handleSavePaddle = async () => {
     setSaving(true)
     try {
       const token = paddleApiKey.trim()
       if (token) await window.api.setSetting('paddleocr_api_key', token)
       await window.api.setSetting('ocr_async_model', paddleModel.trim() || 'PaddleOCR-VL-1.6')
+      await window.api.setDefaultOcrEngine('paddle', 'paddle')
       await refreshSettings()
       await markStepComplete('paddle_ocr')
       message.success(token ? 'PaddleOCR 已保存' : '已跳过 PaddleOCR Token')
@@ -255,6 +290,7 @@ export default function OnboardingWizard() {
         const profileId = upserted.profiles?.find((profile) => profile.provider === provider && profile.baseUrl === baseUrl && profile.model === model)?.id || upserted.profiles?.[0]?.id
         if (profileId) await window.api.switchVisionOcrProviderProfile(profileId)
       }
+      await window.api.setDefaultOcrEngine('vision_model', 'vision_model')
       await refreshSettings()
       await markStepComplete('vision_ocr')
       message.success(visionFollowAi ? '视觉 OCR 将跟随 AI 配置' : '视觉 OCR 配置已保存')
@@ -382,6 +418,17 @@ export default function OnboardingWizard() {
               message="PaddleOCR 用于普通 OCR 和 PDF 文档解析"
               description={<span>没有 Token 也可以先跳过。需要 OCR 时，可前往 <a href={PADDLE_OCR_APPLY_URL} target="_blank" rel="noreferrer">飞桨 PaddleOCR 服务页</a> 申请。</span>}
             />
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+              <Button block icon={<DownloadOutlined />} loading={saving} onClick={() => void handleSelectOcrMode('local')}>
+                下载本地 OCR
+              </Button>
+              <Button block icon={<ApiOutlined />} loading={saving} onClick={() => void handleSelectOcrMode('cloud')}>
+                填写云端 OCR
+              </Button>
+              <Button block icon={<RobotOutlined />} loading={saving} onClick={() => void handleSelectOcrMode('ai')}>
+                使用 AI OCR
+              </Button>
+            </div>
             <Card size="small" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>API Token</Text>

@@ -647,7 +647,7 @@ export function resumeInterruptedDocumentDeletes(): InterruptedDocumentDeleteRec
 }
 
 function resolveImportOcrEngine(value: unknown): OcrEngine {
-  return value === 'vision_model' || value === 'hybrid' ? value : 'paddle'
+  return value === 'local_paddle' || value === 'vision_model' || value === 'hybrid' ? value : 'paddle'
 }
 
 const TEXT_IMPORT_EXTENSIONS = new Set(['.txt', '.md', '.markdown'])

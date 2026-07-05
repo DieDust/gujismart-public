@@ -263,16 +263,16 @@ assert(
 )
 assert(
   documentViewSource.includes("const forceFullRerun = doc.ocr_status === 'completed'")
-    && documentViewSource.includes("if (targetEngine === 'vision_model' || targetEngine === 'hybrid') {")
+    && documentViewSource.includes("if (targetEngine === 'local_paddle' || targetEngine === 'vision_model' || targetEngine === 'hybrid') {")
     && documentViewSource.includes('await ensureOcrPageImages(doc, {')
     && !documentViewSource.includes("targetEngine === 'paddle' || targetEngine === 'vision_model'")
     && documentViewSource.includes('forceFullRerun,'),
-  'Document detail Paddle OCR should not pre-render full-document page images; page images are only required for vision/hybrid OCR.',
+  'Document detail Paddle OCR should not pre-render full-document page images; page images are only required for local/vision/hybrid OCR.',
 )
 assert(
   librarySource.includes('const runOcrInConfiguredBatches = async')
     && librarySource.includes('const batches = chunkArray(uniqueDocIds, ocrBatchSize)')
-    && librarySource.includes("const requiresPageImagesBeforeOcr = engine === 'vision_model' || engine === 'hybrid'")
+    && librarySource.includes("const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'")
     && librarySource.includes('let ocrBatch = batch')
     && librarySource.includes('if (requiresPageImagesBeforeOcr) {')
     && librarySource.includes('const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {')

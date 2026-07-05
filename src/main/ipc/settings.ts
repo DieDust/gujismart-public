@@ -18,9 +18,14 @@ import type {
   DocumentExportFormat,
   DocumentExportOptions,
   ListModelsPayload,
+  LocalPaddleOcrDownloadOptions,
+  LocalPaddleOcrDownloadProgress,
+  LocalPaddleOcrSource,
+  LocalPaddleOcrStatus,
   LlmProviderProfile,
   LlmProviderProfileState,
   LlmProviderProfilesResult,
+  OcrEngine,
   Setting,
   SettingSetResult,
   SettingsMap,
@@ -56,6 +61,12 @@ import {
   needsMetadataTagBindingRebuild,
   rebuildMetadataTagBindings,
 } from '../metadata-tags'
+import {
+  checkLocalPaddleOcrSources,
+  downloadLocalPaddleOcrAddon,
+  getLocalPaddleOcrStatus,
+  importLocalPaddleOcrAddon,
+} from '../local-paddle-ocr'
 
 const PROJECT_GITHUB_REPO = 'DieDust/gujismart-public'
 const PROJECT_RELEASES_URL = `https://github.com/${PROJECT_GITHUB_REPO}/releases`
@@ -567,6 +578,16 @@ function getVisionOcrProfileValidation(profile: LlmProviderProfile) {
   })
 }
 
+function persistLocalPaddleOcrStatus(status: LocalPaddleOcrStatus): void {
+  setSettingValue('local_paddle_ocr_status', status.state)
+  setSettingValue('local_paddle_ocr_bundle_version', status.bundleVersion)
+  setSettingValue('local_paddle_ocr_path', status.installPath)
+}
+
+function emitLocalPaddleOcrProgress(event: Electron.IpcMainInvokeEvent, progress: LocalPaddleOcrDownloadProgress): void {
+  event.sender.send('settings:localPaddleOcrDownloadProgress', progress)
+}
+
 function ensureUniqueExportPath(dirPath: string, fileName: string, usedPaths: Set<string>): string {
   const ext = extname(fileName)
   const base = ext ? fileName.slice(0, -ext.length) : fileName
@@ -621,6 +642,71 @@ export function registerSettingsIpc(): void {
 
   ipcMain.handle('settings:listPaddleOcrModels', async (_event, apiKey?: string): Promise<string[]> => {
     return fetchPaddleOcrModels(String(apiKey || getSettingValue('paddleocr_api_key') || ''))
+  })
+
+  ipcMain.handle('settings:getLocalPaddleOcrStatus', async (): Promise<LocalPaddleOcrStatus> => {
+    return getLocalPaddleOcrStatus()
+  })
+
+  ipcMain.handle('settings:checkLocalPaddleOcrSources', async (): Promise<LocalPaddleOcrSource[]> => {
+    return checkLocalPaddleOcrSources()
+  })
+
+  ipcMain.handle('settings:downloadLocalPaddleOcr', async (
+    event,
+    options?: LocalPaddleOcrDownloadOptions,
+  ): Promise<LocalPaddleOcrStatus> => {
+    const status = await downloadLocalPaddleOcrAddon(options || {}, (progress) => emitLocalPaddleOcrProgress(event, progress))
+    persistLocalPaddleOcrStatus(status)
+    if (status.installed) {
+      setSettingValue('ocr_default_engine', 'local_paddle')
+      setSettingValue('ocr_active_provider_id', 'local_paddle')
+    }
+    saveDatabase()
+    return status
+  })
+
+  ipcMain.handle('settings:importLocalPaddleOcrAddon', async (
+    event,
+    filePath?: string,
+  ): Promise<LocalPaddleOcrStatus> => {
+    let selectedPath = String(filePath || '').trim()
+    if (!selectedPath) {
+      const result = await dialog.showOpenDialog({
+        title: '导入本地 OCR addon',
+        properties: ['openFile'],
+        filters: [{ name: 'GujiSmart OCR addon', extensions: ['zip'] }],
+      })
+      if (result.canceled || result.filePaths.length === 0) {
+        return getLocalPaddleOcrStatus()
+      }
+      selectedPath = result.filePaths[0]
+    }
+    const status = await importLocalPaddleOcrAddon(selectedPath, (progress) => emitLocalPaddleOcrProgress(event, progress))
+    persistLocalPaddleOcrStatus(status)
+    if (status.installed) {
+      setSettingValue('ocr_default_engine', 'local_paddle')
+      setSettingValue('ocr_active_provider_id', 'local_paddle')
+    }
+    saveDatabase()
+    return status
+  })
+
+  ipcMain.handle('settings:setDefaultOcrEngine', async (
+    _event,
+    engine: OcrEngine,
+    providerId?: string,
+  ): Promise<SettingsMap> => {
+    if (!['local_paddle', 'paddle', 'vision_model', 'hybrid'].includes(engine)) {
+      throw new Error('不支持的 OCR 引擎')
+    }
+    setSettingValue('ocr_default_engine', engine)
+    setSettingValue('ocr_active_provider_id', String(providerId || engine))
+    saveDatabase()
+    const rows = queryAll<Setting>('SELECT key, value FROM settings')
+    const result: SettingsMap = {}
+    for (const row of rows) result[row.key] = row.value
+    return result
   })
 
   ipcMain.handle('settings:llmProfiles:list', async (): Promise<LlmProviderProfileState> => {

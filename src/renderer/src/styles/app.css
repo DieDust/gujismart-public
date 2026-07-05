@@ -2141,6 +2141,190 @@ body.is-app-tab-dragging * {
   border-bottom: 1px solid rgba(196, 149, 106, 0.2);
 }
 
+.settings-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.settings-choice-card {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 6px 10px;
+  align-items: center;
+  min-height: 92px;
+  padding: 14px;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.025);
+  color: var(--gs-text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-choice-card:hover {
+  border-color: rgba(196,149,106,0.34);
+  background: rgba(196,149,106,0.08);
+}
+
+.settings-choice-card .anticon {
+  grid-row: 1 / span 2;
+  color: var(--gs-gold);
+  font-size: 20px;
+}
+
+.settings-choice-card span {
+  color: var(--gs-text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-provider-shell {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+  margin-bottom: 14px;
+  align-items: start;
+}
+
+.settings-provider-list,
+.settings-provider-panel {
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.025);
+}
+
+.settings-provider-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  padding: 8px;
+  max-height: min(680px, calc(100vh - 230px));
+  overflow: auto;
+}
+
+.settings-provider-panel {
+  min-width: 0;
+  min-height: min(680px, calc(100vh - 230px));
+  padding: 16px;
+}
+
+.settings-provider-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px dashed rgba(196,149,106,0.28);
+  border-radius: 7px;
+  background: rgba(196,149,106,0.06);
+  color: var(--gs-gold);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-provider-add:hover {
+  border-color: rgba(196,149,106,0.48);
+  background: rgba(196,149,106,0.12);
+}
+
+.settings-provider-item {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 48px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--gs-text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-provider-item:hover,
+.settings-provider-item.active {
+  border-color: rgba(196,149,106,0.25);
+  background: rgba(196,149,106,0.1);
+}
+
+.settings-provider-item strong,
+.settings-provider-item small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-provider-item small {
+  color: var(--gs-text-tertiary);
+  font-size: 12px;
+}
+
+.settings-provider-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--gs-gold);
+}
+
+.settings-local-ocr-status {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px;
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px;
+  background: rgba(0,0,0,0.14);
+}
+
+.settings-provider-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+}
+
+.settings-editor-block {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px;
+  background: rgba(0,0,0,0.14);
+}
+
+.settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 14px;
+}
+
+.settings-form-grid .ant-form-item {
+  margin-bottom: 14px;
+}
+
+.settings-action-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.settings-path-text {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
 @media (max-width: 860px) {
   .settings-view {
     padding: 20px 14px;
@@ -2160,6 +2344,23 @@ body.is-app-tab-dragging * {
 
   .settings-nav-item {
     white-space: nowrap;
+  }
+
+  .settings-choice-grid,
+  .settings-provider-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-local-ocr-status {
+    flex-direction: column;
+  }
+
+  .settings-provider-header {
+    flex-direction: column;
+  }
+
+  .settings-form-grid {
+    grid-template-columns: 1fr;
   }
 }
 

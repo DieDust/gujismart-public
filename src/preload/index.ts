@@ -105,6 +105,10 @@ import type {
   LibraryStateCache,
   ListDocumentOptions,
   ListModelsPayload,
+  LocalPaddleOcrDownloadOptions,
+  LocalPaddleOcrDownloadProgress,
+  LocalPaddleOcrSource,
+  LocalPaddleOcrStatus,
   LlmProviderProfile,
   LlmProviderProfileState,
   LlmProviderProfilesResult,
@@ -634,6 +638,16 @@ const api = {
   },
   listPaddleOcrModels: (apiKey?: string): Promise<string[]> =>
     ipcRenderer.invoke('settings:listPaddleOcrModels', apiKey),
+  getLocalPaddleOcrStatus: (): Promise<LocalPaddleOcrStatus> =>
+    ipcRenderer.invoke('settings:getLocalPaddleOcrStatus'),
+  checkLocalPaddleOcrSources: (): Promise<LocalPaddleOcrSource[]> =>
+    ipcRenderer.invoke('settings:checkLocalPaddleOcrSources'),
+  downloadLocalPaddleOcr: (options?: LocalPaddleOcrDownloadOptions): Promise<LocalPaddleOcrStatus> =>
+    ipcRenderer.invoke('settings:downloadLocalPaddleOcr', options),
+  importLocalPaddleOcrAddon: (filePath?: string): Promise<LocalPaddleOcrStatus> =>
+    ipcRenderer.invoke('settings:importLocalPaddleOcrAddon', filePath),
+  setDefaultOcrEngine: (engine: OcrEngine, providerId?: string): Promise<SettingsMap> =>
+    ipcRenderer.invoke('settings:setDefaultOcrEngine', engine, providerId),
   listLlmProviderProfiles: (): Promise<LlmProviderProfileState> =>
     ipcRenderer.invoke('settings:llmProfiles:list'),
   saveCurrentLlmProviderProfile: (name?: string): Promise<LlmProviderProfileState> =>
@@ -729,6 +743,13 @@ const api = {
     ipcRenderer.on('ocr:statusChanged', handler)
     return () => {
       ipcRenderer.removeListener('ocr:statusChanged', handler)
+    }
+  },
+  onLocalPaddleOcrDownloadProgress: (callback: (data: LocalPaddleOcrDownloadProgress) => void): IpcUnsubscribe => {
+    const handler = (_event: Electron.IpcRendererEvent, data: LocalPaddleOcrDownloadProgress) => callback(data)
+    ipcRenderer.on('settings:localPaddleOcrDownloadProgress', handler)
+    return () => {
+      ipcRenderer.removeListener('settings:localPaddleOcrDownloadProgress', handler)
     }
   },
   onBackgroundTaskStatusChanged: (callback: (data: BackgroundTaskProgressEvent) => void): IpcUnsubscribe => {

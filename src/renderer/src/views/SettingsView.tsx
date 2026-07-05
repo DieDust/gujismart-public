@@ -18,11 +18,12 @@ import {
   FolderOpenOutlined,
   ImportOutlined,
   ReloadOutlined,
+  RobotOutlined,
 } from '@ant-design/icons'
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrDownloadSourceId, type LocalPaddleOcrStatus, type OcrEngine, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
 
@@ -32,6 +33,7 @@ type SettingsSectionKey =
   | 'pdfRepository'
   | 'batch'
   | 'data'
+  | 'ocr'
   | 'paddleOcr'
   | 'visionOcr'
   | 'ai'
@@ -44,9 +46,8 @@ const SETTINGS_SECTIONS: Array<{ key: SettingsSectionKey; label: string; icon: R
   { key: 'pdfRepository', label: 'PDF 原件仓库', icon: <FolderOpenOutlined /> },
   { key: 'batch', label: '批量处理', icon: <SettingOutlined /> },
   { key: 'data', label: '数据管理', icon: <DatabaseOutlined /> },
-  { key: 'paddleOcr', label: 'PaddleOCR 接口', icon: <ApiOutlined /> },
-  { key: 'visionOcr', label: '视觉模型 OCR', icon: <ApiOutlined /> },
-  { key: 'ai', label: 'AI 模型接口', icon: <ApiOutlined /> },
+  { key: 'ocr', label: 'OCR', icon: <ApiOutlined /> },
+  { key: 'ai', label: 'AI', icon: <ApiOutlined /> },
   { key: 'glossary', label: '翻译术语表', icon: <BookOutlined /> },
   { key: 'about', label: '关于与版权', icon: <GithubOutlined /> },
 ]
@@ -118,6 +119,25 @@ function normalizeVisionModel(baseUrl: unknown, model: unknown): string {
 
 function hasFieldValidationErrors(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'errorFields' in error
+}
+
+function isOcrEngine(value: unknown): value is OcrEngine {
+  return value === 'local_paddle' || value === 'paddle' || value === 'vision_model' || value === 'hybrid'
+}
+
+function normalizeOcrEngine(value: unknown): OcrEngine {
+  return isOcrEngine(value) ? value : 'paddle'
+}
+
+function findSavedProfileId(profiles: LlmProviderProfile[] | undefined, provider: string, baseUrl: string, model: string): string {
+  const normalizedProvider = provider.trim()
+  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, '')
+  const normalizedModel = model.trim()
+  return profiles?.find((profile) => (
+    (profile.provider || profile.name) === normalizedProvider
+    && profile.baseUrl === normalizedBaseUrl
+    && profile.model === normalizedModel
+  ))?.id || profiles?.[0]?.id || ''
 }
 
 const PADDLE_OCR_APPLY_URL = 'https://aistudio.baidu.com/paddleocr'
@@ -358,10 +378,18 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const autoBackupSlotCountRef = useRef(3)
   const [llmProfiles, setLlmProfiles] = useState<LlmProviderProfile[]>([])
   const [activeLlmProfileId, setActiveLlmProfileId] = useState('')
+  const [selectedAiProviderId, setSelectedAiProviderId] = useState('')
   const [llmProfileBusy, setLlmProfileBusy] = useState(false)
   const [visionOcrProfiles, setVisionOcrProfiles] = useState<LlmProviderProfile[]>([])
   const [activeVisionOcrProfileId, setActiveVisionOcrProfileId] = useState('')
   const [visionOcrProfileBusy, setVisionOcrProfileBusy] = useState(false)
+  const [defaultOcrEngine, setDefaultOcrEngine] = useState<OcrEngine>('paddle')
+  const [activeOcrProviderId, setActiveOcrProviderId] = useState('paddle')
+  const [selectedOcrProviderId, setSelectedOcrProviderId] = useState('paddle')
+  const [showOcrSetupChoices, setShowOcrSetupChoices] = useState(false)
+  const [localPaddleStatus, setLocalPaddleStatus] = useState<LocalPaddleOcrStatus | null>(null)
+  const [localPaddleBusy, setLocalPaddleBusy] = useState(false)
+  const [localPaddleDownloadProgress, setLocalPaddleDownloadProgress] = useState<LocalPaddleOcrDownloadProgress | null>(null)
   const [paddleOcrModelOptions, setPaddleOcrModelOptions] = useState<string[]>([])
   const [paddleOcrModelsLoading, setPaddleOcrModelsLoading] = useState(false)
   const [llmModelOptions, setLlmModelOptions] = useState<string[]>([])
@@ -379,6 +407,12 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [glossaryLoading, setGlossaryLoading] = useState(false)
   const [glossaryModalOpen, setGlossaryModalOpen] = useState(false)
   const [editingGlossaryTerm, setEditingGlossaryTerm] = useState<TranslationGlossaryTerm | null>(null)
+  const watchedLlmProvider = Form.useWatch('llm_provider', form)
+  const watchedLlmBaseUrl = Form.useWatch('llm_base_url', form)
+  const watchedLlmModel = Form.useWatch('llm_model', form)
+  const watchedVisionOcrProvider = Form.useWatch('vision_ocr_provider', form)
+  const watchedVisionOcrBaseUrl = Form.useWatch('vision_ocr_base_url', form)
+  const watchedVisionOcrModel = Form.useWatch('vision_ocr_model', form)
   const databaseCompactionWorthwhile = isDatabaseCompactionWorthwhile(databaseDiagnostics)
 
   const setSettingsDirty = useCallback((dirty: boolean) => {
@@ -476,6 +510,12 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         const currentVisionPreset = VISION_PROVIDER_PRESETS.find((item) => item.baseUrl === effectiveVisionBaseUrl.replace(/\/+$/, ''))
         if (currentLlmPreset) setLlmModelOptions(currentLlmPreset.models)
         if (currentVisionPreset) setVisionModelOptions(currentVisionPreset.models)
+        const savedOcrEngine = normalizeOcrEngine(settings.ocr_default_engine)
+        const savedOcrProviderId = settings.ocr_active_provider_id || savedOcrEngine
+        setDefaultOcrEngine(savedOcrEngine)
+        setActiveOcrProviderId(savedOcrProviderId)
+        setSelectedOcrProviderId(savedOcrProviderId)
+        setShowOcrSetupChoices(!settings.ocr_default_engine)
         setAutoOcr(settings.auto_ocr_after_import !== 'false')
         setAutoAi(settings.auto_ai_after_ocr !== 'false')
         setAutoDeletePdfAssets(settings.auto_delete_pdf_assets_after_ocr === 'true')
@@ -485,18 +525,34 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         setMetadataTagBindingEnabled(nextMetadataTagBindingEnabled)
         setBatchSize(parseInt(settings.batch_size || '5', 10))
         setRetryCount(parseInt(settings.retry_count || '3', 10))
-        const llmProfileState = await window.api.listLlmProviderProfiles()
+        const [
+          llmProfileState,
+          visionOcrProfileState,
+          localOcrStatus,
+          backupStatus,
+          nextPdfRepositoryStatus,
+          nextAppVersion,
+          nextResearchProjects,
+        ] = await Promise.all([
+          window.api.listLlmProviderProfiles(),
+          window.api.listVisionOcrProviderProfiles(),
+          window.api.getLocalPaddleOcrStatus(),
+          window.api.getBackupStatus(),
+          window.api.listPdfRepositories(),
+          window.api.getVersion(),
+          window.api.listResearchProjects(),
+        ])
         setLlmProfiles(llmProfileState.profiles || [])
         setActiveLlmProfileId(llmProfileState.activeId || '')
-        const visionOcrProfileState = await window.api.listVisionOcrProviderProfiles()
+        setSelectedAiProviderId(llmProfileState.activeId || (currentLlmPreset ? `preset:${currentLlmPreset.name}` : 'custom'))
         setVisionOcrProfiles(visionOcrProfileState.profiles || [])
         setActiveVisionOcrProfileId(visionOcrProfileState.activeId || '')
-        const status = await window.api.getBackupStatus()
-        setBackupStatus(status)
-        syncAutoBackupDraft(status)
-        setPdfRepositoryStatus(await window.api.listPdfRepositories())
-        setAppVersion(await window.api.getVersion())
-        setResearchProjects(await window.api.listResearchProjects())
+        setLocalPaddleStatus(localOcrStatus)
+        setBackupStatus(backupStatus)
+        syncAutoBackupDraft(backupStatus)
+        setPdfRepositoryStatus(nextPdfRepositoryStatus)
+        setAppVersion(nextAppVersion)
+        setResearchProjects(nextResearchProjects)
       } catch (error) {
         console.error('加载设置失败:', error)
       } finally {
@@ -507,6 +563,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
     void loadSettings()
   }, [form, setSettingsDirty, syncAutoBackupDraft])
+
+  useEffect(() => {
+    const unsubscribe = window.api.onLocalPaddleOcrDownloadProgress((progress) => {
+      setLocalPaddleDownloadProgress(progress)
+    })
+    return () => unsubscribe()
+  }, [])
 
   useEffect(() => {
     const unsubscribe = window.api.onBackgroundTaskStatusChanged((event) => {
@@ -664,6 +727,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       if (!detail?.current) return
       setLlmProfiles(detail.profiles || [])
       setActiveLlmProfileId(detail.activeId || '')
+      setSelectedAiProviderId(detail.activeId || '')
       form.setFieldsValue({
         llm_provider: detail.current.provider || detail.current.name,
         llm_base_url: detail.current.baseUrl,
@@ -727,7 +791,12 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           apiKey: String(values.llm_api_key || ''),
           model: String(values.llm_model || '').trim(),
         })
-        const profileId = upserted.profiles?.[0]?.id
+        const profileId = findSavedProfileId(
+          upserted.profiles,
+          providerName,
+          String(values.llm_base_url || ''),
+          String(values.llm_model || ''),
+        )
         if (!profileId) throw new Error('AI 服务商配置保存失败')
         const state = await window.api.switchLlmProviderProfile(profileId)
         setLlmProfiles(state.profiles || [])
@@ -778,9 +847,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   }), [handleSave])
 
   const handleProviderChange = (provider: string) => {
+    if (provider === 'custom') {
+      setSelectedAiProviderId('custom')
+      form.setFieldValue('llm_provider', '自定义')
+      markSettingsDirty()
+      return
+    }
     const preset = AI_PROVIDER_PRESETS.find((item) => item.name === provider)
     if (!preset) return
+    setSelectedAiProviderId(`preset:${preset.name}`)
     form.setFieldsValue({
+      llm_provider: preset.name,
       llm_base_url: preset.baseUrl,
       llm_model: preset.models[0],
     })
@@ -794,6 +871,52 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setVisionModelOptions(preset.models[0] ? [preset.models[0]] : [])
     }
     markSettingsDirty()
+  }
+
+  const handleSelectLlmProfileForEdit = (profile: LlmProviderProfile) => {
+    setSelectedAiProviderId(profile.id)
+    form.setFieldsValue({
+      llm_provider: profile.provider || profile.name,
+      llm_base_url: profile.baseUrl,
+      llm_api_key: profile.apiKey,
+      llm_model: profile.model,
+    })
+    setLlmModelOptions(profile.model ? [String(profile.model)] : [])
+  }
+
+  const handleAddLlmProviderDraft = () => {
+    setSelectedAiProviderId('custom')
+    form.setFieldsValue({
+      llm_provider: '自定义',
+      llm_base_url: '',
+      llm_api_key: '',
+      llm_model: '',
+    })
+    setLlmModelOptions([])
+  }
+
+  const handleSelectVisionOcrProfileForEdit = (profile: LlmProviderProfile) => {
+    setSelectedOcrProviderId(profile.id)
+    form.setFieldsValue({
+      vision_ocr_provider: profile.provider || profile.name,
+      vision_ocr_base_url: profile.baseUrl,
+      vision_ocr_api_key: profile.apiKey,
+      vision_ocr_model: profile.model,
+      vision_ocr_use_llm_config: false,
+    })
+    setVisionModelOptions(profile.model ? [String(profile.model)] : [])
+  }
+
+  const handleAddVisionOcrProviderDraft = () => {
+    setSelectedOcrProviderId('vision_model')
+    form.setFieldsValue({
+      vision_ocr_provider: DEFAULT_VISION_PROVIDER.name,
+      vision_ocr_base_url: DEFAULT_VISION_PROVIDER.baseUrl,
+      vision_ocr_api_key: '',
+      vision_ocr_model: DEFAULT_VISION_MODEL,
+      vision_ocr_use_llm_config: false,
+    })
+    setVisionModelOptions(DEFAULT_VISION_PROVIDER.models)
   }
 
   const handleVisionProviderChange = (provider: string) => {
@@ -877,10 +1000,94 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setPaddleOcrModelsLoading(false)
     }
   }
+
+  const refreshLocalPaddleStatus = async () => {
+    const status = await window.api.getLocalPaddleOcrStatus()
+    setLocalPaddleStatus(status)
+    return status
+  }
+
+  const handleSetDefaultOcrProvider = async (engine: OcrEngine, providerId: string) => {
+    try {
+      await window.api.setDefaultOcrEngine(engine, providerId)
+      setDefaultOcrEngine(engine)
+      setActiveOcrProviderId(providerId)
+      setSelectedOcrProviderId(providerId)
+      setShowOcrSetupChoices(false)
+      message.success(`已设为默认 OCR：${engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? 'AI OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨云端 OCR'}`)
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '切换默认 OCR 失败'))
+    }
+  }
+
+  const handleDownloadLocalPaddle = async (source: LocalPaddleOcrDownloadSourceId = 'auto') => {
+    setLocalPaddleBusy(true)
+    setLocalPaddleDownloadProgress({ state: 'checking', sourceId: source, progress: 0, message: '正在准备本地 OCR 下载' })
+    try {
+      const status = await window.api.downloadLocalPaddleOcr({ source })
+      setLocalPaddleStatus(status)
+      if (status.installed) {
+        await handleSetDefaultOcrProvider('local_paddle', 'local_paddle')
+      } else {
+        message.warning(status.message || '本地 OCR 文件尚未完整安装，请导入完整 addon 后再启用。')
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '下载本地 OCR 失败'))
+    } finally {
+      setLocalPaddleBusy(false)
+    }
+  }
+
+  const handleImportLocalPaddleAddon = async () => {
+    setLocalPaddleBusy(true)
+    setLocalPaddleDownloadProgress({ state: 'installing', sourceId: 'manual', progress: 0, message: '正在导入本地 OCR addon' })
+    try {
+      const status = await window.api.importLocalPaddleOcrAddon()
+      setLocalPaddleStatus(status)
+      if (status.installed) {
+        await handleSetDefaultOcrProvider('local_paddle', 'local_paddle')
+      } else {
+        message.warning(status.message || '已导入文件，但本地 OCR 仍未完整就绪。')
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '导入本地 OCR addon 失败'))
+    } finally {
+      setLocalPaddleBusy(false)
+    }
+  }
+
+  const handleCheckLocalPaddleSources = async () => {
+    setLocalPaddleBusy(true)
+    try {
+      const sources = await window.api.checkLocalPaddleOcrSources()
+      const availableCount = sources.filter((source) => source.available).length
+      message.success(`已检查 ${sources.length} 个本地 OCR 源，当前可访问 ${availableCount} 个。`)
+      await refreshLocalPaddleStatus()
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '检查本地 OCR 下载源失败'))
+    } finally {
+      setLocalPaddleBusy(false)
+    }
+  }
+
+  const handleChooseOcrSetup = async (choice: 'local' | 'cloud' | 'ai') => {
+    if (choice === 'local') {
+      setSelectedOcrProviderId('local_paddle')
+      await handleDownloadLocalPaddle('auto')
+      return
+    }
+    if (choice === 'cloud') {
+      await handleSetDefaultOcrProvider('paddle', 'paddle')
+      return
+    }
+    await handleSetDefaultOcrProvider('vision_model', activeVisionOcrProfileId || 'vision_model')
+  }
+
   const refreshLlmProfiles = async () => {
     const state = await window.api.listLlmProviderProfiles()
     setLlmProfiles(state.profiles || [])
     setActiveLlmProfileId(state.activeId || '')
+    if (!selectedAiProviderId) setSelectedAiProviderId(state.activeId || '')
     return state
   }
 
@@ -897,11 +1104,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         apiKey: String(values.llm_api_key || ''),
         model: String(values.llm_model || '').trim(),
       })
-      const profileId = upserted.profiles?.[0]?.id
+      const profileId = findSavedProfileId(
+        upserted.profiles,
+        providerName,
+        String(values.llm_base_url || ''),
+        String(values.llm_model || ''),
+      )
       if (!profileId) throw new Error('AI 服务商配置保存失败')
       const result = await window.api.switchLlmProviderProfile(profileId)
       setLlmProfiles(result.profiles?.length ? result.profiles : upserted.profiles || [])
       setActiveLlmProfileId(result.activeId || '')
+      setSelectedAiProviderId(result.activeId || profileId)
       if (form.getFieldValue('vision_ocr_use_llm_config')) {
         form.setFieldsValue({
           vision_ocr_provider: result.current?.provider || result.current?.name,
@@ -926,6 +1139,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       const result = await window.api.switchLlmProviderProfile(profileId)
       setLlmProfiles(result.profiles || [])
       setActiveLlmProfileId(result.activeId || '')
+      setSelectedAiProviderId(result.activeId || profileId)
       form.setFieldsValue({
         llm_provider: result.current.provider || result.current.name,
         llm_base_url: result.current.baseUrl,
@@ -956,6 +1170,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       const result = await window.api.deleteLlmProviderProfile(profileId)
       setLlmProfiles(result.profiles || [])
       setActiveLlmProfileId(result.activeId || '')
+      if (selectedAiProviderId === profileId) setSelectedAiProviderId(result.activeId || '')
       message.success('已删除 AI 服务商配置')
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '删除 AI 服务商配置失败'))
@@ -968,6 +1183,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     const state = await window.api.listVisionOcrProviderProfiles()
     setVisionOcrProfiles(state.profiles || [])
     setActiveVisionOcrProfileId(state.activeId || '')
+    if (!selectedOcrProviderId || selectedOcrProviderId === 'vision_model') setSelectedOcrProviderId(state.activeId || 'vision_model')
     return state
   }
 
@@ -984,11 +1200,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         apiKey: String(values.vision_ocr_api_key || ''),
         model: String(values.vision_ocr_model || '').trim(),
       })
-      const profileId = upserted.profiles?.[0]?.id
+      const profileId = findSavedProfileId(
+        upserted.profiles,
+        providerName,
+        String(values.vision_ocr_base_url || ''),
+        String(values.vision_ocr_model || ''),
+      )
       if (!profileId) throw new Error('视觉 OCR 服务商配置保存失败')
       const result = await window.api.switchVisionOcrProviderProfile(profileId)
       setVisionOcrProfiles(result.profiles?.length ? result.profiles : upserted.profiles || [])
       setActiveVisionOcrProfileId(result.activeId || '')
+      setSelectedOcrProviderId(result.activeId || profileId)
       form.setFieldsValue({
         vision_ocr_provider: result.current.provider || result.current.name,
         vision_ocr_base_url: result.current.baseUrl,
@@ -1011,6 +1233,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       const result = await window.api.switchVisionOcrProviderProfile(profileId)
       setVisionOcrProfiles(result.profiles || [])
       setActiveVisionOcrProfileId(result.activeId || '')
+      setSelectedOcrProviderId(result.activeId || profileId)
       form.setFieldsValue({
         vision_ocr_provider: result.current.provider || result.current.name,
         vision_ocr_base_url: result.current.baseUrl,
@@ -1033,6 +1256,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       const result = await window.api.deleteVisionOcrProviderProfile(profileId)
       setVisionOcrProfiles(result.profiles || [])
       setActiveVisionOcrProfileId(result.activeId || '')
+      if (selectedOcrProviderId === profileId) setSelectedOcrProviderId(result.activeId || 'vision_model')
       message.success('已删除视觉 OCR 服务商配置')
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '删除视觉 OCR 服务商配置失败'))
@@ -1288,6 +1512,319 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setPdfRepositoryBusy(false)
     }
   }
+
+  const selectedAiSavedProfile = llmProfiles.find((profile) => profile.id === selectedAiProviderId)
+  const savedAiProviderKeys = new Set(llmProfiles.map((profile) => {
+    const provider = String(profile.provider || profile.name || '').trim().toLowerCase()
+    const baseUrl = String(profile.baseUrl || '').trim().replace(/\/+$/, '').toLowerCase()
+    return `${provider}|${baseUrl}`
+  }))
+  const visibleAiProviderPresets = AI_PROVIDER_PRESETS.filter((preset) => {
+    const key = `${preset.name.trim().toLowerCase()}|${preset.baseUrl.trim().replace(/\/+$/, '').toLowerCase()}`
+    return !savedAiProviderKeys.has(key)
+  })
+  const currentAiProviderLabel = String(watchedLlmProvider || form.getFieldValue('llm_provider') || 'DeepSeek')
+  const currentAiBaseUrl = String(watchedLlmBaseUrl || form.getFieldValue('llm_base_url') || '')
+  const currentAiModel = String(watchedLlmModel || form.getFieldValue('llm_model') || '')
+  const selectedVisionOcrProfile = visionOcrProfiles.find((profile) => profile.id === selectedOcrProviderId)
+  const selectedOcrIsVision = selectedOcrProviderId === 'vision_model' || !!selectedVisionOcrProfile
+  const currentVisionOcrProviderLabel = String(watchedVisionOcrProvider || form.getFieldValue('vision_ocr_provider') || DEFAULT_VISION_PROVIDER.name)
+  const currentVisionOcrBaseUrl = String(watchedVisionOcrBaseUrl || form.getFieldValue('vision_ocr_base_url') || DEFAULT_VISION_PROVIDER.baseUrl)
+  const currentVisionOcrModel = String(watchedVisionOcrModel || form.getFieldValue('vision_ocr_model') || DEFAULT_VISION_MODEL)
+  const currentDefaultOcrLabel = defaultOcrEngine === 'local_paddle'
+    ? '本地 OCR'
+    : defaultOcrEngine === 'vision_model'
+    ? 'AI OCR'
+    : defaultOcrEngine === 'hybrid'
+    ? '混合 OCR'
+    : '飞桨云端 OCR'
+
+  const renderLocalPaddleEditor = () => (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <div className="settings-provider-header">
+        <div>
+          <Text strong style={{ color: 'var(--gs-text-primary)' }}>本地 PaddleOCR V6 small</Text>
+          <br />
+          <Text type="secondary">{localPaddleStatus?.message || '正在读取本地 OCR 状态'}</Text>
+          {localPaddleStatus?.installPath ? (
+            <>
+              <br />
+              <Text type="secondary" className="settings-path-text">{localPaddleStatus.installPath}</Text>
+            </>
+          ) : null}
+        </div>
+        <Space wrap>
+          <Button loading={localPaddleBusy} onClick={() => void refreshLocalPaddleStatus()}>刷新状态</Button>
+          <Button
+            type={defaultOcrEngine === 'local_paddle' ? 'primary' : 'default'}
+            disabled={!localPaddleStatus?.installed}
+            onClick={() => void handleSetDefaultOcrProvider('local_paddle', 'local_paddle')}
+          >
+            设为默认
+          </Button>
+        </Space>
+      </div>
+      <div className="settings-editor-block">
+        <Text type="secondary">安装状态</Text>
+        <div className="settings-action-grid">
+          <Button icon={<DownloadOutlined />} loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle('auto')}>自动下载</Button>
+          <Button loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle('github_release')}>Release addon</Button>
+          <Button loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle('paddle_bos')}>官方模型源</Button>
+          <Button loading={localPaddleBusy} onClick={() => void handleCheckLocalPaddleSources()}>检查源</Button>
+          <Button icon={<ImportOutlined />} loading={localPaddleBusy} onClick={() => void handleImportLocalPaddleAddon()}>手动导入 addon</Button>
+        </div>
+      </div>
+      {localPaddleDownloadProgress ? (
+        <Progress
+          percent={Math.round((localPaddleDownloadProgress.progress || 0) * 100)}
+          status={localPaddleDownloadProgress.state === 'error' ? 'exception' : localPaddleDownloadProgress.state === 'completed' ? 'success' : 'active'}
+          size="small"
+          format={() => localPaddleDownloadProgress.message || localPaddleDownloadProgress.state}
+        />
+      ) : null}
+    </Space>
+  )
+
+  const renderPaddleCloudEditor = () => (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <div className="settings-provider-header">
+        <div>
+          <Text strong style={{ color: 'var(--gs-text-primary)' }}>飞桨云端 OCR</Text>
+          <br />
+          <Text type="secondary">当前默认 OCR：{currentDefaultOcrLabel}</Text>
+        </div>
+        <Space wrap>
+          <Button loading={paddleOcrModelsLoading} onClick={() => void fetchPaddleOcrModelOptions()}>拉取模型</Button>
+          <Button type={defaultOcrEngine === 'paddle' ? 'primary' : 'default'} onClick={() => void handleSetDefaultOcrProvider('paddle', 'paddle')}>设为默认</Button>
+        </Space>
+      </div>
+      <Alert
+        type="info"
+        showIcon
+        message="用于 OCR 文字识别"
+        description={(
+          <Space direction="vertical" size={4}>
+            <Text type="secondary">飞桨 PaddleOCR API Token 可在飞桨 AI Studio 的 PaddleOCR 服务页申请。</Text>
+            <a href={PADDLE_OCR_APPLY_URL} target="_blank" rel="noreferrer">
+              <LinkOutlined /> 前往申请飞桨 PaddleOCR API
+            </a>
+          </Space>
+        )}
+      />
+      <div className="settings-form-grid">
+        <Form.Item label="API Token" name="paddleocr_api_key" extra="例如：abc123def456...">
+          <Input.Password prefix={<KeyOutlined />} placeholder="请输入 PaddleOCR API Token" />
+        </Form.Item>
+        <Form.Item label="PDF 异步 OCR 模型" name="ocr_async_model" extra="默认使用 PaddleOCR-VL-1.6；可拉取官方模型，也可手动输入模型 ID。">
+          <AutoComplete options={paddleOcrModelOptions.map((model) => ({ value: model, label: model }))}>
+            <Input suffix={<Button type="text" size="small" loading={paddleOcrModelsLoading} onClick={() => void fetchPaddleOcrModelOptions()}>拉取</Button>} />
+          </AutoComplete>
+        </Form.Item>
+        <Form.Item label="上传超时（秒）" name="ocr_upload_timeout_seconds" extra="填 0 表示不限制客户端上传时长。">
+          <InputNumber min={0} max={86400} step={60} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="图片上传最长边" name="ocr_max_image_side" extra="越大越清晰，但上传更慢。">
+          <InputNumber min={800} max={4096} step={100} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="图片 JPEG 质量" name="ocr_jpeg_quality" extra="建议 75-88。">
+          <InputNumber min={50} max={95} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="导入前压缩 PDF" name="pdf_compression_enabled" valuePropName="checked" extra="导入 PDF 后先压缩为库内原文。">
+          <Switch />
+        </Form.Item>
+        <Form.Item label="PDF 压缩阈值（MB）" name="pdf_compression_min_size_mb" extra="大于该体积才压缩；默认 10 MB。">
+          <InputNumber min={1} max={1024} step={1} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="PDF 压缩质量" name="pdf_compression_quality" extra="建议 75-88；默认 80。">
+          <InputNumber min={50} max={95} style={{ width: '100%' }} />
+        </Form.Item>
+      </div>
+    </Space>
+  )
+
+  const renderVisionOcrEditor = () => (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <div className="settings-provider-header">
+        <div>
+          <Text strong style={{ color: 'var(--gs-text-primary)' }}>{currentVisionOcrProviderLabel || 'AI OCR'}</Text>
+          <br />
+          <Text type="secondary">{currentVisionOcrModel || '未设置模型'} · {currentVisionOcrBaseUrl || '未设置接口地址'}</Text>
+        </div>
+        <Space wrap>
+          <Button loading={visionOcrProfileBusy} onClick={() => void refreshVisionOcrProfiles()}>刷新</Button>
+          <Button loading={visionModelsLoading} onClick={() => void fetchModelOptions('vision')}>拉取模型</Button>
+          <Button type="primary" loading={visionOcrProfileBusy} onClick={() => void handleSaveCurrentVisionOcrProfile()}>保存配置</Button>
+          <Button onClick={() => void handleSetDefaultOcrProvider('vision_model', activeVisionOcrProfileId || selectedOcrProviderId || 'vision_model')}>设为默认 OCR</Button>
+          {selectedVisionOcrProfile && selectedVisionOcrProfile.id !== activeVisionOcrProfileId ? (
+            <Popconfirm title="删除这个视觉 OCR 服务商配置？" onConfirm={() => void handleDeleteVisionOcrProfile(selectedVisionOcrProfile.id)}>
+              <Button danger disabled={visionOcrProfileBusy}>删除</Button>
+            </Popconfirm>
+          ) : null}
+        </Space>
+      </div>
+      <Alert
+        type="info"
+        showIcon
+        message="用于古籍、报纸和复杂版面的视觉理解 OCR"
+        description={(
+          <Space direction="vertical" size={4}>
+            <Text type="secondary">填写 OpenAI-compatible 视觉模型接口即可接入豆包、火山方舟或其他兼容模型。</Text>
+            <Space wrap>
+              <a href={VOLCENGINE_ARK_QUICKSTART_URL} target="_blank" rel="noreferrer"><LinkOutlined /> 官方快速开始</a>
+              <a href={VOLCENGINE_ARK_API_KEY_URL} target="_blank" rel="noreferrer"><LinkOutlined /> API Key 管理</a>
+              <a href={VOLCENGINE_ARK_ENDPOINT_URL} target="_blank" rel="noreferrer"><LinkOutlined /> 接入点说明</a>
+            </Space>
+          </Space>
+        )}
+      />
+      <div className="settings-form-grid">
+        <Form.Item label="服务商名称" name="vision_ocr_provider">
+          <Input placeholder="例如：豆包" />
+        </Form.Item>
+        <Form.Item label="视觉服务商预设">
+          <Space.Compact style={{ width: '100%' }}>
+            <Select
+              value={getVisionProviderSelectValue(watchedVisionOcrProvider)}
+              placeholder="选择视觉服务商"
+              onChange={handleVisionProviderChange}
+              options={[
+                ...VISION_PROVIDER_PRESETS.map((item) => ({ value: item.name, label: item.name })),
+                { value: 'custom', label: '自定义' },
+              ]}
+            />
+            <Button onClick={applyLlmConfigToVisionOcr}>套用 AI 配置</Button>
+          </Space.Compact>
+        </Form.Item>
+        <Form.Item label="API Base URL" name="vision_ocr_base_url" extra="例如：https://ark.cn-beijing.volces.com/api/v3">
+          <Input prefix={<ApiOutlined />} placeholder="https://ark.cn-beijing.volces.com/api/v3" />
+        </Form.Item>
+        <Form.Item label="API Key" name="vision_ocr_api_key">
+          <Input.Password prefix={<KeyOutlined />} placeholder="请输入视觉模型 API Key" />
+        </Form.Item>
+        <Form.Item label="视觉模型 ID" name="vision_ocr_model" extra="填写服务商控制台中的模型 ID；专属接入点才填写 endpoint ID。">
+          <AutoComplete
+            showSearch
+            allowClear
+            placeholder="doubao-seed-2-0-pro-260215"
+            onDropdownVisibleChange={(open) => {
+              if (open && visionModelOptions.length === 0) void fetchModelOptions('vision')
+            }}
+            onFocus={() => {
+              if (visionModelOptions.length === 0) void fetchModelOptions('vision')
+            }}
+            options={visionModelOptions.map((model) => ({ value: model, label: model }))}
+          >
+            <Input suffix={<Button type="text" size="small" loading={visionModelsLoading} onClick={() => void fetchModelOptions('vision')}>拉取</Button>} />
+          </AutoComplete>
+        </Form.Item>
+        <Form.Item label="跟随 AI 配置" name="vision_ocr_use_llm_config" valuePropName="checked" extra="实际 OCR 调用时使用当前 AI 配置。">
+          <Switch />
+        </Form.Item>
+        <Form.Item label="并发页数" name="vision_ocr_concurrency" extra="上限 20。">
+          <InputNumber min={1} max={20} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="单页超时（秒）" name="vision_ocr_timeout_seconds" extra="超过该时间会中断本页。">
+          <InputNumber min={30} max={900} step={30} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="上传最长边" name="vision_ocr_max_image_side" extra="越大越清晰，但越慢。">
+          <InputNumber min={800} max={4096} step={100} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item label="JPEG 质量" name="vision_ocr_jpeg_quality" extra="建议 75-88。">
+          <InputNumber min={50} max={95} style={{ width: '100%' }} />
+        </Form.Item>
+      </div>
+    </Space>
+  )
+
+  const renderHybridOcrEditor = () => (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <div className="settings-provider-header">
+        <div>
+          <Text strong style={{ color: 'var(--gs-text-primary)' }}>混合 OCR</Text>
+          <br />
+          <Text type="secondary">飞桨识别 + AI 整理</Text>
+        </div>
+        <Button type={defaultOcrEngine === 'hybrid' ? 'primary' : 'default'} onClick={() => void handleSetDefaultOcrProvider('hybrid', 'hybrid')}>设为默认</Button>
+      </div>
+      <div className="settings-editor-block">
+        <Text type="secondary">混合 OCR 会使用飞桨云端 OCR 的 Token 和 AI OCR 的视觉模型配置。请分别确认这两项已经可用。</Text>
+        <div className="settings-action-grid">
+          <Button onClick={() => setSelectedOcrProviderId('paddle')}>编辑飞桨云端 OCR</Button>
+          <Button onClick={() => setSelectedOcrProviderId(activeVisionOcrProfileId || 'vision_model')}>编辑 AI OCR</Button>
+        </div>
+      </div>
+    </Space>
+  )
+
+  const renderOcrEditor = () => {
+    if (selectedOcrProviderId === 'local_paddle') return renderLocalPaddleEditor()
+    if (selectedOcrProviderId === 'paddle') return renderPaddleCloudEditor()
+    if (selectedOcrProviderId === 'hybrid') return renderHybridOcrEditor()
+    if (selectedOcrIsVision) return renderVisionOcrEditor()
+    return renderPaddleCloudEditor()
+  }
+
+  const renderAiEditor = () => (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <div className="settings-provider-header">
+        <div>
+          <Text strong style={{ color: 'var(--gs-text-primary)' }}>{currentAiProviderLabel || 'AI 服务商'}</Text>
+          <br />
+          <Text type="secondary">{currentAiModel || '未设置模型'} · {currentAiBaseUrl || '未设置接口地址'}</Text>
+        </div>
+        <Space wrap>
+          <Button loading={llmProfileBusy} onClick={() => void refreshLlmProfiles()}>刷新</Button>
+          <Button loading={llmModelsLoading} onClick={() => void fetchModelOptions('llm')}>拉取模型</Button>
+          <Button type="primary" loading={llmProfileBusy} onClick={() => void handleSaveCurrentLlmProfile()}>保存并设为当前</Button>
+          {selectedAiSavedProfile && selectedAiSavedProfile.id !== activeLlmProfileId ? (
+            <Popconfirm title="删除这个 AI 服务商配置？" onConfirm={() => void handleDeleteLlmProfile(selectedAiSavedProfile.id)}>
+              <Button danger disabled={llmProfileBusy}>删除</Button>
+            </Popconfirm>
+          ) : null}
+        </Space>
+      </div>
+      <Alert
+        type="info"
+        showIcon
+        message="用于智能问答、翻译、摘要和元数据提取"
+        description={(
+          <Space direction="vertical" size={4}>
+            <Text type="secondary">左侧选择预设会填入接口地址和推荐模型；保存后会出现在左侧快捷切换列表。</Text>
+            <a href={DEEPSEEK_APPLY_URL} target="_blank" rel="noreferrer">
+              <LinkOutlined /> 前往申请 DeepSeek API
+            </a>
+          </Space>
+        )}
+      />
+      <div className="settings-form-grid">
+        <Form.Item label="供应商名称" name="llm_provider">
+          <Input placeholder="例如：DeepSeek" />
+        </Form.Item>
+        <Form.Item label="API Base URL" name="llm_base_url">
+          <Input prefix={<ApiOutlined />} placeholder="https://api.deepseek.com/v1" />
+        </Form.Item>
+        <Form.Item label="API Key" name="llm_api_key">
+          <Input.Password prefix={<KeyOutlined />} placeholder="请输入 API Key" />
+        </Form.Item>
+        <Form.Item label="默认模型" name="llm_model">
+          <AutoComplete
+            showSearch
+            allowClear
+            placeholder="deepseek-chat"
+            onDropdownVisibleChange={(open) => {
+              if (open && llmModelOptions.length === 0) void fetchModelOptions('llm')
+            }}
+            onFocus={() => {
+              if (llmModelOptions.length === 0) void fetchModelOptions('llm')
+            }}
+            options={llmModelOptions.map((model) => ({ value: model, label: model }))}
+          >
+            <Input suffix={<Button type="text" size="small" loading={llmModelsLoading} onClick={() => void fetchModelOptions('llm')}>拉取</Button>} />
+          </AutoComplete>
+        </Form.Item>
+      </div>
+    </Space>
+  )
 
   return (
     <div className="settings-view">
@@ -1864,10 +2401,71 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           </Card>
         </section>
 
-        <section className="settings-section" hidden={activeSettingsSection !== 'paddleOcr'}>
+        <section className="settings-section" hidden={activeSettingsSection !== 'ocr'}>
           <div className="settings-section-title">
-            <ApiOutlined /> PaddleOCR 接口
+            <ApiOutlined /> OCR 配置中心
           </div>
+          {showOcrSetupChoices ? (
+            <div className="settings-choice-grid">
+              <button type="button" className="settings-choice-card" onClick={() => void handleChooseOcrSetup('local')}>
+                <DownloadOutlined />
+                <strong>下载本地 OCR</strong>
+                <span>按需下载 PP-OCRv6 small addon，不进入主安装包。</span>
+              </button>
+              <button type="button" className="settings-choice-card" onClick={() => void handleChooseOcrSetup('cloud')}>
+                <ApiOutlined />
+                <strong>填写云端 OCR</strong>
+                <span>继续使用飞桨云端文档解析，适合批量 PDF。</span>
+              </button>
+              <button type="button" className="settings-choice-card" onClick={() => void handleChooseOcrSetup('ai')}>
+                <RobotOutlined />
+                <strong>使用 AI OCR</strong>
+                <span>使用视觉模型 OCR，适合复杂版面和图文混排。</span>
+              </button>
+            </div>
+          ) : null}
+          <div className="settings-provider-shell">
+            <div className="settings-provider-list" aria-label="OCR 引擎">
+              <button type="button" className="settings-provider-add" onClick={handleAddVisionOcrProviderDraft}>
+                <PlusOutlined /> 添加 AI OCR
+              </button>
+              {[
+                { id: 'local_paddle', label: '本地 PaddleOCR', desc: localPaddleStatus?.installed ? '已安装' : localPaddleStatus?.state === 'partial' ? '部分就绪' : '未安装', engine: 'local_paddle' as OcrEngine },
+                { id: 'paddle', label: '飞桨云端 OCR', desc: 'PaddleOCR 文档解析', engine: 'paddle' as OcrEngine },
+                { id: 'vision_model', label: 'AI OCR 配置', desc: currentVisionOcrModel || '视觉模型 OCR', engine: 'vision_model' as OcrEngine },
+                ...visionOcrProfiles.map((profile) => ({ id: profile.id, label: profile.name, desc: profile.model || 'AI OCR', engine: 'vision_model' as OcrEngine, profile })),
+                { id: 'hybrid', label: '混合 OCR', desc: '飞桨识别 + AI 整理', engine: 'hybrid' as OcrEngine },
+              ].map((provider) => {
+                const fixedProviderId = provider.id === 'local_paddle' || provider.id === 'paddle' || provider.id === 'hybrid'
+                const isDefaultProvider = activeOcrProviderId === provider.id || (fixedProviderId && defaultOcrEngine === provider.engine)
+                return (
+                  <button
+                    key={provider.id}
+                    type="button"
+                    className={`settings-provider-item${selectedOcrProviderId === provider.id ? ' active' : ''}`}
+                    onClick={() => {
+                      if ('profile' in provider && provider.profile) {
+                        handleSelectVisionOcrProfileForEdit(provider.profile)
+                        return
+                      }
+                      setSelectedOcrProviderId(provider.id)
+                    }}
+                  >
+                    <span className="settings-provider-dot" />
+                    <span>
+                      <strong>{provider.label}</strong>
+                      <small>{provider.desc}</small>
+                    </span>
+                    {isDefaultProvider ? <Tag color="gold">默认</Tag> : null}
+                  </button>
+                )
+              })}
+            </div>
+            <div className="settings-provider-panel">
+              {renderOcrEditor()}
+            </div>
+          </div>
+          {false ? (
           <Card size="small" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
             <Alert
               type="info"
@@ -1919,9 +2517,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <InputNumber min={50} max={95} style={{ width: 140 }} />
             </Form.Item>
           </Card>
+          ) : null}
         </section>
 
-        <section className="settings-section" hidden={activeSettingsSection !== 'visionOcr'}>
+        {false ? (
+        <section className="settings-section" hidden={activeSettingsSection !== 'ocr'}>
           <div className="settings-section-title">
             <ApiOutlined /> 视觉模型 OCR
           </div>
@@ -2064,11 +2664,47 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </Card>
           </Card>
         </section>
+        ) : null}
 
         <section className="settings-section" hidden={activeSettingsSection !== 'ai'}>
           <div className="settings-section-title">
-            <ApiOutlined /> AI 模型接口
+            <ApiOutlined /> AI 配置中心
           </div>
+          <div className="settings-provider-shell">
+            <div className="settings-provider-list" aria-label="AI 服务商">
+              <button type="button" className="settings-provider-add" onClick={handleAddLlmProviderDraft}>
+                <PlusOutlined /> 添加服务商
+              </button>
+              {[
+                ...llmProfiles.map((profile) => ({ id: profile.id, label: profile.name, desc: profile.model, profile })),
+                ...visibleAiProviderPresets.map((preset) => ({ id: `preset:${preset.name}`, label: preset.name, desc: preset.baseUrl, preset })),
+              ].map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`settings-provider-item${item.id === selectedAiProviderId ? ' active' : ''}`}
+                  onClick={() => {
+                    if ('profile' in item && item.profile) {
+                      handleSelectLlmProfileForEdit(item.profile)
+                    } else if ('preset' in item && item.preset) {
+                      handleProviderChange(item.preset.name)
+                    }
+                  }}
+                >
+                  <span className="settings-provider-dot" />
+                  <span>
+                    <strong>{item.label}</strong>
+                    <small>{item.desc || 'OpenAI compatible'}</small>
+                  </span>
+                  {item.id === activeLlmProfileId ? <Tag color="gold">当前</Tag> : null}
+                </button>
+              ))}
+            </div>
+            <div className="settings-provider-panel">
+              {renderAiEditor()}
+            </div>
+          </div>
+          {false ? (
           <Card size="small" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
             <Alert
               type="info"
@@ -2166,6 +2802,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </Space>
             </Card>
           </Card>
+          ) : null}
         </section>
 
         <section className="settings-section" hidden={activeSettingsSection !== 'glossary'}>

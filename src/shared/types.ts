@@ -231,7 +231,51 @@ export type TagSource =
   | 'version'
   | 'keywords'
   | (string & {})
-export type OcrEngine = 'paddle' | 'vision_model' | 'hybrid'
+export type OcrEngine = 'local_paddle' | 'paddle' | 'vision_model' | 'hybrid'
+export type LocalPaddleOcrInstallState = 'not_installed' | 'partial' | 'installed' | 'downloading' | 'error'
+export type LocalPaddleOcrDownloadSourceId = 'auto' | 'github_release' | 'paddle_bos' | 'modelscope' | 'huggingface' | 'manual'
+
+export interface LocalPaddleOcrSource {
+  id: Exclude<LocalPaddleOcrDownloadSourceId, 'auto'>
+  label: string
+  url: string
+  kind: 'addon' | 'model' | 'catalog' | 'manual'
+  available?: boolean
+  statusCode?: number
+  bytes?: number
+  error?: string
+}
+
+export interface LocalPaddleOcrStatus {
+  installed: boolean
+  state: LocalPaddleOcrInstallState
+  bundleVersion: string
+  installPath: string
+  runnerPath?: string
+  pythonPath?: string
+  modelPath?: string
+  detModelPath?: string
+  recModelPath?: string
+  message?: string
+  sources: LocalPaddleOcrSource[]
+  updatedAt?: string
+}
+
+export interface LocalPaddleOcrDownloadOptions {
+  source?: LocalPaddleOcrDownloadSourceId
+  manualPath?: string
+}
+
+export interface LocalPaddleOcrDownloadProgress {
+  state: 'checking' | 'downloading' | 'installing' | 'completed' | 'error'
+  sourceId?: LocalPaddleOcrDownloadSourceId
+  fileName?: string
+  bytesDone?: number
+  totalBytes?: number
+  progress?: number
+  message?: string
+  error?: string
+}
 export type OcrProfile = 'general' | 'guji_print_vertical'
 export type OcrSecondPass = 'none' | 'local_segmentation' | 'cloud_column_ocr'
 export type SearchExportFormat = 'txt' | 'markdown' | 'csv' | 'json'

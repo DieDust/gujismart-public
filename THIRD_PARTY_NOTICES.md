@@ -29,6 +29,17 @@ QPDF is used as an external command-line tool. If the bundled executable is unav
 
 These DLLs are not part of GujiSmart's Apache-2.0 source license. They are included only to let the bundled Windows QPDF binaries run on machines that do not already have the matching runtime installed.
 
+## Optional Downloaded Components
+
+### PaddleOCR PP-OCRv6 Addon
+
+- Location: user data directory, under `ocr-addons/pp-ocrv6-small/` after user opt-in.
+- Main package status: not bundled in Setup or Portable builds.
+- Purpose: optional local OCR using PaddleOCR PP-OCRv6 small.
+- License: PaddleOCR is Apache License 2.0; model files remain governed by PaddlePaddle/PaddleOCR upstream terms.
+- Upstream: <https://github.com/PaddlePaddle/PaddleOCR>
+- Implementation notes: see [docs/OCR_ADDON.md](docs/OCR_ADDON.md).
+
 ## Direct Runtime npm Dependencies
 
 The packaged app uses the following direct runtime dependencies from `package.json`. Transitive dependency details are recorded in `package-lock.json` and in each dependency package's own license metadata.

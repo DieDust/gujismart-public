@@ -554,7 +554,7 @@ function findSearchMatchIndexForLocator(
 }
 
 function isOcrEngine(value: unknown): value is OcrEngine {
-  return value === 'paddle' || value === 'vision_model' || value === 'hybrid'
+  return value === 'local_paddle' || value === 'paddle' || value === 'vision_model' || value === 'hybrid'
 }
 
 function getFacsimileExportOptions(format: DocumentExportFormat): DocumentExportOptions | undefined {
@@ -571,6 +571,7 @@ function getFacsimileExportOptions(format: DocumentExportFormat): DocumentExport
 }
 
 function getOcrEngineLabel(engine: string): string {
+  if (engine === 'local_paddle') return '本地 OCR'
   if (engine === 'vision_model') return '大模型 OCR'
   if (engine === 'hybrid') return '混合 OCR'
   return '飞桨 OCR'
@@ -3444,7 +3445,7 @@ export default function DocumentView({
       }
       const storedEngine = parseMaybeJson(doc.metadata)?.ocr_engine
       const targetEngine = isOcrEngine(storedEngine) ? storedEngine : undefined
-      if (targetEngine === 'vision_model' || targetEngine === 'hybrid') {
+      if (targetEngine === 'local_paddle' || targetEngine === 'vision_model' || targetEngine === 'hybrid') {
         const messageKey = `document-ocr-${doc.id}`
         try {
           await ensureOcrPageImages(doc, {
