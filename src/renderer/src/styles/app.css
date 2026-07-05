@@ -2141,45 +2141,6 @@ body.is-app-tab-dragging * {
   border-bottom: 1px solid rgba(196, 149, 106, 0.2);
 }
 
-.settings-choice-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 14px;
-}
-
-.settings-choice-card {
-  display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
-  gap: 6px 10px;
-  align-items: center;
-  min-height: 92px;
-  padding: 14px;
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 8px;
-  background: rgba(255,255,255,0.025);
-  color: var(--gs-text-primary);
-  text-align: left;
-  cursor: pointer;
-}
-
-.settings-choice-card:hover {
-  border-color: rgba(196,149,106,0.34);
-  background: rgba(196,149,106,0.08);
-}
-
-.settings-choice-card .anticon {
-  grid-row: 1 / span 2;
-  color: var(--gs-gold);
-  font-size: 20px;
-}
-
-.settings-choice-card span {
-  color: var(--gs-text-secondary);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
 .settings-provider-shell {
   display: grid;
   grid-template-columns: 280px minmax(0, 1fr);
@@ -2293,13 +2254,27 @@ body.is-app-tab-dragging * {
   border-bottom: 1px solid rgba(255,255,255,0.07);
 }
 
+.settings-provider-actions {
+  justify-content: flex-end;
+  max-width: 260px;
+}
+
+.settings-provider-actions .ant-btn {
+  min-width: 72px;
+}
+
 .settings-editor-block {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   padding: 12px;
   border: 1px solid rgba(255,255,255,0.07);
   border-radius: 8px;
   background: rgba(0,0,0,0.14);
+  overflow: hidden;
 }
 
 .settings-form-grid {
@@ -2316,6 +2291,52 @@ body.is-app-tab-dragging * {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.settings-local-model-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+  width: auto;
+  justify-self: stretch;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.settings-local-model-row {
+  display: grid;
+  gap: 4px;
+  width: auto;
+  justify-self: stretch;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 7px;
+  background: rgba(255,255,255,0.025);
+  overflow: hidden;
+}
+
+.settings-local-model-row .ant-typography {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.settings-local-model-specs {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  max-width: 100%;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  line-height: 1.55;
 }
 
 .settings-path-text {
@@ -2346,7 +2367,6 @@ body.is-app-tab-dragging * {
     white-space: nowrap;
   }
 
-  .settings-choice-grid,
   .settings-provider-shell {
     grid-template-columns: 1fr;
   }

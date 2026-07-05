@@ -4446,7 +4446,7 @@ function resolveOcrEngine(doc: Pick<OcrDocumentRow, 'metadata'>, requested?: Ocr
   }
   const configuredEngine = queryOne<{ value?: string | null }>('SELECT value FROM settings WHERE key = ?', ['ocr_default_engine'])?.value
   if (configuredEngine === 'local_paddle' || configuredEngine === 'paddle' || configuredEngine === 'vision_model' || configuredEngine === 'hybrid') {
-    return configuredEngine
+    return configuredEngine === 'hybrid' ? 'paddle' : configuredEngine
   }
   return 'paddle'
 }
@@ -5495,7 +5495,7 @@ async function processDocumentOcr(
     } else if (engine === 'local_paddle') {
       const localStatus = await getLocalPaddleOcrStatus()
       if (!localStatus.installed) {
-        throw new Error(localStatus.message || '本地 PaddleOCR 尚未安装，请先在设置页下载或导入本地 OCR addon。')
+        throw new Error(localStatus.message || '本地 PaddleOCR 尚未安装，请先在设置页下载本地 OCR 模型。')
       }
       if (pages.length === 0) {
         pages = await ensurePageRecords(docId, Number(doc.page_count || 0) || 0)

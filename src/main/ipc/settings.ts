@@ -673,9 +673,9 @@ export function registerSettingsIpc(): void {
     let selectedPath = String(filePath || '').trim()
     if (!selectedPath) {
       const result = await dialog.showOpenDialog({
-        title: '导入本地 OCR addon',
+        title: '导入本地 OCR 兼容包',
         properties: ['openFile'],
-        filters: [{ name: 'GujiSmart OCR addon', extensions: ['zip'] }],
+        filters: [{ name: '本地 OCR 兼容包', extensions: ['zip'] }],
       })
       if (result.canceled || result.filePaths.length === 0) {
         return getLocalPaddleOcrStatus()

@@ -19,6 +19,7 @@ const SETTINGS_LOAD_TIMEOUT_MS = 3000
 const PADDLE_OCR_APPLY_URL = 'https://aistudio.baidu.com/paddleocr'
 const DEEPSEEK_APPLY_URL = 'https://platform.deepseek.com/'
 const VOLCENGINE_ARK_API_KEY_URL = 'https://www.volcengine.com/docs/82379/1263279'
+const DEFAULT_LOCAL_PADDLE_OCR_SIZE = 'small'
 
 const AI_PROVIDER_PRESETS: ProviderPreset[] = [
   { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', models: ['deepseek-chat', 'deepseek-reasoner'] },
@@ -175,6 +176,7 @@ export default function OnboardingWizard() {
     setSaving(true)
     try {
       if (mode === 'local') {
+        await window.api.setSetting('local_paddle_ocr_size', DEFAULT_LOCAL_PADDLE_OCR_SIZE)
         const status = await window.api.downloadLocalPaddleOcr({ source: 'auto' })
         if (status.installed) {
           await window.api.setDefaultOcrEngine('local_paddle', 'local_paddle')
@@ -182,7 +184,7 @@ export default function OnboardingWizard() {
           message.success('本地 OCR 已设为默认')
           nextStep()
         } else {
-          message.warning(status.message || '本地 OCR 尚未完整安装，可稍后在设置页手动导入 addon。')
+          message.warning(status.message || '本地 OCR 尚未完整安装，可稍后在设置页重试下载。')
         }
         return
       }
@@ -429,6 +431,7 @@ export default function OnboardingWizard() {
                 使用 AI OCR
               </Button>
             </div>
+            <Text type="secondary">本地 OCR 默认下载 PP-OCRv6 中档；进入设置页后可以切换小 / 中 / 大。</Text>
             <Card size="small" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>API Token</Text>

@@ -31,12 +31,12 @@ These DLLs are not part of GujiSmart's Apache-2.0 source license. They are inclu
 
 ## Optional Downloaded Components
 
-### PaddleOCR PP-OCRv6 Addon
+### PaddleOCR PP-OCRv6 Models
 
-- Location: user data directory, under `ocr-addons/pp-ocrv6-small/` after user opt-in.
+- Location: user data directory, under `ocr-addons/pp-ocrv6-<size>/` after user opt-in.
 - Main package status: not bundled in Setup or Portable builds.
-- Purpose: optional local OCR using PaddleOCR PP-OCRv6 small.
-- License: PaddleOCR is Apache License 2.0; model files remain governed by PaddlePaddle/PaddleOCR upstream terms.
+- Purpose: optional local OCR using PaddleOCR PP-OCRv6.
+- License: PaddleOCR is Apache License 2.0; model files are downloaded from official Paddle sources and remain governed by PaddlePaddle/PaddleOCR upstream terms.
 - Upstream: <https://github.com/PaddlePaddle/PaddleOCR>
 - Implementation notes: see [docs/OCR_ADDON.md](docs/OCR_ADDON.md).
 

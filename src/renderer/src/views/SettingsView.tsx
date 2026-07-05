@@ -18,12 +18,11 @@ import {
   FolderOpenOutlined,
   ImportOutlined,
   ReloadOutlined,
-  RobotOutlined,
 } from '@ant-design/icons'
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrDownloadSourceId, type LocalPaddleOcrStatus, type OcrEngine, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type OcrEngine, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
 
@@ -129,6 +128,11 @@ function normalizeOcrEngine(value: unknown): OcrEngine {
   return isOcrEngine(value) ? value : 'paddle'
 }
 
+function normalizeVisibleOcrEngine(value: unknown): OcrEngine {
+  const engine = normalizeOcrEngine(value)
+  return engine === 'hybrid' ? 'paddle' : engine
+}
+
 function findSavedProfileId(profiles: LlmProviderProfile[] | undefined, provider: string, baseUrl: string, model: string): string {
   const normalizedProvider = provider.trim()
   const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, '')
@@ -141,12 +145,43 @@ function findSavedProfileId(profiles: LlmProviderProfile[] | undefined, provider
 }
 
 const PADDLE_OCR_APPLY_URL = 'https://aistudio.baidu.com/paddleocr'
+const PADDLE_OCR_OFFICIAL_URL = 'https://www.paddleocr.ai/'
 const DEEPSEEK_APPLY_URL = 'https://platform.deepseek.com/'
 const VOLCENGINE_ARK_QUICKSTART_URL = 'https://www.volcengine.com/docs/82379/1399008'
 const VOLCENGINE_ARK_API_KEY_URL = 'https://www.volcengine.com/docs/82379/1263279'
 const VOLCENGINE_ARK_ENDPOINT_URL = 'https://www.volcengine.com/docs/82379/1182403?lang=zh'
 const PROJECT_GITHUB_URL = 'https://github.com/DieDust/gujismart-public/'
 const LLM_PROFILE_SYNC_EVENT = 'gujismart:llm-profile-changed'
+const DEFAULT_LOCAL_PADDLE_OCR_SIZE = 'small'
+const LOCAL_PADDLE_OCR_SIZE_OPTIONS = [
+  {
+    value: 'tiny',
+    label: '小',
+    officialName: 'PP-OCRv6 tiny',
+    sizeText: '约 6 MB',
+    desc: '体积最小，下载最快，适合轻量离线识别',
+    hardwareTitle: '入门电脑 / 低频使用',
+    hardware: 'CPU：2 核以上，Intel i3 8 代或 Ryzen 3 3000 级别即可；内存：4 GB 可用，推荐 8 GB；显卡：不需要独显，核显即可。',
+  },
+  {
+    value: 'small',
+    label: '中',
+    officialName: 'PP-OCRv6 small',
+    sizeText: '约 31 MB',
+    desc: '推荐默认，速度、体积和准确率比较均衡',
+    hardwareTitle: '普通笔记本 / 日常批量',
+    hardware: 'CPU：4 核以上，Intel i5 8 代或 Ryzen 5 3000 级别起；内存：8 GB 可用，推荐 16 GB；显卡：非必须，批量任务有 4 GB 显存以上 NVIDIA 独显更合适。',
+  },
+  {
+    value: 'medium',
+    label: '大',
+    officialName: 'PP-OCRv6 medium',
+    sizeText: '约 133 MB',
+    desc: '准确率优先，体积更大，下载和识别更慢',
+    hardwareTitle: '高配电脑 / 准确率优先',
+    hardware: 'CPU：6 核以上，推荐 Intel i7 10 代或 Ryzen 7 4000 级别起；内存：16 GB 可用，批量建议 32 GB；显卡：建议 RTX 3060 / RTX 4060 或 6 GB 显存以上 NVIDIA 独显。',
+  },
+]
 
 const SHORTCUT_ITEMS: Array<{ action: ShortcutAction; label: string; hint: string }> = [
   { action: 'back', label: '返回 / 退出', hint: '阅读页返回文库；主界面触发退出确认' },
@@ -386,7 +421,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [defaultOcrEngine, setDefaultOcrEngine] = useState<OcrEngine>('paddle')
   const [activeOcrProviderId, setActiveOcrProviderId] = useState('paddle')
   const [selectedOcrProviderId, setSelectedOcrProviderId] = useState('paddle')
-  const [showOcrSetupChoices, setShowOcrSetupChoices] = useState(false)
   const [localPaddleStatus, setLocalPaddleStatus] = useState<LocalPaddleOcrStatus | null>(null)
   const [localPaddleBusy, setLocalPaddleBusy] = useState(false)
   const [localPaddleDownloadProgress, setLocalPaddleDownloadProgress] = useState<LocalPaddleOcrDownloadProgress | null>(null)
@@ -484,6 +518,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           ocr_upload_timeout_seconds: settings.ocr_upload_timeout_seconds || '3600',
           ocr_max_image_side: settings.ocr_max_image_side || '2200',
           ocr_jpeg_quality: settings.ocr_jpeg_quality || '82',
+          local_paddle_ocr_size: settings.local_paddle_ocr_size || DEFAULT_LOCAL_PADDLE_OCR_SIZE,
           pdf_compression_enabled: settings.pdf_compression_enabled === 'true',
           pdf_compression_min_size_mb: settings.pdf_compression_min_size_mb || '10',
           pdf_compression_quality: settings.pdf_compression_quality || settings.ocr_jpeg_quality || '80',
@@ -510,12 +545,16 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         const currentVisionPreset = VISION_PROVIDER_PRESETS.find((item) => item.baseUrl === effectiveVisionBaseUrl.replace(/\/+$/, ''))
         if (currentLlmPreset) setLlmModelOptions(currentLlmPreset.models)
         if (currentVisionPreset) setVisionModelOptions(currentVisionPreset.models)
-        const savedOcrEngine = normalizeOcrEngine(settings.ocr_default_engine)
-        const savedOcrProviderId = settings.ocr_active_provider_id || savedOcrEngine
+        const savedOcrEngine = normalizeVisibleOcrEngine(settings.ocr_default_engine)
+        const rawOcrProviderId = settings.ocr_active_provider_id || savedOcrEngine
+        const shouldMigrateHybridOcr = settings.ocr_default_engine === 'hybrid' || rawOcrProviderId === 'hybrid'
+        const savedOcrProviderId = shouldMigrateHybridOcr ? savedOcrEngine : rawOcrProviderId
         setDefaultOcrEngine(savedOcrEngine)
         setActiveOcrProviderId(savedOcrProviderId)
         setSelectedOcrProviderId(savedOcrProviderId)
-        setShowOcrSetupChoices(!settings.ocr_default_engine)
+        if (shouldMigrateHybridOcr) {
+          void window.api.setDefaultOcrEngine('paddle', 'paddle').catch((error) => console.warn('[SettingsView] 迁移旧混合 OCR 默认项失败', error))
+        }
         setAutoOcr(settings.auto_ocr_after_import !== 'false')
         setAutoAi(settings.auto_ai_after_ocr !== 'false')
         setAutoDeletePdfAssets(settings.auto_delete_pdf_assets_after_ocr === 'true')
@@ -1007,80 +1046,46 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     return status
   }
 
+  const handleChangeLocalPaddleSize = async (value: string) => {
+    try {
+      await window.api.setSetting('local_paddle_ocr_size', value)
+      await refreshLocalPaddleStatus()
+      setLocalPaddleDownloadProgress(null)
+    } catch (error: unknown) {
+      message.warning(getErrorMessage(error, '切换本地 OCR 模型档位失败'))
+    }
+  }
+
   const handleSetDefaultOcrProvider = async (engine: OcrEngine, providerId: string) => {
     try {
       await window.api.setDefaultOcrEngine(engine, providerId)
       setDefaultOcrEngine(engine)
       setActiveOcrProviderId(providerId)
       setSelectedOcrProviderId(providerId)
-      setShowOcrSetupChoices(false)
-      message.success(`已设为默认 OCR：${engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? 'AI OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨云端 OCR'}`)
+      message.success(`已设为默认 OCR：${engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? 'AI OCR' : '飞桨云端 OCR'}`)
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '切换默认 OCR 失败'))
     }
   }
 
-  const handleDownloadLocalPaddle = async (source: LocalPaddleOcrDownloadSourceId = 'auto') => {
+  const handleDownloadLocalPaddle = async () => {
     setLocalPaddleBusy(true)
-    setLocalPaddleDownloadProgress({ state: 'checking', sourceId: source, progress: 0, message: '正在准备本地 OCR 下载' })
+    setLocalPaddleDownloadProgress({ state: 'checking', sourceId: 'auto', progress: 0, message: '正在准备本地 OCR 下载' })
     try {
-      const status = await window.api.downloadLocalPaddleOcr({ source })
+      const selectedSize = String(form.getFieldValue('local_paddle_ocr_size') || DEFAULT_LOCAL_PADDLE_OCR_SIZE)
+      await window.api.setSetting('local_paddle_ocr_size', selectedSize)
+      const status = await window.api.downloadLocalPaddleOcr({ source: 'auto' })
       setLocalPaddleStatus(status)
       if (status.installed) {
         await handleSetDefaultOcrProvider('local_paddle', 'local_paddle')
       } else {
-        message.warning(status.message || '本地 OCR 文件尚未完整安装，请导入完整 addon 后再启用。')
+        message.warning(status.message || '本地 OCR 文件尚未完整安装，请稍后重试，或打开官方页面查看下载说明。')
       }
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '下载本地 OCR 失败'))
     } finally {
       setLocalPaddleBusy(false)
     }
-  }
-
-  const handleImportLocalPaddleAddon = async () => {
-    setLocalPaddleBusy(true)
-    setLocalPaddleDownloadProgress({ state: 'installing', sourceId: 'manual', progress: 0, message: '正在导入本地 OCR addon' })
-    try {
-      const status = await window.api.importLocalPaddleOcrAddon()
-      setLocalPaddleStatus(status)
-      if (status.installed) {
-        await handleSetDefaultOcrProvider('local_paddle', 'local_paddle')
-      } else {
-        message.warning(status.message || '已导入文件，但本地 OCR 仍未完整就绪。')
-      }
-    } catch (error: unknown) {
-      message.error(getErrorMessage(error, '导入本地 OCR addon 失败'))
-    } finally {
-      setLocalPaddleBusy(false)
-    }
-  }
-
-  const handleCheckLocalPaddleSources = async () => {
-    setLocalPaddleBusy(true)
-    try {
-      const sources = await window.api.checkLocalPaddleOcrSources()
-      const availableCount = sources.filter((source) => source.available).length
-      message.success(`已检查 ${sources.length} 个本地 OCR 源，当前可访问 ${availableCount} 个。`)
-      await refreshLocalPaddleStatus()
-    } catch (error: unknown) {
-      message.error(getErrorMessage(error, '检查本地 OCR 下载源失败'))
-    } finally {
-      setLocalPaddleBusy(false)
-    }
-  }
-
-  const handleChooseOcrSetup = async (choice: 'local' | 'cloud' | 'ai') => {
-    if (choice === 'local') {
-      setSelectedOcrProviderId('local_paddle')
-      await handleDownloadLocalPaddle('auto')
-      return
-    }
-    if (choice === 'cloud') {
-      await handleSetDefaultOcrProvider('paddle', 'paddle')
-      return
-    }
-    await handleSetDefaultOcrProvider('vision_model', activeVisionOcrProfileId || 'vision_model')
   }
 
   const refreshLlmProfiles = async () => {
@@ -1250,6 +1255,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  const handleSetSelectedVisionOcrAsDefault = async () => {
+    const providerId = selectedVisionOcrProfile?.id || activeVisionOcrProfileId || 'vision_model'
+    if (selectedVisionOcrProfile && selectedVisionOcrProfile.id !== activeVisionOcrProfileId) {
+      await handleSwitchVisionOcrProfile(selectedVisionOcrProfile.id)
+    }
+    await handleSetDefaultOcrProvider('vision_model', providerId)
+  }
+
   const handleDeleteVisionOcrProfile = async (profileId: string) => {
     setVisionOcrProfileBusy(true)
     try {
@@ -1301,6 +1314,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     } finally {
       setBackupBusy(false)
     }
+  }
+
+  const handleSetSelectedLlmAsCurrent = async () => {
+    if (!selectedAiSavedProfile) return
+    await handleSwitchLlmProfile(selectedAiSavedProfile.id)
   }
 
   const handleImportBackupFromPath = async (filePath: string) => {
@@ -1531,19 +1549,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const currentVisionOcrProviderLabel = String(watchedVisionOcrProvider || form.getFieldValue('vision_ocr_provider') || DEFAULT_VISION_PROVIDER.name)
   const currentVisionOcrBaseUrl = String(watchedVisionOcrBaseUrl || form.getFieldValue('vision_ocr_base_url') || DEFAULT_VISION_PROVIDER.baseUrl)
   const currentVisionOcrModel = String(watchedVisionOcrModel || form.getFieldValue('vision_ocr_model') || DEFAULT_VISION_MODEL)
+  const isLocalPaddleDefault = defaultOcrEngine === 'local_paddle'
+  const isPaddleCloudDefault = defaultOcrEngine === 'paddle'
   const currentDefaultOcrLabel = defaultOcrEngine === 'local_paddle'
     ? '本地 OCR'
     : defaultOcrEngine === 'vision_model'
     ? 'AI OCR'
-    : defaultOcrEngine === 'hybrid'
-    ? '混合 OCR'
     : '飞桨云端 OCR'
 
   const renderLocalPaddleEditor = () => (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
       <div className="settings-provider-header">
         <div>
-          <Text strong style={{ color: 'var(--gs-text-primary)' }}>本地 PaddleOCR V6 small</Text>
+          <Text strong style={{ color: 'var(--gs-text-primary)' }}>本地 PaddleOCR</Text>
           <br />
           <Text type="secondary">{localPaddleStatus?.message || '正在读取本地 OCR 状态'}</Text>
           {localPaddleStatus?.installPath ? (
@@ -1556,24 +1574,65 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <Space wrap>
           <Button loading={localPaddleBusy} onClick={() => void refreshLocalPaddleStatus()}>刷新状态</Button>
           <Button
-            type={defaultOcrEngine === 'local_paddle' ? 'primary' : 'default'}
-            disabled={!localPaddleStatus?.installed}
+            type={isLocalPaddleDefault ? 'default' : 'primary'}
+            disabled={!localPaddleStatus?.installed || isLocalPaddleDefault}
             onClick={() => void handleSetDefaultOcrProvider('local_paddle', 'local_paddle')}
           >
-            设为默认
+            {isLocalPaddleDefault ? '已设为默认' : '设为默认'}
           </Button>
         </Space>
       </div>
       <div className="settings-editor-block">
-        <Text type="secondary">安装状态</Text>
+        <Text strong style={{ color: 'var(--gs-text-primary)' }}>下载与安装</Text>
+        <Text type="secondary">点击下载即可，程序会直接从 Paddle 官方模型源获取 PP-OCRv6 检测与识别模型；识别运行需要本机官方 PaddleOCR/PaddleX 支持 PP-OCRv6，版本过旧时会提示升级。</Text>
         <div className="settings-action-grid">
-          <Button icon={<DownloadOutlined />} loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle('auto')}>自动下载</Button>
-          <Button loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle('github_release')}>Release addon</Button>
-          <Button loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle('paddle_bos')}>官方模型源</Button>
-          <Button loading={localPaddleBusy} onClick={() => void handleCheckLocalPaddleSources()}>检查源</Button>
-          <Button icon={<ImportOutlined />} loading={localPaddleBusy} onClick={() => void handleImportLocalPaddleAddon()}>手动导入 addon</Button>
+          <Button type="primary" icon={<DownloadOutlined />} loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle()}>下载/修复本地 OCR</Button>
+          <Button href={PADDLE_OCR_OFFICIAL_URL} target="_blank" rel="noreferrer">PaddleOCR 官方页面</Button>
         </div>
       </div>
+      <div className="settings-editor-block">
+        <Text strong style={{ color: 'var(--gs-text-primary)' }}>模型大小</Text>
+        <Text type="secondary">这里选择的是 PP-OCRv6 本地模型大小，不是 PaddleOCR-VL 或 PP-Structure 大模型。</Text>
+        <Form.Item
+          label="PP-OCRv6 档位"
+          name="local_paddle_ocr_size"
+          extra="默认推荐中（官方 small）；切换档位后点击下载/修复会安装对应检测与识别模型。"
+          style={{ marginBottom: 0 }}
+        >
+          <Select
+            onChange={(value) => void handleChangeLocalPaddleSize(String(value))}
+            options={LOCAL_PADDLE_OCR_SIZE_OPTIONS.map((option) => ({
+              value: option.value,
+              label: `${option.label}（${option.officialName}，${option.sizeText}）· ${option.desc}`,
+            }))}
+          />
+        </Form.Item>
+        <div className="settings-local-model-list">
+          {LOCAL_PADDLE_OCR_SIZE_OPTIONS.map((option) => (
+            <div className="settings-local-model-row" key={option.value}>
+              <Text strong style={{ color: 'var(--gs-text-primary)' }}>{option.label}：{option.officialName} · {option.sizeText}</Text>
+              <Text type="secondary">{option.desc}</Text>
+              <div className="settings-local-model-specs">
+                <Text strong style={{ color: 'var(--gs-text-primary)' }}>{option.hardwareTitle}</Text>
+                <Text type="secondary">{option.hardware}</Text>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      {localPaddleDownloadProgress?.state === 'error' ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="自动下载没有完成"
+          description={(
+            <Space direction="vertical" size={4}>
+              <Text type="secondary">{localPaddleDownloadProgress.error || localPaddleDownloadProgress.message || '请稍后重试，或打开官方页面查看下载说明。'}</Text>
+              <a href={PADDLE_OCR_OFFICIAL_URL} target="_blank" rel="noreferrer"><LinkOutlined /> 打开 PaddleOCR 官方页面</a>
+            </Space>
+          )}
+        />
+      ) : null}
       {localPaddleDownloadProgress ? (
         <Progress
           percent={Math.round((localPaddleDownloadProgress.progress || 0) * 100)}
@@ -1594,8 +1653,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <Text type="secondary">当前默认 OCR：{currentDefaultOcrLabel}</Text>
         </div>
         <Space wrap>
-          <Button loading={paddleOcrModelsLoading} onClick={() => void fetchPaddleOcrModelOptions()}>拉取模型</Button>
-          <Button type={defaultOcrEngine === 'paddle' ? 'primary' : 'default'} onClick={() => void handleSetDefaultOcrProvider('paddle', 'paddle')}>设为默认</Button>
+          <Button
+            type={isPaddleCloudDefault ? 'default' : 'primary'}
+            disabled={isPaddleCloudDefault}
+            onClick={() => void handleSetDefaultOcrProvider('paddle', 'paddle')}
+          >
+            {isPaddleCloudDefault ? '已设为默认' : '设为默认'}
+          </Button>
         </Space>
       </div>
       <Alert
@@ -1650,16 +1714,22 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <br />
           <Text type="secondary">{currentVisionOcrModel || '未设置模型'} · {currentVisionOcrBaseUrl || '未设置接口地址'}</Text>
         </div>
-        <Space wrap>
+        <Space wrap className="settings-provider-actions">
           <Button loading={visionOcrProfileBusy} onClick={() => void refreshVisionOcrProfiles()}>刷新</Button>
-          <Button loading={visionModelsLoading} onClick={() => void fetchModelOptions('vision')}>拉取模型</Button>
           <Button type="primary" loading={visionOcrProfileBusy} onClick={() => void handleSaveCurrentVisionOcrProfile()}>保存配置</Button>
-          <Button onClick={() => void handleSetDefaultOcrProvider('vision_model', activeVisionOcrProfileId || selectedOcrProviderId || 'vision_model')}>设为默认 OCR</Button>
-          {selectedVisionOcrProfile && selectedVisionOcrProfile.id !== activeVisionOcrProfileId ? (
-            <Popconfirm title="删除这个视觉 OCR 服务商配置？" onConfirm={() => void handleDeleteVisionOcrProfile(selectedVisionOcrProfile.id)}>
-              <Button danger disabled={visionOcrProfileBusy}>删除</Button>
-            </Popconfirm>
-          ) : null}
+          <Button
+            disabled={visionOcrProfileBusy || (defaultOcrEngine === 'vision_model' && activeOcrProviderId === (selectedVisionOcrProfile?.id || 'vision_model'))}
+            onClick={() => void handleSetSelectedVisionOcrAsDefault()}
+          >
+            设为默认 OCR
+          </Button>
+          <Popconfirm
+            title={selectedVisionOcrProfile?.id === activeVisionOcrProfileId ? '当前视觉 OCR 服务商正在使用中，不能删除。' : '删除这个视觉 OCR 服务商配置？'}
+            disabled={!selectedVisionOcrProfile || selectedVisionOcrProfile.id === activeVisionOcrProfileId || visionOcrProfileBusy}
+            onConfirm={() => selectedVisionOcrProfile ? void handleDeleteVisionOcrProfile(selectedVisionOcrProfile.id) : undefined}
+          >
+            <Button danger disabled={!selectedVisionOcrProfile || selectedVisionOcrProfile.id === activeVisionOcrProfileId || visionOcrProfileBusy}>删除</Button>
+          </Popconfirm>
         </Space>
       </div>
       <Alert
@@ -1736,30 +1806,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     </Space>
   )
 
-  const renderHybridOcrEditor = () => (
-    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-      <div className="settings-provider-header">
-        <div>
-          <Text strong style={{ color: 'var(--gs-text-primary)' }}>混合 OCR</Text>
-          <br />
-          <Text type="secondary">飞桨识别 + AI 整理</Text>
-        </div>
-        <Button type={defaultOcrEngine === 'hybrid' ? 'primary' : 'default'} onClick={() => void handleSetDefaultOcrProvider('hybrid', 'hybrid')}>设为默认</Button>
-      </div>
-      <div className="settings-editor-block">
-        <Text type="secondary">混合 OCR 会使用飞桨云端 OCR 的 Token 和 AI OCR 的视觉模型配置。请分别确认这两项已经可用。</Text>
-        <div className="settings-action-grid">
-          <Button onClick={() => setSelectedOcrProviderId('paddle')}>编辑飞桨云端 OCR</Button>
-          <Button onClick={() => setSelectedOcrProviderId(activeVisionOcrProfileId || 'vision_model')}>编辑 AI OCR</Button>
-        </div>
-      </div>
-    </Space>
-  )
-
   const renderOcrEditor = () => {
     if (selectedOcrProviderId === 'local_paddle') return renderLocalPaddleEditor()
     if (selectedOcrProviderId === 'paddle') return renderPaddleCloudEditor()
-    if (selectedOcrProviderId === 'hybrid') return renderHybridOcrEditor()
     if (selectedOcrIsVision) return renderVisionOcrEditor()
     return renderPaddleCloudEditor()
   }
@@ -1772,15 +1821,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <br />
           <Text type="secondary">{currentAiModel || '未设置模型'} · {currentAiBaseUrl || '未设置接口地址'}</Text>
         </div>
-        <Space wrap>
+        <Space wrap className="settings-provider-actions">
           <Button loading={llmProfileBusy} onClick={() => void refreshLlmProfiles()}>刷新</Button>
-          <Button loading={llmModelsLoading} onClick={() => void fetchModelOptions('llm')}>拉取模型</Button>
-          <Button type="primary" loading={llmProfileBusy} onClick={() => void handleSaveCurrentLlmProfile()}>保存并设为当前</Button>
-          {selectedAiSavedProfile && selectedAiSavedProfile.id !== activeLlmProfileId ? (
-            <Popconfirm title="删除这个 AI 服务商配置？" onConfirm={() => void handleDeleteLlmProfile(selectedAiSavedProfile.id)}>
-              <Button danger disabled={llmProfileBusy}>删除</Button>
-            </Popconfirm>
-          ) : null}
+          <Button type="primary" loading={llmProfileBusy} onClick={() => void handleSaveCurrentLlmProfile()}>保存配置</Button>
+          <Button disabled={!selectedAiSavedProfile || selectedAiSavedProfile.id === activeLlmProfileId || llmProfileBusy} onClick={() => void handleSetSelectedLlmAsCurrent()}>设为当前</Button>
+          <Popconfirm
+            title={selectedAiSavedProfile?.id === activeLlmProfileId ? '当前 AI 服务商正在使用中，不能删除。' : '删除这个 AI 服务商配置？'}
+            disabled={!selectedAiSavedProfile || selectedAiSavedProfile.id === activeLlmProfileId || llmProfileBusy}
+            onConfirm={() => selectedAiSavedProfile ? void handleDeleteLlmProfile(selectedAiSavedProfile.id) : undefined}
+          >
+            <Button danger disabled={!selectedAiSavedProfile || selectedAiSavedProfile.id === activeLlmProfileId || llmProfileBusy}>删除</Button>
+          </Popconfirm>
         </Space>
       </div>
       <Alert
@@ -2405,25 +2456,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           <div className="settings-section-title">
             <ApiOutlined /> OCR 配置中心
           </div>
-          {showOcrSetupChoices ? (
-            <div className="settings-choice-grid">
-              <button type="button" className="settings-choice-card" onClick={() => void handleChooseOcrSetup('local')}>
-                <DownloadOutlined />
-                <strong>下载本地 OCR</strong>
-                <span>按需下载 PP-OCRv6 small addon，不进入主安装包。</span>
-              </button>
-              <button type="button" className="settings-choice-card" onClick={() => void handleChooseOcrSetup('cloud')}>
-                <ApiOutlined />
-                <strong>填写云端 OCR</strong>
-                <span>继续使用飞桨云端文档解析，适合批量 PDF。</span>
-              </button>
-              <button type="button" className="settings-choice-card" onClick={() => void handleChooseOcrSetup('ai')}>
-                <RobotOutlined />
-                <strong>使用 AI OCR</strong>
-                <span>使用视觉模型 OCR，适合复杂版面和图文混排。</span>
-              </button>
-            </div>
-          ) : null}
           <div className="settings-provider-shell">
             <div className="settings-provider-list" aria-label="OCR 引擎">
               <button type="button" className="settings-provider-add" onClick={handleAddVisionOcrProviderDraft}>
@@ -2434,9 +2466,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 { id: 'paddle', label: '飞桨云端 OCR', desc: 'PaddleOCR 文档解析', engine: 'paddle' as OcrEngine },
                 { id: 'vision_model', label: 'AI OCR 配置', desc: currentVisionOcrModel || '视觉模型 OCR', engine: 'vision_model' as OcrEngine },
                 ...visionOcrProfiles.map((profile) => ({ id: profile.id, label: profile.name, desc: profile.model || 'AI OCR', engine: 'vision_model' as OcrEngine, profile })),
-                { id: 'hybrid', label: '混合 OCR', desc: '飞桨识别 + AI 整理', engine: 'hybrid' as OcrEngine },
               ].map((provider) => {
-                const fixedProviderId = provider.id === 'local_paddle' || provider.id === 'paddle' || provider.id === 'hybrid'
+                const fixedProviderId = provider.id === 'local_paddle' || provider.id === 'paddle'
                 const isDefaultProvider = activeOcrProviderId === provider.id || (fixedProviderId && defaultOcrEngine === provider.engine)
                 return (
                   <button

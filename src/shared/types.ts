@@ -233,13 +233,13 @@ export type TagSource =
   | (string & {})
 export type OcrEngine = 'local_paddle' | 'paddle' | 'vision_model' | 'hybrid'
 export type LocalPaddleOcrInstallState = 'not_installed' | 'partial' | 'installed' | 'downloading' | 'error'
-export type LocalPaddleOcrDownloadSourceId = 'auto' | 'github_release' | 'paddle_bos' | 'modelscope' | 'huggingface' | 'manual'
+export type LocalPaddleOcrDownloadSourceId = 'auto' | 'paddle_bos' | 'modelscope' | 'huggingface' | 'manual'
 
 export interface LocalPaddleOcrSource {
   id: Exclude<LocalPaddleOcrDownloadSourceId, 'auto'>
   label: string
   url: string
-  kind: 'addon' | 'model' | 'catalog' | 'manual'
+  kind: 'model' | 'catalog' | 'manual'
   available?: boolean
   statusCode?: number
   bytes?: number

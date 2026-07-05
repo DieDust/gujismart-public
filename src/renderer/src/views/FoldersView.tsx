@@ -177,13 +177,9 @@ function getFolderOcrEngineLabel(engine: OcrEngine | string): string {
   return engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
 }
 
-function isFolderOcrEngine(value: unknown): value is OcrEngine {
-  return value === 'local_paddle' || value === 'paddle' || value === 'vision_model' || value === 'hybrid'
-}
-
 async function getConfiguredDefaultFolderOcrEngine(): Promise<OcrEngine> {
   const rawValue = await window.api.getSetting('ocr_default_engine')
-  return isFolderOcrEngine(rawValue) ? rawValue : 'paddle'
+  return rawValue === 'local_paddle' || rawValue === 'paddle' || rawValue === 'vision_model' ? rawValue : 'paddle'
 }
 
 async function hasFolderOcrEngineConfig(engine: OcrEngine): Promise<boolean> {
@@ -199,7 +195,7 @@ async function hasFolderOcrEngineConfig(engine: OcrEngine): Promise<boolean> {
 }
 
 function getFolderOcrConfigWarning(engine: OcrEngine): string {
-  if (engine === 'local_paddle') return '请先在设置页下载或导入本地 OCR addon。'
+  if (engine === 'local_paddle') return '请先在设置页下载本地 OCR 模型。'
   if (engine === 'vision_model') return '请先在设置页配置视觉模型 OCR。'
   if (engine === 'hybrid') return '混合 OCR 需要同时配置飞桨 OCR 和视觉模型 OCR。'
   return '请先在设置页配置 PaddleOCR API Token。'
@@ -1624,7 +1620,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
           { key: 'ocr:local_paddle', label: '用本地 OCR' },
           { key: 'ocr:paddle', label: '用飞桨 OCR' },
           { key: 'ocr:vision_model', label: '用大模型 OCR' },
-          { key: 'ocr:hybrid', label: '用混合 OCR（飞桨+大模型整理）' },
         ],
       },
       {
@@ -1635,7 +1630,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
           { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
           { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
           { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
-          { key: 'ocr_force:hybrid', label: '用混合 OCR 覆盖' },
         ],
       },
       { key: 'metadata_extract', label: '批量抓取元数据', icon: <RobotOutlined /> },
@@ -1750,7 +1744,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                     { key: 'ocr:local_paddle', label: '用本地 OCR' },
                     { key: 'ocr:paddle', label: '用飞桨 OCR' },
                     { key: 'ocr:vision_model', label: '用大模型 OCR' },
-                    { key: 'ocr:hybrid', label: '用混合 OCR' },
                   ],
                 },
                 {
@@ -1761,7 +1754,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                     { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
                     { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
                     { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
-                    { key: 'ocr_force:hybrid', label: '用混合 OCR 覆盖' },
                   ],
                 },
                 { key: 'metadata_extract', label: '批量抓取元数据', icon: <RobotOutlined /> },
