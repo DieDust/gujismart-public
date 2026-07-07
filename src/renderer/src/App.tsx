@@ -64,6 +64,25 @@ type AppTabPointerDrag = {
   targetTabId: string | null
   targetDropPosition: TabDropPosition | null
 }
+type AppTabGroupDragTarget = {
+  type: 'tab' | 'group'
+  id: string
+  position: TabDropPosition
+}
+type AppTabGroupPointerDrag = {
+  groupId: string
+  pointerId: number
+  startClientX: number
+  startClientY: number
+  clientX: number
+  grabOffsetX: number
+  width: number
+  height: number
+  top: number
+  moved: boolean
+  previewElement: HTMLElement | null
+  target: AppTabGroupDragTarget | null
+}
 type OpenDocumentDisposition = 'current-tab' | 'new-foreground-tab'
 type OpenDocumentOptions = {
   disposition?: OpenDocumentDisposition
@@ -325,6 +344,40 @@ function reorderAppTabs(current: AppTab[], sourceId: string, targetId: string, p
   return next.every((tab, index) => tab === current[index]) ? current : next
 }
 
+function reorderAppTabGroup(
+  current: AppTab[],
+  sourceGroupId: string,
+  target: AppTabGroupDragTarget,
+): AppTab[] {
+  if (!sourceGroupId) return current
+  if (target.type === 'group' && target.id === sourceGroupId) return current
+  const groupTabs = current.filter((tab) => tab.groupId === sourceGroupId)
+  if (groupTabs.length === 0) return current
+
+  const remainingTabs = current.filter((tab) => tab.groupId !== sourceGroupId)
+  let targetIndex = -1
+  if (target.type === 'group') {
+    const targetIndexes = remainingTabs
+      .map((tab, index) => tab.groupId === target.id ? index : -1)
+      .filter((index) => index >= 0)
+    if (targetIndexes.length === 0) return current
+    targetIndex = target.position === 'before'
+      ? Math.min(...targetIndexes)
+      : Math.max(...targetIndexes) + 1
+  } else {
+    const tabIndex = remainingTabs.findIndex((tab) => tab.id === target.id)
+    if (tabIndex < 0) return current
+    targetIndex = target.position === 'before' ? tabIndex : tabIndex + 1
+  }
+
+  const next = [
+    ...remainingTabs.slice(0, targetIndex),
+    ...groupTabs,
+    ...remainingTabs.slice(targetIndex),
+  ]
+  return next.every((tab, index) => tab === current[index]) ? current : next
+}
+
 function hasConfiguredText(value: unknown): boolean {
   return String(value || '').trim().length > 0
 }
@@ -408,6 +461,7 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState(() => initialWorkspace.activeTabId)
   const [tabMenuOpen, setTabMenuOpen] = useState(false)
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null)
+  const [draggedTabGroupId, setDraggedTabGroupId] = useState<string | null>(null)
   const [dragOverTabGroupId, setDragOverTabGroupId] = useState<string | null>(null)
   const [closedTabHistory, setClosedTabHistory] = useState<ClosedAppTabItem[]>([])
   const [shortcuts, setShortcuts] = useState<ShortcutMap | null>(null)
@@ -525,6 +579,7 @@ export default function App() {
   const suppressTabClickRef = useRef(false)
   const tabsRef = useRef(tabs)
   const tabPointerDragRef = useRef<AppTabPointerDrag | null>(null)
+  const tabGroupPointerDragRef = useRef<AppTabGroupPointerDrag | null>(null)
   const tabPointerCleanupRef = useRef<(() => void) | null>(null)
   const tabDragFrameRef = useRef<number | null>(null)
   const pendingTabLayoutRef = useRef<Map<string, number> | null>(null)
@@ -1403,13 +1458,86 @@ export default function App() {
     return layout
   }
 
+  const captureTabStripItemLayout = () => {
+    const layout = new Map<string, number>()
+    tabStripRef.current?.querySelectorAll<HTMLElement>(':scope > [data-app-tab-id], :scope > [data-app-tab-group-id]').forEach((element) => {
+      const key = element.dataset.appTabId
+        ? `tab:${element.dataset.appTabId}`
+        : element.dataset.appTabGroupId
+          ? `group:${element.dataset.appTabGroupId}`
+          : ''
+      if (key) layout.set(key, element.getBoundingClientRect().left)
+    })
+    return layout
+  }
+
+  const getTabGroupReorderTarget = (strip: HTMLElement, drag: AppTabGroupPointerDrag): AppTabGroupDragTarget | null => {
+    const desiredCenter = drag.clientX - drag.grabOffsetX + drag.width / 2
+    const items = Array.from(strip.querySelectorAll<HTMLElement>(':scope > [data-app-tab-id], :scope > [data-app-tab-group-id]'))
+      .map((element) => {
+        const tabId = element.dataset.appTabId
+        const groupId = element.dataset.appTabGroupId
+        if (groupId === drag.groupId) return null
+        if (!tabId && !groupId) return null
+        const bounds = element.getBoundingClientRect()
+        return {
+          type: groupId ? 'group' as const : 'tab' as const,
+          id: groupId || tabId || '',
+          bounds,
+        }
+      })
+      .filter((item): item is { type: 'tab' | 'group'; id: string; bounds: DOMRect } => !!item)
+
+    let target: AppTabGroupDragTarget | null = null
+    for (const item of items) {
+      if (desiredCenter < item.bounds.left + item.bounds.width / 2) {
+        target = { type: item.type, id: item.id, position: 'before' }
+        break
+      }
+      target = { type: item.type, id: item.id, position: 'after' }
+    }
+    return target
+  }
+
   const scheduleTabDragFrame = () => {
     if (tabDragFrameRef.current !== null) return
     tabDragFrameRef.current = window.requestAnimationFrame(() => {
       tabDragFrameRef.current = null
       const drag = tabPointerDragRef.current
+      const groupDrag = tabGroupPointerDragRef.current
       const strip = tabStripRef.current
-      if (!drag?.moved || !strip) return
+      if (!strip) return
+
+      if (groupDrag?.moved) {
+        const previewLeft = Math.min(
+          Math.max(6, groupDrag.clientX - groupDrag.grabOffsetX),
+          Math.max(6, window.innerWidth - groupDrag.width - 6),
+        )
+        const previewTop = Math.min(
+          Math.max(6, groupDrag.top - 2),
+          Math.max(6, window.innerHeight - groupDrag.height - 6),
+        )
+        groupDrag.previewElement?.style.setProperty(
+          'transform',
+          `translate3d(${previewLeft}px, ${previewTop}px, 0)`,
+        )
+
+        const target = getTabGroupReorderTarget(strip, groupDrag)
+        groupDrag.target = target
+        if (target) {
+          const currentTabs = tabsRef.current
+          const nextTabs = reorderAppTabGroup(currentTabs, groupDrag.groupId, target)
+          if (nextTabs !== currentTabs) {
+            pendingTabLayoutRef.current = captureTabStripItemLayout()
+            tabsRef.current = nextTabs
+            setTabs(nextTabs)
+            scheduleTabDragFrame()
+          }
+        }
+        return
+      }
+
+      if (!drag?.moved) return
 
       const previewLeft = Math.min(
         Math.max(6, drag.clientX - drag.grabOffsetX),
@@ -1565,6 +1693,52 @@ export default function App() {
     }, 0)
   }
 
+  const finishTabGroupPointerDrag = () => {
+    tabPointerCleanupRef.current?.()
+    tabPointerCleanupRef.current = null
+    if (tabDragFrameRef.current !== null) {
+      window.cancelAnimationFrame(tabDragFrameRef.current)
+      tabDragFrameRef.current = null
+    }
+
+    const drag = tabGroupPointerDragRef.current
+    const targetElement = drag
+      ? tabStripRef.current?.querySelector<HTMLElement>(`[data-app-tab-group-id="${CSS.escape(drag.groupId)}"]`)
+      : null
+    tabGroupPointerDragRef.current = null
+    document.body.classList.remove('is-app-tab-dragging')
+
+    if (!drag?.moved) {
+      suppressTabClickRef.current = false
+      return
+    }
+
+    const previewElement = drag.previewElement
+    const targetBounds = targetElement?.getBoundingClientRect()
+    const previewBounds = previewElement?.getBoundingClientRect()
+    if (previewElement && targetBounds && previewBounds) {
+      const settleAnimation = previewElement.animate(
+        [
+          { transform: `translate3d(${previewBounds.left}px, ${previewBounds.top}px, 0)` },
+          { transform: `translate3d(${targetBounds.left}px, ${targetBounds.top}px, 0)` },
+        ],
+        { duration: 160, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
+      )
+      void settleAnimation.finished
+        .catch(() => {})
+        .finally(() => {
+          previewElement.remove()
+          setDraggedTabGroupId(null)
+        })
+    } else {
+      previewElement?.remove()
+      setDraggedTabGroupId(null)
+    }
+    window.setTimeout(() => {
+      suppressTabClickRef.current = false
+    }, 0)
+  }
+
   const handleTabPointerDown = (event: React.PointerEvent<HTMLButtonElement>, tabId: string) => {
     if (event.button !== 0 || (event.target as HTMLElement).closest('.app-tab-close')) return
     tabPointerCleanupRef.current?.()
@@ -1633,20 +1807,102 @@ export default function App() {
     }
   }
 
+  const handleTabGroupPointerDown = (event: React.PointerEvent<HTMLButtonElement>, groupId: string) => {
+    if (event.button !== 0) return
+    tabPointerCleanupRef.current?.()
+    const groupElement = event.currentTarget.closest<HTMLElement>('[data-app-tab-group-id]')
+    if (!groupElement) return
+    const bounds = groupElement.getBoundingClientRect()
+    tabGroupPointerDragRef.current = {
+      groupId,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      clientX: event.clientX,
+      grabOffsetX: event.clientX - bounds.left,
+      width: bounds.width,
+      height: bounds.height,
+      top: bounds.top,
+      moved: false,
+      previewElement: null,
+      target: null,
+    }
+
+    const handlePointerMove = (pointerEvent: PointerEvent) => {
+      const drag = tabGroupPointerDragRef.current
+      if (!drag || pointerEvent.pointerId !== drag.pointerId) return
+      drag.clientX = pointerEvent.clientX
+      if (!drag.moved) {
+        const distance = Math.hypot(
+          pointerEvent.clientX - drag.startClientX,
+          pointerEvent.clientY - drag.startClientY,
+        )
+        if (distance < TAB_DRAG_ACTIVATION_DISTANCE) return
+        drag.moved = true
+        suppressTabClickRef.current = true
+        const previewElement = groupElement.cloneNode(true) as HTMLElement
+        previewElement.removeAttribute('data-app-tab-group-id')
+        previewElement.removeAttribute('data-app-tab-group-drop-target')
+        previewElement.removeAttribute('data-app-tab-group-collapsed')
+        previewElement.classList.remove('is-dragging-source')
+        previewElement.classList.add('app-tab-group-drag-preview')
+        previewElement.style.width = `${bounds.width}px`
+        previewElement.style.height = `${bounds.height}px`
+        previewElement.style.transform = `translate3d(${bounds.left}px, ${bounds.top - 2}px, 0)`
+        previewElement.querySelectorAll('[data-app-tab-id]').forEach((element) => {
+          element.removeAttribute('data-app-tab-id')
+        })
+        previewElement.querySelectorAll('.app-tab-close').forEach((element) => {
+          element.setAttribute('aria-hidden', 'true')
+        })
+        document.body.appendChild(previewElement)
+        drag.previewElement = previewElement
+        setDraggedTabGroupId(groupId)
+        document.body.classList.add('is-app-tab-dragging')
+        window.getSelection()?.removeAllRanges()
+      }
+      pointerEvent.preventDefault()
+      scheduleTabDragFrame()
+    }
+    const handlePointerEnd = (pointerEvent: PointerEvent) => {
+      const drag = tabGroupPointerDragRef.current
+      if (!drag || pointerEvent.pointerId !== drag.pointerId) return
+      finishTabGroupPointerDrag()
+    }
+    window.addEventListener('pointermove', handlePointerMove, { passive: false })
+    window.addEventListener('pointerup', handlePointerEnd)
+    window.addEventListener('pointercancel', handlePointerEnd)
+    tabPointerCleanupRef.current = () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerEnd)
+      window.removeEventListener('pointercancel', handlePointerEnd)
+    }
+  }
+
   useLayoutEffect(() => {
     const previousLayout = pendingTabLayoutRef.current
     const strip = tabStripRef.current
     if (!previousLayout || !strip) return
     pendingTabLayoutRef.current = null
     const draggingId = tabPointerDragRef.current?.tabId
-    strip.querySelectorAll<HTMLElement>('[data-app-tab-id]').forEach((element) => {
+    const draggingGroupId = tabGroupPointerDragRef.current?.groupId
+    const selector = draggingGroupId
+      ? ':scope > [data-app-tab-id], :scope > [data-app-tab-group-id]'
+      : '[data-app-tab-id]'
+    strip.querySelectorAll<HTMLElement>(selector).forEach((element) => {
       const tabId = element.dataset.appTabId
-      if (!tabId || tabId === draggingId) return
-      const previousLeft = previousLayout.get(tabId)
+      const groupId = element.dataset.appTabGroupId
+      if ((tabId && tabId === draggingId) || (groupId && groupId === draggingGroupId)) return
+      const layoutKey = draggingGroupId
+        ? tabId ? `tab:${tabId}` : groupId ? `group:${groupId}` : ''
+        : tabId || ''
+      if (!layoutKey) return
+      const previousLeft = previousLayout.get(layoutKey)
+        ?? (tabId ? previousLayout.get(tabId) ?? previousLayout.get(`tab:${tabId}`) : undefined)
       if (previousLeft === undefined) return
       const deltaX = previousLeft - element.getBoundingClientRect().left
       if (Math.abs(deltaX) < 0.5) return
-      tabReorderAnimationsRef.current.get(tabId)?.cancel()
+      tabReorderAnimationsRef.current.get(layoutKey)?.cancel()
       const animation = element.animate(
         [
           { transform: `translate3d(${deltaX}px, 0, 0)` },
@@ -1654,10 +1910,10 @@ export default function App() {
         ],
         { duration: 170, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
       )
-      tabReorderAnimationsRef.current.set(tabId, animation)
+      tabReorderAnimationsRef.current.set(layoutKey, animation)
       animation.addEventListener('finish', () => {
-        if (tabReorderAnimationsRef.current.get(tabId) === animation) {
-          tabReorderAnimationsRef.current.delete(tabId)
+        if (tabReorderAnimationsRef.current.get(layoutKey) === animation) {
+          tabReorderAnimationsRef.current.delete(layoutKey)
         }
       }, { once: true })
     })
@@ -1668,6 +1924,7 @@ export default function App() {
     if (tabDragFrameRef.current !== null) window.cancelAnimationFrame(tabDragFrameRef.current)
     tabReorderAnimationsRef.current.forEach((animation) => animation.cancel())
     tabPointerDragRef.current?.previewElement?.remove()
+    tabGroupPointerDragRef.current?.previewElement?.remove()
     document.body.classList.remove('is-app-tab-dragging')
   }, [])
 
@@ -2270,7 +2527,7 @@ export default function App() {
           <div className="app-tab-rail">
             <div
               ref={tabStripRef}
-              className={`app-tab-strip ${draggedTabId ? 'is-dragging' : ''}`}
+              className={`app-tab-strip ${draggedTabId || draggedTabGroupId ? 'is-dragging' : ''}`}
               data-app-tab-strip="true"
               data-app-tab-density={tabDensity}
               data-app-tab-count={tabs.length}
@@ -2283,6 +2540,7 @@ export default function App() {
                     <div
                       key={`group:${item.group.id}`}
                       className={`app-tab-group-segment ${item.group.collapsed ? 'is-collapsed' : ''} ${item.active ? 'is-active' : ''} ${dragOverTabGroupId === item.group.id ? 'is-drop-target' : ''}`}
+                      data-app-tab-group-dragging={draggedTabGroupId === item.group.id ? 'true' : undefined}
                       data-app-tab-group-drop-target={item.group.id}
                       data-app-tab-group-id={item.group.id}
                       data-app-tab-group-collapsed={item.group.collapsed ? 'true' : undefined}
@@ -2306,7 +2564,14 @@ export default function App() {
                           title={`${item.group.collapsed ? '展开' : '折叠'} ${item.group.title}`}
                           aria-label={`${item.group.collapsed ? '展开' : '折叠'} ${item.group.title}`}
                           onContextMenu={(event) => event.stopPropagation()}
-                          onClick={() => toggleTabGroupCollapsed(item.group.id)}
+                          onPointerDown={(event) => handleTabGroupPointerDown(event, item.group.id)}
+                          onClick={(event) => {
+                            if (suppressTabClickRef.current) {
+                              event.preventDefault()
+                              return
+                            }
+                            toggleTabGroupCollapsed(item.group.id)
+                          }}
                         >
                           <span className="app-tab-group-toggle">
                             {item.group.collapsed ? <RightOutlined /> : <DownOutlined />}

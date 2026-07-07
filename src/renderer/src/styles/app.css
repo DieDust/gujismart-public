@@ -419,6 +419,11 @@
   box-shadow: 0 0 8px color-mix(in srgb, var(--app-tab-group-color) 40%, transparent);
 }
 
+.app-tab-group-segment[data-app-tab-group-dragging='true'] {
+  opacity: 0;
+  pointer-events: none;
+}
+
 .app-tab-group-segment .app-tab {
   flex: 1 1 var(--app-tab-basis, 210px);
 }
@@ -700,6 +705,23 @@
   background: #292621 !important;
   border-color: rgba(212, 173, 132, 0.5) !important;
   box-shadow: 0 10px 24px rgba(0, 0, 0, 0.34), 0 0 0 1px rgba(212, 173, 132, 0.08);
+  cursor: grabbing;
+  pointer-events: none;
+  will-change: transform;
+  transition: none;
+}
+
+.app-tab-group-drag-preview {
+  position: fixed;
+  z-index: 4000;
+  left: 0;
+  top: 0;
+  margin: 0;
+  flex: none;
+  opacity: 1;
+  background: transparent !important;
+  border-radius: 0;
+  filter: drop-shadow(0 14px 20px rgba(0, 0, 0, 0.3));
   cursor: grabbing;
   pointer-events: none;
   will-change: transform;
