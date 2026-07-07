@@ -234,6 +234,8 @@ export type TagSource =
 export type OcrEngine = 'local_paddle' | 'paddle' | 'vision_model' | 'hybrid'
 export type LocalPaddleOcrInstallState = 'not_installed' | 'partial' | 'installed' | 'downloading' | 'error'
 export type LocalPaddleOcrDownloadSourceId = 'auto' | 'paddle_bos' | 'modelscope' | 'huggingface' | 'manual'
+export type LocalPaddleOcrRuntimeState = 'missing_python' | 'missing_packages' | 'outdated' | 'ready' | 'error'
+export type LocalPaddleOcrRuntimeSource = 'managed' | 'system'
 
 export interface LocalPaddleOcrSource {
   id: Exclude<LocalPaddleOcrDownloadSourceId, 'auto'>
@@ -246,8 +248,25 @@ export interface LocalPaddleOcrSource {
   error?: string
 }
 
+export interface LocalPaddleOcrRuntimeStatus {
+  state: LocalPaddleOcrRuntimeState
+  supported: boolean
+  source?: LocalPaddleOcrRuntimeSource
+  runtimePath: string
+  pythonPath?: string
+  paddleVersion?: string
+  paddleocrVersion?: string
+  paddlexVersion?: string
+  requiredPaddleVersion: string
+  requiredPaddleOcrVersion: string
+  requiredPaddlexVersion: string
+  message: string
+  error?: string
+}
+
 export interface LocalPaddleOcrStatus {
   installed: boolean
+  modelInstalled: boolean
   state: LocalPaddleOcrInstallState
   bundleVersion: string
   installPath: string
@@ -256,6 +275,7 @@ export interface LocalPaddleOcrStatus {
   modelPath?: string
   detModelPath?: string
   recModelPath?: string
+  runtime: LocalPaddleOcrRuntimeStatus
   message?: string
   sources: LocalPaddleOcrSource[]
   updatedAt?: string

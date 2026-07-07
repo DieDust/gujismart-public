@@ -2293,6 +2293,22 @@ body.is-app-tab-dragging * {
   gap: 8px;
 }
 
+.settings-runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.settings-runtime-grid .ant-typography,
+.settings-runtime-grid .ant-tag {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .settings-local-model-list {
   display: grid;
   gap: 8px;

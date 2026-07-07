@@ -40,12 +40,19 @@ Catalog pages can be linked from the UI for reference only:
 - File size is checked against the known official model size.
 - Official `.tar` files are extracted into `models/`.
 - The generated runner script is written into `runner/run_paddleocr.py`.
-- Local OCR status becomes `installed` only when the runner script and both extracted model directories are present.
-- Recognition requires an official PaddleOCR/PaddleX runtime version that supports PP-OCRv6. Older runtimes can download the models but will fail to load them.
+- A shared runtime environment is installed on demand under `ocr-addons/runtime-ppocrv6`.
+- The runtime installer creates an isolated Python venv and installs official packages with pip:
+  - `paddlepaddle>=3.2.1` from the official Paddle CPU package index
+  - `paddleocr>=3.7.0`
+  - `paddlex>=3.7.0`
+- Local OCR status becomes `installed` only when the runner script, both extracted model directories, and a PP-OCRv6-capable runtime are present.
+- Older system runtimes can download the models but will not be treated as ready until upgraded.
 
 ## Release Checklist
 
 - Do not upload PP-OCRv6 model files to GujiSmart GitHub Releases.
+- Do not bundle PaddleOCR/PaddleX/PaddlePaddle runtime packages in Setup or Portable builds.
 - Verify the main Setup and Portable artifacts do not contain PP-OCRv6 model files.
 - Verify automatic download reaches the official Paddle model URLs.
+- Verify runtime installation reaches official pip/Paddle package sources.
 - Verify downloaded files are installed under user data, not the app install directory.

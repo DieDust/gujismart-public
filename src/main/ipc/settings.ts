@@ -66,6 +66,7 @@ import {
   downloadLocalPaddleOcrAddon,
   getLocalPaddleOcrStatus,
   importLocalPaddleOcrAddon,
+  installLocalPaddleOcrRuntime,
 } from '../local-paddle-ocr'
 
 const PROJECT_GITHUB_REPO = 'DieDust/gujismart-public'
@@ -582,6 +583,8 @@ function persistLocalPaddleOcrStatus(status: LocalPaddleOcrStatus): void {
   setSettingValue('local_paddle_ocr_status', status.state)
   setSettingValue('local_paddle_ocr_bundle_version', status.bundleVersion)
   setSettingValue('local_paddle_ocr_path', status.installPath)
+  setSettingValue('local_paddle_ocr_runtime_status', status.runtime.state)
+  setSettingValue('local_paddle_ocr_runtime_path', status.runtime.runtimePath)
 }
 
 function emitLocalPaddleOcrProgress(event: Electron.IpcMainInvokeEvent, progress: LocalPaddleOcrDownloadProgress): void {
@@ -657,6 +660,19 @@ export function registerSettingsIpc(): void {
     options?: LocalPaddleOcrDownloadOptions,
   ): Promise<LocalPaddleOcrStatus> => {
     const status = await downloadLocalPaddleOcrAddon(options || {}, (progress) => emitLocalPaddleOcrProgress(event, progress))
+    persistLocalPaddleOcrStatus(status)
+    if (status.installed) {
+      setSettingValue('ocr_default_engine', 'local_paddle')
+      setSettingValue('ocr_active_provider_id', 'local_paddle')
+    }
+    saveDatabase()
+    return status
+  })
+
+  ipcMain.handle('settings:installLocalPaddleOcrRuntime', async (
+    event,
+  ): Promise<LocalPaddleOcrStatus> => {
+    const status = await installLocalPaddleOcrRuntime((progress) => emitLocalPaddleOcrProgress(event, progress))
     persistLocalPaddleOcrStatus(status)
     if (status.installed) {
       setSettingValue('ocr_default_engine', 'local_paddle')

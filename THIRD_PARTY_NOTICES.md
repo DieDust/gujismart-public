@@ -34,9 +34,10 @@ These DLLs are not part of GujiSmart's Apache-2.0 source license. They are inclu
 ### PaddleOCR PP-OCRv6 Models
 
 - Location: user data directory, under `ocr-addons/pp-ocrv6-<size>/` after user opt-in.
-- Main package status: not bundled in Setup or Portable builds.
+- Runtime location: user data directory, under `ocr-addons/runtime-ppocrv6/` after user opt-in.
+- Main package status: models and runtime packages are not bundled in Setup or Portable builds.
 - Purpose: optional local OCR using PaddleOCR PP-OCRv6.
-- License: PaddleOCR is Apache License 2.0; model files are downloaded from official Paddle sources and remain governed by PaddlePaddle/PaddleOCR upstream terms.
+- License: PaddleOCR is Apache License 2.0; model and runtime files are downloaded from official Paddle/PyPI sources and remain governed by upstream terms.
 - Upstream: <https://github.com/PaddlePaddle/PaddleOCR>
 - Implementation notes: see [docs/OCR_ADDON.md](docs/OCR_ADDON.md).
 

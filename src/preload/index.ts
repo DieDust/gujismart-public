@@ -644,6 +644,8 @@ const api = {
     ipcRenderer.invoke('settings:checkLocalPaddleOcrSources'),
   downloadLocalPaddleOcr: (options?: LocalPaddleOcrDownloadOptions): Promise<LocalPaddleOcrStatus> =>
     ipcRenderer.invoke('settings:downloadLocalPaddleOcr', options),
+  installLocalPaddleOcrRuntime: (): Promise<LocalPaddleOcrStatus> =>
+    ipcRenderer.invoke('settings:installLocalPaddleOcrRuntime'),
   importLocalPaddleOcrAddon: (filePath?: string): Promise<LocalPaddleOcrStatus> =>
     ipcRenderer.invoke('settings:importLocalPaddleOcrAddon', filePath),
   setDefaultOcrEngine: (engine: OcrEngine, providerId?: string): Promise<SettingsMap> =>

@@ -1078,11 +1078,31 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setLocalPaddleStatus(status)
       if (status.installed) {
         await handleSetDefaultOcrProvider('local_paddle', 'local_paddle')
+      } else if (status.modelInstalled) {
+        message.info(status.runtime?.message || '本地 OCR 模型已安装，请继续安装/升级运行环境。')
       } else {
         message.warning(status.message || '本地 OCR 文件尚未完整安装，请稍后重试，或打开官方页面查看下载说明。')
       }
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '下载本地 OCR 失败'))
+    } finally {
+      setLocalPaddleBusy(false)
+    }
+  }
+
+  const handleInstallLocalPaddleRuntime = async () => {
+    setLocalPaddleBusy(true)
+    setLocalPaddleDownloadProgress({ state: 'installing', progress: 0, message: '正在准备本地 OCR 运行环境' })
+    try {
+      const status = await window.api.installLocalPaddleOcrRuntime()
+      setLocalPaddleStatus(status)
+      if (status.installed) {
+        await handleSetDefaultOcrProvider('local_paddle', 'local_paddle')
+      } else {
+        message.success(status.runtime?.message || '本地 OCR 运行环境已安装，请继续下载模型。')
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '安装本地 OCR 运行环境失败'))
     } finally {
       setLocalPaddleBusy(false)
     }
@@ -1583,8 +1603,27 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         </Space>
       </div>
       <div className="settings-editor-block">
-        <Text strong style={{ color: 'var(--gs-text-primary)' }}>下载与安装</Text>
-        <Text type="secondary">点击下载即可，程序会直接从 Paddle 官方模型源获取 PP-OCRv6 检测与识别模型；识别运行需要本机官方 PaddleOCR/PaddleX 支持 PP-OCRv6，版本过旧时会提示升级。</Text>
+        <Text strong style={{ color: 'var(--gs-text-primary)' }}>运行环境</Text>
+        <Text type="secondary">{localPaddleStatus?.runtime?.message || '正在检测本地 OCR 运行环境'}</Text>
+        <div className="settings-runtime-grid">
+          <Tag color={localPaddleStatus?.runtime?.supported ? 'success' : localPaddleStatus?.runtime?.state === 'outdated' ? 'warning' : 'default'}>
+            {localPaddleStatus?.runtime?.supported ? '已支持 PP-OCRv6' : localPaddleStatus?.runtime?.state === 'outdated' ? '需要升级' : '未就绪'}
+          </Tag>
+          <Text type="secondary">Python：{localPaddleStatus?.runtime?.pythonPath || '未检测到'}</Text>
+          <Text type="secondary">PaddleOCR：{localPaddleStatus?.runtime?.paddleocrVersion || `需要 ${localPaddleStatus?.runtime?.requiredPaddleOcrVersion || '3.7.0'}+`}</Text>
+          <Text type="secondary">PaddleX：{localPaddleStatus?.runtime?.paddlexVersion || `需要 ${localPaddleStatus?.runtime?.requiredPaddlexVersion || '3.7.0'}+`}</Text>
+          <Text type="secondary">PaddlePaddle：{localPaddleStatus?.runtime?.paddleVersion || `需要 ${localPaddleStatus?.runtime?.requiredPaddleVersion || '3.2.1'}+`}</Text>
+        </div>
+        <div className="settings-action-grid">
+          <Button icon={<DownloadOutlined />} loading={localPaddleBusy} onClick={() => void handleInstallLocalPaddleRuntime()}>
+            {localPaddleStatus?.runtime?.supported ? '重新安装/升级运行环境' : '安装/升级运行环境'}
+          </Button>
+          <Button href={PADDLE_OCR_OFFICIAL_URL} target="_blank" rel="noreferrer">PaddleOCR 官方页面</Button>
+        </div>
+      </div>
+      <div className="settings-editor-block">
+        <Text strong style={{ color: 'var(--gs-text-primary)' }}>模型下载</Text>
+        <Text type="secondary">点击下载即可，程序会直接从 Paddle 官方模型源获取 PP-OCRv6 检测与识别模型；模型不会进入主安装包。</Text>
         <div className="settings-action-grid">
           <Button type="primary" icon={<DownloadOutlined />} loading={localPaddleBusy} onClick={() => void handleDownloadLocalPaddle()}>下载/修复本地 OCR</Button>
           <Button href={PADDLE_OCR_OFFICIAL_URL} target="_blank" rel="noreferrer">PaddleOCR 官方页面</Button>

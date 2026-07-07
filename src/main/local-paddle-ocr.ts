@@ -11,6 +11,7 @@ import type {
   LocalPaddleOcrDownloadOptions,
   LocalPaddleOcrDownloadProgress,
   LocalPaddleOcrDownloadSourceId,
+  LocalPaddleOcrRuntimeStatus,
   LocalPaddleOcrSource,
   LocalPaddleOcrStatus,
   OcrRecognizeLayoutBlock,
@@ -26,6 +27,12 @@ type LocalPaddleOcrSize = 'tiny' | 'small' | 'medium'
 const LOCAL_PADDLE_OCR_ROOT = 'ocr-addons'
 const DEFAULT_LOCAL_PADDLE_OCR_SIZE: LocalPaddleOcrSize = 'small'
 const OFFICIAL_MODEL_BASE_URL = 'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0'
+const LOCAL_PADDLE_OCR_RUNTIME_DIR = 'runtime-ppocrv6'
+const REQUIRED_PADDLE_VERSION = '3.2.1'
+const MAX_TESTED_PADDLE_VERSION_EXCLUSIVE = '3.3.0'
+const REQUIRED_PADDLE_OCR_VERSION = '3.7.0'
+const REQUIRED_PADDLEX_VERSION = '3.7.0'
+const PADDLE_CPU_INDEX_URL = 'https://www.paddlepaddle.org.cn/packages/stable/cpu/'
 const LOCAL_PADDLE_OCR_MODEL_PROFILES: Record<LocalPaddleOcrSize, {
   label: string
   dirName: string
@@ -76,6 +83,19 @@ interface RunnerInvocationResult {
   stderr: string
 }
 
+interface PythonCommand {
+  command: string
+  argsPrefix: string[]
+  label: string
+  source: 'managed' | 'system'
+}
+
+interface ProcessResult {
+  code: number | null
+  stdout: string
+  stderr: string
+}
+
 class DownloadHttpError extends Error {
   readonly status: number
   readonly url: string
@@ -96,6 +116,32 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms))
+}
+
+function compareVersions(a: string | undefined, b: string): number {
+  const left = String(a || '0').split(/[^\d]+/).filter(Boolean).map((part) => Number(part) || 0)
+  const right = String(b || '0').split(/[^\d]+/).filter(Boolean).map((part) => Number(part) || 0)
+  const length = Math.max(left.length, right.length)
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = left[index] || 0
+    const rightPart = right[index] || 0
+    if (leftPart > rightPart) return 1
+    if (leftPart < rightPart) return -1
+  }
+  return 0
+}
+
+function isVersionAtLeast(value: string | undefined, minimum: string): boolean {
+  return compareVersions(value, minimum) >= 0
+}
+
+function isVersionBelow(value: string | undefined, maximumExclusive: string): boolean {
+  return compareVersions(value, maximumExclusive) < 0
+}
+
+function isPaddleRuntimeVersionSupported(value: string | undefined): boolean {
+  return isVersionAtLeast(value, REQUIRED_PADDLE_VERSION)
+    && isVersionBelow(value, MAX_TESTED_PADDLE_VERSION_EXCLUSIVE)
 }
 
 function normalizeLocalPaddleOcrSize(value: unknown): LocalPaddleOcrSize {
@@ -149,6 +195,14 @@ function getLocalPaddleOcrDownloadPath(): string {
   return join(app.getPath('userData'), LOCAL_PADDLE_OCR_ROOT, 'downloads')
 }
 
+function getLocalPaddleOcrRuntimePath(): string {
+  return join(app.getPath('userData'), LOCAL_PADDLE_OCR_ROOT, LOCAL_PADDLE_OCR_RUNTIME_DIR)
+}
+
+function getLocalPaddleOcrRuntimePythonPath(): string {
+  return join(getLocalPaddleOcrRuntimePath(), process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+}
+
 function getManifestPath(size = getLocalPaddleOcrSizePreference()): string {
   return join(getLocalPaddleOcrInstallPath(size), 'manifest.json')
 }
@@ -176,6 +230,340 @@ function getDirectoryIfReadable(candidate: string): string | undefined {
   }
 }
 
+function runProcess(
+  command: string,
+  args: string[],
+  options: {
+    cwd?: string
+    env?: NodeJS.ProcessEnv
+    timeoutMs?: number
+    onOutput?: (text: string) => void
+  } = {},
+): Promise<ProcessResult> {
+  return new Promise((resolveProcess, rejectProcess) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
+        ...options.env,
+      },
+      windowsHide: true,
+    })
+    const stdout: Buffer[] = []
+    const stderr: Buffer[] = []
+    let settled = false
+    const timeout = options.timeoutMs
+      ? setTimeout(() => {
+        if (settled) return
+        settled = true
+        child.kill()
+        rejectProcess(new Error(`命令执行超时：${command}`))
+      }, options.timeoutMs)
+      : null
+
+    const handleOutput = (chunk: Buffer, target: Buffer[]) => {
+      target.push(chunk)
+      const text = chunk.toString('utf8').trim()
+      if (text) options.onOutput?.(text)
+    }
+
+    child.stdout.on('data', (chunk: Buffer) => handleOutput(chunk, stdout))
+    child.stderr.on('data', (chunk: Buffer) => handleOutput(chunk, stderr))
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      if (timeout) clearTimeout(timeout)
+      rejectProcess(error)
+    })
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      if (timeout) clearTimeout(timeout)
+      resolveProcess({
+        code,
+        stdout: Buffer.concat(stdout).toString('utf8').trim(),
+        stderr: Buffer.concat(stderr).toString('utf8').trim(),
+      })
+    })
+  })
+}
+
+async function runRequiredProcess(
+  command: string,
+  args: string[],
+  label: string,
+  options: Parameters<typeof runProcess>[2] = {},
+): Promise<ProcessResult> {
+  const result = await runProcess(command, args, options)
+  if (result.code !== 0) {
+    const output = [result.stderr, result.stdout].filter(Boolean).join('\n').slice(-2200)
+    throw new Error(`${label}失败：${output || `退出码 ${result.code}`}`)
+  }
+  return result
+}
+
+async function isPythonCommandAvailable(command: PythonCommand): Promise<boolean> {
+  try {
+    const result = await runProcess(command.command, [...command.argsPrefix, '--version'], { timeoutMs: 10_000 })
+    return result.code === 0
+  } catch {
+    return false
+  }
+}
+
+async function resolvePythonCommand(preferManaged = true): Promise<PythonCommand | undefined> {
+  const candidates: PythonCommand[] = []
+  const managedPythonPath = getLocalPaddleOcrRuntimePythonPath()
+  if (preferManaged && existsSync(managedPythonPath)) {
+    candidates.push({
+      command: managedPythonPath,
+      argsPrefix: [],
+      label: 'GujiSmart 本地 OCR 运行环境',
+      source: 'managed',
+    })
+  }
+  const envPython = String(process.env.GUJISMART_PYTHON || '').trim()
+  if (envPython) {
+    candidates.push({ command: envPython, argsPrefix: [], label: envPython, source: 'system' })
+  }
+  if (process.platform === 'win32') {
+    candidates.push(
+      { command: 'python', argsPrefix: [], label: 'python', source: 'system' },
+      { command: 'py', argsPrefix: ['-3'], label: 'py -3', source: 'system' },
+    )
+  } else {
+    candidates.push(
+      { command: 'python3', argsPrefix: [], label: 'python3', source: 'system' },
+      { command: 'python', argsPrefix: [], label: 'python', source: 'system' },
+    )
+  }
+  for (const candidate of candidates) {
+    if (await isPythonCommandAvailable(candidate)) return candidate
+  }
+  return undefined
+}
+
+async function queryPaddleRuntimeVersions(command: PythonCommand): Promise<Record<string, string | undefined>> {
+  const script = `
+import importlib.metadata as metadata
+import json
+
+def version(name):
+    try:
+        return metadata.version(name)
+    except Exception:
+        return None
+
+print(json.dumps({
+    "paddle": version("paddlepaddle"),
+    "paddleocr": version("paddleocr"),
+    "paddlex": version("paddlex"),
+}, ensure_ascii=False))
+`
+  const result = await runRequiredProcess(
+    command.command,
+    [...command.argsPrefix, '-c', script],
+    '检测本地 OCR 运行环境',
+    { timeoutMs: 20_000 },
+  )
+  const parsed: unknown = JSON.parse(result.stdout.split(/\r?\n/).filter(Boolean).pop() || '{}')
+  return isRecord(parsed)
+    ? {
+      paddle: typeof parsed.paddle === 'string' ? parsed.paddle : undefined,
+      paddleocr: typeof parsed.paddleocr === 'string' ? parsed.paddleocr : undefined,
+      paddlex: typeof parsed.paddlex === 'string' ? parsed.paddlex : undefined,
+    }
+    : {}
+}
+
+function createRuntimeStatus(
+  state: LocalPaddleOcrRuntimeStatus['state'],
+  message: string,
+  options: Partial<LocalPaddleOcrRuntimeStatus> = {},
+): LocalPaddleOcrRuntimeStatus {
+  return {
+    state,
+    supported: state === 'ready',
+    runtimePath: getLocalPaddleOcrRuntimePath(),
+    requiredPaddleVersion: REQUIRED_PADDLE_VERSION,
+    requiredPaddleOcrVersion: REQUIRED_PADDLE_OCR_VERSION,
+    requiredPaddlexVersion: REQUIRED_PADDLEX_VERSION,
+    message,
+    ...options,
+  }
+}
+
+export async function getLocalPaddleOcrRuntimeStatus(): Promise<LocalPaddleOcrRuntimeStatus> {
+  const command = await resolvePythonCommand(true)
+  if (!command) {
+    return createRuntimeStatus(
+      'missing_python',
+      '未检测到可用 Python，无法安装或运行本地 PaddleOCR。请先安装 Python 3.10/3.11，或稍后使用云端 OCR / AI OCR。',
+    )
+  }
+  try {
+    const versions = await queryPaddleRuntimeVersions(command)
+    const base = {
+      source: command.source,
+      pythonPath: command.command,
+      paddleVersion: versions.paddle,
+      paddleocrVersion: versions.paddleocr,
+      paddlexVersion: versions.paddlex,
+    }
+    const missing = [
+      versions.paddle ? null : 'paddlepaddle',
+      versions.paddleocr ? null : 'paddleocr',
+      versions.paddlex ? null : 'paddlex',
+    ].filter(Boolean)
+    if (missing.length > 0) {
+      return createRuntimeStatus(
+        'missing_packages',
+        `本地 OCR 运行环境缺少 ${missing.join('、')}，请点击“安装/升级运行环境”。`,
+        base,
+      )
+    }
+    const outdated = [
+      isVersionAtLeast(versions.paddle, REQUIRED_PADDLE_VERSION) ? null : `PaddlePaddle ${versions.paddle}`,
+      isVersionAtLeast(versions.paddleocr, REQUIRED_PADDLE_OCR_VERSION) ? null : `PaddleOCR ${versions.paddleocr}`,
+      isVersionAtLeast(versions.paddlex, REQUIRED_PADDLEX_VERSION) ? null : `PaddleX ${versions.paddlex}`,
+    ].filter(Boolean)
+    if (outdated.length > 0) {
+      return createRuntimeStatus(
+        'outdated',
+        `当前运行库版本过旧（${outdated.join('、')}），请点击“安装/升级运行环境”以支持 PP-OCRv6。`,
+        base,
+      )
+    }
+    return createRuntimeStatus(
+      'ready',
+      `本地 OCR 运行环境已支持 PP-OCRv6：PaddleOCR ${versions.paddleocr}，PaddleX ${versions.paddlex}。`,
+      base,
+    )
+  } catch (error) {
+    return createRuntimeStatus(
+      'error',
+      getResponseErrorMessage(error, '本地 OCR 运行环境检测失败'),
+      {
+        source: command.source,
+        pythonPath: command.command,
+        error: getResponseErrorMessage(error, '本地 OCR 运行环境检测失败'),
+      },
+    )
+  }
+}
+
+async function runRuntimeInstallStep(
+  python: PythonCommand,
+  args: string[],
+  label: string,
+  progress: number,
+  report?: DownloadProgressReporter,
+): Promise<void> {
+  report?.({
+    state: 'installing',
+    progress,
+    message: label,
+  })
+  await runRequiredProcess(
+    python.command,
+    [...python.argsPrefix, ...args],
+    label,
+    {
+      timeoutMs: 30 * 60_000,
+      onOutput: (text) => {
+        const compact = text.replace(/\s+/g, ' ').trim()
+        if (!compact) return
+        report?.({
+          state: 'installing',
+          progress,
+          message: `${label}：${compact.slice(0, 120)}`,
+        })
+      },
+    },
+  )
+}
+
+export async function installLocalPaddleOcrRuntime(report?: DownloadProgressReporter): Promise<LocalPaddleOcrStatus> {
+  const basePython = await resolvePythonCommand(false)
+  if (!basePython) {
+    throw new Error('未检测到可用 Python，无法安装本地 OCR 运行环境。请先安装 Python 3.10/3.11。')
+  }
+  const runtimePath = getLocalPaddleOcrRuntimePath()
+  const runtimePythonPath = getLocalPaddleOcrRuntimePythonPath()
+  await mkdir(dirname(runtimePath), { recursive: true })
+  if (!existsSync(runtimePythonPath)) {
+    report?.({
+      state: 'installing',
+      progress: 0.05,
+      message: '正在创建本地 OCR 独立 Python 运行环境',
+    })
+    await runRequiredProcess(
+      basePython.command,
+      [...basePython.argsPrefix, '-m', 'venv', runtimePath],
+      '创建本地 OCR Python 运行环境',
+      { timeoutMs: 5 * 60_000 },
+    )
+  }
+
+  const runtimePython: PythonCommand = {
+    command: runtimePythonPath,
+    argsPrefix: [],
+    label: 'GujiSmart 本地 OCR 运行环境',
+    source: 'managed',
+  }
+  await runRuntimeInstallStep(
+    runtimePython,
+    ['-m', 'pip', 'install', '-U', 'pip', 'setuptools', 'wheel'],
+    '正在更新 pip 基础组件',
+    0.15,
+    report,
+  )
+  await runRuntimeInstallStep(
+    runtimePython,
+    [
+      '-m',
+      'pip',
+      'install',
+      '-U',
+      `paddlepaddle>=${REQUIRED_PADDLE_VERSION}`,
+      '--index-url',
+      PADDLE_CPU_INDEX_URL,
+      '--extra-index-url',
+      'https://pypi.org/simple',
+    ],
+    '正在安装 PaddlePaddle 官方 CPU 推理引擎',
+    0.38,
+    report,
+  )
+  await runRuntimeInstallStep(
+    runtimePython,
+    [
+      '-m',
+      'pip',
+      'install',
+      '-U',
+      `paddleocr>=${REQUIRED_PADDLE_OCR_VERSION}`,
+      `paddlex>=${REQUIRED_PADDLEX_VERSION}`,
+    ],
+    '正在安装支持 PP-OCRv6 的 PaddleOCR / PaddleX',
+    0.72,
+    report,
+  )
+
+  const runtime = await getLocalPaddleOcrRuntimeStatus()
+  if (!runtime.supported) {
+    throw new Error(runtime.message || '本地 OCR 运行环境安装完成，但尚未支持 PP-OCRv6')
+  }
+  report?.({
+    state: 'completed',
+    progress: 1,
+    message: '本地 OCR 运行环境已支持 PP-OCRv6',
+  })
+  return getLocalPaddleOcrStatus()
+}
+
 function resolveLocalPaddleOcrPaths(size = getLocalPaddleOcrSizePreference()) {
   const profile = getLocalPaddleOcrModelProfile(size)
   const installPath = getLocalPaddleOcrInstallPath(size)
@@ -188,6 +576,7 @@ function resolveLocalPaddleOcrPaths(size = getLocalPaddleOcrSizePreference()) {
     join(installPath, 'run_paddleocr.py'),
   ])
   const pythonPath = firstExistingPath([
+    getLocalPaddleOcrRuntimePythonPath(),
     join(installPath, 'python', 'python.exe'),
     join(installPath, 'runtime', 'python.exe'),
   ])
@@ -241,12 +630,15 @@ export async function getLocalPaddleOcrStatus(): Promise<LocalPaddleOcrStatus> {
   const size = getLocalPaddleOcrSizePreference()
   const profile = getLocalPaddleOcrModelProfile(size)
   const paths = resolveLocalPaddleOcrPaths(size)
+  const runtime = await getLocalPaddleOcrRuntimeStatus()
   const hasRunner = !!paths.runnerPath
   const hasModels = !!paths.detModelPath && !!paths.recModelPath
   const hasAnyInstallAsset = hasRunner || !!paths.detModelPath || !!paths.recModelPath || !!paths.detTarPath || !!paths.recTarPath || existsSync(getManifestPath(size))
-  const installed = hasRunner && hasModels
+  const modelInstalled = hasRunner && hasModels
+  const installed = modelInstalled && runtime.supported
   return {
     installed,
+    modelInstalled,
     state: installed ? 'installed' : hasAnyInstallAsset ? 'partial' : 'not_installed',
     bundleVersion: profile.bundleVersion,
     installPath: paths.installPath,
@@ -255,8 +647,11 @@ export async function getLocalPaddleOcrStatus(): Promise<LocalPaddleOcrStatus> {
     modelPath: paths.modelPath,
     detModelPath: paths.detModelPath,
     recModelPath: paths.recModelPath,
+    runtime,
     message: installed
       ? `本地 PaddleOCR ${profile.label} 已就绪`
+      : modelInstalled
+      ? `${profile.label} 模型已安装，${runtime.message}`
       : hasAnyInstallAsset
       ? `已检测到部分 ${profile.label} 本地 OCR 文件，还缺少运行脚本或完整模型，请重新下载`
       : `本地 PaddleOCR ${profile.label} 尚未安装`,
@@ -836,7 +1231,7 @@ export async function downloadLocalPaddleOcrAddon(options: LocalPaddleOcrDownloa
       await installOfficialModelArtifacts(downloads, size, report)
       await writeInstallManifest(sourceId, downloads, size)
       const status = await getLocalPaddleOcrStatus()
-      if (!status.installed && hasNextSource) {
+      if (!status.modelInstalled && hasNextSource) {
         report?.({
           state: 'installing',
           sourceId,
@@ -845,14 +1240,16 @@ export async function downloadLocalPaddleOcrAddon(options: LocalPaddleOcrDownloa
         })
         continue
       }
-      if (!status.installed) {
+      if (!status.modelInstalled) {
         throw new Error(status.message || '本地 OCR 文件尚未完整安装')
       }
       report?.({
         state: 'completed',
         sourceId,
         progress: 1,
-        message: `本地 OCR ${getLocalPaddleOcrModelProfile(size).label} 已安装`,
+        message: status.installed
+          ? `本地 OCR ${getLocalPaddleOcrModelProfile(size).label} 已安装`
+          : `本地 OCR 模型已安装，运行环境还需安装/升级`,
       })
       return status
     } catch (error) {

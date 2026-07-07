@@ -177,6 +177,7 @@ export default function OnboardingWizard() {
     try {
       if (mode === 'local') {
         await window.api.setSetting('local_paddle_ocr_size', DEFAULT_LOCAL_PADDLE_OCR_SIZE)
+        await window.api.installLocalPaddleOcrRuntime()
         const status = await window.api.downloadLocalPaddleOcr({ source: 'auto' })
         if (status.installed) {
           await window.api.setDefaultOcrEngine('local_paddle', 'local_paddle')
