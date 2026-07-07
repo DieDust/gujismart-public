@@ -162,6 +162,10 @@ function getDefaultTabGroupTitle(index: number): string {
   return `分组 ${index + 1}`
 }
 
+function isDefaultTabGroupTitle(value: unknown): boolean {
+  return /^分组\s*\d+$/.test(String(value || '').trim())
+}
+
 function getDefaultTabGroupColor(index: number): string {
   return TAB_GROUP_COLORS[index % TAB_GROUP_COLORS.length]
 }
@@ -180,8 +184,55 @@ function getNextDefaultTabGroupIndex(tabGroups: WorkspaceTabGroup[]): number {
   return nextNumber - 1
 }
 
-function createDefaultTabGroup(currentGroups: WorkspaceTabGroup[], groupId: string): WorkspaceTabGroup {
-  const nextIndex = getNextDefaultTabGroupIndex(currentGroups)
+function getTabGroupIdsInTabOrder(tabGroups: WorkspaceTabGroup[], tabs: AppTab[]): string[] {
+  const knownGroupIds = new Set(tabGroups.map((group) => group.id))
+  const orderedGroupIds: string[] = []
+  const seenGroupIds = new Set<string>()
+
+  tabs.forEach((tab) => {
+    if (!tab.groupId || !knownGroupIds.has(tab.groupId) || seenGroupIds.has(tab.groupId)) return
+    seenGroupIds.add(tab.groupId)
+    orderedGroupIds.push(tab.groupId)
+  })
+
+  tabGroups.forEach((group) => {
+    if (seenGroupIds.has(group.id)) return
+    seenGroupIds.add(group.id)
+    orderedGroupIds.push(group.id)
+  })
+
+  return orderedGroupIds
+}
+
+function normalizeDefaultTabGroupTitles(
+  tabGroups: WorkspaceTabGroup[],
+  tabs: AppTab[],
+  protectedGroupIds = new Set<string>(),
+): WorkspaceTabGroup[] {
+  const groupsById = new Map(tabGroups.map((group) => [group.id, group]))
+  const normalizedTitles = new Map<string, string>()
+  let nextDefaultIndex = 0
+
+  getTabGroupIdsInTabOrder(tabGroups, tabs).forEach((groupId) => {
+    const group = groupsById.get(groupId)
+    if (!group || protectedGroupIds.has(group.id) || !isDefaultTabGroupTitle(group.title)) return
+    const nextTitle = getDefaultTabGroupTitle(nextDefaultIndex)
+    nextDefaultIndex += 1
+    if (group.title !== nextTitle) {
+      normalizedTitles.set(group.id, nextTitle)
+    }
+  })
+
+  if (normalizedTitles.size === 0) return tabGroups
+  return tabGroups.map((group) => {
+    const title = normalizedTitles.get(group.id)
+    return title ? { ...group, title } : group
+  })
+}
+
+function createDefaultTabGroup(currentGroups: WorkspaceTabGroup[], groupId: string, nextTabs?: AppTab[]): WorkspaceTabGroup {
+  const activeGroups = nextTabs ? pruneTabGroupsForTabs(currentGroups, nextTabs) : currentGroups
+  const nextIndex = getNextDefaultTabGroupIndex(activeGroups)
   return {
     id: groupId,
     title: getDefaultTabGroupTitle(nextIndex),
@@ -511,6 +562,15 @@ export default function App() {
     timer: null as ReturnType<typeof setTimeout> | null
   })
   tabsRef.current = tabs
+
+  useEffect(() => {
+    const protectedGroupIds = new Set(
+      closedTabHistory
+        .map((item) => item.type === 'group' ? item.group.id : item.group?.id)
+        .filter((groupId): groupId is string => !!groupId),
+    )
+    setTabGroups((current) => normalizeDefaultTabGroupTitles(current, tabs, protectedGroupIds))
+  }, [closedTabHistory, tabs])
 
   useLayoutEffect(() => {
     const strip = tabStripRef.current
@@ -1172,7 +1232,7 @@ export default function App() {
     setTabs((current) => {
       const nextTabs = assignTabToGroupInTabs(current, tabId, groupId, false)
       setTabGroups((currentGroups) => {
-        const nextGroup = createDefaultTabGroup(currentGroups, groupId)
+        const nextGroup = createDefaultTabGroup(currentGroups, groupId, nextTabs)
         return pruneTabGroupsForTabs([...currentGroups, nextGroup], nextTabs)
       })
       return nextTabs
@@ -1191,7 +1251,7 @@ export default function App() {
         tabIdSet.has(tab.id) ? { ...tab, groupId } : tab
       ))
       setTabGroups((currentGroups) => {
-        const nextGroup = createDefaultTabGroup(currentGroups, groupId)
+        const nextGroup = createDefaultTabGroup(currentGroups, groupId, nextTabs)
         return pruneTabGroupsForTabs([...currentGroups, nextGroup], nextTabs)
       })
       return nextTabs
