@@ -184,50 +184,36 @@ function getNextDefaultTabGroupIndex(tabGroups: WorkspaceTabGroup[]): number {
   return nextNumber - 1
 }
 
-function getTabGroupIdsInTabOrder(tabGroups: WorkspaceTabGroup[], tabs: AppTab[]): string[] {
-  const knownGroupIds = new Set(tabGroups.map((group) => group.id))
-  const orderedGroupIds: string[] = []
-  const seenGroupIds = new Set<string>()
-
-  tabs.forEach((tab) => {
-    if (!tab.groupId || !knownGroupIds.has(tab.groupId) || seenGroupIds.has(tab.groupId)) return
-    seenGroupIds.add(tab.groupId)
-    orderedGroupIds.push(tab.groupId)
-  })
-
-  tabGroups.forEach((group) => {
-    if (seenGroupIds.has(group.id)) return
-    seenGroupIds.add(group.id)
-    orderedGroupIds.push(group.id)
-  })
-
-  return orderedGroupIds
+function getTabGroupCreatedAt(group: WorkspaceTabGroup, fallbackIndex: number): number {
+  const match = String(group.id || '').match(/^tab-group:(\d+):/)
+  const createdAt = match ? Number(match[1]) : NaN
+  return Number.isFinite(createdAt) ? createdAt : Number.MAX_SAFE_INTEGER + fallbackIndex
 }
 
-function normalizeDefaultTabGroupTitles(
-  tabGroups: WorkspaceTabGroup[],
-  tabs: AppTab[],
-  protectedGroupIds = new Set<string>(),
-): WorkspaceTabGroup[] {
-  const groupsById = new Map(tabGroups.map((group) => [group.id, group]))
-  const normalizedTitles = new Map<string, string>()
-  let nextDefaultIndex = 0
+function repairDefaultTabGroupTitlesByCreationOrder(tabGroups: WorkspaceTabGroup[]): WorkspaceTabGroup[] {
+  const indexedGroups = tabGroups.map((group, index) => ({ group, index }))
+  const defaultGroups = indexedGroups.filter(({ group }) => isDefaultTabGroupTitle(group.title))
+  if (defaultGroups.length < 2) return tabGroups
 
-  getTabGroupIdsInTabOrder(tabGroups, tabs).forEach((groupId) => {
-    const group = groupsById.get(groupId)
-    if (!group || protectedGroupIds.has(group.id) || !isDefaultTabGroupTitle(group.title)) return
-    const nextTitle = getDefaultTabGroupTitle(nextDefaultIndex)
-    nextDefaultIndex += 1
-    if (group.title !== nextTitle) {
-      normalizedTitles.set(group.id, nextTitle)
-    }
+  const repairedTitles = new Map<string, string>()
+  defaultGroups
+    .sort((left, right) => (
+      getTabGroupCreatedAt(left.group, left.index) - getTabGroupCreatedAt(right.group, right.index)
+      || left.index - right.index
+    ))
+    .forEach(({ group }, index) => {
+      repairedTitles.set(group.id, getDefaultTabGroupTitle(index))
+    })
+
+  let changed = false
+  const repairedGroups = tabGroups.map((group) => {
+    const title = repairedTitles.get(group.id)
+    if (!title || group.title === title) return group
+    changed = true
+    return { ...group, title }
   })
 
-  if (normalizedTitles.size === 0) return tabGroups
-  return tabGroups.map((group) => {
-    const title = normalizedTitles.get(group.id)
-    return title ? { ...group, title } : group
-  })
+  return changed ? repairedGroups : tabGroups
 }
 
 function createDefaultTabGroup(currentGroups: WorkspaceTabGroup[], groupId: string, nextTabs?: AppTab[]): WorkspaceTabGroup {
@@ -418,7 +404,7 @@ export default function App() {
   }
   const initialWorkspace = initialWorkspaceRef.current
   const [tabs, setTabs] = useState<AppTab[]>(() => initialWorkspace.tabs)
-  const [tabGroups, setTabGroups] = useState<WorkspaceTabGroup[]>(() => initialWorkspace.tabGroups)
+  const [tabGroups, setTabGroups] = useState<WorkspaceTabGroup[]>(() => repairDefaultTabGroupTitlesByCreationOrder(initialWorkspace.tabGroups))
   const [activeTabId, setActiveTabId] = useState(() => initialWorkspace.activeTabId)
   const [tabMenuOpen, setTabMenuOpen] = useState(false)
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null)
@@ -562,15 +548,6 @@ export default function App() {
     timer: null as ReturnType<typeof setTimeout> | null
   })
   tabsRef.current = tabs
-
-  useEffect(() => {
-    const protectedGroupIds = new Set(
-      closedTabHistory
-        .map((item) => item.type === 'group' ? item.group.id : item.group?.id)
-        .filter((groupId): groupId is string => !!groupId),
-    )
-    setTabGroups((current) => normalizeDefaultTabGroupTitles(current, tabs, protectedGroupIds))
-  }, [closedTabHistory, tabs])
 
   useLayoutEffect(() => {
     const strip = tabStripRef.current
