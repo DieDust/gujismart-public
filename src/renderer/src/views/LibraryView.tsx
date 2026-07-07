@@ -57,7 +57,7 @@ import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshot, LibraryImportQueueState, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -301,9 +301,7 @@ type PdfPreviewQueueItem = {
   pageCount?: number
 }
 
-type PersistedImportQueueJob = Omit<ImportQueueJob, 'folderAssignments'> & {
-  folderAssignments?: Array<[string, string]>
-}
+type PersistedImportQueueJob = LibraryImportQueueJobSnapshot
 
 type ImportBatchQueueResult = {
   result: ImportDocumentResult
@@ -311,11 +309,7 @@ type ImportBatchQueueResult = {
   fileIndex: number
 }
 
-interface PersistedImportQueueState {
-  version: 1
-  savedAt: string
-  jobs: PersistedImportQueueJob[]
-}
+type PersistedImportQueueState = LibraryImportQueueState
 
 function getStatusMeta(map: Partial<Record<string, StatusMeta>>, status: unknown): StatusMeta {
   const key = String(status || '')
@@ -1913,6 +1907,7 @@ export default function LibraryView({
   const importJobSeqRef = useRef(0)
   const activeImportJobRef = useRef<ImportQueueJob | null>(null)
   const restoredImportQueueRef = useRef(false)
+  const importQueuePersistenceChainRef = useRef<Promise<unknown>>(Promise.resolve())
   const activeImportFilePathsRef = useRef<Set<string>>(new Set())
   const queuedImportFilePathsRef = useRef<Set<string>>(new Set())
   const lastClickedDocIdRef = useRef<string | null>(null)
@@ -4042,43 +4037,80 @@ export default function LibraryView({
     }
   }
 
-  const persistImportQueueSnapshot = () => {
-    try {
-      const jobs = [
-        ...(activeImportJobRef.current ? [activeImportJobRef.current] : []),
-        ...importQueueRef.current,
-      ].map(serializeImportQueueJob).filter((job): job is PersistedImportQueueJob => Boolean(job))
+  const buildImportQueueSnapshot = (): PersistedImportQueueState | null => {
+    const jobs = [
+      ...(activeImportJobRef.current ? [activeImportJobRef.current] : []),
+      ...importQueueRef.current,
+    ].map(serializeImportQueueJob).filter((job): job is PersistedImportQueueJob => Boolean(job))
 
-      if (jobs.length === 0) {
-        window.localStorage.removeItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY)
-        return
-      }
-
-      const payload: PersistedImportQueueState = {
-        version: 1,
-        savedAt: new Date().toISOString(),
-        jobs,
-      }
-      window.localStorage.setItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY, JSON.stringify(payload))
-    } catch (error) {
-      console.warn('[Library] Failed to persist import queue', error)
+    if (jobs.length === 0) return null
+    return {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      jobs,
     }
   }
 
-  const clearPersistedImportQueue = () => {
+  const clearLegacyPersistedImportQueue = () => {
     try {
       window.localStorage.removeItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY)
     } catch {
-      // Ignore storage cleanup failures.
+      // Ignore legacy storage cleanup failures.
     }
   }
 
-  const parsePersistedImportQueue = (): ImportQueueJob[] => {
+  const enqueueImportQueuePersistence = (task: () => Promise<unknown>) => {
+    importQueuePersistenceChainRef.current = importQueuePersistenceChainRef.current
+      .catch(() => undefined)
+      .then(task)
+      .catch((error) => {
+        console.warn('[Library] Failed to persist import queue', error)
+      })
+    return importQueuePersistenceChainRef.current
+  }
+
+  const persistImportQueueSnapshot = () => {
+    const snapshot = buildImportQueueSnapshot()
+    void enqueueImportQueuePersistence(() => window.api.saveImportQueueState(snapshot))
+    if (snapshot) clearLegacyPersistedImportQueue()
+  }
+
+  const clearPersistedImportQueue = () => {
+    void enqueueImportQueuePersistence(() => window.api.clearImportQueueState())
+    clearLegacyPersistedImportQueue()
+  }
+
+  const parseLegacyPersistedImportQueue = (): PersistedImportQueueState | null => {
     try {
       const raw = window.localStorage.getItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY)
-      if (!raw) return []
+      if (!raw) return null
       const parsed = JSON.parse(raw) as Partial<PersistedImportQueueState>
-      if (parsed.version !== 1 || !Array.isArray(parsed.jobs)) return []
+      if (parsed.version !== 1 || !Array.isArray(parsed.jobs)) return null
+      return {
+        version: 1,
+        savedAt: typeof parsed.savedAt === 'string' && parsed.savedAt ? parsed.savedAt : new Date().toISOString(),
+        jobs: parsed.jobs,
+      }
+    } catch (error) {
+      console.warn('[Library] Failed to restore legacy import queue', error)
+      return null
+    }
+  }
+
+  const parsePersistedImportQueue = async (): Promise<ImportQueueJob[]> => {
+    try {
+      let parsed = await window.api.getImportQueueState()
+      if (!parsed) {
+        parsed = parseLegacyPersistedImportQueue()
+        if (parsed) {
+          void enqueueImportQueuePersistence(() => window.api.saveImportQueueState(parsed)).then(() => {
+            clearLegacyPersistedImportQueue()
+          }).catch((error) => {
+            console.warn('[Library] Failed to migrate legacy import queue', error)
+          })
+        }
+      }
+      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.jobs)) return []
 
       const jobs = parsed.jobs
         .map((job): ImportQueueJob | null => {
@@ -4427,22 +4459,31 @@ export default function LibraryView({
     if (!libraryInitialLoadDone) return
     if (restoredImportQueueRef.current) return
     restoredImportQueueRef.current = true
-    const restoredJobs = parsePersistedImportQueue()
-    if (restoredJobs.length === 0) return
+    let cancelled = false
+    void parsePersistedImportQueue()
+      .then((restoredJobs) => {
+        if (cancelled || restoredJobs.length === 0) return
 
-    let restoredFileCount = 0
-    for (const job of restoredJobs) {
-      importJobSeqRef.current = Math.max(importJobSeqRef.current, job.id)
-      const filePaths = filterRestoredImportFilePaths(job.filePaths)
-      if (filePaths.length === 0) continue
-      restoredFileCount += filePaths.length
-      enqueueImportJob(filePaths, job.folderId, job.folderAssignments, { engine: job.engine, restored: true })
-    }
+        let restoredFileCount = 0
+        for (const job of restoredJobs) {
+          importJobSeqRef.current = Math.max(importJobSeqRef.current, job.id)
+          const filePaths = filterRestoredImportFilePaths(job.filePaths)
+          if (filePaths.length === 0) continue
+          restoredFileCount += filePaths.length
+          enqueueImportJob(filePaths, job.folderId, job.folderAssignments, { engine: job.engine, restored: true })
+        }
 
-    if (restoredFileCount > 0) {
-      message.info({ content: `检测到上次未完成的导入任务，已自动接回队列：${restoredFileCount} 个文件`, key: 'import-restored', duration: 5 })
-    } else {
-      clearPersistedImportQueue()
+        if (restoredFileCount > 0) {
+          message.info({ content: `检测到上次未完成的导入任务，已自动接回队列：${restoredFileCount} 个文件`, key: 'import-restored', duration: 5 })
+        } else {
+          clearPersistedImportQueue()
+        }
+      })
+      .catch((error) => {
+        console.warn('[Library] Failed to restore import queue', error)
+      })
+    return () => {
+      cancelled = true
     }
   }, [libraryInitialLoadDone])
 

@@ -94,6 +94,7 @@ import type {
   ImportDocumentOptions,
   ImportProgressEvent,
   InitializePdfPagesOptions,
+  LibraryImportQueueState,
   LibraryDocumentSearchField,
   ListDocumentOptions,
   OcrEngine,
@@ -118,6 +119,7 @@ import type {
 } from '../../shared/types'
 
 type JsonRecord = Record<string, unknown>
+const LIBRARY_IMPORT_QUEUE_STATE_ID = 'default'
 
 interface ImportedOcrBlock extends JsonRecord {
   words: string
@@ -840,6 +842,85 @@ function parseJsonRecord(value: unknown): JsonRecord | null {
   } catch {
     return null
   }
+}
+
+function normalizeLibraryImportQueueState(value: unknown): LibraryImportQueueState | null {
+  if (!isJsonRecord(value) || value.version !== 1 || !Array.isArray(value.jobs)) return null
+  const jobs = value.jobs
+    .map((job): LibraryImportQueueState['jobs'][number] | null => {
+      if (!isJsonRecord(job)) return null
+      const filePaths = Array.isArray(job.filePaths)
+        ? job.filePaths.map((filePath) => String(filePath || '').trim()).filter(Boolean)
+        : []
+      if (filePaths.length === 0) return null
+      const folderAssignments = Array.isArray(job.folderAssignments)
+        ? job.folderAssignments
+            .filter((entry): entry is [string, string] => (
+              Array.isArray(entry)
+              && typeof entry[0] === 'string'
+              && entry[0].trim().length > 0
+              && typeof entry[1] === 'string'
+              && entry[1].trim().length > 0
+            ))
+            .map(([filePath, folderId]) => [filePath.trim(), folderId.trim()] as [string, string])
+        : undefined
+      return {
+        id: Number(job.id || 0) || Date.now(),
+        filePaths,
+        folderId: typeof job.folderId === 'string' && job.folderId ? job.folderId : null,
+        folderAssignments: folderAssignments && folderAssignments.length > 0 ? folderAssignments : undefined,
+        engine: resolveImportOcrEngine(job.engine),
+      }
+    })
+    .filter((job): job is LibraryImportQueueState['jobs'][number] => Boolean(job))
+  if (jobs.length === 0) return null
+  return {
+    version: 1,
+    savedAt: typeof value.savedAt === 'string' && value.savedAt ? value.savedAt : new Date().toISOString(),
+    jobs,
+  }
+}
+
+function readLibraryImportQueueState(): LibraryImportQueueState | null {
+  const row = queryOne<{ state_json?: string | null }>(
+    'SELECT state_json FROM library_import_queue_state WHERE id = ?',
+    [LIBRARY_IMPORT_QUEUE_STATE_ID],
+  )
+  if (!row?.state_json) return null
+  return normalizeLibraryImportQueueState(parseJsonRecord(row.state_json))
+}
+
+function saveLibraryImportQueueState(state: LibraryImportQueueState | null): LibraryImportQueueState | null {
+  const normalized = normalizeLibraryImportQueueState(state)
+  if (!normalized) {
+    run('DELETE FROM library_import_queue_state WHERE id = ?', [LIBRARY_IMPORT_QUEUE_STATE_ID])
+    scheduleDatabaseSave()
+    return null
+  }
+  const now = new Date().toISOString()
+  const payload: LibraryImportQueueState = {
+    ...normalized,
+    savedAt: now,
+  }
+  transaction(() => {
+    run(
+      `INSERT INTO library_import_queue_state (id, version, state_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         version = excluded.version,
+         state_json = excluded.state_json,
+         updated_at = excluded.updated_at`,
+      [LIBRARY_IMPORT_QUEUE_STATE_ID, payload.version, JSON.stringify(payload), now, now],
+    )
+  })
+  scheduleDatabaseSave()
+  return payload
+}
+
+function clearLibraryImportQueueState(): boolean {
+  run('DELETE FROM library_import_queue_state WHERE id = ?', [LIBRARY_IMPORT_QUEUE_STATE_ID])
+  scheduleDatabaseSave()
+  return true
 }
 
 function sanitizeFileBaseName(value: unknown, fallback = 'document'): string {
@@ -3708,6 +3789,18 @@ export function registerDocumentIpc(): void {
     }
     allowFileAccessPaths(resolvedSources.flatMap((source) => source.filePaths || []))
     return resolvedSources
+  })
+
+  ipcMain.handle('documents:getImportQueueState', async (): Promise<LibraryImportQueueState | null> => {
+    return readLibraryImportQueueState()
+  })
+
+  ipcMain.handle('documents:saveImportQueueState', async (_event, state: LibraryImportQueueState | null): Promise<LibraryImportQueueState | null> => {
+    return saveLibraryImportQueueState(state)
+  })
+
+  ipcMain.handle('documents:clearImportQueueState', async (): Promise<boolean> => {
+    return clearLibraryImportQueueState()
   })
 
   ipcMain.handle('documents:getPdfInfo', async (_event, filePath: string) => {

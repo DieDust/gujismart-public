@@ -16,6 +16,14 @@ function sliceBetween(source, startMarker, endMarker, label) {
 const root = path.join(__dirname, '..')
 const librarySource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
   .replace(/\r\n?/g, '\n')
+const databaseSource = fs.readFileSync(path.join(root, 'src', 'main', 'database.ts'), 'utf8')
+  .replace(/\r\n?/g, '\n')
+const documentIpcSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
+  .replace(/\r\n?/g, '\n')
+const preloadSource = fs.readFileSync(path.join(root, 'src', 'preload', 'index.ts'), 'utf8')
+  .replace(/\r\n?/g, '\n')
+const sharedTypesSource = fs.readFileSync(path.join(root, 'src', 'shared', 'types.ts'), 'utf8')
+  .replace(/\r\n?/g, '\n')
 const processImportJobBody = sliceBetween(
   librarySource,
   'const processImportJob = async',
@@ -73,27 +81,62 @@ const handleBatchImportBody = sliceBetween(
 
 assert(
   librarySource.includes("LIBRARY_IMPORT_QUEUE_STORAGE_KEY = 'gujismart.library.importQueue.v1'"),
-  'Library import queue should have a versioned localStorage key',
+  'Library import queue should keep the legacy localStorage key for one-time migration',
 )
 assert(
-  librarySource.includes('interface PersistedImportQueueState') && librarySource.includes('type PersistedImportQueueJob'),
-  'Library import queue should persist a structured queue snapshot',
+  sharedTypesSource.includes('export interface LibraryImportQueueJobSnapshot')
+    && sharedTypesSource.includes('export interface LibraryImportQueueState')
+    && librarySource.includes('type PersistedImportQueueJob = LibraryImportQueueJobSnapshot')
+    && librarySource.includes('type PersistedImportQueueState = LibraryImportQueueState'),
+  'Library import queue should share a typed structured queue snapshot across main, preload, and renderer',
 )
 assert(
   librarySource.includes('activeImportJobRef') && librarySource.includes('restoredImportQueueRef'),
   'Library import queue should track the active job and restore only once',
 )
 assert(
+  librarySource.includes('importQueuePersistenceChainRef')
+    && librarySource.includes('const enqueueImportQueuePersistence =')
+    && librarySource.includes('importQueuePersistenceChainRef.current = importQueuePersistenceChainRef.current'),
+  'Library import queue persistence writes should be serialized so a late save cannot resurrect a cleared queue',
+)
+assert(
   librarySource.includes('function LibraryView') && librarySource.includes('persistImportQueueSnapshot'),
   'Library import queue should persist snapshots from the LibraryView workflow',
 )
 assert(
-  librarySource.includes('window.localStorage.setItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY, JSON.stringify(payload))'),
-  'Library import queue should write pending jobs to localStorage',
+  databaseSource.includes('CREATE TABLE IF NOT EXISTS library_import_queue_state')
+    && documentIpcSource.includes('function saveLibraryImportQueueState')
+    && documentIpcSource.includes('INSERT INTO library_import_queue_state')
+    && preloadSource.includes('saveImportQueueState: (state: LibraryImportQueueState | null)')
+    && librarySource.includes('window.api.saveImportQueueState(snapshot)'),
+  'Library import queue should write pending jobs through the main-process SQLite snapshot store',
 )
 assert(
-  librarySource.includes('window.localStorage.removeItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY)'),
-  'Library import queue should clear localStorage when no jobs remain',
+  documentIpcSource.includes('function clearLibraryImportQueueState')
+    && documentIpcSource.includes('DELETE FROM library_import_queue_state WHERE id = ?')
+    && preloadSource.includes('clearImportQueueState: (): Promise<boolean>')
+    && librarySource.includes('window.api.clearImportQueueState()')
+    && librarySource.includes('window.localStorage.removeItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY)'),
+  'Library import queue should clear the SQLite snapshot and remove migrated legacy localStorage state when no jobs remain',
+)
+assert(
+  !librarySource.includes('window.localStorage.setItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY'),
+  'Library import queue should not keep writing new recovery snapshots to renderer localStorage',
+)
+assert(
+  documentIpcSource.includes("ipcMain.handle('documents:getImportQueueState'")
+    && documentIpcSource.includes("ipcMain.handle('documents:saveImportQueueState'")
+    && documentIpcSource.includes("ipcMain.handle('documents:clearImportQueueState'")
+    && preloadSource.includes('getImportQueueState: (): Promise<LibraryImportQueueState | null>'),
+  'Import queue persistence IPC should expose get/save/clear snapshot operations through preload',
+)
+assert(
+  librarySource.includes('let parsed = await window.api.getImportQueueState()')
+    && librarySource.includes('parsed = parseLegacyPersistedImportQueue()')
+    && librarySource.includes('window.api.saveImportQueueState(parsed)')
+    && librarySource.includes('clearLegacyPersistedImportQueue()'),
+  'Restored import queue should read SQLite first and migrate legacy localStorage snapshots once',
 )
 assert(
   librarySource.includes('const countSettledImportBatchPaths =')

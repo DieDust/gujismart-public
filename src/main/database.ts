@@ -903,6 +903,14 @@ CREATE TABLE IF NOT EXISTS library_state_cache (
   updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS library_import_queue_state (
+  id TEXT PRIMARY KEY,
+  version INTEGER DEFAULT 1,
+  state_json TEXT NOT NULL,
+  created_at TEXT,
+  updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS ai_document_summaries (
   doc_id TEXT PRIMARY KEY,
   source_hash TEXT NOT NULL,
@@ -1795,6 +1803,16 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
       size_bytes INTEGER DEFAULT 0,
       mtime_ms REAL DEFAULT 0,
       indexed_at TEXT
+    )
+  `)
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS library_import_queue_state (
+      id TEXT PRIMARY KEY,
+      version INTEGER DEFAULT 1,
+      state_json TEXT NOT NULL,
+      created_at TEXT,
+      updated_at TEXT
     )
   `)
 }

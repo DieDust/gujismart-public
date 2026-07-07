@@ -232,6 +232,21 @@ export type TagSource =
   | 'keywords'
   | (string & {})
 export type OcrEngine = 'local_paddle' | 'paddle' | 'vision_model' | 'hybrid'
+
+export interface LibraryImportQueueJobSnapshot {
+  id: number
+  filePaths: string[]
+  folderId?: string | null
+  folderAssignments?: Array<[string, string]>
+  engine: OcrEngine
+}
+
+export interface LibraryImportQueueState {
+  version: 1
+  savedAt: string
+  jobs: LibraryImportQueueJobSnapshot[]
+}
+
 export type LocalPaddleOcrInstallState = 'not_installed' | 'partial' | 'installed' | 'downloading' | 'error'
 export type LocalPaddleOcrDownloadSourceId = 'auto' | 'paddle_bos' | 'modelscope' | 'huggingface' | 'manual'
 export type LocalPaddleOcrRuntimeState = 'missing_python' | 'missing_packages' | 'outdated' | 'ready' | 'error'

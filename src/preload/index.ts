@@ -99,6 +99,7 @@ import type {
   ImportProgressEvent,
   InitializePdfPagesOptions,
   PdfInfoResult,
+  LibraryImportQueueState,
   LibraryAiScope,
   LibraryAiScopePreview,
   LibraryAiSearchResponse,
@@ -234,6 +235,12 @@ const api = {
 
   importDocuments: (filePaths: string[], options?: ImportDocumentOptions): Promise<ImportDocumentResult[]> =>
     ipcRenderer.invoke('documents:import', filePaths, options),
+  getImportQueueState: (): Promise<LibraryImportQueueState | null> =>
+    ipcRenderer.invoke('documents:getImportQueueState'),
+  saveImportQueueState: (state: LibraryImportQueueState | null): Promise<LibraryImportQueueState | null> =>
+    ipcRenderer.invoke('documents:saveImportQueueState', state),
+  clearImportQueueState: (): Promise<boolean> =>
+    ipcRenderer.invoke('documents:clearImportQueueState'),
 
   listDocuments: (options?: ListDocumentOptions): Promise<DocumentListItem[]> =>
     ipcRenderer.invoke('documents:list', options),
