@@ -25,8 +25,8 @@ import type { SearchReindexDocumentResult } from '../shared/types'
 type NativeDatabase = Database.Database
 type JsonRecord = Record<string, unknown>
 type SearchIndexStagingTable = 'search_ngram_index_staging' | 'search_index_segments_staging'
-const WORKER_DATABASE_BUSY_TIMEOUT_MS = 30000
-const WORKER_DATABASE_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500, 1000, 2000, 4000, 8000, 12000]
+const WORKER_DATABASE_BUSY_TIMEOUT_MS = 10000
+const WORKER_DATABASE_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500, 1000]
 
 interface OcrBlockPoint {
   x?: number | string | null

@@ -2595,6 +2595,18 @@ export default function LibraryView({
 
   useEffect(() => {
     const unsubscribe = window.api.onImportProgress((event) => {
+      if (event.phase === 'stored') {
+        const totalFiles = Math.max(1, Number(event.totalFiles || 1))
+        const completedFiles = typeof event.progress === 'number'
+          ? Math.max(0, Math.min(totalFiles, Math.round(event.progress * totalFiles)))
+          : Math.max(0, Math.min(totalFiles, Number(event.fileIndex || 0) + 1))
+        const content = totalFiles > 1
+          ? `已完成文件写入：${completedFiles}/${totalFiles}`
+          : `已完成文件写入：${event.fileName}`
+        setImportProgressText(content)
+        message.loading({ content, key: 'import', duration: 0 })
+        return
+      }
       const percent = typeof event.progress === 'number'
         ? Math.max(0, Math.min(100, Math.round(event.progress * 100)))
         : null

@@ -49,6 +49,7 @@ assertIncludes(sourcePageReader, 'if (/^https:\\/\\//i.test(directImagePath))', 
 assertIncludes(sourcePageReader, "const isLocalDirectImage = directImagePath && !/^(?:imgs?|images?)\\//i.test(directImagePath)", 'relative OCR asset paths should not block page-image fallback')
 assertIncludes(sourcePageReader, 'if (!cancelled) usePageImage()', 'failed direct image reads should fall back to page image crop')
 assertIncludes(sourcePageReader, 'src && usingDirectImage', 'direct images and cropped page images should render through separate branches')
+assertIncludes(sourcePageReader, "Array.from(readerImageDataUrlCache.keys()).find((key) => key !== imagePath)", 'source reader image cache should not evict the image that was just loaded')
 
 assertIncludes(ocrText, 'function getBlockImagePath', 'reader text extraction should inspect existing layout image asset paths')
 assertIncludes(ocrText, 'function isRenderableImagePath', 'reader text extraction should distinguish remote/local image assets from unresolved OCR relative paths')
@@ -67,6 +68,7 @@ assertIncludes(ocrIpc, 'return !hasGujiImageBlockEvidence(item)', 'Guji OCR plac
 
 assertIncludes(documentView, "if (engine === 'vision_model') return '大模型 OCR'", 'document view should label vision-model OCR consistently as large-model OCR')
 assertIncludes(documentView, 'const messageKey = `page-image-${page.id}`', 'current-page image cache repair should use a stable message key')
+assertIncludes(documentView, 'Array.from(cache.keys()).find((candidate) => candidate !== key)', 'document view page-image cache should not evict the current page image')
 assertIncludes(documentView, 'pageNums: [page.page_num],', 'current-page image cache repair should repair only the current page')
 assertNotIncludes(documentView, "pageNums: [page.page_num],\n      engine: 'vision_model'", 'current-page image cache repair should not pretend to run vision-model OCR')
 assertIncludes(documentView, 'message.destroy(messageKey)', 'page image cache repair should close its loading toast after success or failure')

@@ -136,6 +136,7 @@ type SourcePageReaderPreferences = {
 }
 const AI_LAYOUT_FRONTEND_TIMEOUT_MS = 90_000
 const READER_IMAGE_CACHE_LIMIT = 24
+const READER_IMAGE_CACHE_MAX_CHARS = 96 * 1024 * 1024
 const SOURCE_PAGE_READER_PREFERENCES_SETTING_KEY = 'source_page_reader_preferences'
 const SOURCE_PAGE_READER_PREFERENCES_SAVE_DELAY_MS = 350
 const SOURCE_PAGE_READER_DEFAULT_PREFERENCES: SourcePageReaderPreferences = {
@@ -146,6 +147,22 @@ const SOURCE_PAGE_READER_DEFAULT_PREFERENCES: SourcePageReaderPreferences = {
 }
 const readerImageDataUrlCache = new Map<string, string>()
 const readerImageDataUrlPromises = new Map<string, Promise<string>>()
+
+function putReaderImageDataUrlCache(imagePath: string, dataUrl: string): void {
+  if (readerImageDataUrlCache.has(imagePath)) readerImageDataUrlCache.delete(imagePath)
+  readerImageDataUrlCache.set(imagePath, dataUrl)
+  let totalChars = 0
+  readerImageDataUrlCache.forEach((value) => {
+    totalChars += value.length
+  })
+  while (readerImageDataUrlCache.size > READER_IMAGE_CACHE_LIMIT || totalChars > READER_IMAGE_CACHE_MAX_CHARS) {
+    const oldestKey = Array.from(readerImageDataUrlCache.keys()).find((key) => key !== imagePath)
+    if (!oldestKey) break
+    const oldestValue = readerImageDataUrlCache.get(oldestKey) || ''
+    readerImageDataUrlCache.delete(oldestKey)
+    totalChars -= oldestValue.length
+  }
+}
 
 interface SourcePageReaderProps {
   document: ReaderDocument
@@ -838,12 +855,7 @@ function getReaderPageImageDataUrl(imagePath: string): Promise<string> {
     .then((dataUrl) => {
       readerImageDataUrlPromises.delete(imagePath)
       if (dataUrl) {
-        readerImageDataUrlCache.set(imagePath, dataUrl)
-        while (readerImageDataUrlCache.size > READER_IMAGE_CACHE_LIMIT) {
-          const oldestKey = readerImageDataUrlCache.keys().next().value
-          if (!oldestKey) break
-          readerImageDataUrlCache.delete(oldestKey)
-        }
+        putReaderImageDataUrlCache(imagePath, dataUrl)
       }
       return dataUrl
     })

@@ -4080,6 +4080,21 @@ export function registerDocumentIpc(): void {
       markSearchIndexStaleForDocuments(changedDocIds)
       notifySearchContentChanged()
     }
+    const successfulResults = results.filter((result) => result.success)
+    if (!documentImportShuttingDown && successfulResults.length > 0 && filePaths.length > 0) {
+      const lastSuccessful = successfulResults[successfulResults.length - 1]
+      const fileIndex = Math.max(0, Math.min(filePaths.length - 1, importFileIndex - 1))
+      sendImportProgress(event.sender, {
+        phase: 'stored',
+        filePath: lastSuccessful.sourcePath || filePaths[fileIndex] || '',
+        fileName: filePaths.length === 1
+          ? basename(lastSuccessful.sourcePath || filePaths[fileIndex] || lastSuccessful.title || '文件')
+          : `已写入 ${successfulResults.length}/${filePaths.length} 个文件`,
+        fileIndex,
+        totalFiles: filePaths.length,
+        progress: Math.max(0, Math.min(1, successfulResults.length / filePaths.length)),
+      })
+    }
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()
     return results

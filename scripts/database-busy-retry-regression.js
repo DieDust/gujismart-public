@@ -33,8 +33,12 @@ assert(
   'Explicit database saves should still retry busy checkpoints briefly before shutdown or manual save',
 )
 assert(
-  searchWorkerSource.includes('const WORKER_DATABASE_BUSY_TIMEOUT_MS = 30000'),
-  'Search index worker should use a long busy timeout while OCR is saving pages',
+  searchWorkerSource.includes('const WORKER_DATABASE_BUSY_TIMEOUT_MS = 10000'),
+  'Search index worker should use a bounded busy timeout so background reindexing does not stall for too long',
+)
+assert(
+  searchWorkerSource.includes('const WORKER_DATABASE_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500, 1000]'),
+  'Search index worker busy retries should fail quickly and leave reindexing recoverable',
 )
 assert(
   searchWorkerSource.includes('function runWithBusyRetry'),

@@ -193,8 +193,8 @@ const pendingOcrStatusEventsByDoc = new Map<string, {
   sender: Electron.WebContents
   payload: OcrProgressEvent
   timer: ReturnType<typeof setTimeout> | null
-  lastSentAt: number
 }>()
+const lastOcrStatusSentAtByDoc = new Map<string, number>()
 let autoMetadataQueue = Promise.resolve()
 let ocrFinalizeTimer: ReturnType<typeof setTimeout> | null = null
 let ocrFinalizeRunning = false
@@ -395,6 +395,7 @@ export async function shutdownOcrRuntime(timeoutMs = 3000): Promise<void> {
   const activeDocIds = [...activeOcrTasks.keys()]
   const queuedDocIds = [...queuedOcrDocIds]
   const activeDoneTasks = [...activeOcrTasks.values()].map((task) => task.done)
+  clearAllPendingOcrStatuses()
   activeOcrTasks.forEach((task) => task.controller.abort())
   activeDocIds.forEach((docId) => canceledOcrDocIds.add(docId))
 
@@ -579,9 +580,19 @@ function flushPendingOcrStatus(docId: string): void {
   if (!pending) return
   if (pending.timer) clearTimeout(pending.timer)
   pendingOcrStatusEventsByDoc.delete(docId)
-  if (pending.timer) {
-    sendOcrStatus(pending.sender, pending.payload)
-  }
+  lastOcrStatusSentAtByDoc.set(docId, Date.now())
+  sendOcrStatus(pending.sender, pending.payload)
+}
+
+function clearOcrStatusRuntimeForDoc(docId: string): void {
+  flushPendingOcrStatus(docId)
+  lastOcrStatusSentAtByDoc.delete(docId)
+  displayedOcrProgressByDoc.delete(docId)
+}
+
+function clearAllPendingOcrStatuses(): void {
+  ;[...pendingOcrStatusEventsByDoc.keys()].forEach(clearOcrStatusRuntimeForDoc)
+  lastOcrStatusSentAtByDoc.clear()
 }
 
 function emitOcrStatus(event: Electron.IpcMainInvokeEvent, payload: OcrProgressEvent): void {
@@ -590,6 +601,10 @@ function emitOcrStatus(event: Electron.IpcMainInvokeEvent, payload: OcrProgressE
   if (!docId || isTerminalOcrProgressPayload(next)) {
     if (docId) flushPendingOcrStatus(docId)
     sendOcrStatus(event.sender, next)
+    if (docId) {
+      lastOcrStatusSentAtByDoc.delete(docId)
+      displayedOcrProgressByDoc.delete(docId)
+    }
     return
   }
 
@@ -600,27 +615,29 @@ function emitOcrStatus(event: Electron.IpcMainInvokeEvent, payload: OcrProgressE
 
   const now = Date.now()
   const pending = pendingOcrStatusEventsByDoc.get(docId)
-  const lastSentAt = pending?.lastSentAt || 0
-  if (!pending || now - lastSentAt >= OCR_STATUS_EVENT_THROTTLE_MS) {
+  const lastSentAt = lastOcrStatusSentAtByDoc.get(docId) || 0
+  if (now - lastSentAt >= OCR_STATUS_EVENT_THROTTLE_MS) {
     if (pending?.timer) clearTimeout(pending.timer)
-    pendingOcrStatusEventsByDoc.set(docId, {
-      sender: event.sender,
-      payload: next,
-      timer: null,
-      lastSentAt: now,
-    })
+    pendingOcrStatusEventsByDoc.delete(docId)
+    lastOcrStatusSentAtByDoc.set(docId, now)
     sendOcrStatus(event.sender, next)
     return
   }
 
-  pending.sender = event.sender
-  pending.payload = next
-  if (pending.timer) return
-  pending.timer = setTimeout(() => {
+  const nextPending = pending || {
+    sender: event.sender,
+    payload: next,
+    timer: null,
+  }
+  nextPending.sender = event.sender
+  nextPending.payload = next
+  pendingOcrStatusEventsByDoc.set(docId, nextPending)
+  if (nextPending.timer) return
+  nextPending.timer = setTimeout(() => {
     const latest = pendingOcrStatusEventsByDoc.get(docId)
     if (!latest) return
-    latest.timer = null
-    latest.lastSentAt = Date.now()
+    pendingOcrStatusEventsByDoc.delete(docId)
+    lastOcrStatusSentAtByDoc.set(docId, Date.now())
     sendOcrStatus(latest.sender, latest.payload)
   }, Math.max(0, OCR_STATUS_EVENT_THROTTLE_MS - (now - lastSentAt)))
 }

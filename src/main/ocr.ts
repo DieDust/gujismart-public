@@ -1040,9 +1040,8 @@ interface LocalColumnSlice {
   slotCount: number
 }
 
-function analyzeVerticalColumns(filePath: string, block: LayoutBlockResult): LocalColumnSlice[] {
+function analyzeVerticalColumnsFromImage(image: Electron.NativeImage, block: LayoutBlockResult): LocalColumnSlice[] {
   if (!block.location) return []
-  const image = nativeImage.createFromPath(filePath)
   if (image.isEmpty()) return []
 
   const rect = {
@@ -3326,6 +3325,13 @@ function applyLocalSecondPassSegmentation(result: OcrResultPayload, imagePath: s
   if (blocks.length === 0) return attachProcessingMeta(result, options, imagePath)
 
   const nextBlocks: LayoutBlockResult[] = []
+  let pageImage: Electron.NativeImage | null | undefined
+  const getPageImage = (): Electron.NativeImage | null => {
+    if (pageImage !== undefined) return pageImage
+    const image = nativeImage.createFromPath(imagePath)
+    pageImage = image.isEmpty() ? null : image
+    return pageImage
+  }
   blocks.forEach((rawBlock) => {
     const block: LayoutBlockResult = {
       ...rawBlock,
@@ -3342,7 +3348,8 @@ function applyLocalSecondPassSegmentation(result: OcrResultPayload, imagePath: s
       return
     }
 
-    const columns = analyzeVerticalColumns(imagePath, block)
+    const image = getPageImage()
+    const columns = image ? analyzeVerticalColumnsFromImage(image, block) : []
     if (columns.length <= 1) {
       nextBlocks.push(...splitMergedWideVerticalTextBlock(block))
       return

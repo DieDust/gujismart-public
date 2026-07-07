@@ -296,6 +296,31 @@ const searchFilterDocIdsCache = new Map<string, { createdAt: number; docIds: str
 const folderScopeIdsCache = new Map<string, { createdAt: number; folderIds: string[] }>()
 const postingRowsCache = new Map<string, { createdAt: number; rows: SearchHitRow[] }>()
 const trigramCoverageCache = new Map<string, { createdAt: number; missingDocIds: string[] }>()
+
+type TimedSearchCacheEntry = { createdAt: number }
+
+function getFreshSearchCacheEntry<T extends TimedSearchCacheEntry>(cache: Map<string, T>, cacheKey: string, ttlMs: number): T | null {
+  const cached = cache.get(cacheKey)
+  if (!cached) return null
+  if (Date.now() - cached.createdAt < ttlMs) return cached
+  cache.delete(cacheKey)
+  return null
+}
+
+function setBoundedSearchCacheEntry<T extends TimedSearchCacheEntry>(cache: Map<string, T>, cacheKey: string, value: T, maxSize: number, ttlMs: number): void {
+  const now = Date.now()
+  for (const [key, entry] of cache.entries()) {
+    if (now - entry.createdAt >= ttlMs) cache.delete(key)
+  }
+  cache.set(cacheKey, value)
+  if (cache.size <= maxSize) return
+  const overflowCount = cache.size - maxSize
+  ;[...cache.entries()]
+    .sort((left, right) => left[1].createdAt - right[1].createdAt)
+    .slice(0, overflowCount)
+    .forEach(([key]) => cache.delete(key))
+}
+
 const queuedReindexDocIds = new Set<string>()
 let reindexTimer: NodeJS.Timeout | null = null
 let reindexWorkerRunning = false
@@ -332,15 +357,10 @@ function resolveSearchFolderScopeIds(folderIds: string[]): string[] {
   const uniqueFolderIds = uniqueIds(folderIds)
   if (uniqueFolderIds.length === 0) return []
   const cacheKey = stableStringify(uniqueFolderIds)
-  const cached = folderScopeIdsCache.get(cacheKey)
-  if (cached && Date.now() - cached.createdAt < SEARCH_FILTER_CACHE_TTL_MS) return [...cached.folderIds]
+  const cached = getFreshSearchCacheEntry(folderScopeIdsCache, cacheKey, SEARCH_FILTER_CACHE_TTL_MS)
+  if (cached) return [...cached.folderIds]
   const resolved = resolveFolderAndDescendantIds(uniqueFolderIds)
-  folderScopeIdsCache.set(cacheKey, { createdAt: Date.now(), folderIds: resolved })
-  if (folderScopeIdsCache.size > 40) {
-    const oldestKey = [...folderScopeIdsCache.entries()]
-      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
-    if (oldestKey) folderScopeIdsCache.delete(oldestKey)
-  }
+  setBoundedSearchCacheEntry(folderScopeIdsCache, cacheKey, { createdAt: Date.now(), folderIds: resolved }, 40, SEARCH_FILTER_CACHE_TTL_MS)
   return resolved
 }
 
@@ -2057,8 +2077,8 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
     yearFrom: options.yearFrom || null,
     yearTo: options.yearTo || null,
   })
-  const cached = searchFilterDocIdsCache.get(cacheKey)
-  if (cached && Date.now() - cached.createdAt < SEARCH_FILTER_CACHE_TTL_MS) {
+  const cached = getFreshSearchCacheEntry(searchFilterDocIdsCache, cacheKey, SEARCH_FILTER_CACHE_TTL_MS)
+  if (cached) {
     return cached.docIds ? [...cached.docIds] : cached.docIds
   }
 
@@ -2075,7 +2095,7 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
   }
 
   if (requestedFolderIds.length > 0 && folderIds.length === 0) {
-    searchFilterDocIdsCache.set(cacheKey, { createdAt: Date.now(), docIds: [] })
+    setBoundedSearchCacheEntry(searchFilterDocIdsCache, cacheKey, { createdAt: Date.now(), docIds: [] }, 80, SEARCH_FILTER_CACHE_TTL_MS)
     return []
   }
 
@@ -2138,12 +2158,7 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
   }
 
   const docIds = queryAll<{ id: string }>(sql, params).map((item) => item.id)
-  searchFilterDocIdsCache.set(cacheKey, { createdAt: Date.now(), docIds })
-  if (searchFilterDocIdsCache.size > 80) {
-    const oldestKey = [...searchFilterDocIdsCache.entries()]
-      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
-    if (oldestKey) searchFilterDocIdsCache.delete(oldestKey)
-  }
+  setBoundedSearchCacheEntry(searchFilterDocIdsCache, cacheKey, { createdAt: Date.now(), docIds }, 80, SEARCH_FILTER_CACHE_TTL_MS)
   return [...docIds]
 }
 
@@ -2375,8 +2390,8 @@ function findSegmentDocIdsWithoutTrigram(docIds?: string[]): string[] {
   const activeDocIds = Array.isArray(docIds) && docIds.length > 0 ? resolveActiveDocumentIds(docIds) : undefined
   if (Array.isArray(docIds) && docIds.length > 0 && (!activeDocIds || activeDocIds.length === 0)) return []
   const cacheKey = stableStringify({ type: 'trigram-coverage', docIds: uniqueIds(activeDocIds || []) })
-  const cached = trigramCoverageCache.get(cacheKey)
-  if (cached && Date.now() - cached.createdAt < SEARCH_FILTER_CACHE_TTL_MS) {
+  const cached = getFreshSearchCacheEntry(trigramCoverageCache, cacheKey, SEARCH_FILTER_CACHE_TTL_MS)
+  if (cached) {
     return [...cached.missingDocIds]
   }
   const rows = new Set<string>()
@@ -2410,12 +2425,7 @@ function findSegmentDocIdsWithoutTrigram(docIds?: string[]): string[] {
   }
 
   const missingDocIds = [...rows]
-  trigramCoverageCache.set(cacheKey, { createdAt: Date.now(), missingDocIds })
-  if (trigramCoverageCache.size > 40) {
-    const oldestKey = [...trigramCoverageCache.entries()]
-      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
-    if (oldestKey) trigramCoverageCache.delete(oldestKey)
-  }
+  setBoundedSearchCacheEntry(trigramCoverageCache, cacheKey, { createdAt: Date.now(), missingDocIds }, 40, SEARCH_FILTER_CACHE_TTL_MS)
   return missingDocIds
 }
 
@@ -2759,8 +2769,8 @@ function runSegmentNgramSearch(keyword: string, limit: number, docIds?: string[]
     includeText,
     previewShortQuery,
   })
-  const cached = postingRowsCache.get(cacheKey)
-  if (cached && Date.now() - cached.createdAt < POSTING_CACHE_TTL_MS) {
+  const cached = getFreshSearchCacheEntry(postingRowsCache, cacheKey, POSTING_CACHE_TTL_MS)
+  if (cached) {
     return cached.rows.map((row) => ({ ...row }))
   }
 
@@ -2826,7 +2836,7 @@ function runSegmentNgramSearch(keyword: string, limit: number, docIds?: string[]
     rows.forEach((row) => {
       row.doc_total_hits = totalHitsByDocId.get(row.doc_id) || row.hit_count || 0
     })
-    postingRowsCache.set(cacheKey, { createdAt: Date.now(), rows })
+    setBoundedSearchCacheEntry(postingRowsCache, cacheKey, { createdAt: Date.now(), rows }, 80, POSTING_CACHE_TTL_MS)
     return rows.map((row) => ({ ...row }))
   }
 
@@ -2868,12 +2878,7 @@ function runSegmentNgramSearch(keyword: string, limit: number, docIds?: string[]
     hit_count: row.hit_count,
     rank: Number(row.rank || 1000),
   }))
-  postingRowsCache.set(cacheKey, { createdAt: Date.now(), rows: mapped })
-  if (postingRowsCache.size > 80) {
-    const oldestKey = [...postingRowsCache.entries()]
-      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
-    if (oldestKey) postingRowsCache.delete(oldestKey)
-  }
+  setBoundedSearchCacheEntry(postingRowsCache, cacheKey, { createdAt: Date.now(), rows: mapped }, 80, POSTING_CACHE_TTL_MS)
   return mapped.map((row) => ({ ...row }))
 }
 
@@ -3380,8 +3385,8 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     yearTo: options?.yearTo || null,
     translationScope: options?.translationScope || 'all',
   })
-  const cached = searchResponseCache.get(cacheKey)
-  if (cached && Date.now() - cached.createdAt < SEARCH_CACHE_TTL_MS) {
+  const cached = getFreshSearchCacheEntry(searchResponseCache, cacheKey, SEARCH_CACHE_TTL_MS)
+  if (cached) {
     if (SEARCH_METRICS_ENABLED) {
       console.info('[SearchMetrics]', JSON.stringify({
         query,
@@ -3542,12 +3547,7 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
       resultMode: options?.resultMode || 'preview',
     }))
   }
-  searchResponseCache.set(cacheKey, { createdAt: Date.now(), response: result })
-  if (searchResponseCache.size > 60) {
-    const oldestKey = [...searchResponseCache.entries()]
-      .sort((left, right) => left[1].createdAt - right[1].createdAt)[0]?.[0]
-    if (oldestKey) searchResponseCache.delete(oldestKey)
-  }
+  setBoundedSearchCacheEntry(searchResponseCache, cacheKey, { createdAt: Date.now(), response: result }, 60, SEARCH_CACHE_TTL_MS)
   return result
 }
 

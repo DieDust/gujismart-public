@@ -854,7 +854,7 @@ function putLimitedPageImageCache(cache: Map<string, string>, key: string, value
   cache.set(key, value)
   const getTotalChars = () => Array.from(cache.values()).reduce((total, item) => total + item.length, 0)
   while (cache.size > maxEntries || getTotalChars() > maxTotalChars) {
-    const oldestKey = cache.keys().next().value
+    const oldestKey = Array.from(cache.keys()).find((candidate) => candidate !== key)
     if (!oldestKey) break
     cache.delete(oldestKey)
   }
