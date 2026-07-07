@@ -99,6 +99,8 @@ assertIncludes(app, 'const protectedGroupIds = new Set(', 'App should protect re
 assertIncludes(app, 'createDefaultTabGroup(currentGroups, groupId, nextTabs)', 'new tab groups should ignore stale unused group titles when choosing the next number')
 assertIncludes(app, 'const openRenameTabGroup = (groupId: string) => {', 'tab groups should support renaming')
 assertIncludes(app, 'const updateTabGroupColor = (groupId: string, color: string) => {', 'tab groups should support color changes')
+assertIncludes(app, 'return TAB_GROUP_COLORS[index % TAB_GROUP_COLORS.length]', 'tab group auto colors should cycle when there are more groups than colors')
+assertNotIncludes(app, 'disabled: group.color === color', 'tab group color menu should allow repeated color choices')
 assertIncludes(app, 'const getTabGroupDropTarget = (strip: HTMLElement, clientX: number, clientY: number): string | null => {', 'dragging should detect tab group drop targets')
 assertIncludes(app, 'removeTabFromGroup(droppedTabId)', 'dragging a grouped tab out should remove it from the group')
 assertIncludes(app, 'createGroupForTabs([droppedTab.id, droppedNearTab.id])', 'dragging two ungrouped tabs together should group them')

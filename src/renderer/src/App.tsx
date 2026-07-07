@@ -1841,7 +1841,6 @@ export default function App() {
           颜色 {index + 1}
         </span>
       ),
-      disabled: group.color === color,
     }))
   )
 
