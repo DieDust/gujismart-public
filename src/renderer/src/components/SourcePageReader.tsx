@@ -137,6 +137,7 @@ type SourcePageReaderPreferences = {
 const AI_LAYOUT_FRONTEND_TIMEOUT_MS = 90_000
 const READER_IMAGE_CACHE_LIMIT = 24
 const READER_IMAGE_CACHE_MAX_CHARS = 96 * 1024 * 1024
+const SOURCE_PAGE_READER_RESET_VIEW_EVENT = 'gujismart:source-page-reader-reset-view'
 const SOURCE_PAGE_READER_PREFERENCES_SETTING_KEY = 'source_page_reader_preferences'
 const SOURCE_PAGE_READER_PREFERENCES_SAVE_DELAY_MS = 350
 const SOURCE_PAGE_READER_DEFAULT_PREFERENCES: SourcePageReaderPreferences = {
@@ -2715,6 +2716,15 @@ export default function SourcePageReader({
     return () => {
       active = false
     }
+  }, [])
+
+  useEffect(() => {
+    const handleResetView = () => {
+      setFontSize(SOURCE_PAGE_READER_DEFAULT_PREFERENCES.font_size)
+      setLineHeight(SOURCE_PAGE_READER_DEFAULT_PREFERENCES.line_height)
+    }
+    window.addEventListener(SOURCE_PAGE_READER_RESET_VIEW_EVENT, handleResetView)
+    return () => window.removeEventListener(SOURCE_PAGE_READER_RESET_VIEW_EVENT, handleResetView)
   }, [])
 
   useEffect(() => {

@@ -39,6 +39,7 @@ interface ImageViewerProps {
   onNextPage?: () => void
   viewport?: ViewerViewport
   onViewportChange?: (viewport: ViewerViewport) => void
+  resetToken?: number
 }
 
 type BoxCoordinateScale = OcrCoordinateScale
@@ -80,6 +81,7 @@ export default function ImageViewer({
   onNextPage,
   viewport,
   onViewportChange,
+  resetToken = 0,
 }: ImageViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [viewportState, setViewportState] = useState<ViewerViewport>(DEFAULT_VIEWPORT)
@@ -159,6 +161,11 @@ export default function ImageViewer({
     }
     img.src = src
   }, [fitToScreen, src])
+
+  useEffect(() => {
+    if (resetToken <= 0) return
+    fitToScreen()
+  }, [fitToScreen, resetToken])
 
   useEffect(() => {
     if (activeBoxIndex === lastFocusedBoxRef.current) return

@@ -2673,13 +2673,28 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
     ? 'SELECT COUNT(DISTINCT d.id) as total FROM documents d'
     : `SELECT
         d.*,
-        (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id) as actual_page_count,
-        ${buildDocumentTextPageCountExpression('d')} as text_page_count,
-        ${buildDocumentCompletedPageCountExpression('d')} as ocr_completed_page_count,
-        (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
-        (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
+        COALESCE(page_counts.actual_page_count, 0) as actual_page_count,
+        COALESCE(page_counts.text_page_count, 0) as text_page_count,
+        COALESCE(page_counts.ocr_completed_page_count, 0) as ocr_completed_page_count,
+        COALESCE(page_counts.image_page_count, 0) as image_page_count,
+        COALESCE(note_counts.research_note_count, 0) as research_note_count,
         0 as search_segment_count
-      FROM documents d`
+      FROM documents d
+      LEFT JOIN (
+        SELECT
+          p.doc_id,
+          COUNT(*) as actual_page_count,
+          SUM(CASE WHEN ${buildPageContentAvailableCondition('p')} THEN 1 ELSE 0 END) as text_page_count,
+          SUM(CASE WHEN p.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p')} THEN 1 ELSE 0 END) as ocr_completed_page_count,
+          SUM(CASE WHEN p.image_path IS NOT NULL AND TRIM(p.image_path) <> '' THEN 1 ELSE 0 END) as image_page_count
+        FROM pages p
+        GROUP BY p.doc_id
+      ) page_counts ON page_counts.doc_id = d.id
+      LEFT JOIN (
+        SELECT rn.doc_id, COUNT(*) as research_note_count
+        FROM research_notes rn
+        GROUP BY rn.doc_id
+      ) note_counts ON note_counts.doc_id = d.id`
 
   const params: unknown[] = []
   const conditions: string[] = []
@@ -2997,6 +3012,31 @@ function parseDocumentMetadata(raw: unknown): JsonRecord {
 }
 
 type VerifiedPdfAssetState = 'available' | 'text_only' | 'unknown'
+type VerifiedPdfAssetCacheEntry = {
+  createdAt: number
+  signature: string
+  state: VerifiedPdfAssetState
+  imagePageCount: number
+  metadata: string
+}
+
+const VERIFIED_PDF_ASSET_CACHE_TTL_MS = 10_000
+const VERIFIED_PDF_ASSET_CACHE_MAX_ENTRIES = 500
+const verifiedPdfAssetInfoCache = new Map<string, VerifiedPdfAssetCacheEntry>()
+
+function pruneVerifiedPdfAssetInfoCache(now = Date.now()): void {
+  for (const [key, entry] of verifiedPdfAssetInfoCache.entries()) {
+    if (now - entry.createdAt >= VERIFIED_PDF_ASSET_CACHE_TTL_MS) {
+      verifiedPdfAssetInfoCache.delete(key)
+    }
+  }
+  if (verifiedPdfAssetInfoCache.size <= VERIFIED_PDF_ASSET_CACHE_MAX_ENTRIES) return
+  const overflow = verifiedPdfAssetInfoCache.size - VERIFIED_PDF_ASSET_CACHE_MAX_ENTRIES
+  ;[...verifiedPdfAssetInfoCache.entries()]
+    .sort((left, right) => left[1].createdAt - right[1].createdAt)
+    .slice(0, overflow)
+    .forEach(([key]) => verifiedPdfAssetInfoCache.delete(key))
+}
 
 function isReadableLocalAssetPath(filePath: unknown): boolean {
   const normalized = String(filePath || '').trim()
@@ -3035,6 +3075,22 @@ function getVerifiedPdfAssetInfo(
   metadata = parseDocumentMetadata(doc.metadata),
 ): { state: VerifiedPdfAssetState; imagePageCount: number; metadata: string } {
   const rawImagePageCount = Number(doc.image_page_count || 0)
+  const cacheKey = String(doc.id || '')
+  const signature = JSON.stringify({
+    filePath: resolveManagedStoragePath(String(doc.file_path || '').trim(), doc.id),
+    imagePageCount: rawImagePageCount,
+    metadata: doc.metadata || '',
+  })
+  const cached = cacheKey ? verifiedPdfAssetInfoCache.get(cacheKey) : null
+  const now = Date.now()
+  if (cached && cached.signature === signature && now - cached.createdAt < VERIFIED_PDF_ASSET_CACHE_TTL_MS) {
+    return {
+      state: cached.state,
+      imagePageCount: cached.imagePageCount,
+      metadata: cached.metadata,
+    }
+  }
+
   const hasReadableImage = hasReadablePageImageForDocument(String(doc.id), rawImagePageCount)
   const explicitState = String(metadata.pdf_asset_state || '').trim()
   const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
@@ -3046,11 +3102,20 @@ function getVerifiedPdfAssetInfo(
     state = 'text_only'
   }
 
-  return {
+  const verified = {
     state,
     imagePageCount: state === 'available' && hasReadableImage ? rawImagePageCount : 0,
     metadata: JSON.stringify({ ...metadata, pdf_asset_state: state }),
   }
+  if (cacheKey) {
+    verifiedPdfAssetInfoCache.set(cacheKey, {
+      createdAt: now,
+      signature,
+      ...verified,
+    })
+    pruneVerifiedPdfAssetInfoCache(now)
+  }
+  return verified
 }
 
 function normalizeDocumentSourceAssetsForRead<T extends { image_path?: string | null }>(

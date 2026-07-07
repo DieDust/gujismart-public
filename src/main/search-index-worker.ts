@@ -935,9 +935,16 @@ function commitStagedSearchIndexForDocument(
          updated_at = excluded.updated_at`,
       [docId, 'ready', sourceHash, segmentCount, null, now, now],
     )
-    runOn(sqlite, 'DELETE FROM search_ngram_index_staging WHERE job_id = ?', [jobId])
-    runOn(sqlite, 'DELETE FROM search_index_segments_staging WHERE job_id = ?', [jobId])
   })
+
+  try {
+    transaction(sqlite, () => {
+      runOn(sqlite, 'DELETE FROM search_ngram_index_staging WHERE job_id = ?', [jobId])
+      runOn(sqlite, 'DELETE FROM search_index_segments_staging WHERE job_id = ?', [jobId])
+    })
+  } catch (error) {
+    console.warn('[SearchIndexWorker] Failed to clean staging rows after index commit', error)
+  }
 }
 
 async function reindexDocument(task: SearchIndexWorkerTask): Promise<SearchReindexDocumentResult> {

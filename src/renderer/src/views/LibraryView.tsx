@@ -80,6 +80,8 @@ const LARGE_PDF_PREVIEW_IDLE_DELAY_MS = 30_000
 const AUTO_OCR_PDF_PREVIEW_IDLE_DELAY_MS = 60_000
 const PDF_PREVIEW_LIST_REFRESH_BATCH_SIZE = 10
 const VIRTUAL_LIST_MIN_DOCUMENTS = 8
+const GRID_CARD_INITIAL_RENDER_COUNT = 72
+const GRID_CARD_RENDER_BATCH_SIZE = 48
 const IMPORT_LIST_REFRESH_DEBOUNCE_MS = 350
 const UNFILED_FOLDER_ID = '__gujismart_unfiled__'
 const UNFILED_FOLDER_NAME = '未分类'
@@ -1829,6 +1831,7 @@ export default function LibraryView({
   const { folders, setFolders } = useFolderStore()
 
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list')
+  const [gridRenderLimit, setGridRenderLimit] = useState(GRID_CARD_INITIAL_RENDER_COUNT)
   const [tags, setTags] = useState<TagItem[]>([])
   const [batchMode, setBatchMode] = useState(false)
   const [showSynthesisModal, setShowSynthesisModal] = useState(false)
@@ -1990,6 +1993,10 @@ export default function LibraryView({
   }, [ocrProgressByDoc])
 
   const documentIdOrder = useMemo(() => documents.map((doc) => doc.id), [documents])
+  const gridRenderedDocuments = useMemo(() => {
+    if (viewMode !== 'grid') return documents
+    return documents.slice(0, Math.min(documents.length, gridRenderLimit))
+  }, [documents, gridRenderLimit, viewMode])
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds])
 
   useEffect(() => {
@@ -2389,8 +2396,15 @@ export default function LibraryView({
   const maybeLoadMoreFromScroll = useCallback((target: HTMLElement) => {
     const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight
     if (distanceToBottom > 180) return
+    if (viewMode === 'grid') {
+      const renderedCount = Math.min(gridRenderLimit, documents.length)
+      if (renderedCount < documents.length) {
+        setGridRenderLimit((current) => Math.min(documents.length, Math.max(current, renderedCount) + GRID_CARD_RENDER_BATCH_SIZE))
+        return
+      }
+    }
     loadMoreDocuments()
-  }, [loadMoreDocuments])
+  }, [documents.length, gridRenderLimit, loadMoreDocuments, viewMode])
 
   const handleLibrarySearchFieldsChange = useCallback((values: LibraryDocumentSearchField[]) => {
     const allowedFields = new Set<LibraryDocumentSearchField>(DEFAULT_LIBRARY_SEARCH_FIELDS)
@@ -2943,6 +2957,7 @@ export default function LibraryView({
       listOffsetRef.current = 0
       listHasMoreRef.current = false
       setListHasMore(false)
+      setGridRenderLimit(GRID_CARD_INITIAL_RENDER_COUNT)
       clearSelection()
       libraryContentRef.current?.scrollTo({ top: 0 })
     }
@@ -6114,7 +6129,7 @@ export default function LibraryView({
               style={{ width: '100%', height: '100%' }}
             />
           ) : (
-            documents.map((doc) => {
+            gridRenderedDocuments.map((doc) => {
               const isSelected = selectedIdSet.has(doc.id)
               const docTagNames = splitPipe(doc.tag_names)
               const docTagColors = splitPipe(doc.tag_colors)

@@ -75,6 +75,7 @@ const FACSIMILE_FONT_SCALE_MIN = 0.5
 const FACSIMILE_FONT_SCALE_MAX = 1.35
 const READER_DISPLAY_SCRIPT_STORAGE_KEY = 'gujismart.reader.displayScript'
 const READER_GLOBAL_PREFERENCES_SETTING_KEY = 'reader_global_preferences'
+const SOURCE_PAGE_READER_RESET_VIEW_EVENT = 'gujismart:source-page-reader-reset-view'
 const READER_SEARCH_RESULT_PAGE_SIZE = 10
 const PROOF_PAGE_WINDOW_RADIUS = 1
 const PROOF_IMAGE_PREFETCH_DELAY_MS = 260
@@ -1335,6 +1336,7 @@ export default function DocumentView({
   const [pageViewMode, setPageViewMode] = useState<PageViewMode>('single')
   const [birdDensity, setBirdDensity] = useState<BirdDensity>('medium')
   const [sharedViewport, setSharedViewport] = useState<ViewerViewport | undefined>(undefined)
+  const [imageViewerResetToken, setImageViewerResetToken] = useState(0)
   const [pageTranslations, setPageTranslations] = useState<Record<string, string>>({})
   const [pageTranslationUnits, setPageTranslationUnits] = useState<Record<string, TranslationUnitV1[]>>({})
   const [pageTranslationHashes, setPageTranslationHashes] = useState<Record<string, string>>({})
@@ -4472,6 +4474,16 @@ export default function DocumentView({
     }
   }
 
+  const resetReaderViewScale = useCallback(() => {
+    setReaderFontSize(DEFAULT_READER_GLOBAL_PREFERENCES.font_size)
+    setReaderLineHeight(DEFAULT_READER_GLOBAL_PREFERENCES.line_height)
+    setReaderPageWidth(DEFAULT_READER_GLOBAL_PREFERENCES.page_width)
+    setPageViewMode('single')
+    setSharedViewport(undefined)
+    setImageViewerResetToken((value) => value + 1)
+    window.dispatchEvent(new Event(SOURCE_PAGE_READER_RESET_VIEW_EVENT))
+  }, [])
+
   useEffect(() => {
     if (!shortcuts) return
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -4495,6 +4507,12 @@ export default function DocumentView({
       }
 
       if (isEditableShortcutTarget(event.target)) return
+
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && (event.key === '0' || event.code === 'Digit0')) {
+        event.preventDefault()
+        resetReaderViewScale()
+        return
+      }
 
       if (event.key === 'ArrowUp') {
         event.preventDefault()
@@ -4528,7 +4546,7 @@ export default function DocumentView({
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [focusReaderSearch, getReaderSearchInput, handleBack, navigateShortcutPage, scrollReaderContent, shortcuts, toggleReaderTranslation])
+  }, [focusReaderSearch, getReaderSearchInput, handleBack, navigateShortcutPage, resetReaderViewScale, scrollReaderContent, shortcuts, toggleReaderTranslation])
 
   const exportMenuItems: MenuProps['items'] = [
     { key: 'reading-pdf', label: '导出阅读模式 PDF' },
@@ -5483,6 +5501,7 @@ export default function DocumentView({
                 searchKeyword={effectiveSearchKeyword}
                 viewport={sharedViewport}
                 onViewportChange={setSharedViewport}
+                resetToken={imageViewerResetToken}
                 onBoxClick={(index) => {
                   setActiveBoxIndex(index)
                   setSwitchToRegion(true)
