@@ -6,7 +6,7 @@ GujiSmart 的 OCR 已经不是一条简单的“图片上传后保存文本”�
 
 当前最优先的问题不是再叠加一个新模型，而是先保证“旧结果和人工校对绝不丢失、页码绝不写错、任务可以真正取消和恢复、资源始终有界”。全量重跑、单页重跑、视觉重跑、古籍增强、版面重做和版本切换会在新结果成功前清空人工校对；所谓 OCR 版本按 `(page_id, engine)` 唯一，同一引擎重跑会覆盖历史；异步 PDF `pageRanges` 没有返回页数和来源页校验，当前对应行为测试已经失败；视觉 OCR 和本地 OCR 又没有接入统一取消与恢复合同。
 
-本章建议保留现有 `pages` 和 `page_ocr_versions` 作为兼容投影，复用模块 02 已提出的统一持久化任务调度器，并旁路新增 OCR run、page attempt 和 artifact version 结构。任何结果都先进入 staging，完成页码、结构、质量和来源校验后再以短事务激活；人工校对作为独立数据层保留，OCR 变化只把校对标记为“基线已变化”，不得删除。第一轮正确性修复不需要新增第三方依赖；新增本地模型、外部服务或解析库仍须实施前确认。
+本章建议保留现有 `pages` 和 `page_ocr_versions` 作为兼容投影，复用模块 02 已提出的统一持久化任务调度器，并旁路新增 OCR run、page attempt 和 artifact version 结构。任何结果都先进入 staging，完成页码、结构、质量和来源校验后再以短事务激活；人工校对作为独立数据层保留，OCR 变化只把校对标记为“基线已变化”，不得删除。LLM、视觉 OCR 与 PaddleOCR 的明文凭据泄露统一提升为跨模块 P0，必须先于云端 OCR 功能扩展完成 CredentialVault 迁移。第一轮正确性修复不需要新增第三方依赖；新增本地模型、外部服务或解析库仍须实施前确认。
 
 ## 2. 审阅范围与现状验证
 
@@ -209,7 +209,7 @@ renderer 默认一次并发 5 篇、最大 20 篇（`src/renderer/src/views/Libr
 
 - 远端结果、规范化 IR、质量报告和 source mapping 先写 artifact staging。
 - 页级校验通过后以短事务更新 active artifact 和 `pages` 投影；失败页继续指向旧 artifact。
-- run manifest 记录目标页集合以及每页 `old_active/new_active/failed/skipped`，文献级状态可明确显示 partial，而不是靠文本是否为空推断。
+- run manifest 记录目标页集合以及每页 `old_active/new_active/failed/skipped`；文献级顶层状态使用 `completed + completionKind='partial'`，而不是新增 `partial` 终态或靠文本是否为空推断。
 - 对要求整批一致的操作提供“全部目标页验证完成后再切换”的可选模式，但默认使用有界页级原子激活，避免超大事务。
 
 ### D03-P1-08 恢复合同只覆盖部分 Paddle 任务，legacy pause/cancel 也不终止当前工作
@@ -258,13 +258,13 @@ legacy BatchProcessor 恢复时按 batch group 全部启动（`src/main/batch-pr
 - 文档 IR 按页增量写入，跨页连续性使用有限窗口与最终归并，不 hydrate 整本 payload。
 - 建 10、100、1000、5000 页基准，记录峰值 RSS、event-loop delay、首个结果时延和取消时延。
 
-### D03-P1-12 OCR/视觉 API Key 明文进入 SQLite、renderer 和整库备份
+### D03-P0-01 LLM、视觉 OCR 与 PaddleOCR 凭据明文进入 SQLite、renderer 和整库备份
 
 **证据等级：已确认。**
 
-所有设置都是 `settings(key,value)` 明文（`src/main/database.ts:519` 至 `src/main/database.ts:522`）；视觉和 LLM profile 直接序列化 `apiKey`（`src/main/ipc/settings.ts:511` 至 `src/main/ipc/settings.ts:540`）；`settings:getAll` 返回全部键值到 renderer（`src/main/ipc/settings.ts:633` 至 `src/main/ipc/settings.ts:640`）。整库备份自然会携带这些密钥。
+所有设置都是 `settings(key,value)` 明文（`src/main/database.ts:519` 至 `src/main/database.ts:522`）；视觉和 LLM profile 直接序列化 `apiKey`（`src/main/ipc/settings.ts:511` 至 `src/main/ipc/settings.ts:540`）；PaddleOCR 直接读取 `paddleocr_api_key`（`src/main/ocr.ts:347` 至 `src/main/ocr.ts:356`），模型列表 IPC 也可接收 renderer 明文 Token（`src/main/ipc/settings.ts:646` 至 `src/main/ipc/settings.ts:651`）；`settings:getAll` 返回全部键值到 renderer（`src/main/ipc/settings.ts:633` 至 `src/main/ipc/settings.ts:640`）。整库备份自然会携带三类密钥。
 
-**落实方案：** 使用 Electron `safeStorage` 等现有能力把 secret envelope 留在 main；renderer 只获得 `configured/last4/profileId`。普通备份和诊断默认排除 secret，用户明确选择加密导出时才包含。迁移先复制并验证加密值，再清理旧明文；失败保持旧值且不破坏启动，回滚流程与模块 11 一致。
+**落实方案：** 复用模块 01/07 唯一 `CredentialVault`：Electron `safeStorage` 密文写入 `userData/secrets` versioned sidecar，SQLite 只保存 entry/version/state。renderer 只能短暂提交当前草稿，已保存 secret 不得读回；Paddle/视觉/LLM 模型列表与连通性测试只使用 profileId 或 TTL draft ref。sidecar 与 SQLite 通过 prepare/activate/finalize journal 恢复，普通备份默认排除 secret，历史含密钥备份生成脱敏替代副本后由用户决定是否隔离原件。迁移先准备并验证密文，再切换引用和清理旧明文；失败保持完整旧状态，不能新建普通明文备份。
 
 ### D03-P1-13 阅读正文、搜索、翻译和导出没有使用同一 canonical text
 
@@ -278,7 +278,7 @@ legacy BatchProcessor 恢复时按 batch group 全部启动（`src/main/batch-pr
 
 **落实方案：**
 
-- shared 定义唯一 `CanonicalPageContent`：已确认人工校对优先，否则 active artifact；同时返回来源、base artifact 和 source-range 映射。
+- shared 定义唯一 `CanonicalPageContent` DTO，并由模块 03 的 `CanonicalContentProvider.resolvePage(...)` 返回：已确认人工校对优先，否则 active artifact；同时返回来源、base artifact 和 source-range 映射。
 - canonical proof text 必须从共享 reading-flow derivation 生成，明确排除 header/footer/page number/seal/image 等装饰块，并定义表格、公式、图注的序列化策略。
 - 阅读、页内检索、全库索引、AI、翻译、引用和导出全部消费同一 provider，禁止自行写 `proofed_text || ocr_text` 变体。
 - 结构化阅读不能因为需要 layout blocks 就丢掉人工文本；应把 proof revision 映射回 block/source range，无法映射时明确进入纯文本校对视图。
@@ -389,7 +389,7 @@ Renderer / Import Outbox / Manual OCR
 
 - run ID、doc ID、engine/profile、目标页集合引用、source fingerprint。
 - 模型、endpoint 标识、prompt/参数/pipeline 版本和用户授权版本。
-- queued/running/paused/partial/completed/failed/canceled、统计、开始/结束时间和父 run。
+- 顶层 `TaskStatus=queued|running|paused|completed|error|canceled`、领域 phase、`completionKind=complete|partial`、统计、开始/结束时间和父 run；旧 failed/partial 只通过模块 01 的兼容映射读取。
 
 **`ocr_page_attempts`**
 
@@ -411,12 +411,13 @@ Renderer / Import Outbox / Manual OCR
 - `pages.ocr_text/ocr_result` 是 active artifact 的兼容投影。
 - `proofed_text` 属于人工层，不属于 OCR artifact；任何自动任务不得清空。
 - 校对保存记录 base artifact/hash；基线变化时进入三方差异合并。
-- 搜索、AI、导出和阅读统一使用 canonical text：已确认人工校对优先，否则 active OCR。
+- 搜索、AI、导出和阅读统一使用 `CanonicalContentProvider.resolvePage(...) -> CanonicalPageContent`：已确认人工校对优先，否则 active OCR。
 
 ## 7. 分阶段落实方案
 
-### 阶段 A：先封住数据错误与数据丢失
+### 阶段 A：先封住凭据泄露、数据错误与数据丢失
 
+- 先完成 D03-P0-01：三类凭据共用 main-only sidecar vault/journal，generic settings 拒绝 secret 读回，模型列表不再传 apiKey，普通/历史备份完成脱敏策略。
 - 写 proof 保留、pageRanges 违约、结果 URL 延迟、乱序校对保存和版本覆盖的失败行为测试。
 - 删除所有 OCR 前清空校对逻辑；版本切换保留校对。
 - 修正异步结果 pending 状态机和 phase 条件。
@@ -457,7 +458,7 @@ Renderer / Import Outbox / Manual OCR
 
 ### 阶段 F：安全与隐私
 
-- secret 迁移到 main-only safeStorage。
+- 复核阶段 A 的 CredentialVault、历史备份处理和 secret scanner，不再在此重复建设第二套密钥存储。
 - 日志默认元数据化、原文诊断 opt-in、TTL/容量/清理/备份排除。
 - 外部 OCR 与视觉服务显示页面范围、服务商和授权。
 - 隐私模式可强制只用原生文本层和已批准的本地 OCR。
@@ -479,7 +480,7 @@ Renderer / Import Outbox / Manual OCR
 | OCR-11 | 空结果、真实空白页和图片页被准确区分 | 0 block、纯图、服务空 JSON、解析异常 | 空页不再默认得到健康分 |
 | OCR-12 | 大 PDF 不被预检和 IR 重复整本 hydrate | 1000/5000 页、缓存 8 文献、取消 | 峰值 RSS、event-loop delay 有发布阈值 |
 | OCR-13 | 本地 OCR 模型只加载有限次，worker 卡死可杀死重建 | 连续 100 页、崩溃、超时、坏 stdout | runtime/model 仍不进默认 Release |
-| OCR-14 | renderer、普通备份和普通日志不包含明文 API Key 或整页原文 | 数据库扫描、IPC 捕获、备份解包、日志容量 | 密钥迁移失败可恢复旧库 |
+| OCR-14 | 除用户当前输入草稿外，renderer、普通备份和普通日志不包含三类明文凭据或整页原文 | SQLite/WAL 扫描、IPC/表单捕获、Paddle/视觉模型列表、历史与新备份解包、日志容量 | vault 跨存储故障只留下完整旧/新状态，迁移失败可恢复旧库 |
 | OCR-15 | 搜索、阅读、AI、翻译和导出对同一页使用相同 canonical text | 有校对、切换 OCR、校对基线变化 | 旧页面字段继续可读 |
 | OCR-16 | 校对保存失败可见且可重试，自己的保存回显不清空 undo/redo | false 返回、异常、乱序 response、保存后 undo/redo | 本地草稿不丢，revision 单调 |
 | OCR-17 | block 拆分和旧坐标经过保存、重载、IR 重建后几何不变 | xywh/xyxy/polygon、竖列拆分、叠块拆分 | 原始坐标和推断来源可追溯 |
@@ -560,7 +561,7 @@ Renderer / Import Outbox / Manual OCR
 - 阶段 A 可以完全使用现有 TypeScript、Electron、better-sqlite3、AbortController、streams 和测试工具完成。
 - `task_jobs/task_items` 复用模块 02 的统一调度结构；OCR 只增加领域表，不另建第二套 scheduler。
 - `ocr_runs/ocr_page_attempts/ocr_artifact_versions` 属于收益明显的 additive migration：它们解决错页追踪、崩溃恢复、真正版本和原子激活，建议批准，但必须先自动备份、可重入、失败回滚和旧库演练。
-- `safeStorage` 为 Electron 现有能力，不算新增依赖；密钥迁移必须与模块 11 的备份/恢复方案一起实施。
+- `safeStorage` 为 Electron 现有能力，不算新增依赖；密钥迁移复用模块 01/07 的 CredentialVault sidecar/journal，并与模块 11 的备份/恢复、历史备份脱敏方案一起实施。
 - 常驻本地 runner 可先用现有 child_process 与 JSONL 协议；新的 Python runtime、OCR 模型、第三方流解析器、diff 库或云服务一律标记 **实施前需用户确认**。
 - 默认安装包和公开 Release 不新增本地模型；模型下载来源、hash、许可证、大小和卸载必须可查。
 
@@ -568,7 +569,7 @@ Renderer / Import Outbox / Manual OCR
 
 - 导入模块只负责持久投递 OCR job，不持有整批 renderer Promise；导入完成不等于 OCR 完成。
 - 文库组织模块接收 OCR/AI 元数据建议时必须保留来源、置信度和 artifact/run ID，人工标签优先。
-- 阅读器、搜索、翻译、AI 和导出统一使用“人工校对优先，否则 active OCR”的 canonical text provider。
+- 模块 03 拥有 `CanonicalContentProvider.resolvePage(...) -> CanonicalPageContent` 的 active proof/OCR/source 选择；阅读器、搜索、翻译、AI 和导出统一消费该合同，不另建 canonical text provider。
 - 搜索索引只在 artifact 激活或校对 revision 提交后更新；staging 结果不得进入用户检索。
 - AI 目录和研究不得读取失败、未激活或未授权外发的 OCR artifact。
 - 数据库备份必须同时保护 active 投影、artifact 历史、外置 payload、任务 lease 和 proof revision，并默认排除 secret/原文诊断日志。
