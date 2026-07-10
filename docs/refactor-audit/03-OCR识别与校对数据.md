@@ -266,7 +266,7 @@ legacy BatchProcessor 恢复时按 batch group 全部启动（`src/main/batch-pr
 
 **落实方案：** 复用模块 01/07 唯一 `CredentialVault`：Electron `safeStorage` 密文写入 `userData/secrets` versioned sidecar，SQLite 只保存 entry/version/state。renderer 只能短暂提交当前草稿，已保存 secret 不得读回；Paddle/视觉/LLM 模型列表与连通性测试只使用 profileId 或 TTL draft ref。sidecar 与 SQLite 通过 prepare/activate/finalize journal 恢复，普通备份默认排除 secret，历史含密钥备份生成脱敏替代副本后由用户决定是否隔离原件。迁移先准备并验证密文，再切换引用和清理旧明文；失败保持完整旧状态，不能新建普通明文备份。
 
-### D03-P1-13 阅读正文、搜索、翻译和导出没有使用同一 canonical text
+### D03-P1-12 阅读正文、搜索、翻译和导出没有使用同一 canonical text
 
 **证据等级：已确认。**
 
@@ -284,7 +284,7 @@ legacy BatchProcessor 恢复时按 batch group 全部启动（`src/main/batch-pr
 - 结构化阅读不能因为需要 layout blocks 就丢掉人工文本；应把 proof revision 映射回 block/source range，无法映射时明确进入纯文本校对视图。
 - OCR-15 必须用同一数据库样本跨所有消费者比较输出 hash。
 
-### D03-P1-14 现行校对保存会吞掉失败，调用方无法等待、重试或处理乱序
+### D03-P1-13 现行校对保存会吞掉失败，调用方无法等待、重试或处理乱序
 
 **证据等级：已确认。**
 
@@ -299,7 +299,7 @@ GujiFacsimileProofreader 和 dormant Overlay 的 `onSave` 都是 void 合同；G
 - 保存中、已保存、离线草稿、冲突和失败都有可见状态；失败不关闭编辑器，不清本地内容。
 - undo/redo 生成新 revision 并走同一保存队列，不直接篡改历史 active 行；自己的 save echo 只确认 revision，不重置历史，只有外部 baseRevision 变化才启动合并。
 
-### D03-P1-15 古籍竖列拆分和坐标解析存在保存后 round-trip 损坏
+### D03-P1-14 古籍竖列拆分和坐标解析存在保存后 round-trip 损坏
 
 **证据等级：已确认。**
 
@@ -313,7 +313,7 @@ renderer 对 `[80,120,30,40]` 可按 xywh 解析，IR `toOcrBoundingBox` 对同�
 - renderer、main 和 IR 使用同一坐标 parser/serializer，并做 save -> reload -> rebuild IR round-trip 属性测试。
 - 旧格式猜测带 `inferredFormat/confidence`；不确定时保留原始 coordinate，不静默丢弃。
 
-### D03-P1-16 页图请求越界时可能把 PDF 最后一页静默复制成不存在的页
+### D03-P1-15 页图请求越界时可能把 PDF 最后一页静默复制成不存在的页
 
 **证据等级：已确认。**
 
@@ -321,7 +321,7 @@ renderer 对 `[80,120,30,40]` 可按 xywh 解析，IR `toOcrBoundingBox` 对同�
 
 **落实方案：** PDF 实际页数是硬边界；请求越界必须 `page_out_of_range` 失败，绝不 clamp。render 返回实际 pageNum，缓存前断言与请求一致；数据库页数冲突进入页面完整性诊断，不自动制造页图。
 
-### D03-P1-17 人工编辑 hybrid 页面可能用传统 OCR 底稿覆盖视觉校正和 provenance
+### D03-P1-16 人工编辑 hybrid 页面可能用传统 OCR 底稿覆盖视觉校正和 provenance
 
 **证据等级：已确认。**
 
