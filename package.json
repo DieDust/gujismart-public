@@ -84,7 +84,7 @@
     "test:metadata-tags": "electron scripts/metadata-tags-regression.js",
     "test:ocr-recovery": "electron scripts/ocr-recovery-regression.js",
     "test:startup-recovery": "electron scripts/startup-recovery-regression.js",
-    "test:library-ocr-status": "node scripts/library-ocr-status-reconcile-regression.js",
+    "test:library-ocr-status": "npm run build && node scripts/library-ocr-status-reconcile-regression.js",
     "test:ocr-pdf-resume": "node scripts/ocr-pdf-resume-regression.js",
     "test:research": "electron scripts/research-regression.js",
     "test:evidence-qa": "electron scripts/evidence-qa-regression.js",
