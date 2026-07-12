@@ -94,6 +94,34 @@ function joinLineItems(items: PositionedTextItem[]): string {
   return text.trim()
 }
 
+function splitLineAtColumnGaps(items: PositionedTextItem[], pageWidth: number): PositionedTextItem[][] {
+  const sorted = [...items].sort((left, right) => left.left - right.left)
+  if (sorted.length < 2) return [sorted]
+
+  const positiveHeights = sorted.map((item) => item.height).filter((height) => height > 0)
+  const averageHeight = positiveHeights.length > 0
+    ? positiveHeights.reduce((sum, height) => sum + height, 0) / positiveHeights.length
+    : 1
+  const minimumColumnGap = Math.max(8, averageHeight * 1.45, pageWidth * 0.025)
+  const groups: PositionedTextItem[][] = [[sorted[0]]]
+
+  for (let index = 1; index < sorted.length; index += 1) {
+    const item = sorted[index]
+    const previous = sorted[index - 1]
+    const gap = item.left - (previous.left + previous.width)
+    const currentGroup = groups[groups.length - 1]
+    const leftTextLength = joinLineItems(currentGroup).replace(/\s+/g, '').length
+    const rightTextLength = joinLineItems(sorted.slice(index)).replace(/\s+/g, '').length
+    if (gap >= minimumColumnGap && leftTextLength >= 4 && rightTextLength >= 4) {
+      groups.push([item])
+    } else {
+      currentGroup.push(item)
+    }
+  }
+
+  return groups
+}
+
 function createNativeLayoutBlocks(
   rawItems: PdfTextItem[],
   pageWidth: number,
@@ -129,6 +157,7 @@ function createNativeLayoutBlocks(
   }
 
   return lines
+    .flatMap((line) => splitLineAtColumnGaps(line, pageWidth))
     .map((line, index): OcrRecognizeLayoutBlock | null => {
       const sorted = [...line].sort((left, right) => left.left - right.left)
       const text = joinLineItems(sorted)

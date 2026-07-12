@@ -66,11 +66,12 @@ assertIncludes(ocrText, 'getManualReadingOrder', 'ocrText should detect manual r
 assertIncludes(ocrText, 'manual_reading_order', 'ocrText text-flow ordering should read manual_reading_order')
 assertIncludes(ocrText, 'return compareByOriginalReadingOrder(left, right)', 'Text-flow ordering should fall back to the original OCR order')
 assertIncludes(ocrText, 'const ordered = getTextFlowOcrBlocks(page)', 'Ordered block text should honor manual reading order')
-assertIncludes(ocrText, 'for (const block of getTextFlowOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } }))', 'Readable layout elements should honor manual reading order')
+assertIncludes(ocrText, 'const textFlowLayoutBlocks = getTextFlowOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } })', 'Readable layout elements should start from the manual text-flow order')
+assertIncludes(ocrText, 'for (const block of inferReadableMultiColumnBlocks(textFlowLayoutBlocks))', 'Readable layout elements should repair detected multi-column OCR flow after honoring manual order')
 assertMatch(
   ocrText,
-  /export function extractPageText\(page: OcrTextPage\): string \{\s+const blocks = getTextFlowOcrBlocks\(page\)/,
-  'extractPageText should prefer manually ordered blocks when it reads OCR block text',
+  /export function extractPageText\(page: OcrTextPage\): string \{\s+const canonicalText[\s\S]*?if \(canonicalText\) return canonicalText\s+const blocks = getTextFlowOcrBlocks\(page\)/,
+  'extractPageText should prefer canonical content, then manually ordered OCR blocks',
 )
 assertMatch(
   ocrText,

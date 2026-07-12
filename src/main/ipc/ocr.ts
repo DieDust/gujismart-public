@@ -41,7 +41,28 @@ import {
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { hasVisionOcrConfig, recognizePagesWithVisionModel, refinePagesWithVisionModel } from '../vision-ocr'
-import { getLocalPaddleOcrStatus, recognizePagesWithLocalPaddle } from '../local-paddle-ocr'
+import { readProtectedSetting } from '../settings-security'
+import {
+  completeLegacyBatchItem,
+  createLegacyBatchTask,
+  failLegacyBatchItem,
+  releaseAllLegacyBatchClaims,
+  startLegacyBatchItem,
+} from '../task-batch-compat'
+import {
+  appendImportAutoOcrItems,
+  createImportAutoOcrTask,
+  getImportAutoOcrTask,
+  listResumableImportAutoOcrTasks,
+  recoverInterruptedImportAutoOcrTasks,
+} from '../import-auto-ocr-task'
+import {
+  claimTaskItems,
+  completeTaskItem,
+  failTaskItem,
+  heartbeatTaskLease,
+  releaseTaskItemLease,
+} from '../task-scheduler'
 import { applyCjkTextRenderFallback } from '../../shared/pdf-text-render-fallback'
 import {
   OCR_IR_PIPELINE_VERSION,
@@ -55,9 +76,11 @@ import {
   getOcrPageIr,
   getOcrRegionRerecognitionCandidates,
 } from '../../shared/ocr-ir'
-import type { BatchOcrOptions, Document, DocumentPage, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, OcrRegionRerecognitionOptions, OcrRegionRerecognitionResult, PdfTextLayerAnalysis, PdfTextLayerPageAnalysis, TocItemV2 } from '../../shared/types'
+import type { BatchOcrOptions, Document, DocumentPage, ImportAutoOcrTaskCreateOptions, ImportAutoOcrTaskItemInput, ImportAutoOcrTaskStartResult, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, OcrRegionRerecognitionOptions, OcrRegionRerecognitionResult, PdfTextLayerAnalysis, PdfTextLayerPageAnalysis, TocItemV2 } from '../../shared/types'
 import { ocrRunMetadataFromProgress } from '../../shared/ocr-run-metadata'
 import { statusEnvelopeFromOcrProgress } from '../../shared/status-envelope'
+import { recordCompatibilityOcrArtifacts } from '../ocr-artifacts'
+import { globalOcrDocumentWindow } from '../ocr-document-window'
 
 const AUTO_METADATA_TIMEOUT_MS = 120_000
 const AUTO_METADATA_QUEUE_TIMEOUT_MS = 30 * 60_000
@@ -78,6 +101,8 @@ const OCR_CANCELED_MESSAGE = 'OCR 已取消'
 const HEAVY_PDF_DOC_SIZE_BYTES = 200 * 1024 * 1024
 const HEAVY_PDF_DOC_PAGE_COUNT = 1000
 const RECOVERABLE_BATCH_OCR_PREFIX = 'recoverable_ocr'
+const IMPORT_AUTO_OCR_LEASE_MS = 10 * 60 * 1000
+const IMPORT_AUTO_OCR_HEARTBEAT_MS = 30 * 1000
 const OCR_LAYOUT_QUALITY_REJECTED_PREFIX = '[layout_quality_rejected]'
 const OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
 const OCR_ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'
@@ -184,7 +209,10 @@ interface PageImageCropSpec {
   readingOrder: number
 }
 
+type OcrStatusEvent = Pick<Electron.IpcMainInvokeEvent, 'sender'>
+
 const activeOcrTasks = new Map<string, ActiveOcrTask>()
+const activeImportAutoOcrRuns = new Map<string, Promise<void>>()
 const queuedOcrDocIds = new Set<string>()
 const canceledOcrDocIds = new Set<string>()
 const pendingOcrFinalizePageIds = new Set<string>()
@@ -340,23 +368,11 @@ function shouldPersistBatchOcrForRecovery(options?: BatchOcrOptions): boolean {
 
 function createRecoverableBatchOcrItems(docIds: string[], batchSize: number): Map<string, string> {
   const uniqueDocIds = [...new Set((docIds || []).map((docId) => String(docId || '').trim()).filter(Boolean))]
-  const itemIdsByDocId = new Map<string, string>()
-  if (uniqueDocIds.length === 0) return itemIdsByDocId
-
-  const batchId = `${RECOVERABLE_BATCH_OCR_PREFIX}_${Date.now()}_${nanoid(6)}`
-  const now = new Date().toISOString()
-  transaction(() => {
-    uniqueDocIds.forEach((docId) => {
-      const itemId = nanoid()
-      run(
-        'INSERT INTO batch_queue (id, batch_id, doc_id, status, batch_size, progress, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [itemId, batchId, docId, 'pending', batchSize, 0, null, now],
-      )
-      itemIdsByDocId.set(docId, itemId)
-    })
+  if (uniqueDocIds.length === 0) return new Map<string, string>()
+  const persisted = createLegacyBatchTask(uniqueDocIds, batchSize, {
+    batchId: `${RECOVERABLE_BATCH_OCR_PREFIX}_${Date.now()}_${nanoid(6)}`,
   })
-  scheduleDatabaseSave()
-  return itemIdsByDocId
+  return new Map(persisted.items.map((item) => [item.docId, item.legacyItemId]))
 }
 
 function updateRecoverableBatchOcrItem(
@@ -368,19 +384,13 @@ function updateRecoverableBatchOcrItem(
   const itemId = itemIdsByDocId.get(docId)
   if (!itemId) return
 
-  const now = new Date().toISOString()
   if (status === 'processing') {
-    run(
-      'UPDATE batch_queue SET status = ?, progress = ?, error_message = NULL, started_at = COALESCE(started_at, ?), completed_at = NULL WHERE id = ?',
-      ['processing', 0, now, itemId],
-    )
+    startLegacyBatchItem(itemId, `documents-batch-ocr:${docId}`)
+  } else if (status === 'completed') {
+    completeLegacyBatchItem(itemId, { message: errorMessage })
   } else {
-    run(
-      'UPDATE batch_queue SET status = ?, progress = ?, error_message = ?, completed_at = ? WHERE id = ?',
-      [status, 100, errorMessage ? errorMessage.slice(0, 1000) : null, now, itemId],
-    )
+    failLegacyBatchItem(itemId, { errorMessage: errorMessage || 'OCR 处理失败', recoverable: true })
   }
-  scheduleDatabaseSave()
 }
 
 export async function shutdownOcrRuntime(timeoutMs = 3000): Promise<void> {
@@ -394,7 +404,10 @@ export async function shutdownOcrRuntime(timeoutMs = 3000): Promise<void> {
 
   const activeDocIds = [...activeOcrTasks.keys()]
   const queuedDocIds = [...queuedOcrDocIds]
-  const activeDoneTasks = [...activeOcrTasks.values()].map((task) => task.done)
+  const activeDoneTasks = [
+    ...[...activeOcrTasks.values()].map((task) => task.done),
+    ...activeImportAutoOcrRuns.values(),
+  ]
   clearAllPendingOcrStatuses()
   activeOcrTasks.forEach((task) => task.controller.abort())
   activeDocIds.forEach((docId) => canceledOcrDocIds.add(docId))
@@ -416,6 +429,7 @@ export async function shutdownOcrRuntime(timeoutMs = 3000): Promise<void> {
     saveDatabase()
   }
   await waitForOcrShutdown(activeDoneTasks, timeoutMs)
+  releaseAllLegacyBatchClaims()
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {
@@ -595,7 +609,7 @@ function clearAllPendingOcrStatuses(): void {
   lastOcrStatusSentAtByDoc.clear()
 }
 
-function emitOcrStatus(event: Electron.IpcMainInvokeEvent, payload: OcrProgressEvent): void {
+function emitOcrStatus(event: OcrStatusEvent, payload: OcrProgressEvent): void {
   const next = getMonotonicOcrStatusPayload(payload)
   const docId = String(next.docId || '').trim()
   if (!docId || isTerminalOcrProgressPayload(next)) {
@@ -2870,11 +2884,12 @@ async function retryIncompletePagesWithOriginalPdfOcr(
 
     transaction(() => {
       pages.forEach((page) => {
-        run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = NULL, proofed_text_ref = NULL WHERE id = ?', [
-          'processing',
-          'pending',
-          page.id,
-        ])
+        run(
+          `UPDATE pages SET ocr_status = ?,
+           proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END
+           WHERE id = ?`,
+          ['processing', page.id],
+        )
       })
     })
     scheduleDatabaseSave()
@@ -3081,11 +3096,12 @@ async function retryIncompletePagesWithSinglePageOcr(
       continue
     }
 
-    run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = NULL, proofed_text_ref = NULL WHERE id = ?', [
-      'processing',
-      'pending',
-      originalPage.id,
-    ])
+    run(
+      `UPDATE pages SET ocr_status = ?,
+       proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END
+       WHERE id = ?`,
+      ['processing', originalPage.id],
+    )
     scheduleDatabaseSave()
 
     try {
@@ -3943,10 +3959,14 @@ async function rerunPageLayoutOnly(
 }
 
 function getEngineLabel(engine: string): string {
-  if (engine === 'local_paddle') return '本地 OCR'
   if (engine === 'vision_model') return '视觉 OCR'
   if (engine === 'hybrid') return '混合 OCR'
   return '飞桨 OCR'
+}
+
+function normalizeAvailableOcrEngine(engine: OcrEngine): OcrEngine {
+  if (engine === 'local_paddle') return 'paddle'
+  return engine === 'hybrid' ? 'paddle' : engine
 }
 
 function getPageSnapshotsForOcrSave(pageIds: string[]): Map<string, OcrSavePageSnapshot> {
@@ -4394,10 +4414,13 @@ function updatePageOcrState(pageId: string, result: OcrRecognizeResult, engine: 
   const preparedText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', text)
   const preparedResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', normalized.result)
   run(
-    'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, proofed_text = ?, proofed_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
-    [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, null, null, 'completed', 'pending', pageId],
+    `UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, ocr_status = ?,
+     proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END
+     WHERE id = ?`,
+    [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, 'completed', pageId],
   )
   upsertPageOcrVersion(pageId, engine, normalized.result, text, 'completed', page)
+  recordCompatibilityOcrArtifacts([{ pageId, engine, result: normalized.result, text }])
   markDocumentTocDirty(page.doc_id)
 }
 
@@ -4438,7 +4461,7 @@ async function savePageQualityFailureOcrError(
 }
 
 function finishRecoveredPageQualityFailure(
-  event: Electron.IpcMainInvokeEvent,
+  event: OcrStatusEvent,
   page: Pick<OcrPageRow, 'id' | 'doc_id'>,
 ): void {
   updateDocumentStatusFromPages(page.doc_id)
@@ -4456,14 +4479,14 @@ function parseMetadata(value: unknown): JsonRecord {
 }
 
 function resolveOcrEngine(doc: Pick<OcrDocumentRow, 'metadata'>, requested?: OcrEngine): OcrEngine {
-  if (requested === 'local_paddle' || requested === 'paddle' || requested === 'vision_model' || requested === 'hybrid') return requested
+  if (requested === 'local_paddle' || requested === 'paddle' || requested === 'vision_model' || requested === 'hybrid') return normalizeAvailableOcrEngine(requested)
   const storedEngine = parseMetadata(doc.metadata).ocr_engine
   if (storedEngine === 'local_paddle' || storedEngine === 'paddle' || storedEngine === 'vision_model' || storedEngine === 'hybrid') {
-    return storedEngine
+    return normalizeAvailableOcrEngine(storedEngine)
   }
   const configuredEngine = queryOne<{ value?: string | null }>('SELECT value FROM settings WHERE key = ?', ['ocr_default_engine'])?.value
   if (configuredEngine === 'local_paddle' || configuredEngine === 'paddle' || configuredEngine === 'vision_model' || configuredEngine === 'hybrid') {
-    return configuredEngine === 'hybrid' ? 'paddle' : configuredEngine
+    return normalizeAvailableOcrEngine(configuredEngine)
   }
   return 'paddle'
 }
@@ -4732,13 +4755,10 @@ function getPagesForOcrAttempt(pages: OcrPageRow[], resumeExisting: boolean, att
 function resetPagesForFullOcrRerun(docId: string): void {
   clearDocumentOcrRoutePreference(docId)
   run(
-    `UPDATE pages
-     SET proofed_text = NULL,
-         proofed_text_ref = NULL,
-         ocr_status = ?,
-         proof_status = ?
+    `UPDATE pages SET ocr_status = ?,
+       proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END
      WHERE doc_id = ?`,
-    ['pending', 'pending', docId],
+    ['pending', docId],
   )
   const pageIds = queryAll<{ id: string }>('SELECT id FROM pages WHERE doc_id = ?', [docId]).map((page) => page.id)
   clearPageSearchIndexForDocuments([docId])
@@ -4795,7 +4815,7 @@ function getDocumentTotalPages(docId: string, pageSummary?: { total: number }): 
   return totalPages > 0 ? totalPages : undefined
 }
 
-function emitOcrAlreadyRunningStatus(event: Electron.IpcMainInvokeEvent, docId: string): void {
+function emitOcrAlreadyRunningStatus(event: OcrStatusEvent, docId: string): void {
   const stats = summarizeDocumentOcrPages(docId)
   const totalPages = getDocumentTotalPages(docId, stats)
   const completed = isOcrPageSummaryComplete(stats)
@@ -4827,7 +4847,7 @@ function emitOcrAlreadyRunningStatus(event: Electron.IpcMainInvokeEvent, docId: 
 }
 
 function emitOcrCanceledOrCompletedStatus(
-  event: Electron.IpcMainInvokeEvent,
+  event: OcrStatusEvent,
   docId: string,
   progress = 0,
   totalPages?: number,
@@ -5069,6 +5089,18 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
     })
   })
 
+  const completedVersionWrites = versionWrites.filter((item) => item.status === 'completed')
+  for (let offset = 0; offset < completedVersionWrites.length; offset += 200) {
+    recordCompatibilityOcrArtifacts(
+      completedVersionWrites.slice(offset, offset + 200).map((item) => ({
+        pageId: item.pageId,
+        engine,
+        result: item.result,
+        text: item.text,
+      })),
+    )
+  }
+
   if (changedPageIds.length > 0) {
     if (options.markTocDirty !== false) {
       tocDirtyDocIds.forEach(markDocumentTocDirty)
@@ -5128,7 +5160,7 @@ async function savePageOcrResultsBatched(pageResults: OcrPageResult[], engine: O
 }
 
 async function processDocumentOcr(
-  event: Electron.IpcMainInvokeEvent,
+  event: OcrStatusEvent,
   docId: string,
   totalDocs: number,
   getCompleted: () => number,
@@ -5507,65 +5539,6 @@ async function processDocumentOcr(
           pageNum: payload.pageNum,
           errorMessage: payload.error,
           message: `大模型 OCR ${actionText}：${combinedPages}/${totalPages} 页${activeNote}${sizeNote}${elapsedNote}`,
-        })
-      })
-    } else if (engine === 'local_paddle') {
-      const localStatus = await getLocalPaddleOcrStatus()
-      if (!localStatus.installed) {
-        throw new Error(localStatus.message || '本地 PaddleOCR 尚未安装，请先在设置页下载本地 OCR 模型。')
-      }
-      if (pages.length === 0) {
-        pages = await ensurePageRecords(docId, Number(doc.page_count || 0) || 0)
-        pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
-        completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
-      }
-      if (pagesForOcr.length === 0) {
-        throw new Error('文献已导入，但没有可恢复的页记录或页图，无法继续本地 OCR。请重新导入或打开文献生成页图后再试。')
-      }
-      const missingImagePage = findMissingReadablePageImage(pagesForOcr)
-      if (missingImagePage && pdfPath) {
-        emitOcrStatus(event, {
-          docId,
-          status: 'processing',
-          phase: 'ocr',
-          progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
-          completedPages: completedBefore,
-          totalPages: getDocTotalPages(),
-          pageNum: missingImagePage.page_num || undefined,
-          message: `正在为本地 OCR 生成页面图：${completedBefore}/${getDocTotalPages()} 页`,
-        })
-        const localPageImagePages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)
-        const localPageImagesById = new Map(localPageImagePages.map((page) => [page.id, page]))
-        pages = pages.map((page) => localPageImagesById.get(page.id) || page)
-        pagesForOcr = pagesForOcr.map((page) => localPageImagesById.get(page.id) || page)
-      }
-      const stillMissingImagePage = findMissingReadablePageImage(pagesForOcr)
-      if (stillMissingImagePage) {
-        throw new Error(`第 ${stillMissingImagePage.page_num || ''} 页缺少可读取页图，无法使用本地 PaddleOCR。请先恢复 PDF 原文或重新导入。`)
-      }
-      pageResults = await recognizePagesWithLocalPaddle(pagesForOcr, (payload) => {
-        throwIfOcrCanceled(signal)
-        const combinedPages = getCombinedPageCount(payload.completedPages)
-        const totalPages = getDocTotalPages() || payload.totalPages
-        const docFraction = getCombinedDocFraction(payload.completedPages, payload.totalPages)
-        if (payload.status === 'completed' && payload.result) {
-          savePageOcrResultsDeferred([{
-            pageId: payload.pageId,
-            result: payload.result,
-            text: payload.text || getOcrResultText(payload.result),
-            status: 'completed',
-          }], 'local_paddle', { refreshSearch: false })
-        }
-        emitOcrStatus(event, {
-          docId,
-          status: 'processing',
-          phase: 'ocr',
-          progress: getDocProgress(getCompleted(), totalDocs, docFraction),
-          completedPages: combinedPages,
-          totalPages,
-          pageNum: payload.pageNum,
-          errorMessage: payload.error,
-          message: `本地 PaddleOCR 识别中：${combinedPages}/${totalPages} 页`,
         })
       })
     } else if (engine === 'paddle' && asyncPdfRouteRisk?.preferPageImage && pdfPath && pagesForOcr.length > 0) {
@@ -6202,10 +6175,234 @@ async function processDocumentOcr(
   }
 }
 
+function getImportAutoOcrTaskConfig(jobId: string): { engine: OcrEngine; batchSize: number; totalCount: number } {
+  const job = getImportAutoOcrTask(jobId)
+  const engineValue = String(job.settingsSnapshot.engine || 'paddle')
+  const engine: OcrEngine = engineValue === 'local_paddle' || engineValue === 'vision_model' || engineValue === 'hybrid'
+    ? normalizeAvailableOcrEngine(engineValue)
+    : 'paddle'
+  const rawBatchSize = Number(job.settingsSnapshot.batchSize || 5)
+  const batchSize = Math.max(1, Math.min(200, Number.isSafeInteger(rawBatchSize) ? rawBatchSize : 5))
+  return { engine, batchSize, totalCount: job.totalCount }
+}
+
+async function acquireDocumentOcrSlot(docId: string): Promise<void> {
+  while (!ocrRuntimeShuttingDown) {
+    const active = activeOcrTasks.get(docId)
+    if (active) {
+      await active.done
+      continue
+    }
+    if (!queuedOcrDocIds.has(docId)) {
+      queuedOcrDocIds.add(docId)
+      return
+    }
+    await sleep(100)
+  }
+}
+
+async function processImportAutoOcrClaim(
+  event: OcrStatusEvent,
+  claim: ReturnType<typeof claimTaskItems>[number],
+  engine: OcrEngine,
+  totalCount: number,
+  getCompleted: () => number,
+): Promise<boolean> {
+  const docId = String(claim.input.docId || claim.domainRef || '').trim()
+  if (!docId) {
+    failTaskItem({
+      itemId: claim.itemId,
+      leaseToken: claim.leaseToken,
+      error: { code: 'import_auto_ocr_doc_missing', message: '自动 OCR 任务缺少文献 ID。', recoverable: false },
+    })
+    return false
+  }
+
+  await acquireDocumentOcrSlot(docId)
+  if (ocrRuntimeShuttingDown) {
+    releaseTaskItemLease({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+    return false
+  }
+
+  const doc = queryOne<{ id: string; page_count: number | null }>('SELECT id, page_count FROM documents WHERE id = ?', [docId])
+  if (!doc) {
+    failTaskItem({
+      itemId: claim.itemId,
+      leaseToken: claim.leaseToken,
+      error: { code: 'import_auto_ocr_document_not_found', message: '待 OCR 文献已不存在。', recoverable: false },
+    })
+    return false
+  }
+
+  const controller = new AbortController()
+  let resolveDone: () => void = () => undefined
+  const done = new Promise<void>((resolve) => {
+    resolveDone = resolve
+  })
+  const heartbeat = setInterval(() => {
+    try {
+      heartbeatTaskLease({ itemId: claim.itemId, leaseToken: claim.leaseToken, leaseMs: IMPORT_AUTO_OCR_LEASE_MS })
+    } catch (error) {
+      console.warn('[OCR] 自动 OCR 任务续租失败', error)
+      controller.abort()
+    }
+  }, IMPORT_AUTO_OCR_HEARTBEAT_MS)
+
+  queuedOcrDocIds.delete(docId)
+  canceledOcrDocIds.delete(docId)
+  activeOcrTasks.set(docId, { controller, done })
+  run(
+    'UPDATE documents SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = NULL, updated_at = ? WHERE id = ?',
+    ['processing', 'processing', 'pending', new Date().toISOString(), docId],
+  )
+  scheduleDatabaseSave()
+  emitOcrStatus(event, {
+    docId,
+    status: 'processing',
+    phase: 'ocr',
+    progress: getCompleted() / Math.max(totalCount, 1),
+    completedPages: 0,
+    totalPages: Number(doc.page_count || 0) || undefined,
+    message: '正在执行导入后的自动 OCR',
+  })
+
+  try {
+    const result = await processDocumentOcr(event, docId, Math.max(totalCount, 1), getCompleted, engine, false, {
+      signal: controller.signal,
+    })
+    if (result.success) {
+      completeTaskItem({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+      return true
+    }
+    if (ocrRuntimeShuttingDown) {
+      releaseTaskItemLease({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+      return false
+    }
+    failTaskItem({
+      itemId: claim.itemId,
+      leaseToken: claim.leaseToken,
+      error: {
+        code: result.errorMessage === OCR_CANCELED_MESSAGE ? 'ocr_canceled' : 'import_auto_ocr_failed',
+        message: result.errorMessage || '自动 OCR 未完成。',
+        recoverable: true,
+        recoveryAction: 'retry_task',
+      },
+    })
+    return false
+  } catch (error) {
+    if (ocrRuntimeShuttingDown || isOcrAbortError(error)) {
+      releaseTaskItemLease({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+      return false
+    }
+    failTaskItem({
+      itemId: claim.itemId,
+      leaseToken: claim.leaseToken,
+      error: {
+        code: 'import_auto_ocr_failed',
+        message: (error as Error)?.message || '自动 OCR 失败。',
+        recoverable: true,
+        recoveryAction: 'retry_task',
+      },
+    })
+    return false
+  } finally {
+    clearInterval(heartbeat)
+    if (activeOcrTasks.get(docId)?.controller === controller) activeOcrTasks.delete(docId)
+    queuedOcrDocIds.delete(docId)
+    canceledOcrDocIds.delete(docId)
+    resolveDone()
+  }
+}
+
+async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promise<void> {
+  const config = getImportAutoOcrTaskConfig(jobId)
+  const concurrency = getOcrDocumentConcurrency(config.batchSize)
+  const documentLimit = createLimiter(concurrency)
+  const heavyPdfLimit = createLimiter(1)
+  let completedCount = getImportAutoOcrTask(jobId).completedCount
+  const workerId = `import-auto-ocr:${jobId}:${nanoid(6)}`
+  pauseBackgroundSearchReindex()
+  try {
+    while (!ocrRuntimeShuttingDown) {
+      const claims = claimTaskItems({
+        jobId,
+        workerId,
+        limit: Math.min(200, Math.max(1, config.batchSize)),
+        leaseMs: IMPORT_AUTO_OCR_LEASE_MS,
+      })
+      if (claims.length === 0) break
+
+      await Promise.all(claims.map((claim) => {
+        const docId = String(claim.input.docId || claim.domainRef || '').trim()
+        const limit = docId && isHeavyPdfOcrDocument(docId) ? heavyPdfLimit : documentLimit
+        if (docId) {
+          const doc = queryOne<{ page_count: number | null }>('SELECT page_count FROM documents WHERE id = ?', [docId])
+          emitOcrStatus(event, {
+            docId,
+            status: 'queued',
+            phase: 'queued',
+            progress: completedCount / Math.max(config.totalCount, 1),
+            completedPages: 0,
+            totalPages: Number(doc?.page_count || 0) || undefined,
+            message: '已加入全局 OCR 队列',
+          })
+        }
+        return limit(() => globalOcrDocumentWindow.run(getOcrDocumentConcurrency(), async () => {
+          const success = await processImportAutoOcrClaim(event, claim, config.engine, config.totalCount, () => completedCount)
+          completedCount += 1
+          return success
+        }))
+      }))
+      await yieldToEventLoop()
+    }
+  } finally {
+    resumeBackgroundSearchReindex({ reason: 'ocr-batch-deferred' })
+  }
+}
+
+function startImportAutoOcrTaskRun(event: OcrStatusEvent, jobId: string): ImportAutoOcrTaskStartResult {
+  const job = getImportAutoOcrTask(jobId)
+  const existing = activeImportAutoOcrRuns.get(jobId)
+  if (existing) return { jobId, totalCount: job.totalCount, started: false }
+  const taskRun = runImportAutoOcrTask(event, jobId)
+    .catch((error) => console.error('[OCR] 导入后自动 OCR 任务失败', error))
+    .finally(() => activeImportAutoOcrRuns.delete(jobId))
+  activeImportAutoOcrRuns.set(jobId, taskRun)
+  return { jobId, totalCount: job.totalCount, started: true }
+}
+
+export function resumePendingImportAutoOcrTasks(sender: Electron.WebContents): number {
+  if (ocrRuntimeShuttingDown || sender.isDestroyed()) return 0
+  recoverInterruptedImportAutoOcrTasks()
+  const event: OcrStatusEvent = { sender }
+  const tasks = listResumableImportAutoOcrTasks()
+  tasks.forEach((task) => startImportAutoOcrTaskRun(event, task.id))
+  return tasks.length
+}
+
 export function registerOcrIpc(): void {
+  ipcMain.handle('ocr:createImportAutoTask', async (_event, options: ImportAutoOcrTaskCreateOptions) => {
+    const task = createImportAutoOcrTask(options)
+    const config = getImportAutoOcrTaskConfig(task.id)
+    return { jobId: task.id, engine: config.engine, batchSize: config.batchSize, totalCount: task.totalCount }
+  })
+
+  ipcMain.handle('ocr:appendImportAutoTask', async (_event, jobId: string, items: ImportAutoOcrTaskItemInput[]) => {
+    const before = getImportAutoOcrTask(jobId).totalCount
+    const task = appendImportAutoOcrItems(jobId, items)
+    return { jobId: task.id, appendedCount: Math.max(0, task.totalCount - before), totalCount: task.totalCount }
+  })
+
+  ipcMain.handle('ocr:startImportAutoTask', async (event, jobId: string): Promise<ImportAutoOcrTaskStartResult> => {
+    if (ocrRuntimeShuttingDown) {
+      const task = getImportAutoOcrTask(jobId)
+      return { jobId: task.id, totalCount: task.totalCount, started: false }
+    }
+    return startImportAutoOcrTaskRun(event, jobId)
+  })
+
   ipcMain.handle('ocr:checkToken', async () => {
-    const row = queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'paddleocr_api_key'")
-    return !!row?.value
+    return Boolean(readProtectedSetting('paddleocr_api_key'))
   })
 
   ipcMain.handle('ocr:checkVisionConfig', async () => hasVisionOcrConfig())
@@ -6310,7 +6507,7 @@ export function registerOcrIpc(): void {
     await Promise.all(
       queuedDocIds.map((docId) => {
         const limit = heavyPdfDocIds.has(docId) ? heavyPdfLimit : docLimit
-        return limit(async () => {
+        return limit(() => globalOcrDocumentWindow.run(getOcrDocumentConcurrency(), async () => {
         if (ocrRuntimeShuttingDown) {
           queuedOcrDocIds.delete(docId)
           return
@@ -6377,7 +6574,7 @@ export function registerOcrIpc(): void {
           canceledOcrDocIds.delete(docId)
           resolveDone()
         }
-      })
+      }))
       }),
     )
     } finally {
@@ -6400,11 +6597,10 @@ export function registerOcrIpc(): void {
       throw new Error('当前页面所属文献不存在')
     }
 
-    run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = ? WHERE id = ?', ['processing', 'pending', null, pageId])
-    run('UPDATE documents SET ocr_status = ?, import_status = ?, proof_status = ?, updated_at = ? WHERE id = ?', [
+    run(`UPDATE pages SET ocr_status = ?, proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END WHERE id = ?`, ['processing', pageId])
+    run('UPDATE documents SET ocr_status = ?, import_status = ?, updated_at = ? WHERE id = ?', [
       'processing',
       'processing',
-      'pending',
       new Date().toISOString(),
       page.doc_id,
     ])
@@ -6469,11 +6665,10 @@ export function registerOcrIpc(): void {
       throw new Error('未配置视觉模型 OCR，请先到设置页填写端点、API Key 和视觉模型 ID。')
     }
 
-    run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = ? WHERE id = ?', ['processing', 'pending', null, pageId])
-    run('UPDATE documents SET ocr_status = ?, import_status = ?, proof_status = ?, updated_at = ? WHERE id = ?', [
+    run(`UPDATE pages SET ocr_status = ?, proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END WHERE id = ?`, ['processing', pageId])
+    run('UPDATE documents SET ocr_status = ?, import_status = ?, updated_at = ? WHERE id = ?', [
       'processing',
       'processing',
-      'pending',
       new Date().toISOString(),
       page.doc_id,
     ])
@@ -6534,11 +6729,10 @@ export function registerOcrIpc(): void {
       secondPass: options?.secondPass || 'cloud_column_ocr',
     })
 
-    run('UPDATE pages SET ocr_status = ?, proof_status = ?, proofed_text = ? WHERE id = ?', ['processing', 'pending', null, pageId])
-    run('UPDATE documents SET ocr_status = ?, import_status = ?, proof_status = ?, updated_at = ? WHERE id = ?', [
+    run(`UPDATE pages SET ocr_status = ?, proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END WHERE id = ?`, ['processing', pageId])
+    run('UPDATE documents SET ocr_status = ?, import_status = ?, updated_at = ? WHERE id = ?', [
       'processing',
       'processing',
-      'pending',
       new Date().toISOString(),
       page.doc_id,
     ])
@@ -6600,8 +6794,7 @@ export function registerOcrIpc(): void {
       throw new Error('当前页面所属文献不存在')
     }
 
-    run('UPDATE pages SET proof_status = ?, proofed_text = ? WHERE id = ?', ['pending', null, pageId])
-    run('UPDATE documents SET proof_status = ?, updated_at = ? WHERE id = ?', ['pending', new Date().toISOString(), page.doc_id])
+    run(`UPDATE pages SET proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END WHERE id = ?`, [pageId])
     scheduleDatabaseSave()
     emitOcrStatus(event, { docId: page.doc_id, status: doc.ocr_status || 'completed', progress: 0.5 })
 

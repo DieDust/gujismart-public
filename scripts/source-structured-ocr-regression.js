@@ -7,6 +7,44 @@ function assert(condition, message) {
   if (!condition) throw new Error(message)
 }
 
+async function importFilesWithCapabilities(win, filePaths) {
+  const inputId = `structured-ocr-capability-${Date.now()}`
+  await win.evaluate((id) => {
+    const input = document.createElement('input')
+    input.id = id
+    input.type = 'file'
+    input.multiple = true
+    input.style.display = 'none'
+    document.body.appendChild(input)
+  }, inputId)
+  try {
+    await win.locator(`#${inputId}`).setInputFiles(filePaths)
+    return await win.evaluate(async (id) => {
+      const input = document.getElementById(id)
+      const selected = await window.api.grantDroppedImportSources(Array.from(input?.files || []))
+      if (!selected.ok) throw new Error(selected.error.message)
+      const results = []
+      let cursor = null
+      try {
+        while (true) {
+          const batch = await window.api.readImportSelectionBatch(selected.value.selectionId, cursor, 200)
+          if (!batch.ok) throw new Error(batch.error.message)
+          if (batch.value.items.length > 0) {
+            results.push(...await window.api.importDocuments(batch.value.items.map((item) => item.grantId)))
+          }
+          if (batch.value.done) break
+          cursor = batch.value.nextCursor
+        }
+      } finally {
+        await window.api.releaseImportSelection(selected.value.selectionId)
+      }
+      return results
+    }, inputId)
+  } finally {
+    await win.evaluate((id) => document.getElementById(id)?.remove(), inputId)
+  }
+}
+
 async function run() {
   const userDataDir = path.join(os.tmpdir(), 'gujismart-structured-ocr-user-' + Date.now())
   const dataDir = path.join(os.tmpdir(), 'gujismart-structured-ocr-db-' + Date.now())
@@ -105,7 +143,7 @@ async function run() {
     await win.waitForLoadState('domcontentloaded')
     await win.waitForFunction(() => !!window.api && !!window.__smokeOpenDocument, null, { timeout: 15000 })
 
-    const importResults = await win.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+    const importResults = await importFilesWithCapabilities(win, [samplePath])
     assert(Array.isArray(importResults) && importResults[0]?.success, `Import failed: ${JSON.stringify(importResults)}`)
     const docId = importResults[0].id
 

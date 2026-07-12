@@ -2,9 +2,9 @@
 
 ## 1. 本章结论
 
-GujiSmart 的 OCR 已经不是一条简单的“图片上传后保存文本”链路。当前实现同时覆盖飞桨同步图片 OCR、飞桨异步 PDF OCR、PDF 原生文本层直读、视觉模型 OCR、混合 OCR、本地 PaddleOCR、古籍竖排与表格后处理、低质量区域重识别、OCR IR、搜索索引刷新、启动恢复和多种校对界面。尤其是 PDF/qpdf 分片、流式上传、JSONL 下载、已完成页跳过、坐标对齐、重复文本拦截和结构化 IR，都是应当保留的工程基础。
+GujiSmart 的 OCR 已经不是一条简单的“图片上传后保存文本”链路。当前实现覆盖飞桨同步图片 OCR、飞桨异步 PDF OCR、PDF 原生文本层直读、视觉模型 OCR、混合 OCR、古籍竖排与表格后处理、低质量区域重识别、OCR IR、搜索索引刷新、启动恢复和多种校对界面。尤其是 PDF/qpdf 分片、流式上传、JSONL 下载、已完成页跳过、坐标对齐、重复文本拦截和结构化 IR，都是应当保留的工程基础。本地 PaddleOCR 因暂时不能满足坐标、图片块和表格结构的成品要求，已于 2026-07-11 从产品入口和执行路由退役。
 
-当前最优先的问题不是再叠加一个新模型，而是先保证“旧结果和人工校对绝不丢失、页码绝不写错、任务可以真正取消和恢复、资源始终有界”。全量重跑、单页重跑、视觉重跑、古籍增强、版面重做和版本切换会在新结果成功前清空人工校对；所谓 OCR 版本按 `(page_id, engine)` 唯一，同一引擎重跑会覆盖历史；异步 PDF `pageRanges` 没有返回页数和来源页校验，当前对应行为测试已经失败；视觉 OCR 和本地 OCR 又没有接入统一取消与恢复合同。
+当前最优先的问题不是再叠加一个新模型，而是先保证“旧结果和人工校对绝不丢失、页码绝不写错、任务可以真正取消和恢复、资源始终有界”。全量重跑、单页重跑、视觉重跑、古籍增强、版面重做和版本切换会在新结果成功前清空人工校对；所谓 OCR 版本按 `(page_id, engine)` 唯一，同一引擎重跑会覆盖历史；异步 PDF `pageRanges` 没有返回页数和来源页校验，当前对应行为测试已经失败；视觉 OCR 仍需完整接入统一取消与恢复合同。
 
 本章建议保留现有 `pages` 和 `page_ocr_versions` 作为兼容投影，复用模块 02 已提出的统一持久化任务调度器，并旁路新增 OCR run、page attempt 和 artifact version 结构。任何结果都先进入 staging，完成页码、结构、质量和来源校验后再以短事务激活；人工校对作为独立数据层保留，OCR 变化只把校对标记为“基线已变化”，不得删除。LLM、视觉 OCR 与 PaddleOCR 的明文凭据泄露统一提升为跨模块 P0，必须先于云端 OCR 功能扩展完成 CredentialVault 迁移。第一轮正确性修复不需要新增第三方依赖；新增本地模型、外部服务或解析库仍须实施前确认。
 
@@ -112,7 +112,8 @@ Local Paddle
 - 坐标保存、读取时兼容校正、局部低质量区域重识别和结构重处理。
 - OCR IR 的来源、处理过程、阅读顺序、表格/公式、跨页连续性和质量摘要。
 - OCR 保存后搜索标脏、后台 finalize、目录失效和页面资产外置。
-- 本地 OCR runtime/model 不进入默认安装包和公开 Release；下载、校验和安全解压边界继续保留。
+- 本地 OCR 功能当前退役：设置、首次引导、文库、文件夹和重跑菜单不再提供入口，主进程不再打包本地 runtime/model 下载与执行实现。
+- 历史 `local_paddle` 数据库值、任务快照和共享类型只作兼容读取，并统一回退为飞桨云端 OCR；不执行数据库迁移，不删除历史 OCR 结果。
 
 ## 5. 关键问题
 
@@ -563,6 +564,7 @@ Renderer / Import Outbox / Manual OCR
 - `ocr_runs/ocr_page_attempts/ocr_artifact_versions` 属于收益明显的 additive migration：它们解决错页追踪、崩溃恢复、真正版本和原子激活，建议批准，但必须先自动备份、可重入、失败回滚和旧库演练。
 - `safeStorage` 为 Electron 现有能力，不算新增依赖；密钥迁移复用模块 01/07 的 CredentialVault sidecar/journal，并与模块 11 的备份/恢复、历史备份脱敏方案一起实施。
 - 常驻本地 runner 可先用现有 child_process 与 JSONL 协议；新的 Python runtime、OCR 模型、第三方流解析器、diff 库或云服务一律标记 **实施前需用户确认**。
+
 - 默认安装包和公开 Release 不新增本地模型；模型下载来源、hash、许可证、大小和卸载必须可查。
 
 ## 11. 与其他模块的约束
@@ -575,3 +577,23 @@ Renderer / Import Outbox / Manual OCR
 - 数据库备份必须同时保护 active 投影、artifact 历史、外置 payload、任务 lease 和 proof revision，并默认排除 secret/原文诊断日志。
 - UI/交互模块负责 run 级任务中心、暂停/取消、异常审查、版本 diff、费用与隐私提示；完整性校验必须留在 main。
 - 正式实现前先把本章 OCR-01 至 OCR-20 写入目标成品验收方案；正确性、校对保留、错页 fail-closed、可取消恢复和有界资源属于发布阻断门槛。
+
+## 12. 第四步首批 OCR 接入结果（2026-07-11）
+
+- `batch:start/create` 与主用 `documents:batchOcr` 的可恢复 Paddle 路径先创建 `ocr.batch` scheduler job/item，再写 `batch_queue` 兼容投影；旧 IPC 和 `BatchQueueItem` 返回形状保留。
+- OCR 开始时领取精确 item 并创建递增 attempt/lease；完成、部分完成、失败、重试、暂停、取消和关机释放均先提交 scheduler，再同步旧表。lease 过期后可回收，旧 attempt token 不能覆盖新结果。
+- `BatchProcessor` 取消改为只中止目标 job 的 controller，不再误伤其他批次；取消后的 abort 不会把 canceled item 又投影成 pending。暂停只停止新领取，当前提交仍可完成。
+- 启动恢复先用旧文献/page 事实校正 legacy 行，再按 `legacy:batch_queue:<id>` 幂等桥接；重复启动不会复制 job/item，旧 pending/processing/completed/failed 可继续读取。
+- 仍保留的边界：单页、区域、vision OCR 还没有全部变成 scheduler item；OCR run/page artifact 的完整不可变领域表、统一 cancel signal 和质量门禁属于后续 OCR 切片。本地 OCR 已退役，历史 `local_paddle` 请求只作兼容回退。不得因为本步已有通用 artifact 引用就声称 OCR artifact activation 已全部完成。
+
+自动验收：`check:task-scheduler`、`check:batch-processor-save`、`check:startup-nonblocking`、`test:library-ocr-status`。
+
+## 13. 第五步 OCR 产物与唯一正文结果（2026-07-11）
+
+- 旁路新增 `ocr_runs`、`ocr_page_attempts`、`ocr_artifact_versions`、`ocr_page_active_artifacts`；`pages` 只 additive 增加 active/base/stale 指针，原有正文、OCR 版本和旧客户端读取路径继续兼容。
+- `CanonicalContentProvider` 的顺序固定为：已确认人工校对 > active 不可变 OCR artifact > active legacy OCR version > legacy page 投影 > unavailable。pending 校对草稿不再误入正式搜索、AI、翻译或导出。
+- OCR 保存、重跑和版本切换不再清空 `proofed_text` 或把已完成校对降级；OCR 基线变化只置 `proof_base_stale`，用户内容保持不变。
+- legacy OCR 写入同步创建兼容 artifact；相同内容幂等复用，历史内容再次成为当前版本时重新激活原 artifact，不复制 run 或篡改历史。
+- 单次 canonical 列表最多 200 页，批量加载 active/legacy 版本；文献总页数不设产品上限，AI 等消费者通过 cursor 继续读取。
+
+已覆盖：优先级、外置 payload、原子激活、幂等、不可变约束、人工校对保护、历史版本重新激活、重复初始化、分页和消费者接入。尚未完成的稳定 block identity、质量门禁、全部 OCR executor 原生 run/attempt 化与三方 diff 仍进入后续切片。

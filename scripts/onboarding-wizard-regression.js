@@ -51,10 +51,11 @@ for (const apiName of [
   assertIncludes(wizard + app, apiName, 'onboarding API reuse')
 }
 
-assertIncludes(wizard, "if (token) await window.api.setSetting('paddleocr_api_key', token)", 'PaddleOCR skip must not clear token')
-assertIncludes(wizard, "paddleApiKey.trim() || String(settings?.paddleocr_api_key || '').trim()", 'PaddleOCR model fetch should fall back to saved token')
-assertIncludes(wizard, 'window.api.listPaddleOcrModels(apiKey || undefined)', 'PaddleOCR model fetch should reuse main-process saved-token fallback')
-assertIncludes(wizard, "if (!baseUrl.trim() || !apiKey.trim())", 'AI model fetch should not fail when optional API key is omitted during onboarding')
+assertIncludes(wizard, "if (token) await window.api.saveCredential('paddleocr_api_key', token)", 'PaddleOCR skip must not clear the stored credential')
+assertNotIncludes(wizard, "setSetting('paddleocr_api_key'", 'PaddleOCR credential must not use generic settings IPC')
+assertIncludes(wizard, "window.api.listPaddleOcrModels(paddleApiKey.trim() || undefined)", 'PaddleOCR model fetch should let main use the saved credential when the draft is empty')
+assertIncludes(wizard, "if (!baseUrl.trim())", 'AI model fetch should allow main to use an already saved credential')
+assertIncludes(wizard, "kind === 'vision' ? 'vision_ocr_api_key' : 'llm_api_key'", 'model drafts must be bound to the selected credential purpose')
 assertIncludes(settingsIpc, 'comparePaddleOcrModelsNewestFirst', 'PaddleOCR model list should use newest-first model sorting')
 assertIncludes(settingsIpc, '.sort(comparePaddleOcrModelsNewestFirst)', 'PaddleOCR model list should not use plain alphabetical sorting')
 assertIncludes(wizard, "'vision_ocr_use_llm_config', 'true'", 'vision OCR follow-AI setting')

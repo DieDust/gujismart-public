@@ -43,8 +43,101 @@ interface BackupManifest {
   slot?: number | null
   includesStorage?: boolean
   includesPagePayloads?: boolean
+  credentialsExcluded?: boolean
+  credentialRequiredAfterRestore?: boolean
   timestamp?: string
   integrityReport?: BackupIntegrityReport
+}
+
+const PROTECTED_BACKUP_SETTING_KEYS = [
+  'llm_api_key',
+  'paddleocr_api_key',
+  'vision_ocr_api_key',
+] as const
+
+function redactProfileCredentials(value: string): { value: string; changed: boolean } {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (!Array.isArray(parsed)) return { value, changed: false }
+    let changed = false
+    const sanitized = parsed.map((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+      const profile = { ...(item as Record<string, unknown>) }
+      if ('apiKey' in profile) {
+        delete profile.apiKey
+        changed = true
+      }
+      return profile
+    })
+    return { value: JSON.stringify(sanitized), changed }
+  } catch {
+    return { value, changed: false }
+  }
+}
+
+function redactProtectedSettingsFromBackup(backupDir: string): boolean {
+  let credentialsFound = false
+  const sqlitePath = join(getBackupDbDir(backupDir), 'gujismart.db')
+  if (existsSync(sqlitePath)) {
+    const sqlite = new Database(sqlitePath)
+    try {
+      const hasSettings = Boolean(sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'").get())
+      if (hasSettings) {
+        const placeholders = PROTECTED_BACKUP_SETTING_KEYS.map(() => '?').join(', ')
+        const protectedCount = sqlite.prepare(`SELECT COUNT(*) AS count FROM settings WHERE key IN (${placeholders})`).get(...PROTECTED_BACKUP_SETTING_KEYS) as { count?: number }
+        const refCount = sqlite.prepare("SELECT COUNT(*) AS count FROM settings WHERE key LIKE 'credential_ref:%'").get() as { count?: number }
+        credentialsFound = Number(protectedCount?.count || 0) > 0 || Number(refCount?.count || 0) > 0
+        const transaction = sqlite.transaction(() => {
+          sqlite.prepare(`DELETE FROM settings WHERE key IN (${placeholders})`).run(...PROTECTED_BACKUP_SETTING_KEYS)
+          sqlite.prepare("DELETE FROM settings WHERE key LIKE 'credential_ref:%'").run()
+          for (const key of ['llm_provider_profiles', 'vision_ocr_provider_profiles']) {
+            const row = sqlite.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value?: string } | undefined
+            if (!row?.value) continue
+            const sanitized = redactProfileCredentials(row.value)
+            if (!sanitized.changed) continue
+            credentialsFound = true
+            sqlite.prepare('UPDATE settings SET value = ? WHERE key = ?').run(sanitized.value, key)
+          }
+        })
+        transaction()
+        if (credentialsFound) {
+          sqlite.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('credentials_required_after_restore', 'true')").run()
+        }
+        sqlite.pragma('wal_checkpoint(TRUNCATE)')
+      }
+    } finally {
+      sqlite.close()
+      rmSync(`${sqlitePath}-wal`, { force: true })
+      rmSync(`${sqlitePath}-shm`, { force: true })
+    }
+  }
+
+  const jsonPath = join(getBackupDbDir(backupDir), 'gujismart.json')
+  if (existsSync(jsonPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(jsonPath, 'utf8')) as { settings?: Record<string, unknown> }
+      if (parsed.settings && typeof parsed.settings === 'object') {
+        for (const key of PROTECTED_BACKUP_SETTING_KEYS) {
+          if (key in parsed.settings) credentialsFound = true
+          delete parsed.settings[key]
+        }
+        for (const key of Object.keys(parsed.settings)) {
+          if (key.startsWith('credential_ref:')) delete parsed.settings[key]
+        }
+        for (const key of ['llm_provider_profiles', 'vision_ocr_provider_profiles']) {
+          const raw = parsed.settings[key]
+          if (typeof raw !== 'string') continue
+          const sanitized = redactProfileCredentials(raw)
+          if (sanitized.changed) credentialsFound = true
+          parsed.settings[key] = sanitized.value
+        }
+        writeFileSync(jsonPath, JSON.stringify(parsed, null, 2), 'utf8')
+      }
+    } catch (error) {
+      throw new Error(`Legacy backup settings could not be redacted: ${(error as Error).message}`)
+    }
+  }
+  return credentialsFound
 }
 
 function normalizeAutoBackupSlotCount(value: unknown): number {
@@ -426,7 +519,13 @@ function cleanupExtraAutoBackupSlots(slotCount = AUTO_BACKUP_SLOT_COUNT): void {
   }
 }
 
-function writeManifest(backupDir: string, type: 'manual' | 'auto', slot?: number, includesStorage = true): void {
+function writeManifest(
+  backupDir: string,
+  type: 'manual' | 'auto',
+  slot?: number,
+  includesStorage = true,
+  credentialRequiredAfterRestore = false,
+): void {
   const manifest = {
     version: '1.0.0',
     app: '文献管理',
@@ -434,6 +533,8 @@ function writeManifest(backupDir: string, type: 'manual' | 'auto', slot?: number
     slot: slot ?? null,
     includesStorage,
     includesPagePayloads: existsSync(getStoragePagePayloadsDir(getBackupStorageDir(backupDir))),
+    credentialsExcluded: true,
+    credentialRequiredAfterRestore,
     timestamp: new Date().toISOString(),
     integrityReport: collectBackupIntegrityReport(backupDir, { includesStorage }),
   }
@@ -457,7 +558,8 @@ function copyCurrentDataTo(backupDir: string, type: 'manual' | 'auto', slot?: nu
 
   copyStorageForBackup(dataDir, backupDir, includeStorage)
 
-  writeManifest(backupDir, type, slot, includeStorage)
+  const credentialRequiredAfterRestore = redactProtectedSettingsFromBackup(backupDir)
+  writeManifest(backupDir, type, slot, includeStorage, credentialRequiredAfterRestore)
   return backupDir
 }
 
@@ -606,6 +708,8 @@ export function getBackupStatus(): BackupStatus {
       includesStorage: includesStorage ?? existsSync(getBackupStorageDir(path)),
       sizeBytes: existsSync(path) ? getDirSize(path) : 0,
       integrityReport,
+      credentialsExcluded: manifest?.credentialsExcluded === true,
+      credentialRequiredAfterRestore: manifest?.credentialRequiredAfterRestore === true,
     }
   })
 
@@ -619,6 +723,7 @@ export function getBackupStatus(): BackupStatus {
     nextBackupAt,
     autoBackupRoot,
     slots,
+    legacyCredentialRiskCount: slots.filter((slot) => slot.exists && slot.credentialsExcluded !== true).length,
     configValidation: validateBackupSettingsConfig({
       enabled,
       intervalHours,

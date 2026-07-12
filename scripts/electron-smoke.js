@@ -88,12 +88,23 @@ async function clickMenu(window, label) {
 }
 
 async function dismissBlockingModal(window) {
-  const dismissed = await window.evaluate(() => {
+  let attempts = 0
+  while (await dismissOneBlockingModal(window)) {
+    attempts += 1
+    if (attempts >= 8) break
+    await window.waitForTimeout(400)
+  }
+}
+
+async function dismissOneBlockingModal(window) {
+  return window.evaluate(() => {
     const wraps = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     for (const wrap of wraps) {
       const style = window.getComputedStyle(wrap)
       if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') continue
       const target = wrap.querySelector('.ant-modal-close')
+        || wrap.querySelector('.ant-modal-confirm-btns .ant-btn-default')
+        || wrap.querySelector('.ant-modal-footer .ant-btn-default')
       if (target instanceof HTMLElement) {
         target.click()
         return true
@@ -101,9 +112,6 @@ async function dismissBlockingModal(window) {
     }
     return false
   })
-  if (dismissed) {
-    await window.waitForTimeout(500)
-  }
 }
 
 async function verifyMainText(window, expectedText) {
@@ -208,6 +216,49 @@ async function verifyCitationStyles(window) {
   })
 }
 
+let capabilityInputSequence = 0
+
+async function importFilesWithCapabilities(window, filePaths) {
+  const inputId = `smoke-capability-input-${++capabilityInputSequence}`
+  await window.evaluate((id) => {
+    const input = document.createElement('input')
+    input.id = id
+    input.type = 'file'
+    input.multiple = true
+    input.style.display = 'none'
+    document.body.appendChild(input)
+  }, inputId)
+
+  try {
+    await window.locator(`#${inputId}`).setInputFiles(filePaths)
+    return await window.evaluate(async (id) => {
+      const input = document.getElementById(id)
+      const selectionResult = await window.api.grantDroppedImportSources(Array.from(input?.files || []))
+      if (!selectionResult.ok) throw new Error(selectionResult.error.message)
+
+      const results = []
+      let cursor = null
+      try {
+        while (true) {
+          const batchResult = await window.api.readImportSelectionBatch(selectionResult.value.selectionId, cursor, 200)
+          if (!batchResult.ok) throw new Error(batchResult.error.message)
+          if (batchResult.value.items.length > 0) {
+            const batch = await window.api.importDocuments(batchResult.value.items.map((item) => item.grantId))
+            results.push(...batch)
+          }
+          if (batchResult.value.done) break
+          cursor = batchResult.value.nextCursor
+        }
+      } finally {
+        await window.api.releaseImportSelection(selectionResult.value.selectionId)
+      }
+      return results
+    }, inputId)
+  } finally {
+    await window.evaluate((id) => document.getElementById(id)?.remove(), inputId)
+  }
+}
+
 async function verifyLibrarySearchSubmit(window, userDataDir) {
   const hitTitle = 'library-submit-hit-alpha'
   const missTitle = 'library-submit-miss-beta'
@@ -216,7 +267,7 @@ async function verifyLibrarySearchSubmit(window, userDataDir) {
   fs.writeFileSync(hitPath, 'Library submit search smoke hit document.\n', 'utf8')
   fs.writeFileSync(missPath, 'Library submit search smoke miss document.\n', 'utf8')
 
-  const importResults = await window.evaluate(async (paths) => window.api.importDocuments(paths), [hitPath, missPath])
+  const importResults = await importFilesWithCapabilities(window, [hitPath, missPath])
   if (!Array.isArray(importResults) || importResults.length !== 2 || importResults.some((item) => !item?.success || !item?.id)) {
     throw new Error(`Expected library search smoke imports to succeed, saw ${JSON.stringify(importResults)}`)
   }
@@ -361,7 +412,7 @@ async function verifyLibraryIncrementalLoading(window, userDataDir) {
     return { title, filePath }
   })
 
-  const importResults = await window.evaluate(async (paths) => window.api.importDocuments(paths), files.map((item) => item.filePath))
+  const importResults = await importFilesWithCapabilities(window, files.map((item) => item.filePath))
   if (!Array.isArray(importResults) || importResults.length !== files.length || importResults.some((item) => !item?.success || !item?.id)) {
     throw new Error(`Expected library incremental loading imports to succeed, saw ${JSON.stringify(importResults)}`)
   }
@@ -443,9 +494,7 @@ async function verifySearchReaderRoundTrip(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => {
-    return window.api.importDocuments([filePath])
-  }, samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected smoke text import to succeed')
   }
@@ -568,7 +617,7 @@ async function verifySearchDocumentHitDirectory(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected search hit directory smoke import to succeed')
   }
@@ -665,7 +714,7 @@ async function verifyReaderSearchStaysWithinVisibleSpread(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected visible spread smoke import to succeed')
   }
@@ -917,7 +966,7 @@ async function verifyReaderSearchHasSingleActiveHighlight(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected many-active smoke import to succeed')
   }
@@ -1051,7 +1100,7 @@ async function verifyReaderSearchKeepsActiveVisibleAcrossManyPageFlips(window, u
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected page-flip search smoke import to succeed')
   }
@@ -1176,7 +1225,7 @@ async function verifyReaderSearchSyncsAfterManualPageFlip(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected manual-page-sync smoke import to succeed')
   }
@@ -1292,7 +1341,7 @@ async function verifyReaderSearchKeepsActiveVisibleInLongSection(window, userDat
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected long-section search smoke import to succeed')
   }
@@ -1411,7 +1460,7 @@ async function verifyReaderSearchRendersHtmlTables(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected html-table smoke import to succeed')
   }
@@ -1488,7 +1537,7 @@ async function verifyReaderNormalizesInlineMathMarkers(window, userDataDir) {
     'utf8'
   )
 
-  const importResults = await window.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+  const importResults = await importFilesWithCapabilities(window, [samplePath])
   if (!Array.isArray(importResults) || !importResults[0]?.success) {
     throw new Error('Expected inline-math smoke import to succeed')
   }

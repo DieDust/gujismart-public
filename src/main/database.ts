@@ -348,6 +348,9 @@ CREATE TABLE IF NOT EXISTS pages (
   ocr_text_ref TEXT,
   ocr_result_ref TEXT,
   proofed_text_ref TEXT,
+  active_ocr_artifact_id TEXT,
+  proof_base_artifact_id TEXT,
+  proof_base_stale INTEGER NOT NULL DEFAULT 0,
   ocr_status TEXT DEFAULT 'pending',
   proof_status TEXT DEFAULT 'pending',
   created_at TEXT,
@@ -494,6 +497,186 @@ CREATE TABLE IF NOT EXISTS batch_queue (
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS ocr_runs (
+  id TEXT PRIMARY KEY,
+  task_job_id TEXT,
+  doc_id TEXT NOT NULL,
+  engine TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'paused', 'completed', 'error', 'canceled')),
+  idempotency_key TEXT,
+  settings_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  manifest_json TEXT NOT NULL DEFAULT '{}',
+  error_json TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  FOREIGN KEY (task_job_id) REFERENCES task_jobs(id) ON DELETE SET NULL,
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  UNIQUE (doc_id, engine, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS ocr_page_attempts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  page_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'paused', 'completed', 'error', 'canceled')),
+  error_json TEXT,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  FOREIGN KEY (run_id) REFERENCES ocr_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE,
+  UNIQUE (run_id, page_id, attempt_no)
+);
+
+CREATE TABLE IF NOT EXISTS ocr_artifact_versions (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  attempt_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  page_id TEXT NOT NULL,
+  page_num INTEGER,
+  engine TEXT NOT NULL,
+  ocr_text TEXT,
+  ocr_text_ref TEXT,
+  ocr_result TEXT,
+  ocr_result_ref TEXT,
+  source_hash TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'staged' CHECK (status IN ('staged', 'validated', 'active', 'superseded', 'error')),
+  idempotency_key TEXT,
+  created_at INTEGER NOT NULL,
+  activated_at INTEGER,
+  FOREIGN KEY (run_id) REFERENCES ocr_runs(id) ON DELETE CASCADE,
+  FOREIGN KEY (attempt_id) REFERENCES ocr_page_attempts(id) ON DELETE CASCADE,
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE,
+  UNIQUE (run_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS ocr_page_active_artifacts (
+  page_id TEXT PRIMARY KEY,
+  artifact_id TEXT NOT NULL UNIQUE,
+  activated_at INTEGER NOT NULL,
+  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE,
+  FOREIGN KEY (artifact_id) REFERENCES ocr_artifact_versions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ocr_runs_doc ON ocr_runs(doc_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ocr_page_attempts_run ON ocr_page_attempts(run_id, page_id, attempt_no DESC);
+CREATE INDEX IF NOT EXISTS idx_ocr_artifacts_page ON ocr_artifact_versions(page_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ocr_artifacts_run ON ocr_artifact_versions(run_id, created_at);
+
+CREATE TABLE IF NOT EXISTS task_jobs (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'paused', 'completed', 'error', 'canceled')),
+  phase TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
+  idempotency_key TEXT,
+  settings_snapshot_json TEXT NOT NULL DEFAULT '{}',
+  total_count INTEGER NOT NULL DEFAULT 0 CHECK (total_count >= 0),
+  queued_count INTEGER NOT NULL DEFAULT 0 CHECK (queued_count >= 0),
+  running_count INTEGER NOT NULL DEFAULT 0 CHECK (running_count >= 0),
+  completed_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_count >= 0),
+  error_count INTEGER NOT NULL DEFAULT 0 CHECK (error_count >= 0),
+  canceled_count INTEGER NOT NULL DEFAULT 0 CHECK (canceled_count >= 0),
+  completion_kind TEXT CHECK (completion_kind IS NULL OR completion_kind IN ('full', 'partial')),
+  error_json TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS task_items (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'paused', 'completed', 'error', 'canceled')),
+  phase TEXT,
+  idempotency_key TEXT,
+  domain_type TEXT,
+  domain_ref TEXT,
+  input_json TEXT NOT NULL DEFAULT '{}',
+  cursor_json TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  active_attempt_id TEXT,
+  lease_owner TEXT,
+  lease_token TEXT,
+  leased_at INTEGER,
+  lease_expires_at INTEGER,
+  heartbeat_at INTEGER,
+  completion_kind TEXT CHECK (completion_kind IS NULL OR completion_kind IN ('full', 'partial')),
+  error_json TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  started_at INTEGER,
+  completed_at INTEGER,
+  FOREIGN KEY (job_id) REFERENCES task_jobs(id) ON DELETE CASCADE,
+  UNIQUE (job_id, ordinal),
+  UNIQUE (job_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+  status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'paused', 'completed', 'error', 'canceled')),
+  lease_owner TEXT NOT NULL,
+  lease_token TEXT NOT NULL,
+  cursor_json TEXT,
+  error_json TEXT,
+  started_at INTEGER NOT NULL,
+  heartbeat_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  FOREIGN KEY (job_id) REFERENCES task_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (item_id) REFERENCES task_items(id) ON DELETE CASCADE,
+  UNIQUE (item_id, attempt_no)
+);
+
+CREATE TABLE IF NOT EXISTS task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL,
+  item_id TEXT,
+  attempt_id TEXT,
+  event_type TEXT NOT NULL,
+  status TEXT CHECK (status IS NULL OR status IN ('queued', 'running', 'paused', 'completed', 'error', 'canceled')),
+  phase TEXT,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES task_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (item_id) REFERENCES task_items(id) ON DELETE CASCADE,
+  FOREIGN KEY (attempt_id) REFERENCES task_attempts(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_artifacts (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  job_id TEXT NOT NULL,
+  item_id TEXT,
+  attempt_id TEXT,
+  kind TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+  sha256 TEXT,
+  idempotency_key TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES task_jobs(id) ON DELETE CASCADE,
+  FOREIGN KEY (item_id) REFERENCES task_items(id) ON DELETE CASCADE,
+  FOREIGN KEY (attempt_id) REFERENCES task_attempts(id) ON DELETE SET NULL,
+  UNIQUE (job_id, idempotency_key)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_jobs_idempotency ON task_jobs(kind, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_task_jobs_queue ON task_jobs(status, priority DESC, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_task_items_claim ON task_items(job_id, status, ordinal, id);
+CREATE INDEX IF NOT EXISTS idx_task_items_lease ON task_items(status, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_task_attempts_item ON task_attempts(item_id, attempt_no DESC);
+CREATE INDEX IF NOT EXISTS idx_task_events_job_cursor ON task_events(job_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_job_cursor ON task_artifacts(job_id, seq);
+
 CREATE TABLE IF NOT EXISTS citation_templates (
   id TEXT PRIMARY KEY,
   style_id TEXT,
@@ -616,6 +799,199 @@ CREATE TABLE IF NOT EXISTS research_outputs (
   created_at TEXT,
   FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS citation_snapshots (
+  id TEXT PRIMARY KEY,
+  identity_hash TEXT NOT NULL UNIQUE,
+  document_id TEXT NOT NULL,
+  style_id TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  citation_type TEXT NOT NULL,
+  format_id TEXT NOT NULL,
+  metadata_version TEXT NOT NULL,
+  style_version TEXT NOT NULL,
+  template_version TEXT NOT NULL,
+  resolution_json TEXT NOT NULL,
+  rendered_text TEXT NOT NULL,
+  verification_status TEXT NOT NULL CHECK (verification_status IN ('verified', 'draft', 'blocked', 'legacy-unverified')),
+  snapshot_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_citation_snapshots_document ON citation_snapshots(document_id, created_at DESC, id);
+
+CREATE TABLE IF NOT EXISTS export_snapshots (
+  id TEXT PRIMARY KEY,
+  identity_hash TEXT NOT NULL UNIQUE,
+  document_id TEXT NOT NULL,
+  format TEXT NOT NULL,
+  options_json TEXT NOT NULL,
+  source_version TEXT NOT NULL,
+  page_manifest_json TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_export_snapshots_document ON export_snapshots(document_id, created_at DESC, id);
+
+CREATE TABLE IF NOT EXISTS export_artifacts (
+  id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL,
+  export_path TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  byte_size INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (snapshot_id) REFERENCES export_snapshots(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_export_artifacts_snapshot ON export_artifacts(snapshot_id, created_at DESC, id);
+
+CREATE TABLE IF NOT EXISTS research_evidence (
+  id TEXT PRIMARY KEY,
+  identity_hash TEXT NOT NULL UNIQUE,
+  doc_id TEXT NOT NULL,
+  page_id TEXT,
+  page_num INTEGER,
+  locator_json TEXT NOT NULL,
+  quote TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  content_version TEXT NOT NULL,
+  verification_status TEXT NOT NULL CHECK (verification_status IN ('verified', 'stale', 'source-missing', 'legacy-unverified', 'migration-pending')),
+  created_at INTEGER NOT NULL,
+  verified_at INTEGER,
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_evidence_relations (
+  id TEXT PRIMARY KEY,
+  evidence_id TEXT NOT NULL,
+  project_id TEXT,
+  relation_kind TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (evidence_id) REFERENCES research_evidence(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE CASCADE,
+  UNIQUE (evidence_id, project_id, relation_kind)
+);
+
+CREATE TABLE IF NOT EXISTS research_record_versions (
+  id TEXT PRIMARY KEY,
+  record_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  evidence_id TEXT,
+  values_json TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'excluded', 'needs-review')),
+  note TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  parent_version_id TEXT,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (record_id) REFERENCES ai_research_records(id) ON DELETE CASCADE,
+  FOREIGN KEY (evidence_id) REFERENCES research_evidence(id) ON DELETE SET NULL,
+  FOREIGN KEY (parent_version_id) REFERENCES research_record_versions(id) ON DELETE SET NULL,
+  UNIQUE (record_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS research_record_review_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (record_id) REFERENCES ai_research_records(id) ON DELETE CASCADE,
+  FOREIGN KEY (version_id) REFERENCES research_record_versions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS research_output_versions (
+  id TEXT PRIMARY KEY,
+  output_id TEXT,
+  project_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  parent_version_id TEXT,
+  output_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('draft', 'formal', 'archived')),
+  input_manifest_json TEXT NOT NULL,
+  input_manifest_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (output_id) REFERENCES research_outputs(id) ON DELETE SET NULL,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (parent_version_id) REFERENCES research_output_versions(id) ON DELETE SET NULL,
+  UNIQUE (project_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS research_aggregate_artifacts (
+  id TEXT PRIMARY KEY,
+  identity_hash TEXT NOT NULL UNIQUE,
+  criteria_hash TEXT NOT NULL,
+  library_generation INTEGER NOT NULL,
+  index_generation_vector_hash TEXT NOT NULL,
+  exactness TEXT NOT NULL CHECK (exactness IN ('exact', 'bounded-preview')),
+  result_json TEXT NOT NULL,
+  result_hash TEXT NOT NULL,
+  coverage_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_aggregate_relations (
+  id TEXT PRIMARY KEY,
+  aggregate_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  relation_kind TEXT NOT NULL DEFAULT 'research-statistic',
+  label TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (aggregate_id) REFERENCES research_aggregate_artifacts(id) ON DELETE CASCADE,
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE CASCADE,
+  UNIQUE (aggregate_id, project_id, relation_kind)
+);
+
+CREATE TABLE IF NOT EXISTS research_claim_manifests (
+  id TEXT PRIMARY KEY,
+  output_version_id TEXT NOT NULL UNIQUE,
+  schema_version TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  parser_version TEXT NOT NULL,
+  normalization_version TEXT NOT NULL,
+  coverage_json TEXT NOT NULL,
+  manifest_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (output_version_id) REFERENCES research_output_versions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS research_claim_entries (
+  id TEXT PRIMARY KEY,
+  manifest_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  claim_kind TEXT NOT NULL CHECK (claim_kind IN ('statement', 'numeric')),
+  char_start INTEGER NOT NULL,
+  char_end INTEGER NOT NULL,
+  text_hash TEXT NOT NULL,
+  occurrence_index INTEGER NOT NULL,
+  support_status TEXT NOT NULL CHECK (support_status IN ('supported', 'unsupported', 'stale')),
+  evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+  aggregate_ids_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (manifest_id) REFERENCES research_claim_manifests(id) ON DELETE CASCADE,
+  UNIQUE (manifest_id, ordinal),
+  UNIQUE (manifest_id, char_start, char_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_evidence_doc ON research_evidence(doc_id, page_num);
+CREATE INDEX IF NOT EXISTS idx_research_evidence_relations_project ON research_evidence_relations(project_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_research_record_versions_record ON research_record_versions(record_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_research_output_versions_project ON research_output_versions(project_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_research_aggregate_relations_project ON research_aggregate_relations(project_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_research_claim_entries_manifest ON research_claim_entries(manifest_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS ai_research_tasks (
   id TEXT PRIMARY KEY,
@@ -895,6 +1271,122 @@ CREATE TABLE IF NOT EXISTS search_index_status (
   updated_at TEXT,
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS translation_context_snapshots (
+  id TEXT PRIMARY KEY,
+  context_hash TEXT NOT NULL UNIQUE,
+  unit_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  page_id TEXT NOT NULL,
+  unit_source_hash TEXT NOT NULL,
+  canonical_source_hash TEXT NOT NULL,
+  content_version TEXT NOT NULL,
+  source_locator_json TEXT NOT NULL,
+  target_language TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  style TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  model_signature TEXT NOT NULL,
+  parameters_hash TEXT NOT NULL,
+  glossary_version TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  protector_version TEXT NOT NULL,
+  normalizer_version TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS translation_unit_revisions (
+  id TEXT PRIMARY KEY,
+  unit_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  parent_revision_id TEXT,
+  context_snapshot_id TEXT,
+  source_hash TEXT NOT NULL,
+  translation_text TEXT NOT NULL,
+  origin TEXT NOT NULL CHECK (origin IN ('legacy', 'machine', 'manual')),
+  status TEXT NOT NULL CHECK (status IN ('active', 'superseded', 'detached', 'stale')),
+  content_hash TEXT NOT NULL,
+  quality_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY (parent_revision_id) REFERENCES translation_unit_revisions(id) ON DELETE SET NULL,
+  FOREIGN KEY (context_snapshot_id) REFERENCES translation_context_snapshots(id) ON DELETE SET NULL,
+  UNIQUE (unit_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS translation_attempts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  context_snapshot_id TEXT NOT NULL,
+  base_revision_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running', 'committed', 'conflict', 'error', 'canceled')),
+  candidate_revision_id TEXT,
+  error_code TEXT,
+  created_at INTEGER NOT NULL,
+  completed_at INTEGER,
+  FOREIGN KEY (context_snapshot_id) REFERENCES translation_context_snapshots(id) ON DELETE CASCADE,
+  FOREIGN KEY (base_revision_id) REFERENCES translation_unit_revisions(id) ON DELETE CASCADE,
+  FOREIGN KEY (candidate_revision_id) REFERENCES translation_unit_revisions(id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_translation_unit_active_revision
+  ON translation_unit_revisions(unit_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_translation_unit_revisions_history
+  ON translation_unit_revisions(unit_id, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_translation_attempts_task
+  ON translation_attempts(task_id, created_at);
+
+CREATE TABLE IF NOT EXISTS search_generation_state (
+  scope TEXT PRIMARY KEY,
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+  updated_at INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO search_generation_state (scope, generation, updated_at)
+VALUES ('library', 0, CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_insert AFTER INSERT ON documents BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_update AFTER UPDATE ON documents BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_delete AFTER DELETE ON documents BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_insert AFTER INSERT ON pages BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_update AFTER UPDATE ON pages BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_delete AFTER DELETE ON pages BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_document_tags_insert AFTER INSERT ON document_tags BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_document_tags_delete AFTER DELETE ON document_tags BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_document_folders_insert AFTER INSERT ON document_folders BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_document_folders_delete AFTER DELETE ON document_folders BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_index_status_insert AFTER INSERT ON search_index_status BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_index_status_update AFTER UPDATE ON search_index_status BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_index_status_delete AFTER DELETE ON search_index_status BEGIN
+  UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+END;
 
 CREATE TABLE IF NOT EXISTS library_state_cache (
   cache_key TEXT PRIMARY KEY,
@@ -1490,6 +1982,9 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'pages', 'ocr_text_ref TEXT', 'ocr_text_ref')
   addColumnIfMissing(sqlite, 'pages', 'ocr_result_ref TEXT', 'ocr_result_ref')
   addColumnIfMissing(sqlite, 'pages', 'proofed_text_ref TEXT', 'proofed_text_ref')
+  addColumnIfMissing(sqlite, 'pages', 'active_ocr_artifact_id TEXT', 'active_ocr_artifact_id')
+  addColumnIfMissing(sqlite, 'pages', 'proof_base_artifact_id TEXT', 'proof_base_artifact_id')
+  addColumnIfMissing(sqlite, 'pages', 'proof_base_stale INTEGER NOT NULL DEFAULT 0', 'proof_base_stale')
 
   addColumnIfMissing(sqlite, 'documents', 'is_favorite INTEGER DEFAULT 0', 'is_favorite')
   addColumnIfMissing(sqlite, 'documents', 'favorite_at TEXT', 'favorite_at')

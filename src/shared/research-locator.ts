@@ -15,13 +15,19 @@ function normalizePageNum(value: ResearchLocatorDefaults['pageNum']): number | n
 }
 
 export function normalizeResearchLocator(locator: Record<string, unknown>, defaults: ResearchLocatorDefaults): Record<string, unknown> {
+  const stable = tryParseStableReaderLocator(locator)
+  if (stable) {
+    const expectedDocId = String(defaults.docId || '').trim()
+    if (expectedDocId && stable.documentId !== expectedDocId) throw new Error('research_locator_document_mismatch')
+    return stable as unknown as Record<string, unknown>
+  }
   const normalized: Record<string, unknown> = { ...locator }
   const docId = String(defaults.docId || '').trim()
   const pageNum = normalizePageNum(defaults.pageNum)
   const sourceType = String(defaults.sourceType || '').trim()
-  if (docId && !normalized.docId && !normalized.doc_id) normalized.docId = docId
+  if (docId && !normalized.documentId && !normalized.docId && !normalized.doc_id) normalized.docId = docId
   if (pageNum !== null && normalized.pageNum === undefined && normalized.page_num === undefined) normalized.pageNum = pageNum
-  if (sourceType && !normalized.sourceType && !normalized.source_type) normalized.sourceType = sourceType
+  if (sourceType && !normalized.sourceKind && !normalized.sourceType && !normalized.source_type) normalized.sourceType = sourceType
   return normalized
 }
 
@@ -40,3 +46,4 @@ export function stringifyResearchLocator(value: unknown, defaults: ResearchLocat
   if (!isRecord(value)) return ''
   return JSON.stringify(normalizeResearchLocator(value, defaults))
 }
+import { tryParseStableReaderLocator } from './stable-reader-locator'

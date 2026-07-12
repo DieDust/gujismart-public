@@ -13,10 +13,20 @@ import {
   mapDocTypeToHistoryCitationFormat,
 } from '../../shared/history-citation'
 import { buildCitationFieldResolutionReport } from '../../shared/citation-field-resolver'
+import { buildCitationResolutionV2 } from '../../shared/citation-resolution-v2'
+import {
+  getCitationSourceVersionHashes,
+  listCitationSnapshots,
+  persistCitationSnapshot,
+  validateCitationSnapshot,
+} from '../citation-snapshots'
 import type {
   CitationFieldResolutionReport,
   CitationStyle,
   CitationGenerateOptions,
+  CitationResolutionV2,
+  CitationSnapshot,
+  CursorPage,
   CitationStyleDraft,
   CitationStyleDraftOptions,
   CitationStyleDraftWithRaw,
@@ -31,7 +41,7 @@ import type {
 } from '../../shared/types'
 
 type CitationMetadata = Record<string, unknown>
-type CitationDocumentRow = Pick<Document, 'title' | 'author' | 'dynasty' | 'source' | 'metadata'>
+type CitationDocumentRow = Pick<Document, 'title' | 'author' | 'dynasty' | 'source' | 'metadata' | 'doc_type'>
 type CitationPageFieldKey = 'pages' | 'page_reference' | 'cite_pages'
 
 export interface CitationWithDiagnostics {
@@ -241,9 +251,34 @@ function createCitationFields(
     cite_source: pickMetadataValue(metadata, 'cite_source'),
     cite_pages: pickMetadataValue(metadata, 'cite_pages'),
     newspaper: pickMetadataValue(metadata, 'newspaper', 'journal', 'source'),
-    key: (doc.author || 'unknown').split(',')[0].trim().toLowerCase().replace(/\s+/g, '') + (publicationYear || new Date().getFullYear()),
+    key: (doc.author || 'unknown').split(',')[0].trim().toLowerCase().replace(/\s+/g, '') + (publicationYear || 'n.d.'),
   }
   return { ...fields, ...createCitationPageFieldOverrides(options) }
+}
+
+function getCitationFieldSource(
+  field: string,
+  value: string,
+  doc: CitationDocumentRow,
+  metadata: CitationMetadata,
+  options?: CitationGenerateOptions,
+): string {
+  if (field === 'page_reference' || field === 'pages' || field === 'cite_pages') {
+    if (options?.fieldOverrides?.[field] !== undefined) return `options.fieldOverrides.${field}`
+    if (options?.pageNum !== undefined && options.pageNum !== null) return 'options.pageNum'
+  }
+  const documentFields: Record<string, unknown> = {
+    title: doc.title,
+    author: doc.author,
+    dynasty: doc.dynasty,
+    source: doc.source,
+    doc_type: doc.doc_type,
+  }
+  if (normalizeValue(documentFields[field]) === value && value) return `documents.${field}`
+  for (const [key, metadataValue] of Object.entries(metadata)) {
+    if (normalizeValue(metadataValue) === value && value) return `metadata.${key}`
+  }
+  return value ? 'derived' : ''
 }
 
 function cleanupCitationOutput(value: string): string {
@@ -567,7 +602,7 @@ async function inferCitationTemplateFromSample(
 
 export function buildCitationWithDiagnostics(docId: string, templateId: string, options?: CitationGenerateOptions): CitationWithDiagnostics {
   ensureCitationSchema()
-  const doc = queryOne<CitationDocumentRow>('SELECT title, author, dynasty, source, metadata FROM documents WHERE id = ?', [docId])
+  const doc = queryOne<CitationDocumentRow>('SELECT title, author, dynasty, source, metadata, doc_type FROM documents WHERE id = ?', [docId])
   if (!doc) return { citation: null, fieldReport: null }
 
   const template = queryOne<CitationTemplate>('SELECT * FROM citation_templates WHERE id = ?', [templateId])
@@ -583,6 +618,43 @@ export function buildCitationWithDiagnostics(docId: string, templateId: string, 
     result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value)
   }
   return { citation: cleanupCitationOutput(result), fieldReport }
+}
+
+export function resolveCitationV2(docId: string, templateId: string, options?: CitationGenerateOptions): CitationResolutionV2 | null {
+  ensureCitationSchema()
+  const doc = queryOne<CitationDocumentRow>('SELECT title, author, dynasty, source, metadata, doc_type FROM documents WHERE id = ?', [docId])
+  const template = queryOne<CitationTemplate>('SELECT * FROM citation_templates WHERE id = ?', [templateId])
+  if (!doc || !template?.style_id) return null
+  const versions = getCitationSourceVersionHashes(docId, template.style_id, template.id)
+  if (!versions) return null
+  const metadata = parseMetadata(doc.metadata)
+  const fields = createCitationFields(doc, metadata, options)
+  let rendered = normalizeTemplateText(template.template_text)
+  for (const [key, value] of Object.entries(fields)) {
+    rendered = rendered.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value)
+  }
+  rendered = cleanupCitationOutput(rendered)
+  return buildCitationResolutionV2({
+    documentId: docId,
+    citationType: mapDocTypeToCitationFormat(doc.doc_type || ''),
+    formatId: versions.formatId,
+    styleVersion: versions.styleVersion,
+    templateVersion: versions.templateVersion,
+    rendered,
+    fields: Object.entries(fields).map(([name, value]) => ({
+      name,
+      value,
+      source: getCitationFieldSource(name, value, doc, metadata, options),
+    })),
+  })
+}
+
+export function createCitationSnapshot(docId: string, templateId: string, options?: CitationGenerateOptions): CitationSnapshot | null {
+  const resolution = resolveCitationV2(docId, templateId, options)
+  if (!resolution) return null
+  const template = queryOne<CitationTemplate>('SELECT * FROM citation_templates WHERE id = ?', [templateId])
+  if (!template?.style_id) return null
+  return persistCitationSnapshot({ documentId: docId, styleId: template.style_id, templateId, resolution })
 }
 
 export function buildCitation(docId: string, templateId: string, options?: CitationGenerateOptions): string | null {
@@ -612,7 +684,7 @@ export function buildCitationByStyle(
     [styleId, targetType],
   ) || queryOne<CitationTemplate>(
     `SELECT * FROM citation_templates
-     WHERE style_id = ?
+     WHERE style_id = ? AND format_type IN ('GB-T7714', 'APA', 'MLA', 'Chicago', 'IEEE', 'Custom')
      ORDER BY is_default DESC, name ASC
      LIMIT 1`,
     [styleId],
@@ -799,6 +871,28 @@ export function registerCitationIpc(): void {
     if (!result) throw new Error('文献或引用模板不存在')
     return result
   })
+
+  ipcMain.handle('citation:resolveV2', async (
+    _event,
+    docId: string,
+    templateId: string,
+    options?: CitationGenerateOptions,
+  ): Promise<CitationResolutionV2 | null> => resolveCitationV2(docId, templateId, options))
+
+  ipcMain.handle('citation:createSnapshot', async (
+    _event,
+    docId: string,
+    templateId: string,
+    options?: CitationGenerateOptions,
+  ): Promise<CitationSnapshot | null> => createCitationSnapshot(docId, templateId, options))
+
+  ipcMain.handle('citation:validateSnapshot', async (_event, snapshotId: string) => validateCitationSnapshot(snapshotId))
+
+  ipcMain.handle('citation:listSnapshots', async (
+    _event,
+    documentId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<CursorPage<CitationSnapshot>> => listCitationSnapshots(documentId, options))
 
   ipcMain.handle('citation:generateBatch', async (_event, docIds: string[], templateId: string): Promise<string[]> => {
     ensureCitationSchema()

@@ -1,4 +1,5 @@
 import type { OpenDocumentTarget, SearchHitLocator } from '@shared/types'
+import { tryParseStableReaderLocator } from '@shared/stable-reader-locator'
 
 export type WorkspaceViewKey =
   | 'library'
@@ -62,8 +63,9 @@ export interface AppWorkspaceStorage {
   removeItem(key: string): void
 }
 
-interface PersistedAppWorkspaceV1 {
-  version: 1
+interface PersistedAppWorkspaceV2 {
+  version: 2
+  revision: number
   savedAt: string
   activeTabId: string
   siderCollapsed: boolean
@@ -71,7 +73,9 @@ interface PersistedAppWorkspaceV1 {
   tabGroups?: WorkspaceTabGroup[]
 }
 
-export const APP_WORKSPACE_STORAGE_KEY = 'gujismart.app-workspace.v1'
+export const APP_WORKSPACE_STORAGE_KEY = 'gujismart.app-workspace.v2'
+export const APP_WORKSPACE_LAST_KNOWN_GOOD_KEY = 'gujismart.app-workspace.v2.last-known-good'
+export const APP_WORKSPACE_LEGACY_STORAGE_KEY = 'gujismart.app-workspace.v1'
 
 const HOME_TAB_ID = 'home'
 const MAX_RESTORED_TABS = 60
@@ -216,6 +220,7 @@ function sanitizeDocumentTarget(value: unknown, fallbackDocId = ''): OpenDocumen
   const excerpt = cleanString(value.excerpt, MAX_EXCERPT_LENGTH)
   const sourceId = cleanString(value.sourceId, MAX_ID_LENGTH)
   const locator = sanitizeLocator(value.locator)
+  const stableLocator = tryParseStableReaderLocator(value.stableLocator)
   const highlightExcerpt = cleanString(value.highlightExcerpt, MAX_EXCERPT_LENGTH)
   const sourceLabel = cleanString(value.sourceLabel, MAX_TITLE_LENGTH)
   const highlightColor = cleanString(value.highlightColor, 80)
@@ -224,6 +229,7 @@ function sanitizeDocumentTarget(value: unknown, fallbackDocId = ''): OpenDocumen
   if (excerpt) target.excerpt = excerpt
   if (sourceId) target.sourceId = sourceId
   if (locator) target.locator = locator
+  if (stableLocator && stableLocator.documentId === docId) target.stableLocator = stableLocator
   if (value.revealToc === true) target.revealToc = true
   if (highlightExcerpt) target.highlightExcerpt = highlightExcerpt
   if (sourceLabel) target.sourceLabel = sourceLabel
@@ -357,9 +363,11 @@ function sanitizeTabs(value: unknown, tabGroups: WorkspaceTabGroup[] = []): Work
 export function loadAppWorkspace(storage: AppWorkspaceStorage): AppWorkspaceState {
   try {
     const raw = storage.getItem(APP_WORKSPACE_STORAGE_KEY)
+      || storage.getItem(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY)
+      || storage.getItem(APP_WORKSPACE_LEGACY_STORAGE_KEY)
     if (!raw) return createDefaultWorkspace()
     const parsed: unknown = JSON.parse(raw)
-    if (!isRecord(parsed) || parsed.version !== 1) {
+    if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2)) {
       storage.removeItem(APP_WORKSPACE_STORAGE_KEY)
       return createDefaultWorkspace()
     }
@@ -402,8 +410,18 @@ export function saveAppWorkspace(
     const activeTabId = safeTabs.some((tab) => tab.id === state.activeTabId)
       ? state.activeTabId
       : safeTabs[0].id
-    const payload: PersistedAppWorkspaceV1 = {
-      version: 1,
+    const current = storage.getItem(APP_WORKSPACE_STORAGE_KEY)
+    if (current) {
+      try {
+        const parsed = JSON.parse(current)
+        if (isRecord(parsed) && parsed.version === 2) storage.setItem(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY, current)
+      } catch {
+        // Do not promote a corrupt snapshot to last-known-good.
+      }
+    }
+    const payload: PersistedAppWorkspaceV2 = {
+      version: 2,
+      revision: Date.now(),
       savedAt: new Date().toISOString(),
       activeTabId,
       siderCollapsed: state.siderCollapsed,

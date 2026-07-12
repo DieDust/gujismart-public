@@ -24,6 +24,10 @@ export interface ResearchProjectIntegrityInput {
   aiDatasetCount?: number
   aiRecordCount?: number
   unconfirmedAiRecordCount?: number
+  evidenceCount?: number
+  staleEvidenceCount?: number
+  formalOutputVersionCount?: number
+  draftOutputVersionCount?: number
   notes: ResearchProjectIntegrityNoteInput[]
 }
 
@@ -41,6 +45,10 @@ export interface ResearchProjectIntegrityReport {
     aiDatasetCount: number
     aiRecordCount: number
     unconfirmedAiRecordCount: number
+    evidenceCount: number
+    staleEvidenceCount: number
+    formalOutputVersionCount: number
+    draftOutputVersionCount: number
   }
   issues: ResearchProjectIntegrityIssue[]
   issueCount: number
@@ -84,6 +92,10 @@ export function buildResearchProjectIntegrityReport(input: ResearchProjectIntegr
     aiDatasetCount: Math.max(0, Number(input.aiDatasetCount || 0)),
     aiRecordCount: Math.max(0, Number(input.aiRecordCount || 0)),
     unconfirmedAiRecordCount: Math.max(0, Number(input.unconfirmedAiRecordCount || 0)),
+    evidenceCount: Math.max(0, Number(input.evidenceCount || 0)),
+    staleEvidenceCount: Math.max(0, Number(input.staleEvidenceCount || 0)),
+    formalOutputVersionCount: Math.max(0, Number(input.formalOutputVersionCount || 0)),
+    draftOutputVersionCount: Math.max(0, Number(input.draftOutputVersionCount || 0)),
   }
   const issues: ResearchProjectIntegrityIssue[] = []
 
@@ -134,6 +146,18 @@ export function buildResearchProjectIntegrityReport(input: ResearchProjectIntegr
     severity: 'warning',
     message: 'Some AI research records are still pending confirmation.',
     count: metrics.unconfirmedAiRecordCount,
+  } : null)
+  addIssue(issues, metrics.staleEvidenceCount > 0 ? {
+    code: 'evidence.stale',
+    severity: 'error',
+    message: 'Some research evidence no longer resolves to its verified source content.',
+    count: metrics.staleEvidenceCount,
+  } : null)
+  addIssue(issues, metrics.draftOutputVersionCount > 0 ? {
+    code: 'outputs.draft_versions',
+    severity: 'info',
+    message: 'Some research output versions are drafts and may have incomplete evidence coverage.',
+    count: metrics.draftOutputVersionCount,
   } : null)
 
   return {

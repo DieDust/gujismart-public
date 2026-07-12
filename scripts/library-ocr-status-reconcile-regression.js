@@ -7,6 +7,46 @@ function assert(condition, message) {
   if (!condition) throw new Error(message)
 }
 
+let capabilityInputSequence = 0
+
+async function importFilesWithCapabilities(win, filePaths) {
+  const inputId = `ocr-status-capability-input-${++capabilityInputSequence}`
+  await win.evaluate((id) => {
+    const input = document.createElement('input')
+    input.id = id
+    input.type = 'file'
+    input.multiple = true
+    input.style.display = 'none'
+    document.body.appendChild(input)
+  }, inputId)
+  try {
+    await win.locator(`#${inputId}`).setInputFiles(filePaths)
+    return await win.evaluate(async (id) => {
+      const input = document.getElementById(id)
+      const selection = await window.api.grantDroppedImportSources(Array.from(input?.files || []))
+      if (!selection.ok) throw new Error(selection.error.message)
+      const results = []
+      let cursor = null
+      try {
+        while (true) {
+          const page = await window.api.readImportSelectionBatch(selection.value.selectionId, cursor, 200)
+          if (!page.ok) throw new Error(page.error.message)
+          if (page.value.items.length > 0) {
+            results.push(...await window.api.importDocuments(page.value.items.map((item) => item.grantId)))
+          }
+          if (page.value.done) break
+          cursor = page.value.nextCursor
+        }
+      } finally {
+        await window.api.releaseImportSelection(selection.value.selectionId)
+      }
+      return results
+    }, inputId)
+  } finally {
+    await win.evaluate((id) => document.getElementById(id)?.remove(), inputId)
+  }
+}
+
 async function run() {
   const userDataDir = path.join(os.tmpdir(), 'gujismart-ocr-status-user-' + Date.now())
   const profileDir = path.join(os.tmpdir(), 'gujismart-ocr-status-profile-' + Date.now())
@@ -79,7 +119,7 @@ async function run() {
     await win.waitForLoadState('domcontentloaded')
     await win.waitForFunction(() => !!window.api, null, { timeout: 15000 })
 
-    const importResults = await win.evaluate(async (filePath) => window.api.importDocuments([filePath]), samplePath)
+    const importResults = await importFilesWithCapabilities(win, [samplePath])
     assert(Array.isArray(importResults) && importResults[0]?.success, `Import failed: ${JSON.stringify(importResults)}`)
     const docId = importResults[0].id
 
@@ -152,7 +192,7 @@ async function run() {
     assert(healthRow?.ocr_status === 'completed', `Expected health report to derive completed OCR status, saw ${JSON.stringify(healthRow)}`)
     assert(!healthReport.rows.some((row) => row.id === docId && row.ocr_status !== 'completed'), `Expected health report not to flag reconciled doc as incomplete: ${JSON.stringify(healthReport)}`)
 
-    const reviewImportResults = await win.evaluate(async (filePath) => window.api.importDocuments([filePath]), reviewSamplePath)
+    const reviewImportResults = await importFilesWithCapabilities(win, [reviewSamplePath])
     assert(Array.isArray(reviewImportResults) && reviewImportResults[0]?.success, `Review import failed: ${JSON.stringify(reviewImportResults)}`)
     const reviewDocId = reviewImportResults[0].id
     const reviewDetail = await win.evaluate(async (id) => window.api.getDocument(id), reviewDocId)

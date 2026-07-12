@@ -21,6 +21,7 @@ import {
   createResearchOutputInputSnapshot,
   stringifyResearchOutputInputSnapshot,
 } from '../../shared/research-output-snapshot'
+import { commitExistingResearchRecordUpdate, createResearchOutputVersion } from '../research-repository'
 import type {
   AiResearchCreateTaskPayload,
   AiResearchDataset,
@@ -512,7 +513,7 @@ function insertStatisticalRecords(
         evidence?.doc_id || '',
         evidence?.page_num || null,
         evidence?.snippet ? String(evidence.snippet).replace(/<<|>>/g, '').trim() : summary,
-        JSON.stringify(evidence?.locator || {}),
+        JSON.stringify(evidence?.stableLocator || evidence?.locator || {}),
         sourceHash,
         JSON.stringify(buildStatisticalValues(fields, stat)),
         1,
@@ -643,7 +644,7 @@ async function runTask(taskId: string): Promise<AiResearchRunResult> {
             hit.doc_id,
             hit.page_num || null,
             String(hit.snippet || '').replace(/<<|>>/g, '').trim(),
-            JSON.stringify(hit.locator || {}),
+            JSON.stringify(hit.stableLocator || hit.locator || {}),
             sourceHash,
             JSON.stringify(extracted.values),
             extracted.confidence,
@@ -718,11 +719,16 @@ function updateRecord(recordId: string, payload: AiResearchRecordUpdatePayload):
   const existing = rowToRecord(queryOne<AiResearchRecord>('SELECT * FROM ai_research_records WHERE id = ?', [recordId]))
   const nextValues = payload.values ? payload.values : existing.values || {}
   const nextStatus = payload.status || existing.status
+  let versionStatus: 'pending' | 'confirmed' | 'excluded' = 'pending'
+  if (nextStatus === 'confirmed') versionStatus = 'confirmed'
+  if (nextStatus === 'excluded') versionStatus = 'excluded'
   const nextNote = payload.note ?? existing.note
-  run(
-    'UPDATE ai_research_records SET values_json = ?, status = ?, note = ?, updated_at = ? WHERE id = ?',
-    [JSON.stringify(nextValues), nextStatus, nextNote, new Date().toISOString(), recordId],
-  )
+  commitExistingResearchRecordUpdate({
+    recordId,
+    values: nextValues,
+    status: versionStatus,
+    note: nextNote,
+  })
   saveDatabase()
   return rowToRecord(queryOne<AiResearchRecord>('SELECT * FROM ai_research_records WHERE id = ?', [recordId]))
 }
@@ -877,6 +883,15 @@ async function generateReport(payload: AiResearchReportPayload): Promise<{ conte
       'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [outputId, dataset.project_id, outputType, `${dataset.name} - AI 数据报告`, content, dataset.id, inputSnapshotJson, new Date().toISOString()],
     )
+    createResearchOutputVersion({
+      outputId,
+      projectId: dataset.project_id,
+      outputType,
+      title: `${dataset.name} - AI 数据报告`,
+      content,
+      recordIds: records.map((record) => record.id),
+      status: 'draft',
+    })
     saveDatabase()
   }
   return { content, outputId }

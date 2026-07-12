@@ -153,11 +153,8 @@ function getFolderDropPosition(event: DragEvent<HTMLElement>): FolderDropPositio
   return 'inside'
 }
 
-function getDroppedPaths(event: DragEvent<HTMLElement>): string[] {
-  const paths = Array.from(event.dataTransfer.files)
-    .map((file) => window.api.getPathForFile(file))
-    .filter((filePath): filePath is string => !!filePath)
-  return Array.from(new Set(paths))
+function getDroppedFiles(event: DragEvent<HTMLElement>): File[] {
+  return Array.from(event.dataTransfer.files)
 }
 
 function delay(ms = 0): Promise<void> {
@@ -179,7 +176,7 @@ function getFolderOcrEngineLabel(engine: OcrEngine | string): string {
 
 async function getConfiguredDefaultFolderOcrEngine(): Promise<OcrEngine> {
   const rawValue = await window.api.getSetting('ocr_default_engine')
-  return rawValue === 'local_paddle' || rawValue === 'paddle' || rawValue === 'vision_model' ? rawValue : 'paddle'
+  return rawValue === 'paddle' || rawValue === 'vision_model' ? rawValue : 'paddle'
 }
 
 async function hasFolderOcrEngineConfig(engine: OcrEngine): Promise<boolean> {
@@ -1048,61 +1045,43 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     }
   }, [loadFolderContent, loadOverview, runFolderOcrInConfiguredBatches, selectedFolderId])
 
-  const importSourcePathsToFolder = useCallback(async (sourcePaths: string[], folderId?: string | null) => {
-    const uniqueSourcePaths = Array.from(new Set(sourcePaths.map((filePath) => String(filePath || '').trim()).filter(Boolean)))
-    if (uniqueSourcePaths.length === 0) {
+  const importFilesToFolder = useCallback(async (files: File[], folderId?: string | null) => {
+    if (files.length === 0) {
       message.info('没有识别到可导入的文件')
       return
     }
-
-    const newPathKeys = uniqueSourcePaths.map(normalizeImportQueuePath).filter(Boolean)
+    const selectionResult = await window.api.grantDroppedImportSources(files)
+    if (!selectionResult.ok) {
+      message.error(selectionResult.error.message)
+      return
+    }
+    const selection = selectionResult.value
+    let ownershipTransferred = false
+    let registeredActive = false
+    const newPathKeys = [selection.selectionId]
+    try {
     const alreadyActive = newPathKeys.every((key) => activeImportFilePathsRef.current.has(key))
     if (alreadyActive) {
       message.info('这些文件正在导入中')
       return
     }
     newPathKeys.forEach((key) => activeImportFilePathsRef.current.add(key))
+    registeredActive = true
 
     setImporting(true)
     setImportProgressText('正在解析拖入的文件')
     message.loading({ content: '正在解析拖入的文件…', key: FOLDERS_IMPORT_MESSAGE_KEY, duration: 0 })
 
-    try {
-      const sources = await window.api.resolveImportSources(uniqueSourcePaths)
-      const importFiles: string[] = sources
-        .filter((source) => !source.isDirectory)
-        .flatMap((source) => source.filePaths)
-      const folderAssignments = new Map<string, string>()
+      const sources = selection.sources
+      const sourceFolderIds = new Map<string, string>()
 
       for (const source of sources.filter((item) => item.isDirectory)) {
-        if (source.filePaths.length === 0) {
-          message.info(`文件夹“${source.sourceName}”里没有找到可导入的文件`)
-          await delay(0)
-          continue
-        }
-
-        const folder = await window.api.createFolder({
-          name: source.sourceName,
-          parent_id: folderId || undefined,
-          external_path: source.sourcePath,
-        })
-
-        for (const filePath of source.filePaths) {
-          importFiles.push(filePath)
-          if (folder?.id) folderAssignments.set(filePath, folder.id)
-          if (importFiles.length % 200 === 0) await delay(0)
-        }
+        const folder = await window.api.createFolderFromImportSource(selection.selectionId, source.sourceId, folderId || null)
+        if (folder?.id) sourceFolderIds.set(source.sourceId, folder.id)
         await delay(0)
       }
 
-      const uniqueImportFiles = Array.from(new Set(importFiles))
-      if (uniqueImportFiles.length === 0) {
-        message.info({ content: '没有找到可导入的文件', key: FOLDERS_IMPORT_MESSAGE_KEY, duration: 4 })
-        return
-      }
-
       const importBatchSize = await getConfiguredImportBatchSize()
-      const importBatches = chunkArray(uniqueImportFiles, importBatchSize)
       const defaultOcrEngine = await getConfiguredDefaultFolderOcrEngine()
       let importedCount = 0
       let duplicateCount = 0
@@ -1117,24 +1096,40 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         folderAssociationMap.set(targetFolderId, current)
       }
 
-      for (let batchIndex = 0; batchIndex < importBatches.length; batchIndex += 1) {
-        const batch = importBatches[batchIndex]
-        const start = batchIndex * importBatchSize
-        const end = Math.min(start + batch.length, uniqueImportFiles.length)
-        const progressText = `正在导入第 ${batchIndex + 1}/${importBatches.length} 批（${start + 1}-${end}/${uniqueImportFiles.length}）`
+      let cursor: string | null = null
+      let batchIndex = 0
+      let processedFileCount = 0
+      let selectionDone = false
+      while (!selectionDone) {
+        const selectionBatchResult = await window.api.readImportSelectionBatch(selection.selectionId, cursor, importBatchSize)
+        if (!selectionBatchResult.ok) throw new Error(selectionBatchResult.error.message)
+        const selectionBatch = selectionBatchResult.value
+        selectionDone = selectionBatch.done
+        cursor = selectionBatch.nextCursor
+        if (selectionBatch.items.length === 0) {
+          if (selectionDone) await window.api.releaseImportSelection(selection.selectionId)
+          continue
+        }
+        batchIndex += 1
+        const batch = selectionBatch.items.map((item) => item.grantId)
+        const sourceIdByGrantId = new Map(selectionBatch.items.map((item) => [item.grantId, item.sourceId]))
+        const start = processedFileCount
+        processedFileCount += batch.length
+        const progressText = `正在导入第 ${batchIndex} 批（本批 ${batch.length} 个文件）`
         setImportProgressText(progressText)
         message.loading({ content: progressText, key: FOLDERS_IMPORT_MESSAGE_KEY, duration: 0 })
 
         const batchResults = await window.api.importDocuments(batch, { ocrEngine: defaultOcrEngine })
         for (let resultIndex = 0; resultIndex < batchResults.length; resultIndex += 1) {
           const result = batchResults[resultIndex]
-          const originalPath = result.sourcePath || batch[resultIndex] || ''
+          const sourceGrantId = result.sourceGrantId || batch[resultIndex] || ''
           if (!result.success) {
             failedResults.push(result)
             continue
           }
 
-          const targetFolderId = (originalPath && folderAssignments.get(originalPath)) || folderId || null
+          const sourceId = sourceIdByGrantId.get(sourceGrantId)
+          const targetFolderId = (sourceId && sourceFolderIds.get(sourceId)) || folderId || null
           queueFolderAssociation(result.id, targetFolderId)
 
           if (result.sourceType === 'duplicate-pdf' || result.sourceType === 'restored-pdf') {
@@ -1147,19 +1142,20 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
             autoOcrDocIds.push(result.id)
           }
 
-          const pdfWorkPath = result.storedPath || originalPath
+          const pdfWorkPath = result.storedPath || ''
           if (pdfWorkPath.toLowerCase().endsWith('.pdf')) {
             autoOcrDocIds.push(result.id)
             pdfPreviewQueue.push({
               docId: result.id,
               filePath: pdfWorkPath,
               fileIndex: start + resultIndex,
-              totalFiles: uniqueImportFiles.length,
+              totalFiles: processedFileCount,
               pageCount: result.pageCount,
             })
           }
         }
         await delay(0)
+        if (selectionDone) await window.api.releaseImportSelection(selection.selectionId)
       }
 
       for (const [targetFolderId, docIds] of folderAssociationMap.entries()) {
@@ -1213,9 +1209,12 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         duration: 6,
       })
     } finally {
-      newPathKeys.forEach((key) => activeImportFilePathsRef.current.delete(key))
-      setImporting(false)
-      setImportProgressText('')
+      if (!ownershipTransferred) await window.api.releaseImportSelection(selection.selectionId)
+      if (registeredActive) {
+        newPathKeys.forEach((key) => activeImportFilePathsRef.current.delete(key))
+        setImporting(false)
+        setImportProgressText('')
+      }
     }
   }, [
     getConfiguredImportBatchSize,
@@ -1227,13 +1226,13 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
   ])
 
   const handleImportFilesToFolder = useCallback((event: DragEvent<HTMLElement>, folderId?: string | null) => {
-    const paths = getDroppedPaths(event)
-    if (paths.length === 0) {
+    const files = getDroppedFiles(event)
+    if (files.length === 0) {
       message.info('没有识别到可导入的文件')
       return
     }
-    void importSourcePathsToFolder(paths, folderId || null)
-  }, [importSourcePathsToFolder])
+    void importFilesToFolder(files, folderId || null)
+  }, [importFilesToFolder])
 
   const handleFolderDragStart = (event: DragEvent<HTMLElement>, folderId: string) => {
     event.dataTransfer.effectAllowed = 'move'
@@ -1617,7 +1616,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         label: 'OCR 识别',
         icon: <ThunderboltOutlined />,
         children: [
-          { key: 'ocr:local_paddle', label: '用本地 OCR' },
           { key: 'ocr:paddle', label: '用飞桨 OCR' },
           { key: 'ocr:vision_model', label: '用大模型 OCR' },
         ],
@@ -1627,7 +1625,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
         label: '重新 OCR 已选文献',
         icon: <ReloadOutlined />,
         children: [
-          { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
           { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
           { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
         ],
@@ -1741,7 +1738,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                   label: 'OCR 识别',
                   icon: <ThunderboltOutlined />,
                   children: [
-                    { key: 'ocr:local_paddle', label: '用本地 OCR' },
                     { key: 'ocr:paddle', label: '用飞桨 OCR' },
                     { key: 'ocr:vision_model', label: '用大模型 OCR' },
                   ],
@@ -1751,7 +1747,6 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                   label: '重新 OCR 已选文献',
                   icon: <ReloadOutlined />,
                   children: [
-                    { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
                     { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
                     { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
                   ],

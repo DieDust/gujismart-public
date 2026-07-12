@@ -44,9 +44,9 @@ assertIncludes(backupSource, "`before-import-${timestamp}.zip`", 'pre-import saf
 assertIncludes(backupSource, 'await writeBackupZip(tempBackupDir, safetyBackupPath)', 'pre-import safety backups should be convenient restore packages')
 assertIncludes(backupSource, 'export async function importBackupFromPath', 'backup import should support direct dropped backup package paths')
 assertIncludes(settingsIpcSource, "ipcMain.handle('backup:importFromPath'", 'main process should expose direct backup import IPC')
-assertIncludes(preloadSource, 'importBackupFromPath: (filePath: string): Promise<BackupImportResult> =>', 'preload should expose direct backup import')
+assertIncludes(preloadSource, 'importDroppedBackup: (file: File): Promise<BackupImportResult> =>', 'preload should convert a real dropped backup File without exposing a renderer path-string API')
 assertIncludes(settingsViewSource, 'className={`settings-backup-dropzone ${backupDropActive ? \'is-active\' : \'\'}`}', 'settings data page should expose a backup package drop zone')
-assertIncludes(settingsViewSource, 'window.api.importBackupFromPath(normalizedPath)', 'dropped backup packages should import without opening a file picker')
+assertIncludes(settingsViewSource, 'window.api.importDroppedBackup(file)', 'dropped backup packages should import through the preload File boundary without opening a file picker')
 assertIncludes(settingsViewSource, '导入拖入的备份包？', 'dropped backup packages should still require explicit confirmation')
 assertIncludes(appCssSource, '.settings-backup-dropzone', 'settings backup drop zone should be styled')
 

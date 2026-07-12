@@ -4,6 +4,7 @@ import { autoExtractAndApply } from './ai'
 import { queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import {
   OcrAbortError,
+  getOcrDocumentConcurrency,
   getPageImageSize,
   isOcrAbortError,
   postProcessRecognizedPageResult,
@@ -11,8 +12,21 @@ import {
   recognizePdfAsync,
   shouldUseAsyncPdfOcr,
 } from './ocr'
+import { globalOcrDocumentWindow } from './ocr-document-window'
 import { markSearchIndexStaleForPages, notifySearchContentChanged } from './semantic-search'
 import { preparePagePayloadUpdate } from './page-payload-store'
+import {
+  cancelLegacyBatchTask,
+  completeLegacyBatchItem,
+  failLegacyBatchItem,
+  hasActiveLegacyBatchClaim,
+  pauseLegacyBatchTask,
+  releaseAllLegacyBatchClaims,
+  releaseLegacyBatchItem,
+  resumeLegacyBatchTask,
+  startLegacyBatchItem,
+} from './task-batch-compat'
+import { bridgeLegacyBatchQueue } from './task-scheduler'
 import type { OcrPageResult } from './ocr'
 import type { BatchJob, BatchProgressEvent, Document, DocumentPage, PageOcrOptions } from '../shared/types'
 
@@ -147,6 +161,7 @@ class BatchProcessor {
   private jobs = new Map<string, BatchJob>()
   private queueItemIdsByJob = new Map<string, Map<string, string>>()
   private activeControllers = new Set<AbortController>()
+  private activeControllersByJob = new Map<string, Set<AbortController>>()
   private activeJobRuns = new Set<Promise<void>>()
   private mainWindow: BrowserWindow | null = null
   private processing = false
@@ -271,14 +286,15 @@ class BatchProcessor {
           const preparedText = preparePagePayloadUpdate(page.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
 
           run(
-            'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
+            `UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, ocr_status = ?,
+             proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END
+             WHERE id = ?`,
             [
               preparedResult.value,
               preparedResult.ref,
               preparedText.value,
               preparedText.ref,
               pageResult.status,
-              'pending',
               pageResult.pageId,
             ],
           )
@@ -370,37 +386,35 @@ class BatchProcessor {
   private updateQueueItemStatus(job: BatchJob, docId: string, status: 'processing' | 'completed' | 'failed', errorMessage?: string): void {
     const itemId = this.getQueueItemId(job, docId)
     if (!itemId) return
-    const now = new Date().toISOString()
     if (status === 'processing') {
-      run(
-        'UPDATE batch_queue SET status = ?, progress = ?, error_message = NULL, started_at = COALESCE(started_at, ?), completed_at = NULL WHERE id = ?',
-        ['processing', 0, now, itemId],
-      )
-      scheduleDatabaseSave()
+      startLegacyBatchItem(itemId, `batch-processor:${job.id}`)
       return
     }
-
-    run(
-      'UPDATE batch_queue SET status = ?, progress = ?, error_message = ?, completed_at = ? WHERE id = ?',
-      [status, 100, errorMessage ? errorMessage.slice(0, 1000) : null, now, itemId],
-    )
-    scheduleDatabaseSave()
+    if (status === 'completed') {
+      completeLegacyBatchItem(itemId, { message: errorMessage })
+      return
+    }
+    failLegacyBatchItem(itemId, { errorMessage: errorMessage || 'OCR 处理失败', recoverable: true })
   }
 
   private resetQueueItemForResume(job: BatchJob, docId: string): void {
     const itemId = this.getQueueItemId(job, docId)
     const now = new Date().toISOString()
     if (itemId) {
-      run(
-        `UPDATE batch_queue
-         SET status = 'pending',
-             progress = 0,
-             error_message = NULL,
-             started_at = NULL,
-             completed_at = NULL
-         WHERE id = ?`,
-        [itemId],
-      )
+      if (hasActiveLegacyBatchClaim(itemId)) {
+        releaseLegacyBatchItem(itemId)
+      } else {
+        run(
+          `UPDATE batch_queue
+           SET status = 'pending',
+               progress = 0,
+               error_message = NULL,
+               started_at = NULL,
+               completed_at = NULL
+           WHERE id = ?`,
+          [itemId],
+        )
+      }
     }
     run(
       `UPDATE pages
@@ -466,6 +480,7 @@ class BatchProcessor {
       return { resumedJobs: 0, resumedItems: 0, completedItems: 0, skippedItems: 0 }
     }
     const completedItems = this.reconcileFinishedQueueItems()
+    bridgeLegacyBatchQueue()
     const skippedItems = queryAll<{ id: string }>(
       `SELECT b.id
        FROM batch_queue b
@@ -504,8 +519,12 @@ class BatchProcessor {
         if (!queueItemIdsByDocId.has(item.doc_id)) queueItemIdsByDocId.set(item.doc_id, item.id)
       })
       const batchSize = Math.max(1, Number(items[0]?.batch_size || 5) || 5)
+      const taskJobId = queryOne<{ id: string }>(
+        'SELECT id FROM task_jobs WHERE kind = ? AND idempotency_key = ?',
+        ['ocr.batch', `legacy:batch_queue:${batchId}`],
+      )?.id
       const job = this.createJob(docIds, batchSize, {
-        id: `resume_${batchId}`,
+        id: taskJobId || `resume_${batchId}`,
         queueItemIdsByDocId,
       })
       resumedJobs += 1
@@ -571,8 +590,12 @@ class BatchProcessor {
   private async processBatch(job: BatchJob, docIds: string[]): Promise<void> {
     for (const docId of docIds) {
       if (job.status !== 'running' || this.shuttingDown) return
+      await globalOcrDocumentWindow.run(getOcrDocumentConcurrency(), async () => {
       const controller = new AbortController()
       this.activeControllers.add(controller)
+      const jobControllers = this.activeControllersByJob.get(job.id) || new Set<AbortController>()
+      jobControllers.add(controller)
+      this.activeControllersByJob.set(job.id, jobControllers)
 
       try {
         this.updateQueueItemStatus(job, docId, 'processing')
@@ -599,7 +622,7 @@ class BatchProcessor {
           job.failedCount += 1
           this.updateQueueItemStatus(job, docId, 'failed', ZERO_PAGE_OCR_ERROR)
           this.sendProgress(job)
-          continue
+          return
         }
         if (pages.length > 0 && pagesForOcr.length === 0 && this.hasSequentialPageRecords(pages, expectedPdfPageCount)) {
           run('UPDATE documents SET ocr_status = ?, import_status = ?, error_message = NULL, updated_at = ? WHERE id = ?', [
@@ -612,7 +635,7 @@ class BatchProcessor {
           job.processedCount += 1
           this.updateQueueItemStatus(job, docId, 'completed')
           this.sendProgress(job)
-          continue
+          return
         }
 
         let pageResults: OcrPageResult[] = []
@@ -754,6 +777,7 @@ class BatchProcessor {
           this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)
         }
       } catch (error) {
+        if (job.status === 'canceled') return
         if (this.shuttingDown || isOcrAbortError(error)) {
           this.resetQueueItemForResume(job, docId)
           return
@@ -772,9 +796,13 @@ class BatchProcessor {
         this.updateQueueItemStatus(job, docId, 'failed', errorMessage)
       } finally {
         this.activeControllers.delete(controller)
+        const controllers = this.activeControllersByJob.get(job.id)
+        controllers?.delete(controller)
+        if (controllers?.size === 0) this.activeControllersByJob.delete(job.id)
       }
 
       this.sendProgress(job)
+      })
     }
   }
 
@@ -782,22 +810,26 @@ class BatchProcessor {
     const job = this.jobs.get(jobId)
     if (!job || job.status !== 'running') return
     job.status = 'paused'
-    this.processing = false
+    pauseLegacyBatchTask(jobId)
+    this.processing = [...this.jobs.values()].some((item) => item.status === 'running')
     this.sendProgress(job)
   }
 
   resumeJob(jobId: string): void {
     const job = this.jobs.get(jobId)
     if (!job || job.status !== 'paused') return
+    resumeLegacyBatchTask(jobId)
     void this.startJob(jobId)
   }
 
   cancelJob(jobId: string): void {
     const job = this.jobs.get(jobId)
     if (!job) return
-    job.status = 'error'
-    this.processing = false
+    job.status = 'canceled'
+    cancelLegacyBatchTask(jobId)
+    this.activeControllersByJob.get(jobId)?.forEach((controller) => controller.abort())
     this.jobs.delete(jobId)
+    this.processing = [...this.jobs.values()].some((item) => item.status === 'running')
     this.sendProgress(job)
   }
 
@@ -833,6 +865,7 @@ class BatchProcessor {
       })
     }
 
+    releaseAllLegacyBatchClaims()
     saveDatabase()
   }
 

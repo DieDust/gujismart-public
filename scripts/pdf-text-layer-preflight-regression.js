@@ -30,6 +30,21 @@ async function writePdf(fileName, pageKinds) {
         'The preflight should preserve this text without invoking OCR.',
       ]
       lines.forEach((line, index) => page.drawText(line, { x: 54, y: 720 - index * 28, size: 12, font }))
+    } else if (kind === 'two-column') {
+      const leftLines = [
+        'LEFT_COLUMN_ALPHA separate text.',
+        'LEFT_COLUMN_BETA separate text.',
+      ]
+      const rightLines = [
+        'RIGHT_COLUMN_ALPHA separate text.',
+        'RIGHT_COLUMN_BETA separate text.',
+      ]
+      leftLines.forEach((line, index) => page.drawText(line, { x: 42, y: 720 - index * 28, size: 9, font }))
+      rightLines.forEach((line, index) => page.drawText(line, { x: 330, y: 720 - index * 28, size: 9, font }))
+    } else if (kind === 'fragmented-ltr') {
+      page.drawText('NORMAL_LEFT_TO', { x: 54, y: 720, size: 10, font })
+      page.drawText('RIGHT_FRAGMENT', { x: 145, y: 720, size: 10, font })
+      page.drawText('Ordinary left to right PDF text must remain one readable line.', { x: 54, y: 690, size: 10, font })
     }
   }
   const filePath = path.join(tempRoot, fileName)
@@ -57,6 +72,31 @@ async function runAssertions() {
   assert.ok(textAnalysis.pages[0].coordinateCoverage >= 0.9)
   assert.ok(textAnalysis.pages[0].layoutBlocks.length > 0)
   assert.ok(textAnalysis.pages[0].layoutBlocks.every((block) => block.segmentation_source === 'native_pdf_text'))
+
+  const twoColumnPdf = await writePdf('two-column.pdf', ['two-column'])
+  const twoColumnAnalysis = await preflight.analyzePdfTextLayer(twoColumnPdf, { analyzeAllPages: true })
+  assert.strictEqual(twoColumnAnalysis.mode, 'native_text')
+  const twoColumnBlocks = twoColumnAnalysis.pages[0].layoutBlocks
+  assert.ok(twoColumnBlocks.some((block) => String(block.words || '').includes('LEFT_COLUMN_ALPHA')))
+  assert.ok(twoColumnBlocks.some((block) => String(block.words || '').includes('RIGHT_COLUMN_ALPHA')))
+  assert.ok(
+    twoColumnBlocks.every((block) => !(
+      String(block.words || '').includes('LEFT_COLUMN_')
+      && String(block.words || '').includes('RIGHT_COLUMN_')
+    )),
+    `native PDF text layout must not concatenate left and right columns on the same baseline: ${JSON.stringify(twoColumnBlocks)}`,
+  )
+
+  const fragmentedLtrPdf = await writePdf('fragmented-ltr.pdf', ['fragmented-ltr'])
+  const fragmentedLtrAnalysis = await preflight.analyzePdfTextLayer(fragmentedLtrPdf, { analyzeAllPages: true })
+  assert.strictEqual(fragmentedLtrAnalysis.mode, 'native_text')
+  assert.ok(
+    fragmentedLtrAnalysis.pages[0].layoutBlocks.some((block) => (
+      String(block.words || '').includes('NORMAL_LEFT_TO')
+      && String(block.words || '').includes('RIGHT_FRAGMENT')
+    )),
+    'ordinary left-to-right text fragments must remain on the same line',
+  )
 
   const blankPdf = await writePdf('blank.pdf', ['blank'])
   const blankAnalysis = await preflight.analyzePdfTextLayer(blankPdf, { analyzeAllPages: true })

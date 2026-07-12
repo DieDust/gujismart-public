@@ -263,7 +263,7 @@ assert(
 )
 assert(
   documentViewSource.includes("const forceFullRerun = doc.ocr_status === 'completed'")
-    && documentViewSource.includes("if (targetEngine === 'local_paddle' || targetEngine === 'vision_model' || targetEngine === 'hybrid') {")
+    && documentViewSource.includes("if (targetEngine === 'vision_model') {")
     && documentViewSource.includes('await ensureOcrPageImages(doc, {')
     && !documentViewSource.includes("targetEngine === 'paddle' || targetEngine === 'vision_model'")
     && documentViewSource.includes('forceFullRerun,'),

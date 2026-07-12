@@ -185,9 +185,9 @@ assert(
     && librarySource.includes('const shouldAttemptAutoOcrForPreview = previewAutoOcrBackground !== \'false\'')
     && librarySource.includes('const previewAutoOcrConfigReady = shouldAttemptAutoOcrForPreview ? await hasOcrEngineConfig(engine) : false')
     && librarySource.includes('const shouldDeferImportPdfPreview = shouldAttemptAutoOcrForPreview && previewAutoOcrConfigReady')
-    && librarySource.includes("const autoOcrBackground = await window.api.getSetting('auto_ocr_after_import')")
-    && librarySource.includes('const hasConfig = await hasOcrEngineConfig(engine)'),
-  'Import preview deferral should use an early auto-OCR readiness snapshot while final auto-OCR launch still rechecks settings and config.',
+    && librarySource.includes('createImportAutoOcrTask({')
+    && librarySource.includes('startImportAutoOcrTask(autoOcrTaskJobId)'),
+  'Import preview deferral and persistent auto-OCR execution should share one stable readiness/config snapshot.',
 )
 
 console.log('PDF page initialization regression passed.')

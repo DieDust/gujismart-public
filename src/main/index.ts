@@ -8,14 +8,17 @@ import { Readable } from 'stream'
 import { startAutoBackupScheduler, stopAutoBackupScheduler } from './backup'
 import { backfillLibraryFileFingerprints, shutdownPdfAssetRuntime } from './pdf-assets'
 import { scheduleStartupMetadataReclassification } from './metadata-reclassifier'
-import { allowFileAccessPaths, assertAllowedLocalResourceUrl, assertHttpUrl } from './file-access'
+import { allowManagedFileAccessPaths, assertAllowedLocalResourceUrl, assertHttpUrl } from './file-access'
+import { fileCapabilityService } from './file-capabilities'
+import { importSelectionService } from './import-selections'
 import { shutdownHealthReportWorkers } from './health-report-worker-client'
 import { shutdownSearchIndexWorkers } from './search-index-worker-client'
 import { ensureDisabledMetadataTagBindingsCleared, ensureEnabledMetadataTagBindingsRebuilt } from './metadata-tags'
 import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'
-import { shutdownOcrRuntime } from './ipc/ocr'
+import { resumePendingImportAutoOcrTasks, shutdownOcrRuntime } from './ipc/ocr'
 import { shutdownBookTranslationRuntime, shutdownDocumentDeleteRuntime, shutdownDocumentImportRuntime } from './ipc/documents'
 import { batchProcessor } from './batch-processor'
+import { initializeSettingsSecurity } from './settings-security'
 
 let mainWindow: BrowserWindow | null = null
 let quitConfirmed = false
@@ -23,7 +26,10 @@ let quitPromptOpen = false
 let runtimeShutdownStarted = false
 let runtimeShutdownPromise: Promise<void> | null = null
 let startupMaintenanceScheduled = false
+let importAutoOcrRecoveryScheduled = false
+let fileCapabilitySweepTimer: NodeJS.Timeout | null = null
 const STARTUP_MAINTENANCE_DELAY_MS = 15_000
+const FILE_CAPABILITY_SWEEP_INTERVAL_MS = 60_000
 
 type ConsoleMethodName = 'log' | 'info' | 'warn' | 'error' | 'debug'
 
@@ -237,6 +243,10 @@ function createWindow(): void {
   mainWindow.webContents.on('did-finish-load', () => {
     console.log(`[Main] Renderer finished loading: ${mainWindow?.webContents.getURL() || ''}`)
     showMainWindowFallback('did-finish-load')
+    if (!importAutoOcrRecoveryScheduled && mainWindow && !mainWindow.isDestroyed()) {
+      importAutoOcrRecoveryScheduled = true
+      resumePendingImportAutoOcrTasks(mainWindow.webContents)
+    }
     if (rendererRecoveryResetTimer) {
       clearTimeout(rendererRecoveryResetTimer)
     }
@@ -245,6 +255,11 @@ function createWindow(): void {
       rendererRecoveryResetTimer = null
     }, 15000)
     rendererRecoveryResetTimer.unref?.()
+  })
+  const capabilityOwnerId = mainWindow.webContents.id
+  mainWindow.webContents.once('destroyed', () => {
+    fileCapabilityService.revokeOwner(capabilityOwnerId)
+    importSelectionService.revokeOwner(capabilityOwnerId)
   })
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
@@ -259,6 +274,8 @@ function createWindow(): void {
   }
 
   mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    fileCapabilityService.revokeOwner(capabilityOwnerId)
+    importSelectionService.revokeOwner(capabilityOwnerId)
     console.error(`[Main] Renderer process gone: reason=${details.reason}; exitCode=${details.exitCode}`)
     const win = mainWindow
     if (
@@ -375,6 +392,11 @@ async function shutdownApplicationRuntime(): Promise<void> {
   if (runtimeShutdownPromise) return runtimeShutdownPromise
   runtimeShutdownStarted = true
   runtimeShutdownPromise = (async () => {
+    if (fileCapabilitySweepTimer) {
+      clearInterval(fileCapabilitySweepTimer)
+      fileCapabilitySweepTimer = null
+    }
+    fileCapabilityService.revokeAll()
     stopAutoBackupScheduler()
     await shutdownStartupRecovery().catch((error) => {
       console.warn('[Main] Failed to shutdown startup recovery cleanly', error)
@@ -464,11 +486,17 @@ app.whenReady()
     })
 
     await initDatabase()
+    initializeSettingsSecurity()
     registerAllIpcHandlers()
+    fileCapabilitySweepTimer = setInterval(() => {
+      fileCapabilityService.sweepExpired()
+      importSelectionService.sweepExpired()
+    }, FILE_CAPABILITY_SWEEP_INTERVAL_MS)
+    fileCapabilitySweepTimer.unref?.()
     createWindow()
     setTimeout(() => {
       try {
-        allowFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
+        allowManagedFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
       } catch (error) {
         console.warn('[Main] Failed to preload stored local resource paths', error)
       }

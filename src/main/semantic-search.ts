@@ -4,6 +4,9 @@ import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
 import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
 import { buildSearchIndexHealthDiagnostics } from '../shared/search-index-health'
+import { stableLocatorFromLegacySearchLocator } from '../shared/stable-reader-locator'
+import { resolveCanonicalPageContent } from './canonical-content'
+import { attachSearchSnapshot, getLibrarySearchGeneration, recordSearchSnapshotAggregate, validateSearchSnapshot } from './search-snapshots'
 import { statusEnvelopeFromSearchIndexStatus } from '../shared/status-envelope'
 import { getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, refreshSearchSegmentsFtsForDocument, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import { normalizeChineseSearchText, normalizeWhitespace } from './text-normalization'
@@ -104,6 +107,48 @@ type SearchIndexReindexReason =
   | 'global-stale-suppressed'
 
 type JsonRecord = Record<string, unknown>
+
+const locatorCanonicalCache = new Map<string, { expiresAt: number; content: ReturnType<typeof resolveCanonicalPageContent> }>()
+const LOCATOR_CANONICAL_CACHE_MAX = 400
+const LOCATOR_CANONICAL_CACHE_TTL_MS = 2_000
+
+function getCanonicalLocatorContext(locator: SearchHitLocator): {
+  contentVersion: string
+  sourceHash: string
+  quote: string
+  prefix: string
+  suffix: string
+} | undefined {
+  if (!locator.pageId || locator.translationSource || locator.sourceType === 'translation') return undefined
+  const now = Date.now()
+  let cached = locatorCanonicalCache.get(locator.pageId)
+  if (!cached || cached.expiresAt <= now) {
+    try {
+      cached = { expiresAt: now + LOCATOR_CANONICAL_CACHE_TTL_MS, content: resolveCanonicalPageContent(locator.pageId) }
+      locatorCanonicalCache.delete(locator.pageId)
+      locatorCanonicalCache.set(locator.pageId, cached)
+      while (locatorCanonicalCache.size > LOCATOR_CANONICAL_CACHE_MAX) {
+        const oldest = locatorCanonicalCache.keys().next().value
+        if (!oldest) break
+        locatorCanonicalCache.delete(oldest)
+      }
+    } catch {
+      return undefined
+    }
+  }
+  const start = Number(locator.charStart)
+  const end = Number(locator.charEnd)
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start) return undefined
+  const quote = cached.content.text.slice(start, end)
+  if (!quote.trim()) return undefined
+  return {
+    contentVersion: cached.content.artifactId || cached.content.baseArtifactId || `${cached.content.source}:${cached.content.sourceHash}`,
+    sourceHash: cached.content.sourceHash,
+    quote,
+    prefix: cached.content.text.slice(Math.max(0, start - 48), start),
+    suffix: cached.content.text.slice(end, end + 48),
+  }
+}
 
 interface SearchIndexSegmentStats {
   segmentCount: number
@@ -2931,9 +2976,11 @@ function createSearchHit(
     queryTerm: queryTerm || hit.term,
     occurrenceIndex,
   }
+  const stableLocator = stableLocatorFromLegacySearchLocator(locator, getCanonicalLocatorContext(locator))
   return {
     id: `${row.segment_id}:${occurrenceIndex}:${hit.index}`,
     locator,
+    stableLocator,
     snippet: buildMarkedSnippetFromOriginalHit(
       snippetText || row.text || row.normalized_text || '',
       { index: originalRange.start, length: Math.max(1, originalRange.end - originalRange.start) },
@@ -3366,10 +3413,9 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     }
   }
 
-  const cacheKey = stableStringify({
+  const criteriaKey = stableStringify({
     query: normalizedQuery,
     limit,
-    page: options?.page || 1,
     pageSize: options?.pageSize || null,
     exhaustive,
     resultMode: options?.resultMode || 'preview',
@@ -3392,6 +3438,52 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     yearTo: options?.yearTo || null,
     translationScope: options?.translationScope || 'all',
   })
+  const requestedSnapshotId = String(options?.snapshotId || '').trim()
+  const requestedSnapshot = requestedSnapshotId
+    ? validateSearchSnapshot(requestedSnapshotId, { criteriaKey })
+    : null
+  if (requestedSnapshot && requestedSnapshot.validation !== 'active') {
+    throw new Error(`search_snapshot_${requestedSnapshot.validation.replace('-', '_')}`)
+  }
+  const currentGeneration = requestedSnapshot?.snapshot?.librarySearchGeneration ?? getLibrarySearchGeneration()
+  const cacheKey = stableStringify({
+    criteriaKey,
+    generation: currentGeneration,
+    page: options?.page || 1,
+  })
+  const withSnapshot = (response: SearchGroupedResponse): SearchGroupedResponse => {
+    const recordAggregate = (snapshotId: string, value: SearchGroupedResponse): SearchGroupedResponse => {
+      recordSearchSnapshotAggregate(snapshotId, {
+        query: value.query,
+        totalDocuments: value.totalDocuments,
+        totalHits: value.totalHits,
+        status: value.status || 'complete',
+        warnings: value.warnings,
+        exactness: exhaustive && value.status === 'complete' ? 'exact' : 'bounded-preview',
+        coverage: {
+          returnedDocuments: value.groups.length,
+          returnedHits: value.groups.reduce((sum, group) => sum + group.hits.length, 0),
+          totalsExact: exhaustive && value.status === 'complete',
+        },
+      })
+      return value
+    }
+    if (requestedSnapshot?.snapshot) {
+      const finalValidation = validateSearchSnapshot(requestedSnapshot.snapshot.snapshotId, { criteriaKey })
+      if (finalValidation.validation !== 'active') {
+        throw new Error(`search_snapshot_${finalValidation.validation.replace('-', '_')}`)
+      }
+      return recordAggregate(finalValidation.snapshot!.snapshotId, {
+        ...response,
+        snapshotId: finalValidation.snapshot!.snapshotId,
+        librarySearchGeneration: finalValidation.snapshot!.librarySearchGeneration,
+        indexGenerationVectorHash: finalValidation.snapshot!.indexGenerationVectorHash,
+        snapshotExpiresAt: finalValidation.snapshot!.expiresAt,
+      })
+    }
+    const attached = attachSearchSnapshot(response, criteriaKey)
+    return recordAggregate(attached.snapshotId, attached)
+  }
   const cached = getFreshSearchCacheEntry(searchResponseCache, cacheKey, SEARCH_CACHE_TTL_MS)
   if (cached) {
     if (SEARCH_METRICS_ENABLED) {
@@ -3404,7 +3496,7 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
         previewHits: cached.response.groups.reduce((sum, group) => sum + group.hits.length, 0),
       }))
     }
-    return {
+    return withSnapshot({
       ...cached.response,
       groups: cached.response.groups.map((group) => ({
         ...group,
@@ -3413,7 +3505,7 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
         tagNames: [...(group.tagNames || [])],
         folderNames: [...(group.folderNames || [])],
       })),
-    }
+    })
   }
 
   if (options?.translationScope === 'source' || options?.translationScope === 'translation') {
@@ -3432,7 +3524,7 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     }
     sql += ' ORDER BY s.doc_id, s.page_num, s.ordinal LIMIT ?'
     params.push(options.resultMode === 'all' ? MAX_DOCUMENT_SEARCH_SESSION_HITS : Math.max(1000, limit * 80))
-    return groupRowsByOccurrences(queryAll<SearchHitRow>(sql, params), query, options)
+    return withSnapshot(groupRowsByOccurrences(queryAll<SearchHitRow>(sql, params), query, options))
   }
 
   const staleDocIds = checkSearchIndexForScope(scopedDocIds, { autoReindex })
@@ -3554,8 +3646,10 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
       resultMode: options?.resultMode || 'preview',
     }))
   }
-  setBoundedSearchCacheEntry(searchResponseCache, cacheKey, { createdAt: Date.now(), response: result }, 60, SEARCH_CACHE_TTL_MS)
-  return result
+  if (getLibrarySearchGeneration() === currentGeneration) {
+    setBoundedSearchCacheEntry(searchResponseCache, cacheKey, { createdAt: Date.now(), response: result }, 60, SEARCH_CACHE_TTL_MS)
+  }
+  return withSnapshot(result)
 }
 
 export function getDocumentSearchHits(docId: string, query: string, options?: SearchOptions): SearchSessionState {
@@ -3645,6 +3739,7 @@ function flattenGroupedResponse(response: SearchGroupedResponse, hitField: strin
     updated_at: group.updatedAt,
     last_opened_at: group.lastOpenedAt,
     locator: hit.locator,
+    stableLocator: hit.stableLocator,
   } as SearchResult)))
 }
 
@@ -3669,6 +3764,7 @@ function groupFlatSearchResults(results: Array<SearchResult & { locator?: Search
     const hit: SearchHit = {
       id: `${locator.segmentId}:${locator.occurrenceIndex}:${index}`,
       locator,
+      stableLocator: stableLocatorFromLegacySearchLocator(locator),
       snippet: item.snippet || '',
       score: Number(item.rank || index),
     }

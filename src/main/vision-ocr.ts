@@ -4,6 +4,9 @@ import { basename, extname, join } from 'path'
 import { getDataDir, queryOne } from './database'
 import { getResponseErrorMessage, isAbortError } from '../shared/errors'
 import type { OcrRecognizeLayoutBlock, OcrRecognizeResult } from '../shared/types'
+import { isProtectedSettingKey } from './protected-settings'
+import { readProtectedSetting } from './settings-security'
+import { isCurrentVisionOcrConnectionVerified } from './vision-ocr-verification'
 
 type JsonRecord = Record<string, unknown>
 
@@ -130,6 +133,7 @@ interface VisionOcrSettings {
 }
 
 function getSetting(key: string): string {
+  if (isProtectedSettingKey(key)) return readProtectedSetting(key).trim()
   return String(queryOne<{ value: string }>('SELECT value FROM settings WHERE key = ?', [key])?.value || '').trim()
 }
 
@@ -158,10 +162,14 @@ export function hasVisionOcrConfig(): boolean {
   const llmReady = !!getSetting('llm_api_key')
     && !!llmModel
     && !isKnownTextOnlyVisionTarget(llmBaseUrl, llmModel)
-  return visionReady || (useLlmConfig && llmReady)
+  const configured = useLlmConfig ? llmReady : visionReady
+  return configured && isCurrentVisionOcrConnectionVerified()
 }
 
 function getVisionOcrSettings(): VisionOcrSettings {
+  if (!isCurrentVisionOcrConnectionVerified()) {
+    throw new Error('当前 AI OCR 配置尚未通过连接测试，请先在设置中测试成功后再使用。')
+  }
   const useLlmConfig = getSetting('vision_ocr_use_llm_config') !== 'false'
   const visionApiKey = getSetting('vision_ocr_api_key')
   const visionBaseUrl = getSetting('vision_ocr_base_url')

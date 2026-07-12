@@ -1264,3 +1264,37 @@ preset 只能调整默认 query、字段模板、source preference、展示和�
 - **模块 12 性能、测试与发布：** 使用 AI-01 至 AI-56 的分层门禁，固定机器记录资源；旧源码字符串通过不能代替行为。发布继续受用户本地验收门禁约束。
 - **模块 13 新功能路线：** 本章 9 项新功能按前置依赖、成本、风险排序；NF-04 复用唯一 ResearchEntity，NF-09 只增加 inbox workflow，NF-06 只增加交互审计，不重复核心 evidence/claim/output 表。模块 13 只做统一排期和取舍。
 - **模块 14 全局复核：** 必须重点核对 `CanonicalContentProvider.resolvePage -> CanonicalPageContent`、`StableReaderLocator`、`SearchEvidenceResolver` 的正交状态、`task_jobs/task_items`、CredentialVault sidecar/journal、record/aggregate provenance、claim manifest 和 output snapshot；最终只能保留一个权威合同。
+
+## 12. 第六步 AI 定位接入结果（2026-07-11）
+
+- AI research evidence 和 Evidence QA source additive 携带模块 05 唯一 `StableReaderLocator`；旧 locator 保留兼容。
+- 当前 AI retrieval 自有 segment 结果缺 canonical version/hash 时只产生 page precision，不以关键词首个位置伪造 verified exact。
+- exact AI evidence、SearchSnapshot、aggregate/claim lineage 仍等待第七/八步 resolver 与研究证据切片；本步只统一定位身份，不提升证据等级。
+
+## 13. 第七步搜索证据边界结果（2026-07-12）
+
+- AI/研究调用方现在可通过唯一 `SearchEvidenceResolver` 验证 stable locator，明确区分 relocated、stale、source-missing 与 legacy-unverified。
+- 执行期 SearchSnapshot 绑定 criteria/generation/TTL；AI 不得把过期 snapshot 或旧分页结果继续组合为当前答案。
+- ResearchEvidence、ResearchAggregateArtifact、record review、claim/output lineage 尚未持久化，进入第八步；本步不把 TTL snapshot 升格为长期研究事实。
+
+## 14. 第八步研究证据与输出谱系结果（2026-07-12）
+
+- 新增唯一 `ResearchEvidence` 本体与项目 relation：相同 canonical source/range/quote 复用 evidence ID，项目备注、标签和用途独立保存；列表采用最多 200 条的 rowid cursor。
+- 旧 `research_notes` 可按单条显式晋升；只有 exact locator 或当前 canonical 正文中的唯一匹配才能生成 verified evidence，缺失或歧义时 fail closed，不批量猜测回填。
+- AI research record 更新现在追加 immutable version 与 review event，并使用 expected version CAS；`confirmed` 必须引用当前 verified evidence，旧记录表继续作为兼容投影。
+- research/AI 输出同时保存 project-global immutable output version、SHA-256、parent 和 main 构建的 record/evidence input manifest。正式输出只接受最新 confirmed record 且生成时重新解析 evidence；草稿允许缺项但明确记录 coverage/omitted。
+- 本步没有实现 `ResearchAggregateArtifact` 和逐句 claim manifest 自动绑定；这些不能由 renderer payload、TTL SearchSnapshot 或 pending record 冒充。
+
+## 15. 第八步 B 统计 provenance 结果（2026-07-12）
+
+- `ResearchAggregateArtifact` 已由模块 06 唯一实现，AI/研究输出只引用 artifact ID，不复制 totals 或接受 renderer 伪造结果。
+- main 构建的 output input manifest 现在可冻结 aggregate ID、criteria/result hash、exactness 与验证状态；正式输出拒绝跨专题、stale、corrupt 和 bounded-preview artifact。
+- 项目 relation 与 artifact 本体分离，相同统计可被多个研究用途引用而不复制结果。逐句 claim manifest 仍未实现，不能把 aggregate 进入 input manifest 误报为每个数字都已逐句绑定。
+
+## 16. 第八步 C 正式输出 claim 谱系结果（2026-07-12）
+
+- 每个新 output version 同事务写入 immutable claim manifest/entries；entry 只保存 UTF-16 range、规范化 text hash、重复 occurrence、support status 和 evidence/aggregate IDs，不复制正文。
+- `claim-segmenter/v1` 保守枚举非空句段，不使用模型猜事实性。重复句按不同 range/occurrence 保存，CRLF/LF 使用统一 hash normalization，非 BMP 字符仍以 JavaScript UTF-16 code unit 定位。
+- formal 要求每个句段都有属于该 output input manifest 的 provenance，并在写入时重新验证 evidence 与 exact aggregate；未知、越界、重复 binding、stale 或 unsupported 均拒绝。自动 AI 报告没有逐句映射时保存为 draft，不再因“输入里有证据”而伪装 formal。
+- 草稿定稿使用 claim manifest hash CAS 并创建 parent-linked formal 新版本；草稿审核期间 record version 变化会返回 `research_output_inputs_changed`，不会偷偷换用最新输入。
+- 只读 IPC 提供最多 200 条 entry 的 cursor 页面与 verified/incomplete/stale/corrupt 验证；历史 manifest 不允许 renderer 改写。交互式逐句审计 UI 仍属于后续产品切片。

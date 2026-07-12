@@ -19,7 +19,6 @@ import type {
   DocumentExportOptions,
   ListModelsPayload,
   LocalPaddleOcrDownloadOptions,
-  LocalPaddleOcrDownloadProgress,
   LocalPaddleOcrSource,
   LocalPaddleOcrStatus,
   LlmProviderProfile,
@@ -34,6 +33,8 @@ import type {
   TypesetEnvironmentStatus,
   TypesetMetadata,
   TypesetTemplate,
+  VisionOcrConnectionTestPayload,
+  VisionOcrConnectionTestResult,
 } from '../../shared/types'
 import {
   backupData,
@@ -61,18 +62,33 @@ import {
   needsMetadataTagBindingRebuild,
   rebuildMetadataTagBindings,
 } from '../metadata-tags'
+import { isProtectedSettingKey } from '../protected-settings'
 import {
-  checkLocalPaddleOcrSources,
-  downloadLocalPaddleOcrAddon,
-  getLocalPaddleOcrStatus,
-  importLocalPaddleOcrAddon,
-  installLocalPaddleOcrRuntime,
-} from '../local-paddle-ocr'
+  assertVisionOcrProfileVerified,
+  clearVisionOcrConnectionVerification,
+  getVisionOcrConnectionState,
+  markVisionOcrConnectionVerified,
+  testVisionOcrConnection,
+} from '../vision-ocr-verification'
+import {
+  consumeCredentialDraft,
+  getCredentialPublicState,
+  getPublicSettingsMap as getRendererSettingsSnapshot,
+  prepareCredentialDraft,
+  readProtectedSetting,
+  readPublicSetting,
+  revokeCredentialDraftOwner,
+  revokeProtectedSetting,
+  writeProtectedSetting,
+  writePublicSetting,
+} from '../settings-security'
+import { validateSettingValue } from '../../shared/setting-definitions'
 
 const PROJECT_GITHUB_REPO = 'DieDust/gujismart-public'
 const PROJECT_RELEASES_URL = `https://github.com/${PROJECT_GITHUB_REPO}/releases`
 const PROJECT_LATEST_RELEASE_API_URL = `https://api.github.com/repos/${PROJECT_GITHUB_REPO}/releases/latest`
 const REMOTE_IMAGE_MAX_BYTES = 15 * 1024 * 1024
+const registeredCredentialDraftOwners = new Set<number>()
 
 const IMAGE_MIME_BY_EXT: Record<string, string> = {
   jpg: 'image/jpeg',
@@ -182,6 +198,25 @@ function parseReleaseAssets(value: unknown): AppUpdateAsset[] {
     .filter((asset) => asset.name && asset.url && /\.exe$/i.test(asset.name))
 }
 
+function getPackagedBuildCreatedAt(): number | null {
+  if (!app.isPackaged) return null
+  const sbomPath = join(process.resourcesPath, 'release-metadata', 'sbom.spdx.json')
+  if (!existsSync(sbomPath)) return null
+  try {
+    const sbom = JSON.parse(readFileSync(sbomPath, 'utf8')) as { creationInfo?: { created?: string } }
+    const createdAt = Date.parse(String(sbom.creationInfo?.created || ''))
+    return Number.isFinite(createdAt) ? createdAt : null
+  } catch {
+    return null
+  }
+}
+
+function isReleaseNewerThanBuild(publishedAt: string, buildCreatedAt: number | null): boolean {
+  if (buildCreatedAt === null) return true
+  const releasePublishedAt = Date.parse(String(publishedAt || ''))
+  return !Number.isFinite(releasePublishedAt) || releasePublishedAt > buildCreatedAt
+}
+
 async function checkLatestAppUpdate(): Promise<AppUpdateInfo> {
   const currentVersion = app.getVersion()
   const checkedAt = new Date().toISOString()
@@ -211,13 +246,15 @@ async function checkLatestAppUpdate(): Promise<AppUpdateInfo> {
       throw new Error('GitHub Release 返回内容无效')
     }
     const latestVersion = getStringField(payload, 'tag_name').replace(/^v/i, '') || currentVersion
+    const publishedAt = getStringField(payload, 'published_at')
     return {
       currentVersion,
       latestVersion,
-      hasUpdate: compareAppVersions(latestVersion, currentVersion) > 0,
+      hasUpdate: compareAppVersions(latestVersion, currentVersion) > 0
+        && isReleaseNewerThanBuild(publishedAt, getPackagedBuildCreatedAt()),
       releaseUrl: getStringField(payload, 'html_url') || PROJECT_RELEASES_URL,
       releaseName: getStringField(payload, 'name') || undefined,
-      publishedAt: getStringField(payload, 'published_at') || undefined,
+      publishedAt: publishedAt || undefined,
       body: getStringField(payload, 'body') || undefined,
       assets: parseReleaseAssets(payload.assets),
       checkedAt,
@@ -345,11 +382,15 @@ interface OpenAiModelItem {
 }
 
 function getSettingValue(key: string): string {
-  return String(queryOne<{ value?: string | null }>('SELECT value FROM settings WHERE key = ?', [key])?.value || '')
+  return isProtectedSettingKey(key) ? readProtectedSetting(key) : readPublicSetting(key)
 }
 
 function setSettingValue(key: string, value: string): void {
-  run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value])
+  if (isProtectedSettingKey(key)) {
+    writeProtectedSetting(key, value)
+    return
+  }
+  writePublicSetting(key, value)
 }
 
 function makeLlmProfileId(provider: string, baseUrl: string, model: string): string {
@@ -450,7 +491,7 @@ async function fetchPaddleOcrModels(_apiKey: string): Promise<string[]> {
   }
 }
 
-function parseLlmProviderProfiles(value: unknown): LlmProviderProfile[] {
+function parseLlmProviderProfiles(value: unknown, kind: 'llm' | 'vision_ocr'): LlmProviderProfile[] {
   if (!value || typeof value !== 'string') return []
   try {
     const parsed = JSON.parse(value)
@@ -461,9 +502,9 @@ function parseLlmProviderProfiles(value: unknown): LlmProviderProfile[] {
         name: String(item?.name || item?.provider || '').trim(),
         provider: String(item?.provider || item?.name || '').trim(),
         baseUrl: String(item?.baseUrl || '').trim().replace(/\/+$/, ''),
-        apiKey: String(item?.apiKey || ''),
         model: String(item?.model || '').trim(),
         updatedAt: item?.updatedAt ? String(item.updatedAt) : undefined,
+        credential: getCredentialPublicState(`${kind}_profile:${String(item?.id || item?.name || '').trim()}`),
       }))
       .filter((item) => item.id && item.name && item.baseUrl && item.model)
   } catch {
@@ -472,7 +513,7 @@ function parseLlmProviderProfiles(value: unknown): LlmProviderProfile[] {
 }
 
 function getLlmProviderProfiles(): LlmProviderProfile[] {
-  const stored = parseLlmProviderProfiles(getSettingValue(LLM_PROFILE_SETTINGS_KEY))
+  const stored = parseLlmProviderProfiles(getSettingValue(LLM_PROFILE_SETTINGS_KEY), 'llm')
   const current = getCurrentLlmProfile()
   if (!current.baseUrl || !current.model) return stored
   const byId = stored.find((item) => item.id === current.id)
@@ -486,56 +527,74 @@ function getCurrentVisionOcrProfile(): LlmProviderProfile {
   const provider = getSettingValue('vision_ocr_provider') || '豆包'
   const baseUrl = (getSettingValue('vision_ocr_base_url') || 'https://ark.cn-beijing.volces.com/api/v3').replace(/\/+$/, '')
   const model = getSettingValue('vision_ocr_model') || ''
+  const id = getSettingValue('vision_ocr_active_provider_id') || makeVisionOcrProfileId(provider, baseUrl, model)
+  const apiKey = readProtectedSetting('vision_ocr_api_key')
   return {
-    id: getSettingValue('vision_ocr_active_provider_id') || makeVisionOcrProfileId(provider, baseUrl, model),
+    id,
     name: provider,
     provider,
     baseUrl,
-    apiKey: getSettingValue('vision_ocr_api_key'),
     model,
     updatedAt: new Date().toISOString(),
+    credential: getCredentialPublicState('vision_ocr_api_key'),
+    connectionTest: getVisionOcrConnectionState(id, baseUrl, model, apiKey),
   }
 }
 
 function getVisionOcrProviderProfiles(): LlmProviderProfile[] {
-  const stored = parseLlmProviderProfiles(getSettingValue(VISION_OCR_PROFILE_SETTINGS_KEY))
+  const stored = parseLlmProviderProfiles(getSettingValue(VISION_OCR_PROFILE_SETTINGS_KEY), 'vision_ocr')
   const current = getCurrentVisionOcrProfile()
-  if (!current.baseUrl || !current.model) return stored
+  const withConnectionState = (profile: LlmProviderProfile): LlmProviderProfile => ({
+    ...profile,
+    connectionTest: getVisionOcrConnectionState(
+      profile.id,
+      profile.baseUrl,
+      profile.model,
+      readProtectedSetting(`vision_ocr_profile:${profile.id}`) || (profile.id === current.id ? readProtectedSetting('vision_ocr_api_key') : ''),
+    ),
+  })
+  if (!current.baseUrl || !current.model) return stored.map(withConnectionState)
   const byId = stored.find((item) => item.id === current.id)
   if (byId) {
-    return stored.map((item) => item.id === current.id ? { ...item, ...current, updatedAt: item.updatedAt } : item)
+    return stored.map((item) => withConnectionState(item.id === current.id ? { ...item, ...current, updatedAt: item.updatedAt } : item))
   }
-  return [current, ...stored]
+  return [current, ...stored.map(withConnectionState)]
 }
 
 function saveVisionOcrProviderProfiles(profiles: LlmProviderProfile[]): void {
   const normalized = profiles
-    .map((item) => ({
-      ...item,
-      id: String(item.id || item.name || '').trim(),
-      name: String(item.name || item.provider || '').trim(),
-      provider: String(item.provider || item.name || '').trim(),
-      baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
-      apiKey: String(item.apiKey || ''),
-      model: String(item.model || '').trim(),
-      updatedAt: item.updatedAt || new Date().toISOString(),
-    }))
+    .map((item) => {
+      const id = String(item.id || item.name || '').trim()
+      const apiKey = String(item.apiKey || '')
+      if (id && apiKey) writeProtectedSetting(`vision_ocr_profile:${id}`, apiKey)
+      return {
+        id,
+        name: String(item.name || item.provider || '').trim(),
+        provider: String(item.provider || item.name || '').trim(),
+        baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
+        model: String(item.model || '').trim(),
+        updatedAt: item.updatedAt || new Date().toISOString(),
+      }
+    })
     .filter((item) => item.id && item.name && item.baseUrl && item.model)
   setSettingValue(VISION_OCR_PROFILE_SETTINGS_KEY, JSON.stringify(normalized))
 }
 
 function saveLlmProviderProfiles(profiles: LlmProviderProfile[]): void {
   const normalized = profiles
-    .map((item) => ({
-      ...item,
-      id: String(item.id || item.name || '').trim(),
-      name: String(item.name || item.provider || '').trim(),
-      provider: String(item.provider || item.name || '').trim(),
-      baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
-      apiKey: String(item.apiKey || ''),
-      model: String(item.model || '').trim(),
-      updatedAt: item.updatedAt || new Date().toISOString(),
-    }))
+    .map((item) => {
+      const id = String(item.id || item.name || '').trim()
+      const apiKey = String(item.apiKey || '')
+      if (id && apiKey) writeProtectedSetting(`llm_profile:${id}`, apiKey)
+      return {
+        id,
+        name: String(item.name || item.provider || '').trim(),
+        provider: String(item.provider || item.name || '').trim(),
+        baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
+        model: String(item.model || '').trim(),
+        updatedAt: item.updatedAt || new Date().toISOString(),
+      }
+    })
     .filter((item) => item.id && item.name && item.baseUrl && item.model)
   setSettingValue(LLM_PROFILE_SETTINGS_KEY, JSON.stringify(normalized))
 }
@@ -549,9 +608,9 @@ function getCurrentLlmProfile(): LlmProviderProfile {
     name: provider,
     provider,
     baseUrl,
-    apiKey: getSettingValue('llm_api_key'),
     model,
     updatedAt: new Date().toISOString(),
+    credential: getCredentialPublicState('llm_api_key'),
   }
 }
 
@@ -564,7 +623,7 @@ function getLlmProfileValidation(profile: LlmProviderProfile) {
     provider: profile.provider || profile.name,
     name: profile.name,
     baseUrl: profile.baseUrl,
-    apiKey: profile.apiKey,
+    apiKey: profile.apiKey || (profile.credential?.configured ? 'configured' : ''),
     model: profile.model,
   })
 }
@@ -574,21 +633,9 @@ function getVisionOcrProfileValidation(profile: LlmProviderProfile) {
     provider: profile.provider || profile.name,
     name: profile.name,
     baseUrl: profile.baseUrl,
-    apiKey: profile.apiKey,
+    apiKey: profile.apiKey || (profile.credential?.configured ? 'configured' : ''),
     model: profile.model,
   })
-}
-
-function persistLocalPaddleOcrStatus(status: LocalPaddleOcrStatus): void {
-  setSettingValue('local_paddle_ocr_status', status.state)
-  setSettingValue('local_paddle_ocr_bundle_version', status.bundleVersion)
-  setSettingValue('local_paddle_ocr_path', status.installPath)
-  setSettingValue('local_paddle_ocr_runtime_status', status.runtime.state)
-  setSettingValue('local_paddle_ocr_runtime_path', status.runtime.runtimePath)
-}
-
-function emitLocalPaddleOcrProgress(event: Electron.IpcMainInvokeEvent, progress: LocalPaddleOcrDownloadProgress): void {
-  event.sender.send('settings:localPaddleOcrDownloadProgress', progress)
 }
 
 function ensureUniqueExportPath(dirPath: string, fileName: string, usedPaths: Set<string>): string {
@@ -605,18 +652,43 @@ function ensureUniqueExportPath(dirPath: string, fileName: string, usedPaths: Se
 }
 
 export function registerSettingsIpc(): void {
+  ipcMain.handle('settings:credential:prepare', async (event, key: string, value: string) => {
+    const ownerId = event.sender.id
+    if (!registeredCredentialDraftOwners.has(ownerId)) {
+      registeredCredentialDraftOwners.add(ownerId)
+      event.sender.once('destroyed', () => {
+        registeredCredentialDraftOwners.delete(ownerId)
+        revokeCredentialDraftOwner(ownerId)
+      })
+    }
+    return prepareCredentialDraft(ownerId, key, value)
+  })
+
+  ipcMain.handle('settings:credential:commit', async (event, key: string, draftRef: string) => {
+    const value = consumeCredentialDraft(event.sender.id, key, draftRef)
+    return writeProtectedSetting(key, value)
+  })
+
+  ipcMain.handle('settings:credential:revoke', async (_event, key: string) => {
+    if (!isProtectedSettingKey(key)) throw new Error('credential_purpose_invalid')
+    return revokeProtectedSetting(key)
+  })
+
   ipcMain.handle('settings:get', async (_event, key: string): Promise<string | null> => {
-    const row = queryOne<Pick<Setting, 'value'>>('SELECT value FROM settings WHERE key = ?', [key])
-    return row?.value ?? null
+    if (isProtectedSettingKey(key)) return null
+    const value = readPublicSetting(key)
+    return value || null
   })
 
   ipcMain.handle('settings:set', async (_event, key: string, value: string): Promise<SettingSetResult> => {
-    const previousValue = key === METADATA_TAG_BINDING_SETTING_KEY ? getSettingValue(key) : ''
-    run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', [key, value])
+    if (isProtectedSettingKey(key)) throw new Error('protected_setting_requires_credential_api')
+    const validated = validateSettingValue(key, value)
+    const previousValue = validated.key === METADATA_TAG_BINDING_SETTING_KEY ? getSettingValue(validated.key) : ''
+    setSettingValue(validated.key, validated.value)
     let metadataTagCleanup: SettingSetResult['metadataTagCleanup'] = null
     let metadataTagRebuild: SettingSetResult['metadataTagRebuild'] = null
-    if (key === METADATA_TAG_BINDING_SETTING_KEY) {
-      const normalizedValue = String(value).trim().toLowerCase()
+    if (validated.key === METADATA_TAG_BINDING_SETTING_KEY) {
+      const normalizedValue = validated.value.trim().toLowerCase()
       const wasEnabled = String(previousValue).trim().toLowerCase() === 'true'
       if (normalizedValue === 'false') {
         metadataTagCleanup = ensureDisabledMetadataTagBindingsCleared()
@@ -631,81 +703,75 @@ export function registerSettingsIpc(): void {
   })
 
   ipcMain.handle('settings:getAll', async (): Promise<SettingsMap> => {
-    const rows = queryAll<Setting>('SELECT key, value FROM settings')
-    const result: SettingsMap = {}
-    for (const row of rows) {
-      result[row.key] = row.value
-    }
-    return result
+    return getRendererSettingsSnapshot()
   })
 
   ipcMain.handle('settings:listModels', async (_event, payload?: ListModelsPayload): Promise<string[]> => {
-    return fetchOpenAiCompatibleModels(String(payload?.baseUrl || ''), String(payload?.apiKey || ''))
+    const credentialKey = payload?.credentialKey === 'vision_ocr_api_key' ? 'vision_ocr_api_key' : 'llm_api_key'
+    const draftSecret = payload?.credentialDraftRef
+      ? consumeCredentialDraft(_event.sender.id, credentialKey, payload.credentialDraftRef)
+      : ''
+    return fetchOpenAiCompatibleModels(
+      String(payload?.baseUrl || getSettingValue('llm_base_url') || ''),
+      String(draftSecret || readProtectedSetting(credentialKey) || ''),
+    )
   })
 
-  ipcMain.handle('settings:listPaddleOcrModels', async (_event, apiKey?: string): Promise<string[]> => {
-    return fetchPaddleOcrModels(String(apiKey || getSettingValue('paddleocr_api_key') || ''))
+  ipcMain.handle('settings:listPaddleOcrModels', async (event, credentialDraftRef?: string): Promise<string[]> => {
+    const draftSecret = credentialDraftRef
+      ? consumeCredentialDraft(event.sender.id, 'paddleocr_api_key', credentialDraftRef)
+      : ''
+    return fetchPaddleOcrModels(String(draftSecret || readProtectedSetting('paddleocr_api_key') || ''))
   })
 
   ipcMain.handle('settings:getLocalPaddleOcrStatus', async (): Promise<LocalPaddleOcrStatus> => {
-    return getLocalPaddleOcrStatus()
+    return {
+      installed: false,
+      modelInstalled: false,
+      state: 'not_installed',
+      bundleVersion: '',
+      installPath: '',
+      runtime: {
+        state: 'error',
+        supported: false,
+        runtimePath: '',
+        requiredPaddleVersion: '',
+        requiredPaddleOcrVersion: '',
+        requiredPaddlexVersion: '',
+        message: '本地 OCR 功能当前已停用',
+      },
+      message: '本地 OCR 功能当前已停用',
+      sources: [],
+    }
   })
 
   ipcMain.handle('settings:checkLocalPaddleOcrSources', async (): Promise<LocalPaddleOcrSource[]> => {
-    return checkLocalPaddleOcrSources()
+    return []
   })
 
   ipcMain.handle('settings:downloadLocalPaddleOcr', async (
     event,
     options?: LocalPaddleOcrDownloadOptions,
   ): Promise<LocalPaddleOcrStatus> => {
-    const status = await downloadLocalPaddleOcrAddon(options || {}, (progress) => emitLocalPaddleOcrProgress(event, progress))
-    persistLocalPaddleOcrStatus(status)
-    if (status.installed) {
-      setSettingValue('ocr_default_engine', 'local_paddle')
-      setSettingValue('ocr_active_provider_id', 'local_paddle')
-    }
-    saveDatabase()
-    return status
+    void event
+    void options
+    throw new Error('本地 OCR 功能当前已停用')
   })
 
   ipcMain.handle('settings:installLocalPaddleOcrRuntime', async (
     event,
   ): Promise<LocalPaddleOcrStatus> => {
-    const status = await installLocalPaddleOcrRuntime((progress) => emitLocalPaddleOcrProgress(event, progress))
-    persistLocalPaddleOcrStatus(status)
-    if (status.installed) {
-      setSettingValue('ocr_default_engine', 'local_paddle')
-      setSettingValue('ocr_active_provider_id', 'local_paddle')
-    }
-    saveDatabase()
-    return status
+    void event
+    throw new Error('本地 OCR 功能当前已停用')
   })
 
   ipcMain.handle('settings:importLocalPaddleOcrAddon', async (
     event,
     filePath?: string,
   ): Promise<LocalPaddleOcrStatus> => {
-    let selectedPath = String(filePath || '').trim()
-    if (!selectedPath) {
-      const result = await dialog.showOpenDialog({
-        title: '导入本地 OCR 兼容包',
-        properties: ['openFile'],
-        filters: [{ name: '本地 OCR 兼容包', extensions: ['zip'] }],
-      })
-      if (result.canceled || result.filePaths.length === 0) {
-        return getLocalPaddleOcrStatus()
-      }
-      selectedPath = result.filePaths[0]
-    }
-    const status = await importLocalPaddleOcrAddon(selectedPath, (progress) => emitLocalPaddleOcrProgress(event, progress))
-    persistLocalPaddleOcrStatus(status)
-    if (status.installed) {
-      setSettingValue('ocr_default_engine', 'local_paddle')
-      setSettingValue('ocr_active_provider_id', 'local_paddle')
-    }
-    saveDatabase()
-    return status
+    void event
+    void filePath
+    throw new Error('本地 OCR 功能当前已停用')
   })
 
   ipcMain.handle('settings:setDefaultOcrEngine', async (
@@ -716,13 +782,18 @@ export function registerSettingsIpc(): void {
     if (!['local_paddle', 'paddle', 'vision_model', 'hybrid'].includes(engine)) {
       throw new Error('不支持的 OCR 引擎')
     }
-    setSettingValue('ocr_default_engine', engine)
-    setSettingValue('ocr_active_provider_id', String(providerId || engine))
+    const normalizedEngine: OcrEngine = engine === 'local_paddle' || engine === 'hybrid' ? 'paddle' : engine
+    const normalizedProviderId = providerId === 'local_paddle' || providerId === 'hybrid' ? normalizedEngine : String(providerId || normalizedEngine)
+    if (normalizedEngine === 'vision_model') {
+      const profile = getVisionOcrProviderProfiles().find((item) => item.id === normalizedProviderId)
+      if (!profile) throw new Error('未找到 AI OCR 配置，请先保存并测试连接。')
+      const secret = readProtectedSetting(`vision_ocr_profile:${profile.id}`) || readProtectedSetting('vision_ocr_api_key')
+      assertVisionOcrProfileVerified(profile.id, profile.baseUrl, profile.model, secret)
+    }
+    setSettingValue('ocr_default_engine', normalizedEngine)
+    setSettingValue('ocr_active_provider_id', normalizedProviderId)
     saveDatabase()
-    const rows = queryAll<Setting>('SELECT key, value FROM settings')
-    const result: SettingsMap = {}
-    for (const row of rows) result[row.key] = row.value
-    return result
+    return getRendererSettingsSnapshot()
   })
 
   ipcMain.handle('settings:llmProfiles:list', async (): Promise<LlmProviderProfileState> => {
@@ -747,6 +818,8 @@ export function registerSettingsIpc(): void {
       updatedAt: new Date().toISOString(),
     }
     const profiles = getLlmProviderProfiles().filter((item) => item.id !== profile.id)
+    const currentSecret = readProtectedSetting('llm_api_key')
+    if (currentSecret) writeProtectedSetting(`llm_profile:${profile.id}`, currentSecret)
     saveLlmProviderProfiles([profile, ...profiles])
     setSettingValue('llm_active_provider_id', profile.id)
     setSettingValue('llm_provider', profile.provider)
@@ -759,7 +832,8 @@ export function registerSettingsIpc(): void {
     }
   })
 
-  ipcMain.handle('settings:llmProfiles:upsert', async (_event, profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
+  ipcMain.handle('settings:llmProfiles:upsert', async (event, profile: LlmProviderProfile, credentialDraftRef?: string): Promise<LlmProviderProfilesResult> => {
+    if (profile && 'apiKey' in profile) throw new Error('profile_secret_requires_credential_draft')
     const provider = String(profile?.provider || profile?.name || '').trim()
     const baseUrl = String(profile?.baseUrl || '').trim().replace(/\/+$/, '')
     const model = String(profile?.model || '').trim()
@@ -768,13 +842,16 @@ export function registerSettingsIpc(): void {
       name: String(profile?.name || profile?.provider || '').trim(),
       provider,
       baseUrl,
-      apiKey: String(profile?.apiKey || ''),
       model,
       updatedAt: new Date().toISOString(),
     }
     const configValidation = getLlmProfileValidation(next)
     if (!next.id || configValidation.error_count > 0) {
       throw new Error('AI 服务商配置不完整')
+    }
+    if (credentialDraftRef) {
+      writeProtectedSetting(`llm_profile:${next.id}`, consumeCredentialDraft(event.sender.id, 'llm_api_key', credentialDraftRef))
+      next.credential = getCredentialPublicState(`llm_profile:${next.id}`)
     }
     const profiles = getLlmProviderProfiles().filter((item) => item.id !== next.id)
     saveLlmProviderProfiles([next, ...profiles])
@@ -794,16 +871,20 @@ export function registerSettingsIpc(): void {
     setSettingValue('llm_active_provider_id', profile.id)
     setSettingValue('llm_provider', profile.provider || profile.name)
     setSettingValue('llm_base_url', profile.baseUrl)
-    setSettingValue('llm_api_key', profile.apiKey)
+    const profileSecret = readProtectedSetting(`llm_profile:${profile.id}`)
+    if (profileSecret) writeProtectedSetting('llm_api_key', profileSecret)
+    else revokeProtectedSetting('llm_api_key')
     setSettingValue('llm_model', profile.model)
     saveDatabase()
-    return { activeId: profile.id, current: profile, profiles, configValidation: getLlmProfileValidation(profile) }
+    const current = getCurrentLlmProfile()
+    return { activeId: profile.id, current, profiles: getLlmProviderProfiles(), configValidation: getLlmProfileValidation(current) }
   })
 
   ipcMain.handle('settings:llmProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
     const id = String(profileId || '').trim()
     const activeId = getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider')
     if (id && id === activeId) throw new Error('不能删除当前正在使用的 AI 服务商')
+    if (id) revokeProtectedSetting(`llm_profile:${id}`)
     saveLlmProviderProfiles(getLlmProviderProfiles().filter((item) => item.id !== id))
     saveDatabase()
     return { activeId, profiles: getLlmProviderProfiles(), configValidation: getLlmProfileValidation(getCurrentLlmProfile()) }
@@ -819,7 +900,41 @@ export function registerSettingsIpc(): void {
     }
   })
 
-  ipcMain.handle('settings:visionOcrProfiles:upsert', async (_event, profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
+  ipcMain.handle('settings:visionOcrProfiles:testConnection', async (
+    event,
+    payload: VisionOcrConnectionTestPayload,
+    credentialDraftRef?: string,
+  ): Promise<VisionOcrConnectionTestResult> => {
+    const useLlmConfig = payload?.useLlmConfig === true
+    const credentialKey = useLlmConfig ? 'llm_api_key' : 'vision_ocr_api_key'
+    const draftSecret = credentialDraftRef
+      ? consumeCredentialDraft(event.sender.id, credentialKey, credentialDraftRef)
+      : ''
+    const provider = String(payload?.provider || payload?.name || '').trim()
+    const baseUrl = String(payload?.baseUrl || (useLlmConfig ? getSettingValue('llm_base_url') : '')).trim()
+    const model = String(payload?.model || (useLlmConfig ? getSettingValue('llm_model') : '')).trim()
+    const requestedId = String(payload?.id || '').trim()
+    const profileId = useLlmConfig
+      ? `vision_follow_ai:${makeLlmProfileId(provider, baseUrl, model)}`
+      : requestedId && requestedId !== 'vision_draft'
+        ? requestedId
+        : makeVisionOcrProfileId(provider, baseUrl, model)
+    const savedSecret = useLlmConfig
+      ? readProtectedSetting('llm_api_key')
+      : readProtectedSetting(`vision_ocr_profile:${profileId}`)
+        || (profileId === getSettingValue('vision_ocr_active_provider_id') ? readProtectedSetting('vision_ocr_api_key') : '')
+    const apiKey = String(draftSecret || savedSecret || '')
+    await testVisionOcrConnection(baseUrl, model, apiKey)
+    const connectionTest = markVisionOcrConnectionVerified(profileId, baseUrl, model, apiKey)
+    return {
+      ...connectionTest,
+      profileId,
+      message: '连接测试成功，当前配置已允许保存和使用。',
+    }
+  })
+
+  ipcMain.handle('settings:visionOcrProfiles:upsert', async (event, profile: LlmProviderProfile, credentialDraftRef?: string): Promise<LlmProviderProfilesResult> => {
+    if (profile && 'apiKey' in profile) throw new Error('profile_secret_requires_credential_draft')
     const provider = String(profile?.provider || profile?.name || '').trim()
     const baseUrl = String(profile?.baseUrl || '').trim().replace(/\/+$/, '')
     const model = String(profile?.model || '').trim()
@@ -828,13 +943,21 @@ export function registerSettingsIpc(): void {
       name: String(profile?.name || profile?.provider || '').trim(),
       provider,
       baseUrl,
-      apiKey: String(profile?.apiKey || ''),
       model,
       updatedAt: new Date().toISOString(),
     }
     const configValidation = getVisionOcrProfileValidation(next)
     if (!next.id || configValidation.error_count > 0) {
       throw new Error('视觉 OCR 服务商配置不完整')
+    }
+    const submittedSecret = credentialDraftRef
+      ? consumeCredentialDraft(event.sender.id, 'vision_ocr_api_key', credentialDraftRef)
+      : readProtectedSetting(`vision_ocr_profile:${next.id}`)
+        || (next.id === getSettingValue('vision_ocr_active_provider_id') ? readProtectedSetting('vision_ocr_api_key') : '')
+    assertVisionOcrProfileVerified(next.id, next.baseUrl, next.model, submittedSecret)
+    if (credentialDraftRef) {
+      writeProtectedSetting(`vision_ocr_profile:${next.id}`, submittedSecret)
+      next.credential = getCredentialPublicState(`vision_ocr_profile:${next.id}`)
     }
     const profiles = getVisionOcrProviderProfiles().filter((item) => item.id !== next.id)
     saveVisionOcrProviderProfiles([next, ...profiles])
@@ -851,23 +974,56 @@ export function registerSettingsIpc(): void {
     const profiles = getVisionOcrProviderProfiles()
     const profile = profiles.find((item) => item.id === id)
     if (!profile) throw new Error('未找到视觉 OCR 服务商配置')
+    const profileSecret = readProtectedSetting(`vision_ocr_profile:${profile.id}`) || readProtectedSetting('vision_ocr_api_key')
+    assertVisionOcrProfileVerified(profile.id, profile.baseUrl, profile.model, profileSecret)
     setSettingValue('vision_ocr_active_provider_id', profile.id)
     setSettingValue('vision_ocr_provider', profile.provider || profile.name)
     setSettingValue('vision_ocr_use_llm_config', 'false')
     setSettingValue('vision_ocr_base_url', profile.baseUrl)
-    setSettingValue('vision_ocr_api_key', profile.apiKey)
+    if (profileSecret) writeProtectedSetting('vision_ocr_api_key', profileSecret)
+    else revokeProtectedSetting('vision_ocr_api_key')
     setSettingValue('vision_ocr_model', profile.model)
     saveDatabase()
-    return { activeId: profile.id, current: profile, profiles, configValidation: getVisionOcrProfileValidation(profile) }
+    const current = getCurrentVisionOcrProfile()
+    return { activeId: profile.id, current, profiles: getVisionOcrProviderProfiles(), configValidation: getVisionOcrProfileValidation(current) }
   })
 
   ipcMain.handle('settings:visionOcrProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
     const id = String(profileId || '').trim()
     const activeId = getSettingValue('vision_ocr_active_provider_id') || getSettingValue('vision_ocr_provider')
-    if (id && id === activeId) throw new Error('不能删除当前正在使用的视觉 OCR 服务商')
-    saveVisionOcrProviderProfiles(getVisionOcrProviderProfiles().filter((item) => item.id !== id))
+    const remainingProfiles = getVisionOcrProviderProfiles().filter((item) => item.id !== id)
+    if (id) revokeProtectedSetting(`vision_ocr_profile:${id}`)
+    if (id) clearVisionOcrConnectionVerification(id)
+    saveVisionOcrProviderProfiles(remainingProfiles)
+    let nextActiveId = activeId
+    if (id && id === activeId) {
+      const fallbackProfile = remainingProfiles.find((profile) => profile.connectionTest?.verified)
+      if (fallbackProfile) {
+        nextActiveId = fallbackProfile.id
+        setSettingValue('vision_ocr_active_provider_id', fallbackProfile.id)
+        setSettingValue('vision_ocr_provider', fallbackProfile.provider || fallbackProfile.name)
+        setSettingValue('vision_ocr_use_llm_config', 'false')
+        setSettingValue('vision_ocr_base_url', fallbackProfile.baseUrl)
+        setSettingValue('vision_ocr_model', fallbackProfile.model)
+        const fallbackSecret = readProtectedSetting(`vision_ocr_profile:${fallbackProfile.id}`)
+        if (fallbackSecret) writeProtectedSetting('vision_ocr_api_key', fallbackSecret)
+        else revokeProtectedSetting('vision_ocr_api_key')
+      } else {
+        nextActiveId = ''
+        setSettingValue('vision_ocr_active_provider_id', '')
+        setSettingValue('vision_ocr_provider', '')
+        setSettingValue('vision_ocr_base_url', '')
+        setSettingValue('vision_ocr_model', '')
+        revokeProtectedSetting('vision_ocr_api_key')
+        setSettingValue('vision_ocr_use_llm_config', 'false')
+        if (getSettingValue('ocr_default_engine') === 'vision_model') {
+          setSettingValue('ocr_default_engine', 'paddle')
+          setSettingValue('ocr_active_provider_id', 'paddle')
+        }
+      }
+    }
     saveDatabase()
-    return { activeId, profiles: getVisionOcrProviderProfiles(), configValidation: getVisionOcrProfileValidation(getCurrentVisionOcrProfile()) }
+    return { activeId: nextActiveId, profiles: getVisionOcrProviderProfiles(), configValidation: getVisionOcrProfileValidation(getCurrentVisionOcrProfile()) }
   })
 }
 
@@ -1127,4 +1283,3 @@ export function registerBackupIpc(): void {
     }
   })
 }
-

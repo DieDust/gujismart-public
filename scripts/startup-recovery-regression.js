@@ -1,6 +1,6 @@
 const assert = require('assert')
 const { app } = require('electron')
-const { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } = require('fs')
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } = require('fs')
 const { tmpdir } = require('os')
 const { join } = require('path')
 const { buildSync } = require('esbuild')
@@ -17,7 +17,8 @@ writeFileSync(entryPath, `
   const database = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'database.ts'))})
   const search = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'semantic-search.ts'))})
   const startupRecovery = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'startup-recovery.ts'))})
-  module.exports = { database, search, startupRecovery }
+  const pdfAssets = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'pdf-assets.ts'))})
+  module.exports = { database, search, startupRecovery, pdfAssets }
 `)
 
 buildSync({
@@ -63,10 +64,10 @@ function insertDocument(database, id, status = {}) {
   )
 }
 
-function insertPage(database, id, docId, pageNum, status = 'pending') {
+function insertPage(database, id, docId, pageNum, status = 'pending', imagePath = null) {
   database.run(
     'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [id, docId, pageNum, null, status === 'completed' ? `text ${pageNum}` : null, null, null, status, 'pending', new Date().toISOString()],
+    [id, docId, pageNum, imagePath, status === 'completed' ? `text ${pageNum}` : null, null, null, status, 'pending', new Date().toISOString()],
   )
 }
 
@@ -124,7 +125,7 @@ async function run() {
   try {
     const modules = require(bundlePath)
     database = modules.database
-    const { search, startupRecovery } = modules
+    const { search, startupRecovery, pdfAssets } = modules
 
     await database.initDatabase()
 
@@ -209,8 +210,21 @@ async function run() {
     const storageRoot = join(tempDataDir, 'storage')
     const knownStorageDir = join(storageRoot, 'doc_index_ready')
     const orphanStorageDir = join(storageRoot, 'orphan_doc')
+    const dotStorageDir = join(storageRoot, '.orphan-dot')
     const pagePayloadStorageDir = join(storageRoot, 'page-payloads')
     const deletingStorageDir = join(storageRoot, 'doc_deleting')
+    const boundaryDeleteStorageDir = join(storageRoot, 'managed_delete_boundaries')
+    const similarDeleteStorageDir = join(storageRoot, 'managed_delete_similar')
+    const similarProtectedDir = join(storageRoot, 'managed_delete_target-copy')
+    const externalProtectedFile = join(tempRoot, 'external', 'outside.pdf')
+    const repositoryProtectedFile = join(tempRoot, 'repository', 'archive.pdf')
+    const parentProtectedDir = join(tempRoot, 'protected-parent')
+    const parentProtectedFile = join(parentProtectedDir, 'keep.txt')
+    const siblingProtectedFile = join(knownStorageDir, 'keep.txt')
+    const similarProtectedFile = join(similarProtectedDir, 'keep.txt')
+    const junctionTargetDir = join(tempRoot, 'junction-target')
+    const junctionTargetFile = join(junctionTargetDir, 'keep.txt')
+    const orphanJunctionDir = join(storageRoot, 'orphan_junction')
     const interruptedCompressionStorageDir = join(storageRoot, 'doc_interrupted_compression')
     const interruptedCompressionPdfPath = join(interruptedCompressionStorageDir, 'stored.pdf')
     const interruptedCompressionOriginalPath = join(interruptedCompressionStorageDir, '.original-123456-abcdef.pdf')
@@ -219,15 +233,33 @@ async function run() {
     const compressionTempDir = join(tempDataDir, 'temp', 'pdf-compression')
     mkdirSync(knownStorageDir, { recursive: true })
     mkdirSync(orphanStorageDir, { recursive: true })
+    mkdirSync(dotStorageDir, { recursive: true })
     mkdirSync(pagePayloadStorageDir, { recursive: true })
     mkdirSync(deletingStorageDir, { recursive: true })
+    mkdirSync(boundaryDeleteStorageDir, { recursive: true })
+    mkdirSync(similarDeleteStorageDir, { recursive: true })
+    mkdirSync(similarProtectedDir, { recursive: true })
+    mkdirSync(join(tempRoot, 'external'), { recursive: true })
+    mkdirSync(join(tempRoot, 'repository'), { recursive: true })
+    mkdirSync(parentProtectedDir, { recursive: true })
+    mkdirSync(junctionTargetDir, { recursive: true })
     mkdirSync(interruptedCompressionStorageDir, { recursive: true })
     mkdirSync(ocrTempDir, { recursive: true })
     mkdirSync(activeOcrTempDir, { recursive: true })
     mkdirSync(compressionTempDir, { recursive: true })
     writeFileSync(join(orphanStorageDir, 'leftover.txt'), 'orphan')
+    writeFileSync(join(dotStorageDir, 'keep.txt'), 'dot storage')
     writeFileSync(join(pagePayloadStorageDir, 'payload.json.gz'), 'external payload')
     writeFileSync(join(deletingStorageDir, 'source.txt'), 'deleting')
+    writeFileSync(join(boundaryDeleteStorageDir, 'source.txt'), 'boundary deleting')
+    writeFileSync(join(similarDeleteStorageDir, 'source.txt'), 'similar deleting')
+    writeFileSync(externalProtectedFile, 'external bytes')
+    writeFileSync(repositoryProtectedFile, 'repository bytes')
+    writeFileSync(parentProtectedFile, 'parent bytes')
+    writeFileSync(siblingProtectedFile, 'sibling bytes')
+    writeFileSync(similarProtectedFile, 'similar prefix bytes')
+    writeFileSync(junctionTargetFile, 'junction bytes')
+    symlinkSync(junctionTargetDir, orphanJunctionDir, process.platform === 'win32' ? 'junction' : 'dir')
     writeFileSync(interruptedCompressionOriginalPath, '%PDF-1.4\n% interrupted compression original\n')
     writeFileSync(join(ocrTempDir, 'chunk_0001.pdf'), 'temporary ocr chunk')
     writeFileSync(join(activeOcrTempDir, 'chunk_0001.pdf'), 'active temporary ocr chunk')
@@ -311,9 +343,26 @@ async function run() {
     insertDocument(database, 'doc_deleting', {
       importStatus: 'deleting',
       ocrStatus: 'processing',
-      filePath: join(deletingStorageDir, 'source.txt'),
+      filePath: externalProtectedFile,
+      thumbPath: repositoryProtectedFile,
     })
     insertPage(database, 'page_deleting_1', 'doc_deleting', 1, 'processing')
+    insertDocument(database, 'managed_delete_boundaries', {
+      importStatus: 'deleting',
+      ocrStatus: 'processing',
+      filePath: parentProtectedDir,
+      thumbPath: knownStorageDir,
+    })
+    insertDocument(database, 'managed_delete_similar', {
+      importStatus: 'deleting',
+      ocrStatus: 'processing',
+      filePath: similarProtectedDir,
+    })
+    insertDocument(database, 'managed_delete_target-copy', {
+      importStatus: 'stored',
+      ocrStatus: 'pending',
+      pageCount: 0,
+    })
     database.run(
       'INSERT INTO batch_queue (id, batch_id, doc_id, status, batch_size, progress, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       ['batch_completed_stale', 'startup_resume_batch', 'doc_translate', 'pending', 5, 0, null, new Date().toISOString()],
@@ -328,7 +377,7 @@ async function run() {
     assert.strictEqual(summary.resetAiLayoutCacheRows, 1)
     assert.strictEqual(summary.resetTranslationCacheRows, 1)
     assert.strictEqual(summary.orphanStorageDirs, 1)
-    assert.strictEqual(summary.deletingDocuments.queuedDocuments, 2)
+    assert.strictEqual(summary.deletingDocuments.queuedDocuments, 4)
     assert.strictEqual(summary.ocr.recoveredDocuments, 4)
     assert.strictEqual(summary.completedOcrDocuments, 2)
     assert.strictEqual(summary.repairedInterruptedImports, 5)
@@ -434,7 +483,10 @@ async function run() {
     )
     assert.strictEqual(existsSync(orphanStorageDir), false)
     assert.strictEqual(existsSync(knownStorageDir), true)
+    assert.strictEqual(existsSync(dotStorageDir), true)
     assert.strictEqual(existsSync(pagePayloadStorageDir), true)
+    assert.strictEqual(existsSync(orphanJunctionDir), true)
+    assert.strictEqual(readFileSync(junctionTargetFile, 'utf8'), 'junction bytes')
     assert.strictEqual(existsSync(interruptedCompressionPdfPath), true)
     assert.strictEqual(existsSync(interruptedCompressionOriginalPath), false)
     assert.strictEqual(existsSync(ocrTempDir), false)
@@ -447,10 +499,25 @@ async function run() {
       'interrupted document delete to finish',
     )
     await waitFor(
+      () => database.queryOne('SELECT id FROM documents WHERE id = ?', ['managed_delete_boundaries']) === null,
+      'boundary document delete to finish',
+    )
+    await waitFor(
+      () => database.queryOne('SELECT id FROM documents WHERE id = ?', ['managed_delete_similar']) === null,
+      'similar-prefix document delete to finish',
+    )
+    await waitFor(
       () => database.queryOne('SELECT id FROM documents WHERE id = ?', ['doc_interrupted_text']) === null,
       'unrecoverable interrupted text import cleanup',
     )
     await waitFor(() => !existsSync(deletingStorageDir), 'interrupted document storage cleanup')
+    await waitFor(() => !existsSync(boundaryDeleteStorageDir), 'boundary document storage cleanup')
+    await waitFor(() => !existsSync(similarDeleteStorageDir), 'similar-prefix document storage cleanup')
+    assert.strictEqual(readFileSync(externalProtectedFile, 'utf8'), 'external bytes')
+    assert.strictEqual(readFileSync(repositoryProtectedFile, 'utf8'), 'repository bytes')
+    assert.strictEqual(readFileSync(parentProtectedFile, 'utf8'), 'parent bytes')
+    assert.strictEqual(readFileSync(siblingProtectedFile, 'utf8'), 'sibling bytes')
+    assert.strictEqual(readFileSync(similarProtectedFile, 'utf8'), 'similar prefix bytes')
 
     const secondSummary = await startupRecovery.runStartupRecovery()
     assert.strictEqual(secondSummary.resetSearchIndexJobs, 0)
@@ -470,6 +537,52 @@ async function run() {
       skippedItems: 0,
     })
     assert.strictEqual(secondSummary.removedTempDirs, 0)
+
+    const syncPdfId = 'managed_pdf_sync'
+    const syncPdfDir = join(storageRoot, syncPdfId)
+    const syncPdfPath = join(syncPdfDir, 'source.pdf')
+    const syncPagePath = join(syncPdfDir, 'page.jpg')
+    const syncExternalThumb = join(tempRoot, 'repository', 'sync-thumb.jpg')
+    mkdirSync(syncPdfDir, { recursive: true })
+    writeFileSync(syncPdfPath, '%PDF-1.4\nmanaged sync\n')
+    writeFileSync(syncPagePath, 'managed sync page')
+    writeFileSync(syncExternalThumb, 'sync external thumb')
+    insertDocument(database, syncPdfId, { filePath: syncPdfPath, thumbPath: syncExternalThumb })
+    insertPage(database, 'managed_page_sync', syncPdfId, 1, 'pending', syncPagePath)
+    assert.strictEqual(pdfAssets.cleanupPdfAssets(syncPdfId).cleaned, true)
+    assert.strictEqual(existsSync(syncPdfPath), false)
+    assert.strictEqual(existsSync(syncPagePath), false)
+    assert.strictEqual(readFileSync(syncExternalThumb, 'utf8'), 'sync external thumb')
+
+    const asyncPdfId = 'managed_pdf_async'
+    const asyncPdfDir = join(storageRoot, asyncPdfId)
+    const asyncPdfPath = join(asyncPdfDir, 'source.pdf')
+    const asyncPagePath = join(asyncPdfDir, 'page.jpg')
+    const asyncRepositoryPath = join(tempRoot, 'repository', 'async-source.pdf')
+    mkdirSync(asyncPdfDir, { recursive: true })
+    writeFileSync(asyncPdfPath, '%PDF-1.4\nmanaged async\n')
+    writeFileSync(asyncPagePath, 'managed async page')
+    writeFileSync(asyncRepositoryPath, '%PDF-1.4\nrepository async\n')
+    insertDocument(database, asyncPdfId, { filePath: asyncPdfPath, thumbPath: asyncRepositoryPath })
+    insertPage(database, 'managed_page_async', asyncPdfId, 1, 'pending', asyncPagePath)
+    assert.strictEqual((await pdfAssets.cleanupPdfAssetsAsync(asyncPdfId)).cleaned, true)
+    assert.strictEqual(existsSync(asyncPdfPath), false)
+    assert.strictEqual(existsSync(asyncPagePath), false)
+    assert.strictEqual(readFileSync(asyncRepositoryPath, 'utf8'), '%PDF-1.4\nrepository async\n')
+
+    const legacyPdfId = 'managed_pdf_legacy'
+    const legacyPdfDir = join(storageRoot, legacyPdfId)
+    const collidingManagedPdf = join(legacyPdfDir, 'source.pdf')
+    const nonexistentLegacyPath = join(tempRoot, 'old-install', 'source.pdf')
+    mkdirSync(legacyPdfDir, { recursive: true })
+    writeFileSync(collidingManagedPdf, '%PDF-1.4\nmanaged collision must remain\n')
+    insertDocument(database, legacyPdfId, { filePath: nonexistentLegacyPath })
+    pdfAssets.cleanupPdfAssets(legacyPdfId)
+    assert.strictEqual(
+      readFileSync(collidingManagedPdf, 'utf8'),
+      '%PDF-1.4\nmanaged collision must remain\n',
+      'legacy relocation hint must not authorize deleting a same-named managed file',
+    )
 
     console.log('Startup recovery regression passed')
   } finally {

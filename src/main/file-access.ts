@@ -1,7 +1,8 @@
 import { existsSync, realpathSync, statSync } from 'fs'
-import { resolve } from 'path'
+import { isAbsolute, relative, resolve, sep } from 'path'
 import { getDataDir } from './database'
 import { getPdfRepositoryPaths } from './pdf-assets'
+import { inspectManagedStorageRoot } from './managed-path-boundary'
 
 const runtimeAllowedFiles = new Set<string>()
 const runtimeAllowedRoots = new Set<string>()
@@ -17,11 +18,17 @@ function normalizeExistingPath(filePath: string): string {
 }
 
 function isInsidePath(candidate: string, root: string): boolean {
-  const normalizedCandidate = normalizeExistingPath(candidate).toLowerCase()
-  const normalizedRoot = normalizeExistingPath(root).toLowerCase()
-  return normalizedCandidate === normalizedRoot
-    || normalizedCandidate.startsWith(`${normalizedRoot}\\`)
-    || normalizedCandidate.startsWith(`${normalizedRoot}/`)
+  const normalizedCandidate = normalizeExistingPath(candidate)
+  const normalizedRoot = normalizeExistingPath(root)
+  if (!normalizedCandidate || !normalizedRoot) return false
+  const relativePath = relative(normalizedRoot, normalizedCandidate)
+  return relativePath === ''
+    || (!isAbsolute(relativePath) && relativePath !== '..' && !relativePath.startsWith(`..${sep}`))
+}
+
+function getManagedStorageRoot(): string | null {
+  const decision = inspectManagedStorageRoot(getDataDir())
+  return decision.allowed && decision.canonicalRoot ? decision.canonicalRoot : null
 }
 
 function pathFromLocalResourceUrl(value: string): string {
@@ -51,6 +58,20 @@ export function allowFileAccessPaths(paths: string[]): void {
   for (const filePath of paths || []) allowFileAccessPath(filePath)
 }
 
+export function allowManagedFileAccessPath(filePath: string): void {
+  const normalized = normalizeExistingPath(filePath)
+  const managedStorageRoot = getManagedStorageRoot()
+  if (!normalized
+    || !managedStorageRoot
+    || !existsSync(normalized)
+    || !isInsidePath(normalized, managedStorageRoot)) return
+  if (statSync(normalized).isFile()) runtimeAllowedFiles.add(normalized)
+}
+
+export function allowManagedFileAccessPaths(paths: string[]): void {
+  for (const filePath of paths || []) allowManagedFileAccessPath(filePath)
+}
+
 export function assertHttpUrl(rawUrl: string): string {
   const url = new URL(String(rawUrl || '').trim())
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
@@ -67,10 +88,10 @@ export function assertAllowedLocalFilePath(filePath: string): string {
   if (runtimeAllowedFiles.has(normalized)) return normalized
 
   const allowedRoots = [
-    getDataDir(),
+    getManagedStorageRoot(),
     ...getPdfRepositoryPaths(),
     ...runtimeAllowedRoots,
-  ].filter(Boolean)
+  ].filter((root): root is string => Boolean(root))
 
   if (!allowedRoots.some((root) => isInsidePath(normalized, root))) {
     throw new Error('该文件不在文献管理授权访问范围内')
@@ -82,5 +103,14 @@ export function assertAllowedLocalResourceUrl(url: string): string {
   if (!String(url || '').startsWith('local-resource://')) {
     throw new Error('不支持的本地资源协议')
   }
-  return assertAllowedLocalFilePath(pathFromLocalResourceUrl(url))
+  const normalized = normalizeExistingPath(pathFromLocalResourceUrl(url))
+  if (!normalized || !existsSync(normalized)) {
+    throw new Error('文件不存在')
+  }
+  const managedStorageRoot = getManagedStorageRoot()
+  if (!runtimeAllowedFiles.has(normalized)
+    && (!managedStorageRoot || !isInsidePath(normalized, managedStorageRoot))) {
+    throw new Error('该文件不在文献管理授权访问范围内')
+  }
+  return normalized
 }

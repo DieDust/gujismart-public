@@ -130,7 +130,7 @@ function normalizeOcrEngine(value: unknown): OcrEngine {
 
 function normalizeVisibleOcrEngine(value: unknown): OcrEngine {
   const engine = normalizeOcrEngine(value)
-  return engine === 'hybrid' ? 'paddle' : engine
+  return engine === 'hybrid' || engine === 'local_paddle' ? 'paddle' : engine
 }
 
 function findSavedProfileId(profiles: LlmProviderProfile[] | undefined, provider: string, baseUrl: string, model: string): string {
@@ -182,6 +182,23 @@ const LOCAL_PADDLE_OCR_SIZE_OPTIONS = [
     hardware: 'CPU：6 核以上，推荐 Intel i7 10 代或 Ryzen 7 4000 级别起；内存：16 GB 可用，批量建议 32 GB；显卡：建议 RTX 3060 / RTX 4060 或 6 GB 显存以上 NVIDIA 独显。',
   },
 ]
+
+function createVisionOcrConnectionSignature(input: {
+  selectedId: string
+  useLlmConfig: boolean
+  activeLlmProfileId: string
+  baseUrl: string
+  model: string
+  apiKey: string
+}): string {
+  return JSON.stringify([
+    input.useLlmConfig ? 'follow_ai' : 'vision_profile',
+    input.useLlmConfig ? input.activeLlmProfileId : input.selectedId,
+    String(input.baseUrl || '').trim().replace(/\/+$/, ''),
+    String(input.model || '').trim(),
+    String(input.apiKey || ''),
+  ])
+}
 
 const SHORTCUT_ITEMS: Array<{ action: ShortcutAction; label: string; hint: string }> = [
   { action: 'back', label: '返回 / 退出', hint: '阅读页返回文库；主界面触发退出确认' },
@@ -386,6 +403,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const loadingSettingsRef = useRef(true)
   const dirtyRef = useRef(false)
   const [saving, setSaving] = useState(false)
+  const [credentialHints, setCredentialHints] = useState<Record<'llm_api_key' | 'paddleocr_api_key' | 'vision_ocr_api_key', string>>({
+    llm_api_key: '',
+    paddleocr_api_key: '',
+    vision_ocr_api_key: '',
+  })
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionKey>('automation')
   const [autoOcr, setAutoOcr] = useState(true)
   const [autoAi, setAutoAi] = useState(true)
@@ -418,6 +440,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [visionOcrProfiles, setVisionOcrProfiles] = useState<LlmProviderProfile[]>([])
   const [activeVisionOcrProfileId, setActiveVisionOcrProfileId] = useState('')
   const [visionOcrProfileBusy, setVisionOcrProfileBusy] = useState(false)
+  const [visionOcrConnectionTesting, setVisionOcrConnectionTesting] = useState(false)
+  const [visionOcrConnectionTest, setVisionOcrConnectionTest] = useState<{ signature: string; profileId: string; testedAt?: string } | null>(null)
   const [defaultOcrEngine, setDefaultOcrEngine] = useState<OcrEngine>('paddle')
   const [activeOcrProviderId, setActiveOcrProviderId] = useState('paddle')
   const [selectedOcrProviderId, setSelectedOcrProviderId] = useState('paddle')
@@ -443,10 +467,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [editingGlossaryTerm, setEditingGlossaryTerm] = useState<TranslationGlossaryTerm | null>(null)
   const watchedLlmProvider = Form.useWatch('llm_provider', form)
   const watchedLlmBaseUrl = Form.useWatch('llm_base_url', form)
+  const watchedLlmApiKey = Form.useWatch('llm_api_key', form)
   const watchedLlmModel = Form.useWatch('llm_model', form)
   const watchedVisionOcrProvider = Form.useWatch('vision_ocr_provider', form)
   const watchedVisionOcrBaseUrl = Form.useWatch('vision_ocr_base_url', form)
+  const watchedVisionOcrApiKey = Form.useWatch('vision_ocr_api_key', form)
   const watchedVisionOcrModel = Form.useWatch('vision_ocr_model', form)
+  const watchedVisionOcrUseLlmConfig = Form.useWatch('vision_ocr_use_llm_config', form)
   const databaseCompactionWorthwhile = isDatabaseCompactionWorthwhile(databaseDiagnostics)
 
   const setSettingsDirty = useCallback((dirty: boolean) => {
@@ -512,8 +539,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     const loadSettings = async () => {
       try {
         const settings = await window.api.getAllSettings()
+        setCredentialHints({
+          llm_api_key: settings.llm_api_key_configured === 'true'
+            ? `已安全保存（末四位 ${settings.llm_api_key_last4 || '****'}）`
+            : '',
+          paddleocr_api_key: settings.paddleocr_api_key_configured === 'true'
+            ? `已安全保存（末四位 ${settings.paddleocr_api_key_last4 || '****'}）`
+            : '',
+          vision_ocr_api_key: settings.vision_ocr_api_key_configured === 'true'
+            ? `已安全保存（末四位 ${settings.vision_ocr_api_key_last4 || '****'}）`
+            : '',
+        })
         form.setFieldsValue({
-          paddleocr_api_key: settings.paddleocr_api_key || '',
+          paddleocr_api_key: '',
           ocr_async_model: settings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : settings.ocr_async_model || 'PaddleOCR-VL-1.6',
           ocr_upload_timeout_seconds: settings.ocr_upload_timeout_seconds || '3600',
           ocr_max_image_side: settings.ocr_max_image_side || '2200',
@@ -523,12 +561,12 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           pdf_compression_min_size_mb: settings.pdf_compression_min_size_mb || '10',
           pdf_compression_quality: settings.pdf_compression_quality || settings.ocr_jpeg_quality || '80',
           llm_provider: settings.llm_provider || 'DeepSeek',
-          llm_api_key: settings.llm_api_key || '',
+          llm_api_key: '',
           llm_base_url: settings.llm_base_url || 'https://api.deepseek.com/v1',
           llm_model: settings.llm_model || 'deepseek-v4-flash',
           vision_ocr_base_url: settings.vision_ocr_base_url || DEFAULT_VISION_PROVIDER.baseUrl,
           vision_ocr_provider: normalizeVisionProviderName(settings.vision_ocr_provider),
-          vision_ocr_api_key: settings.vision_ocr_api_key || '',
+          vision_ocr_api_key: '',
           vision_ocr_model: normalizeVisionModel(settings.vision_ocr_base_url || DEFAULT_VISION_PROVIDER.baseUrl, settings.vision_ocr_model),
           vision_ocr_use_llm_config: settings.vision_ocr_use_llm_config !== 'false',
           vision_ocr_concurrency: settings.vision_ocr_concurrency || '1',
@@ -547,12 +585,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         if (currentVisionPreset) setVisionModelOptions(currentVisionPreset.models)
         const savedOcrEngine = normalizeVisibleOcrEngine(settings.ocr_default_engine)
         const rawOcrProviderId = settings.ocr_active_provider_id || savedOcrEngine
-        const shouldMigrateHybridOcr = settings.ocr_default_engine === 'hybrid' || rawOcrProviderId === 'hybrid'
-        const savedOcrProviderId = shouldMigrateHybridOcr ? savedOcrEngine : rawOcrProviderId
+        const shouldMigrateRetiredOcr = settings.ocr_default_engine === 'hybrid'
+          || settings.ocr_default_engine === 'local_paddle'
+          || rawOcrProviderId === 'hybrid'
+          || rawOcrProviderId === 'local_paddle'
+        const savedOcrProviderId = shouldMigrateRetiredOcr ? savedOcrEngine : rawOcrProviderId
         setDefaultOcrEngine(savedOcrEngine)
         setActiveOcrProviderId(savedOcrProviderId)
         setSelectedOcrProviderId(savedOcrProviderId)
-        if (shouldMigrateHybridOcr) {
+        if (shouldMigrateRetiredOcr) {
           void window.api.setDefaultOcrEngine('paddle', 'paddle').catch((error) => console.warn('[SettingsView] 迁移旧混合 OCR 默认项失败', error))
         }
         setAutoOcr(settings.auto_ocr_after_import !== 'false')
@@ -586,6 +627,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         setSelectedAiProviderId(llmProfileState.activeId || (currentLlmPreset ? `preset:${currentLlmPreset.name}` : 'custom'))
         setVisionOcrProfiles(visionOcrProfileState.profiles || [])
         setActiveVisionOcrProfileId(visionOcrProfileState.activeId || '')
+        const initiallySelectedVisionProfile = settings.vision_ocr_use_llm_config === 'false'
+          ? (visionOcrProfileState.profiles || []).find((profile) => profile.id === savedOcrProviderId)
+          : undefined
+        if (initiallySelectedVisionProfile?.connectionTest?.verified) {
+          setVisionOcrConnectionTest({
+            signature: createVisionOcrConnectionSignature({
+              selectedId: initiallySelectedVisionProfile.id,
+              useLlmConfig: false,
+              activeLlmProfileId: llmProfileState.activeId || '',
+              baseUrl: initiallySelectedVisionProfile.baseUrl,
+              model: initiallySelectedVisionProfile.model,
+              apiKey: '',
+            }),
+            profileId: initiallySelectedVisionProfile.id,
+            testedAt: initiallySelectedVisionProfile.connectionTest.testedAt,
+          })
+        }
         setLocalPaddleStatus(localOcrStatus)
         setBackupStatus(backupStatus)
         syncAutoBackupDraft(backupStatus)
@@ -770,14 +828,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       form.setFieldsValue({
         llm_provider: detail.current.provider || detail.current.name,
         llm_base_url: detail.current.baseUrl,
-        llm_api_key: detail.current.apiKey,
+        llm_api_key: '',
         llm_model: detail.current.model,
       })
       if (form.getFieldValue('vision_ocr_use_llm_config')) {
         form.setFieldsValue({
           vision_ocr_provider: detail.current.provider || detail.current.name,
           vision_ocr_base_url: detail.current.baseUrl,
-          vision_ocr_api_key: detail.current.apiKey,
+          vision_ocr_api_key: '',
           vision_ocr_model: detail.current.model,
         })
         setVisionModelOptions(detail.current.model ? [String(detail.current.model)] : [])
@@ -792,8 +850,16 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     try {
       const values = form.getFieldsValue()
       for (const [key, value] of Object.entries(values)) {
+        if (key === 'llm_api_key' || key === 'paddleocr_api_key' || key === 'vision_ocr_api_key') continue
         if (value !== undefined && value !== null) {
           await window.api.setSetting(key, String(value))
+        }
+      }
+      for (const key of ['llm_api_key', 'paddleocr_api_key', 'vision_ocr_api_key'] as const) {
+        const draft = String(values[key] || '')
+        if (draft) {
+          await window.api.saveCredential(key, draft)
+          setCredentialHints((current) => ({ ...current, [key]: `已安全保存（末四位 ${draft.slice(-4)}）` }))
         }
       }
       await window.api.setSetting('auto_ocr_after_import', autoOcr ? 'true' : 'false')
@@ -917,7 +983,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     form.setFieldsValue({
       llm_provider: profile.provider || profile.name,
       llm_base_url: profile.baseUrl,
-      llm_api_key: profile.apiKey,
+      llm_api_key: '',
       llm_model: profile.model,
     })
     setLlmModelOptions(profile.model ? [String(profile.model)] : [])
@@ -939,15 +1005,27 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     form.setFieldsValue({
       vision_ocr_provider: profile.provider || profile.name,
       vision_ocr_base_url: profile.baseUrl,
-      vision_ocr_api_key: profile.apiKey,
+      vision_ocr_api_key: '',
       vision_ocr_model: profile.model,
       vision_ocr_use_llm_config: false,
     })
     setVisionModelOptions(profile.model ? [String(profile.model)] : [])
+    setVisionOcrConnectionTest(profile.connectionTest?.verified ? {
+      signature: createVisionOcrConnectionSignature({
+        selectedId: profile.id,
+        useLlmConfig: false,
+        activeLlmProfileId,
+        baseUrl: profile.baseUrl,
+        model: profile.model,
+        apiKey: '',
+      }),
+      profileId: profile.id,
+      testedAt: profile.connectionTest.testedAt,
+    } : null)
   }
 
   const handleAddVisionOcrProviderDraft = () => {
-    setSelectedOcrProviderId('vision_model')
+    setSelectedOcrProviderId('vision_draft')
     form.setFieldsValue({
       vision_ocr_provider: DEFAULT_VISION_PROVIDER.name,
       vision_ocr_base_url: DEFAULT_VISION_PROVIDER.baseUrl,
@@ -956,6 +1034,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       vision_ocr_use_llm_config: false,
     })
     setVisionModelOptions(DEFAULT_VISION_PROVIDER.models)
+    setVisionOcrConnectionTest(null)
   }
 
   const handleVisionProviderChange = (provider: string) => {
@@ -1004,14 +1083,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     const fallbackPreset = kind === 'vision'
       ? VISION_PROVIDER_PRESETS.find((item) => item.baseUrl === normalizedBaseUrl)
       : AI_PROVIDER_PRESETS.find((item) => item.baseUrl === normalizedBaseUrl)
-    if (!baseUrl || !apiKey) {
+    if (!baseUrl) {
       if (fallbackPreset?.models?.length) setOptions(fallbackPreset.models)
       return
     }
 
     setLoading(true)
     try {
-      const models = await window.api.listModels(baseUrl, apiKey)
+      const models = await window.api.listModels(baseUrl, apiKey, kind === 'vision' ? 'vision_ocr_api_key' : 'llm_api_key')
       const usableModels = kind === 'vision' ? models.filter(isVisionModelCandidate) : models
       const mergedModels = [...new Set([...(fallbackPreset?.models || []), ...usableModels])]
       setOptions(mergedModels)
@@ -1144,7 +1223,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         form.setFieldsValue({
           vision_ocr_provider: result.current?.provider || result.current?.name,
           vision_ocr_base_url: result.current?.baseUrl || '',
-          vision_ocr_api_key: result.current?.apiKey || '',
+          vision_ocr_api_key: '',
           vision_ocr_model: result.current?.model || '',
         })
         setVisionModelOptions(result.current?.model ? [String(result.current.model)] : [])
@@ -1168,14 +1247,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       form.setFieldsValue({
         llm_provider: result.current.provider || result.current.name,
         llm_base_url: result.current.baseUrl,
-        llm_api_key: result.current.apiKey,
+        llm_api_key: '',
         llm_model: result.current.model,
       })
       if (form.getFieldValue('vision_ocr_use_llm_config')) {
         form.setFieldsValue({
           vision_ocr_provider: result.current.provider || result.current.name,
           vision_ocr_base_url: result.current.baseUrl,
-          vision_ocr_api_key: result.current.apiKey,
+          vision_ocr_api_key: '',
           vision_ocr_model: result.current.model,
         })
         setVisionModelOptions(result.current.model ? [String(result.current.model)] : [])
@@ -1208,17 +1287,60 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     const state = await window.api.listVisionOcrProviderProfiles()
     setVisionOcrProfiles(state.profiles || [])
     setActiveVisionOcrProfileId(state.activeId || '')
-    if (!selectedOcrProviderId || selectedOcrProviderId === 'vision_model') setSelectedOcrProviderId(state.activeId || 'vision_model')
+    if (!selectedOcrProviderId || selectedOcrProviderId === 'vision_draft') setSelectedOcrProviderId(state.activeId || 'paddle')
     return state
+  }
+
+  const handleTestVisionOcrConnection = async () => {
+    const values = form.getFieldsValue()
+    const useLlmConfig = values.vision_ocr_use_llm_config === true
+    const provider = String(useLlmConfig ? values.llm_provider : values.vision_ocr_provider || '视觉 OCR').trim()
+    const baseUrl = String(useLlmConfig ? values.llm_base_url : values.vision_ocr_base_url || '').trim()
+    const model = String(useLlmConfig ? values.llm_model : values.vision_ocr_model || '').trim()
+    const apiKey = String(useLlmConfig ? values.llm_api_key : values.vision_ocr_api_key || '')
+    const selectedId = selectedVisionOcrProfile?.id || ''
+    const signature = createVisionOcrConnectionSignature({
+      selectedId: useLlmConfig ? activeLlmProfileId : selectedOcrProviderId,
+      useLlmConfig,
+      activeLlmProfileId,
+      baseUrl,
+      model,
+      apiKey,
+    })
+    setVisionOcrConnectionTesting(true)
+    setVisionOcrConnectionTest(null)
+    try {
+      const result = await window.api.testVisionOcrProviderConnection({
+        id: selectedId,
+        name: provider,
+        provider,
+        baseUrl,
+        model,
+        apiKey,
+        useLlmConfig,
+      })
+      setVisionOcrConnectionTest({ signature, profileId: result.profileId, testedAt: result.testedAt })
+      if (!useLlmConfig && selectedId) {
+        setVisionOcrProfiles((profiles) => profiles.map((profile) => profile.id === selectedId
+          ? { ...profile, connectionTest: { verified: true, testedAt: result.testedAt } }
+          : profile))
+      }
+      message.success(result.message)
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, 'AI OCR 连接测试失败'))
+    } finally {
+      setVisionOcrConnectionTesting(false)
+    }
   }
 
   const handleSaveCurrentVisionOcrProfile = async () => {
     setVisionOcrProfileBusy(true)
     try {
       const values = form.getFieldsValue()
+      if (!visionOcrConnectionVerified) throw new Error('请先测试 AI OCR 连接')
       const providerName = String(values.vision_ocr_provider || values.llm_provider || '视觉 OCR').trim()
       const upserted = await window.api.upsertVisionOcrProviderProfile({
-        id: '',
+        id: selectedVisionOcrProfile?.id || visionOcrConnectionTest?.profileId || '',
         name: providerName,
         provider: providerName,
         baseUrl: String(values.vision_ocr_base_url || '').trim(),
@@ -1239,11 +1361,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       form.setFieldsValue({
         vision_ocr_provider: result.current.provider || result.current.name,
         vision_ocr_base_url: result.current.baseUrl,
-        vision_ocr_api_key: result.current.apiKey,
+        vision_ocr_api_key: '',
         vision_ocr_model: result.current.model,
         vision_ocr_use_llm_config: false,
       })
       setVisionModelOptions(result.current.model ? [String(result.current.model)] : [])
+      setVisionOcrConnectionTest(result.current.connectionTest?.verified ? {
+        signature: createVisionOcrConnectionSignature({
+          selectedId: result.current.id,
+          useLlmConfig: false,
+          activeLlmProfileId,
+          baseUrl: result.current.baseUrl,
+          model: result.current.model,
+          apiKey: '',
+        }),
+        profileId: result.current.id,
+        testedAt: result.current.connectionTest.testedAt,
+      } : null)
       message.success(`已保存并切换视觉 OCR 服务商：${result.current.name}`)
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '保存视觉 OCR 服务商配置失败'))
@@ -1262,11 +1396,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       form.setFieldsValue({
         vision_ocr_provider: result.current.provider || result.current.name,
         vision_ocr_base_url: result.current.baseUrl,
-        vision_ocr_api_key: result.current.apiKey,
+        vision_ocr_api_key: '',
         vision_ocr_model: result.current.model,
         vision_ocr_use_llm_config: false,
       })
       setVisionModelOptions(result.current.model ? [String(result.current.model)] : [])
+      setVisionOcrConnectionTest(result.current.connectionTest?.verified ? {
+        signature: createVisionOcrConnectionSignature({
+          selectedId: result.current.id,
+          useLlmConfig: false,
+          activeLlmProfileId,
+          baseUrl: result.current.baseUrl,
+          model: result.current.model,
+          apiKey: '',
+        }),
+        profileId: result.current.id,
+        testedAt: result.current.connectionTest.testedAt,
+      } : null)
       message.success(`已切换视觉 OCR 服务商：${result.current.name}`)
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '切换视觉 OCR 服务商失败'))
@@ -1289,7 +1435,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       const result = await window.api.deleteVisionOcrProviderProfile(profileId)
       setVisionOcrProfiles(result.profiles || [])
       setActiveVisionOcrProfileId(result.activeId || '')
-      if (selectedOcrProviderId === profileId) setSelectedOcrProviderId(result.activeId || 'vision_model')
+      if (selectedOcrProviderId === profileId) setSelectedOcrProviderId(result.activeId || 'paddle')
+      setVisionOcrConnectionTest(null)
       message.success('已删除视觉 OCR 服务商配置')
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '删除视觉 OCR 服务商配置失败'))
@@ -1341,10 +1488,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     await handleSwitchLlmProfile(selectedAiSavedProfile.id)
   }
 
-  const handleImportBackupFromPath = async (filePath: string) => {
-    const normalizedPath = filePath.trim()
-    if (!normalizedPath) return
-    if (!normalizedPath.toLowerCase().endsWith('.zip')) {
+  const handleImportDroppedBackup = async (file: File) => {
+    if (!file.name.toLowerCase().endsWith('.zip')) {
       message.info('请拖入 GujiSmart 备份压缩包（.zip）')
       return
     }
@@ -1357,7 +1502,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       onOk: async () => {
         setBackupBusy(true)
         try {
-          const result = await window.api.importBackupFromPath(normalizedPath)
+          const result = await window.api.importDroppedBackup(file)
           if (result?.success) {
             message.success(result.safetyBackupPath
               ? `导入完成，软件将自动重启；当前数据安全备份包：${result.safetyBackupPath}`
@@ -1505,21 +1650,17 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const handleAddPdfRepository = async () => {
     setPdfRepositoryBusy(true)
     try {
-      const selected = await window.api.selectPdfRepositoryFolder()
-      if (selected) {
-        await refreshPdfRepositoryStatus()
-        message.success('已添加 PDF 原件仓库')
-      }
+      setPdfRepositoryStatus(await window.api.selectAndAddPdfRepository())
+      message.success('已添加 PDF 原件仓库')
     } finally {
       setPdfRepositoryBusy(false)
     }
   }
 
-  const handleRemovePdfRepository = async (path: string) => {
+  const handleRemovePdfRepository = async (repositoryId: string) => {
     setPdfRepositoryBusy(true)
     try {
-      const paths = (pdfRepositoryStatus?.paths || []).filter((item) => item !== path)
-      setPdfRepositoryStatus(await window.api.setPdfRepositoryPaths(paths))
+      setPdfRepositoryStatus(await window.api.removePdfRepository(repositoryId))
       message.success('已移除仓库目录')
     } finally {
       setPdfRepositoryBusy(false)
@@ -1565,10 +1706,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const currentAiBaseUrl = String(watchedLlmBaseUrl || form.getFieldValue('llm_base_url') || '')
   const currentAiModel = String(watchedLlmModel || form.getFieldValue('llm_model') || '')
   const selectedVisionOcrProfile = visionOcrProfiles.find((profile) => profile.id === selectedOcrProviderId)
-  const selectedOcrIsVision = selectedOcrProviderId === 'vision_model' || !!selectedVisionOcrProfile
+  const selectedOcrIsVision = selectedOcrProviderId === 'vision_draft' || !!selectedVisionOcrProfile
   const currentVisionOcrProviderLabel = String(watchedVisionOcrProvider || form.getFieldValue('vision_ocr_provider') || DEFAULT_VISION_PROVIDER.name)
   const currentVisionOcrBaseUrl = String(watchedVisionOcrBaseUrl || form.getFieldValue('vision_ocr_base_url') || DEFAULT_VISION_PROVIDER.baseUrl)
   const currentVisionOcrModel = String(watchedVisionOcrModel || form.getFieldValue('vision_ocr_model') || DEFAULT_VISION_MODEL)
+  const currentVisionOcrConnectionSignature = createVisionOcrConnectionSignature({
+    selectedId: watchedVisionOcrUseLlmConfig ? activeLlmProfileId : selectedOcrProviderId,
+    useLlmConfig: watchedVisionOcrUseLlmConfig === true,
+    activeLlmProfileId,
+    baseUrl: watchedVisionOcrUseLlmConfig ? String(watchedLlmBaseUrl || '') : currentVisionOcrBaseUrl,
+    model: watchedVisionOcrUseLlmConfig ? String(watchedLlmModel || '') : currentVisionOcrModel,
+    apiKey: watchedVisionOcrUseLlmConfig ? String(watchedLlmApiKey || '') : String(watchedVisionOcrApiKey || ''),
+  })
+  const visionOcrConnectionVerified = visionOcrConnectionTest?.signature === currentVisionOcrConnectionSignature
   const isLocalPaddleDefault = defaultOcrEngine === 'local_paddle'
   const isPaddleCloudDefault = defaultOcrEngine === 'paddle'
   const currentDefaultOcrLabel = defaultOcrEngine === 'local_paddle'
@@ -1715,8 +1865,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         )}
       />
       <div className="settings-form-grid">
-        <Form.Item label="API Token" name="paddleocr_api_key" extra="例如：abc123def456...">
-          <Input.Password prefix={<KeyOutlined />} placeholder="请输入 PaddleOCR API Token" />
+        <Form.Item label="API Token" name="paddleocr_api_key" extra={credentialHints.paddleocr_api_key || '例如：abc123def456...'}>
+          <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.paddleocr_api_key ? '留空将保留已保存 Token' : '请输入 PaddleOCR API Token'} />
         </Form.Item>
         <Form.Item label="PDF 异步 OCR 模型" name="ocr_async_model" extra="默认使用 PaddleOCR-VL-1.6；可拉取官方模型，也可手动输入模型 ID。">
           <AutoComplete options={paddleOcrModelOptions.map((model) => ({ value: model, label: model }))}>
@@ -1755,19 +1905,20 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         </div>
         <Space wrap className="settings-provider-actions">
           <Button loading={visionOcrProfileBusy} onClick={() => void refreshVisionOcrProfiles()}>刷新</Button>
-          <Button type="primary" loading={visionOcrProfileBusy} onClick={() => void handleSaveCurrentVisionOcrProfile()}>保存配置</Button>
+          <Button icon={<LinkOutlined />} loading={visionOcrConnectionTesting} onClick={() => void handleTestVisionOcrConnection()}>测试连接</Button>
+          <Button type="primary" loading={visionOcrProfileBusy} disabled={!visionOcrConnectionVerified || watchedVisionOcrUseLlmConfig === true} onClick={() => void handleSaveCurrentVisionOcrProfile()}>保存配置</Button>
           <Button
-            disabled={visionOcrProfileBusy || (defaultOcrEngine === 'vision_model' && activeOcrProviderId === (selectedVisionOcrProfile?.id || 'vision_model'))}
+            disabled={visionOcrProfileBusy || !selectedVisionOcrProfile?.connectionTest?.verified || !visionOcrConnectionVerified || (defaultOcrEngine === 'vision_model' && activeOcrProviderId === selectedVisionOcrProfile.id)}
             onClick={() => void handleSetSelectedVisionOcrAsDefault()}
           >
             设为默认 OCR
           </Button>
           <Popconfirm
-            title={selectedVisionOcrProfile?.id === activeVisionOcrProfileId ? '当前视觉 OCR 服务商正在使用中，不能删除。' : '删除这个视觉 OCR 服务商配置？'}
-            disabled={!selectedVisionOcrProfile || selectedVisionOcrProfile.id === activeVisionOcrProfileId || visionOcrProfileBusy}
+            title={selectedVisionOcrProfile?.id === activeVisionOcrProfileId ? '删除当前视觉 OCR 配置后，将自动切换到其他配置或飞桨云端 OCR。' : '删除这个视觉 OCR 服务商配置？'}
+            disabled={!selectedVisionOcrProfile || visionOcrProfileBusy}
             onConfirm={() => selectedVisionOcrProfile ? void handleDeleteVisionOcrProfile(selectedVisionOcrProfile.id) : undefined}
           >
-            <Button danger disabled={!selectedVisionOcrProfile || selectedVisionOcrProfile.id === activeVisionOcrProfileId || visionOcrProfileBusy}>删除</Button>
+            <Button danger disabled={!selectedVisionOcrProfile || visionOcrProfileBusy}>删除</Button>
           </Popconfirm>
         </Space>
       </div>
@@ -1785,6 +1936,14 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </Space>
           </Space>
         )}
+      />
+      <Alert
+        type={visionOcrConnectionVerified ? 'success' : 'warning'}
+        showIcon
+        message={visionOcrConnectionVerified ? '连接测试已通过，可以保存和使用此 AI OCR 配置' : '连接尚未测试，或配置已在测试后发生变化'}
+        description={visionOcrConnectionVerified && visionOcrConnectionTest?.testedAt
+          ? `测试时间：${new Date(visionOcrConnectionTest.testedAt).toLocaleString()}`
+          : '请先完成一次真实图片请求测试；修改 Base URL、模型、API Key 或跟随方式后需要重新测试。'}
       />
       <div className="settings-form-grid">
         <Form.Item label="服务商名称" name="vision_ocr_provider">
@@ -1807,8 +1966,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <Form.Item label="API Base URL" name="vision_ocr_base_url" extra="例如：https://ark.cn-beijing.volces.com/api/v3">
           <Input prefix={<ApiOutlined />} placeholder="https://ark.cn-beijing.volces.com/api/v3" />
         </Form.Item>
-        <Form.Item label="API Key" name="vision_ocr_api_key">
-          <Input.Password prefix={<KeyOutlined />} placeholder="请输入视觉模型 API Key" />
+        <Form.Item label="API Key" name="vision_ocr_api_key" extra={credentialHints.vision_ocr_api_key || undefined}>
+          <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.vision_ocr_api_key ? '留空将保留已保存 Key' : '请输入视觉模型 API Key'} />
         </Form.Item>
         <Form.Item label="视觉模型 ID" name="vision_ocr_model" extra="填写服务商控制台中的模型 ID；专属接入点才填写 endpoint ID。">
           <AutoComplete
@@ -1846,7 +2005,6 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   )
 
   const renderOcrEditor = () => {
-    if (selectedOcrProviderId === 'local_paddle') return renderLocalPaddleEditor()
     if (selectedOcrProviderId === 'paddle') return renderPaddleCloudEditor()
     if (selectedOcrIsVision) return renderVisionOcrEditor()
     return renderPaddleCloudEditor()
@@ -1893,8 +2051,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <Form.Item label="API Base URL" name="llm_base_url">
           <Input prefix={<ApiOutlined />} placeholder="https://api.deepseek.com/v1" />
         </Form.Item>
-        <Form.Item label="API Key" name="llm_api_key">
-          <Input.Password prefix={<KeyOutlined />} placeholder="请输入 API Key" />
+        <Form.Item label="API Key" name="llm_api_key" extra={credentialHints.llm_api_key || undefined}>
+          <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.llm_api_key ? '留空将保留已保存 Key' : '请输入 API Key'} />
         </Form.Item>
         <Form.Item label="默认模型" name="llm_model">
           <AutoComplete
@@ -2074,9 +2232,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               </Space>
             </div>
             <Space direction="vertical" style={{ width: '100%' }} size={8}>
-              {(pdfRepositoryStatus?.paths || []).length > 0 ? (pdfRepositoryStatus?.paths || []).map((path) => (
+              {(pdfRepositoryStatus?.repositories || []).length > 0 ? (pdfRepositoryStatus?.repositories || []).map((repository) => (
                 <div
-                  key={path}
+                  key={repository.repositoryId}
                   style={{
                     display: 'grid',
                     gridTemplateColumns: 'minmax(0, 1fr) auto',
@@ -2088,8 +2246,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     background: 'rgba(255,255,255,0.03)',
                   }}
                 >
-                  <Text ellipsis title={path} style={{ color: 'var(--gs-text-secondary)' }}>{path}</Text>
-                  <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => void handleRemovePdfRepository(path)} />
+                  <Text ellipsis title={repository.displayPath} style={{ color: 'var(--gs-text-secondary)' }}>{repository.displayPath}</Text>
+                  <Button size="small" type="text" danger icon={<DeleteOutlined />} onClick={() => void handleRemovePdfRepository(repository.repositoryId)} />
                 </div>
               )) : (
                 <Text type="secondary">尚未添加 PDF 原件仓库目录。</Text>
@@ -2309,6 +2467,15 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
 
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 220px', gap: 16, alignItems: 'start' }}>
               <div>
+                {(backupStatus?.legacyCredentialRiskCount || 0) > 0 ? (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    style={{ marginBottom: 12 }}
+                    message={`发现 ${backupStatus?.legacyCredentialRiskCount || 0} 个旧格式自动备份`}
+                    description="这些备份生成时尚未记录凭据排除证明。软件不会自动删除它们；请先生成新版备份并确认可恢复，再自行处理旧备份。"
+                  />
+                ) : null}
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 12 }}>
                   <div>
                     <Text strong style={{ color: 'var(--gs-text-primary)' }}>定时自动备份</Text>
@@ -2437,14 +2604,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     event.preventDefault()
                     event.stopPropagation()
                     setBackupDropActive(false)
-                    const filePath = Array.from(event.dataTransfer.files)
-                      .map((file) => window.api.getPathForFile(file))
-                      .find((path) => path?.toLowerCase().endsWith('.zip'))
-                    if (!filePath) {
+                    const file = Array.from(event.dataTransfer.files)
+                      .find((item) => item.name.toLowerCase().endsWith('.zip'))
+                    if (!file) {
                       message.info('请拖入 GujiSmart 备份压缩包（.zip）')
                       return
                     }
-                    void handleImportBackupFromPath(filePath)
+                    void handleImportDroppedBackup(file)
                   }}
                 >
                   <ImportOutlined />
@@ -2501,12 +2667,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 <PlusOutlined /> 添加 AI OCR
               </button>
               {[
-                { id: 'local_paddle', label: '本地 PaddleOCR', desc: localPaddleStatus?.installed ? '已安装' : localPaddleStatus?.state === 'partial' ? '部分就绪' : '未安装', engine: 'local_paddle' as OcrEngine },
                 { id: 'paddle', label: '飞桨云端 OCR', desc: 'PaddleOCR 文档解析', engine: 'paddle' as OcrEngine },
-                { id: 'vision_model', label: 'AI OCR 配置', desc: currentVisionOcrModel || '视觉模型 OCR', engine: 'vision_model' as OcrEngine },
-                ...visionOcrProfiles.map((profile) => ({ id: profile.id, label: profile.name, desc: profile.model || 'AI OCR', engine: 'vision_model' as OcrEngine, profile })),
+                ...(selectedOcrProviderId === 'vision_draft'
+                  ? [{ id: 'vision_draft', label: '新建 AI OCR', desc: '未保存', engine: 'vision_model' as OcrEngine }]
+                  : []),
+                ...visionOcrProfiles.map((profile) => ({
+                  id: profile.id,
+                  label: profile.name,
+                  desc: `${profile.model || 'AI OCR'} · ${profile.connectionTest?.verified ? '已测试' : '未测试'}`,
+                  engine: 'vision_model' as OcrEngine,
+                  profile,
+                })),
               ].map((provider) => {
-                const fixedProviderId = provider.id === 'local_paddle' || provider.id === 'paddle'
+                const fixedProviderId = provider.id === 'paddle'
                 const isDefaultProvider = activeOcrProviderId === provider.id || (fixedProviderId && defaultOcrEngine === provider.engine)
                 return (
                   <button
@@ -2553,8 +2726,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 </Space>
               )}
             />
-            <Form.Item label="API Token" name="paddleocr_api_key" extra="例如：abc123def456...">
-              <Input.Password prefix={<KeyOutlined />} placeholder="请输入 PaddleOCR API Token" />
+            <Form.Item label="API Token" name="paddleocr_api_key" extra={credentialHints.paddleocr_api_key || '例如：abc123def456...'}>
+              <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.paddleocr_api_key ? '留空将保留已保存 Token' : '请输入 PaddleOCR API Token'} />
             </Form.Item>
             <Form.Item label="PDF 异步 OCR 模型" name="ocr_async_model" extra="默认使用 PaddleOCR-VL-1.6；点击拉取会从官方文档解析当前可用模型，也可手动输入官方模型 ID。">
               <AutoComplete
@@ -2652,8 +2825,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <Form.Item name="vision_ocr_provider" hidden>
               <Input />
             </Form.Item>
-            <Form.Item label="API Key" name="vision_ocr_api_key">
-              <Input.Password prefix={<KeyOutlined />} placeholder="请输入视觉模型 API Key" />
+            <Form.Item label="API Key" name="vision_ocr_api_key" extra={credentialHints.vision_ocr_api_key || undefined}>
+              <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.vision_ocr_api_key ? '留空将保留已保存 Key' : '请输入视觉模型 API Key'} />
             </Form.Item>
             <Form.Item label="视觉模型 ID" name="vision_ocr_model" extra="填写服务商控制台中的模型 ID；只有专属接入点才填写 endpoint ID。">
               <AutoComplete
@@ -2691,7 +2864,10 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     <Button size="small" loading={visionOcrProfileBusy} onClick={() => void refreshVisionOcrProfiles()}>
                       刷新
                     </Button>
-                    <Button size="small" type="primary" loading={visionOcrProfileBusy} onClick={() => void handleSaveCurrentVisionOcrProfile()}>
+                    <Button size="small" icon={<LinkOutlined />} loading={visionOcrConnectionTesting} onClick={() => void handleTestVisionOcrConnection()}>
+                      测试连接
+                    </Button>
+                    <Button size="small" type="primary" loading={visionOcrProfileBusy} disabled={!visionOcrConnectionVerified || watchedVisionOcrUseLlmConfig === true} onClick={() => void handleSaveCurrentVisionOcrProfile()}>
                       保存当前为视觉服务商
                     </Button>
                   </Space>
@@ -2705,11 +2881,11 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     return (
                       <List.Item
                         actions={[
-                          <Button key="switch" size="small" type={active ? 'primary' : 'default'} disabled={active || visionOcrProfileBusy} onClick={() => void handleSwitchVisionOcrProfile(profile.id)}>
+                          <Button key="switch" size="small" type={active ? 'primary' : 'default'} disabled={active || visionOcrProfileBusy || !profile.connectionTest?.verified} onClick={() => void handleSwitchVisionOcrProfile(profile.id)}>
                             {active ? '使用中' : '切换'}
                           </Button>,
-                          <Popconfirm key="delete" title="删除这个视觉 OCR 服务商配置？" disabled={active} onConfirm={() => void handleDeleteVisionOcrProfile(profile.id)}>
-                            <Button size="small" danger disabled={active || visionOcrProfileBusy}>删除</Button>
+                          <Popconfirm key="delete" title={active ? '删除当前视觉 OCR 配置后，将自动切换到其他配置或飞桨云端 OCR。' : '删除这个视觉 OCR 服务商配置？'} onConfirm={() => void handleDeleteVisionOcrProfile(profile.id)}>
+                            <Button size="small" danger disabled={visionOcrProfileBusy}>删除</Button>
                           </Popconfirm>,
                         ]}
                       >
@@ -2718,6 +2894,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                             <Space wrap>
                               <Text style={{ color: 'var(--gs-text-primary)' }}>{profile.name}</Text>
                               {active ? <Tag color="gold">当前</Tag> : null}
+                              <Tag color={profile.connectionTest?.verified ? 'green' : 'default'}>{profile.connectionTest?.verified ? '已测试' : '未测试'}</Tag>
                             </Space>
                           )}
                           description={(
@@ -2803,8 +2980,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <Form.Item label="API Base URL" name="llm_base_url">
               <Input prefix={<ApiOutlined />} placeholder="https://api.deepseek.com/v1" />
             </Form.Item>
-            <Form.Item label="API Key" name="llm_api_key">
-              <Input.Password prefix={<KeyOutlined />} placeholder="请输入 API Key" />
+            <Form.Item label="API Key" name="llm_api_key" extra={credentialHints.llm_api_key || undefined}>
+              <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.llm_api_key ? '留空将保留已保存 Key' : '请输入 API Key'} />
             </Form.Item>
             <Form.Item label="默认模型" name="llm_model">
               <AutoComplete

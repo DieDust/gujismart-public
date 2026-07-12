@@ -6,7 +6,8 @@ import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } 
 import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate } from './page-payload-store'
 import { getErrorMessage } from '../shared/errors'
 import { markSearchIndexStaleForPages, notifySearchContentChanged } from './semantic-search'
-import { DEFAULT_TRANSLATION_STYLE, buildTranslationCacheKey } from '../shared/translation-cache'
+import { resolveCanonicalPageContent } from './canonical-content'
+import { DEFAULT_TRANSLATION_STYLE, TRANSLATION_CACHE_VERSION, buildTranslationCacheKey } from '../shared/translation-cache'
 import { projectParallelTranslationBySourceCoverage } from '../shared/parallel-translation'
 import {
   buildTranslationUnitDrafts,
@@ -18,6 +19,15 @@ import {
   parseTranslationUnitOutput,
   restoreTranslationText,
 } from '../shared/translation-units'
+import {
+  beginTranslationAttempt,
+  commitMachineTranslationAttempt,
+  commitManualTranslationRevision,
+  createTranslationContextSnapshot,
+  ensureActiveTranslationRevision,
+  failTranslationAttempt,
+  getActiveTranslationRevision,
+} from './translation-revisions'
 import type {
   Document,
   DocumentPage,
@@ -25,6 +35,7 @@ import type {
   PageTranslationProgressEvent,
   PageTranslationResult,
   TranslationMode,
+  TranslationContextSnapshot,
   TranslationStyle,
   TranslationUnitUpdatePayload,
   TranslationUnitV1,
@@ -115,7 +126,15 @@ function makeModelSignature(): string {
   ].map((part) => part.trim()).filter(Boolean).join('|') || 'default'
 }
 
+function getTranslationProviderIdentity(): { providerId: string; model: string } {
+  return {
+    providerId: getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider', 'AI'),
+    model: getSettingValue('llm_model', 'default'),
+  }
+}
+
 function rowToUnit(row: TranslationUnitRow): TranslationUnitV1 {
+  const activeRevision = getActiveTranslationRevision(row.unit_id) || ensureActiveTranslationRevision(row.unit_id)
   return {
     id: row.unit_id,
     docId: row.doc_id,
@@ -143,6 +162,8 @@ function rowToUnit(row: TranslationUnitRow): TranslationUnitV1 {
     sourceIndex: row.source_index,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    currentRevisionId: activeRevision?.id || null,
+    revision: activeRevision?.revision || null,
   }
 }
 
@@ -154,7 +175,14 @@ function getPage(pageId: string): DocumentPage {
     [pageId],
   )
   if (!raw) throw new Error('页面不存在')
-  return hydratePagePayloadRow(raw)
+  const hydrated = hydratePagePayloadRow(raw)
+  const canonical = resolveCanonicalPageContent(pageId)
+  return {
+    ...hydrated,
+    proofed_text: canonical.source === 'human-proof' ? canonical.text : null,
+    ocr_text: canonical.text,
+    canonical_content: canonical,
+  }
 }
 
 function getStoredRows(pageId: string): TranslationUnitRow[] {
@@ -429,44 +457,90 @@ async function translateBatch(
   return { translations, invalidIds }
 }
 
+function getOrCreateUnitTranslationContext(
+  page: DocumentPage,
+  unit: TranslationUnitV1,
+  request: PageTranslationRequest,
+  mode: TranslationMode,
+  glossarySignature: string,
+  documentTitle: string,
+  review: boolean,
+): TranslationContextSnapshot {
+  const canonical = resolveCanonicalPageContent(page.id)
+  const contentVersion = canonical.artifactId || canonical.baseArtifactId || `${canonical.source}:${canonical.sourceHash}`
+  const provider = getTranslationProviderIdentity()
+  const modelSignature = makeModelSignature()
+  return createTranslationContextSnapshot({
+    unitId: unit.id,
+    contentVersion,
+    canonicalSourceHash: canonical.sourceHash,
+    sourceLocator: {
+      schemaVersion: 'stable-reader-locator/v2',
+      precision: 'block',
+      documentId: page.doc_id,
+      sourcePageId: page.id,
+      pageNum: Number(page.page_num || 0),
+      blockId: unit.blockId,
+      contentVersion,
+      sourceHash: canonical.sourceHash,
+      sourceKind: canonical.source,
+      verificationStatus: 'verified',
+    },
+    mode,
+    style: request.style || DEFAULT_TRANSLATION_STYLE,
+    providerId: provider.providerId,
+    model: provider.model,
+    modelSignature,
+    parameters: {
+      review,
+      documentTitle,
+      pageContextBefore: mode === 'fast' ? '' : request.pageContextBefore || '',
+      pageContextAfter: mode === 'fast' ? '' : request.pageContextAfter || '',
+    },
+    glossaryVersion: glossarySignature || 'none',
+    promptVersion: 'translation-prompt/v1',
+    protectorVersion: 'translation-protector/v1',
+    normalizerVersion: TRANSLATION_CACHE_VERSION,
+  })
+}
+
+function beginTranslationBatchAttempts(
+  taskId: string,
+  page: DocumentPage,
+  units: TranslationUnitV1[],
+  request: PageTranslationRequest,
+  mode: TranslationMode,
+  glossarySignature: string,
+  documentTitle: string,
+  review: boolean,
+): Map<string, string> {
+  const attempts = new Map<string, string>()
+  for (const unit of units) {
+    const context = getOrCreateUnitTranslationContext(page, unit, request, mode, glossarySignature, documentTitle, review)
+    const attempt = beginTranslationAttempt({ taskId, unitId: unit.id, contextSnapshotId: context.id })
+    attempts.set(unit.id, attempt.id)
+  }
+  return attempts
+}
+
 function saveTranslatedUnits(
   pageId: string,
   units: TranslationUnitV1[],
   translations: Map<string, string>,
   invalidIds: Set<string>,
-  mode: TranslationMode,
-  modelSignature: string,
-  glossarySignature: string,
+  attemptIds: Map<string, string>,
   quality: Record<string, unknown>,
 ): void {
-  const now = new Date().toISOString()
-  transaction(() => {
-    for (const unit of units) {
-      if (unit.manualOverride) continue
-      const translation = translations.get(unit.id)
-      run(
-        `UPDATE page_translation_units
-         SET translation_text = CASE WHEN ? <> '' THEN ? ELSE translation_text END,
-             mode = ?, model_signature = ?, glossary_signature = ?,
-             status = ?, stale = ?, quality_json = ?, updated_at = ?
-         WHERE page_id = ? AND unit_id = ? AND target_language = 'zh-CN'`,
-        [
-          translation || '',
-          translation || '',
-          mode,
-          modelSignature,
-          glossarySignature,
-          invalidIds.has(unit.id) ? 'error' : translation ? 'ready' : unit.status,
-          invalidIds.has(unit.id) ? 1 : 0,
-          JSON.stringify(quality),
-          now,
-          pageId,
-          unit.id,
-        ],
-      )
+  for (const unit of units) {
+    const attemptId = attemptIds.get(unit.id)
+    if (!attemptId) continue
+    const translation = translations.get(unit.id)
+    if (invalidIds.has(unit.id) || !translation) {
+      failTranslationAttempt(attemptId, invalidIds.has(unit.id) ? 'translation_quality_invalid' : 'translation_result_missing')
+      continue
     }
-  })
-  scheduleDatabaseSave()
+    commitMachineTranslationAttempt({ attemptId, translationText: translation, quality })
+  }
   markSearchIndexStaleForPages([pageId])
   notifySearchContentChanged()
 }
@@ -560,17 +634,43 @@ export async function translatePageUnits(request: PageTranslationRequest): Promi
   const glossarySignature = getTranslationGlossaryVersionSignature(request.glossaryProjectId)
   const glossary = getActiveTranslationGlossary({
     projectId: request.glossaryProjectId,
-    text: String(page.proofed_text || page.ocr_text || ''),
+    text: page.canonical_content?.text || '',
   })
   let units = ensurePageTranslationUnits(request.pageId)
   const requestedIds = new Set((request.unitIds || []).map(String))
-  const targetUnits = units.filter((unit) => (
+  const eligibleUnits = units.filter((unit) => (
     !unit.skipped
     && !unit.manualOverride
     && (requestedIds.size === 0 || requestedIds.has(unit.id))
-    && (request.force || unit.status !== 'ready' || unit.stale || !unit.translationText)
   ))
+  const desiredContextIds = new Map(eligibleUnits.map((unit) => [
+    unit.id,
+    getOrCreateUnitTranslationContext(
+      page,
+      unit,
+      request,
+      mode,
+      glossary.signature || glossarySignature,
+      doc?.title || request.documentTitle || '',
+      mode === 'quality',
+    ).id,
+  ]))
+  const targetUnits = eligibleUnits.filter((unit) => {
+    const activeRevision = getActiveTranslationRevision(unit.id)
+    return request.force || unit.status !== 'ready' || unit.stale || !unit.translationText
+      || !activeRevision || activeRevision.context_snapshot_id !== desiredContextIds.get(unit.id)
+  })
   if (targetUnits.length === 0) return buildPageResult(taskId, request, mode, units)
+  const allAttemptIds = beginTranslationBatchAttempts(
+    taskId,
+    page,
+    targetUnits,
+    request,
+    mode,
+    glossary.signature || glossarySignature,
+    doc?.title || request.documentTitle || '',
+    false,
+  )
 
   const now = new Date().toISOString()
   transaction(() => {
@@ -618,9 +718,7 @@ export async function translatePageUnits(request: PageTranslationRequest): Promi
         batch,
         translations,
         new Set(invalidIds),
-        mode,
-        modelSignature,
-        glossary.signature || glossarySignature,
+        allAttemptIds,
         {
           batchIndex,
           batchCount: batches.length,
@@ -649,6 +747,17 @@ export async function translatePageUnits(request: PageTranslationRequest): Promi
       const reviewTargets = units.filter((unit) => !unit.skipped && !unit.manualOverride && unit.translationText && unit.status === 'ready')
       for (const batch of chunkTranslationUnits(reviewTargets)) {
         throwIfTranslationCanceled(taskId)
+        const reviewAttemptIds = beginTranslationBatchAttempts(
+          taskId,
+          page,
+          batch,
+          request,
+          mode,
+          glossary.signature || glossarySignature,
+          doc?.title || request.documentTitle || '',
+          true,
+        )
+        reviewAttemptIds.forEach((attemptId, unitId) => allAttemptIds.set(unitId, attemptId))
         const review = await translateBatch(
           batch,
           request,
@@ -663,29 +772,17 @@ export async function translatePageUnits(request: PageTranslationRequest): Promi
           batch,
           review.translations,
           new Set(review.invalidIds),
-          mode,
-          modelSignature,
-          glossary.signature || glossarySignature,
+          reviewAttemptIds,
           { reviewed: true },
         )
       }
       units = ensurePageTranslationUnits(request.pageId)
     }
   } catch (error) {
-    const now = new Date().toISOString()
     const errorMessage = getErrorMessage(error, '页面翻译失败')
-    transaction(() => {
-      targetUnits.forEach((unit) => {
-        run(
-          `UPDATE page_translation_units
-           SET status = 'error', stale = CASE WHEN TRIM(COALESCE(translation_text, '')) <> '' THEN 1 ELSE stale END,
-               quality_json = ?, updated_at = ?
-           WHERE page_id = ? AND unit_id = ? AND manual_override = 0`,
-          [JSON.stringify({ error: errorMessage }), now, request.pageId, unit.id],
-        )
-      })
+    allAttemptIds.forEach((attemptId) => {
+      failTranslationAttempt(attemptId, errorMessage.slice(0, 200) || 'translation_failed')
     })
-    scheduleDatabaseSave()
     throw error
   } finally {
     canceledTranslationTaskIds.delete(taskId)
@@ -710,21 +807,13 @@ export function updateTranslationUnit(unitId: string, payload: TranslationUnitUp
   )
   if (!row) return null
   const translationText = String(payload.translationText || '').trim()
-  run(
-    `UPDATE page_translation_units
-     SET translation_text = ?, manual_override = ?, stale = 0,
-         status = ?, quality_json = ?, updated_at = ?
-     WHERE unit_id = ? AND target_language = 'zh-CN'`,
-    [
-      translationText,
-      payload.manualOverride === false ? 0 : 1,
-      translationText ? 'ready' : 'pending',
-      JSON.stringify({ manuallyEdited: payload.manualOverride !== false }),
-      new Date().toISOString(),
-      unitId,
-    ],
-  )
-  scheduleDatabaseSave()
+  if (!translationText) throw new Error('translation_text_required')
+  commitManualTranslationRevision({
+    unitId,
+    translationText,
+    expectedRevisionId: payload.expectedRevisionId,
+    manualOverride: payload.manualOverride,
+  })
   markSearchIndexStaleForPages([row.page_id])
   notifySearchContentChanged()
   return rowToUnit(queryOne<TranslationUnitRow>(

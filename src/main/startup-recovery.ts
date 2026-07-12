@@ -9,6 +9,7 @@ import { batchProcessor, type BatchQueueResumeSummary } from './batch-processor'
 import { getPdfPageCountFast } from './pdf-info'
 import { isSearchIndexReindexQueuedInMemory, isSearchIndexUsableForDocument, markSearchIndexStaleForDocuments } from './semantic-search'
 import { emitBackgroundTaskStatus } from './background-tasks'
+import { inspectManagedDeleteTarget } from './managed-path-boundary'
 import { nanoid } from 'nanoid'
 
 export interface StartupRecoverySummary {
@@ -561,10 +562,21 @@ async function removeOrphanStorageDirs(): Promise<number> {
   const entries = await readdir(storageRoot, { withFileTypes: true })
   let removed = 0
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+    if ((!entry.isDirectory() && !entry.isSymbolicLink()) || entry.name.startsWith('.')) continue
     if (RESERVED_STORAGE_DIR_NAMES.has(entry.name)) continue
     if (knownDocIds.has(entry.name)) continue
-    await rm(join(storageRoot, entry.name), { recursive: true, force: true })
+    const targetPath = join(storageRoot, entry.name)
+    const decision = inspectManagedDeleteTarget({
+      dataDir: getDataDir(),
+      docId: entry.name,
+      targetPath,
+      kind: 'document-root',
+    })
+    if (!decision.allowed || !decision.canonicalTarget) {
+      console.warn(`[Startup Recovery] Skipped unsafe orphan cleanup for ${entry.name}: ${decision.reason || 'unknown-reason'}`)
+      continue
+    }
+    await rm(decision.canonicalTarget, { recursive: true, force: true })
     removed += 1
     if (removed % ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL === 0) {
       await yieldToEventLoop()

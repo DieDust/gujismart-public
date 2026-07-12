@@ -1,15 +1,21 @@
 import { BrowserWindow } from 'electron'
 import type { BackgroundTaskProgressEvent } from '../shared/types'
+import { taskStateFromLegacyBackgroundEvent } from '../shared/task-contract'
 
 const BACKGROUND_TASK_STATUS_MIN_INTERVAL_MS = 1000
+type BackgroundTaskInput = Omit<BackgroundTaskProgressEvent, 'updatedAt' | 'taskState'> & { updatedAt?: string }
 const throttledTaskTimers = new Map<string, ReturnType<typeof setTimeout>>()
-const throttledTaskPayloads = new Map<string, Omit<BackgroundTaskProgressEvent, 'updatedAt'> & { updatedAt?: string }>()
+const throttledTaskPayloads = new Map<string, BackgroundTaskInput>()
 const lastTaskStatusEmittedAt = new Map<string, number>()
 
-function sendBackgroundTaskStatus(payload: Omit<BackgroundTaskProgressEvent, 'updatedAt'> & { updatedAt?: string }): void {
+function sendBackgroundTaskStatus(payload: BackgroundTaskInput): void {
   const event: BackgroundTaskProgressEvent = {
     ...payload,
     updatedAt: payload.updatedAt || new Date().toISOString(),
+    taskState: taskStateFromLegacyBackgroundEvent({
+      ...payload,
+      updatedAt: payload.updatedAt || new Date().toISOString(),
+    }),
   }
 
   if (!BrowserWindow || typeof BrowserWindow.getAllWindows !== 'function') return
@@ -20,7 +26,7 @@ function sendBackgroundTaskStatus(payload: Omit<BackgroundTaskProgressEvent, 'up
   }
 }
 
-export function emitBackgroundTaskStatus(payload: Omit<BackgroundTaskProgressEvent, 'updatedAt'> & { updatedAt?: string }): void {
+export function emitBackgroundTaskStatus(payload: BackgroundTaskInput): void {
   const taskId = String(payload.taskId || '')
   const shouldThrottle = taskId && (payload.status === 'queued' || payload.status === 'processing')
   if (!shouldThrottle) {

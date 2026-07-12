@@ -1,0 +1,15 @@
+{
+  "id": "synthetic-modern-001",
+  "docType": "journal",
+  "title": "A Reproducible Study of Synthetic Reading Workflows",
+  "authors": ["Lin Test", "Qiao Example"],
+  "year": 2026,
+  "journal": "Journal of Reproducible Fixtures",
+  "doi": "10.0000/gujismart.synthetic.001",
+  "abstract": "This fictional paper evaluates a deterministic local reading workflow using generated records only.",
+  "sections": [
+    { "heading": "Methods", "text": "A fixed seed produced all records and no external corpus was used." },
+    { "heading": "Results", "text": "Search, citation, translation, and export identities remained stable across repeated runs." }
+  ],
+  "table": { "headers": ["Workflow", "Pass rate"], "rows": [["Ancient text", "100%"], ["Modern paper", "100%"]] }
+}

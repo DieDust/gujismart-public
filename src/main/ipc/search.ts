@@ -3,6 +3,14 @@ import { writeFileSync } from 'fs'
 import { nanoid } from 'nanoid'
 import { queryOne, run, saveDatabase } from '../database'
 import { createHash } from 'crypto'
+import { resolveCanonicalPageContent } from '../canonical-content'
+import { validateSearchSnapshot } from '../search-snapshots'
+import { resolveSearchEvidence } from '../search-evidence-resolver'
+import {
+  listResearchAggregateRelations,
+  promoteSearchSnapshotAggregate,
+  validateResearchAggregateArtifact,
+} from '../research-aggregates'
 import {
   aiPlannedSearch,
   deleteSavedSearch,
@@ -21,6 +29,7 @@ import {
 } from '../semantic-search'
 import type {
   AiPlannedSearchResponse,
+  CursorPage,
   SaveSearchExcerptsOptions,
   SaveSearchExcerptsResult,
   SavedSearch,
@@ -41,6 +50,11 @@ import type {
   SearchReindexDocumentResult,
   SearchResult,
   SearchSessionState,
+  SearchSnapshotValidationResult,
+  ResolvedSearchEvidence,
+  ResearchAggregateArtifact,
+  ResearchAggregateRelation,
+  StableReaderLocator,
 } from '../../shared/types'
 import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
 import { buildCitation, buildCitationByStyle, mapDocTypeToCitationFormat } from './citation'
@@ -113,6 +127,7 @@ interface SearchExportRecord {
   hitCount: number
   citation: string
   locator: SearchHit['locator']
+  stableLocator?: SearchHit['stableLocator']
   searchKeyword: string
   exportedAt: string
   sourceType: HitSourceResolution['sourceType']
@@ -278,15 +293,15 @@ function loadHitSegment(hit: SearchHit): SearchIndexSegmentRow | null {
 function loadHitPageText(hit: SearchHit): string {
   const pageNum = hit.locator.pageNum
   if (!pageNum) return ''
-  const row = queryOne<{ proofed_text?: string | null; ocr_text?: string | null }>(
-    `SELECT proofed_text, ocr_text
+  const row = queryOne<{ id: string }>(
+    `SELECT id
      FROM pages
      WHERE doc_id = ? AND page_num = ?
      ORDER BY page_num ASC
      LIMIT 1`,
     [hit.locator.docId, pageNum],
   )
-  return row?.proofed_text || row?.ocr_text || ''
+  return row?.id ? resolveCanonicalPageContent(row.id).text : ''
 }
 
 function findNthOccurrence(text: string, term: string, occurrenceIndex: number): number {
@@ -604,6 +619,7 @@ function buildExportRecords(
         hitCount: paragraph.hitCount,
         citation: formatHitCitation(group, hit, options),
         locator: hit.locator,
+        stableLocator: hit.stableLocator,
         searchKeyword: keyword,
         exportedAt,
         sourceType: paragraph.sourceType,
@@ -1014,6 +1030,7 @@ function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExcerptsO
     const sourceId = JSON.stringify({
       sourceType: 'search',
       locator: record.locator,
+      stableLocator: record.stableLocator || null,
       citation: record.citation,
       searchKeyword: query,
       matchedQuery: record.hitTerms[0] || record.locator.queryTerm || query,
@@ -1051,7 +1068,7 @@ function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExcerptsO
         'search',
         sourceId,
         'quote',
-        JSON.stringify(record.locator),
+        JSON.stringify(record.stableLocator || record.locator),
         record.citation,
         paragraphHash,
         now,
@@ -1080,6 +1097,35 @@ export function registerSearchIpc(): void {
   ipcMain.handle('search:queryV2', async (_event, keyword: string, options?: SearchOptions): Promise<SearchGroupedResponse> => {
     return querySearchV2(keyword, options)
   })
+
+  ipcMain.handle('search:validateSnapshot', async (_event, snapshotId: string, criteriaKey?: string): Promise<SearchSnapshotValidationResult> => {
+    return validateSearchSnapshot(snapshotId, { criteriaKey })
+  })
+
+  ipcMain.handle('search:resolveEvidence', async (_event, locator: StableReaderLocator): Promise<ResolvedSearchEvidence> => {
+    return resolveSearchEvidence(locator)
+  })
+
+  ipcMain.handle('search:promoteAggregate', async (
+    _event,
+    snapshotId: string,
+    projectId: string,
+    options?: { relationKind?: string; label?: string },
+  ): Promise<{ artifact: ResearchAggregateArtifact; relation: ResearchAggregateRelation }> => (
+    promoteSearchSnapshotAggregate({ snapshotId, projectId, ...options })
+  ))
+
+  ipcMain.handle('search:validateAggregate', async (_event, artifactId: string) => (
+    validateResearchAggregateArtifact(artifactId)
+  ))
+
+  ipcMain.handle('search:listAggregateRelations', async (
+    _event,
+    projectId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<CursorPage<ResearchAggregateRelation & { artifact: ResearchAggregateArtifact }>> => (
+    listResearchAggregateRelations(projectId, options)
+  ))
 
   ipcMain.handle('search:exportExcerpts', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportResult> => {
     return exportSearchExcerpts(keyword, options)

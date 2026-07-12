@@ -2,6 +2,7 @@ import { BrowserWindow } from 'electron'
 import { reclassifyAndApplyDocument } from './ai'
 import { queryAll, queryOne, run, saveDatabase } from './database'
 import type { MetadataReclassificationProgressEvent } from '../shared/types'
+import { readProtectedSetting } from './settings-security'
 
 const RECLASSIFY_VERSION = '0.6-history-doc-type-ai-reclassify-2026-05-19'
 const LEGACY_DOC_TYPE_NAMES = ['论文', '期刊', '学术论文', '图书', '书籍', '古籍']
@@ -25,8 +26,7 @@ function emitReclassificationProgress(payload: MetadataReclassificationProgressE
 }
 
 function hasLlmConfig(): boolean {
-  const row = queryOne<{ value: string | null }>("SELECT value FROM settings WHERE key = 'llm_api_key'")
-  return !!row?.value
+  return Boolean(readProtectedSetting('llm_api_key'))
 }
 
 function hasCompletedReclassification(): boolean {

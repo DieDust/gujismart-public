@@ -18,6 +18,7 @@ import type {
   SearchHitLocator,
   SearchResult,
 } from '../shared/types'
+import { stableLocatorFromLegacySearchLocator } from '../shared/stable-reader-locator'
 
 export const HIGH_FREQUENCY_HIT_THRESHOLD = 500
 export const HIGH_FREQUENCY_DOC_THRESHOLD = 80
@@ -757,6 +758,7 @@ function rowToEvidenceItem(row: SampleRow, stat: AiResearchQueryStat, index: num
       cooccurringTerms: stat.facets.cooccurringTerms.slice(0, 8).map((bucket) => bucket.label),
     },
     locator,
+    stableLocator: stableLocatorFromLegacySearchLocator(locator),
   }
 }
 
@@ -919,5 +921,6 @@ export function evidenceItemToSearchResult(item: AiResearchEvidenceItem): Search
     hit_field: 'fulltext',
     matched_query: item.matched_query,
     locator: item.locator,
+    stableLocator: item.stableLocator,
   }
 }

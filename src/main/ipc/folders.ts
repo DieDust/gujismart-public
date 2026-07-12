@@ -21,7 +21,9 @@ import type {
 } from '../../shared/types'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { buildCumulativeFolderDocumentCounts, resolveFolderAndDescendantIds } from '../folder-scope'
-import { allowFileAccessPaths } from '../file-access'
+import { allowManagedFileAccessPaths } from '../file-access'
+import { importSelectionService } from '../import-selections'
+import { scanCanonicalExternalFolder } from '../external-folder-boundary'
 
 const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
   '.pdf',
@@ -51,6 +53,12 @@ function normalizeFolderName(value: unknown): string {
 function normalizeParentId(value: unknown): string | null {
   const parentId = String(value || '').trim()
   return parentId || null
+}
+
+export function rejectProtectedExternalPathFields(value: unknown): void {
+  if (value && typeof value === 'object' && 'external_path' in value) {
+    throw new Error('external_path 只能由主进程中的已授权目录写入')
+  }
 }
 
 function folderParentWhere(parentId: string | null): { sql: string; params: unknown[] } {
@@ -86,10 +94,6 @@ function findFolderByNameInParent(name: string, parentId: string | null, exclude
 function updateExistingFolderMetadata(folder: Folder, data: FolderCreatePayload | FolderUpdatePayload, now: string): Folder | null {
   const sets: string[] = []
   const params: unknown[] = []
-  if (!folder.external_path && data.external_path) {
-    sets.push('external_path = ?')
-    params.push(data.external_path)
-  }
   if (!folder.icon && data.icon) {
     sets.push('icon = ?')
     params.push(data.icon)
@@ -134,9 +138,9 @@ function mergeFolderContentsInto(sourceId: string, targetId: string, data: Folde
 
   const sets: string[] = ['updated_at = ?']
   const params: unknown[] = [now]
-  if (!target.external_path && (data.external_path || source.external_path)) {
+  if (!target.external_path && source.external_path) {
     sets.push('external_path = ?')
-    params.push(data.external_path || source.external_path)
+    params.push(source.external_path)
   }
   if (!target.icon && (data.icon || source.icon)) {
     sets.push('icon = ?')
@@ -170,17 +174,21 @@ function getFolderChildrenMap(folders: Array<Pick<Folder, 'id' | 'parent_id'>>):
   return childrenByParent
 }
 
-function assertFolderMoveAllowed(folderId: string, nextParentId: string | null): Folder {
-  const current = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
-  if (!current) throw new Error('文件夹不存在')
-
-  if (nextParentId) {
-    if (nextParentId === folderId) throw new Error('不能把文件夹移动到自己里面')
-    const parent = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [nextParentId])
-    if (!parent) throw new Error('目标文件夹不存在')
+function assertFolderParentAllowed(folderId: string | null, nextParentId: string | null): void {
+  if (!nextParentId) return
+  if (folderId && nextParentId === folderId) throw new Error('不能把文件夹移动到自己里面')
+  const parent = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [nextParentId])
+  if (!parent) throw new Error('目标文件夹不存在')
+  if (folderId) {
     const descendants = new Set(resolveFolderAndDescendantIds([folderId]))
     if (descendants.has(nextParentId)) throw new Error('不能把文件夹移动到自己的子文件夹里面')
   }
+}
+
+function assertFolderMoveAllowed(folderId: string, nextParentId: string | null): Folder {
+  const current = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
+  if (!current) throw new Error('文件夹不存在')
+  assertFolderParentAllowed(folderId, nextParentId)
 
   const conflict = findFolderByNameInParent(current.name, nextParentId, folderId)
   if (conflict) throw new Error(`同一层级已有同名文件夹“${current.name}”`)
@@ -430,7 +438,7 @@ function mapFolderContentRows(rows: FolderContentDocumentRow[]): FolderOverviewD
     updated_at: row.updated_at || null,
     last_opened_at: row.last_opened_at || null,
   }))
-  allowFileAccessPaths(documents.flatMap((doc) => [doc.thumb_path || '', doc.first_page_image_path || '']).filter(Boolean))
+  allowManagedFileAccessPaths(documents.flatMap((doc) => [doc.thumb_path || '', doc.first_page_image_path || '']).filter(Boolean))
   return documents
 }
 
@@ -607,9 +615,11 @@ export function registerFolderIpc(): void {
   })
 
   ipcMain.handle('folders:create', async (_event, data: FolderCreatePayload): Promise<Folder | null> => {
+    rejectProtectedExternalPathFields(data)
     const name = normalizeFolderName(data.name)
     if (!name) throw new Error('文件夹名称不能为空')
     const parentId = normalizeParentId(data.parent_id)
+    assertFolderParentAllowed(null, parentId)
     const now = new Date().toISOString()
     const existing = findFolderByNameInParent(name, parentId)
     if (existing) {
@@ -622,7 +632,7 @@ export function registerFolderIpc(): void {
 
     run(
       'INSERT INTO folders (id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, name, parentId, data.external_path || null, data.icon || 'folder', data.color || null, sortOrder, now, now]
+      [id, name, parentId, null, data.icon || 'folder', data.color || null, sortOrder, now, now]
     )
     saveDatabase()
     markLibraryStateCacheDirty()
@@ -631,6 +641,7 @@ export function registerFolderIpc(): void {
   })
 
   ipcMain.handle('folders:update', async (_event, id: string, data: FolderUpdatePayload): Promise<boolean> => {
+    rejectProtectedExternalPathFields(data)
     const folderId = String(id || '').trim()
     if (!folderId) return false
     const current = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
@@ -639,14 +650,14 @@ export function registerFolderIpc(): void {
     const nextName = 'name' in data ? normalizeFolderName(data.name) : current.name
     if (!nextName) throw new Error('文件夹名称不能为空')
     const nextParentId = 'parent_id' in data ? normalizeParentId(data.parent_id) : current.parent_id
+    assertFolderParentAllowed(folderId, nextParentId)
     const now = new Date().toISOString()
     const existing = findFolderByNameInParent(nextName, nextParentId, folderId)
     if (existing) {
-      mergeFolderInto(folderId, existing.id, data, now)
-      return true
+      throw new Error(`同一层级已有同名文件夹“${nextName}”`)
     }
 
-    const allowedFields: Array<keyof FolderUpdatePayload> = ['name', 'parent_id', 'external_path', 'icon', 'color', 'sort_order']
+    const allowedFields: Array<keyof FolderUpdatePayload> = ['name', 'parent_id', 'icon', 'color', 'sort_order']
     const sets: string[] = []
     const params: unknown[] = []
 
@@ -744,13 +755,35 @@ export function registerFolderIpc(): void {
     )
   })
 
-  ipcMain.handle('folders:selectExternal', async (): Promise<string | null> => {
-    const result = await dialog.showOpenDialog({
-      title: '选择电脑文件夹',
-      properties: ['openDirectory']
-    })
-    if (result.canceled || result.filePaths.length === 0) return null
-    return result.filePaths[0]
+  ipcMain.handle('folders:createFromImportSource', async (
+    event,
+    selectionId: string,
+    sourceId: string,
+    parentId?: string | null,
+  ): Promise<Folder | null> => {
+    const externalPath = await importSelectionService.getDirectorySourcePath(event.sender.id, selectionId, sourceId)
+    const name = normalizeFolderName(externalPath.split(/[/\\]/).pop())
+    if (!name) return null
+    const normalizedParentId = normalizeParentId(parentId)
+    assertFolderParentAllowed(null, normalizedParentId)
+    const now = new Date().toISOString()
+    const existing = findFolderByNameInParent(name, normalizedParentId)
+    if (existing) {
+      if (!existing.external_path) {
+        run('UPDATE folders SET external_path = ?, updated_at = ? WHERE id = ?', [externalPath, now, existing.id])
+        saveDatabase()
+      }
+      return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [existing.id])
+    }
+    const id = nanoid()
+    const maxOrder = queryOne<{ max_order: number | null }>('SELECT MAX(sort_order) as max_order FROM folders WHERE parent_id ' + (normalizedParentId ? '= ?' : 'IS NULL'), normalizedParentId ? [normalizedParentId] : undefined)
+    run(
+      'INSERT INTO folders (id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, name, normalizedParentId, externalPath, 'folder', null, (Number(maxOrder?.max_order) || 0) + 1, now, now],
+    )
+    saveDatabase()
+    markLibraryStateCacheDirty()
+    return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [id])
   })
 
   ipcMain.handle('folders:scanExternal', async (_event, folderId: string): Promise<FolderImportFile[]> => {
@@ -758,23 +791,10 @@ export function registerFolderIpc(): void {
     if (!folder || !folder.external_path) return []
 
     const extPath = folder.external_path
-    if (!existsSync(extPath)) return []
-
     try {
-      return collectSupportedFolderFiles(extPath)
+      return await scanCanonicalExternalFolder(extPath, SUPPORTED_FOLDER_IMPORT_EXTENSIONS)
     } catch (e) {
       console.error('[IPC] Failed to scan external folder:', e)
-      return []
-    }
-  })
-
-  ipcMain.handle('folders:scanPath', async (_event, dirPath: string): Promise<FolderImportFile[]> => {
-    if (!existsSync(dirPath)) return []
-
-    try {
-      return collectSupportedFolderFiles(dirPath)
-    } catch (e) {
-      console.error('[IPC] Failed to scan path:', e)
       return []
     }
   })

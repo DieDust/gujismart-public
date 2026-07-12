@@ -1,6 +1,6 @@
 # GujiSmart 全面重构审阅
 
-本目录记录 GujiSmart 的全量代码审阅、分模块优化设计、新功能路线图与后续实施计划。审阅以当前活跃仓库为唯一事实来源，遵循 `AGENTS.md`、现有架构与发布规范，不在本阶段修改业务代码。
+本目录记录 GujiSmart 的全量代码审阅、分模块优化设计、新功能路线图与实施计划。审阅以当前活跃仓库为唯一事实来源，遵循 `AGENTS.md`、现有架构与发布规范；业务实现按 `plans/` 中的切片逐项测试、复核和本地验收。
 
 ## 审阅原则
 
@@ -35,11 +35,20 @@
 
 ## 交付状态
 
-- 代码事实来源：`D:\文献处理软件\gujismart`
+- 代码事实来源：当前仓库根目录
 - 发布远端：`https://github.com/DieDust/gujismart-public.git`
-- 当前阶段：01 至 14 全部专题审阅、产品路线图和全局冲突复核已完成；下一阶段由用户另行批准后再编写实施切片并修改业务代码
-- 业务代码修改：禁止
-- 实施计划：在模块设计完成并自检后写入 `plans/`
+- 当前阶段：Gate 0、迁移顺序第 2/3 步、第 4 步唯一调度器、第 5 步 canonical 正文、第 6 步 StableReaderLocator、第 7 步 generation/snapshot/resolver、第 8 步 ResearchEvidence/record/output、第 8B 步 aggregate 和第 8C 步 claim lineage 已实现
+- 业务代码修改：仅允许按已登记实施切片、TDD、规格复核、质量复核和完整门禁执行
+- 实施计划：统一存放于 `plans/`；当前实施到 `2026-07-12-第八步C正式输出Claim谱系.md`，下一切片进入翻译 revision/CAS/context，随后 CitationSnapshot/ExportSnapshot；均未新增依赖
 - 正式执行前：提交全部已批准文档，并创建独立的重构前检查点提交与标签
-- 当前公开状态：禁止发布；模块 12 已确认公开截图、包内许可证和发布审批链存在阻断项
-- 公开发布：当前只允许本地提交；业务实现完成后先由用户本地测试，只有用户明确确认无问题并批准公开后，才允许 push、PR、GitHub Actions 或 Release
+- 当前公开状态：1.1.0 本地候选已完成用户测试并获明确公开批准；旧 README 截图、包内许可证、SBOM、发布清单和成品冒烟测试阻断均已处理
+- 公开发布：发布前仍必须在同一候选提交上完成完整门禁；只有维护者明确批准后才允许 push tag 或创建 GitHub Release
+
+## 2026-07-12 连续实施进度
+
+- 第九步 A：TranslationContextSnapshot、revision/attempt 与 CAS 已接入，保护人工译文并保留冲突候选。
+- 第九步 B：CitationResolver V2 与 immutable CitationSnapshot 已接入，字段缺失、版本 stale/corrupt 可诊断。
+- 第九步 C：ExportSnapshot、ExportArtifact 与 AtomicExportWriter 已覆盖全部文献导出格式，失败保留旧文件。
+- 第九步 D：Esc 不再隐式退出，workspace v2 + last-known-good + v1 fallback 和交互状态机已建立。
+- 第十步：古籍/现代论文合成 fixture、SPDX SBOM、vendor hash、包内许可配置、本地 RC manifest 与 packaged smoke 脚本已建立。
+- 1.1.0 本地 Setup/Portable 已完成测试，公开截图已替换为合成或空库截图，维护者已批准进入公开发布流程。

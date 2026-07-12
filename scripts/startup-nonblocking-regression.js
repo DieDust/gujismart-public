@@ -43,6 +43,11 @@ const autoBackupSchedulerBody = sliceBetween(
   'export function startAutoBackupScheduler()',
   'export function stopAutoBackupScheduler()',
 )
+const orphanStorageCleanupBody = sliceBetween(
+  startupRecovery,
+  'async function removeOrphanStorageDirs()',
+  'async function recoverInterruptedPdfCompressionSources',
+)
 
 assert(
   mainIndex.includes("import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'"),
@@ -97,7 +102,7 @@ assert(
 )
 assert(
   mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 15_000')
-    && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex),
+    && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowManagedFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex),
   'Startup resource allow-list preloading should be delayed so large libraries do not block the first window.',
 )
 assert(
@@ -140,20 +145,20 @@ assert(
   'Database resource path listing should support skipping page image paths.',
 )
 assert(
-  /documents:get[\s\S]{0,1800}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
-  'Full document reads should allow returned page image paths on demand.',
+  /documents:get[\s\S]{0,1800}allowManagedFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Full document reads should allow only managed page image paths on demand.',
 )
 assert(
-  /documents:getLight[\s\S]{0,1800}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
-  'Light document reads should allow returned page image paths on demand.',
+  /documents:getLight[\s\S]{0,2200}allowManagedFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Light document reads should allow only managed page image paths on demand.',
 )
 assert(
-  /documents:getPagesRange[\s\S]{0,900}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
-  'Paged document reads should allow returned page image paths on demand.',
+  /documents:getPagesRange[\s\S]{0,900}allowManagedFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Paged document reads should allow only managed page image paths on demand.',
 )
 assert(
-  /documents:getReadingWindow[\s\S]{0,1800}allowFileAccessPath\(page\.image_path\)/.test(documentsIpc),
-  'Reading window reads should allow returned page image paths on demand.',
+  /documents:getReadingWindow[\s\S]{0,1800}allowManagedFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  'Reading window reads should allow only managed page image paths on demand.',
 )
 assert(
   libraryView.includes("event.kind === 'startup-recovery'")
@@ -194,8 +199,9 @@ assert(
   'A fresh scheduled startup recovery should clear stale cancel state and report canceled summaries explicitly.',
 )
 assert(
-  mainIndex.includes("import { shutdownOcrRuntime } from './ipc/ocr'")
-    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,900}await shutdownOcrRuntime\(\)[\s\S]{0,1800}closeDatabase\(\)/.test(mainIndex),
+  mainIndex.includes('shutdownOcrRuntime')
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,900}await shutdownOcrRuntime\(\)[\s\S]{0,1800}closeDatabase\(\)/.test(mainIndex)
+    && ocrIpc.includes('...activeImportAutoOcrRuns.values()'),
   'Runtime shutdown should cancel and wait for OCR work before closing the database.',
 )
 assert(
@@ -243,13 +249,13 @@ assert(
 assert(
   documentsIpc.includes('activeDocumentImportJobs')
     && documentsIpc.includes('export async function shutdownDocumentImportRuntime')
-    && /ipcMain\.handle\('documents:import', \([^)]*filePaths: string\[\], options\?: ImportDocumentOptions\) => trackDocumentImportJob\(async \(\) => \{/.test(documentsIpc),
+    && /ipcMain\.handle\('documents:import', \([^)]*grantIds: string\[\], options\?: ImportDocumentOptions\) => trackDocumentImportJob\(async \(\) => \{/.test(documentsIpc),
   'Document import IPC jobs should be tracked so shutdown does not close the database while an import is writing.',
 )
 assert(
   documentsIpc.includes('export async function shutdownDocumentImportRuntime(timeoutMs = 30000)')
     && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime(timeoutMs = 30000)')
-    && /for \(const filePath of filePaths\) \{[\s\S]{0,180}if \(documentImportShuttingDown\) break/.test(documentsIpc),
+    && /for \(const \[fileIndex, entry\] of lease\.entries\.entries\(\)\) \{[\s\S]{0,400}if \(documentImportShuttingDown\) break/.test(documentsIpc),
   'Document import/delete shutdown should wait long enough for database writes to settle and stop import at file boundaries.',
 )
 assert(
@@ -282,15 +288,16 @@ assert(
   ocrIpc.includes('function shouldPersistBatchOcrForRecovery')
     && ocrIpc.includes("engine === 'paddle' && options?.forceFullRerun !== true")
     && ocrIpc.includes('function createRecoverableBatchOcrItems')
-    && ocrIpc.includes('INSERT INTO batch_queue')
-    && recoverableBatchOcrItemsBody.includes('scheduleDatabaseSave()')
+    && recoverableBatchOcrItemsBody.includes('createLegacyBatchTask(uniqueDocIds, batchSize')
+    && !recoverableBatchOcrItemsBody.includes('INSERT INTO batch_queue')
     && !recoverableBatchOcrItemsBody.includes('saveDatabase()')
+    && ocrIpc.includes('releaseAllLegacyBatchClaims()')
     && ocrIpc.includes('let recoverableQueueItemIdsByDocId = new Map<string, string>()')
     && ocrIpc.includes('recoverableQueueItemIdsByDocId = persistForRecovery')
     && ocrIpc.includes("updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
     && ocrIpc.includes('!ocrRuntimeShuttingDown')
     && ocrIpc.includes("result.success ? 'completed' : 'failed'"),
-  'Paddle batch OCR should persist recoverable batch_queue rows and avoid marking shutdown aborts as failed.',
+  'Paddle batch OCR should persist through the shared scheduler, retain the legacy projection, and release leases on shutdown.',
 )
 assert(
   batchProcessor.includes('async shutdownRuntime')
@@ -298,7 +305,8 @@ assert(
     && batchProcessor.includes('this.resetQueueItemForResume(job, docId)')
     && batchProcessor.includes('recognizePdfAsync(pdfPath, undefined, {')
     && batchProcessor.includes('signal: controller.signal')
-    && batchProcessor.includes("UPDATE batch_queue\n         SET status = 'pending'"),
+    && batchProcessor.includes('releaseLegacyBatchItem(itemId)')
+    && batchProcessor.includes('releaseAllLegacyBatchClaims()'),
   'Batch processor shutdown should cancel active OCR uploads and leave the active queue item resumable.',
 )
 assert(
@@ -315,14 +323,15 @@ assert(
 )
 assert(
   startupRecovery.includes('ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL')
-    && /async function removeOrphanStorageDirs\(\)[\s\S]{0,900}await yieldToEventLoop\(\)/.test(startupRecovery)
-    && !/async function removeOrphanStorageDirs\(\)[\s\S]{0,900}Promise\.all\(entries\.map/.test(startupRecovery),
+    && orphanStorageCleanupBody.includes('await yieldToEventLoop()')
+    && !orphanStorageCleanupBody.includes('Promise.all(entries.map'),
   'Startup recovery should clean orphan storage directories incrementally instead of deleting every leftover directory concurrently.',
 )
 assert(
   startupRecovery.includes('RESERVED_STORAGE_DIR_NAMES')
     && startupRecovery.includes("'page-payloads'")
-    && /async function removeOrphanStorageDirs\(\)[\s\S]{0,500}RESERVED_STORAGE_DIR_NAMES\.has\(entry\.name\)[\s\S]{0,500}await rm/.test(startupRecovery),
+    && orphanStorageCleanupBody.includes('RESERVED_STORAGE_DIR_NAMES.has(entry.name)')
+    && orphanStorageCleanupBody.includes('await rm(decision.canonicalTarget'),
   'Startup recovery should preserve shared enterprise storage directories such as page-payloads.',
 )
 assert(

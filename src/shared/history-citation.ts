@@ -88,6 +88,12 @@ export const CITATION_FORMAT_ORDER = [
   'english_journal',
   'english_collection',
   'english_archive',
+  'GB-T7714',
+  'APA',
+  'MLA',
+  'Chicago',
+  'IEEE',
+  'Custom',
 ]
 
 export const CITATION_FORMAT_COLORS: Record<string, string> = {

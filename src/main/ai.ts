@@ -19,6 +19,8 @@ import {
 } from '../shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '../shared/translation-cache'
 import { getResponseErrorMessage, isAbortError } from '../shared/errors'
+import { readProtectedSetting } from './settings-security'
+import { listCanonicalPageContents } from './canonical-content'
 import type {
   AiSynthesisResult,
   AiSynthesisTemplate,
@@ -239,13 +241,14 @@ function getMetadataObject(doc: { metadata?: string | null }): JsonRecord {
 }
 
 function getPageTexts(docId: string): Array<{ pageNum: number; text: string }> {
-  const pages = queryAll<{ page_num: number; ocr_text: string }>(
-    "SELECT page_num, COALESCE(proofed_text, ocr_text, '') as ocr_text FROM pages WHERE doc_id = ? ORDER BY page_num",
-    [docId]
-  )
-
+  const pages: Array<{ pageNum: number; text: string }> = []
+  let cursor: string | null = null
+  do {
+    const page = listCanonicalPageContents(docId, { limit: 200, cursor })
+    pages.push(...page.items.map((item) => ({ pageNum: item.pageNum, text: item.text })))
+    cursor = page.nextCursor
+  } while (cursor)
   return pages
-    .map((page) => ({ pageNum: page.page_num, text: page.ocr_text || '' }))
     .filter((page) => page.text.trim().length > 0)
 }
 
@@ -299,17 +302,18 @@ function parseMaybeJsonValue<T>(value: unknown, fallback: T): T {
 }
 
 function getDetailedPageTexts(docId: string): AiSourcePage[] {
-  const rows = queryAll<{ page_num: number; text: string; ocr_result: string | null }>(
-    "SELECT page_num, COALESCE(proofed_text, ocr_text, '') as text, ocr_result FROM pages WHERE doc_id = ? ORDER BY page_num",
+  const rows = queryAll<{ page_num: number; ocr_result: string | null }>(
+    'SELECT page_num, ocr_result FROM pages WHERE doc_id = ? ORDER BY page_num',
     [docId],
   )
-
-  return rows
-    .map((row) => {
-      const parsed = parseMaybeJsonValue<any>(row.ocr_result, {})
+  const resultsByPage = new Map(rows.map((row) => [Number(row.page_num), row.ocr_result]))
+  return getPageTexts(docId)
+    .map((page) => {
+      const ocrResult = resultsByPage.get(page.pageNum)
+      const parsed = parseMaybeJsonValue<any>(ocrResult, {})
       return {
-        pageNum: row.page_num,
-        text: String(row.text || '').trim(),
+        pageNum: page.pageNum,
+        text: String(page.text || '').trim(),
         title: parsed?.ebook?.title ? String(parsed.ebook.title).trim() : undefined,
       }
     })
@@ -1035,7 +1039,7 @@ function getCompatibleRetryBody(body: JsonRecord, errorMessage: string): JsonRec
 }
 
 export async function callLLM(messages: ChatMessage[]): Promise<string> {
-  const apiKey = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_api_key'")?.value || '').trim()
+  const apiKey = readProtectedSetting('llm_api_key').trim()
   const baseUrl = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_base_url'")?.value || 'https://api.deepseek.com/v1').replace(/\/+$/, '')
   const model = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_model'")?.value || 'deepseek-chat').trim()
   const provider = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_provider'")?.value || 'AI').trim()
@@ -1103,7 +1107,7 @@ export async function callLLMStream(
   messages: ChatMessage[],
   onDelta: (delta: string) => void,
 ): Promise<string> {
-  const apiKey = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_api_key'")?.value || '').trim()
+  const apiKey = readProtectedSetting('llm_api_key').trim()
   const baseUrl = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_base_url'")?.value || 'https://api.deepseek.com/v1').replace(/\/+$/, '')
   const model = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_model'")?.value || 'deepseek-chat').trim()
   const provider = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_provider'")?.value || 'AI').trim()

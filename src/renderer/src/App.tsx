@@ -36,7 +36,7 @@ import {
   type WorkspaceViewKey,
 } from './utils/appWorkspace'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
-import type { AppUpdateInfo, BackgroundTaskProgressEvent, DatabaseStorageDiagnostics, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
+import type { AppUpdateInfo, BackgroundTaskProgressEvent, DatabaseStorageDiagnostics, ImportSelection, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
 import './styles/app.css'
 
@@ -91,7 +91,7 @@ type OpenDocumentOptions = {
 type OpenDocumentHandler = (target: OpenDocumentTarget | string, options?: OpenDocumentOptions) => void
 type LibraryDroppedImportRequest = {
   id: number
-  paths: string[]
+  selection: ImportSelection
   folderId?: string | null
 }
 type FoldersViewState = WorkspaceFoldersState
@@ -392,11 +392,11 @@ function getSettingsForOnboardingCheck(): Promise<SettingsMap | typeof ONBOARDIN
 }
 
 function hasPaddleOcrConfig(settings: SettingsMap): boolean {
-  return hasConfiguredText(settings.paddleocr_api_key)
+  return settings.paddleocr_api_key_configured === 'true'
 }
 
 function hasAiConfig(settings: SettingsMap): boolean {
-  return hasConfiguredText(settings.llm_api_key)
+  return settings.llm_api_key_configured === 'true'
     && hasConfiguredText(settings.llm_base_url)
     && hasConfiguredText(settings.llm_model)
 }
@@ -1047,14 +1047,14 @@ export default function App() {
     return () => window.removeEventListener('gujismart:onboarding-action', handleOnboardingAction)
   }, [handleImport, runWithSettingsLeaveGuard])
 
-  const handleDroppedImport = (paths: string[], folderId?: string | null) => {
+  const handleDroppedImport = (selection: ImportSelection, folderId?: string | null) => {
     runWithSettingsLeaveGuard(() => {
       focusOrCreateLibraryTab()
       setLibraryFilter(folderId ? { type: 'folder', value: folderId } : { type: 'all' })
       setLibraryFocusSection(folderId ? 'folders' : undefined)
       setLibraryDroppedImportRequest({
         id: libraryDroppedImportSeqRef.current += 1,
-        paths,
+        selection,
         folderId: folderId || null,
       })
     })
@@ -1524,16 +1524,6 @@ export default function App() {
 
         const target = getTabGroupReorderTarget(strip, groupDrag)
         groupDrag.target = target
-        if (target) {
-          const currentTabs = tabsRef.current
-          const nextTabs = reorderAppTabGroup(currentTabs, groupDrag.groupId, target)
-          if (nextTabs !== currentTabs) {
-            pendingTabLayoutRef.current = captureTabStripItemLayout()
-            tabsRef.current = nextTabs
-            setTabs(nextTabs)
-            scheduleTabDragFrame()
-          }
-        }
         return
       }
 
@@ -1575,21 +1565,10 @@ export default function App() {
       drag.targetTabId = target?.tabId || null
       drag.targetDropPosition = target?.position || null
 
-      if (target) {
-        const currentTabs = tabsRef.current
-        const nextTabs = reorderAppTabs(currentTabs, drag.tabId, target.tabId, target.position)
-        if (nextTabs !== currentTabs) {
-          pendingTabLayoutRef.current = captureTabLayout()
-          tabsRef.current = nextTabs
-          setTabs(nextTabs)
-          scheduleTabDragFrame()
-          return
-        }
-      }
     })
   }
 
-  const finishTabPointerDrag = () => {
+  const finishTabPointerDrag = (cancelled = false) => {
     tabPointerCleanupRef.current?.()
     tabPointerCleanupRef.current = null
     if (tabDragFrameRef.current !== null) {
@@ -1607,8 +1586,10 @@ export default function App() {
     tabPointerDragRef.current = null
     document.body.classList.remove('is-app-tab-dragging')
 
-    if (!drag?.moved) {
+    if (!drag?.moved || cancelled) {
       setDragOverTabGroupId(null)
+      drag?.previewElement?.remove()
+      setDraggedTabId(null)
       suppressTabClickRef.current = false
       return
     }
@@ -1630,6 +1611,16 @@ export default function App() {
       if (!droppedGroupId && droppedTab && droppedNearTab && !droppedTab.groupId && !droppedNearTab.groupId) {
         pendingTabLayoutRef.current = captureTabLayout()
         createGroupForTabs([droppedTab.id, droppedNearTab.id])
+        return
+      }
+      if (drag.targetTabId && drag.targetDropPosition) {
+        const currentTabs = tabsRef.current
+        const nextTabs = reorderAppTabs(currentTabs, drag.tabId, drag.targetTabId, drag.targetDropPosition)
+        if (nextTabs !== currentTabs) {
+          pendingTabLayoutRef.current = captureTabLayout()
+          tabsRef.current = nextTabs
+          setTabs(nextTabs)
+        }
       }
     }
 
@@ -1693,7 +1684,7 @@ export default function App() {
     }, 0)
   }
 
-  const finishTabGroupPointerDrag = () => {
+  const finishTabGroupPointerDrag = (cancelled = false) => {
     tabPointerCleanupRef.current?.()
     tabPointerCleanupRef.current = null
     if (tabDragFrameRef.current !== null) {
@@ -1708,9 +1699,21 @@ export default function App() {
     tabGroupPointerDragRef.current = null
     document.body.classList.remove('is-app-tab-dragging')
 
-    if (!drag?.moved) {
+    if (!drag?.moved || cancelled) {
+      drag?.previewElement?.remove()
+      setDraggedTabGroupId(null)
       suppressTabClickRef.current = false
       return
+    }
+
+    if (drag.target) {
+      const currentTabs = tabsRef.current
+      const nextTabs = reorderAppTabGroup(currentTabs, drag.groupId, drag.target)
+      if (nextTabs !== currentTabs) {
+        pendingTabLayoutRef.current = captureTabStripItemLayout()
+        tabsRef.current = nextTabs
+        setTabs(nextTabs)
+      }
     }
 
     const previewElement = drag.previewElement
@@ -1792,18 +1795,23 @@ export default function App() {
       pointerEvent.preventDefault()
       scheduleTabDragFrame()
     }
-    const handlePointerEnd = (pointerEvent: PointerEvent) => {
+    const handlePointerUp = (pointerEvent: PointerEvent) => {
       const drag = tabPointerDragRef.current
       if (!drag || pointerEvent.pointerId !== drag.pointerId) return
       finishTabPointerDrag()
     }
+    const handlePointerCancel = (pointerEvent: PointerEvent) => {
+      const drag = tabPointerDragRef.current
+      if (!drag || pointerEvent.pointerId !== drag.pointerId) return
+      finishTabPointerDrag(true)
+    }
     window.addEventListener('pointermove', handlePointerMove, { passive: false })
-    window.addEventListener('pointerup', handlePointerEnd)
-    window.addEventListener('pointercancel', handlePointerEnd)
+    window.addEventListener('pointerup', handlePointerUp)
+    window.addEventListener('pointercancel', handlePointerCancel)
     tabPointerCleanupRef.current = () => {
       window.removeEventListener('pointermove', handlePointerMove)
-      window.removeEventListener('pointerup', handlePointerEnd)
-      window.removeEventListener('pointercancel', handlePointerEnd)
+      window.removeEventListener('pointerup', handlePointerUp)
+      window.removeEventListener('pointercancel', handlePointerCancel)
     }
   }
 
@@ -1864,18 +1872,23 @@ export default function App() {
       pointerEvent.preventDefault()
       scheduleTabDragFrame()
     }
-    const handlePointerEnd = (pointerEvent: PointerEvent) => {
+    const handlePointerUp = (pointerEvent: PointerEvent) => {
       const drag = tabGroupPointerDragRef.current
       if (!drag || pointerEvent.pointerId !== drag.pointerId) return
       finishTabGroupPointerDrag()
     }
+    const handlePointerCancel = (pointerEvent: PointerEvent) => {
+      const drag = tabGroupPointerDragRef.current
+      if (!drag || pointerEvent.pointerId !== drag.pointerId) return
+      finishTabGroupPointerDrag(true)
+    }
     window.addEventListener('pointermove', handlePointerMove, { passive: false })
-    window.addEventListener('pointerup', handlePointerEnd)
-    window.addEventListener('pointercancel', handlePointerEnd)
+    window.addEventListener('pointerup', handlePointerUp)
+    window.addEventListener('pointercancel', handlePointerCancel)
     tabPointerCleanupRef.current = () => {
       window.removeEventListener('pointermove', handlePointerMove)
-      window.removeEventListener('pointerup', handlePointerEnd)
-      window.removeEventListener('pointercancel', handlePointerEnd)
+      window.removeEventListener('pointerup', handlePointerUp)
+      window.removeEventListener('pointercancel', handlePointerCancel)
     }
   }
 
@@ -1949,12 +1962,22 @@ export default function App() {
       if (event.defaultPrevented || hasShortcutBlockingOverlay() || isEditableShortcutTarget(event.target)) return
       if (shortcutMatches(event, shortcuts.back)) {
         event.preventDefault()
-        window.close()
+        if (tabGroupSettingsOpenId) {
+          setTabGroupSettingsOpenId(null)
+          return
+        }
+        if (tabMenuOpen) {
+          setTabMenuOpen(false)
+          return
+        }
+        if (libraryAiOpen) {
+          setLibraryAiOpen(false)
+        }
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activeDocumentTab, shortcuts])
+  }, [activeDocumentTab, libraryAiOpen, shortcuts, tabGroupSettingsOpenId, tabMenuOpen])
 
   useEffect(() => {
     if (!window.api) return
@@ -2236,6 +2259,7 @@ export default function App() {
           sourceId={target.sourceId}
           searchSession={target.searchSession}
           locator={target.locator}
+          stableLocator={target.stableLocator}
           revealToc={!!target.revealToc}
           highlightExcerpt={target.highlightExcerpt || ''}
           highlightColor={target.highlightColor || ''}
@@ -2732,13 +2756,13 @@ export default function App() {
             event.preventDefault()
             event.dataTransfer.dropEffect = 'copy'
           }}
-          onDrop={(event) => {
+          onDrop={async (event) => {
             event.preventDefault()
-            const paths = Array.from(event.dataTransfer.files)
-              .map((file) => window.api.getPathForFile(file))
-              .filter((filePath): filePath is string => !!filePath)
-            if (paths.length > 0) {
-              handleDroppedImport(Array.from(new Set(paths)))
+            const result = await window.api.grantDroppedImportSources(Array.from(event.dataTransfer.files))
+            if (result.ok) {
+              handleDroppedImport(result.value)
+            } else if (result.error.code !== 'CAPABILITY_INVALID_REQUEST') {
+              message.error(result.error.message)
             }
           }}
         >

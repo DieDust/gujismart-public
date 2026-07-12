@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "gujismart-synthetic-fixtures/v1",
+  "seed": "gujismart-public-fixtures-2026-07",
+  "license": "Apache-2.0",
+  "provenance": "Fictional content authored for GujiSmart automated and visual tests.",
+  "privacy": "Contains no user library content, credentials, local paths, or copyrighted publication excerpts.",
+  "fixtures": [
+    { "id": "synthetic-ancient-001", "file": "ancient-document.json", "audience": "ancient-text" },
+    { "id": "synthetic-modern-001", "file": "modern-paper.json", "audience": "modern-paper" }
+  ]
+}

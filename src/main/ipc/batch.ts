@@ -1,13 +1,22 @@
 import { ipcMain, BrowserWindow } from 'electron'
 import { queryAll, run, saveDatabase } from '../database'
 import { batchProcessor } from '../batch-processor'
-import { nanoid } from 'nanoid'
+import {
+  completeLegacyBatchItem,
+  createLegacyBatchTask,
+  failLegacyBatchItem,
+  hasActiveLegacyBatchClaim,
+  resetLegacyBatchItem,
+  startLegacyBatchItem,
+} from '../task-batch-compat'
 import type { BatchCreateResult, BatchItemStatus, BatchJob, BatchQueueItem, BatchStartResult } from '../../shared/types'
 
 export function registerBatchIpc(): void {
   ipcMain.handle('batch:start', async (_event, docIds: string[], batchSize?: number): Promise<BatchStartResult> => {
     const size = batchSize || 5
-    const job = batchProcessor.createJob(docIds, size)
+    const persisted = createLegacyBatchTask(docIds, size)
+    const queueItemIdsByDocId = new Map(persisted.items.map((item) => [item.docId, item.legacyItemId]))
+    const job = batchProcessor.createJob(docIds, size, { id: persisted.jobId, queueItemIdsByDocId })
 
     const win = BrowserWindow.getFocusedWindow()
     if (win) batchProcessor.setMainWindow(win)
@@ -40,20 +49,9 @@ export function registerBatchIpc(): void {
   })
 
   ipcMain.handle('batch:create', async (_event, docIds: string[], batchSize?: number): Promise<BatchCreateResult> => {
-    const batchId = nanoid()
     const size = batchSize || 5
-    const now = new Date().toISOString()
-
-    for (const docId of docIds) {
-      const id = nanoid()
-      run(
-        'INSERT INTO batch_queue (id, batch_id, doc_id, status, batch_size, progress, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [id, batchId, docId, 'pending', size, 0, now]
-      )
-    }
-    saveDatabase()
-
-    return { batchId, count: docIds.length }
+    const persisted = createLegacyBatchTask(docIds, size)
+    return { batchId: persisted.batchId, count: persisted.count }
   })
 
   ipcMain.handle('batch:list', async (): Promise<BatchQueueItem[]> => {
@@ -65,25 +63,17 @@ export function registerBatchIpc(): void {
   })
 
   ipcMain.handle('batch:updateStatus', async (_event, id: string, status: BatchItemStatus, errorMessage?: string): Promise<boolean> => {
-    const now = new Date().toISOString()
-    const updates: string[] = ['status = ?']
-    const params: unknown[] = [status]
-
     if (status === 'processing') {
-      updates.push('started_at = ?')
-      params.push(now)
+      if (!hasActiveLegacyBatchClaim(id)) startLegacyBatchItem(id, 'legacy-batch-ipc')
+    } else if (status === 'completed') {
+      if (!hasActiveLegacyBatchClaim(id)) startLegacyBatchItem(id, 'legacy-batch-ipc')
+      completeLegacyBatchItem(id, { message: errorMessage })
+    } else if (status === 'failed') {
+      if (!hasActiveLegacyBatchClaim(id)) startLegacyBatchItem(id, 'legacy-batch-ipc')
+      failLegacyBatchItem(id, { errorMessage: errorMessage || '批处理失败', recoverable: true })
+    } else {
+      resetLegacyBatchItem(id)
     }
-    if (status === 'completed' || status === 'failed') {
-      updates.push('completed_at = ?')
-      params.push(now)
-    }
-    if (errorMessage) {
-      updates.push('error_message = ?')
-      params.push(errorMessage)
-    }
-
-    params.push(id)
-    run(`UPDATE batch_queue SET ${updates.join(', ')} WHERE id = ?`, params)
     saveDatabase()
     return true
   })

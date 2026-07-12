@@ -1,5 +1,6 @@
 ﻿import { getDataDir, queryAll, queryOne } from './database'
 import { extname, join } from 'path'
+import { randomUUID } from 'crypto'
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
 import { pathToFileURL } from 'url'
 import { BrowserWindow, nativeImage } from 'electron'
@@ -10,7 +11,10 @@ import * as fontkit from '@pdf-lib/fontkit'
 import { isTocLabel, looksLikeTocText, parseTocEntries, type TocFormattedEntry } from '../shared/toc-format'
 import { deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
 import { hydratePagePayloadRows } from './page-payload-store'
-import type { Document, DocumentExportFormat, DocumentExportOptions } from '../shared/types'
+import { attachCanonicalPageContent } from './canonical-content'
+import { writeAtomicExport } from './atomic-export-writer'
+import { persistExportArtifact, persistExportSnapshot } from './export-snapshots'
+import type { Document, DocumentExportFormat, DocumentExportOptions, DocumentPage } from '../shared/types'
 
 marked.setOptions({
   gfm: true,
@@ -19,18 +23,7 @@ marked.setOptions({
 
 const MAX_VISUAL_PDF_PAGES = 160
 
-interface ExportPage {
-  id: string
-  page_num: number
-  image_path?: string | null
-  ocr_text?: string | null
-  ocr_result?: string | null
-  proofed_text?: string | null
-  ocr_text_ref?: string | null
-  ocr_result_ref?: string | null
-  proofed_text_ref?: string | null
-  proof_status?: string | null
-}
+interface ExportPage extends DocumentPage {}
 
 interface ExportPageOcrVersion {
   page_id: string
@@ -334,6 +327,8 @@ function metadataText(metadata: JsonRecord, key: string, fallback = ''): string 
 }
 
 function getPageText(page: ExportPage): string {
+  const canonicalText = String(page.canonical_content?.text || '').trim()
+  if (canonicalText) return canonicalText
   const proofedText = String(page.proofed_text || '').trim()
   if (proofedText) return proofedText
   const ir = getOrBuildOcrPageIr(page.ocr_result, { pageIndex: Number(page.page_num || 0) || 1 })
@@ -2466,7 +2461,7 @@ async function exportPdfFromHtml(htmlContent: string, exportPath: string): Promi
   const tempDir = join(getDataDir(), 'temp')
   if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true })
 
-  const tempHtmlPath = join(tempDir, `_export_${Date.now()}.html`)
+  const tempHtmlPath = join(tempDir, `_export_${randomUUID()}.html`)
   writeFileSync(tempHtmlPath, htmlContent, 'utf-8')
 
   let win: BrowserWindow | null = null
@@ -2530,7 +2525,7 @@ async function exportPdfFromHtml(htmlContent: string, exportPath: string): Promi
   }
 }
 
-export async function exportDocument(
+async function renderExportDocument(
   docId: string,
   format: InternalDocumentExportFormat,
   exportPath: string,
@@ -2539,7 +2534,10 @@ export async function exportDocument(
   const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [docId])
   if (!doc) throw new Error('文献不存在')
 
-  const pages = withActiveOcrVersions(docId, hydratePagePayloadRows(queryAll<ExportPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])))
+  const pages = attachCanonicalPageContent(withActiveOcrVersions(
+    docId,
+    hydratePagePayloadRows(queryAll<ExportPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [docId])),
+  ))
   const metadataObj = parseMaybeJson<JsonRecord>(doc.metadata, {})
   const metadataSource = metadataText(metadataObj, 'source')
   const metadataVersion = metadataText(metadataObj, 'version')
@@ -2625,5 +2623,40 @@ export async function exportDocument(
   }
 
   writeFileSync(exportPath, content, 'utf-8')
+  return true
+}
+
+function validateRenderedExport(format: InternalDocumentExportFormat, stagingPath: string): void {
+  const bytes = readFileSync(stagingPath)
+  if (bytes.length < 1) throw new Error('导出文件为空')
+  if (format === 'pdf' || format === 'reading-pdf' || format === 'layout-pdf' || format === 'layout-searchable-pdf') {
+    if (bytes.subarray(0, 5).toString('ascii') !== '%PDF-') throw new Error('导出的 PDF 文件头无效')
+    assertPdfHasNoType3Fonts(stagingPath, 'PDF')
+  } else if (format === 'paddle-json') {
+    JSON.parse(bytes.toString('utf8'))
+  } else if (format === 'tei-xml' || format === 'page-xml') {
+    if (!bytes.toString('utf8').trimStart().startsWith('<?xml')) throw new Error('导出的 XML 文件头无效')
+  } else if (format === 'html') {
+    if (!/<html[\s>]/i.test(bytes.toString('utf8'))) throw new Error('导出的 HTML 结构无效')
+  }
+}
+
+export async function exportDocument(
+  docId: string,
+  format: InternalDocumentExportFormat,
+  exportPath: string,
+  options: ExportOptions = {},
+) {
+  const snapshot = persistExportSnapshot({
+    documentId: docId,
+    format,
+    options,
+  })
+  const result = await writeAtomicExport(
+    exportPath,
+    (stagingPath) => renderExportDocument(docId, format, stagingPath, options),
+    (stagingPath) => validateRenderedExport(format, stagingPath),
+  )
+  persistExportArtifact({ snapshotId: snapshot.id, exportPath, contentHash: result.contentHash, byteSize: result.byteSize })
   return true
 }

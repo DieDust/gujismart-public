@@ -1126,6 +1126,164 @@ export function getTextFlowOcrBlocks(page: OcrTextPage): OcrTextBlock[] {
   })
 }
 
+function isHorizontalReaderLineBlock(block: OcrTextBlock): boolean {
+  const rect = getBlockRect(block)
+  const text = getBlockText(block)
+  const label = getBlockLabel(block)
+  if (!rect || text.length < 4) return false
+  if (isLayoutImageLabel(label) || isTableBlock(block) || isVerticalTextLabel(label) || isDecorativeLayoutBlock(block, text)) return false
+  return rect.width >= Math.max(48, rect.height * 2.2) && rect.height <= 96
+}
+
+function unionBlockRects(blocks: OcrTextBlock[]): Rect | null {
+  const rects = blocks.map(getBlockRect).filter((rect): rect is Rect => rect !== null)
+  if (rects.length === 0) return null
+  const left = Math.min(...rects.map((rect) => rect.left))
+  const top = Math.min(...rects.map((rect) => rect.top))
+  const right = Math.max(...rects.map((rect) => rect.left + rect.width))
+  const bottom = Math.max(...rects.map((rect) => rect.top + rect.height))
+  return { left, top, width: right - left, height: bottom - top }
+}
+
+function mergeReaderLineRun(blocks: OcrTextBlock[]): OcrTextBlock {
+  if (blocks.length === 1) return blocks[0]
+  const first = blocks[0]
+  const words = blocks.map(getBlockDisplayText).filter(Boolean).join('\n')
+  const rawWords = blocks.map(getRawOcrBlockText).filter(Boolean).join('\n')
+  return {
+    ...first,
+    words,
+    raw_words: rawWords || words,
+    location: unionBlockRects(blocks) || first.location,
+  }
+}
+
+function canMergeReaderLines(run: OcrTextBlock[], next: OcrTextBlock): boolean {
+  const previous = run[run.length - 1]
+  if (!isHorizontalReaderLineBlock(previous) || !isHorizontalReaderLineBlock(next)) return false
+  if (!isLayoutTextLabel(getBlockLabel(previous)) || !isLayoutTextLabel(getBlockLabel(next))) return false
+  const previousRect = getBlockRect(previous)
+  const nextRect = getBlockRect(next)
+  const firstRect = getBlockRect(run[0])
+  if (!previousRect || !nextRect || !firstRect) return false
+  const verticalGap = nextRect.top - (previousRect.top + previousRect.height)
+  if (verticalGap < -Math.max(previousRect.height, nextRect.height) * 0.35) return false
+  if (verticalGap > Math.max(10, Math.max(previousRect.height, nextRect.height) * 0.75)) return false
+  const startsIndentedParagraph = endsSentence(getBlockText(previous))
+    && nextRect.left - firstRect.left > Math.max(12, nextRect.height * 0.75)
+  return !startsIndentedParagraph
+}
+
+function mergeReaderColumnLines(blocks: OcrTextBlock[]): OcrTextBlock[] {
+  const ordered = [...blocks].sort((left, right) => {
+    const a = getBlockPoint(left)
+    const b = getBlockPoint(right)
+    return a.top - b.top || a.left - b.left
+  })
+  const merged: OcrTextBlock[] = []
+  let run: OcrTextBlock[] = []
+  const flush = () => {
+    if (run.length > 0) merged.push(mergeReaderLineRun(run))
+    run = []
+  }
+  for (const block of ordered) {
+    if (run.length === 0 || canMergeReaderLines(run, block)) {
+      run.push(block)
+    } else {
+      flush()
+      run.push(block)
+    }
+  }
+  flush()
+  return merged
+}
+
+function orderReaderColumnBand(blocks: OcrTextBlock[], splitX: number): OcrTextBlock[] {
+  const left: OcrTextBlock[] = []
+  const right: OcrTextBlock[] = []
+  for (const block of blocks) {
+    const rect = getBlockRect(block)
+    if (!rect || rect.left + rect.width / 2 <= splitX) left.push(block)
+    else right.push(block)
+  }
+  return [...mergeReaderColumnLines(left), ...mergeReaderColumnLines(right)]
+}
+
+function inferReadableMultiColumnBlocks(blocks: OcrTextBlock[]): OcrTextBlock[] {
+  if (blocks.some((block) => getManualReadingOrder(block) !== null)) return blocks
+  const candidates = blocks.filter(isHorizontalReaderLineBlock)
+  if (candidates.length < 8) return blocks
+
+  const positioned = candidates
+    .map((block) => ({ block, rect: getBlockRect(block) as Rect }))
+    .sort((left, right) => (left.rect.left + left.rect.width / 2) - (right.rect.left + right.rect.width / 2))
+  let splitIndex = -1
+  let largestGap = 0
+  for (let index = 1; index < positioned.length; index += 1) {
+    const previousCenter = positioned[index - 1].rect.left + positioned[index - 1].rect.width / 2
+    const nextCenter = positioned[index].rect.left + positioned[index].rect.width / 2
+    const gap = nextCenter - previousCenter
+    if (gap > largestGap) {
+      largestGap = gap
+      splitIndex = index
+    }
+  }
+  if (splitIndex < 3 || positioned.length - splitIndex < 3) return blocks
+
+  const pageLeft = Math.min(...positioned.map((item) => item.rect.left))
+  const pageRight = Math.max(...positioned.map((item) => item.rect.left + item.rect.width))
+  const pageWidth = Math.max(1, pageRight - pageLeft)
+  if (largestGap < Math.max(36, pageWidth * 0.12)) return blocks
+
+  const leftCluster = positioned.slice(0, splitIndex)
+  const rightCluster = positioned.slice(splitIndex)
+  const leftCenter = leftCluster[leftCluster.length - 1].rect.left + leftCluster[leftCluster.length - 1].rect.width / 2
+  const rightCenter = rightCluster[0].rect.left + rightCluster[0].rect.width / 2
+  const splitX = (leftCenter + rightCenter) / 2
+  let bodyStart = Number.POSITIVE_INFINITY
+  for (const left of leftCluster) {
+    for (const right of rightCluster) {
+      const tolerance = Math.max(left.rect.height, right.rect.height) * 1.35
+      if (Math.abs(left.rect.top - right.rect.top) <= tolerance) {
+        bodyStart = Math.min(bodyStart, Math.max(left.rect.top, right.rect.top))
+      }
+    }
+  }
+  if (!Number.isFinite(bodyStart)) return blocks
+
+  const ordered = [...blocks].sort((left, right) => {
+    const a = getBlockPoint(left)
+    const b = getBlockPoint(right)
+    return a.top - b.top || a.left - b.left
+  })
+  const preamble = ordered.filter((block) => (getBlockRect(block)?.top ?? Number.POSITIVE_INFINITY) < bodyStart)
+  const body = ordered.filter((block) => (getBlockRect(block)?.top ?? Number.NEGATIVE_INFINITY) >= bodyStart)
+  const spanning = body.filter((block) => {
+    const rect = getBlockRect(block)
+    return !!rect
+      && rect.width >= pageWidth * 0.58
+      && rect.left < splitX
+      && rect.left + rect.width > splitX
+  })
+  const result = [...preamble]
+  const consumed = new Set<OcrTextBlock>(preamble)
+  for (const separator of spanning) {
+    const separatorRect = getBlockRect(separator)
+    if (!separatorRect) continue
+    const band = body.filter((block) => {
+      if (consumed.has(block) || block === separator || spanning.includes(block)) return false
+      const top = getBlockRect(block)?.top ?? Number.POSITIVE_INFINITY
+      return top < separatorRect.top
+    })
+    band.forEach((block) => consumed.add(block))
+    consumed.add(separator)
+    result.push(...orderReaderColumnBand(band, splitX), separator)
+  }
+  const tail = body.filter((block) => !consumed.has(block))
+  result.push(...orderReaderColumnBand(tail, splitX))
+  return result
+}
+
 function getOrderedBlockText(page: OcrTextPage): string {
   const ordered = getTextFlowOcrBlocks(page)
   if (ordered.length === 0) return ''
@@ -1161,6 +1319,9 @@ function shouldPreferOcrBlocksForReading(page: OcrTextPage, blocks: OcrTextBlock
 }
 
 export function extractPageText(page: OcrTextPage): string {
+  const canonicalText = String(page?.canonical_content?.text || '').trim()
+  if (canonicalText) return canonicalText
+
   const blocks = getTextFlowOcrBlocks(page)
   if (shouldPreferOcrBlocksForReading(page, blocks)) {
     const blockText = blocks.map(getBlockText).filter(Boolean).join('\n\n')
@@ -1742,7 +1903,8 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
   const layoutBlocks = getLayoutAwareBlocks(page)
 
   if (layoutBlocks.length > 0) {
-    for (const block of getTextFlowOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } })) {
+    const textFlowLayoutBlocks = getTextFlowOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } })
+    for (const block of inferReadableMultiColumnBlocks(textFlowLayoutBlocks)) {
       const label = getBlockLabel(block)
       const rawText = getBlockText(block)
       const displayText = getBlockDisplayText(block)

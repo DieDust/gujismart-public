@@ -24,6 +24,7 @@ import { renderOcrInlineText } from '../utils/ocrInlineRender'
 import { buildViewerSearchHits } from '../utils/searchHitCount'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import { getErrorMessage } from '@shared/errors'
+import { legacySearchLocatorFromUnknown } from '@shared/stable-reader-locator'
 import { isParallelTranslationDisplayReady } from '@shared/parallel-translation'
 import { normalizeTranslationSourceText } from '@shared/translation-cache'
 import { getCanonicalPageTranslationSourceText } from '@shared/translation-source'
@@ -1535,6 +1536,9 @@ function toFiniteNumber(value: unknown, fallback = 0): number {
 }
 
 function asSearchHitLocator(value: unknown): SearchHitLocator | null {
+  if (isJsonRecord(value) && readRecordValue(value, 'schemaVersion') === 'stable-reader-locator/v2') {
+    return legacySearchLocatorFromUnknown(value)
+  }
   if (!isJsonRecord(value)) return null
   const matchText = String(readRecordValue(value, 'matchText') || readRecordValue(value, 'queryTerm') || '').trim()
   const charStart = Math.max(0, toFiniteNumber(readRecordValue(value, 'charStart'), 0))

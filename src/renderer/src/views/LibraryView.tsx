@@ -27,6 +27,7 @@ import {
   UnorderedListOutlined
 } from '@ant-design/icons'
 import {
+  Alert,
   Button,
   Checkbox,
   Dropdown,
@@ -55,9 +56,12 @@ import MetadataEditor from '../components/MetadataEditor'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
+import { toggleSelectionId } from '../utils/interactionKernel'
+import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshot, LibraryImportQueueState, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import { matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -288,6 +292,16 @@ type DocumentMetadata = Record<string, unknown>
 type ImportQueueJob = {
   id: number
   filePaths: string[]
+  selectionId: string
+  nextCursor: string | null
+  selectionDone: boolean
+  sourceLabels: string[]
+  displayNames?: Map<string, string>
+  remainingAuthorizationLabels?: string[]
+  authorizationHasUndiscoveredSources?: boolean
+  allowedReauthorizationSourceIds?: Set<string>
+  directorySourceIds?: Set<string>
+  sourceFolderIds?: Map<string, string>
   folderId?: string | null
   folderAssignments?: Map<string, string>
   engine: OcrEngine
@@ -301,11 +315,11 @@ type PdfPreviewQueueItem = {
   pageCount?: number
 }
 
-type PersistedImportQueueJob = LibraryImportQueueJobSnapshot
+type PersistedImportQueueJob = LibraryImportQueueJobSnapshotV2
 
 type ImportBatchQueueResult = {
   result: ImportDocumentResult
-  originalPath: string
+  grantId: string
   fileIndex: number
 }
 
@@ -404,7 +418,7 @@ function isOcrEngine(value: unknown): value is OcrEngine {
 }
 
 function normalizeVisibleOcrEngine(value: unknown): OcrEngine {
-  return value === 'local_paddle' || value === 'paddle' || value === 'vision_model' ? value : 'paddle'
+  return value === 'paddle' || value === 'vision_model' ? value : 'paddle'
 }
 
 function needsOcrWork(doc: DocumentItem, engine?: OcrEngine): boolean {
@@ -457,7 +471,7 @@ interface LibraryViewProps {
   initialFilter?: LibraryFilter
   initialFocusSection?: 'tags' | 'folders' | 'smart'
   importRequest?: number
-  droppedImportRequest?: { id: number; paths: string[]; folderId?: string | null } | null
+  droppedImportRequest?: { id: number; selection: ImportSelection; folderId?: string | null } | null
   onDroppedImportHandled?: (requestId: number) => void
   onOpenLibraryAi?: (payload?: LibraryAiOpenPayload) => void
 }
@@ -575,6 +589,7 @@ interface BookTranslationProgressInfo {
 }
 
 const OCR_AI_TOAST_TIMEOUT_MS = 125_000
+const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'
 type StopPropagationEvent = Pick<MouseEvent, 'stopPropagation'>
 
 function isImmediateOcrProgressEvent(data: OcrProgressEvent): boolean {
@@ -1437,7 +1452,6 @@ function DocumentVirtualRow({
       label: '重新 OCR 整本文献',
       icon: <ThunderboltOutlined />,
       children: [
-        { key: 'rerun_ocr_book:local_paddle', label: '用本地 OCR 覆盖' },
         { key: 'rerun_ocr_book:paddle', label: '用飞桨 OCR 覆盖' },
         { key: 'rerun_ocr_book:vision_model', label: '用大模型 OCR 覆盖' },
       ],
@@ -1812,7 +1826,6 @@ export default function LibraryView({
     searchKey,
     setDocuments,
     setSelectedIds,
-    toggleSelect,
     selectAll,
     clearSelection,
     setLoading,
@@ -1857,6 +1870,7 @@ export default function LibraryView({
   const [importing, setImporting] = useState(false)
   const [importProgressText, setImportProgressText] = useState('')
   const [importQueueLength, setImportQueueLength] = useState(0)
+  const [authorizationRequiredJobs, setAuthorizationRequiredJobs] = useState<LibraryImportQueueJobSnapshotV2[]>([])
   const [importOcrEngine, setImportOcrEngine] = useState<OcrEngine>('paddle')
   const [libraryInitialLoadDone, setLibraryInitialLoadDone] = useState(false)
   const [documentTotal, setDocumentTotal] = useState(0)
@@ -1907,6 +1921,7 @@ export default function LibraryView({
   const importJobSeqRef = useRef(0)
   const activeImportJobRef = useRef<ImportQueueJob | null>(null)
   const restoredImportQueueRef = useRef(false)
+  const authorizationRequiredJobsRef = useRef<LibraryImportQueueJobSnapshotV2[]>([])
   const importQueuePersistenceChainRef = useRef<Promise<unknown>>(Promise.resolve())
   const activeImportFilePathsRef = useRef<Set<string>>(new Set())
   const queuedImportFilePathsRef = useRef<Set<string>>(new Set())
@@ -2463,18 +2478,13 @@ export default function LibraryView({
 
     for (const { data, nextInfo } of updates) {
       const toastKey = `ocr-progress-${data.docId}`
+      message.destroy(toastKey)
 
       if (data.status === 'queued' || data.status === 'processing' || data.status === 'pending') {
         message.destroy(`ocr-error-${data.docId}`)
       }
 
       if (data.status === 'processing' || data.aiStatus === 'processing') {
-        activeOcrToastKeysRef.current.add(toastKey)
-        message.loading({
-          content: getOcrProgressText(nextInfo),
-          key: toastKey,
-          duration: 0,
-        })
         if (data.phase === 'ai' && data.aiStatus === 'processing') {
           window.setTimeout(() => {
             setOcrProgressByDoc((current) => {
@@ -2568,6 +2578,15 @@ export default function LibraryView({
           message.warning({ content: data.errorMessage, key: `ocr-error-${data.docId}`, duration: 6 })
         }
       }
+    }
+
+    const activitySummary = buildOcrActivitySummary(Object.values(nextProgressByDoc))
+    if (activitySummary) {
+      activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
+      message.loading({ content: activitySummary, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
+    } else {
+      activeOcrToastKeysRef.current.delete(OCR_ACTIVITY_MESSAGE_KEY)
+      message.destroy(OCR_ACTIVITY_MESSAGE_KEY)
     }
 
     if (events.some(isImmediateOcrProgressEvent)) {
@@ -3905,58 +3924,6 @@ export default function LibraryView({
     }, delayMs)
   }
 
-  const runImportOcrQueue = async (
-    items: Array<
-      | { type: 'ready'; docId: string }
-      | { type: 'prepare-pdf'; docId: string; filePath: string; fileIndex: number; totalFiles: number }
-    >,
-    engine: OcrEngine,
-  ) => {
-    if (items.length === 0) return 0
-
-    const batchSize = await getConfiguredBatchSize()
-    const queuedDocIds = new Set<string>()
-    const pendingBatch: string[] = []
-    let batchIndex = 0
-    let successCount = 0
-
-    const flushBatch = async () => {
-      if (pendingBatch.length === 0) return
-      batchIndex += 1
-      const batch = pendingBatch.splice(0, pendingBatch.length)
-      message.loading({
-        content: `正在用${getOcrEngineLabel(engine)}按清单顺序处理第 ${batchIndex} 批（每批 ${batchSize} 篇）…`,
-        key: 'auto-ocr',
-        duration: 0,
-      })
-      successCount += await runOcrInConfiguredBatches(batch, engine, 'auto-ocr')
-      await delay(0)
-    }
-
-    for (const item of items) {
-      if (queuedDocIds.has(item.docId)) continue
-
-      if (item.type === 'prepare-pdf' && engine !== 'paddle') {
-        message.loading({
-          content: `正在后台准备${getOcrEngineLabel(engine)}页图：${item.fileIndex + 1}/${item.totalFiles}`,
-          key: 'auto-ocr',
-          duration: 0,
-        })
-        const ready = await preparePdfPagesForOcrAfterImport(item.docId, item.filePath, item.fileIndex, item.totalFiles, engine)
-        if (!ready) continue
-        scheduleImportListRefresh()
-        await delay(0)
-      }
-
-      queuedDocIds.add(item.docId)
-      pendingBatch.push(item.docId)
-      if (pendingBatch.length >= batchSize) await flushBatch()
-    }
-
-    await flushBatch()
-    return successCount
-  }
-
   const getQueuedImportFileCount = () => importQueueRef.current.reduce((sum, job) => sum + job.filePaths.length, 0)
 
   const refreshImportQueueLength = () => {
@@ -3973,7 +3940,7 @@ export default function LibraryView({
     const pendingKeys = batch.map(normalizeImportQueuePath)
     let settled = 0
     for (const item of results) {
-      const key = normalizeImportQueuePath(item.result.sourcePath || item.originalPath || '')
+      const key = normalizeImportQueuePath(item.result.sourceGrantId || item.grantId || '')
       if (!key) continue
       const index = pendingKeys.indexOf(key)
       if (index < 0) continue
@@ -4023,29 +3990,39 @@ export default function LibraryView({
   }
 
   const serializeImportQueueJob = (job: ImportQueueJob): PersistedImportQueueJob | null => {
-    const filePaths = job.filePaths.map((filePath) => String(filePath || '').trim()).filter(Boolean)
-    if (filePaths.length === 0) return null
-    const folderAssignments = job.folderAssignments
-      ? [...job.folderAssignments.entries()].filter((entry): entry is [string, string] => Boolean(entry[0] && entry[1]))
-      : undefined
+    const isReauthorization = Array.isArray(job.remainingAuthorizationLabels)
+    const hasUndiscoveredSources = job.authorizationHasUndiscoveredSources === true || !job.selectionDone
+    const sourceLabels = isReauthorization
+      ? job.remainingAuthorizationLabels || []
+      : hasUndiscoveredSources
+        ? job.sourceLabels
+        : [...(job.displayNames?.values() || [])]
+    const pendingCount = job.filePaths.length
+      + (isReauthorization ? sourceLabels.length : 0)
+      + (hasUndiscoveredSources ? 1 : 0)
+    if (pendingCount === 0) return null
     return {
       id: job.id,
-      filePaths,
+      selectionId: null,
+      sourceLabels,
+      pendingCount,
       folderId: job.folderId || null,
-      folderAssignments: folderAssignments && folderAssignments.length > 0 ? folderAssignments : undefined,
       engine: job.engine,
+      authorizationStatus: 'authorization-required',
+      hasUndiscoveredSources,
     }
   }
 
   const buildImportQueueSnapshot = (): PersistedImportQueueState | null => {
-    const jobs = [
+    const activeJobs = [
       ...(activeImportJobRef.current ? [activeImportJobRef.current] : []),
       ...importQueueRef.current,
     ].map(serializeImportQueueJob).filter((job): job is PersistedImportQueueJob => Boolean(job))
+    const jobs = [...authorizationRequiredJobsRef.current, ...activeJobs]
 
     if (jobs.length === 0) return null
     return {
-      version: 1,
+      version: 2,
       savedAt: new Date().toISOString(),
       jobs,
     }
@@ -4069,6 +4046,11 @@ export default function LibraryView({
     return importQueuePersistenceChainRef.current
   }
 
+  const replaceAuthorizationRequiredJobs = (jobs: LibraryImportQueueJobSnapshotV2[]) => {
+    authorizationRequiredJobsRef.current = jobs
+    setAuthorizationRequiredJobs(jobs)
+  }
+
   const persistImportQueueSnapshot = () => {
     const snapshot = buildImportQueueSnapshot()
     void enqueueImportQueuePersistence(() => window.api.saveImportQueueState(snapshot))
@@ -4080,65 +4062,36 @@ export default function LibraryView({
     clearLegacyPersistedImportQueue()
   }
 
-  const parseLegacyPersistedImportQueue = (): PersistedImportQueueState | null => {
+  const getLegacyPersistedImportQueueJobs = (): LibraryImportQueueJobSnapshotV2[] => {
     try {
       const raw = window.localStorage.getItem(LIBRARY_IMPORT_QUEUE_STORAGE_KEY)
-      if (!raw) return null
-      const parsed = JSON.parse(raw) as Partial<PersistedImportQueueState>
-      if (parsed.version !== 1 || !Array.isArray(parsed.jobs)) return null
-      return {
-        version: 1,
-        savedAt: typeof parsed.savedAt === 'string' && parsed.savedAt ? parsed.savedAt : new Date().toISOString(),
-        jobs: parsed.jobs,
-      }
+      if (!raw) return []
+      const parsed = JSON.parse(raw) as { version?: unknown; jobs?: Array<Record<string, unknown>> }
+      if (parsed.version !== 1 || !Array.isArray(parsed.jobs)) return []
+      return parsed.jobs.map((job, index) => ({
+        id: Number(job.id || 0) || Date.now() + index,
+        selectionId: null,
+        sourceLabels: [],
+        pendingCount: Array.isArray(job.filePaths) ? job.filePaths.length : 1,
+        folderId: typeof job.folderId === 'string' ? job.folderId : null,
+        engine: isOcrEngine(job.engine) ? job.engine : 'paddle',
+        authorizationStatus: 'authorization-required',
+        hasUndiscoveredSources: true,
+      }))
     } catch (error) {
       console.warn('[Library] Failed to restore legacy import queue', error)
-      return null
+      return []
     }
   }
 
-  const parsePersistedImportQueue = async (): Promise<ImportQueueJob[]> => {
+  const getPersistedImportAuthorizationRequiredJobs = async (): Promise<LibraryImportQueueJobSnapshotV2[]> => {
     try {
-      let parsed = await window.api.getImportQueueState()
-      if (!parsed) {
-        parsed = parseLegacyPersistedImportQueue()
-        if (parsed) {
-          void enqueueImportQueuePersistence(() => window.api.saveImportQueueState(parsed)).then(() => {
-            clearLegacyPersistedImportQueue()
-          }).catch((error) => {
-            console.warn('[Library] Failed to migrate legacy import queue', error)
-          })
-        }
-      }
-      if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.jobs)) return []
-
-      const jobs = parsed.jobs
-        .map((job): ImportQueueJob | null => {
-          const filePaths = Array.isArray(job.filePaths)
-            ? job.filePaths.map((filePath) => String(filePath || '').trim()).filter(Boolean)
-            : []
-          if (filePaths.length === 0) return null
-          const folderAssignments = Array.isArray(job.folderAssignments)
-            ? new Map(job.folderAssignments.filter((entry): entry is [string, string] => (
-              Array.isArray(entry)
-              && typeof entry[0] === 'string'
-              && !!entry[0]
-              && typeof entry[1] === 'string'
-              && !!entry[1]
-            )))
-            : undefined
-          return {
-            id: Number(job.id || 0) || importJobSeqRef.current + 1,
-            filePaths,
-            folderId: typeof job.folderId === 'string' && job.folderId ? job.folderId : null,
-            folderAssignments: folderAssignments && folderAssignments.size > 0 ? folderAssignments : undefined,
-            engine: isOcrEngine(job.engine) ? job.engine : 'paddle',
-          } satisfies ImportQueueJob
-        })
-      return jobs.filter((job): job is ImportQueueJob => Boolean(job))
+      const parsed = await window.api.getImportQueueState()
+      if (parsed?.version === 2) return parsed.jobs
+      return getLegacyPersistedImportQueueJobs()
     } catch (error) {
       console.warn('[Library] Failed to restore import queue', error)
-      return []
+      return getLegacyPersistedImportQueueJobs()
     }
   }
 
@@ -4156,19 +4109,39 @@ export default function LibraryView({
       const shouldAttemptAutoOcrForPreview = previewAutoOcrBackground !== 'false'
       const previewAutoOcrConfigReady = shouldAttemptAutoOcrForPreview ? await hasOcrEngineConfig(engine) : false
       const shouldDeferImportPdfPreview = shouldAttemptAutoOcrForPreview && previewAutoOcrConfigReady
+      const autoOcrBatchSize = await getConfiguredBatchSize()
+      let autoOcrTask: Awaited<ReturnType<typeof window.api.createImportAutoOcrTask>> | null = null
+      let autoOcrTaskJobId: string | null = null
+      let autoOcrCandidateCount = 0
+      let persistedAutoOcrCount = 0
+      const ensureAutoOcrTask = async () => {
+        if (!autoOcrTask) {
+          autoOcrTask = await window.api.createImportAutoOcrTask({
+            engine,
+            batchSize: autoOcrBatchSize,
+            sourceImportJobId: String(job.id),
+          })
+          autoOcrTaskJobId = autoOcrTask.jobId
+        }
+        return autoOcrTask
+      }
       let importedCount = 0
       let restoredDuplicateCount = 0
       let skippedDuplicateCount = 0
       let compressedPdfCount = 0
       let compressedPdfBytesSaved = 0
-      const autoOcrQueue: Parameters<typeof runImportOcrQueue>[0] = []
       const failedResults: ImportDocumentResult[] = []
 
       const processImportedBatchResults = async (
         queuedResults: ImportBatchQueueResult[],
-      ): Promise<{ pdfPreviewQueue: PdfPreviewQueueItem[]; deferredPdfPreviewQueue: PdfPreviewQueueItem[] }> => {
+      ): Promise<{
+        pdfPreviewQueue: PdfPreviewQueueItem[]
+        deferredPdfPreviewQueue: PdfPreviewQueueItem[]
+        autoOcrItems: Array<{ docId: string; sourceOrder: number; sourceType: string | null }>
+      }> => {
         const pdfPreviewQueue: PdfPreviewQueueItem[] = []
         const deferredPdfPreviewQueue: PdfPreviewQueueItem[] = []
+        const autoOcrItems: Array<{ docId: string; sourceOrder: number; sourceType: string | null }> = []
         const folderAssociationMap = new Map<string, string[]>()
         const queueFolderAssociation = (docId: string, targetFolderId: string | null) => {
           if (!docId || !targetFolderId) return
@@ -4178,12 +4151,12 @@ export default function LibraryView({
         }
 
         for (const item of queuedResults) {
-          const { result, originalPath, fileIndex } = item
+          const { result, grantId, fileIndex } = item
           if (!result.success) {
             failedResults.push(result)
             continue
           }
-          const targetFolderId = (originalPath && folderAssignments?.get(originalPath)) || folderId || null
+          const targetFolderId = (grantId && folderAssignments?.get(grantId)) || folderId || null
 
           if (result.sourceType === 'restored-pdf') {
             restoredDuplicateCount += 1
@@ -4199,7 +4172,7 @@ export default function LibraryView({
 
           queueFolderAssociation(result.id, targetFolderId)
 
-          if (!originalPath) continue
+          if (!grantId) continue
 
           if (result.sourceType === 'paddle-json' || result.sourceType === 'ebook-text') {
             importedCount += 1
@@ -4211,10 +4184,23 @@ export default function LibraryView({
             compressedPdfBytesSaved += Number(result.pdfCompression.savedBytes || 0)
           }
 
-          const pdfWorkPath = result.storedPath || originalPath
+          const pdfWorkPath = result.storedPath || ''
           if (pdfWorkPath.toLowerCase().endsWith('.pdf')) {
             importedCount += 1
-            autoOcrQueue.push({ type: 'prepare-pdf', docId: result.id, filePath: pdfWorkPath, fileIndex, totalFiles: totalFileCount })
+            autoOcrCandidateCount += 1
+            let readyForAutoOcr = true
+            if (previewAutoOcrConfigReady && engine !== 'paddle') {
+              message.loading({
+                content: `正在准备${getOcrEngineLabel(engine)}页图：${fileIndex + 1}/${totalFileCount}`,
+                key: 'auto-ocr',
+                duration: 0,
+              })
+              readyForAutoOcr = await preparePdfPagesForOcrAfterImport(result.id, pdfWorkPath, fileIndex, totalFileCount, engine)
+              if (readyForAutoOcr) scheduleImportListRefresh()
+            }
+            if (previewAutoOcrConfigReady && readyForAutoOcr) {
+              autoOcrItems.push({ docId: result.id, sourceOrder: fileIndex, sourceType: result.sourceType || 'pdf-file' })
+            }
             if (engine !== 'local_paddle' && engine !== 'vision_model' && engine !== 'hybrid') {
               const previewItem = { docId: result.id, filePath: pdfWorkPath, fileIndex, totalFiles: totalFileCount, pageCount: result.pageCount }
               if (Number(result.pageCount || 0) >= LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT) {
@@ -4225,7 +4211,12 @@ export default function LibraryView({
             }
           } else {
             importedCount += 1
-            if (result.ocrReady || result.sourceType === 'image-file') autoOcrQueue.push({ type: 'ready', docId: result.id })
+            if (result.ocrReady || result.sourceType === 'image-file') {
+              autoOcrCandidateCount += 1
+              if (previewAutoOcrConfigReady) {
+                autoOcrItems.push({ docId: result.id, sourceOrder: fileIndex, sourceType: result.sourceType || null })
+              }
+            }
           }
         }
 
@@ -4243,7 +4234,7 @@ export default function LibraryView({
           }
         }
 
-        return { pdfPreviewQueue, deferredPdfPreviewQueue }
+        return { pdfPreviewQueue, deferredPdfPreviewQueue, autoOcrItems }
       }
 
       for (let batchIndex = 0; batchIndex < importBatches.length; batchIndex += 1) {
@@ -4260,7 +4251,7 @@ export default function LibraryView({
           batchResults.forEach((result, resultIndex) => {
             batchQueuedResults.push({
               result,
-              originalPath: result.sourcePath || batch[resultIndex] || '',
+              grantId: result.sourceGrantId || batch[resultIndex] || '',
               fileIndex: start + resultIndex,
             })
           })
@@ -4270,7 +4261,8 @@ export default function LibraryView({
             id: '',
             title: batch[0]?.split(/[/\\]/).pop() || '导入批次',
             success: false,
-            sourcePath: batch[0] || '',
+            sourceGrantId: batch[0] || '',
+            displayName: job.displayNames?.get(batch[0] || '') || '导入批次',
             error: errorMessage,
           })
           message.warning({ content: `当前导入批次中断：${errorMessage}。未确认完成的文件会保留在队列中。`, key: 'import', duration: 6 })
@@ -4280,7 +4272,14 @@ export default function LibraryView({
         job.filePaths = job.filePaths.slice(settledBatchFileCount)
         persistImportQueueSnapshot()
 
-        const { pdfPreviewQueue, deferredPdfPreviewQueue } = await processImportedBatchResults(batchQueuedResults)
+        const { pdfPreviewQueue, deferredPdfPreviewQueue, autoOcrItems } = await processImportedBatchResults(batchQueuedResults)
+        if (autoOcrItems.length > 0) {
+          const task = await ensureAutoOcrTask()
+          for (const appendBatch of chunkArray(autoOcrItems, 200)) {
+            const appended = await window.api.appendImportAutoOcrItems(task.jobId, appendBatch)
+            persistedAutoOcrCount = appended.totalCount
+          }
+        }
 
         if ((batchIndex + 1) % IMPORT_LIST_REFRESH_BATCHES === 0 && batchIndex !== importBatches.length - 1) {
           scheduleImportListRefresh()
@@ -4320,22 +4319,14 @@ export default function LibraryView({
       }
       await refreshLibraryAfterImport()
 
-      const autoOcrBackground = await window.api.getSetting('auto_ocr_after_import')
-      const totalAutoOcrCount = autoOcrQueue.length
-      if (autoOcrBackground !== 'false' && totalAutoOcrCount > 0) {
-        const hasConfig = await hasOcrEngineConfig(engine)
-        if (hasConfig) {
-          message.loading({ content: `已加入 OCR 队列，将按设置分批处理 ${totalAutoOcrCount} 篇文献…`, key: 'auto-ocr', duration: 0 })
-          void runImportOcrQueue(autoOcrQueue, engine)
-            .then(async () => {
-              message.success({ content: 'OCR 已完成', key: 'auto-ocr' })
-              await loadDocuments(filter, { reset: true, silent: true })
-            })
-            .catch((error) => {
-              console.error(error)
-              message.error({ content: `后台 ${getOcrEngineLabel(engine)} 失败`, key: 'auto-ocr' })
-            })
-        } else {
+      if (autoOcrTaskJobId && persistedAutoOcrCount > 0) {
+        const started = await window.api.startImportAutoOcrTask(autoOcrTaskJobId)
+        message.success({
+          content: `已持久化并启动 OCR 任务，共 ${started.totalCount} 篇；关闭软件后仍会按原顺序续跑。`,
+          key: 'auto-ocr',
+          duration: 6,
+        })
+      } else if (shouldAttemptAutoOcrForPreview && autoOcrCandidateCount > 0 && !previewAutoOcrConfigReady) {
           message.warning({
             content: engine === 'vision_model'
               ? '已导入，但未配置视觉模型 OCR；请在设置页填写端点、API Key 和模型 ID 后再重试。'
@@ -4347,12 +4338,46 @@ export default function LibraryView({
             key: 'auto-ocr',
             duration: 6,
           })
-        }
       }
     } catch (error) {
       console.error(error)
       message.error({ content: `导入文献失败：${(error as Error)?.message || '未知错误'}`, key: 'import', duration: 6 })
     }
+  }
+
+  const refillImportSelectionJob = async (job: ImportQueueJob): Promise<void> => {
+    if (!job.selectionId || job.selectionDone || job.filePaths.length > 0) return
+    const batchResult = await window.api.readImportSelectionBatch(job.selectionId, job.nextCursor, await getConfiguredImportBatchSize())
+    if (!batchResult.ok) {
+      job.selectionDone = true
+      message.warning(batchResult.error.message)
+      return
+    }
+    let items = batchResult.value.items
+    if (job.authorizationHasUndiscoveredSources) {
+      items = items.filter((item) => job.allowedReauthorizationSourceIds?.has(item.sourceId))
+    } else if (job.remainingAuthorizationLabels) {
+      const matched = matchReauthorizedItems(job.remainingAuthorizationLabels, items)
+      items = matched.matchedItems
+      job.remainingAuthorizationLabels = matched.remainingLabels
+    }
+    const acceptedDirectorySourceIds = [...new Set(items.map((item) => item.sourceId))]
+      .filter((sourceId) => job.directorySourceIds?.has(sourceId) && !job.sourceFolderIds?.has(sourceId))
+    for (const sourceId of acceptedDirectorySourceIds) {
+      const folder = await window.api.createFolderFromImportSource(job.selectionId, sourceId, job.folderId || null)
+      if (folder?.id) {
+        if (!job.sourceFolderIds) job.sourceFolderIds = new Map()
+        job.sourceFolderIds.set(sourceId, folder.id)
+      }
+    }
+    job.filePaths = items.map((item) => item.grantId)
+    job.displayNames = new Map(items.map((item) => [item.grantId, item.displayName]))
+    job.folderAssignments = new Map(items
+      .map((item) => [item.grantId, job.sourceFolderIds?.get(item.sourceId)] as const)
+      .filter((entry): entry is readonly [string, string] => Boolean(entry[1])))
+    job.nextCursor = batchResult.value.nextCursor
+    job.selectionDone = batchResult.value.done
+    if (batchResult.value.done) await window.api.releaseImportSelection(job.selectionId)
   }
 
   const drainImportQueue = async () => {
@@ -4375,18 +4400,35 @@ export default function LibraryView({
           activeImportFilePathsRef.current.add(filePath)
         })
 
+        let remainingBeforeRefill = 0
         try {
           await processImportJob(job)
         } finally {
+          remainingBeforeRefill = job.filePaths.length
+          await refillImportSelectionJob(job)
           if (job.filePaths.length > 0) {
             importQueueRef.current.unshift(job)
+          } else if (job.selectionDone && (job.remainingAuthorizationLabels?.length || 0) > 0) {
+            replaceAuthorizationRequiredJobs([
+              ...authorizationRequiredJobsRef.current.filter((item) => item.id !== job.id),
+              {
+                id: job.id,
+                selectionId: null,
+                sourceLabels: job.remainingAuthorizationLabels || [],
+                pendingCount: job.remainingAuthorizationLabels?.length || 0,
+                folderId: job.folderId || null,
+                engine: job.engine,
+                authorizationStatus: 'authorization-required',
+                hasUndiscoveredSources: job.authorizationHasUndiscoveredSources,
+              },
+            ])
           }
           activeImportJobRef.current = null
           jobPathKeys.forEach((filePath) => activeImportFilePathsRef.current.delete(filePath))
           refreshImportQueueLength()
           persistImportQueueSnapshot()
         }
-        if (job.filePaths.length > 0) break
+        if (remainingBeforeRefill > 0) break
         await loadBaseData()
         await delay(0)
       }
@@ -4395,7 +4437,9 @@ export default function LibraryView({
       setImporting(false)
       setImportProgressText('')
       activeImportFilePathsRef.current.clear()
-      if (importQueueRef.current.length === 0 && !activeImportJobRef.current) {
+      if (importQueueRef.current.length === 0
+        && !activeImportJobRef.current
+        && authorizationRequiredJobsRef.current.length === 0) {
         setImportQueueLength(0)
         queuedImportFilePathsRef.current.clear()
         clearPersistedImportQueue()
@@ -4410,7 +4454,20 @@ export default function LibraryView({
     filePaths: string[],
     folderId?: string | null,
     folderAssignments?: Map<string, string>,
-    options?: { engine?: OcrEngine; restored?: boolean },
+    options?: {
+      engine?: OcrEngine
+      selectionId?: string
+      nextCursor?: string | null
+      selectionDone?: boolean
+      sourceLabels?: string[]
+      sourceFolderIds?: Map<string, string>
+      displayNames?: Map<string, string>
+      remainingAuthorizationLabels?: string[]
+      authorizationHasUndiscoveredSources?: boolean
+      allowedReauthorizationSourceIds?: Set<string>
+      directorySourceIds?: Set<string>
+      jobId?: number
+    },
   ) => {
     const seen = new Set<string>()
     const nextFilePaths: string[] = []
@@ -4423,17 +4480,30 @@ export default function LibraryView({
       nextFilePaths.push(filePath)
     }
 
-    if (nextFilePaths.length === 0) {
+    if (nextFilePaths.length === 0
+      && (options?.selectionDone ?? true)
+      && (options?.remainingAuthorizationLabels?.length || 0) === 0) {
       message.info({ content: '这些文件已在当前导入队列中', key: 'import-queue-duplicate', duration: 3 })
-      return
+      return false
     }
 
     const nextAssignments = folderAssignments
       ? new Map(nextFilePaths.map((filePath) => [filePath, folderAssignments.get(filePath)]).filter((entry): entry is [string, string] => Boolean(entry[1])))
       : undefined
+    if (options?.jobId) importJobSeqRef.current = Math.max(importJobSeqRef.current, options.jobId)
     const job: ImportQueueJob = {
-      id: importJobSeqRef.current += 1,
+      id: options?.jobId || (importJobSeqRef.current += 1),
       filePaths: nextFilePaths,
+      selectionId: options?.selectionId || '',
+      nextCursor: options?.nextCursor ?? null,
+      selectionDone: options?.selectionDone ?? true,
+      sourceLabels: options?.sourceLabels || [],
+      sourceFolderIds: options?.sourceFolderIds,
+      displayNames: options?.displayNames,
+      remainingAuthorizationLabels: options?.remainingAuthorizationLabels,
+      authorizationHasUndiscoveredSources: options?.authorizationHasUndiscoveredSources,
+      allowedReauthorizationSourceIds: options?.allowedReauthorizationSourceIds,
+      directorySourceIds: options?.directorySourceIds,
       folderId,
       folderAssignments: nextAssignments,
       engine: options?.engine || importOcrEngine,
@@ -4444,109 +4514,23 @@ export default function LibraryView({
     refreshImportQueueLength()
     persistImportQueueSnapshot()
 
-    if (options?.restored) {
-      message.loading({ content: `已恢复上次未完成的导入队列：${nextFilePaths.length} 个文件`, key: 'import', duration: 0 })
-    } else if (importQueueRunningRef.current) {
+    if (importQueueRunningRef.current) {
       message.success({ content: `已加入导入队列：${nextFilePaths.length} 个文件，将在当前任务后自动处理`, key: 'import-queued', duration: 4 })
     } else {
       message.loading({ content: `已加入导入队列：${nextFilePaths.length} 个文件`, key: 'import', duration: 0 })
     }
 
     void drainImportQueue()
-  }
-
-  useEffect(() => {
-    if (!libraryInitialLoadDone) return
-    if (restoredImportQueueRef.current) return
-    restoredImportQueueRef.current = true
-    let cancelled = false
-    void parsePersistedImportQueue()
-      .then((restoredJobs) => {
-        if (cancelled || restoredJobs.length === 0) return
-
-        let restoredFileCount = 0
-        for (const job of restoredJobs) {
-          importJobSeqRef.current = Math.max(importJobSeqRef.current, job.id)
-          const filePaths = filterRestoredImportFilePaths(job.filePaths)
-          if (filePaths.length === 0) continue
-          restoredFileCount += filePaths.length
-          enqueueImportJob(filePaths, job.folderId, job.folderAssignments, { engine: job.engine, restored: true })
-        }
-
-        if (restoredFileCount > 0) {
-          message.info({ content: `检测到上次未完成的导入任务，已自动接回队列：${restoredFileCount} 个文件`, key: 'import-restored', duration: 5 })
-        } else {
-          clearPersistedImportQueue()
-        }
-      })
-      .catch((error) => {
-        console.warn('[Library] Failed to restore import queue', error)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [libraryInitialLoadDone])
-
-  const importFilePaths = async (filePaths: string[], folderId?: string | null, folderAssignments?: Map<string, string>) => {
-    if (filePaths.length === 0) return
-
-    const duplicateFiles: string[] = []
-    const newFiles: string[] = []
-    const existingNames = getLoadedImportBaseNames()
-
-    for (const filePath of filePaths) {
-      const fileName = filePath.split(/[/\\]/).pop() || ''
-      const isPdf = fileName.toLowerCase().endsWith('.pdf')
-      if (isPdf) {
-        newFiles.push(filePath)
-        continue
-      }
-      const baseName = fileName.replace(/\.[^.]+$/, '')
-      const existsAlready = existingNames.has(baseName.toLowerCase())
-
-      if (existsAlready) {
-        duplicateFiles.push(fileName)
-      } else {
-        newFiles.push(filePath)
-      }
-    }
-
-    if (duplicateFiles.length === 0) {
-      enqueueImportJob(filePaths, folderId, folderAssignments)
-      return
-    }
-
-    await new Promise<void>((resolve) => {
-      const duplicatePreview = duplicateFiles.slice(0, 50)
-      const hiddenDuplicateCount = Math.max(0, duplicateFiles.length - duplicatePreview.length)
-      Modal.confirm({
-        title: '发现重复文献',
-        content: (
-          <div>
-            <p>以下文献已存在于文库中：</p>
-            <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
-              {duplicatePreview.map((name) => <li key={name}>{name}</li>)}
-            </ul>
-            {hiddenDuplicateCount > 0 ? <p>还有 {hiddenDuplicateCount} 个重复文件未展开显示。</p> : null}
-            <p>{newFiles.length > 0 ? `是否继续导入其余 ${newFiles.length} 个文件？` : '没有新的文件可以导入。'}</p>
-          </div>
-        ),
-        okText: newFiles.length > 0 ? `继续导入 ${newFiles.length} 个文件` : '确定',
-        cancelText: '取消',
-        onOk: () => {
-          if (newFiles.length > 0) {
-            enqueueImportJob(newFiles, folderId, folderAssignments)
-          }
-          resolve()
-        },
-        onCancel: () => resolve()
-      })
-    })
+    return true
   }
 
   const handleImport = async () => {
-    const filePaths = await window.api.openFileDialog()
-    await importDroppedSources(filePaths)
+    const result = await window.api.selectImportSources()
+    if (result.ok) {
+      await importDroppedSources(result.value)
+    } else if (result.error.code !== 'CAPABILITY_INVALID_REQUEST') {
+      message.error(result.error.message)
+    }
   }
 
   const hasOcrEngineConfig = async (engine: OcrEngine): Promise<boolean> => {
@@ -4567,56 +4551,111 @@ export default function LibraryView({
 
   const getOcrEngineLabel = (engine: OcrEngine): string => engine === 'local_paddle' ? '本地 OCR' : engine === 'vision_model' ? '大模型 OCR' : engine === 'hybrid' ? '混合 OCR' : '飞桨 OCR'
 
-  const getDroppedPaths = (event: DragEvent<HTMLElement>): string[] => {
-    const paths = Array.from(event.dataTransfer.files)
-      .map((file) => window.api.getPathForFile(file))
-      .filter((filePath): filePath is string => !!filePath)
-
-    return Array.from(new Set(paths))
-  }
-
-  const importDroppedSources = async (sourcePaths: string[], targetFolderId?: string | null) => {
-    if (sourcePaths.length === 0) {
-      message.info('没有识别到可导入的文件')
-      return
+  const importDroppedSources = async (
+    selection: ImportSelection,
+    targetFolderId?: string | null,
+    reauthorizationJob?: LibraryImportQueueJobSnapshotV2,
+  ): Promise<boolean> => {
+    let ownershipTransferred = false
+    try {
+    const sourceMatch = reauthorizationJob?.hasUndiscoveredSources
+      ? reauthorizationJob.sourceLabels.length > 0
+        ? matchReauthorizedSources(reauthorizationJob.sourceLabels, selection.sources)
+        : { allowedSourceIds: new Set(selection.sources.map((source) => source.sourceId)), remainingLabels: [] }
+      : null
+    const sourceFolderIds = new Map<string, string>()
+    const directorySourceIds = new Set(selection.sources.filter((source) => source.isDirectory).map((source) => source.sourceId))
+    const importBatchSize = await getConfiguredImportBatchSize()
+    const batchResult = await window.api.readImportSelectionBatch(selection.selectionId, null, importBatchSize)
+    if (!batchResult.ok) {
+      message.error(batchResult.error.message)
+      return false
     }
-
-    const sources = await window.api.resolveImportSources(sourcePaths)
-    const importFiles: string[] = sources
-      .filter((source) => !source.isDirectory)
-      .flatMap((source) => source.filePaths)
-    const folderAssignments = new Map<string, string>()
-
-    for (const source of sources.filter((item) => item.isDirectory)) {
-      if (source.filePaths.length === 0) {
-        message.info(`文件夹“${source.sourceName}”里没有找到可导入的文件`)
-        await delay(0)
-        continue
-      }
-
-      const folder = await window.api.createFolder({
-        name: source.sourceName,
-        parent_id: targetFolderId || undefined,
-        external_path: source.sourcePath
-      })
-
-      for (const filePath of source.filePaths) {
-        importFiles.push(filePath)
-        if (folder?.id) folderAssignments.set(filePath, folder.id)
-        if (importFiles.length % 200 === 0) await delay(0)
-      }
-      await delay(0)
+    let items = batchResult.value.items
+    let remainingAuthorizationLabels = reauthorizationJob?.sourceLabels
+      ? [...reauthorizationJob.sourceLabels]
+      : undefined
+    if (sourceMatch) {
+      items = items.filter((item) => sourceMatch.allowedSourceIds.has(item.sourceId))
+      remainingAuthorizationLabels = sourceMatch.remainingLabels
+    } else if (reauthorizationJob) {
+      const matched = matchReauthorizedItems(reauthorizationJob.sourceLabels, items)
+      items = matched.matchedItems
+      remainingAuthorizationLabels = matched.remainingLabels
     }
-
-    const uniqueImportFiles = Array.from(new Set(importFiles))
-    if (uniqueImportFiles.length > 0) {
-      await importFilePaths(uniqueImportFiles, targetFolderId || null, folderAssignments)
-    } else {
+    const acceptedDirectorySourceIds = [...new Set(items.map((item) => item.sourceId))]
+      .filter((sourceId) => directorySourceIds.has(sourceId))
+    for (const sourceId of acceptedDirectorySourceIds) {
+      const folder = await window.api.createFolderFromImportSource(selection.selectionId, sourceId, targetFolderId || null)
+      if (folder?.id) sourceFolderIds.set(sourceId, folder.id)
+    }
+    const grantIds = items.map((item) => item.grantId)
+    const folderAssignments = new Map(items
+      .map((item) => [item.grantId, sourceFolderIds.get(item.sourceId)] as const)
+      .filter((entry): entry is readonly [string, string] => Boolean(entry[1])))
+    if (grantIds.length === 0 && batchResult.value.done && !reauthorizationJob) {
       message.info('没有找到可导入的文件')
+      return false
     }
-
-    await loadBaseData()
+    const replacementEstablished = enqueueImportJob(grantIds, targetFolderId || null, folderAssignments, {
+      selectionId: selection.selectionId,
+      nextCursor: batchResult.value.nextCursor,
+      selectionDone: batchResult.value.done,
+      sourceLabels: selection.sources.map((source) => source.displayName),
+      sourceFolderIds,
+      displayNames: new Map(items.map((item) => [item.grantId, item.displayName])),
+      engine: reauthorizationJob?.engine,
+      remainingAuthorizationLabels,
+      authorizationHasUndiscoveredSources: reauthorizationJob?.hasUndiscoveredSources,
+      allowedReauthorizationSourceIds: sourceMatch?.allowedSourceIds,
+      directorySourceIds,
+      jobId: reauthorizationJob?.id,
+    })
+    ownershipTransferred = replacementEstablished && !batchResult.value.done
+    return replacementEstablished
+    } finally {
+      if (!ownershipTransferred) await window.api.releaseImportSelection(selection.selectionId)
+    }
   }
+
+  const promptImportQueueReauthorization = (job: LibraryImportQueueJobSnapshotV2) => {
+    Modal.confirm({
+      title: '继续上次未完成的导入？',
+      content: `该任务还有约 ${job.pendingCount} 个文件需要重新授权。重新选择原文件或原目录后会继续处理，取消不会删除任务。`,
+      okText: '重新选择',
+      cancelText: '稍后处理',
+      onOk: async () => {
+        const result = await window.api.selectImportSources()
+        if (!result.ok) return
+        const replacementEstablished = await importDroppedSources(result.value, job.folderId || null, job)
+        if (!replacementEstablished) return
+        const nextJobs = transitionAuthorizationJobs(authorizationRequiredJobsRef.current, job.id, {
+          replacementEstablished: true,
+        })
+        replaceAuthorizationRequiredJobs(nextJobs)
+        persistImportQueueSnapshot()
+        const nextJob = nextJobs[0]
+        if (nextJob) window.setTimeout(() => promptImportQueueReauthorization(nextJob), 0)
+      },
+      onCancel: () => undefined,
+    })
+  }
+
+  useEffect(() => {
+    if (!libraryInitialLoadDone || restoredImportQueueRef.current) return
+    restoredImportQueueRef.current = true
+    let cancelled = false
+    void getPersistedImportAuthorizationRequiredJobs()
+      .then((jobs) => {
+        if (cancelled || jobs.length === 0) return
+        replaceAuthorizationRequiredJobs(jobs)
+        promptImportQueueReauthorization(jobs[0])
+      })
+      .catch((error) => console.warn('[Library] Failed to restore import queue', error))
+    return () => {
+      cancelled = true
+    }
+  }, [libraryInitialLoadDone])
 
   const handleDragEnter = (event: DragEvent<HTMLElement>) => {
     event.preventDefault()
@@ -4653,7 +4692,9 @@ export default function LibraryView({
     if (isDocumentDrag(event)) return
 
     try {
-      await importDroppedSources(getDroppedPaths(event))
+      const result = await window.api.grantDroppedImportSources(Array.from(event.dataTransfer.files))
+      if (result.ok) await importDroppedSources(result.value)
+      else message.error(result.error.message)
     } catch (error) {
       console.error(error)
       message.error('拖拽导入失败')
@@ -4667,11 +4708,11 @@ export default function LibraryView({
   }, [importRequest])
 
   useEffect(() => {
-    if (!droppedImportRequest || droppedImportRequest.paths.length === 0) return
+    if (!droppedImportRequest) return
     if (droppedImportRequest.id === lastDroppedImportRequestRef.current) return
     lastDroppedImportRequestRef.current = droppedImportRequest.id
     const request = droppedImportRequest
-    void importDroppedSources(request.paths, request.folderId || null).finally(() => {
+    void importDroppedSources(request.selection, request.folderId || null).finally(() => {
       onDroppedImportHandled?.(request.id)
     })
   }, [droppedImportRequest, onDroppedImportHandled])
@@ -5054,8 +5095,14 @@ export default function LibraryView({
       }
     }
 
+    if (batchMode) {
+      setSelectedIds(toggleSelectionId(selectedIds, docId))
+      lastClickedDocIdRef.current = docId
+      return
+    }
+
     if (event?.ctrlKey || event?.metaKey) {
-      toggleSelect(docId)
+      setSelectedIds(toggleSelectionId(selectedIds, docId))
       setBatchMode(true)
       lastClickedDocIdRef.current = docId
       return
@@ -5063,7 +5110,7 @@ export default function LibraryView({
     lastClickedDocIdRef.current = docId
     setSelectedIds([docId])
     setBatchMode(false)
-  }, [batchMode, documentIdOrder, documents, selectedIds, setSelectedIds, toggleSelect])
+  }, [batchMode, documentIdOrder, documents, selectedIds, setSelectedIds])
 
   const handleDocumentOpen = useCallback((docId: string) => {
     onSelectDoc?.({ docId })
@@ -5160,7 +5207,9 @@ export default function LibraryView({
     if (!isExternalFileDrag(event)) return
 
     try {
-      await importDroppedSources(getDroppedPaths(event), folderId)
+      const result = await window.api.grantDroppedImportSources(Array.from(event.dataTransfer.files))
+      if (result.ok) await importDroppedSources(result.value, folderId)
+      else message.error(result.error.message)
     } catch (error) {
       console.error(error)
       message.error('拖拽导入到文件夹失败')
@@ -5190,7 +5239,6 @@ export default function LibraryView({
       label: '批量 OCR 识别',
       icon: <ThunderboltOutlined />,
       children: [
-        { key: 'ocr:local_paddle', label: '用本地 OCR' },
         { key: 'ocr:paddle', label: '用飞桨 OCR' },
         { key: 'ocr:vision_model', label: '用大模型 OCR' },
       ],
@@ -5200,7 +5248,6 @@ export default function LibraryView({
       label: '重新 OCR 已选文献',
       icon: <ReloadOutlined />,
       children: [
-        { key: 'ocr_force:local_paddle', label: '用本地 OCR 覆盖' },
         { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
         { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
       ],
@@ -6030,6 +6077,24 @@ export default function LibraryView({
           </div>
         ) : null}
 
+        {authorizationRequiredJobs.length > 0 ? (
+          <Alert
+            className="import-reauthorization-banner"
+            type="warning"
+            showIcon
+            message={`有 ${authorizationRequiredJobs.length} 个导入任务需要重新授权`}
+            description={(
+              <Space wrap size={8}>
+                {authorizationRequiredJobs.map((job) => (
+                  <Button key={job.id} size="small" onClick={() => promptImportQueueReauthorization(job)}>
+                    重新选择（约 {job.pendingCount} 个文件）
+                  </Button>
+                ))}
+              </Space>
+            )}
+          />
+        ) : null}
+
         <div className={`library-drop-hint ${dragActive ? 'drag-over' : ''}`}>
           <InboxOutlined />
           <span>{importing ? '正在后台导入文献，当前页面可继续使用' : '拖拽 PDF、图片、JSON、EPUB、TXT、Markdown 或文件夹到这里导入'}</span>
@@ -6044,7 +6109,6 @@ export default function LibraryView({
               value={importOcrEngine}
               onChange={(value) => setImportOcrEngine(value as OcrEngine)}
               options={[
-                { value: 'local_paddle', label: '本地 OCR' },
                 { value: 'paddle', label: '飞桨 OCR' },
                 { value: 'vision_model', label: '大模型 OCR' },
               ]}
@@ -6227,7 +6291,6 @@ export default function LibraryView({
                   label: '重新 OCR 整本文献',
                   icon: <ThunderboltOutlined />,
                   children: [
-                    { key: 'rerun_ocr_book:local_paddle', label: '用本地 OCR 覆盖' },
                     { key: 'rerun_ocr_book:paddle', label: '用飞桨 OCR 覆盖' },
                     { key: 'rerun_ocr_book:vision_model', label: '用大模型 OCR 覆盖' },
                   ],

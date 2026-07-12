@@ -43,6 +43,7 @@ import type {
   SearchResult,
 } from '@shared/types'
 import { getErrorMessage } from '@shared/errors'
+import { legacySearchLocatorFromUnknown } from '@shared/stable-reader-locator'
 import {
   DEFAULT_HIGHLIGHT_COLOR,
   HIGHLIGHT_COLOR_OPTIONS,
@@ -145,7 +146,7 @@ function getSourceNumber(source: JsonRecord | null | undefined, key: string): nu
 }
 
 function asSearchHitLocator(value: unknown): SearchHitLocator | undefined {
-  return isRecord(value) ? value as unknown as SearchHitLocator : undefined
+  return legacySearchLocatorFromUnknown(value) || undefined
 }
 
 function getKindMeta(kind?: string) {

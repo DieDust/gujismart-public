@@ -50,7 +50,7 @@ import { shouldTranslatePageText } from '@shared/translation-text'
 import { getOrBuildOcrPageIr, getOcrPageIr, getOcrRegionRerecognitionCandidates } from '@shared/ocr-ir'
 import { DEFAULT_HIGHLIGHT_COLOR } from '../utils/highlightColors'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
-import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, TranslationGlossaryScope, TranslationMode, TranslationUnitV1 } from '@shared/types'
+import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, StableReaderLocator, TranslationGlossaryScope, TranslationMode, TranslationUnitV1 } from '@shared/types'
 
 const { Title, Text } = Typography
 const AiPanel = lazy(() => import('../components/AiPanel'))
@@ -92,6 +92,7 @@ interface DocumentViewProps {
   searchKeyword?: string
   sourceId?: string
   locator?: SearchHitLocator
+  stableLocator?: StableReaderLocator
   searchSession?: SearchSessionState
   revealToc?: boolean
   highlightExcerpt?: string
@@ -454,6 +455,31 @@ function getSearchLocatorKey(locator: SearchHitLocator | null | undefined, keywo
   ].join('|')
 }
 
+function resolveStableLocatorPageIndex(
+  pages: Array<Pick<DocumentViewPage, 'id' | 'page_num'>>,
+  stableLocator: StableReaderLocator | null | undefined,
+  legacyLocator: SearchHitLocator | null | undefined,
+  fallbackIndex = 0,
+): number {
+  if (!stableLocator) return resolveLocatorPageIndex(pages, legacyLocator, fallbackIndex)
+  if (pages.length === 0) {
+    if (stableLocator.pageNum) return Math.max(0, stableLocator.pageNum - 1)
+    return Math.max(0, fallbackIndex)
+  }
+  if (stableLocator.sourcePageId) {
+    const byId = pages.findIndex((page) => String(page.id) === stableLocator.sourcePageId)
+    if (byId >= 0) return byId
+  }
+  if (stableLocator.pageNum) {
+    const byPageNum = pages.findIndex((page) => Number(page.page_num) === stableLocator.pageNum)
+    if (byPageNum >= 0) return byPageNum
+  }
+  if (stableLocator.progressFallback !== undefined) {
+    return clampPageIndex(Math.round(stableLocator.progressFallback * Math.max(0, pages.length - 1)), pages.length)
+  }
+  return resolveLocatorPageIndex(pages, legacyLocator, fallbackIndex)
+}
+
 type ReaderGlobalPreferences = {
   view_mode: ReaderViewMode
   font_family: string
@@ -477,6 +503,7 @@ const DEFAULT_READER_GLOBAL_PREFERENCES: ReaderGlobalPreferences = {
 function getDocumentOpenContextKey(
   documentId: string,
   locator: SearchHitLocator | null | undefined,
+  stableLocator: StableReaderLocator | null | undefined,
   initialPageIndex = 0,
   searchKeyword = '',
   sourceId = '',
@@ -487,6 +514,7 @@ function getDocumentOpenContextKey(
   return [
     documentId,
     getSearchLocatorKey(locator, searchKeyword),
+    stableLocator ? `${stableLocator.precision}:${stableLocator.sourcePageId || ''}:${stableLocator.pageNum || ''}` : '',
     initialPageIndex,
     searchKeyword,
     sourceId,
@@ -1299,6 +1327,7 @@ export default function DocumentView({
   searchKeyword = '',
   sourceId,
   locator,
+  stableLocator,
   searchSession,
   revealToc = false,
   highlightExcerpt = '',
@@ -1310,7 +1339,7 @@ export default function DocumentView({
   onOpenDocument,
   compactHeader = false,
 }: DocumentViewProps) {
-  const openContextKey = getDocumentOpenContextKey(documentId, locator, initialPageIndex, searchKeyword, sourceId, highlightExcerpt, revealToc, searchSession)
+  const openContextKey = getDocumentOpenContextKey(documentId, locator, stableLocator, initialPageIndex, searchKeyword, sourceId, highlightExcerpt, revealToc, searchSession)
   const [doc, setDoc] = useState<DocumentViewDocument | null>(null)
   const [loading, setLoading] = useState(true)
   const [ocrProcessing, setOcrProcessing] = useState(false)
@@ -1439,7 +1468,7 @@ export default function DocumentView({
       onOpenDocument?.(target)
       return
     }
-    const targetPageIndex = resolveLocatorPageIndex(sortedPagesRef.current, target.locator, target.pageIndex ?? initialPageIndex)
+    const targetPageIndex = resolveStableLocatorPageIndex(sortedPagesRef.current, target.stableLocator, target.locator, target.pageIndex ?? initialPageIndex)
     const keyword = target.keyword || target.highlightExcerpt || target.locator?.queryTerm || target.excerpt?.slice(0, 40) || ''
     temporaryNavigationRef.current = true
     setDocumentMode('read')
@@ -2069,7 +2098,7 @@ export default function DocumentView({
         throw new Error('Document detail is empty')
       }
       setDoc(normalizedDoc)
-      const targetIndex = resolveLocatorPageIndex(normalizedDoc.pages || [], locator, initialPageIndex)
+      const targetIndex = resolveStableLocatorPageIndex(normalizedDoc.pages || [], stableLocator, locator, initialPageIndex)
       void loadPagesAround(targetIndex, 4)
     } catch (error) {
       console.error(error)
@@ -2077,7 +2106,7 @@ export default function DocumentView({
     } finally {
       if (activeDocumentIdRef.current === targetDocId) setLoading(false)
     }
-  }, [documentId, initialPageIndex, loadPagesAround, locator])
+  }, [documentId, initialPageIndex, loadPagesAround, locator, stableLocator])
 
   const saveReaderStateSoon = useCallback((state: ReaderStateSavePayload) => {
     if (temporaryNavigationRef.current) return
@@ -2441,7 +2470,7 @@ export default function DocumentView({
     hasInitializedPageRef.current = false
     readerStateLoadedRef.current = false
     documentModeTouchedRef.current = false
-    const initialTargetPageIndex = Math.max(0, getFinitePageIndex(locator?.pageIndex) ?? initialPageIndex)
+    const initialTargetPageIndex = resolveStableLocatorPageIndex([], stableLocator, locator, initialPageIndex)
     setCurrentPageIndex(initialTargetPageIndex)
     setReaderPageIndex(initialTargetPageIndex)
     setDocumentMode('read')
@@ -2459,7 +2488,7 @@ export default function DocumentView({
     searchRequestIdRef.current += 1
     incomingSearchSessionKeyRef.current = ''
     appliedInitialSearchLocatorKeyRef.current = ''
-    temporaryNavigationRef.current = !!(sourceId || locator || searchSession?.hits?.length || searchKeyword || highlightExcerpt)
+    temporaryNavigationRef.current = !!(sourceId || locator || stableLocator || searchSession?.hits?.length || searchKeyword || highlightExcerpt)
     setDocumentSearchSession(searchSession)
     setCurrentMatchIndex(searchSession?.activeHitIndex ?? -1)
     if (revealToc) {
@@ -2474,7 +2503,7 @@ export default function DocumentView({
           throw new Error('Document detail is empty')
         }
         setDoc(normalizedDoc)
-        const targetIndex = resolveLocatorPageIndex(normalizedDoc.pages || [], locator, initialPageIndex)
+        const targetIndex = resolveStableLocatorPageIndex(normalizedDoc.pages || [], stableLocator, locator, initialPageIndex)
         void loadPagesAround(targetIndex, 4)
       } catch (error) {
         console.error(error)
@@ -2494,11 +2523,11 @@ export default function DocumentView({
     const maxIndex = doc.pages ? doc.pages.length - 1 : 0
     if (!hasInitializedPageRef.current) {
       hasInitializedPageRef.current = true
-      setCurrentPageIndex(resolveLocatorPageIndex(sortedPages, locator, initialPageIndex))
+      setCurrentPageIndex(resolveStableLocatorPageIndex(sortedPages, stableLocator, locator, initialPageIndex))
       return
     }
     setCurrentPageIndex((value) => Math.min(value, maxIndex))
-  }, [doc, documentMode, initialPageIndex, isEbookDocument, locator, sortedPages])
+  }, [doc, documentMode, initialPageIndex, isEbookDocument, locator, sortedPages, stableLocator])
 
   useEffect(() => {
     const query = effectiveSearchKeyword.trim()
@@ -2971,7 +3000,6 @@ export default function DocumentView({
         putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
         if (options?.updateDoc !== false && doc?.id && page.id) {
           const imagePath = await window.api.cachePageImage(doc.id, page.page_num, rendered.dataUrl)
-          await window.api.updatePage(page.id, { image_path: imagePath })
           setDoc((previous) => {
             if (!previous?.pages) return previous
             return {
@@ -3006,10 +3034,9 @@ export default function DocumentView({
         pageNums: [page.page_num],
         messageKey,
         onProgress: (content, key) => message.loading({ content, key: key || messageKey, duration: 0 }),
-        onPageCached: async (pageNum, imagePath, dataUrl) => {
+        onPageCached: async (pageNum, _imagePath, dataUrl) => {
           if (pageNum !== page.page_num) return
           putLimitedPageImageCache(pageImageCacheRef.current, getPageImageCacheKey(page, doc.id, documentId), dataUrl)
-          await window.api.updatePage(page.id, { image_path: imagePath })
         },
       })
       if (result.cachedPageNums.includes(page.page_num)) return true
@@ -3037,7 +3064,6 @@ export default function DocumentView({
       const rendered = await renderPdfFilePageToImage(sourceFilePath, page.page_num)
       const imagePath = await window.api.cachePageImage(doc.id, page.page_num, rendered.dataUrl)
       putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
-      await window.api.updatePage(page.id, { image_path: imagePath })
       setDoc((previous) => {
         if (!previous?.pages) return previous
         return {
@@ -3446,8 +3472,10 @@ export default function DocumentView({
         await window.api.updateDocument(doc.id, { ocr_status: 'pending' })
       }
       const storedEngine = parseMaybeJson(doc.metadata)?.ocr_engine
-      const targetEngine = isOcrEngine(storedEngine) ? storedEngine : undefined
-      if (targetEngine === 'local_paddle' || targetEngine === 'vision_model' || targetEngine === 'hybrid') {
+      const targetEngine = isOcrEngine(storedEngine)
+        ? storedEngine === 'local_paddle' || storedEngine === 'hybrid' ? 'paddle' : storedEngine
+        : undefined
+      if (targetEngine === 'vision_model') {
         const messageKey = `document-ocr-${doc.id}`
         try {
           await ensureOcrPageImages(doc, {
@@ -3549,7 +3577,6 @@ export default function DocumentView({
               : JSON.stringify(data.ocr_result)
           return {
             ...page,
-            image_path: data.image_path ?? page.image_path,
             ocr_result: nextOcrResult,
             ocr_text: data.ocr_text ?? page.ocr_text,
             proofed_text: data.proofed_text ?? page.proofed_text,
@@ -3627,9 +3654,6 @@ export default function DocumentView({
         const rendered = await renderPdfFilePageToImage(sourceFilePath, targetPage.page_num)
         const imagePath = await window.api.cachePageImage(doc.id, targetPage.page_num, rendered.dataUrl)
         putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, rendered.dataUrl)
-        if (targetPage.id) {
-          await window.api.updatePage(targetPage.id, { image_path: imagePath })
-        }
         setDoc((previous) => {
           if (!previous?.pages) return previous
           const nextMetadata = parseMaybeJson(previous.metadata)
@@ -3655,12 +3679,9 @@ export default function DocumentView({
         sourceFilePath,
         messageKey,
         onProgress: (content, key) => message.loading({ content, key: key || messageKey, duration: 0 }),
-        onPageCached: async (pageNum, imagePath, dataUrl) => {
+        onPageCached: async (pageNum, _imagePath, dataUrl) => {
           if (pageNum !== targetPage.page_num) return
           putLimitedPageImageCache(pageImageCacheRef.current, cacheKey, dataUrl)
-          if (targetPage.id) {
-            await window.api.updatePage(targetPage.id, { image_path: imagePath })
-          }
           if (targetPage.id === currentPage?.id || targetPage.page_num === currentPage?.page_num) {
             setImageDataUrl(dataUrl)
           }
@@ -3678,11 +3699,13 @@ export default function DocumentView({
     }
   }
 
-  const handleRestorePdfAsset = async (manualPath?: string, targetPage: DocumentViewPage | undefined = currentPage) => {
+  const handleRestorePdfAsset = async (targetPage: DocumentViewPage | undefined = currentPage, manual = false) => {
     if (!doc?.id) return false
     setRestoringPdf(true)
     try {
-      const result = await window.api.restorePdfForDocument(doc.id, manualPath)
+      const result = manual
+        ? await window.api.selectAndRestorePdfForDocument(doc.id)
+        : await window.api.restorePdfForDocument(doc.id)
       if (result?.restored) {
         const refreshed = await refreshDocumentKeepPage(targetPage?.id || currentPage?.id)
         const refreshedPage = refreshed?.pages?.find((page) => (
@@ -3706,13 +3729,7 @@ export default function DocumentView({
   }
 
   const handleRestorePdfManually = async () => {
-    const paths = await window.api.openFileDialog()
-    const pdfPath = paths.find((item) => item.toLowerCase().endsWith('.pdf'))
-    if (!pdfPath) {
-      message.warning('请选择 PDF 文件')
-      return
-    }
-    await handleRestorePdfAsset(pdfPath)
+    await handleRestorePdfAsset(currentPage, true)
   }
 
   const switchDocumentMode = async (nextMode: DocumentMode) => {
@@ -3733,7 +3750,7 @@ export default function DocumentView({
       pageCount,
     )
     if (nextMode === 'proof' && isTextOnlyPdf) {
-      const restored = await handleRestorePdfAsset(undefined, sortedPages[syncedPageIndex] || currentPage)
+      const restored = await handleRestorePdfAsset(sortedPages[syncedPageIndex] || currentPage)
       if (documentModeSwitchSerialRef.current !== switchSerial) return
       if (!restored) {
         message.warning('无法自动补回原始 PDF，请手动选择 PDF')
@@ -4352,9 +4369,11 @@ export default function DocumentView({
   }, [drainReaderTranslationQueue, hasReadyTranslationForSource])
 
   const updateReaderTranslationUnit = useCallback(async (pageId: string, unitId: string, translationText: string) => {
+    const expectedRevisionId = (pageTranslationUnits[pageId] || []).find((unit) => unit.id === unitId)?.currentRevisionId || null
     const updated = await window.api.updateTranslationUnit(unitId, {
       translationText,
       manualOverride: true,
+      expectedRevisionId,
     })
     if (!updated) throw new Error('翻译单元不存在')
     setPageTranslationUnits((current) => {
@@ -4366,7 +4385,7 @@ export default function DocumentView({
       }))
       return { ...current, [pageId]: nextUnits }
     })
-  }, [])
+  }, [pageTranslationUnits])
 
   const retranslateReaderTranslationUnit = useCallback(async (payload: ReaderTranslationPayload, unitId: string) => {
     if (!doc?.id) return

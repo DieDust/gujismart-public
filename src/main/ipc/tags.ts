@@ -9,9 +9,27 @@ function normalizeTagName(name: string): string {
   return name.trim().toLowerCase()
 }
 
+function normalizeTagParentId(value: unknown): string | null {
+  const parentId = String(value || '').trim()
+  return parentId || null
+}
+
+function assertTagParentAllowed(tagId: string | null, nextParentId: string | null): void {
+  if (!nextParentId) return
+  const visited = new Set<string>()
+  let currentId: string | null = nextParentId
+  while (currentId) {
+    if (tagId && currentId === tagId) throw new Error('不能把标签移动到自己或自己的子标签下面')
+    if (visited.has(currentId)) throw new Error('标签层级已存在循环，请先修复后再编辑')
+    visited.add(currentId)
+    const current = queryOne<Pick<Tag, 'id' | 'parent_id'>>('SELECT id, parent_id FROM tags WHERE id = ?', [currentId])
+    if (!current) throw new Error('父标签不存在')
+    currentId = normalizeTagParentId(current.parent_id)
+  }
+}
+
 export function registerTagIpc(): void {
   ipcMain.handle('tags:list', async (_event, search?: string): Promise<Tag[]> => {
-    refreshTagUsage()
     const keyword = search?.trim()
     if (keyword) {
       return queryAll<Tag>(
@@ -23,8 +41,11 @@ export function registerTagIpc(): void {
   })
 
   ipcMain.handle('tags:create', async (_event, data: TagCreatePayload): Promise<Tag | null> => {
-    const name = data.name.trim()
+    const name = String(data.name || '').trim()
+    if (!name) throw new Error('标签名称不能为空')
     const normalizedName = normalizeTagName(name)
+    const parentId = normalizeTagParentId(data.parent_id)
+    assertTagParentAllowed(null, parentId)
     const existing = queryOne<Tag>('SELECT * FROM tags WHERE normalized_name = ?', [normalizedName])
     if (existing) return existing
 
@@ -32,7 +53,7 @@ export function registerTagIpc(): void {
     const now = new Date().toISOString()
     run(
       'INSERT INTO tags (id, name, color, parent_id, source, confidence, usage_count, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, name, data.color || '#1890ff', data.parent_id || null, data.source || 'manual', data.confidence ?? null, 0, normalizedName, now, now]
+      [id, name, data.color || '#1890ff', parentId, data.source || 'manual', data.confidence ?? null, 0, normalizedName, now, now]
     )
     saveDatabase()
     markLibraryStateCacheDirty()
@@ -40,14 +61,26 @@ export function registerTagIpc(): void {
   })
 
   ipcMain.handle('tags:update', async (_event, id: string, data: TagUpdatePayload): Promise<Tag | null> => {
+    const tagId = String(id || '').trim()
+    if (!tagId) return null
+    const current = queryOne<Tag>('SELECT * FROM tags WHERE id = ?', [tagId])
+    if (!current) return null
+    const nextName = data.name === undefined ? current.name : String(data.name || '').trim()
+    if (!nextName) throw new Error('标签名称不能为空')
+    const nextNormalizedName = normalizeTagName(nextName)
+    const nextParentId = data.parent_id === undefined ? normalizeTagParentId(current.parent_id) : normalizeTagParentId(data.parent_id)
+    assertTagParentAllowed(tagId, nextParentId)
+    const conflict = queryOne<Tag>('SELECT * FROM tags WHERE normalized_name = ? AND id <> ?', [nextNormalizedName, tagId])
+    if (conflict) throw new Error(`已存在同名标签“${nextName}”`)
+
     const sets: string[] = []
     const params: unknown[] = []
 
     if (data.name !== undefined) {
       sets.push('name = ?')
-      params.push(String(data.name).trim())
+      params.push(nextName)
       sets.push('normalized_name = ?')
-      params.push(normalizeTagName(String(data.name)))
+      params.push(nextNormalizedName)
     }
     if (data.color !== undefined) {
       sets.push('color = ?')
@@ -55,7 +88,7 @@ export function registerTagIpc(): void {
     }
     if (data.parent_id !== undefined) {
       sets.push('parent_id = ?')
-      params.push(data.parent_id)
+      params.push(nextParentId)
     }
     if (data.source !== undefined) {
       sets.push('source = ?')
@@ -72,11 +105,11 @@ export function registerTagIpc(): void {
       return queryOne<Tag>('SELECT * FROM tags WHERE id = ?', [id])
     }
 
-    params.push(id)
+    params.push(tagId)
     run(`UPDATE tags SET ${sets.join(', ')} WHERE id = ?`, params)
     saveDatabase()
     markLibraryStateCacheDirty()
-    return queryOne<Tag>('SELECT * FROM tags WHERE id = ?', [id])
+    return queryOne<Tag>('SELECT * FROM tags WHERE id = ?', [tagId])
   })
 
   ipcMain.handle('tags:delete', async (_event, id: string): Promise<boolean> => {

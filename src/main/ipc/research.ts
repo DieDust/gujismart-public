@@ -6,8 +6,14 @@ import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { buildCitationByStyle } from './citation'
 import type {
   AiSynthesisTemplate,
+  CursorPage,
   Document,
+  ResearchEvidence,
+  ResearchEvidenceRelation,
   ResearchDashboardStats,
+  ResearchClaimBinding,
+  ResearchClaimManifestPage,
+  ResearchClaimManifestValidationResult,
   ResearchKnowledgeKind,
   ResearchNote,
   ResearchNotePayload,
@@ -17,6 +23,7 @@ import type {
   ResearchOutlineUpdatePayload,
   ResearchOutput,
   ResearchOutputPayload,
+  ResearchOutputVersion,
   ResearchProject,
   ResearchProjectExportOptions,
   ResearchProjectExportResult,
@@ -31,6 +38,14 @@ import {
 import { buildResearchProjectIntegrityReport } from '../../shared/research-integrity'
 import { stringifyResearchLocator } from '../../shared/research-locator'
 import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
+import {
+  createResearchOutputVersion,
+  finalizeResearchOutputVersion,
+  getResearchClaimManifestPage,
+  listResearchEvidenceRelations,
+  promoteResearchNoteToEvidence,
+  validateResearchClaimManifest,
+} from '../research-repository'
 
 type ResearchMetadata = Record<string, unknown>
 type ProjectRow = Pick<ResearchProject, 'id' | 'name' | 'description'>
@@ -111,10 +126,6 @@ function stableHashPrefix(value: string): string {
 
 function previewText(value: unknown, limit = 180): string {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit)
-}
-
-function normalizeOutputInputSnapshotJson(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : ''
 }
 
 function stringifyLocator(data: ResearchNotePayload, defaults: { docId: string; pageNum: unknown; sourceType: string }): string {
@@ -428,6 +439,26 @@ function getProjectIntegrityReport(projectId: string) {
     "SELECT COUNT(*) as count FROM ai_research_records WHERE project_id = ? AND status NOT IN ('confirmed', 'excluded')",
     [projectId],
   )?.count || 0)
+  const evidenceCount = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(DISTINCT re.id) as count FROM research_evidence re
+     INNER JOIN research_evidence_relations rer ON rer.evidence_id = re.id
+     WHERE rer.project_id = ? AND rer.status = 'active'`,
+    [projectId],
+  )?.count || 0)
+  const staleEvidenceCount = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(DISTINCT re.id) as count FROM research_evidence re
+     INNER JOIN research_evidence_relations rer ON rer.evidence_id = re.id
+     WHERE rer.project_id = ? AND rer.status = 'active' AND re.verification_status <> 'verified'`,
+    [projectId],
+  )?.count || 0)
+  const formalOutputVersionCount = Number(queryOne<{ count: number }>(
+    "SELECT COUNT(*) as count FROM research_output_versions WHERE project_id = ? AND status = 'formal'",
+    [projectId],
+  )?.count || 0)
+  const draftOutputVersionCount = Number(queryOne<{ count: number }>(
+    "SELECT COUNT(*) as count FROM research_output_versions WHERE project_id = ? AND status = 'draft'",
+    [projectId],
+  )?.count || 0)
   return buildResearchProjectIntegrityReport({
     projectId,
     documentCount,
@@ -436,6 +467,10 @@ function getProjectIntegrityReport(projectId: string) {
     aiDatasetCount,
     aiRecordCount,
     unconfirmedAiRecordCount,
+    evidenceCount,
+    staleEvidenceCount,
+    formalOutputVersionCount,
+    draftOutputVersionCount,
     notes: notes.map((note) => ({
       id: note.id,
       locatorJson: note.locator_json,
@@ -954,11 +989,45 @@ export function registerResearchIpc(): void {
 
   ipcMain.handle('research:listNotes', async (_event, projectId?: string | null): Promise<ResearchNote[]> => listNotes(projectId))
 
+  ipcMain.handle(
+    'research:listEvidenceRelations',
+    async (
+      _event,
+      projectId: string,
+      options?: { limit?: number; cursor?: string | null },
+    ): Promise<CursorPage<ResearchEvidenceRelation & { evidence: ResearchEvidence }>> => (
+      listResearchEvidenceRelations(projectId, options)
+    ),
+  )
+
+  ipcMain.handle(
+    'research:promoteNoteEvidence',
+    async (_event, noteId: string): Promise<{ evidence: ResearchEvidence; relation: ResearchEvidenceRelation | null }> => (
+      promoteResearchNoteToEvidence(noteId)
+    ),
+  )
+
   ipcMain.handle('research:deleteNote', async (_event, id: string): Promise<boolean> => {
     run('DELETE FROM research_notes WHERE id = ?', [id])
     saveDatabase()
     return true
   })
+
+  ipcMain.handle('research:getClaimManifest', async (
+    _event,
+    outputVersionId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<ResearchClaimManifestPage | null> => getResearchClaimManifestPage(outputVersionId, options))
+
+  ipcMain.handle('research:validateClaimManifest', async (
+    _event,
+    outputVersionId: string,
+  ): Promise<ResearchClaimManifestValidationResult> => validateResearchClaimManifest(outputVersionId))
+
+  ipcMain.handle('research:finalizeOutputVersion', async (
+    _event,
+    input: { draftOutputVersionId: string; expectedClaimManifestHash: string; claimBindings: ResearchClaimBinding[] },
+  ): Promise<ResearchOutputVersion> => finalizeResearchOutputVersion(input))
 
   ipcMain.handle('research:synthesizeProject', async (
     _event,
@@ -988,6 +1057,15 @@ export function registerResearchIpc(): void {
           'INSERT INTO research_outputs (id, project_id, output_type, title, content, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
           [id, projectId, templateType, `${project.name} - AI 研究综述`, content, inputSnapshotJson, new Date().toISOString()],
         )
+        createResearchOutputVersion({
+          outputId: id,
+          projectId,
+          outputType: templateType,
+          title: `${project.name} - AI 研究综述`,
+          content,
+          recordIds: [],
+          status: 'draft',
+        })
         saveDatabase()
         return requireQueryResult(
           queryOne<ResearchOutput>('SELECT * FROM research_outputs WHERE id = ?', [id]),
@@ -1014,6 +1092,15 @@ export function registerResearchIpc(): void {
       'INSERT INTO research_outputs (id, project_id, output_type, title, content, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [id, projectId, templateType, `${project.name} - AI 研究综述`, content, inputSnapshotJson, new Date().toISOString()],
     )
+    createResearchOutputVersion({
+      outputId: id,
+      projectId,
+      outputType: templateType,
+      title: `${project.name} - AI 研究综述`,
+      content,
+      recordIds: [],
+      status: 'draft',
+    })
     saveDatabase()
     return requireQueryResult(
       queryOne<ResearchOutput>('SELECT * FROM research_outputs WHERE id = ?', [id]),
@@ -1031,21 +1118,30 @@ export function registerResearchIpc(): void {
     const project = queryOne<ProjectRow>('SELECT * FROM research_projects WHERE id = ?', [projectId])
     if (!project) throw new Error('研究专题不存在')
     const id = nanoid()
-    const inputSnapshotJson = normalizeOutputInputSnapshotJson(payload.input_snapshot_json || payload.inputSnapshotJson)
-      || buildResearchOutputSnapshotJson({
-        source: 'research:createOutput',
-        projectId,
-        outputType: payload.output_type,
-        sourceDatasetId: payload.source_dataset_id || null,
-        metadata: {
-          contentHash: stableHashPrefix(content),
-          titleHash: stableHashPrefix(title),
-        },
-      })
+    const inputSnapshotJson = buildResearchOutputSnapshotJson({
+      source: 'research:createOutput',
+      projectId,
+      outputType: payload.output_type,
+      sourceDatasetId: payload.source_dataset_id || null,
+      metadata: {
+        contentHash: stableHashPrefix(content),
+        titleHash: stableHashPrefix(title),
+      },
+    })
     run(
       'INSERT INTO research_outputs (id, project_id, output_type, title, content, source_dataset_id, input_snapshot_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       [id, projectId, payload.output_type, title, content, payload.source_dataset_id || null, inputSnapshotJson, new Date().toISOString()],
     )
+    createResearchOutputVersion({
+      outputId: id,
+      projectId,
+      outputType: payload.output_type,
+      title,
+      content,
+      recordIds: [],
+      aggregateIds: payload.aggregate_ids || payload.aggregateIds || [],
+      status: 'draft',
+    })
     saveDatabase()
     return requireQueryResult(
       queryOne<ResearchOutput>('SELECT * FROM research_outputs WHERE id = ?', [id]),

@@ -143,8 +143,18 @@ assert(
   batchSource.includes('resumePendingQueueFromDatabase()')
     && batchSource.includes('reconcileFinishedQueueItems()')
     && batchSource.includes('queueItemIdsByJob')
-    && batchSource.includes("UPDATE batch_queue SET status = ?, progress = ?"),
-  'Legacy batch processor should be able to resume persisted queue items and write terminal item status back to batch_queue.',
+    && batchSource.includes('bridgeLegacyBatchQueue()')
+    && batchSource.includes('startLegacyBatchItem(')
+    && batchSource.includes('completeLegacyBatchItem(')
+    && batchSource.includes('failLegacyBatchItem('),
+  'Legacy batch processor should resume through the durable scheduler and project terminal status back to batch_queue.',
+)
+assert(
+  batchSource.includes('activeControllersByJob')
+    && batchSource.includes('this.activeControllersByJob.get(jobId)?.forEach((controller) => controller.abort())')
+    && batchSource.includes("job.status = 'canceled'")
+    && processBatchBody.includes("if (job.status === 'canceled') return"),
+  'Canceling one batch should abort only that job and must not project canceled items back to pending.',
 )
 assert(
   batchSource.includes('function getBatchDocumentOcrReviewMessage')

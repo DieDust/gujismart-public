@@ -1,5 +1,61 @@
 # 更新日志 / Changelog
 
+## 1.1.0 - 2026-07-12
+
+### 中文
+
+#### 新增
+
+- 新增可恢复的持久任务调度、稳定阅读定位、搜索快照与研究证据谱系，为大批量导入、OCR、检索、翻译和 AI 研究提供统一的状态与追溯能力。
+- 新增 AI OCR 服务商配置管理和真实图片连接测试；只有测试成功且 URL、模型、API Key 均未变化的配置才能保存、切换、设为默认或执行 OCR。
+- 新增引用快照、导出快照、研究输出版本、翻译修订与冲突保护，降低后台结果覆盖人工修改或正式研究成果失去来源的问题。
+- 新增本地 RC 证据、SPDX SBOM、vendor 文件哈希清单和 packaged smoke，为后续开源发布提供可复核材料。
+
+#### 改进
+
+- 批量导入改为按用户设置的并发数量持续补位处理，队列可容纳大量文件，并强化中断恢复、授权恢复和进度一致性。
+- OCR 结果使用不可变产物和唯一正文解析链路，优先保护人工校对；改进整本 PDF 双栏文本层、纵横排阅读顺序、坐标、图片和表格数据的兼容性。
+- 改进文献批量删除、多选取消、文件夹与标签管理、工作区恢复和阅读器定位，减少大批量操作卡顿及交互状态意外退出。
+- 改进设置与凭据安全，API Key 仅由主进程安全存储，备份、日志、IPC 和渲染进程不再暴露明文密钥。
+- 改进全库/全文检索、研究证据、翻译、引用和导出的版本化与原子写入，增强结果稳定性和可追溯性。
+
+#### 调整
+
+- 暂停本地 PaddleOCR 功能。当前继续使用飞桨云端 OCR 或通过测试的 AI OCR，以确保坐标、图片和表格能力完整。
+- 本版本可直接从 GitHub Release 升级；继续兼容原有数据库和文献目录，首次启动后会在后台恢复未完成任务，无需手动迁移数据。
+
+#### 下载
+
+- `GujiSmart-1.1.0-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.0-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- Added a recoverable persistent task scheduler, stable reader locators, search snapshots, and research evidence lineage for consistent state and traceability across large imports, OCR, search, translation, and AI research.
+- Added AI OCR provider management with a real image connection test. A configuration can only be saved, activated, selected as default, or used for OCR after a successful test, and any URL, model, or API key change invalidates that result.
+- Added citation snapshots, export snapshots, research output versions, translation revisions, and conflict protection to prevent background results from overwriting manual work or detaching formal research outputs from their sources.
+- Added local RC evidence, an SPDX SBOM, bundled-vendor file hashes, and packaged smoke testing for later open-source release review.
+
+#### Improvements
+
+- Changed bulk import to continuously refill the user-configured concurrency window, support large queues, and improve interruption recovery, authorization recovery, and progress consistency.
+- Moved OCR results to immutable artifacts and a single canonical content path that protects manual proofreading, with improved compatibility for whole-PDF two-column text layers, mixed reading directions, coordinates, images, and tables.
+- Improved bulk document deletion, selection toggling, folder and tag management, workspace restoration, and reader positioning to reduce freezes and unexpected interaction exits during large operations.
+- Hardened settings and credential storage so API keys remain main-process-only and are not exposed through backups, logs, IPC payloads, or renderer state snapshots.
+- Improved versioning and atomic persistence for library/full-text search, research evidence, translation, citation, and export results.
+
+#### Changes
+
+- Temporarily retired local PaddleOCR. Cloud PaddleOCR or a successfully tested AI OCR provider should be used to retain coordinate, image, and table support.
+- This release can be installed directly from GitHub Releases. Existing databases and document directories remain compatible, and unfinished tasks resume in the background after startup without a manual data migration.
+
+#### Downloads
+
+- `GujiSmart-1.1.0-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.1.0-Portable-x64.exe` for portable use.
+
 ## 1.0.9 - 2026-07-03
 
 ### 中文

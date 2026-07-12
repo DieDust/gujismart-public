@@ -40,6 +40,11 @@ import type {
   BatchItemStatus,
   BatchJob,
   BatchOcrOptions,
+  ImportAutoOcrTaskAppendResult,
+  ImportAutoOcrTaskCreateOptions,
+  ImportAutoOcrTaskCreateResult,
+  ImportAutoOcrTaskItemInput,
+  ImportAutoOcrTaskStartResult,
   BatchQueueItem,
   BatchStartResult,
   BackupImportResult,
@@ -56,6 +61,8 @@ import type {
   AppPathName,
   AppUpdateInfo,
   CitationGenerateOptions,
+  CitationResolutionV2,
+  CitationSnapshot,
   CitationStyle,
   CitationStyleDraft,
   CitationStyleDraftOptions,
@@ -67,8 +74,11 @@ import type {
   CitationTemplateInference,
   CitationTemplatePayload,
   CitationTemplateUpdatePayload,
+  CursorPage,
   BulkAssociationResult,
+  CapabilityResult,
   CompletedPdfAssetCleanupResult,
+  CredentialDraftRef,
   Document,
   DocumentAppendPagePayload,
   DocumentAppendPagesOptions,
@@ -96,6 +106,8 @@ import type {
   DocumentUpdatePayload,
   ImportDocumentResult,
   ImportDocumentOptions,
+  ImportSelection,
+  ImportSelectionBatch,
   ImportProgressEvent,
   InitializePdfPagesOptions,
   PdfInfoResult,
@@ -139,6 +151,11 @@ import type {
   ReaderState,
   ReaderStateSavePayload,
   ResearchKnowledgeKind,
+  ResearchAggregateArtifact,
+  ResearchAggregateRelation,
+  ResearchClaimBinding,
+  ResearchClaimManifestPage,
+  ResearchClaimManifestValidationResult,
   ResearchNote,
   ResearchNotePayload,
   ResearchNoteUpdatePayload,
@@ -147,6 +164,7 @@ import type {
   ResearchOutlineUpdatePayload,
   ResearchOutput,
   ResearchOutputPayload,
+  ResearchOutputVersion,
   ResearchProject,
   ResearchReferenceExportFormat,
   ResearchProjectExportOptions,
@@ -154,7 +172,8 @@ import type {
   ResearchProjectPayload,
   ResearchProjectUpdatePayload,
   ResearchDashboardStats,
-  ResolvedImportSource,
+  ResearchEvidence,
+  ResearchEvidenceRelation,
   SavedSearch,
   SavedSearchPayload,
   SavedSearchRunResult,
@@ -164,6 +183,9 @@ import type {
   SearchExportResult,
   SearchDocumentHitPage,
   SearchGroupedResponse,
+  SearchSnapshotValidationResult,
+  ResolvedSearchEvidence,
+  StableReaderLocator,
   SearchIndexStatus,
   SearchOptions,
   SearchReindexAllResult,
@@ -179,6 +201,8 @@ import type {
   TaskProgressEvent,
   TranslationUnitUpdatePayload,
   TranslationUnitV1,
+  TranslationContextSnapshot,
+  TranslationUnitRevision,
   TocItemSource,
   TocItemV2,
   TranslationGlossaryListOptions,
@@ -189,8 +213,24 @@ import type {
   TypesetEnvironmentStatus,
   TypesetMetadata,
   TypesetTemplate,
+  VisionOcrConnectionTestPayload,
+  VisionOcrConnectionTestResult,
   CompactAutoBackupResult,
 } from '../shared/types'
+
+type RendererCredentialKey = 'llm_api_key' | 'paddleocr_api_key' | 'vision_ocr_api_key'
+
+async function prepareCredentialDraft(key: RendererCredentialKey, value: string): Promise<CredentialDraftRef | null> {
+  const secret = String(value || '')
+  if (!secret) return null
+  return ipcRenderer.invoke('settings:credential:prepare', key, secret)
+}
+
+async function saveCredential(key: RendererCredentialKey, value: string): Promise<unknown> {
+  const draft = await prepareCredentialDraft(key, value)
+  if (!draft) return null
+  return ipcRenderer.invoke('settings:credential:commit', key, draft.draftRef)
+}
 
 type IpcUnsubscribe = () => void
 
@@ -215,26 +255,35 @@ const api = {
     ipcRenderer.invoke('documents:cleanupPdfAssets', docId),
   cleanupCompletedPdfAssets: (): Promise<CompletedPdfAssetCleanupResult> =>
     ipcRenderer.invoke('documents:cleanupCompletedPdfAssets'),
-  selectPdfRepositoryFolder: (): Promise<string | null> =>
+  selectAndAddPdfRepository: (): Promise<PdfRepositoryStatus> =>
     ipcRenderer.invoke('pdfRepository:selectFolder'),
   listPdfRepositories: (): Promise<PdfRepositoryStatus> =>
     ipcRenderer.invoke('pdfRepository:list'),
-  setPdfRepositoryPaths: (paths: string[]): Promise<PdfRepositoryStatus> =>
-    ipcRenderer.invoke('pdfRepository:setPaths', paths),
-  indexPdfRepositories: (paths?: string[]): Promise<PdfRepositoryIndexResult> =>
-    ipcRenderer.invoke('pdfRepository:index', paths),
-  restorePdfForDocument: (docId: string, manualPath?: string): Promise<PdfAssetRestoreResult> =>
-    ipcRenderer.invoke('pdfRepository:restoreForDocument', docId, manualPath),
+  removePdfRepository: (repositoryId: string): Promise<PdfRepositoryStatus> =>
+    ipcRenderer.invoke('pdfRepository:remove', repositoryId),
+  indexPdfRepositories: (): Promise<PdfRepositoryIndexResult> =>
+    ipcRenderer.invoke('pdfRepository:index'),
+  restorePdfForDocument: (docId: string): Promise<PdfAssetRestoreResult> =>
+    ipcRenderer.invoke('pdfRepository:restoreForDocument', docId),
+  selectAndRestorePdfForDocument: (docId: string): Promise<PdfAssetRestoreResult> =>
+    ipcRenderer.invoke('pdfRepository:selectAndRestoreForDocument', docId),
 
-  openFileDialog: (): Promise<string[]> =>
-    ipcRenderer.invoke('dialog:openFiles'),
-  getPathForFile: (file: File): string =>
-    webUtils.getPathForFile(file),
-  resolveImportSources: (paths: string[]): Promise<ResolvedImportSource[]> =>
-    ipcRenderer.invoke('documents:resolveImportSources', paths),
-
-  importDocuments: (filePaths: string[], options?: ImportDocumentOptions): Promise<ImportDocumentResult[]> =>
-    ipcRenderer.invoke('documents:import', filePaths, options),
+  selectImportSources: (): Promise<CapabilityResult<ImportSelection>> =>
+    ipcRenderer.invoke('documents:selectImportSources'),
+  grantDroppedImportSources: (files: File[]): Promise<CapabilityResult<ImportSelection>> => {
+    const paths = files.map((file) => webUtils.getPathForFile(file)).filter(Boolean)
+    return ipcRenderer.invoke('documents:grantDroppedImportSources', paths)
+  },
+  readImportSelectionBatch: (
+    selectionId: string,
+    cursor?: string | null,
+    limit?: number,
+  ): Promise<CapabilityResult<ImportSelectionBatch>> =>
+    ipcRenderer.invoke('documents:readImportSelectionBatch', selectionId, cursor, limit),
+  releaseImportSelection: (selectionId: string): Promise<boolean> =>
+    ipcRenderer.invoke('documents:releaseImportSelection', selectionId),
+  importDocuments: (grantIds: string[], options?: ImportDocumentOptions): Promise<ImportDocumentResult[]> =>
+    ipcRenderer.invoke('documents:import', grantIds, options),
   getImportQueueState: (): Promise<LibraryImportQueueState | null> =>
     ipcRenderer.invoke('documents:getImportQueueState'),
   saveImportQueueState: (state: LibraryImportQueueState | null): Promise<LibraryImportQueueState | null> =>
@@ -296,6 +345,12 @@ const api = {
     ipcRenderer.invoke('translation:translatePage', request),
   updateTranslationUnit: (unitId: string, payload: TranslationUnitUpdatePayload): Promise<TranslationUnitV1 | null> =>
     ipcRenderer.invoke('translation:updateUnit', unitId, payload),
+  listTranslationRevisions: (
+    unitId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<CursorPage<TranslationUnitRevision>> => ipcRenderer.invoke('translation:listRevisions', unitId, options),
+  getTranslationContextSnapshot: (contextId: string): Promise<TranslationContextSnapshot | null> =>
+    ipcRenderer.invoke('translation:getContextSnapshot', contextId),
   clearMachineTranslationUnits: (docId: string, pageId?: string): Promise<number> =>
     ipcRenderer.invoke('translation:clearMachine', docId, pageId),
   cancelTranslationTask: (taskId: string): Promise<boolean> =>
@@ -356,6 +411,12 @@ const api = {
     ipcRenderer.invoke('ocr:cancelDocument', docId),
   batchOcr: (docIds: string[], options?: BatchOcrOptions): Promise<number> =>
     ipcRenderer.invoke('documents:batchOcr', docIds, options),
+  createImportAutoOcrTask: (options: ImportAutoOcrTaskCreateOptions): Promise<ImportAutoOcrTaskCreateResult> =>
+    ipcRenderer.invoke('ocr:createImportAutoTask', options),
+  appendImportAutoOcrItems: (jobId: string, items: ImportAutoOcrTaskItemInput[]): Promise<ImportAutoOcrTaskAppendResult> =>
+    ipcRenderer.invoke('ocr:appendImportAutoTask', jobId, items),
+  startImportAutoOcrTask: (jobId: string): Promise<ImportAutoOcrTaskStartResult> =>
+    ipcRenderer.invoke('ocr:startImportAutoTask', jobId),
   reprocessOcrStructure: (docId: string): Promise<number> =>
     ipcRenderer.invoke('documents:reprocessOcrStructure', docId),
 
@@ -449,6 +510,8 @@ const api = {
   getFolder: (id: string): Promise<Folder | null> => ipcRenderer.invoke('folders:get', id),
   createFolder: (data: FolderCreatePayload): Promise<Folder | null> =>
     ipcRenderer.invoke('folders:create', data),
+  createFolderFromImportSource: (selectionId: string, sourceId: string, parentId?: string | null): Promise<Folder | null> =>
+    ipcRenderer.invoke('folders:createFromImportSource', selectionId, sourceId, parentId),
   updateFolder: (id: string, data: FolderUpdatePayload): Promise<boolean> =>
     ipcRenderer.invoke('folders:update', id, data),
   moveFolder: (data: FolderMovePayload): Promise<Folder[]> =>
@@ -466,10 +529,6 @@ const api = {
     ipcRenderer.invoke('folders:getDocuments', folderId),
   scanExternalFolder: (folderId: string): Promise<FolderImportFile[]> =>
     ipcRenderer.invoke('folders:scanExternal', folderId),
-  selectExternalFolder: (): Promise<string | null> =>
-    ipcRenderer.invoke('folders:selectExternal'),
-  scanFolderPath: (dirPath: string): Promise<FolderImportFile[]> =>
-    ipcRenderer.invoke('folders:scanPath', dirPath),
 
   listTags: (search?: string): Promise<Tag[]> => ipcRenderer.invoke('tags:list', search),
   createTag: (data: TagCreatePayload): Promise<Tag | null> =>
@@ -506,6 +565,26 @@ const api = {
     ipcRenderer.invoke('search:fulltext', keyword, options),
   querySearchV2: (keyword: string, options?: SearchOptions): Promise<SearchGroupedResponse> =>
     ipcRenderer.invoke('search:queryV2', keyword, options),
+  validateSearchSnapshot: (snapshotId: string, criteriaKey?: string): Promise<SearchSnapshotValidationResult> =>
+    ipcRenderer.invoke('search:validateSnapshot', snapshotId, criteriaKey),
+  resolveSearchEvidence: (locator: StableReaderLocator): Promise<ResolvedSearchEvidence> =>
+    ipcRenderer.invoke('search:resolveEvidence', locator),
+  promoteSearchAggregate: (
+    snapshotId: string,
+    projectId: string,
+    options?: { relationKind?: string; label?: string },
+  ): Promise<{ artifact: ResearchAggregateArtifact; relation: ResearchAggregateRelation }> =>
+    ipcRenderer.invoke('search:promoteAggregate', snapshotId, projectId, options),
+  validateResearchAggregate: (artifactId: string): Promise<{
+    validation: 'verified' | 'stale-generation' | 'corrupt' | 'not-found'
+    artifact: ResearchAggregateArtifact | null
+    currentGeneration: number
+  }> => ipcRenderer.invoke('search:validateAggregate', artifactId),
+  listResearchAggregateRelations: (
+    projectId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<CursorPage<ResearchAggregateRelation & { artifact: ResearchAggregateArtifact }>> =>
+    ipcRenderer.invoke('search:listAggregateRelations', projectId, options),
   exportSearchExcerpts: (keyword: string, options?: SearchOptions): Promise<SearchExportResult> =>
     ipcRenderer.invoke('search:exportExcerpts', keyword, options),
   previewSearchExportExcerpts: (keyword: string, options?: SearchOptions): Promise<SearchExportPreviewResult> =>
@@ -556,6 +635,16 @@ const api = {
   deleteCitationTemplate: (id: string): Promise<boolean> => ipcRenderer.invoke('citation:deleteTemplate', id),
   generateCitation: (docId: string, templateId: string, options?: CitationGenerateOptions): Promise<string> =>
     ipcRenderer.invoke('citation:generate', docId, templateId, options),
+  resolveCitationV2: (docId: string, templateId: string, options?: CitationGenerateOptions): Promise<CitationResolutionV2 | null> =>
+    ipcRenderer.invoke('citation:resolveV2', docId, templateId, options),
+  createCitationSnapshot: (docId: string, templateId: string, options?: CitationGenerateOptions): Promise<CitationSnapshot | null> =>
+    ipcRenderer.invoke('citation:createSnapshot', docId, templateId, options),
+  validateCitationSnapshot: (snapshotId: string): Promise<{ validation: 'verified' | 'stale' | 'corrupt' | 'not-found'; snapshot: CitationSnapshot | null }> =>
+    ipcRenderer.invoke('citation:validateSnapshot', snapshotId),
+  listCitationSnapshots: (
+    documentId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<CursorPage<CitationSnapshot>> => ipcRenderer.invoke('citation:listSnapshots', documentId, options),
   generateCitationByStyle: (
     docId: string,
     styleId: string,
@@ -607,6 +696,27 @@ const api = {
     ipcRenderer.invoke('research:assignNotesToOutline', noteIds, outlineId),
   listResearchNotes: (projectId?: string | null): Promise<ResearchNote[]> =>
     ipcRenderer.invoke('research:listNotes', projectId),
+  listResearchEvidenceRelations: (
+    projectId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<CursorPage<ResearchEvidenceRelation & { evidence: ResearchEvidence }>> =>
+    ipcRenderer.invoke('research:listEvidenceRelations', projectId, options),
+  getResearchClaimManifest: (
+    outputVersionId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): Promise<ResearchClaimManifestPage | null> =>
+    ipcRenderer.invoke('research:getClaimManifest', outputVersionId, options),
+  validateResearchClaimManifest: (outputVersionId: string): Promise<ResearchClaimManifestValidationResult> =>
+    ipcRenderer.invoke('research:validateClaimManifest', outputVersionId),
+  finalizeResearchOutputVersion: (input: {
+    draftOutputVersionId: string
+    expectedClaimManifestHash: string
+    claimBindings: ResearchClaimBinding[]
+  }): Promise<ResearchOutputVersion> => ipcRenderer.invoke('research:finalizeOutputVersion', input),
+  promoteResearchNoteEvidence: (
+    noteId: string,
+  ): Promise<{ evidence: ResearchEvidence; relation: ResearchEvidenceRelation | null }> =>
+    ipcRenderer.invoke('research:promoteNoteEvidence', noteId),
   deleteResearchNote: (id: string): Promise<boolean> => ipcRenderer.invoke('research:deleteNote', id),
   synthesizeResearchProject: (projectId: string, templateType: AiSynthesisTemplate, customPrompt?: string, citationStyleId?: string): Promise<ResearchOutput> =>
     ipcRenderer.invoke('research:synthesizeProject', projectId, templateType, customPrompt, citationStyleId),
@@ -637,14 +747,27 @@ const api = {
     ipcRenderer.invoke('settings:get', key),
   setSetting: (key: string, value: string): Promise<SettingSetResult> =>
     ipcRenderer.invoke('settings:set', key, value),
+  saveCredential: (key: RendererCredentialKey, value: string): Promise<unknown> =>
+    saveCredential(key, value),
+  revokeCredential: (key: RendererCredentialKey): Promise<boolean> =>
+    ipcRenderer.invoke('settings:credential:revoke', key),
   getAllSettings: (): Promise<SettingsMap> =>
     ipcRenderer.invoke('settings:getAll'),
-  listModels: (baseUrl: string, apiKey: string): Promise<string[]> => {
-    const payload: ListModelsPayload = { baseUrl, apiKey }
-    return ipcRenderer.invoke('settings:listModels', payload)
+  listModels: (
+    baseUrl: string,
+    apiKey: string,
+    credentialKey: 'llm_api_key' | 'vision_ocr_api_key' = 'llm_api_key',
+  ): Promise<string[]> => {
+    return prepareCredentialDraft(credentialKey, apiKey).then((draft) => {
+      const payload: ListModelsPayload = { baseUrl, credentialKey, credentialDraftRef: draft?.draftRef }
+      return ipcRenderer.invoke('settings:listModels', payload)
+    })
   },
-  listPaddleOcrModels: (apiKey?: string): Promise<string[]> =>
-    ipcRenderer.invoke('settings:listPaddleOcrModels', apiKey),
+  listPaddleOcrModels: (apiKey?: string): Promise<string[]> => {
+    return prepareCredentialDraft('paddleocr_api_key', String(apiKey || '')).then((draft) =>
+      ipcRenderer.invoke('settings:listPaddleOcrModels', draft?.draftRef),
+    )
+  },
   getLocalPaddleOcrStatus: (): Promise<LocalPaddleOcrStatus> =>
     ipcRenderer.invoke('settings:getLocalPaddleOcrStatus'),
   checkLocalPaddleOcrSources: (): Promise<LocalPaddleOcrSource[]> =>
@@ -661,16 +784,28 @@ const api = {
     ipcRenderer.invoke('settings:llmProfiles:list'),
   saveCurrentLlmProviderProfile: (name?: string): Promise<LlmProviderProfileState> =>
     ipcRenderer.invoke('settings:llmProfiles:saveCurrent', name),
-  upsertLlmProviderProfile: (profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> =>
-    ipcRenderer.invoke('settings:llmProfiles:upsert', profile),
+  upsertLlmProviderProfile: async (profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
+    const { apiKey, ...publicProfile } = profile
+    const draft = await prepareCredentialDraft('llm_api_key', String(apiKey || ''))
+    return ipcRenderer.invoke('settings:llmProfiles:upsert', publicProfile, draft?.draftRef)
+  },
   switchLlmProviderProfile: (profileId: string): Promise<LlmProviderProfileState> =>
     ipcRenderer.invoke('settings:llmProfiles:switch', profileId),
   deleteLlmProviderProfile: (profileId: string): Promise<LlmProviderProfilesResult> =>
     ipcRenderer.invoke('settings:llmProfiles:delete', profileId),
   listVisionOcrProviderProfiles: (): Promise<LlmProviderProfileState> =>
     ipcRenderer.invoke('settings:visionOcrProfiles:list'),
-  upsertVisionOcrProviderProfile: (profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> =>
-    ipcRenderer.invoke('settings:visionOcrProfiles:upsert', profile),
+  testVisionOcrProviderConnection: async (payload: VisionOcrConnectionTestPayload): Promise<VisionOcrConnectionTestResult> => {
+    const { apiKey, ...publicPayload } = payload
+    const credentialKey = payload.useLlmConfig ? 'llm_api_key' : 'vision_ocr_api_key'
+    const draft = await prepareCredentialDraft(credentialKey, String(apiKey || ''))
+    return ipcRenderer.invoke('settings:visionOcrProfiles:testConnection', publicPayload, draft?.draftRef)
+  },
+  upsertVisionOcrProviderProfile: async (profile: LlmProviderProfile): Promise<LlmProviderProfilesResult> => {
+    const { apiKey, ...publicProfile } = profile
+    const draft = await prepareCredentialDraft('vision_ocr_api_key', String(apiKey || ''))
+    return ipcRenderer.invoke('settings:visionOcrProfiles:upsert', publicProfile, draft?.draftRef)
+  },
   switchVisionOcrProviderProfile: (profileId: string): Promise<LlmProviderProfileState> =>
     ipcRenderer.invoke('settings:visionOcrProfiles:switch', profileId),
   deleteVisionOcrProviderProfile: (profileId: string): Promise<LlmProviderProfilesResult> =>
@@ -689,8 +824,8 @@ const api = {
 
   createBackup: (): Promise<BackupResult> => ipcRenderer.invoke('backup:create'),
   importBackup: (): Promise<BackupImportResult> => ipcRenderer.invoke('backup:import'),
-  importBackupFromPath: (filePath: string): Promise<BackupImportResult> =>
-    ipcRenderer.invoke('backup:importFromPath', filePath),
+  importDroppedBackup: (file: File): Promise<BackupImportResult> =>
+    ipcRenderer.invoke('backup:importFromPath', webUtils.getPathForFile(file)),
   restoreBackup: (): Promise<BackupImportResult> => ipcRenderer.invoke('backup:restore'),
   getBackupStatus: (): Promise<BackupStatus> => ipcRenderer.invoke('backup:getStatus'),
   configureAutoBackup: (enabled: boolean, intervalHours: number, includeStorage?: boolean, slotCount?: number): Promise<BackupStatus> =>

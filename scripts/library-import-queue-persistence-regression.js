@@ -36,12 +36,6 @@ const flushOcrStatusBufferBody = sliceBetween(
   'useEffect(() => {\n    void loadBaseData()',
   'OCR status UI flush',
 )
-const runImportOcrQueueBody = sliceBetween(
-  librarySource,
-  'const runImportOcrQueue = async',
-  'const getQueuedImportFileCount =',
-  'Import OCR queue',
-)
 const handleBatchOcrBody = sliceBetween(
   librarySource,
   'const handleBatchOcr = async',
@@ -81,14 +75,15 @@ const handleBatchImportBody = sliceBetween(
 
 assert(
   librarySource.includes("LIBRARY_IMPORT_QUEUE_STORAGE_KEY = 'gujismart.library.importQueue.v1'"),
-  'Library import queue should keep the legacy localStorage key for one-time migration',
+  'Library import queue should keep the legacy localStorage key for authorization-required detection',
 )
 assert(
-  sharedTypesSource.includes('export interface LibraryImportQueueJobSnapshot')
-    && sharedTypesSource.includes('export interface LibraryImportQueueState')
-    && librarySource.includes('type PersistedImportQueueJob = LibraryImportQueueJobSnapshot')
+  sharedTypesSource.includes('export interface LibraryImportQueueJobSnapshotV1')
+    && sharedTypesSource.includes('export interface LibraryImportQueueJobSnapshotV2')
+    && sharedTypesSource.includes('export type LibraryImportQueueState =')
+    && librarySource.includes('type PersistedImportQueueJob = LibraryImportQueueJobSnapshotV2')
     && librarySource.includes('type PersistedImportQueueState = LibraryImportQueueState'),
-  'Library import queue should share a typed structured queue snapshot across main, preload, and renderer',
+  'Library import queue should keep a typed v1 read contract and path-free v2 persistence contract',
 )
 assert(
   librarySource.includes('activeImportJobRef') && librarySource.includes('restoredImportQueueRef'),
@@ -132,11 +127,12 @@ assert(
   'Import queue persistence IPC should expose get/save/clear snapshot operations through preload',
 )
 assert(
-  librarySource.includes('let parsed = await window.api.getImportQueueState()')
-    && librarySource.includes('parsed = parseLegacyPersistedImportQueue()')
-    && librarySource.includes('window.api.saveImportQueueState(parsed)')
-    && librarySource.includes('clearLegacyPersistedImportQueue()'),
-  'Restored import queue should read SQLite first and migrate legacy localStorage snapshots once',
+  documentIpcSource.includes("authorizationStatus: 'authorization-required' as const")
+    && documentIpcSource.includes('selectionId: null')
+    && librarySource.includes('getPersistedImportAuthorizationRequiredJobs()')
+    && librarySource.includes("okText: '重新选择'")
+    && !librarySource.includes('enqueueImportJob(filePaths, job.folderId'),
+  'Restored import queue must redact paths and require a fresh user authorization instead of replaying v1 paths',
 )
 assert(
   librarySource.includes('const countSettledImportBatchPaths =')
@@ -155,29 +151,23 @@ assert(
   'Library import queue should not synthesize per-file failures for an interrupted IPC batch because that would drop unfinished files',
 )
 assert(
-  librarySource.includes('importQueueRef.current.unshift(job)') && librarySource.includes('if (job.filePaths.length > 0) break'),
+  librarySource.includes('importQueueRef.current.unshift(job)') && librarySource.includes('if (remainingBeforeRefill > 0) break'),
   'Library import queue should keep unfinished paths queued after an outer import failure instead of dropping them',
 )
 assert(
   librarySource.includes('function rebuildQueuedImportPathSet') || librarySource.includes('const rebuildQueuedImportPathSet'),
-  'Library import queue should rebuild duplicate tracking after preserving unfinished queued paths',
+  'Library import queue should rebuild duplicate tracking for opaque grant IDs',
 )
 assert(
-  librarySource.includes('if (!libraryInitialLoadDone) return') && librarySource.includes('parsePersistedImportQueue()'),
-  'Library import queue should wait for the first document list load before restoring',
+  librarySource.includes('if (!libraryInitialLoadDone || restoredImportQueueRef.current) return')
+    && librarySource.includes('getPersistedImportAuthorizationRequiredJobs()'),
+  'Library import queue should wait for the first document list load before showing reauthorization state',
 )
 assert(
-  librarySource.includes('filterRestoredImportFilePaths(job.filePaths)'),
-  'Restored import queue should filter already-loaded non-PDF duplicates before enqueueing',
-)
-assert(
-  librarySource.includes("if (doc.import_status === 'error' || doc.import_status === 'processing' || doc.import_status === 'deleting') return")
-    && librarySource.includes('restorableExistingNames'),
-  'Restored import queue should not let half-written or failed imports block re-importing the original file',
-)
-assert(
-  librarySource.includes('enqueueImportJob(filePaths, job.folderId, job.folderAssignments, { engine: job.engine, restored: true })'),
-  'Restored import queue should preserve the OCR engine and folder assignments',
+  librarySource.includes('selectionId: null')
+    && librarySource.includes("authorizationStatus: 'authorization-required'")
+    && !librarySource.includes('filePaths,\n      folderId: job.folderId'),
+  'New persisted queue snapshots must not contain paths or runtime grant IDs',
 )
 assert(
   processImportJobBody.includes('const processImportedBatchResults = async')
@@ -215,14 +205,16 @@ assert(
 assert(
   processImportJobBody.includes('const previewAutoOcrBackground = await window.api.getSetting(\'auto_ocr_after_import\')')
     && processImportJobBody.includes('const shouldDeferImportPdfPreview = shouldAttemptAutoOcrForPreview && previewAutoOcrConfigReady')
-    && processImportJobBody.includes('const autoOcrBackground = await window.api.getSetting(\'auto_ocr_after_import\')')
-    && processImportJobBody.includes('const hasConfig = await hasOcrEngineConfig(engine)'),
-  'Library import should defer PDF preview work only from an early auto-OCR readiness snapshot while final auto-OCR launch still rechecks settings.',
+    && processImportJobBody.includes('createImportAutoOcrTask({')
+    && processImportJobBody.includes('appendImportAutoOcrItems(task.jobId, appendBatch)')
+    && processImportJobBody.includes('startImportAutoOcrTask(autoOcrTaskJobId)'),
+  'Library import should snapshot automatic OCR readiness and persist every imported OCR item before starting execution.',
 )
 assert(
-  runImportOcrQueueBody.includes("successCount += await runOcrInConfiguredBatches(batch, engine, 'auto-ocr')")
-    && !runImportOcrQueueBody.includes("successCount += await runOcrInConfiguredBatches(batch, engine, 'auto-ocr')\n      await loadDocuments(filter, { silent: true })"),
-  'Import auto-OCR should rely on runOcrInConfiguredBatches refreshes instead of awaiting a duplicate outer list reload after every batch.',
+  !processImportJobBody.includes('const autoOcrQueue:')
+    && processImportJobBody.includes('for (const appendBatch of chunkArray(autoOcrItems, 200))')
+    && processImportJobBody.includes('persistedAutoOcrCount = appended.totalCount'),
+  'Import auto-OCR must not retain unsubmitted future batches in renderer memory.',
 )
 assert(
   librarySource.includes('const cancelScheduledImportListRefresh = useCallback')
@@ -243,9 +235,9 @@ assert(
   'OCR batch runner should not block between batches on document list reloads.',
 )
 assert(
-  runImportOcrQueueBody.includes('scheduleImportListRefresh()')
-    && !runImportOcrQueueBody.includes("if (!ready) continue\n        await loadDocuments(filter, { silent: true })"),
-  'Import auto-OCR PDF page preparation should schedule a debounced list refresh instead of blocking the OCR queue.',
+  processImportJobBody.includes('readyForAutoOcr = await preparePdfPagesForOcrAfterImport(')
+    && processImportJobBody.includes('if (readyForAutoOcr) scheduleImportListRefresh()'),
+  'Non-Paddle import auto-OCR should prepare page images before registering runnable persistent items.',
 )
 assert(
   handleBatchOcrBody.includes("await runOcrInConfiguredBatches(targetIds, engine, 'batch-ocr'")

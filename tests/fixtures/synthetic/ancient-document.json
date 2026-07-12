@@ -1,0 +1,18 @@
+{
+  "id": "synthetic-ancient-001",
+  "docType": "古籍",
+  "title": "云窗校录",
+  "author": "佚名",
+  "edition": "合成测试本",
+  "layout": { "direction": "vertical-rl", "columns": 6 },
+  "pages": [
+    {
+      "pageNum": 1,
+      "proofStatus": "pending",
+      "blocks": [
+        { "id": "a1-title", "label": "title", "text": "云窗校录", "box": [820, 70, 100, 360] },
+        { "id": "a1-body", "label": "text", "text": "春日开卷，录旧闻数则，以备检寻。", "box": [180, 90, 600, 980] }
+      ]
+    }
+  ]
+}

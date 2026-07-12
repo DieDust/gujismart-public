@@ -444,7 +444,8 @@ assert(
   'savePageOcrResults should guard suspicious runaway repeated OCR text and persist async PDF quality failures as retryable error pages.',
 )
 assert(
-  resetPagesForFullOcrRerunBody.includes('SET proofed_text = NULL')
+  !resetPagesForFullOcrRerunBody.includes('proofed_text = NULL')
+    && resetPagesForFullOcrRerunBody.includes('proof_base_stale')
     && !resetPagesForFullOcrRerunBody.includes('ocr_result = NULL')
     && !resetPagesForFullOcrRerunBody.includes('ocr_text = NULL')
     && savePageOcrResultsBody.includes('const hasExistingOcrText = String(existingPage?.ocr_text || \'\').trim().length > 0')
@@ -858,9 +859,9 @@ assert(
 )
 assert(
   ocrIpcSource.includes('function createRecoverableBatchOcrItems')
-    && sliceBetween(ocrIpcSource, 'function createRecoverableBatchOcrItems', 'function updateRecoverableBatchOcrItem', 'recoverable batch OCR item body').includes('scheduleDatabaseSave()')
+    && sliceBetween(ocrIpcSource, 'function createRecoverableBatchOcrItems', 'function updateRecoverableBatchOcrItem', 'recoverable batch OCR item body').includes('createLegacyBatchTask(uniqueDocIds, batchSize')
     && !sliceBetween(ocrIpcSource, 'function createRecoverableBatchOcrItems', 'function updateRecoverableBatchOcrItem', 'recoverable batch OCR item body').includes('saveDatabase()'),
-  'batch OCR recovery queue creation should defer checkpoints instead of synchronously blocking upload startup.',
+  'batch OCR recovery queue creation should delegate durable scheduler writes and avoid synchronous checkpoints during upload startup.',
 )
 assert(
   semanticSearchSource.includes('let reindexDrainCompletedCount = 0')

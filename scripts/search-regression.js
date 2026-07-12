@@ -74,6 +74,21 @@ async function run() {
     }
 
     const response = search.querySearchV2('渡', { limit: 80 })
+    const pagedSnapshot = search.querySearchV2('渡', { limit: 80, page: 1, pageSize: 1 })
+    assert.ok(pagedSnapshot.snapshotId, 'Expected querySearchV2 to issue a SearchSnapshot')
+    assert.ok(Number.isSafeInteger(pagedSnapshot.librarySearchGeneration))
+    assert.match(String(pagedSnapshot.indexGenerationVectorHash || ''), /^[a-f0-9]{64}$/)
+    const sameSnapshot = search.querySearchV2('渡', { limit: 80, page: 2, pageSize: 1, snapshotId: pagedSnapshot.snapshotId })
+    assert.strictEqual(sameSnapshot.snapshotId, pagedSnapshot.snapshotId, 'Expected pagination to reuse the validated snapshot')
+    database.run("UPDATE documents SET title = title || ' changed' WHERE id = 'doc_a'")
+    assert.throws(
+      () => search.querySearchV2('渡', { limit: 80, page: 2, pageSize: 1, snapshotId: pagedSnapshot.snapshotId }),
+      /search_snapshot_stale/,
+    )
+    const stableHit = response.groups.flatMap((group) => group.hits).find((hit) => hit.stableLocator?.precision === 'exact')
+    assert.ok(stableHit, 'Expected verified search hits to include an exact StableReaderLocator v2')
+    assert.strictEqual(stableHit.stableLocator.schemaVersion, 'stable-reader-locator/v2')
+    assert.ok(stableHit.stableLocator.quote.includes('渡'))
     assert.strictEqual(response.totalDocuments, 2)
     assert.strictEqual(response.totalHits, 8)
     assert.deepStrictEqual(

@@ -38,6 +38,8 @@ async function main() {
 
   const {
     APP_WORKSPACE_STORAGE_KEY,
+    APP_WORKSPACE_LAST_KNOWN_GOOD_KEY,
+    APP_WORKSPACE_LEGACY_STORAGE_KEY,
     loadAppWorkspace,
     saveAppWorkspace,
   } = require(bundlePath)
@@ -109,6 +111,7 @@ async function main() {
   assert.strictEqual(restored.tabs[2].document.target.keyword, '测试关键词')
 
   const parsed = JSON.parse(raw)
+  assert.strictEqual(parsed.version, 2)
   parsed.activeTabId = 'missing-tab'
   parsed.tabs.push(parsed.tabs[0])
   storage.setItem(APP_WORKSPACE_STORAGE_KEY, JSON.stringify(parsed))
@@ -121,6 +124,21 @@ async function main() {
   assert.deepStrictEqual(fallback.tabs, [{ id: 'home', kind: 'home', title: '首页' }])
   assert.strictEqual(fallback.activeTabId, 'home')
   assert.strictEqual(storage.getItem(APP_WORKSPACE_STORAGE_KEY), null)
+
+  storage.setItem(APP_WORKSPACE_LEGACY_STORAGE_KEY, JSON.stringify({
+    version: 1,
+    savedAt: '2026-01-01T00:00:00.000Z',
+    activeTabId: 'home',
+    siderCollapsed: false,
+    tabs: [{ id: 'home', kind: 'home', title: 'Home' }],
+  }))
+  assert.strictEqual(loadAppWorkspace(storage).activeTabId, 'home')
+
+  saveAppWorkspace(storage, { activeTabId: 'home', siderCollapsed: false, tabGroups: [], tabs: [{ id: 'home', kind: 'home', title: 'Home' }] })
+  saveAppWorkspace(storage, { activeTabId: 'home', siderCollapsed: true, tabGroups: [], tabs: [{ id: 'home', kind: 'home', title: 'Home' }] })
+  assert.ok(storage.getItem(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY))
+  storage.setItem(APP_WORKSPACE_STORAGE_KEY, '{corrupt')
+  assert.strictEqual(loadAppWorkspace(storage).activeTabId, 'home')
 
   console.log('Workspace restore regression passed.')
 }

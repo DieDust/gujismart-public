@@ -585,6 +585,7 @@ function makeSourceFromResult(result: EvidenceSearchResult): EvidenceQaSource {
     page_num: result.page_num || result.locator?.pageNum || null,
     snippet,
     locator: result.locator,
+    stableLocator: result.stableLocator,
     rank: result.rank,
     matched_query: result.matched_query || result.locator?.queryTerm || '',
     source_hash: hashSource(`${result.doc_id}:${result.page_num || ''}:${snippet}`),

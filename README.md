@@ -4,23 +4,23 @@
 
 ## 界面预览
 
-| 翻译模式：版式还原 | 翻译模式：阅读模式 |
-| --- | --- |
-| ![翻译模式版式还原](docs/images/screenshot-08-translation-layout.png) | ![翻译模式阅读模式](docs/images/screenshot-09-translation-reader.png) |
+以下截图使用空库或合成示例数据，不包含真实用户文献。
 
-![首页](docs/images/screenshot-01-home.png)
-
-| 文件夹 | 摘录 |
+| 欢迎页 | 文献库 |
 | --- | --- |
-| ![文件夹功能](docs/images/screenshot-02-folders.png) | ![摘录功能](docs/images/screenshot-03-excerpts.png) |
+| ![欢迎页](docs/images/tutorial-01-welcome.png) | ![空文献库](docs/images/tutorial-02-library.png) |
 
-| 检索 | 图片显示 |
+| 研究工作台 | 全文检索 |
 | --- | --- |
-| ![检索功能](docs/images/screenshot-04-search.png) | ![图片显示功能](docs/images/screenshot-05-reader-images.png) |
+| ![研究工作台](docs/images/tutorial-03-research.png) | ![全文检索](docs/images/tutorial-04-search.png) |
 
-| 版式还原 | 引用 |
+| 引用格式 | 标签管理 |
 | --- | --- |
-| ![版式还原功能](docs/images/screenshot-06-layout-restore.png) | ![引用功能](docs/images/screenshot-07-citation.png) |
+| ![引用格式](docs/images/tutorial-05-citation.png) | ![标签管理](docs/images/tutorial-06-tags.png) |
+
+| 处理队列 | 设置 |
+| --- | --- |
+| ![处理队列](docs/images/tutorial-07-dashboard.png) | ![设置](docs/images/tutorial-08-settings.png) |
 
 ## 功能概览
 

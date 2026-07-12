@@ -28,6 +28,10 @@ try {
     aiDatasetCount: 1,
     aiRecordCount: 3,
     unconfirmedAiRecordCount: 2,
+    evidenceCount: 4,
+    staleEvidenceCount: 1,
+    formalOutputVersionCount: 2,
+    draftOutputVersionCount: 1,
     notes: [
       { id: 'note_complete', locatorJson: '{"docId":"doc"}', sourceHash: 'hash', sourceAvailable: 1 },
       { id: 'note_missing_locator', locatorJson: '', sourceHash: 'hash2', sourceAvailable: 1 },
@@ -48,13 +52,19 @@ try {
   assert.strictEqual(report.metrics.aiDatasetCount, 1)
   assert.strictEqual(report.metrics.aiRecordCount, 3)
   assert.strictEqual(report.metrics.unconfirmedAiRecordCount, 2)
+  assert.strictEqual(report.metrics.evidenceCount, 4)
+  assert.strictEqual(report.metrics.staleEvidenceCount, 1)
+  assert.strictEqual(report.metrics.formalOutputVersionCount, 2)
+  assert.strictEqual(report.metrics.draftOutputVersionCount, 1)
   assert.ok(report.issues.some((issue) => issue.code === 'project.missing_documents' && issue.severity === 'error'))
   assert.ok(report.issues.some((issue) => issue.code === 'notes.missing_locator' && issue.entityIds.includes('note_missing_locator')))
   assert.ok(report.issues.some((issue) => issue.code === 'notes.missing_source_hash' && issue.entityIds.includes('note_missing_hash')))
   assert.ok(report.issues.some((issue) => issue.code === 'notes.unavailable_source' && issue.entityIds.includes('note_unavailable')))
   assert.ok(report.issues.some((issue) => issue.code === 'outputs.empty'))
   assert.ok(report.issues.some((issue) => issue.code === 'ai_records.unconfirmed'))
-  assert.strictEqual(report.errorCount, 2)
+  assert.ok(report.issues.some((issue) => issue.code === 'evidence.stale' && issue.severity === 'error'))
+  assert.ok(report.issues.some((issue) => issue.code === 'outputs.draft_versions' && issue.severity === 'info'))
+  assert.strictEqual(report.errorCount, 3)
   assert.strictEqual(report.warningCount, 3)
 
   console.log('Research integrity regression checks passed.')

@@ -6,6 +6,7 @@ import { basename, dirname, extname, join, normalize } from 'path'
 import { getDataDir, queryAll, queryOne, resolveManagedStoragePath, run, scheduleDatabaseSave } from './database'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from './page-payload-store'
 import { buildPdfCompressionMetadata, storePdfWithCompression, storePdfWithCompressionSync } from './pdf-compression'
+import { inspectManagedDeleteTarget } from './managed-path-boundary'
 import type {
   CompletedPdfAssetCleanupResult,
   DocumentMetadataResult,
@@ -312,6 +313,10 @@ export function getPdfRepositoryPaths(): string[] {
 function writeRepositoryPaths(paths: string[]): void {
   const normalized = Array.from(new Set(paths.map((item) => normalize(String(item || '').trim())).filter(Boolean)))
   run('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ['pdf_repository_paths', JSON.stringify(normalized)])
+}
+
+function getRepositoryId(filePath: string): string {
+  return createHash('sha256').update(normalize(filePath)).digest('hex').slice(0, 24)
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -699,6 +704,12 @@ export function getPdfRepositoryStatus(): PdfRepositoryStatus {
     FROM pdf_repository_index
   `)
   return {
+    repositories: paths.map((filePath) => ({
+      repositoryId: getRepositoryId(filePath),
+      displayName: basename(filePath),
+      displayPath: filePath,
+      available: existsSync(filePath),
+    })),
     paths,
     stats: {
       fileCount: Number(stats?.fileCount || 0),
@@ -706,6 +717,15 @@ export function getPdfRepositoryStatus(): PdfRepositoryStatus {
     },
     lastIndexedAt: stats?.lastIndexedAt || null,
   }
+}
+
+export function removePdfRepositoryById(repositoryId: string): PdfRepositoryStatus {
+  const paths = readRepositoryPaths()
+  const matchingPath = paths.find((filePath) => getRepositoryId(filePath) === repositoryId)
+  if (!matchingPath) return getPdfRepositoryStatus()
+  writeRepositoryPaths(paths.filter((filePath) => filePath !== matchingPath))
+  scheduleDatabaseSave()
+  return getPdfRepositoryStatus()
 }
 
 export function addPdfRepositoryPath(dirPath: string): PdfRepositoryStatus {
@@ -891,9 +911,8 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
 
   let bytesFreed = 0
   const preservedImageCount = materializeContentImageAssets(docId)
-  const storageDir = join(getDataDir(), 'storage', docId)
   const metadata = parseMetadata(doc.metadata)
-  const filePath = resolveManagedStoragePath(doc.file_path, docId)
+  const filePath = String(doc.file_path || '').trim()
   if (filePath && extname(filePath).toLowerCase() === '.pdf' && existsSync(filePath) && !metadata.pdf_sha256) {
     const fingerprint = getPdfFingerprint(filePath)
     updateMetadata(docId, {
@@ -906,9 +925,15 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
   const pathsToDelete = new Set<string>()
   const addPath = (value?: string | null) => {
     if (!value) return
-    const normalizedPath = normalize(resolveManagedStoragePath(value, docId))
-    if (isPathInsideDirectory(normalizedPath, storageDir) && existsSync(normalizedPath)) {
-      pathsToDelete.add(normalizedPath)
+    const normalizedPath = normalize(value)
+    const decision = inspectManagedDeleteTarget({
+      dataDir: getDataDir(),
+      docId,
+      targetPath: normalizedPath,
+      kind: 'document-asset',
+    })
+    if (decision.allowed && decision.canonicalTarget) {
+      pathsToDelete.add(decision.canonicalTarget)
     }
   }
 
@@ -918,10 +943,17 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
 
   for (const filePath of pathsToDelete) {
     try {
-      const stats = statSync(filePath)
+      const decision = inspectManagedDeleteTarget({
+        dataDir: getDataDir(),
+        docId,
+        targetPath: filePath,
+        kind: 'document-asset',
+      })
+      if (!decision.allowed || !decision.canonicalTarget) continue
+      const stats = statSync(decision.canonicalTarget)
       if (stats.isFile()) {
         bytesFreed += stats.size
-        rmSync(filePath, { force: true })
+        rmSync(decision.canonicalTarget, { force: true })
       }
     } catch {
       // Ignore files that disappeared while cleanup was running.
@@ -945,9 +977,8 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
 
   let bytesFreed = 0
   const preservedImageCount = await materializeContentImageAssetsAsync(docId)
-  const storageDir = join(getDataDir(), 'storage', docId)
   const metadata = parseMetadata(doc.metadata)
-  const filePath = resolveManagedStoragePath(doc.file_path, docId)
+  const filePath = String(doc.file_path || '').trim()
   if (filePath && extname(filePath).toLowerCase() === '.pdf' && await pathExists(filePath) && !metadata.pdf_sha256) {
     const fingerprint = await getPdfFingerprintAsync(filePath)
     updateMetadata(docId, {
@@ -960,9 +991,15 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
   const pathsToDelete = new Set<string>()
   const addPath = async (value?: string | null) => {
     if (!value) return
-    const normalizedPath = normalize(resolveManagedStoragePath(value, docId))
-    if (isPathInsideDirectory(normalizedPath, storageDir) && await pathExists(normalizedPath)) {
-      pathsToDelete.add(normalizedPath)
+    const normalizedPath = normalize(value)
+    const decision = inspectManagedDeleteTarget({
+      dataDir: getDataDir(),
+      docId,
+      targetPath: normalizedPath,
+      kind: 'document-asset',
+    })
+    if (decision.allowed && decision.canonicalTarget) {
+      pathsToDelete.add(decision.canonicalTarget)
     }
   }
 
@@ -974,10 +1011,17 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
 
   for (const filePath of pathsToDelete) {
     try {
-      const stats = await stat(filePath)
+      const decision = inspectManagedDeleteTarget({
+        dataDir: getDataDir(),
+        docId,
+        targetPath: filePath,
+        kind: 'document-asset',
+      })
+      if (!decision.allowed || !decision.canonicalTarget) continue
+      const stats = await stat(decision.canonicalTarget)
       if (stats.isFile()) {
         bytesFreed += stats.size
-        await rm(filePath, { force: true })
+        await rm(decision.canonicalTarget, { force: true })
       }
     } catch {
       // Ignore files that disappeared while cleanup was running.

@@ -8,6 +8,7 @@ import { PDFDocument } from 'pdf-lib'
 import { queryOne } from './database'
 import { isAbortError } from '../shared/errors'
 import { ensureOcrResultIr } from '../shared/ocr-ir'
+import { readProtectedSetting } from './settings-security'
 import type { OcrBoundingBox, OcrProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult, OcrRecognizeWordResult, OcrSecondPass, PageOcrOptions } from '../shared/types'
 export type { OcrProfile, OcrSecondPass, PageOcrOptions } from '../shared/types'
 
@@ -344,8 +345,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function getToken(): string {
-  const row = queryOne("SELECT value FROM settings WHERE key = 'paddleocr_api_key'")
-  const token = row?.value as string | undefined
+  const token = readProtectedSetting('paddleocr_api_key')
 
   if (!token) {
     throw new Error('尚未配置 PaddleOCR API Token，请先到设置页完成配置。')

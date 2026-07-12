@@ -5,6 +5,7 @@ import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { getErrorMessage } from '@shared/errors'
 import { buildSearchExcerptSourceHashInput } from '@shared/search-evidence'
+import { stableLocatorFromLegacySearchLocator } from '@shared/stable-reader-locator'
 import { resolveDocumentCitation } from '../utils/citations'
 import type {
   CitationStyle,
@@ -445,6 +446,7 @@ function groupFlatResults(results: FlatSearchResult[], query: string, warnings: 
     const hit: SearchHit = {
       id: `${locator.segmentId}:${locator.occurrenceIndex}:${index}`,
       locator,
+      stableLocator: stableLocatorFromLegacySearchLocator(locator),
       snippet: item.snippet || '',
       score: Number(item.rank || index),
     }
@@ -561,6 +563,12 @@ function getReliableLocatorPageIndex(locator: SearchHitLocator | null | undefine
   return Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined
 }
 
+function getStableLocatorPageIndex(hit: SearchHit | null | undefined): number | undefined {
+  const pageNum = Number(hit?.stableLocator?.pageNum)
+  if (Number.isFinite(pageNum) && pageNum > 0) return Math.floor(pageNum) - 1
+  return getReliableLocatorPageIndex(hit?.locator)
+}
+
 function buildSearchHitFromFlatResult(item: FlatSearchResult, query: string, fallbackKeyword: string): SearchHit | undefined {
   if (!item.locator) return undefined
   const matchText = item.locator.matchText || item.matched_query || fallbackKeyword || query
@@ -571,6 +579,7 @@ function buildSearchHitFromFlatResult(item: FlatSearchResult, query: string, fal
       matchText,
       queryTerm: item.locator.queryTerm || item.matched_query || fallbackKeyword || query,
     },
+    stableLocator: item.stableLocator || stableLocatorFromLegacySearchLocator(item.locator),
     snippet: String(item.snippet || ''),
     score: Number(item.rank || 0),
   }
@@ -674,7 +683,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const buildSearchOptions = (
     overrideFilters = filters,
-    options: { paged?: boolean; page?: number; resultMode?: 'preview' | 'all' } = {},
+    options: { paged?: boolean; page?: number; resultMode?: 'preview' | 'all'; snapshotId?: string } = {},
   ) => ({
     ...compactFilterOptions(overrideFilters),
     limit: DEFAULT_SEARCH_GROUP_LIMIT,
@@ -682,6 +691,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     contextMode,
     resultMode: options.resultMode || 'preview' as const,
     ...(options.paged ? { page: options.page || 1, pageSize: SEARCH_PAGE_SIZE } : {}),
+    ...(options.snapshotId ? { snapshotId: options.snapshotId } : {}),
   })
 
   const buildSearchSignature = (
@@ -1007,7 +1017,14 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           refreshViewerHitCountsInBackground(grouped, activeKeyword, activeSort, activeSignature, 'ai', overrideFilters, nextResults, nextAiState)
         }
       } else {
-        const grouped = await window.api.querySearchV2(activeKeyword, buildSearchOptions(overrideFilters, { paged: true, page: overridePage }))
+        const reusableSnapshotId = overridePage > 1 && executedSearchSignature === activeSignature
+          ? groupedResponse?.snapshotId
+          : undefined
+        const grouped = await window.api.querySearchV2(activeKeyword, buildSearchOptions(overrideFilters, {
+          paged: true,
+          page: overridePage,
+          snapshotId: reusableSnapshotId,
+        }))
         const readerCountedGrouped = activeSort === 'hitCount'
           ? await applyViewerHitCounts(grouped, activeKeyword, activeSort)
           : grouped
@@ -1023,7 +1040,12 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       }
     } catch (error) {
       console.error(error)
-      message.error('检索失败')
+      const errorMessage = getErrorMessage(error, '')
+      if (errorMessage.includes('search_snapshot_')) {
+        message.warning('检索结果已更新，请重新检索后继续翻页')
+      } else {
+        message.error('检索失败')
+      }
     } finally {
       setLoading(false)
     }
@@ -1348,17 +1370,19 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const openGroupedDocument = (group: SearchDocumentGroup, hit?: SearchHit) => {
     const activeHit = hit || group.hits[0]
+    const exactLegacyLocator = activeHit?.stableLocator?.precision === 'exact' ? activeHit.locator : undefined
     const activeKeyword = (keyword || inputValue || activeHit?.locator.queryTerm || '').trim()
     persistCurrentSearchReturnState()
     onSelectDoc?.({
       docId: group.docId,
-      pageIndex: getReliableLocatorPageIndex(activeHit?.locator),
+      pageIndex: getStableLocatorPageIndex(activeHit),
       keyword: activeKeyword || activeHit?.locator.queryTerm || inputValue,
       excerpt: activeHit ? stripSnippetMarkers(activeHit.snippet).slice(0, 120) : undefined,
       sourceId: 'search',
-      locator: activeHit?.locator,
+      locator: exactLegacyLocator,
+      stableLocator: activeHit?.stableLocator,
       openTranslation: Boolean(activeHit?.locator.translationSource),
-      searchSession: buildFocusedSearchSession(activeKeyword || activeHit?.locator.queryTerm || inputValue, activeHit),
+      searchSession: buildFocusedSearchSession(activeKeyword || activeHit?.locator.queryTerm || inputValue, exactLegacyLocator ? activeHit : undefined),
     })
   }
 
@@ -2016,6 +2040,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             const jumpKeyword = getJumpKeyword(item, inputValue, hitTerms)
             const activeKeyword = (keyword || inputValue || item.locator?.queryTerm || jumpKeyword).trim()
             const focusedHit = buildSearchHitFromFlatResult(item, activeKeyword, jumpKeyword)
+            const exactLegacyLocator = focusedHit?.stableLocator?.precision === 'exact' ? item.locator : undefined
             return (
               <Card
                 size={'small'}
@@ -2025,12 +2050,13 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                   persistCurrentSearchReturnState()
                   onSelectDoc?.({
                     docId: item.doc_id,
-                    pageIndex: getReliableLocatorPageIndex(item.locator),
+                    pageIndex: getStableLocatorPageIndex(focusedHit),
                     keyword: activeKeyword,
                     excerpt: stripSnippetMarkers(String(item.snippet || '')).slice(0, 120),
                     sourceId: item.hit_field || 'search',
-                    locator: item.locator,
-                    searchSession: buildFocusedSearchSession(activeKeyword, focusedHit),
+                    locator: exactLegacyLocator,
+                    stableLocator: focusedHit?.stableLocator,
+                    searchSession: buildFocusedSearchSession(activeKeyword, exactLegacyLocator ? focusedHit : undefined),
                   })
                 }}
               >

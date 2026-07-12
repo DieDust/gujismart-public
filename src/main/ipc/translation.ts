@@ -6,10 +6,14 @@ import {
   translatePageUnits,
   updateTranslationUnit,
 } from '../translation-service'
+import { getTranslationContextSnapshot, listTranslationRevisions } from '../translation-revisions'
 import type {
+  CursorPage,
   PageTranslationRequest,
   PageTranslationResult,
   TranslationUnitUpdatePayload,
+  TranslationContextSnapshot,
+  TranslationUnitRevision,
   TranslationUnitV1,
 } from '../../shared/types'
 
@@ -40,5 +44,15 @@ export function registerTranslationIpc(): void {
 
   ipcMain.handle('translation:cancelTask', (_event, taskId: string): boolean => (
     cancelTranslationTask(taskId)
+  ))
+
+  ipcMain.handle('translation:listRevisions', (
+    _event,
+    unitId: string,
+    options?: { limit?: number; cursor?: string | null },
+  ): CursorPage<TranslationUnitRevision> => listTranslationRevisions(unitId, options))
+
+  ipcMain.handle('translation:getContextSnapshot', (_event, contextId: string): TranslationContextSnapshot | null => (
+    getTranslationContextSnapshot(contextId)
   ))
 }

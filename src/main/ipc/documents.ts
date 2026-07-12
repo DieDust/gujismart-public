@@ -31,14 +31,19 @@ import {
   getPdfFingerprintAsync,
   getPdfRepositoryStatus,
   indexPdfRepositoriesAsync,
+  removePdfRepositoryById,
   restorePdfAssetForDocumentAsync,
-  setPdfRepositoryPaths,
 } from '../pdf-assets'
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
+import { inspectManagedDeleteTarget, type ManagedDeleteKind } from '../managed-path-boundary'
+import { FileCapabilityError, fileCapabilityService } from '../file-capabilities'
+import { cancelLegacyImportQueueTasks, registerLegacyImportQueueState } from '../task-import-compat'
+import { attachCanonicalPageContent } from '../canonical-content'
+import { importSelectionService } from '../import-selections'
 import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { normalizeHistoryDocType } from '../../shared/history-citation'
 import { getErrorMessage } from '../../shared/errors'
@@ -59,7 +64,7 @@ import {
 import { shouldTranslatePageText } from '../../shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '../../shared/translation-source'
 import { deriveOcrTextFromIr, ensureOcrResultIr, getOcrPageIr } from '../../shared/ocr-ir'
-import { allowFileAccessPath, allowFileAccessPaths, assertAllowedLocalFilePath } from '../file-access'
+import { allowFileAccessPath, allowManagedFileAccessPath, assertAllowedLocalFilePath } from '../file-access'
 import { documentPipelineDiagnosticsFromImportProgress } from '../../shared/document-pipeline-diagnostics'
 import { statusEnvelopeFromImportProgress } from '../../shared/status-envelope'
 import type {
@@ -70,6 +75,7 @@ import type {
   BookTranslationProgressEvent,
   BookTranslationStartResult,
   CompletedPdfAssetCleanupResult,
+  CapabilityResult,
   Document,
   DocumentAppendPagePayload,
   DocumentAppendPagesOptions,
@@ -92,6 +98,8 @@ import type {
   Folder,
   ImportDocumentResult,
   ImportDocumentOptions,
+  ImportSelection,
+  ImportSelectionBatch,
   ImportProgressEvent,
   InitializePdfPagesOptions,
   LibraryImportQueueState,
@@ -111,7 +119,6 @@ import type {
   ReadStatus,
   ReaderState,
   ReaderStateSavePayload,
-  ResolvedImportSource,
   Tag,
   TocItemV2,
   TranslationStyle,
@@ -120,6 +127,7 @@ import type {
 
 type JsonRecord = Record<string, unknown>
 const LIBRARY_IMPORT_QUEUE_STATE_ID = 'default'
+const IMPORT_FILE_LEASE_TTL_MS = 8 * 60 * 60 * 1000
 
 interface ImportedOcrBlock extends JsonRecord {
   words: string
@@ -138,6 +146,7 @@ type DeletePathTask = {
   docId: string
   path: string
   label: string
+  kind: ManagedDeleteKind
 }
 
 interface DeleteDocumentsResult {
@@ -188,6 +197,16 @@ interface DocumentHealthSourceRow extends Document {
 
 type DocumentSearchPageRow = Omit<DocumentPage, 'image_path'>
 
+function rejectProtectedPathFields(payload: unknown, fields: readonly string[]): void {
+  if (!payload || typeof payload !== 'object') return
+  const protectedField = fields.find((field) => field in payload)
+  if (protectedField) {
+    throw new Error(`不允许通过通用更新接口修改受保护路径字段：${protectedField}`)
+  }
+}
+
+type InternalImportDocumentResult = ImportDocumentResult & { sourcePath?: string }
+
 interface BookTranslationPageRow {
   id: string
   doc_id: string
@@ -227,7 +246,7 @@ export interface InterruptedDocumentDeleteRecoverySummary {
 }
 
 type DocumentExistsRow = Pick<Document, 'id'>
-type DocumentFileRow = Pick<Document, 'id' | 'file_path' | 'thumb_path'>
+type DocumentFileRow = Pick<Document, 'id'>
 type DocumentPdfSourceRow = Pick<Document, 'id' | 'file_path'>
 type DocumentMetadataRow = Pick<Document, 'metadata'>
 type TranslationCachePageRow = Pick<DocumentPage, 'id' | 'doc_id' | 'page_num'>
@@ -245,7 +264,17 @@ interface PageOcrVersionDetailRow extends PageOcrVersion {
 
 const deletePathInBackground = (task: DeletePathTask): void => {
   setImmediate(() => {
-    rm(task.path, { recursive: true, force: true }).catch((error) => {
+    const decision = inspectManagedDeleteTarget({
+      dataDir: getDataDir(),
+      docId: task.docId,
+      targetPath: task.path,
+      kind: task.kind,
+    })
+    if (!decision.allowed || !decision.canonicalTarget) {
+      console.warn(`[Documents] Skipped unsafe cleanup for ${task.docId}: ${decision.reason || 'unknown-reason'}`)
+      return
+    }
+    rm(decision.canonicalTarget, { recursive: true, force: true }).catch((error) => {
       console.error(`[Documents] Failed to delete ${task.label}:`, error)
     })
   })
@@ -391,7 +420,7 @@ function getDocumentsForDelete(docIds: string[]): DocumentFileRow[] {
   const rows: DocumentFileRow[] = []
   runForIdChunks(docIds, (chunkIds, placeholders) => {
     rows.push(...queryAll<DocumentFileRow>(
-      `SELECT id, file_path, thumb_path FROM documents WHERE id IN (${placeholders})`,
+      `SELECT id FROM documents WHERE id IN (${placeholders})`,
       chunkIds,
     ))
   })
@@ -413,15 +442,21 @@ function getDeleteCleanupTasks(docs: DocumentFileRow[]): DeletePathTask[] {
   const cleanupTasks: DeletePathTask[] = []
   for (const doc of docs) {
     const storageDir = join(getDataDir(), 'storage', doc.id)
-    const filePath = doc.file_path
-    const thumbPath = doc.thumb_path
-
-    if (existsSync(storageDir)) cleanupTasks.push({ docId: doc.id, path: storageDir, label: `storage directory for ${doc.id}` })
-    if (filePath && !filePath.startsWith(storageDir) && existsSync(filePath)) {
-      cleanupTasks.push({ docId: doc.id, path: filePath, label: `source file for ${doc.id}` })
-    }
-    if (thumbPath && !thumbPath.startsWith(storageDir) && existsSync(thumbPath)) {
-      cleanupTasks.push({ docId: doc.id, path: thumbPath, label: `thumbnail for ${doc.id}` })
+    const decision = inspectManagedDeleteTarget({
+      dataDir: getDataDir(),
+      docId: doc.id,
+      targetPath: storageDir,
+      kind: 'document-root',
+    })
+    if (decision.allowed) {
+      cleanupTasks.push({
+        docId: doc.id,
+        path: storageDir,
+        label: `storage directory for ${doc.id}`,
+        kind: 'document-root',
+      })
+    } else if (decision.reason !== 'target-missing') {
+      console.warn(`[Documents] Skipped unsafe cleanup task for ${doc.id}: ${decision.reason || 'unknown-reason'}`)
     }
   }
   return cleanupTasks
@@ -845,39 +880,50 @@ function parseJsonRecord(value: unknown): JsonRecord | null {
 }
 
 function normalizeLibraryImportQueueState(value: unknown): LibraryImportQueueState | null {
-  if (!isJsonRecord(value) || value.version !== 1 || !Array.isArray(value.jobs)) return null
+  if (!isJsonRecord(value) || (value.version !== 1 && value.version !== 2) || !Array.isArray(value.jobs)) return null
   const jobs = value.jobs
-    .map((job): LibraryImportQueueState['jobs'][number] | null => {
+    .map((job) => {
       if (!isJsonRecord(job)) return null
       const filePaths = Array.isArray(job.filePaths)
         ? job.filePaths.map((filePath) => String(filePath || '').trim()).filter(Boolean)
         : []
-      if (filePaths.length === 0) return null
-      const folderAssignments = Array.isArray(job.folderAssignments)
-        ? job.folderAssignments
-            .filter((entry): entry is [string, string] => (
-              Array.isArray(entry)
-              && typeof entry[0] === 'string'
-              && entry[0].trim().length > 0
-              && typeof entry[1] === 'string'
-              && entry[1].trim().length > 0
-            ))
-            .map(([filePath, folderId]) => [filePath.trim(), folderId.trim()] as [string, string])
-        : undefined
+      const sourceLabels = Array.isArray(job.sourceLabels)
+        ? job.sourceLabels.map((label) => String(label || '').trim()).filter(Boolean)
+        : filePaths.map((filePath) => basename(filePath))
+      const pendingCount = Math.max(0, Math.floor(Number(job.pendingCount ?? filePaths.length) || 0))
+      if (pendingCount === 0 && sourceLabels.length === 0) return null
       return {
         id: Number(job.id || 0) || Date.now(),
-        filePaths,
+        selectionId: null,
+        sourceLabels,
+        pendingCount,
         folderId: typeof job.folderId === 'string' && job.folderId ? job.folderId : null,
-        folderAssignments: folderAssignments && folderAssignments.length > 0 ? folderAssignments : undefined,
         engine: resolveImportOcrEngine(job.engine),
+        authorizationStatus: 'authorization-required' as const,
+        hasUndiscoveredSources: value.version === 2 && job.hasUndiscoveredSources === true,
       }
     })
-    .filter((job): job is LibraryImportQueueState['jobs'][number] => Boolean(job))
+    .filter((job): job is NonNullable<typeof job> => Boolean(job))
   if (jobs.length === 0) return null
   return {
-    version: 1,
+    version: 2,
     savedAt: typeof value.savedAt === 'string' && value.savedAt ? value.savedAt : new Date().toISOString(),
     jobs,
+  }
+}
+
+function capabilityFailure(error: unknown): CapabilityResult<never> {
+  const code = error instanceof FileCapabilityError ? error.code : 'CAPABILITY_INVALID_REQUEST'
+  return {
+    ok: false,
+    error: {
+      code,
+      message: code === 'CAPABILITY_EXPIRED'
+        ? '文件授权已过期，请重新选择'
+        : code === 'CAPABILITY_OWNER_MISMATCH'
+          ? '文件授权不属于当前窗口'
+          : '文件授权无效，请重新选择',
+    },
   }
 }
 
@@ -893,6 +939,7 @@ function readLibraryImportQueueState(): LibraryImportQueueState | null {
 function saveLibraryImportQueueState(state: LibraryImportQueueState | null): LibraryImportQueueState | null {
   const normalized = normalizeLibraryImportQueueState(state)
   if (!normalized) {
+    cancelLegacyImportQueueTasks()
     run('DELETE FROM library_import_queue_state WHERE id = ?', [LIBRARY_IMPORT_QUEUE_STATE_ID])
     scheduleDatabaseSave()
     return null
@@ -913,11 +960,13 @@ function saveLibraryImportQueueState(state: LibraryImportQueueState | null): Lib
       [LIBRARY_IMPORT_QUEUE_STATE_ID, payload.version, JSON.stringify(payload), now, now],
     )
   })
+  registerLegacyImportQueueState(payload)
   scheduleDatabaseSave()
   return payload
 }
 
 function clearLibraryImportQueueState(): boolean {
+  cancelLegacyImportQueueTasks()
   run('DELETE FROM library_import_queue_state WHERE id = ?', [LIBRARY_IMPORT_QUEUE_STATE_ID])
   scheduleDatabaseSave()
   return true
@@ -2141,9 +2190,9 @@ async function parseEpubFile(filePath: string): Promise<ParsedEbook> {
   const opf = xmlParser.parse(decodeEpubEntry(await opfFile.async('uint8array')))?.package
   const metadata = opf?.metadata || {}
   const manifestItems = toArray(opf?.manifest?.item)
-  const manifestById = new Map<string, any>()
+  const manifestById = new Map<string, JsonRecord>()
   manifestItems.forEach((item) => {
-    if (item?.id) manifestById.set(String(item.id), item)
+    if (isJsonRecord(item) && item.id) manifestById.set(String(item.id), item)
   })
 
   const title = textValue(metadata.title) || basename(filePath, extname(filePath))
@@ -2153,7 +2202,7 @@ async function parseEpubFile(filePath: string): Promise<ParsedEbook> {
   const spineRefs = toArray(opf?.spine?.itemref)
   const spineItems = spineRefs
     .map((ref) => manifestById.get(String(ref?.idref || '')))
-    .filter((item) => item?.href && /\.(xhtml|html|htm)$/i.test(String(item.href)))
+    .filter((item): item is JsonRecord => Boolean(item?.href && /\.(xhtml|html|htm)$/i.test(String(item.href))))
 
   if (spineItems.length === 0) throw new Error('EPUB 没有可阅读的正文 spine')
 
@@ -3729,7 +3778,7 @@ async function getCachedDocumentHealthReport(options?: DocumentHealthReportOptio
 }
 
 export function registerDocumentIpc(): void {
-  ipcMain.handle('dialog:openFiles', async () => {
+  ipcMain.handle('documents:selectImportSources', async (event): Promise<CapabilityResult<ImportSelection>> => {
     const result = await dialog.showOpenDialog({
       title: '导入文献',
       filters: [
@@ -3739,56 +3788,41 @@ export function registerDocumentIpc(): void {
         { name: '图片文件', extensions: ['png', 'jpg', 'jpeg', 'tiff', 'tif', 'bmp'] },
         { name: 'Paddle OCR JSON', extensions: ['json'] },
       ],
-      properties: ['openFile', 'multiSelections']
+      properties: ['openFile', 'openDirectory', 'multiSelections']
     })
-    allowFileAccessPaths(result.filePaths)
-    return result.filePaths
+    if (result.canceled || result.filePaths.length === 0) {
+      return { ok: false, error: { code: 'CAPABILITY_INVALID_REQUEST', message: '未选择文件' } }
+    }
+    try {
+      return { ok: true, value: await importSelectionService.create(event.sender.id, result.filePaths) }
+    } catch (error) {
+      return capabilityFailure(error)
+    }
   })
 
-  ipcMain.handle('documents:resolveImportSources', async (_event, sourcePaths: string[]): Promise<ResolvedImportSource[]> => {
-    const seen = new Set<string>()
-    const resolvedSources: ResolvedImportSource[] = []
-
-    for (const sourcePath of sourcePaths) {
-      if (!sourcePath || seen.has(sourcePath) || !existsSync(sourcePath)) continue
-      seen.add(sourcePath)
-
-      let sourceStat
-      try {
-        sourceStat = await stat(sourcePath)
-      } catch {
-        continue
-      }
-
-      if (sourceStat.isDirectory()) {
-        resolvedSources.push({
-          sourcePath,
-          sourceName: basename(sourcePath),
-          isDirectory: true,
-          filePaths: await collectImportableFiles(sourcePath),
-        })
-      } else if (sourceStat.isFile() && SUPPORTED_IMPORT_EXTENSIONS.has(extname(sourcePath).toLowerCase())) {
-        resolvedSources.push({
-          sourcePath,
-          sourceName: basename(sourcePath),
-          isDirectory: false,
-          filePaths: [sourcePath],
-        })
-      } else {
-        resolvedSources.push({
-          sourcePath,
-          sourceName: basename(sourcePath),
-          isDirectory: false,
-          filePaths: [],
-        })
-      }
-
-      if (resolvedSources.length % 10 === 0) {
-        await yieldToEventLoop()
-      }
+  ipcMain.handle('documents:grantDroppedImportSources', async (event, trustedPaths: string[]): Promise<CapabilityResult<ImportSelection>> => {
+    try {
+      return { ok: true, value: await importSelectionService.create(event.sender.id, trustedPaths) }
+    } catch (error) {
+      return capabilityFailure(error)
     }
-    allowFileAccessPaths(resolvedSources.flatMap((source) => source.filePaths || []))
-    return resolvedSources
+  })
+
+  ipcMain.handle('documents:readImportSelectionBatch', async (
+    event,
+    selectionId: string,
+    cursor?: string | null,
+    limit?: number,
+  ): Promise<CapabilityResult<ImportSelectionBatch>> => {
+    try {
+      return { ok: true, value: await importSelectionService.readBatch(event.sender.id, selectionId, cursor, limit) }
+    } catch (error) {
+      return capabilityFailure(error)
+    }
+  })
+
+  ipcMain.handle('documents:releaseImportSelection', async (event, selectionId: string): Promise<boolean> => {
+    return importSelectionService.release(event.sender.id, selectionId)
   })
 
   ipcMain.handle('documents:getImportQueueState', async (): Promise<LibraryImportQueueState | null> => {
@@ -3808,8 +3842,16 @@ export function registerDocumentIpc(): void {
     return getPdfInfo(safePath)
   })
 
-  ipcMain.handle('documents:import', (event, filePaths: string[], options?: ImportDocumentOptions) => trackDocumentImportJob(async () => {
-    allowFileAccessPaths(filePaths)
+  ipcMain.handle('documents:import', (event, grantIds: string[], options?: ImportDocumentOptions) => trackDocumentImportJob(async () => {
+    const lease = await fileCapabilityService.beginFileBatch(
+      event.sender.id,
+      grantIds,
+      'document-import',
+      IMPORT_FILE_LEASE_TTL_MS,
+    )
+    const filePaths = lease.entries.map((entry) => entry.path)
+    let leaseSettled = false
+    try {
     const importOcrEngine = resolveImportOcrEngine(options?.ocrEngine)
     const storageDir = join(getDataDir(), 'storage')
     if (!existsSync(storageDir)) {
@@ -3817,12 +3859,15 @@ export function registerDocumentIpc(): void {
     }
 
     const now = new Date().toISOString()
-    const results: ImportDocumentResult[] = []
+    const results: InternalImportDocumentResult[] = []
     let importFileIndex = 0
 
-    for (const filePath of filePaths) {
-      const fileIndex = importFileIndex
-      importFileIndex += 1
+    for (const [fileIndex, entry] of lease.entries.entries()) {
+      const filePath = entry.path
+      const sourceGrantId = entry.grantId
+      const resultStartIndex = results.length
+      importFileIndex = fileIndex + 1
+      fileCapabilityService.renewFileBatch(lease.leaseId, IMPORT_FILE_LEASE_TTL_MS)
       if (documentImportShuttingDown) break
       try {
         const id = nanoid()
@@ -3851,9 +3896,10 @@ export function registerDocumentIpc(): void {
           )
           if (possibleDuplicate?.id) {
             pdfFingerprint = await getPdfFingerprintAsync(filePath, ({ bytesDone, totalBytes }) => {
+              fileCapabilityService.renewFileBatch(lease.leaseId, IMPORT_FILE_LEASE_TTL_MS)
               sendImportProgress(event.sender, {
                 phase: 'hashing',
-                filePath,
+                filePath: sourceGrantId,
                 fileName: basename(filePath),
                 fileIndex,
                 totalFiles: filePaths.length,
@@ -4052,9 +4098,10 @@ export function registerDocumentIpc(): void {
 
         if (isPdfFile && !copiedPdf) {
           copiedPdf = await copyFileWithFingerprintAsync(filePath, destPath, pdfFingerprint || undefined, ({ bytesDone, totalBytes }) => {
+            fileCapabilityService.renewFileBatch(lease.leaseId, IMPORT_FILE_LEASE_TTL_MS)
             sendImportProgress(event.sender, {
               phase: 'copying',
-              filePath,
+              filePath: sourceGrantId,
               fileName: basename(filePath),
               fileIndex,
               totalFiles: filePaths.length,
@@ -4227,6 +4274,11 @@ export function registerDocumentIpc(): void {
         })
         if (documentImportShuttingDown) break
       } finally {
+        for (let resultIndex = resultStartIndex; resultIndex < results.length; resultIndex += 1) {
+          results[resultIndex].sourceGrantId = sourceGrantId
+          results[resultIndex].displayName = basename(filePath)
+        }
+        fileCapabilityService.renewFileBatch(lease.leaseId, IMPORT_FILE_LEASE_TTL_MS)
         await yieldToEventLoop()
       }
     }
@@ -4244,7 +4296,7 @@ export function registerDocumentIpc(): void {
       const fileIndex = Math.max(0, Math.min(filePaths.length - 1, importFileIndex - 1))
       sendImportProgress(event.sender, {
         phase: 'stored',
-        filePath: lastSuccessful.sourcePath || filePaths[fileIndex] || '',
+        filePath: lastSuccessful.sourceGrantId || lease.entries[fileIndex]?.grantId || '',
         fileName: filePaths.length === 1
           ? basename(lastSuccessful.sourcePath || filePaths[fileIndex] || lastSuccessful.title || '文件')
           : `已写入 ${successfulResults.length}/${filePaths.length} 个文件`,
@@ -4255,7 +4307,24 @@ export function registerDocumentIpc(): void {
     }
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()
-    return results
+    const settledGrantIds = [...new Set(results
+      .map((result) => result.sourceGrantId)
+      .filter((grantId): grantId is string => Boolean(grantId)))]
+    fileCapabilityService.settleFileBatch(lease.leaseId, settledGrantIds)
+    leaseSettled = true
+    return results.map(({ sourcePath, ...result }) => ({
+      ...result,
+      displayName: result.displayName || basename(sourcePath || result.title),
+    }))
+    } finally {
+      if (!leaseSettled) {
+        try {
+          fileCapabilityService.abortFileBatch(lease.leaseId)
+        } catch {
+          // The lease may already be expired while the import is unwinding.
+        }
+      }
+    }
   }))
 
   ipcMain.handle('documents:list', async (_event, options?: ListDocumentOptions): Promise<DocumentListItem[]> => {
@@ -4285,20 +4354,21 @@ export function registerDocumentIpc(): void {
     const storageDir = join(getDataDir(), 'storage')
     if (doc.file_path) doc.file_path = migratePath(doc.file_path, storageDir)
     if (doc.thumb_path) doc.thumb_path = migratePath(doc.thumb_path, storageDir)
-    if (doc.file_path) allowFileAccessPath(doc.file_path)
-    if (doc.thumb_path) allowFileAccessPath(doc.thumb_path)
+    if (doc.file_path) allowManagedFileAccessPath(doc.file_path)
+    if (doc.thumb_path) allowManagedFileAccessPath(doc.thumb_path)
     for (const page of pages) {
       if (page.image_path) {
         page.image_path = migratePath(page.image_path, storageDir)
-        allowFileAccessPath(page.image_path)
+        allowManagedFileAccessPath(page.image_path)
       }
     }
     repairStoredGujiOcrPagesForRead(pages)
     normalizeDocumentSourceAssetsForRead(doc, pages)
+    const canonicalPages = attachCanonicalPageContent(pages)
 
     return {
       ...doc,
-      pages,
+      pages: canonicalPages,
       tags,
       folders,
       metadata_candidates: getMetadataCandidates(id)
@@ -4335,12 +4405,12 @@ export function registerDocumentIpc(): void {
     const storageDir = join(getDataDir(), 'storage')
     if (doc.file_path) doc.file_path = migratePath(doc.file_path, storageDir)
     if (doc.thumb_path) doc.thumb_path = migratePath(doc.thumb_path, storageDir)
-    if (doc.file_path) allowFileAccessPath(doc.file_path)
-    if (doc.thumb_path) allowFileAccessPath(doc.thumb_path)
+    if (doc.file_path) allowManagedFileAccessPath(doc.file_path)
+    if (doc.thumb_path) allowManagedFileAccessPath(doc.thumb_path)
     for (const page of pages) {
       if (page.image_path) {
         page.image_path = migratePath(page.image_path, storageDir)
-        allowFileAccessPath(page.image_path)
+        allowManagedFileAccessPath(page.image_path)
       }
       page.__light = true
     }
@@ -4410,12 +4480,12 @@ export function registerDocumentIpc(): void {
     for (const page of pages) {
       if (page.image_path) {
         page.image_path = migratePath(page.image_path, storageDir)
-        allowFileAccessPath(page.image_path)
+        allowManagedFileAccessPath(page.image_path)
       }
       page.__full = true
     }
     repairStoredGujiOcrPagesForRead(pages)
-    return pages
+    return attachCanonicalPageContent(pages)
   })
 
   ipcMain.handle('documents:getSearchPages', async (_event, docId: string): Promise<DocumentPage[]> => {
@@ -4430,6 +4500,9 @@ export function registerDocumentIpc(): void {
         ocr_text_ref,
         proofed_text,
         proofed_text_ref,
+        active_ocr_artifact_id,
+        proof_base_artifact_id,
+        proof_base_stale,
         ocr_status,
         proof_status,
         created_at
@@ -4438,13 +4511,13 @@ export function registerDocumentIpc(): void {
       ORDER BY page_num`,
       [docId],
     ))
-    return pages.map((page) => ({
+    return attachCanonicalPageContent(pages.map((page) => ({
       ...page,
       ...parsePageOcrMeta(page),
       image_path: null,
       has_text: String(page.proofed_text || page.ocr_text || '').trim().length > 0,
       __search_text_only: true,
-    }))
+    })))
   })
 
   ipcMain.handle('documents:getReadingWindow', async (_event, docId: string, pageIndex?: number, radius?: number): Promise<DocumentReadingWindow | null> => {
@@ -4463,19 +4536,20 @@ export function registerDocumentIpc(): void {
     const storageDir = join(getDataDir(), 'storage')
     if (doc.file_path) doc.file_path = migratePath(doc.file_path, storageDir)
     if (doc.thumb_path) doc.thumb_path = migratePath(doc.thumb_path, storageDir)
-    if (doc.file_path) allowFileAccessPath(doc.file_path)
-    if (doc.thumb_path) allowFileAccessPath(doc.thumb_path)
+    if (doc.file_path) allowManagedFileAccessPath(doc.file_path)
+    if (doc.thumb_path) allowManagedFileAccessPath(doc.thumb_path)
     for (const page of pages) {
       if (page.image_path) {
         page.image_path = migratePath(page.image_path, storageDir)
-        allowFileAccessPath(page.image_path)
+        allowManagedFileAccessPath(page.image_path)
       }
       page.__full = true
     }
     repairStoredGujiOcrPagesForRead(pages)
+    const canonicalPages = attachCanonicalPageContent(pages)
     return {
       document: doc,
-      pages,
+      pages: canonicalPages,
       pageIndex: safeIndex,
       pageCount,
       startPageNum,
@@ -4485,6 +4559,7 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:update', async (_event, id: string, data: DocumentUpdatePayload) => {
+    rejectProtectedPathFields(data, ['file_path', 'thumb_path'])
     const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [id])
     if (!doc) return false
 
@@ -4494,8 +4569,6 @@ export function registerDocumentIpc(): void {
       'dynasty',
       'source',
       'doc_type',
-      'file_path',
-      'thumb_path',
       'page_count',
       'ocr_status',
       'proof_status',
@@ -5082,6 +5155,7 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:initializePdfPages', async (_event, docId: string, pageCount: number, options?: InitializePdfPagesOptions) => {
+    rejectProtectedPathFields(options, ['thumbPath'])
     const doc = queryOne<DocumentPdfSourceRow>('SELECT id, file_path FROM documents WHERE id = ?', [docId])
     if (!doc) {
       throw new Error('文献不存在')
@@ -5101,10 +5175,6 @@ export function registerDocumentIpc(): void {
     if (options?.title && String(options.title).trim() && String(options.title).trim() !== '未命名文档') {
       updates.push('title = ?')
       params.push(String(options.title).trim())
-    }
-    if (options?.thumbPath !== undefined) {
-      updates.push('thumb_path = ?')
-      params.push(options.thumbPath || null)
     }
     params.push(docId)
     run(`UPDATE documents SET ${updates.join(', ')} WHERE id = ?`, params)
@@ -5182,46 +5252,68 @@ export function registerDocumentIpc(): void {
     return cleanupCompletedPdfAssetsAsync()
   })
 
-  ipcMain.handle('pdfRepository:selectFolder', async () => {
+  ipcMain.handle('pdfRepository:selectFolder', async (event) => {
     const result = await dialog.showOpenDialog({
       title: '选择 PDF 原件仓库',
       properties: ['openDirectory'],
     })
-    if (result.canceled || result.filePaths.length === 0) return null
-    addPdfRepositoryPath(result.filePaths[0])
-    allowFileAccessPath(result.filePaths[0])
-    return result.filePaths[0]
+    if (result.canceled || result.filePaths.length === 0) return getPdfRepositoryStatus()
+    const grants = await fileCapabilityService.issueTrustedPaths({
+      ownerId: event.sender.id,
+      purpose: 'pdf-repository',
+      paths: [result.filePaths[0]],
+      kind: 'directory',
+      consumeMode: 'once',
+    })
+    const repositoryPath = await fileCapabilityService.useDirectory(event.sender.id, grants[0].grantId, 'pdf-repository')
+    return addPdfRepositoryPath(repositoryPath)
   })
 
   ipcMain.handle('pdfRepository:list', async (): Promise<PdfRepositoryStatus> => {
     return getPdfRepositoryStatus()
   })
 
-  ipcMain.handle('pdfRepository:setPaths', async (_event, paths: string[]): Promise<PdfRepositoryStatus> => {
-    allowFileAccessPaths(paths)
-    return setPdfRepositoryPaths(paths)
+  ipcMain.handle('pdfRepository:remove', async (_event, repositoryId: string): Promise<PdfRepositoryStatus> => {
+    return removePdfRepositoryById(String(repositoryId || ''))
   })
 
-  ipcMain.handle('pdfRepository:index', async (_event, paths?: string[]): Promise<PdfRepositoryIndexResult> => {
-    if (paths) allowFileAccessPaths(paths)
-    return indexPdfRepositoriesAsync(paths)
+  ipcMain.handle('pdfRepository:index', async (): Promise<PdfRepositoryIndexResult> => {
+    return indexPdfRepositoriesAsync()
   })
 
-  ipcMain.handle('pdfRepository:restoreForDocument', async (_event, docId: string, manualPath?: string): Promise<PdfAssetRestoreResult> => {
-    if (manualPath) allowFileAccessPath(manualPath)
+  ipcMain.handle('pdfRepository:restoreForDocument', async (_event, docId: string): Promise<PdfAssetRestoreResult> => {
+    return restorePdfAssetForDocumentAsync(docId)
+  })
+
+  ipcMain.handle('pdfRepository:selectAndRestoreForDocument', async (event, docId: string): Promise<PdfAssetRestoreResult> => {
+    const result = await dialog.showOpenDialog({
+      title: '选择要补回的 PDF 原件',
+      filters: [{ name: 'PDF 文档', extensions: ['pdf'] }],
+      properties: ['openFile'],
+    })
+    if (result.canceled || result.filePaths.length === 0) return { restored: false, error: '未选择 PDF 文件' }
+    const grants = await fileCapabilityService.issueTrustedPaths({
+      ownerId: event.sender.id,
+      purpose: 'pdf-restore',
+      paths: [result.filePaths[0]],
+      kind: 'file',
+      consumeMode: 'once',
+    })
+    const manualPath = await fileCapabilityService.consumeFile(event.sender.id, grants[0].grantId, 'pdf-restore')
     return restorePdfAssetForDocumentAsync(docId, manualPath)
   })
 
   ipcMain.handle('pages:update', async (_event, pageId: string, data: PageUpdatePayload) => {
-    const page = queryOne<{ doc_id: string; page_num: number | null; image_path: string | null }>(
-      'SELECT doc_id, page_num, image_path FROM pages WHERE id = ?',
+    rejectProtectedPathFields(data, ['image_path'])
+    const page = queryOne<{ doc_id: string; page_num: number | null; image_path: string | null; proof_status: string; active_ocr_artifact_id: string | null }>(
+      'SELECT doc_id, page_num, image_path, proof_status, active_ocr_artifact_id FROM pages WHERE id = ?',
       [pageId],
     )
     if (!page) return false
     const normalizedData: PageUpdatePayload = { ...data }
     if ('ocr_result' in normalizedData && normalizedData.ocr_result) {
       let imageSize: { width: number; height: number } | null = null
-      const imagePath = String(normalizedData.image_path || page.image_path || '').trim()
+      const imagePath = String(page.image_path || '').trim()
       if (imagePath) {
         try {
           const image = nativeImage.createFromPath(imagePath)
@@ -5245,7 +5337,7 @@ export function registerDocumentIpc(): void {
       }
     }
 
-    const allowedFields: Array<keyof PageUpdatePayload> = ['image_path', 'ocr_text', 'ocr_result', 'proofed_text', 'ocr_status', 'proof_status']
+    const allowedFields: Array<keyof PageUpdatePayload> = ['ocr_text', 'ocr_result', 'proofed_text', 'ocr_status', 'proof_status']
     const sets: string[] = []
     const params: unknown[] = []
 
@@ -5260,6 +5352,11 @@ export function registerDocumentIpc(): void {
       }
       sets.push(`${field} = ?`)
       params.push(value)
+    }
+
+    const effectiveProofStatus = normalizedData.proof_status === undefined ? page.proof_status : normalizedData.proof_status
+    if ('proofed_text' in normalizedData && effectiveProofStatus === 'completed') {
+      sets.push('proof_base_artifact_id = active_ocr_artifact_id', 'proof_base_stale = 0')
     }
 
     if (sets.length === 0) return false
@@ -5309,14 +5406,12 @@ export function registerDocumentIpc(): void {
 
     const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', normalizedOcrResult)
     const nextOcrText = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_text', ocrText)
-    run('UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, proofed_text = ?, proofed_text_ref = ?, proof_status = ? WHERE id = ?', [
+    run(`UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?,
+      proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END WHERE id = ?`, [
       nextOcrResult.value,
       nextOcrResult.ref,
       nextOcrText.value,
       nextOcrText.ref,
-      null,
-      null,
-      'pending',
       pageId,
     ])
     syncDocumentProofStatus(page.doc_id)
@@ -5357,8 +5452,10 @@ export function registerDocumentIpc(): void {
       : null
     const nextOcrResult = preparePagePayloadUpdate(page.doc_id, pageId, 'ocr_result', normalizedVersionResult)
     run(
-      'UPDATE pages SET ocr_text = ?, ocr_text_ref = ?, ocr_result = ?, ocr_result_ref = ?, proofed_text = ?, proofed_text_ref = ?, ocr_status = ?, proof_status = ? WHERE id = ?',
-      [nextOcrText.value, nextOcrText.ref, nextOcrResult.value, nextOcrResult.ref, null, null, 'completed', 'pending', pageId],
+      `UPDATE pages SET ocr_text = ?, ocr_text_ref = ?, ocr_result = ?, ocr_result_ref = ?, ocr_status = ?,
+       proof_base_stale = CASE WHEN TRIM(COALESCE(proofed_text, '')) <> '' THEN 1 ELSE proof_base_stale END
+       WHERE id = ?`,
+      [nextOcrText.value, nextOcrText.ref, nextOcrResult.value, nextOcrResult.ref, 'completed', pageId],
     )
     const doc = queryOne<DocumentMetadataRow>('SELECT metadata FROM documents WHERE id = ?', [page.doc_id])
     const metadata = (() => {

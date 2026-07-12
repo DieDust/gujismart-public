@@ -22,6 +22,7 @@ import type { Document as LibraryDocument, DocumentPage, ReaderTranslationOption
 import { getCitationPageNumber, getReadablePageElements, getReadablePageText, normalizeOcrTextForReading, type ReadablePageElement } from '../utils/ocrText'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import { getErrorMessage } from '@shared/errors'
+import { legacySearchLocatorFromUnknown } from '@shared/stable-reader-locator'
 import ParallelTranslationView from './ParallelTranslationView'
 import LlmProfileSelector from './LlmProfileSelector'
 import AiMarkdown from './AiMarkdown'
@@ -571,6 +572,9 @@ function toFiniteNumber(value: unknown, fallback = 0): number {
 }
 
 function asSearchHitLocator(value: unknown): SearchHitLocator | null {
+  if (isJsonRecord(value) && readRecordValue(value, 'schemaVersion') === 'stable-reader-locator/v2') {
+    return legacySearchLocatorFromUnknown(value)
+  }
   if (!isJsonRecord(value)) return null
   const matchText = String(readRecordValue(value, 'matchText') || readRecordValue(value, 'queryTerm') || '').trim()
   const charStart = Math.max(0, toFiniteNumber(readRecordValue(value, 'charStart'), 0))

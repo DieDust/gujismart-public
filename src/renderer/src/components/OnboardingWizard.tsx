@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Alert, AutoComplete, Button, Card, Checkbox, Input, Modal, Select, Space, Spin, Steps, Tag, Typography, message } from 'antd'
-import { ApiOutlined, CheckCircleOutlined, DownloadOutlined, FileSearchOutlined, KeyOutlined, RobotOutlined } from '@ant-design/icons'
+import { ApiOutlined, CheckCircleOutlined, FileSearchOutlined, KeyOutlined, RobotOutlined } from '@ant-design/icons'
 import type { SettingsMap } from '@shared/types'
 import { PRODUCT_NAME } from '@shared/types'
 import { useOnboardingStore } from '../stores/useOnboardingStore'
@@ -19,7 +19,6 @@ const SETTINGS_LOAD_TIMEOUT_MS = 3000
 const PADDLE_OCR_APPLY_URL = 'https://aistudio.baidu.com/paddleocr'
 const DEEPSEEK_APPLY_URL = 'https://platform.deepseek.com/'
 const VOLCENGINE_ARK_API_KEY_URL = 'https://www.volcengine.com/docs/82379/1263279'
-const DEFAULT_LOCAL_PADDLE_OCR_SIZE = 'small'
 
 const AI_PROVIDER_PRESETS: ProviderPreset[] = [
   { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', models: ['deepseek-chat', 'deepseek-reasoner'] },
@@ -42,19 +41,18 @@ function hasText(value: unknown): boolean {
 
 function isAiConfigured(settings: SettingsMap | null): boolean {
   if (!settings) return false
-  return hasText(settings.llm_api_key) && hasText(settings.llm_base_url) && hasText(settings.llm_model)
+  return settings.llm_api_key_configured === 'true' && hasText(settings.llm_base_url) && hasText(settings.llm_model)
 }
 
 function isPaddleConfigured(settings: SettingsMap | null): boolean {
-  if (settings?.ocr_default_engine === 'local_paddle') return settings.local_paddle_ocr_status === 'installed'
   if (settings?.ocr_default_engine === 'vision_model') return isVisionConfigured(settings)
-  return hasText(settings?.paddleocr_api_key)
+  return settings?.paddleocr_api_key_configured === 'true'
 }
 
 function isVisionConfigured(settings: SettingsMap | null): boolean {
   if (!settings) return false
   if (settings.vision_ocr_use_llm_config !== 'false') return isAiConfigured(settings)
-  return hasText(settings.vision_ocr_api_key) && hasText(settings.vision_ocr_base_url) && hasText(settings.vision_ocr_model)
+  return settings.vision_ocr_api_key_configured === 'true' && hasText(settings.vision_ocr_base_url) && hasText(settings.vision_ocr_model)
 }
 
 function getPreset(name: string, presets: ProviderPreset[]): ProviderPreset {
@@ -117,19 +115,19 @@ export default function OnboardingWizard() {
         const nextSettings = await getAllSettingsForOnboarding()
         if (cancelled) return
         setSettings(nextSettings)
-        setPaddleApiKey(nextSettings.paddleocr_api_key || '')
+        setPaddleApiKey('')
         setPaddleModel(nextSettings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : nextSettings.ocr_async_model || 'PaddleOCR-VL-1.6')
         const currentAiPreset = AI_PROVIDER_PRESETS.find((preset) => preset.name === nextSettings.llm_provider) || AI_PROVIDER_PRESETS[0]
         setAiProvider(nextSettings.llm_provider || currentAiPreset.name)
         setAiBaseUrl(nextSettings.llm_base_url || currentAiPreset.baseUrl)
-        setAiApiKey(nextSettings.llm_api_key || '')
+        setAiApiKey('')
         setAiModel(nextSettings.llm_model || currentAiPreset.models[0] || '')
         setAiModels(currentAiPreset.models.length ? currentAiPreset.models : nextSettings.llm_model ? [nextSettings.llm_model] : [])
         const currentVisionPreset = VISION_PROVIDER_PRESETS.find((preset) => preset.baseUrl === String(nextSettings.vision_ocr_base_url || '').replace(/\/+$/, '')) || VISION_PROVIDER_PRESETS[0]
         setVisionFollowAi(nextSettings.vision_ocr_use_llm_config !== 'false')
         setVisionProvider(nextSettings.vision_ocr_provider || currentVisionPreset.name)
         setVisionBaseUrl(nextSettings.vision_ocr_base_url || currentVisionPreset.baseUrl)
-        setVisionApiKey(nextSettings.vision_ocr_api_key || '')
+        setVisionApiKey('')
         setVisionModel(nextSettings.vision_ocr_model || currentVisionPreset.models[0] || '')
         setVisionModels(currentVisionPreset.models.length ? currentVisionPreset.models : nextSettings.vision_ocr_model ? [nextSettings.vision_ocr_model] : [])
       } catch (error) {
@@ -172,23 +170,9 @@ export default function OnboardingWizard() {
     }
   }
 
-  const handleSelectOcrMode = async (mode: 'local' | 'cloud' | 'ai') => {
+  const handleSelectOcrMode = async (mode: 'cloud' | 'ai') => {
     setSaving(true)
     try {
-      if (mode === 'local') {
-        await window.api.setSetting('local_paddle_ocr_size', DEFAULT_LOCAL_PADDLE_OCR_SIZE)
-        await window.api.installLocalPaddleOcrRuntime()
-        const status = await window.api.downloadLocalPaddleOcr({ source: 'auto' })
-        if (status.installed) {
-          await window.api.setDefaultOcrEngine('local_paddle', 'local_paddle')
-          await markStepComplete('paddle_ocr')
-          message.success('本地 OCR 已设为默认')
-          nextStep()
-        } else {
-          message.warning(status.message || '本地 OCR 尚未完整安装，可稍后在设置页重试下载。')
-        }
-        return
-      }
       if (mode === 'cloud') {
         await window.api.setDefaultOcrEngine('paddle', 'paddle')
         message.success('已选择飞桨云端 OCR，请继续填写 Token 或稍后补充。')
@@ -210,7 +194,7 @@ export default function OnboardingWizard() {
     setSaving(true)
     try {
       const token = paddleApiKey.trim()
-      if (token) await window.api.setSetting('paddleocr_api_key', token)
+      if (token) await window.api.saveCredential('paddleocr_api_key', token)
       await window.api.setSetting('ocr_async_model', paddleModel.trim() || 'PaddleOCR-VL-1.6')
       await window.api.setDefaultOcrEngine('paddle', 'paddle')
       await refreshSettings()
@@ -237,7 +221,7 @@ export default function OnboardingWizard() {
     try {
       await window.api.setSetting('llm_provider', provider)
       await window.api.setSetting('llm_base_url', baseUrl)
-      await window.api.setSetting('llm_api_key', aiApiKey)
+      if (aiApiKey) await window.api.saveCredential('llm_api_key', aiApiKey)
       await window.api.setSetting('llm_model', model)
       const upserted = await window.api.upsertLlmProviderProfile({
         id: '',
@@ -279,7 +263,7 @@ export default function OnboardingWizard() {
         }
         await window.api.setSetting('vision_ocr_provider', provider)
         await window.api.setSetting('vision_ocr_base_url', baseUrl)
-        await window.api.setSetting('vision_ocr_api_key', visionApiKey)
+        if (visionApiKey) await window.api.saveCredential('vision_ocr_api_key', visionApiKey)
         await window.api.setSetting('vision_ocr_model', model)
         await window.api.setSetting('vision_ocr_use_llm_config', 'false')
         const upserted = await window.api.upsertVisionOcrProviderProfile({
@@ -310,8 +294,7 @@ export default function OnboardingWizard() {
     if (kind === 'paddle') {
       setPaddleModelsLoading(true)
       try {
-        const apiKey = paddleApiKey.trim() || String(settings?.paddleocr_api_key || '').trim()
-        const models = await window.api.listPaddleOcrModels(apiKey || undefined)
+        const models = await window.api.listPaddleOcrModels(paddleApiKey.trim() || undefined)
         setPaddleModels(models.length ? models : paddleModels)
         if (models[0]) setPaddleModel(models[0])
         message.success(`已加载 ${models.length} 个 PaddleOCR 模型`)
@@ -331,13 +314,17 @@ export default function OnboardingWizard() {
     const setModel = kind === 'ai' ? setAiModel : setVisionModel
     const presets = kind === 'ai' ? AI_PROVIDER_PRESETS : VISION_PROVIDER_PRESETS
     const fallbackPreset = presets.find((item) => item.baseUrl === baseUrl.trim().replace(/\/+$/, ''))
-    if (!baseUrl.trim() || !apiKey.trim()) {
+    if (!baseUrl.trim()) {
       if (fallbackPreset?.models?.length) setOptions(fallbackPreset.models)
       return
     }
     setLoadingState(true)
     try {
-      const models = await window.api.listModels(baseUrl.trim(), apiKey.trim())
+      const models = await window.api.listModels(
+        baseUrl.trim(),
+        apiKey.trim(),
+        kind === 'vision' ? 'vision_ocr_api_key' : 'llm_api_key',
+      )
       setOptions([...new Set([...(fallbackPreset?.models || []), ...models])])
       if (models[0]) setModel(models[0])
       message.success(`已加载 ${models.length} 个模型`)
@@ -422,9 +409,6 @@ export default function OnboardingWizard() {
               description={<span>没有 Token 也可以先跳过。需要 OCR 时，可前往 <a href={PADDLE_OCR_APPLY_URL} target="_blank" rel="noreferrer">飞桨 PaddleOCR 服务页</a> 申请。</span>}
             />
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
-              <Button block icon={<DownloadOutlined />} loading={saving} onClick={() => void handleSelectOcrMode('local')}>
-                下载本地 OCR
-              </Button>
               <Button block icon={<ApiOutlined />} loading={saving} onClick={() => void handleSelectOcrMode('cloud')}>
                 填写云端 OCR
               </Button>
@@ -432,7 +416,6 @@ export default function OnboardingWizard() {
                 使用 AI OCR
               </Button>
             </div>
-            <Text type="secondary">本地 OCR 默认下载 PP-OCRv6 中档；进入设置页后可以切换小 / 中 / 大。</Text>
             <Card size="small" style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>API Token</Text>

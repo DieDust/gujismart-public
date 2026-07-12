@@ -233,7 +233,214 @@ export type TagSource =
   | (string & {})
 export type OcrEngine = 'local_paddle' | 'paddle' | 'vision_model' | 'hybrid'
 
-export interface LibraryImportQueueJobSnapshot {
+export type FileCapabilityErrorCode =
+  | 'CAPABILITY_UNKNOWN'
+  | 'CAPABILITY_EXPIRED'
+  | 'CAPABILITY_OWNER_MISMATCH'
+  | 'CAPABILITY_PURPOSE_MISMATCH'
+  | 'CAPABILITY_KIND_MISMATCH'
+  | 'CAPABILITY_ALREADY_CONSUMED'
+  | 'CAPABILITY_ALREADY_LOCKED'
+  | 'CAPABILITY_TARGET_MISSING'
+  | 'CAPABILITY_TARGET_CHANGED'
+  | 'CAPABILITY_SYMLINK_REJECTED'
+  | 'CAPABILITY_BATCH_LIMIT'
+  | 'CAPABILITY_INVALID_REQUEST'
+  | 'CAPABILITY_LEASE_UNKNOWN'
+  | 'CAPABILITY_LEASE_EXPIRED'
+  | 'CAPABILITY_LEASE_MISMATCH'
+
+export interface FileCapabilityErrorResult {
+  code: FileCapabilityErrorCode
+  message: string
+}
+
+export type TaskStatus = 'queued' | 'running' | 'paused' | 'completed' | 'error' | 'canceled'
+export type TaskCompletionKind = 'full' | 'partial'
+
+export interface ErrorEnvelope {
+  code: string
+  message: string
+  recoverable: boolean
+  recoveryAction?: string
+  details?: Record<string, string | number | boolean | null>
+}
+
+export interface TaskStateEnvelope {
+  taskId: string
+  kind: string
+  status: TaskStatus
+  phase?: string
+  progress?: number
+  committedCount?: number
+  totalCount?: number
+  completionKind?: TaskCompletionKind
+  blockedReason?: string
+  recoveryAction?: string
+  error?: ErrorEnvelope
+  updatedAt?: string
+}
+
+export interface TaskJobRecord {
+  id: string
+  kind: string
+  status: TaskStatus
+  phase: string | null
+  priority: number
+  idempotencyKey: string | null
+  settingsSnapshot: Record<string, unknown>
+  totalCount: number
+  queuedCount: number
+  runningCount: number
+  completedCount: number
+  errorCount: number
+  canceledCount: number
+  completionKind: TaskCompletionKind | null
+  error: ErrorEnvelope | null
+  createdAt: number
+  updatedAt: number
+  startedAt: number | null
+  completedAt: number | null
+}
+
+export interface TaskItemRecord {
+  id: string
+  jobId: string
+  ordinal: number
+  status: TaskStatus
+  phase: string | null
+  idempotencyKey: string | null
+  domainType: string | null
+  domainRef: string | null
+  input: Record<string, unknown>
+  cursor: Record<string, unknown> | null
+  attemptCount: number
+  activeAttemptId: string | null
+  leaseOwner: string | null
+  leaseExpiresAt: number | null
+  completionKind: TaskCompletionKind | null
+  error: ErrorEnvelope | null
+  createdAt: number
+  updatedAt: number
+  startedAt: number | null
+  completedAt: number | null
+}
+
+export interface TaskClaim {
+  jobId: string
+  itemId: string
+  attemptId: string
+  attemptNo: number
+  leaseToken: string
+  leaseExpiresAt: number
+  domainType: string | null
+  domainRef: string | null
+  input: Record<string, unknown>
+  cursor: Record<string, unknown> | null
+}
+
+export interface TaskEventRecord {
+  id: number
+  jobId: string
+  itemId: string | null
+  attemptId: string | null
+  eventType: string
+  status: TaskStatus | null
+  phase: string | null
+  payload: Record<string, unknown>
+  createdAt: number
+}
+
+export interface TaskArtifactRecord {
+  id: string
+  sequence: number
+  jobId: string
+  itemId: string | null
+  attemptId: string | null
+  kind: string
+  ref: string
+  version: number
+  sha256: string | null
+  idempotencyKey: string | null
+  metadata: Record<string, unknown>
+  createdAt: number
+}
+
+export interface CursorPage<T> {
+  items: T[]
+  nextCursor: string | null
+}
+
+export type CanonicalContentSource = 'human-proof' | 'ocr-artifact' | 'legacy-projection' | 'unavailable'
+export type CanonicalVerificationStatus = 'confirmed' | 'machine' | 'unavailable'
+
+export interface CanonicalPageContent {
+  pageId: string
+  docId: string
+  pageNum: number
+  text: string
+  source: CanonicalContentSource
+  verificationStatus: CanonicalVerificationStatus
+  sourceHash: string
+  artifactId: string | null
+  activeArtifactId: string | null
+  baseArtifactId: string | null
+  proofStatus: ProofStatus
+  ocrStatus: OcrStatus
+  proofBaseStale: boolean
+}
+
+export type SettingValueType = 'string' | 'boolean' | 'integer' | 'secret'
+export type SettingSensitivity = 'public' | 'protected'
+
+export interface SettingDefinition {
+  key: string
+  type: SettingValueType
+  sensitivity: SettingSensitivity
+  rendererVisible: boolean
+  defaultValue?: string
+  min?: number
+  max?: number
+}
+
+export type CapabilityResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: FileCapabilityErrorResult }
+
+export interface LocalFileGrantRef {
+  grantId: string
+  displayName: string
+  kind: 'file' | 'directory'
+  expiresAt: number
+}
+
+export interface ImportSourceRef extends LocalFileGrantRef {
+  sourceId: string
+  isDirectory: boolean
+}
+
+export interface ImportSelection {
+  selectionId: string
+  sources: ImportSourceRef[]
+  discoveredFileCount: number | null
+  authorizationStatus: 'authorized'
+}
+
+export interface ImportSelectionBatchItem {
+  grantId: string
+  sourceId: string
+  displayName: string
+  relativeDisplayPath?: string
+}
+
+export interface ImportSelectionBatch {
+  selectionId: string
+  items: ImportSelectionBatchItem[]
+  nextCursor: string | null
+  done: boolean
+}
+
+export interface LibraryImportQueueJobSnapshotV1 {
   id: number
   filePaths: string[]
   folderId?: string | null
@@ -241,11 +448,31 @@ export interface LibraryImportQueueJobSnapshot {
   engine: OcrEngine
 }
 
-export interface LibraryImportQueueState {
+export interface LibraryImportQueueJobSnapshotV2 {
+  id: number
+  selectionId: string | null
+  sourceLabels: string[]
+  pendingCount: number
+  folderId?: string | null
+  engine: OcrEngine
+  authorizationStatus: 'authorized' | 'authorization-required'
+  hasUndiscoveredSources?: boolean
+}
+
+export interface LibraryImportQueueStateV1 {
   version: 1
   savedAt: string
-  jobs: LibraryImportQueueJobSnapshot[]
+  jobs: LibraryImportQueueJobSnapshotV1[]
 }
+
+export interface LibraryImportQueueStateV2 {
+  version: 2
+  savedAt: string
+  jobs: LibraryImportQueueJobSnapshotV2[]
+}
+
+export type LibraryImportQueueState = LibraryImportQueueStateV1 | LibraryImportQueueStateV2
+export type LibraryImportQueueJobSnapshot = LibraryImportQueueJobSnapshotV1 | LibraryImportQueueJobSnapshotV2
 
 export type LocalPaddleOcrInstallState = 'not_installed' | 'partial' | 'installed' | 'downloading' | 'error'
 export type LocalPaddleOcrDownloadSourceId = 'auto' | 'paddle_bos' | 'modelscope' | 'huggingface' | 'manual'
@@ -388,7 +615,8 @@ export interface ImportDocumentResult {
   id: string
   title: string
   success: boolean
-  sourcePath?: string
+  sourceGrantId?: string
+  displayName?: string
   error?: string
   sourceType?: 'file' | 'image-file' | 'paddle-json' | 'ebook-text' | 'restored-pdf' | 'duplicate-pdf'
   ocrReady?: boolean
@@ -413,13 +641,6 @@ export interface ImportProgressEvent {
   pipelineDiagnostics?: DocumentPipelineDiagnostics
 }
 
-export interface ResolvedImportSource {
-  sourcePath: string
-  sourceName: string
-  isDirectory: boolean
-  filePaths: string[]
-}
-
 export interface ImportDocumentOptions {
   ocrEngine?: OcrEngine
 }
@@ -428,6 +649,37 @@ export interface BatchOcrOptions {
   engine?: OcrEngine
   forceFullRerun?: boolean
   concurrency?: number
+}
+
+export interface ImportAutoOcrTaskCreateOptions {
+  engine: OcrEngine
+  batchSize: number
+  sourceImportJobId?: string | null
+}
+
+export interface ImportAutoOcrTaskItemInput {
+  docId: string
+  sourceOrder: number
+  sourceType?: string | null
+}
+
+export interface ImportAutoOcrTaskCreateResult {
+  jobId: string
+  engine: OcrEngine
+  batchSize: number
+  totalCount: number
+}
+
+export interface ImportAutoOcrTaskAppendResult {
+  jobId: string
+  appendedCount: number
+  totalCount: number
+}
+
+export interface ImportAutoOcrTaskStartResult {
+  jobId: string
+  totalCount: number
+  started: boolean
 }
 
 export type OcrRecognizeMode = 'accurate' | 'traditional'
@@ -727,7 +979,6 @@ export interface DocumentAppendPagesOptions {
 
 export interface InitializePdfPagesOptions {
   title?: string
-  thumbPath?: string | null
 }
 
 export interface PdfInfoResult {
@@ -775,12 +1026,20 @@ export interface CompletedPdfAssetCleanupResult {
 }
 
 export interface PdfRepositoryStatus {
+  repositories: PdfRepositoryEntry[]
   paths: string[]
   stats: {
     fileCount: number
     totalBytes: number
   }
   lastIndexedAt: string | null
+}
+
+export interface PdfRepositoryEntry {
+  repositoryId: string
+  displayName: string
+  displayPath: string
+  available: boolean
 }
 
 export interface PdfRepositoryIndexResult {
@@ -895,8 +1154,6 @@ export interface DocumentUpdatePayload extends Partial<Pick<Document,
   | 'dynasty'
   | 'source'
   | 'doc_type'
-  | 'file_path'
-  | 'thumb_path'
   | 'page_count'
   | 'ocr_status'
   | 'proof_status'
@@ -1009,7 +1266,7 @@ export interface DocumentListPage {
   offset: number
 }
 
-export type BatchProgressStatus = 'pending' | 'running' | 'paused' | 'completed' | 'error' | (string & {})
+export type BatchProgressStatus = 'pending' | 'running' | 'paused' | 'completed' | 'error' | 'canceled' | (string & {})
 
 export interface BatchJob {
   id: string
@@ -1061,6 +1318,7 @@ export interface BackgroundTaskProgressEvent {
   completedCount?: number
   errorMessage?: string
   updatedAt: string
+  taskState: TaskStateEnvelope
 }
 
 export type TranslationStyle = 'academic_smooth' | (string & {})
@@ -1098,6 +1356,8 @@ export interface TranslationUnitV1 {
   sourceIndex?: number | null
   createdAt?: string | null
   updatedAt?: string | null
+  currentRevisionId?: string | null
+  revision?: number | null
 }
 
 export interface PageTranslationRequest {
@@ -1147,6 +1407,65 @@ export interface PageTranslationResult {
 export interface TranslationUnitUpdatePayload {
   translationText: string
   manualOverride?: boolean
+  expectedRevisionId?: string | null
+}
+
+export interface TranslationContextSnapshot {
+  id: string
+  context_hash: string
+  unit_id: string
+  doc_id: string
+  page_id: string
+  unit_source_hash: string
+  canonical_source_hash: string
+  content_version: string
+  source_locator_json: string
+  target_language: string
+  mode: TranslationMode
+  style: string
+  provider_id: string
+  model: string
+  model_signature: string
+  parameters_hash: string
+  glossary_version: string
+  prompt_version: string
+  protector_version: string
+  normalizer_version: string
+  created_at: number
+}
+
+export interface TranslationUnitRevision {
+  id: string
+  unit_id: string
+  revision: number
+  parent_revision_id: string | null
+  context_snapshot_id: string | null
+  source_hash: string
+  translation_text: string
+  origin: 'legacy' | 'machine' | 'manual'
+  status: 'active' | 'superseded' | 'detached' | 'stale'
+  content_hash: string
+  quality_json: string
+  created_at: number
+}
+
+export interface TranslationAttempt {
+  id: string
+  task_id: string
+  unit_id: string
+  context_snapshot_id: string
+  base_revision_id: string
+  status: 'running' | 'committed' | 'conflict' | 'error' | 'canceled'
+  candidate_revision_id: string | null
+  error_code: string | null
+  created_at: number
+  completed_at: number | null
+}
+
+export interface TranslationRevisionCommitResult {
+  outcome: 'committed' | 'conflict'
+  revision: TranslationUnitRevision
+  activeRevisionId: string
 }
 
 export interface TranslationCacheKeyOptions {
@@ -1235,7 +1554,6 @@ export interface Page {
 }
 
 export interface PageUpdatePayload extends Partial<Pick<Page,
-  | 'image_path'
   | 'ocr_text'
   | 'proofed_text'
   | 'ocr_status'
@@ -1251,6 +1569,7 @@ export interface DocumentPage extends Page {
   __full?: boolean
   __light?: boolean
   __search_text_only?: boolean
+  canonical_content?: CanonicalPageContent
 }
 
 export interface DocumentLightPage extends Pick<Page, 'id' | 'doc_id' | 'page_num' | 'image_path' | 'ocr_status' | 'proof_status' | 'created_at'> {
@@ -1398,6 +1717,7 @@ export interface OpenDocumentTarget {
   excerpt?: string
   sourceId?: string
   locator?: SearchHitLocator
+  stableLocator?: StableReaderLocator
   searchSession?: SearchSessionState
   revealToc?: boolean
   highlightExcerpt?: string
@@ -1423,12 +1743,11 @@ export interface Folder {
 export interface FolderCreatePayload {
   name: string
   parent_id?: string | null
-  external_path?: string | null
   icon?: string
   color?: string | null
 }
 
-export type FolderUpdatePayload = Partial<Pick<Folder, 'name' | 'parent_id' | 'external_path' | 'icon' | 'color' | 'sort_order'>>
+export type FolderUpdatePayload = Partial<Pick<Folder, 'name' | 'parent_id' | 'icon' | 'color' | 'sort_order'>>
 
 export interface FolderMovePayload {
   id: string
@@ -1690,19 +2009,79 @@ export interface Setting {
 
 export type SettingsMap = Record<string, string>
 
+export interface CredentialPublicState {
+  configured: boolean
+  last4?: string
+  version: number
+  state: 'active' | 'missing' | 'corrupt'
+}
+
+export type {
+  CitationResolutionDiagnostic,
+  CitationResolutionV2,
+  CitationResolvedField,
+  CitationResolvedFieldStatus,
+} from './citation-resolution-v2'
+
+export interface CitationSnapshot {
+  id: string
+  identity_hash: string
+  document_id: string
+  style_id: string
+  template_id: string
+  citation_type: string
+  format_id: string
+  metadata_version: string
+  style_version: string
+  template_version: string
+  resolution_json: string
+  rendered_text: string
+  verification_status: 'verified' | 'draft' | 'blocked' | 'legacy-unverified'
+  snapshot_hash: string
+  created_at: number
+}
+
+export interface CredentialDraftRef {
+  draftRef: string
+  expiresAt: number
+}
+
 export interface LlmProviderProfile {
   id: string
   name: string
   provider: string
   baseUrl: string
-  apiKey: string
+  apiKey?: string
   model: string
   updatedAt?: string
+  credential?: CredentialPublicState
+  connectionTest?: VisionOcrConnectionTestState
+}
+
+export interface VisionOcrConnectionTestState {
+  verified: boolean
+  testedAt?: string
+}
+
+export interface VisionOcrConnectionTestPayload {
+  id?: string
+  name?: string
+  provider?: string
+  baseUrl?: string
+  model?: string
+  apiKey?: string
+  useLlmConfig?: boolean
+}
+
+export interface VisionOcrConnectionTestResult extends VisionOcrConnectionTestState {
+  profileId: string
+  message: string
 }
 
 export interface ListModelsPayload {
   baseUrl?: string
-  apiKey?: string
+  credentialDraftRef?: string
+  credentialKey?: 'llm_api_key' | 'vision_ocr_api_key'
 }
 
 export interface LlmProviderProfileState {
@@ -1741,6 +2120,8 @@ export interface BackupSlot {
   sizeBytes?: number
   includesStorage?: boolean
   integrityReport?: BackupIntegrityReport
+  credentialsExcluded?: boolean
+  credentialRequiredAfterRestore?: boolean
 }
 
 export interface BackupStatus {
@@ -1753,6 +2134,7 @@ export interface BackupStatus {
   nextBackupAt: string | null
   autoBackupRoot: string
   slots: BackupSlot[]
+  legacyCredentialRiskCount: number
   configValidation?: ConfigValidationReport
 }
 
@@ -1978,6 +2360,29 @@ export interface ResearchOutputPayload {
   source_dataset_id?: string | null
   input_snapshot_json?: string
   inputSnapshotJson?: string
+  aggregate_ids?: string[]
+  aggregateIds?: string[]
+}
+
+export interface ExportSnapshot {
+  id: string
+  identity_hash: string
+  document_id: string
+  format: string
+  options_json: string
+  source_version: string
+  page_manifest_json: string
+  snapshot_hash: string
+  created_at: number
+}
+
+export interface ExportArtifact {
+  id: string
+  snapshot_id: string
+  export_path: string
+  content_hash: string
+  byte_size: number
+  created_at: number
 }
 
 export interface ResearchDashboardStats {
@@ -2085,6 +2490,7 @@ export interface SearchResult {
   is_favorite?: number
   metadata_status?: MetadataStatus
   locator?: SearchHitLocator
+  stableLocator?: StableReaderLocator
   updated_at?: string
   last_opened_at?: string | null
 }
@@ -2111,9 +2517,174 @@ export interface SearchHitLocator {
   occurrenceIndex: number
 }
 
+export interface ResearchEvidence {
+  id: string
+  identity_hash: string
+  doc_id: string
+  page_id: string | null
+  page_num: number | null
+  locator_json: string
+  quote: string
+  source_hash: string
+  content_version: string
+  verification_status: SearchEvidenceVerificationStatus
+  created_at: number
+  verified_at: number | null
+}
+
+export interface ResearchEvidenceRelation {
+  id: string
+  evidence_id: string
+  project_id: string | null
+  relation_kind: string
+  note: string
+  tags_json: string
+  status: string
+  created_at: number
+  updated_at: number
+}
+
+export interface ResearchRecordVersion {
+  id: string
+  record_id: string
+  version: number
+  evidence_id: string | null
+  values_json: string
+  status: 'pending' | 'confirmed' | 'excluded' | 'needs-review'
+  note: string
+  content_hash: string
+  parent_version_id: string | null
+  created_at: number
+}
+
+export interface ResearchOutputVersion {
+  id: string
+  output_id: string | null
+  project_id: string
+  version: number
+  parent_version_id: string | null
+  output_type: AiSynthesisTemplate
+  title: string
+  content: string
+  content_hash: string
+  status: 'draft' | 'formal' | 'archived'
+  input_manifest_json: string
+  input_manifest_hash: string
+  created_at: number
+}
+
+export interface ResearchClaimBinding {
+  start: number
+  end: number
+  evidenceIds?: string[]
+  aggregateIds?: string[]
+}
+
+export interface ResearchClaimManifest {
+  id: string
+  output_version_id: string
+  schema_version: 'research-claim-manifest/v1'
+  content_hash: string
+  parser_version: 'claim-segmenter/v1'
+  normalization_version: 'unicode-nfc-crlf/v1'
+  coverage_json: string
+  manifest_hash: string
+  created_at: number
+}
+
+export interface ResearchClaimEntry {
+  id: string
+  manifest_id: string
+  ordinal: number
+  claim_kind: 'statement' | 'numeric'
+  char_start: number
+  char_end: number
+  text_hash: string
+  occurrence_index: number
+  support_status: 'supported' | 'unsupported' | 'stale'
+  evidence_ids_json: string
+  aggregate_ids_json: string
+  created_at: number
+}
+
+export interface ResearchClaimManifestPage {
+  manifest: ResearchClaimManifest
+  entries: CursorPage<ResearchClaimEntry>
+}
+
+export interface ResearchClaimManifestValidationResult {
+  validation: 'verified' | 'incomplete' | 'stale' | 'corrupt' | 'not-found'
+  manifest: ResearchClaimManifest | null
+  coverage: { total: number; supported: number; unsupported: number; stale: number }
+  reason?: string
+}
+
+export type StableReaderLocatorPrecision = 'exact' | 'block' | 'page' | 'document'
+export type StableReaderLocatorVerificationStatus = 'verified' | 'legacy-unverified'
+export type StableReaderOffsetUnit = 'utf16-code-unit'
+
+export interface StableReaderSourceRange {
+  start: number
+  end: number
+}
+
+interface StableReaderLocatorBase {
+  schemaVersion: 'stable-reader-locator/v2'
+  precision: StableReaderLocatorPrecision
+  documentId: string
+  sourcePageId?: string
+  pageNum?: number
+  href?: string
+  chapterPath?: string[]
+  progressFallback?: number
+  sourceKind?: string
+  verificationStatus: StableReaderLocatorVerificationStatus
+}
+
+export interface StableReaderExactLocator extends StableReaderLocatorBase {
+  precision: 'exact'
+  contentVersion: string
+  sourceHash: string
+  offsetUnit: StableReaderOffsetUnit
+  sourceRanges: StableReaderSourceRange[]
+  quote: string
+  prefix: string
+  suffix: string
+  occurrenceIndex: number
+}
+
+export interface StableReaderBlockLocator extends StableReaderLocatorBase {
+  precision: 'block'
+  blockId: string
+  contentVersion: string
+  sourceHash: string
+}
+
+export interface StableReaderPageLocator extends StableReaderLocatorBase {
+  precision: 'page'
+  contentVersion?: string
+  sourceHash?: string
+}
+
+export interface StableReaderDocumentLocator extends StableReaderLocatorBase {
+  precision: 'document'
+  contentVersion?: string
+  sourceHash?: string
+}
+
+export type StableReaderLocator = StableReaderExactLocator | StableReaderBlockLocator | StableReaderPageLocator | StableReaderDocumentLocator
+export type StableReaderLocatorResolution = 'exact' | 'relocated' | 'unresolved'
+
+export interface StableReaderLocatorResolutionResult {
+  resolution: StableReaderLocatorResolution
+  locator: StableReaderLocator
+  reason?: string
+}
+
 export interface SearchHit {
   id: string
   locator: SearchHitLocator
+  stableLocator?: StableReaderLocator
   snippet: string
   score: number
 }
@@ -2139,6 +2710,7 @@ export interface EvidenceQaSource {
   page_num: number | null
   snippet: string
   locator?: SearchHitLocator
+  stableLocator?: StableReaderLocator
   rank?: number
   matched_query?: string
   source_hash?: string
@@ -2395,6 +2967,7 @@ export interface AiResearchEvidenceItem {
   matched_query: string
   localStats?: AiResearchEvidenceLocalStats
   locator?: SearchHitLocator
+  stableLocator?: StableReaderLocator
 }
 
 export interface AiResearchEvidencePack {
@@ -2612,6 +3185,78 @@ export interface SearchGroupedResponse {
   page?: number
   pageSize?: number
   totalPages?: number
+  snapshotId?: string
+  librarySearchGeneration?: number
+  indexGenerationVectorHash?: string
+  snapshotExpiresAt?: number
+}
+
+export type SearchSnapshotValidation = 'active' | 'expired' | 'stale' | 'criteria-mismatch' | 'not-found'
+
+export interface SearchSnapshotMetadata {
+  snapshotId: string
+  criteriaHash: string
+  librarySearchGeneration: number
+  indexGenerationVectorHash: string
+  createdAt: number
+  expiresAt: number
+}
+
+export interface SearchSnapshotValidationResult {
+  validation: SearchSnapshotValidation
+  snapshot: SearchSnapshotMetadata | null
+  currentGeneration: number
+}
+
+export interface SearchSnapshotAggregateSummary {
+  query: string
+  totalDocuments: number
+  totalHits: number
+  status: SearchQueryStatus
+  warnings: string[]
+  exactness: 'exact' | 'bounded-preview'
+  coverage: {
+    returnedDocuments: number
+    returnedHits: number
+    totalsExact: boolean
+  }
+}
+
+export interface ResearchAggregateArtifact {
+  id: string
+  identity_hash: string
+  criteria_hash: string
+  library_generation: number
+  index_generation_vector_hash: string
+  exactness: 'exact' | 'bounded-preview'
+  result_json: string
+  result_hash: string
+  coverage_json: string
+  created_at: number
+}
+
+export interface ResearchAggregateRelation {
+  id: string
+  aggregate_id: string
+  project_id: string
+  relation_kind: string
+  label: string
+  created_at: number
+  updated_at: number
+}
+
+export type SearchEvidenceVerificationStatus = 'verified' | 'stale' | 'source-missing' | 'legacy-unverified' | 'migration-pending'
+
+export interface ResolvedSearchEvidence {
+  stableLocator: StableReaderLocator
+  text: string
+  sourceKind: string
+  precision: StableReaderLocatorPrecision
+  resolution: StableReaderLocatorResolution
+  verificationStatus: SearchEvidenceVerificationStatus
+  contentVersion?: string
+  sourceHash?: string
+  reason?: string
 }
 
 export type SearchQueryStatus = 'preview' | 'candidate' | 'verifying' | 'scanning' | 'complete'
@@ -2715,6 +3360,7 @@ export interface SearchOptions {
   citationTemplateId?: string
   previewOnly?: boolean
   translationScope?: TranslationSearchScope
+  snapshotId?: string
 }
 
 export interface SearchExportOptions {

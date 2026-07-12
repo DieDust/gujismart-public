@@ -23,6 +23,30 @@ npm run build
 - `npm run check:backup-integrity` verifies backup manifest integrity reports and restored-data integrity diagnostics.
 - `npm run check:metadata-tag-guard` verifies metadata tag normalization and manual-tag cleanup protection.
 - `npm run check:module-layering` verifies extracted shared logic stays pure and covered by focused checks.
+- `npm run check:managed-path-boundary` verifies canonical managed-storage containment and uses a temporary Electron database to cover document delete recovery, PDF cleanup, and startup orphan cleanup.
+- `npm run check:path-mutation-boundary` registers the real document IPC handlers against a temporary SQLite database to verify protected path-only and mixed payloads cause no writes, while ordinary metadata, OCR, proof, and PDF-title initialization remain available.
+- `npm run check:file-capabilities` verifies main-only, purpose-bound file and directory grants, including expiry, revocation, target identity changes, symlink/junction rejection, bounded capacity, deterministic batch leases, renderer lifecycle cleanup, and managed-storage-only automatic local-resource access.
+- `npm run check:import-capabilities` verifies opaque import references, bounded streaming directory batches, session release and retry, canonical external-folder scans, and actionable queue reauthorization without renderer-supplied paths.
+- `npm run check:credential-vault` verifies encrypted sidecar persistence, replacement versions, restart recovery, corruption handling, revocation, and the safeStorage-unavailable boundary.
+- `npm run check:credential-drafts` verifies owner/purpose/TTL-bound one-time credential draft references and renderer lifecycle revocation.
+- `npm run check:protected-settings` verifies legacy protected-key/profile migration and renderer public-state projection without plaintext secrets.
+- `npm run check:settings-security` verifies the cross-layer IPC boundary and runs an Electron/SQLite migration against a temporary legacy database.
+- `npm run check:shared-contracts` verifies closed TaskStatus values, TaskStateEnvelope validation, redacted ErrorEnvelope behavior, and typed SettingDefinition validation.
+- `npm run check:task-scheduler` runs an Electron/SQLite integration matrix for additive task tables, idempotent jobs/items, bounded claims, lease expiry/reclaim, stale-attempt rejection, pause/cancel/retry, immutable artifact references, event pagination, transaction rollback, and legacy OCR/import queue bridges.
+- `npm run check:canonical-content` verifies canonical page priority, bounded hydration, immutable OCR artifacts, active-version reactivation, additive schema re-entry, and reader/search/AI/translation/export provider wiring.
+- `npm run check:ocr-proof-preservation` verifies OCR reruns, result saves, and version switches preserve completed human proof while marking its OCR base stale.
+- `npm run check:stable-reader-locator` verifies v2 exact/block/page/document validation, honest legacy downgrade, exact-only compatibility projection, quote-context relocation, and search/workspace/research wiring.
+- `npm run check:search-snapshot-evidence` verifies additive search generation invalidation, bounded TTL snapshots, criteria/generation validation, canonical exact relocation, source-missing failure, and schema re-entry.
+- `npm run check:research-lineage` verifies unique canonical evidence identities, project relations, record CAS/review versions, evidence revalidation, immutable parent-linked outputs, main-built input manifests, and schema re-entry.
+- `npm run check:research-aggregate` verifies main-recorded snapshot statistics, immutable aggregate promotion, identity reuse, project relation cursors, stale/corrupt validation, and restart persistence.
+- `npm run check:research-claim-manifest` verifies deterministic claim ranges, repeated-text occurrences, UTF-16/non-BMP handling, newline normalization, provenance allowlists, and formal coverage rejection.
+- `npm run check:translation-revision-cas` verifies immutable translation context/revisions, late-result CAS conflicts, and manual translation protection.
+- `npm run check:citation-snapshot` verifies type-aware citation diagnostics and immutable snapshot stale/corrupt/restart behavior.
+- `npm run check:export-snapshot` verifies same-directory atomic export publication, old-target preservation, concurrent staging uniqueness, snapshot identity, and artifact hashes.
+- `npm run check:interaction-kernel` verifies close participant aggregation, latest-request-wins tokens, and drag preview/commit/cancel semantics.
+- `npm run check:release-evidence` verifies synthetic dual-audience fixtures, SPDX generation, vendor hashes, and the non-public local RC manifest.
+- `npm run prepare:release-metadata` writes SBOM, vendor manifest, and local RC evidence under ignored `tmp/package-metadata` for packaging.
+- `npm run smoke:packaged` launches `dist/win-unpacked` with isolated user data and verifies package metadata plus a nonblank renderer.
 - `npm run check:search-excerpt-source-hash` verifies that manual and batch search excerpt saves keep a compatible source-hash contract.
 - `npm run check:research-integrity` verifies the internal research project integrity report used by output snapshots.
 - `npm run test:research` verifies research notes, exports, and output input snapshots.
@@ -53,9 +77,12 @@ npm run test:search
 npm run test:research
 npm run test:evidence-qa
 npm run test:ai-ui
+npm run check:import-auto-ocr-task
 ```
 
 Prefer adding or updating one of these tests when a change touches search, research notes, evidence QA, or AI markdown rendering.
+
+`check:import-auto-ocr-task` uses a temporary synthetic SQLite library to verify bounded append, idempotency, import order, restart recovery, and the renderer/main OCR handoff without private documents.
 
 ## Script Hygiene
 
