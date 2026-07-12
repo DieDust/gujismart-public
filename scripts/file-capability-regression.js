@@ -2,6 +2,7 @@ const assert = require('assert')
 const {
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -65,7 +66,7 @@ async function main() {
     kind: 'file',
     expiresAt: 1100,
   })
-  assert.strictEqual(await service.consumeFile(11, firstGrant.grantId, 'document-import'), path.resolve(firstFile))
+  assert.strictEqual(await service.consumeFile(11, firstGrant.grantId, 'document-import'), realpathSync(firstFile))
   await expectCode(() => service.consumeFile(11, firstGrant.grantId, 'document-import'), 'CAPABILITY_ALREADY_CONSUMED')
 
   const [purposeGrant] = await service.issueTrustedPaths({
@@ -86,8 +87,8 @@ async function main() {
     kind: 'directory',
     consumeMode: 'session',
   })
-  assert.strictEqual(await service.useDirectory(11, directoryGrant.grantId, 'pdf-repository'), path.resolve(directory))
-  assert.strictEqual(await service.useDirectory(11, directoryGrant.grantId, 'pdf-repository'), path.resolve(directory))
+  assert.strictEqual(await service.useDirectory(11, directoryGrant.grantId, 'pdf-repository'), realpathSync(directory))
+  assert.strictEqual(await service.useDirectory(11, directoryGrant.grantId, 'pdf-repository'), realpathSync(directory))
 
   now = 1_101
   await expectCode(() => service.useDirectory(11, directoryGrant.grantId, 'pdf-repository'), 'CAPABILITY_EXPIRED')
@@ -183,7 +184,7 @@ async function main() {
   )
   service.settleFileBatch(batch.leaseId, [batchGrants[0].grantId])
   await expectCode(() => service.consumeFile(50, batchGrants[0].grantId, 'document-import'), 'CAPABILITY_ALREADY_CONSUMED')
-  assert.strictEqual(await service.consumeFile(50, batchGrants[1].grantId, 'document-import'), path.resolve(batchTwo))
+  assert.strictEqual(await service.consumeFile(50, batchGrants[1].grantId, 'document-import'), realpathSync(batchTwo))
 
   const atomicGrants = await service.issueTrustedPaths({
     ownerId: 60,
@@ -195,7 +196,7 @@ async function main() {
     () => service.beginFileBatch(60, [atomicGrants[0].grantId, 'unknown-grant'], 'document-import'),
     'CAPABILITY_UNKNOWN',
   )
-  assert.strictEqual(await service.consumeFile(60, atomicGrants[0].grantId, 'document-import'), path.resolve(batchOne))
+  assert.strictEqual(await service.consumeFile(60, atomicGrants[0].grantId, 'document-import'), realpathSync(batchOne))
 
   assert.strictEqual(service.sweepExpired(10_000) > 0, true)
   assert.strictEqual(service.activeCount, 0)
@@ -218,7 +219,7 @@ async function main() {
     paths: [secondFile],
     kind: 'file',
   }), 'CAPABILITY_BATCH_LIMIT')
-  assert.strictEqual(await capacityService.consumeFile(70, capacityGrant.grantId, 'document-import'), path.resolve(firstFile))
+  assert.strictEqual(await capacityService.consumeFile(70, capacityGrant.grantId, 'document-import'), realpathSync(firstFile))
   assert.strictEqual(capacityService.activeCount, 0, 'consumed once grant should release active capacity')
   await expectCode(
     () => capacityService.consumeFile(70, capacityGrant.grantId, 'document-import'),
@@ -231,7 +232,7 @@ async function main() {
       paths: [secondFile],
       kind: 'file',
     })
-    assert.strictEqual(await capacityService.consumeFile(70, grant.grantId, 'document-import'), path.resolve(secondFile))
+    assert.strictEqual(await capacityService.consumeFile(70, grant.grantId, 'document-import'), realpathSync(secondFile))
     assert.strictEqual(capacityService.activeCount, 0)
   }
 
@@ -259,7 +260,7 @@ async function main() {
     'CAPABILITY_ALREADY_LOCKED',
   )
   leaseService.abortFileBatch(abortBatch.leaseId)
-  assert.strictEqual(await leaseService.consumeFile(80, abortGrant.grantId, 'document-import'), path.resolve(batchOne))
+  assert.strictEqual(await leaseService.consumeFile(80, abortGrant.grantId, 'document-import'), realpathSync(batchOne))
 
   const [lockedGrant] = await leaseService.issueTrustedPaths({
     ownerId: 81,

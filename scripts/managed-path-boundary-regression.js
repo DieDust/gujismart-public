@@ -4,6 +4,7 @@ const {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -72,7 +73,7 @@ try {
     kind: 'document-root',
   })
   assert.strictEqual(documentRootDecision.allowed, true)
-  assert.strictEqual(documentRootDecision.canonicalTarget, path.resolve(docRoot))
+  assert.strictEqual(documentRootDecision.canonicalTarget, realpathSync(docRoot))
 
   const assetDecision = inspectManagedDeleteTarget({
     dataDir,
@@ -81,7 +82,7 @@ try {
     kind: 'document-asset',
   })
   assert.strictEqual(assetDecision.allowed, true)
-  assert.strictEqual(assetDecision.canonicalTarget, path.resolve(managedFile))
+  assert.strictEqual(assetDecision.canonicalTarget, realpathSync(managedFile))
 
   for (const docId of ['', '.', '..', '../doc-a', 'doc/a', 'doc\\a', path.resolve(docRoot), `doc\0a`]) {
     assertRejected(inspectManagedDeleteTarget({ dataDir, docId, targetPath: docRoot, kind: 'document-root' }), 'invalid-document-id')
@@ -113,8 +114,14 @@ try {
   const replaceableDocumentId = 'managed_replaced_cleanup'
   const replaceableRoot = path.join(storageRoot, replaceableDocumentId)
   mkdirSync(replaceableRoot)
-  assert.strictEqual(inspectManagedDeleteTarget({ dataDir, docId: replaceableDocumentId, targetPath: replaceableRoot, kind: 'document-root' }).allowed, true)
-  rmSync(replaceableRoot, { recursive: true, force: true })
+  const replaceableDecision = inspectManagedDeleteTarget({
+    dataDir,
+    docId: replaceableDocumentId,
+    targetPath: replaceableRoot,
+    kind: 'document-root',
+  })
+  assert.strictEqual(replaceableDecision.allowed, true)
+  rmSync(replaceableDecision.canonicalTarget, { recursive: true, force: true })
   if (junctionCovered) {
     symlinkSync(outsideRoot, replaceableRoot, process.platform === 'win32' ? 'junction' : 'dir')
     assertRejected(inspectManagedDeleteTarget({ dataDir, docId: replaceableDocumentId, targetPath: replaceableRoot, kind: 'document-root' }), 'target-is-symlink')
