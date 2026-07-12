@@ -36,7 +36,8 @@ async function main() {
 
     const files = await scanCanonicalExternalFolder(sourceRoot, new Set(['.pdf', '.txt']))
     assert.deepStrictEqual(files.map((item) => item.name).sort(), ['inside.pdf', 'inside.txt'])
-    const comparisonRoot = process.platform === 'win32' ? sourceRoot.toUpperCase() : sourceRoot
+    const canonicalSourceRoot = await fsp.realpath(sourceRoot)
+    const comparisonRoot = process.platform === 'win32' ? canonicalSourceRoot.toUpperCase() : canonicalSourceRoot
     assert(files.every((item) => {
       const relativePath = path.relative(comparisonRoot, item.path)
       return relativePath !== '..'
