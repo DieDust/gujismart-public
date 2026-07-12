@@ -36,7 +36,13 @@ async function main() {
 
     const files = await scanCanonicalExternalFolder(sourceRoot, new Set(['.pdf', '.txt']))
     assert.deepStrictEqual(files.map((item) => item.name).sort(), ['inside.pdf', 'inside.txt'])
-    assert(files.every((item) => item.path.startsWith(sourceRoot)), 'scan must not escape to a similar-prefix directory')
+    const comparisonRoot = process.platform === 'win32' ? sourceRoot.toUpperCase() : sourceRoot
+    assert(files.every((item) => {
+      const relativePath = path.relative(comparisonRoot, item.path)
+      return relativePath !== '..'
+        && !relativePath.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relativePath)
+    }), 'scan must not escape to a similar-prefix directory')
 
     if (junctionSupported) {
       const rootJunction = path.join(tempRoot, 'root-link')
