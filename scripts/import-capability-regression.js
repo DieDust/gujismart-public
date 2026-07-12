@@ -38,7 +38,7 @@ assert(documents.includes("ipcMain.handle('documents:releaseImportSelection'"), 
 assert(!documents.includes("ipcMain.handle('documents:resolveImportSources'"), 'main must remove raw path source resolution')
 assert(!documents.includes('allowFileAccessPaths(filePaths)'), 'main import must not promote renderer paths to the display allowlist')
 assert(documents.includes('fileCapabilityService.beginFileBatch(')
-  && documents.includes("'document-import',\n      IMPORT_FILE_LEASE_TTL_MS"), 'main import must atomically lease owner-bound document grants')
+  && /'document-import',\r?\n\s+IMPORT_FILE_LEASE_TTL_MS/.test(documents), 'main import must atomically lease owner-bound document grants')
 assert(!documents.includes('grantIdByPath'), 'main import must not collapse distinct grants through a path-keyed map')
 assert(documents.includes('const sourceGrantId = entry.grantId'), 'main import must preserve the lease entry grant ID by index')
 assert(documents.includes('renewFileBatch(lease.leaseId'), 'long imports must renew their bounded lease while making progress')
