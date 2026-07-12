@@ -8,7 +8,7 @@
 
 | 欢迎页 | 文献库 |
 | --- | --- |
-| ![欢迎页](docs/images/tutorial-01-welcome.png) | ![空文献库](docs/images/tutorial-02-library.png) |
+| ![欢迎页](docs/images/tutorial-01-welcome.png) | ![文献库](docs/images/tutorial-02-library.png) |
 
 | 研究工作台 | 全文检索 |
 | --- | --- |
