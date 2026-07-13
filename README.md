@@ -63,7 +63,7 @@ npm run smoke
 - `npm run build`：构建 Electron main、preload 和 renderer。
 - `npm run smoke`：运行 Electron 冒烟测试。
 
-更多回归测试和脚本卫生规则见 [docs/SCRIPTS.md](docs/SCRIPTS.md)。依赖本地私有文献库的人工 QA 脚本不进入公开仓库。
+更多回归测试和脚本卫生规则见 [docs/SCRIPTS.md](docs/SCRIPTS.md)。维护者发布新版本前必须遵循 [开源发布操作规范](docs/OPEN_SOURCE_RELEASE.md)。依赖本地私有文献库的人工 QA 脚本不进入公开仓库。
 
 ## 配置说明
 

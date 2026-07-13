@@ -41,8 +41,8 @@
 - 业务代码修改：仅允许按已登记实施切片、TDD、规格复核、质量复核和完整门禁执行
 - 实施计划：统一存放于 `plans/`；当前实施到 `2026-07-12-第八步C正式输出Claim谱系.md`，下一切片进入翻译 revision/CAS/context，随后 CitationSnapshot/ExportSnapshot；均未新增依赖
 - 正式执行前：提交全部已批准文档，并创建独立的重构前检查点提交与标签
-- 当前公开状态：1.1.0 本地候选已完成用户测试并获明确公开批准；旧 README 截图、包内许可证、SBOM、发布清单和成品冒烟测试阻断均已处理
-- 公开发布：发布前仍必须在同一候选提交上完成完整门禁；只有维护者明确批准后才允许 push tag 或创建 GitHub Release
+- 当前公开状态：1.1.0 已于 2026-07-12 公开发布；README 已于同日使用当前版本和合成数据重新截图，包内许可证、SBOM、发布清单和成品冒烟测试阻断均已处理
+- 公开发布：后续版本必须遵循 [`docs/OPEN_SOURCE_RELEASE.md`](../OPEN_SOURCE_RELEASE.md)，先完成同一候选提交的本地门禁和维护者验收，只推 `main` 并等待 CI 成功后才允许创建一次发布标签
 
 ## 2026-07-12 连续实施进度
 
@@ -51,4 +51,4 @@
 - 第九步 C：ExportSnapshot、ExportArtifact 与 AtomicExportWriter 已覆盖全部文献导出格式，失败保留旧文件。
 - 第九步 D：Esc 不再隐式退出，workspace v2 + last-known-good + v1 fallback 和交互状态机已建立。
 - 第十步：古籍/现代论文合成 fixture、SPDX SBOM、vendor hash、包内许可配置、本地 RC manifest 与 packaged smoke 脚本已建立。
-- 1.1.0 本地 Setup/Portable 已完成测试，公开截图已替换为合成或空库截图，维护者已批准进入公开发布流程。
+- 1.1.0 Setup/Portable 已完成本地与 GitHub Actions 成品测试并公开发布；后续版本不得移动远程标签或用重复 Release 构建修补同一版本。
