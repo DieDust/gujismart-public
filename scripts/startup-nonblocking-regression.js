@@ -167,8 +167,9 @@ assert(
 )
 assert(
   documentsIpc.includes('saveDatabase, scheduleDatabaseSave')
-    && /function markDocumentsDeleting[\s\S]{0,650}saveDatabase\(\)/.test(documentsIpc),
-  'Document delete markers should be checkpointed immediately so startup recovery can resume deletes after a sudden quit.',
+    && /function markDocumentsDeleting[\s\S]{0,650}scheduleDatabaseSave\(\)/.test(documentsIpc)
+    && /export async function shutdownDocumentDeleteRuntime[\s\S]{0,220}saveDatabase\(\)/.test(documentsIpc),
+  'Document delete markers should use WAL durability without blocking IPC and flush during orderly shutdown.',
 )
 assert(
   startupRecovery.includes('let startupRecoveryPromise: Promise<void> | null = null')
@@ -243,7 +244,7 @@ assert(
 assert(
   documentsIpc.includes('activeDocumentDeleteJobs')
     && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime')
-    && /function scheduleDocumentDeleteJob[\s\S]{0,900}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,500}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc),
+    && /function scheduleDocumentDeleteJob[\s\S]{0,1800}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,500}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc),
   'Document delete jobs should be tracked so shutdown can wait for active delete cleanup.',
 )
 assert(

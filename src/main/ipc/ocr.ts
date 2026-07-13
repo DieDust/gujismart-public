@@ -6042,7 +6042,7 @@ async function processDocumentOcr(
     const autoAi = queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'auto_ai_after_ocr'")
     const hybridReadyForAutoAi = engine !== 'hybrid' || (!pageResultsPersistedInChunks && hasCompletedHybridVisionRefine(pageResults))
     const hybridRefineFallback = engine === 'hybrid' && !pageResultsPersistedInChunks && hasHybridVisionRefineFallback(pageResults)
-    if (autoAi?.value !== 'false' && !hasFinalPendingPageFailure && !hasFinalReviewPageFailure && hybridReadyForAutoAi) {
+    if (autoAi?.value === 'true' && !hasFinalPendingPageFailure && !hasFinalReviewPageFailure && hybridReadyForAutoAi) {
       aiExtractionStarted = true
       emitOcrStatus(event, {
         docId,

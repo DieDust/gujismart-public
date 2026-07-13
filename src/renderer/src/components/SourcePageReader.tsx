@@ -1,4 +1,5 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo } from 'react'
 import { Button, Empty, Input, Modal, Pagination, Popover, Segmented, Select, Slider, Space, Spin, Switch, Typography, message } from 'antd'
 import type { InputRef } from 'antd/es/input'
 import {
@@ -31,6 +32,8 @@ import { getCanonicalPageTranslationSourceText } from '@shared/translation-sourc
 import ParallelTranslationView from './ParallelTranslationView'
 import LlmProfileSelector from './LlmProfileSelector'
 import AiMarkdown from './AiMarkdown'
+import { toLocalResourceUrl } from '../utils/localResource'
+import { findFirstSearchHitAtOrAfterPage, sortSearchIndexesByReadingOrder } from '../utils/readerSearchNavigation'
 import {
   DEFAULT_HIGHLIGHT_COLOR,
   HIGHLIGHT_COLOR_OPTIONS,
@@ -43,6 +46,8 @@ const { Text } = Typography
 const READER_SEARCH_RESULT_PAGE_SIZE = 10
 const toSimplified = OpenCC.Converter({ from: 'tw', to: 'cn' })
 const toTraditional = OpenCC.Converter({ from: 'cn', to: 'tw' })
+const readablePageElementsCache = new WeakMap<object, ReadablePageElement[]>()
+const pageElementRenderOrderCache = new WeakMap<object, Map<number, number>>()
 
 type ReaderTheme = 'paper' | 'sepia' | 'dark'
 type ReaderDisplayScript = 'original' | 'simplified' | 'traditional'
@@ -308,7 +313,13 @@ function getTranslationCachePageId(page: ReaderSourcePage | null | undefined): s
 }
 
 function getPageElements(page: ReaderSourcePage | null | undefined): ReadablePageElement[] {
-  return page ? getReadablePageElements(page) : []
+  if (!page) return []
+  const cacheKey = page as object
+  const cached = readablePageElementsCache.get(cacheKey)
+  if (cached) return cached
+  const elements = getReadablePageElements(page)
+  readablePageElementsCache.set(cacheKey, elements)
+  return elements
 }
 
 function isEbookReaderDocument(document: ReaderDocument, pages: ReaderSourcePage[]): boolean {
@@ -852,7 +863,10 @@ function getReaderPageImageDataUrl(imagePath: string): Promise<string> {
   if (pending) return pending
   const loadImage = /^https:\/\//i.test(imagePath)
     ? window.api.readRemoteImageAsDataURL(imagePath)
-    : window.api.readImageAsDataURL(imagePath)
+    : window.api.isReadableFile(imagePath).then((readable) => {
+        if (!readable) throw new Error('reader image is not readable')
+        return toLocalResourceUrl(imagePath)
+      })
   const promise = loadImage
     .then((dataUrl) => {
       readerImageDataUrlPromises.delete(imagePath)
@@ -1764,6 +1778,9 @@ function getElementIndexFromSearchHitSegment(segmentId: unknown): number {
 }
 
 function getPageElementRenderOrder(page: ReaderSourcePage): Map<number, number> {
+  const cacheKey = page as object
+  const cached = pageElementRenderOrderCache.get(cacheKey)
+  if (cached) return cached
   const order = new Map<number, number>()
   const elements = getPageElements(page)
   let cursor = 0
@@ -1779,6 +1796,7 @@ function getPageElementRenderOrder(page: ReaderSourcePage): Map<number, number> 
       cursor += 1
     }
   })
+  pageElementRenderOrderCache.set(cacheKey, order)
   return order
 }
 
@@ -1881,6 +1899,8 @@ function highlightPlainText(
         data-reader-search-hit-index={globalHitIndex}
         data-search-active={active ? 'true' : undefined}
         data-search-hit-index={globalHitIndex}
+        data-search-active-color={activeColor}
+        data-search-idle-color={inactiveColor}
         style={{
           background: active ? activeColor : inactiveColor,
           color: getHighlightTextColor(markColor),
@@ -2342,7 +2362,6 @@ function SourcePageSpread({
   lineHeight,
   theme,
   searchKeyword,
-  activeSearchHit,
   searchMatches,
   pendingTocTarget,
   aiLayoutEnabled,
@@ -2365,7 +2384,6 @@ function SourcePageSpread({
   lineHeight: number
   theme: ReaderTheme
   searchKeyword: string
-  activeSearchHit?: ReaderSearchMatch | null
   searchMatches: ReaderSearchMatch[]
   pendingTocTarget?: PendingSearchTarget | null
   aiLayoutEnabled?: boolean
@@ -2407,13 +2425,6 @@ function SourcePageSpread({
           const aiText = aiLayoutEnabled && pageId ? String(aiLayoutByPageId?.[pageId] || '').trim() : ''
           const elements = getDisplayPageElements(page, aiText)
           const elementGroups: ReaderElementGroup[] = elements.map((element, index) => {
-            const activeHitElementIndex = Number(activeSearchHit?.elementIndex)
-            const hasActiveHitElementIndex = Number.isFinite(activeHitElementIndex) && activeHitElementIndex >= 0
-            const activeElementByChar = !hasActiveHitElementIndex
-              && activeSearchHit?.pageIndex === pageIndex
-              && activeSearchHit.charIndex >= element.charStart
-              && activeSearchHit.charIndex <= element.charEnd
-            const activeElementByIndex = activeSearchHit?.pageIndex === pageIndex && activeSearchHit.elementIndex === index
             const elementMatches = searchMatchesByElement.get(`${pageIndex}:${index}`) || []
             const orderedElementMatches = elementMatches
               .slice()
@@ -2424,23 +2435,12 @@ function SourcePageSpread({
             const globalSearchStartIndex = globalMatchIndexes.length
               ? Math.min(...globalMatchIndexes)
               : null
-            const activeGlobalIndex = Number.isFinite(Number(activeSearchHit?.globalIndex)) ? Number(activeSearchHit?.globalIndex) : null
-            const activeByGlobalIndex = activeGlobalIndex !== null
-            const activeOccurrenceByGlobalIndex = activeGlobalIndex !== null
-              ? orderedElementMatches
-                .findIndex((match) => Number(match.globalIndex) === activeGlobalIndex)
-              : -1
-            const activeOccurrenceIndex = activeByGlobalIndex
-              ? activeOccurrenceByGlobalIndex >= 0 ? activeOccurrenceByGlobalIndex : null
-              : activeElementByChar || activeElementByIndex
-                ? activeSearchHit?.occurrenceIndex ?? 0
-                : null
             return {
               element,
               index,
               anchorId: getElementAnchorId(page, pageIndex, index),
-              activeHit: activeOccurrenceIndex,
-              activeGlobalHitIndex: activeGlobalIndex,
+              activeHit: null,
+              activeGlobalHitIndex: null,
               globalSearchStartIndex,
               globalSearchHitIndexes: globalMatchIndexes.length ? globalMatchIndexes : null,
             }
@@ -2504,6 +2504,44 @@ function SourcePageSpread({
     </div>
   )
 }
+
+function areSourcePageSpreadPropsEqual(
+  previous: Parameters<typeof SourcePageSpread>[0],
+  next: Parameters<typeof SourcePageSpread>[0],
+): boolean {
+  if (previous.rowPages !== next.rowPages
+    || previous.pageCount !== next.pageCount
+    || previous.pageMetrics !== next.pageMetrics
+    || previous.adaptivePages !== next.adaptivePages
+    || previous.fontSize !== next.fontSize
+    || previous.lineHeight !== next.lineHeight
+    || previous.theme !== next.theme
+    || previous.searchKeyword !== next.searchKeyword
+    || previous.pendingTocTarget !== next.pendingTocTarget
+    || previous.aiLayoutEnabled !== next.aiLayoutEnabled
+    || previous.aiLayoutByPageId !== next.aiLayoutByPageId
+    || previous.aiLayoutLoading !== next.aiLayoutLoading
+    || previous.aiLayoutErrors !== next.aiLayoutErrors
+    || previous.highlightColor !== next.highlightColor
+    || previous.noteHighlightsByElement !== next.noteHighlightsByElement
+    || previous.displayScript !== next.displayScript
+    || previous.searchActiveOnly !== next.searchActiveOnly
+    || previous.pageIndices.length !== next.pageIndices.length
+    || previous.searchMatches.length !== next.searchMatches.length) return false
+  if (previous.pageIndices.some((value, index) => value !== next.pageIndices[index])) return false
+  return previous.searchMatches.every((match, index) => {
+    const candidate = next.searchMatches[index]
+    return !!candidate
+      && match.pageIndex === candidate.pageIndex
+      && match.elementIndex === candidate.elementIndex
+      && match.charIndex === candidate.charIndex
+      && match.occurrenceIndex === candidate.occurrenceIndex
+      && match.globalIndex === candidate.globalIndex
+  })
+}
+
+const MemoizedSourcePageSpread = memo(SourcePageSpread, areSourcePageSpreadPropsEqual)
+
 export default function SourcePageReader({
   document,
   pages,
@@ -2571,14 +2609,15 @@ export default function SourcePageReader({
   const [readerSidebarTab, setReaderSidebarTab] = useState<ReaderSidebarTab>('toc')
   const [searchResultPage, setSearchResultPage] = useState(1)
   const [readerNotes, setReaderNotes] = useState<ReaderNoteItem[]>([])
-  const [localSearchSession, setLocalSearchSession] = useState<SearchSessionState | null>(null)
   const [dismissedSearchSessionKey, setDismissedSearchSessionKey] = useState('')
   const [readerHighlightColor, setReaderHighlightColor] = useState('')
   const incomingSearchSessionKey = getSearchSessionStateKey(searchSession)
   const incomingSearchSession = incomingSearchSessionKey && incomingSearchSessionKey === dismissedSearchSessionKey ? undefined : searchSession
-  const effectiveSearchSession = localSearchSession || incomingSearchSession || undefined
+  const committedSearchInput = searchKeyword.trim()
 
   const readerScrollRef = useRef<HTMLDivElement | null>(null)
+  const searchCounterRef = useRef<HTMLSpanElement | null>(null)
+  const instantSearchHitIndexRef = useRef(-1)
   const tocScrollRef = useRef<HTMLDivElement | null>(null)
   const pageInputRef = useRef<InputRef | null>(null)
   const pendingAnchorRef = useRef<string | null>(null)
@@ -2592,7 +2631,6 @@ export default function SourcePageReader({
   const aiLayoutInFlightRef = useRef<Set<string>>(new Set())
   const aiLayoutGenerationRef = useRef(0)
   const handledBookTranslationRequestRef = useRef(0)
-  const indexedSearchRequestRef = useRef(0)
   const emittedLocalSearchKeywordRef = useRef('')
   const localSearchEditedRef = useRef(false)
   const sourceReaderPreferencesLoadedRef = useRef(false)
@@ -2613,6 +2651,37 @@ export default function SourcePageReader({
   )
   const pageCount = sortedPages.length
   const safeIndex = Math.max(0, Math.min(pageCount - 1, currentPageIndex || 0))
+  const effectiveSearchSession = useMemo(() => {
+    if (!incomingSearchSession?.hits?.length || incomingSearchSession.query.trim() !== committedSearchInput) {
+      return incomingSearchSession
+    }
+    const activeHitId = incomingSearchSession.hits[incomingSearchSession.activeHitIndex]?.id
+    const sortableHits = incomingSearchSession.hits.map((hit) => {
+      const pageIndex = findPageIndexForLocator(sortedPages, hit.locator)
+      const page = pageIndex >= 0 ? sortedPages[pageIndex] : null
+      const match = page ? locateSearchMatchByLocator(page, pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput) : null
+      const renderOrder = page ? getPageElementRenderOrder(page) : null
+      return {
+        pageIndex: Math.max(0, pageIndex),
+        elementOrder: match ? renderOrder?.get(match.elementIndex) ?? match.elementIndex : Number.MAX_SAFE_INTEGER,
+        charIndex: match?.charIndex ?? Number(hit.locator.charStart || 0),
+      }
+    })
+    const indexes = sortSearchIndexesByReadingOrder(sortableHits)
+    const hits = indexes.map((index) => incomingSearchSession.hits[index])
+    const preservedActiveHitIndex = activeHitId ? hits.findIndex((hit) => hit.id === activeHitId) : -1
+    const currentPageActiveHitIndex = findFirstSearchHitAtOrAfterPage(
+      hits.map((hit) => ({ pageIndex: findPageIndexForLocator(sortedPages, hit.locator) })),
+      safeIndex,
+    )
+    return {
+      ...incomingSearchSession,
+      hits,
+      activeHitIndex: localSearchEdited
+        ? currentPageActiveHitIndex
+        : preservedActiveHitIndex >= 0 ? preservedActiveHitIndex : incomingSearchSession.activeHitIndex,
+    }
+  }, [committedSearchInput, incomingSearchSession, localSearchEdited, safeIndex, sortedPages])
   const sortedPagesRef = useRef<ReaderSourcePage[]>([])
   const safeIndexRef = useRef(0)
   const activePage = sortedPages[safeIndex]
@@ -2778,71 +2847,18 @@ export default function SourcePageReader({
     setLocalSearchEdited(false)
     localSearchEditedRef.current = false
     emittedLocalSearchKeywordRef.current = ''
-    setLocalSearchSession(null)
-    indexedSearchRequestRef.current += 1
     if (searchKeyword.trim()) setDismissedSearchSessionKey('')
   }, [searchKeyword])
 
   useEffect(() => {
-    const query = localSearchInput.trim()
-    const docId = document?.id
-    if (!localSearchEdited || !docId || !query) return
-    const requestId = ++indexedSearchRequestRef.current
-    setLocalSearchSession((previous) => {
-      if (previous?.query === query && previous.status === 'searching') return previous
-      return { query, hits: [], activeHitIndex: -1, status: 'searching' }
-    })
-    const timer = window.setTimeout(() => {
-      window.api.getDocumentSearchHits(docId, query, { limit: 20000, resultMode: 'all' })
-        .then((session) => {
-          if (indexedSearchRequestRef.current !== requestId) return
-          const hits = Array.isArray(session?.hits) ? session.hits : []
-          const latestPages = sortedPagesRef.current
-          const latestLocatorIndex = buildPageLocatorIndex(latestPages)
-          const latestSafeIndex = safeIndexRef.current
-          const currentPageIndex = hits.findIndex((hit) => findPageIndexForLocatorFast(latestLocatorIndex, hit.locator) === latestSafeIndex)
-          const activeHitIndex = currentPageIndex >= 0
-            ? currentPageIndex
-            : Number(session?.activeHitIndex) >= 0
-              ? Math.min(hits.length - 1, Number(session.activeHitIndex))
-              : hits.length > 0
-                ? 0
-                : -1
-          localSearchCursorRef.current = -1
-          sessionSearchCursorRef.current = activeHitIndex
-          setSearchCursor(-1)
-          setSessionSearchCursor(activeHitIndex)
-          setLocalSearchSession({
-            query,
-            hits,
-            activeHitIndex,
-            status: session?.status === 'error' ? 'error' : 'ready',
-          })
-        })
-        .catch((error: unknown) => {
-          if (indexedSearchRequestRef.current !== requestId) return
-          console.error('Failed to load source reader search hits', error)
-          localSearchCursorRef.current = -1
-          sessionSearchCursorRef.current = -1
-          setSearchCursor(-1)
-          setSessionSearchCursor(-1)
-          setLocalSearchSession({ query, hits: [], activeHitIndex: -1, status: 'error' })
-        })
-    }, 180)
-    return () => {
-      window.clearTimeout(timer)
-    }
-  }, [document?.id, localSearchEdited, localSearchInput])
-
-  useEffect(() => {
-    if (localSearchInput.trim()) {
+    if (committedSearchInput) {
       setTocOpen(true)
       setReaderSidebarTab('search')
       setSearchResultPage(1)
       return
     }
     setSearchResultPage(1)
-  }, [localSearchInput])
+  }, [committedSearchInput])
 
   useEffect(() => {
     const docId = document?.id
@@ -3143,7 +3159,7 @@ export default function SourcePageReader({
 
   const effectiveSessionHits = effectiveSearchSession?.hits || []
   const hasIncomingLocatorSession = !localSearchEdited && effectiveSessionHits.length > 0
-  const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === localSearchInput.trim() && effectiveSessionHits.length > 0
+  const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === committedSearchInput && effectiveSessionHits.length > 0
   const hasFullLocalSearchPages = !isEbook && Array.isArray(searchPages) && searchPages.length >= sortedPages.length
   const searchSourcePages = useMemo(() => {
     if (!isEbook && Array.isArray(searchPages) && searchPages.length >= sortedPages.length) {
@@ -3153,11 +3169,11 @@ export default function SourcePageReader({
   }, [isEbook, searchPages, sortedPages])
 
   const allSearchMatches = useMemo(() => {
-    const keyword = localSearchInput.trim()
+    const keyword = committedSearchInput
     if (!keyword) return []
     if (localSearchEdited || hasMatchingSearchSession || !hasFullLocalSearchPages) return []
     return readerSearchHitsToMatches(searchSourcePages, keyword, document?.id)
-  }, [document?.id, hasFullLocalSearchPages, hasMatchingSearchSession, localSearchEdited, localSearchInput, searchSourcePages])
+  }, [committedSearchInput, document?.id, hasFullLocalSearchPages, hasMatchingSearchSession, localSearchEdited, searchSourcePages])
 
   const hasReaderNavigation = allSearchMatches.length > 0 && !hasIncomingLocatorSession
   const hasSessionNavigation = hasMatchingSearchSession
@@ -3173,8 +3189,8 @@ export default function SourcePageReader({
     })
     return map
   }, [effectiveSessionHits, hasSessionNavigation, pageLocatorIndex])
-  const searchIndexLoading = Boolean(localSearchInput.trim())
-    && effectiveSearchSession?.query?.trim() === localSearchInput.trim()
+  const searchIndexLoading = Boolean(committedSearchInput)
+    && effectiveSearchSession?.query?.trim() === committedSearchInput
     && effectiveSearchSession.status === 'searching'
   const currentPageSessionHitIndex = hasSessionNavigation
     ? sessionHitIndexesByPage.get(safeIndex)?.[0] ?? -1
@@ -3195,9 +3211,9 @@ export default function SourcePageReader({
     if (!hit?.locator) return null
     const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
     if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
-    const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || localSearchInput)
+    const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
     return { ...match, globalIndex: effectiveSessionHitIndex, sessionIndex: effectiveSessionHitIndex }
-  }, [effectiveSearchSession, effectiveSessionHitIndex, localSearchInput, sortedPages])
+  }, [committedSearchInput, effectiveSearchSession, effectiveSessionHitIndex, sortedPages])
   const sessionLocalSearchIndex = useMemo(() => {
     if (!sessionActiveHit || !allSearchMatches.length) return -1
     return allSearchMatches
@@ -3231,7 +3247,7 @@ export default function SourcePageReader({
           if (!hit?.locator) return null
           const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
           if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
-          const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || localSearchInput)
+          const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
           return { ...match, globalIndex: index, sessionIndex: index }
         })
         .filter(Boolean) as ReaderSearchMatch[]
@@ -3245,10 +3261,10 @@ export default function SourcePageReader({
     }
     if (!allSearchMatches.length) return []
     return visibleLocalMatches
-  }, [allSearchMatches, effectiveSessionHitIndex, effectiveSessionHits, hasSessionNavigation, localSearchInput, pageCount, pageLocatorIndex, safeIndex, sessionActiveHit, sessionHitIndexesByPage, sortedPages, visiblePageIndices])
+  }, [allSearchMatches, committedSearchInput, effectiveSessionHitIndex, effectiveSessionHits, hasSessionNavigation, pageCount, pageLocatorIndex, safeIndex, sessionActiveHit, sessionHitIndexesByPage, sortedPages, visiblePageIndices])
 
-  const hasMatchingSessionCursor = effectiveSearchSession?.query?.trim() === localSearchInput.trim()
-  const shouldAnchorSearchAtFirstHit = !!localSearchInput.trim() && !hasSessionNavigation && allSearchMatches.length > 0 && searchCursor < 0
+  const hasMatchingSessionCursor = effectiveSearchSession?.query?.trim() === committedSearchInput
+  const shouldAnchorSearchAtFirstHit = !!committedSearchInput && !hasSessionNavigation && allSearchMatches.length > 0 && searchCursor < 0
   const activeLocalHitIndex = shouldAnchorSearchAtFirstHit ? -1 : searchMatches.findIndex((hit) => hit.pageIndex === safeIndex || visiblePageIndices.includes(hit.pageIndex))
   const sessionCursorLocalIndex = hasMatchingSessionCursor && !hasSessionNavigation && sessionSearchCursor >= 0
     ? searchMatches.findIndex((hit) => hit.sessionIndex === sessionSearchCursor)
@@ -3262,8 +3278,8 @@ export default function SourcePageReader({
     ? searchMatches.find((hit) => hit.globalIndex === activeSearchHit?.globalIndex) || activeSearchHit
     : activeSearchHit
   const renderedSearchKeyword = hasSessionNavigation && effectiveSessionHitIndex >= 0
-    ? effectiveSessionHits[effectiveSessionHitIndex]?.locator?.queryTerm || effectiveSessionHits[effectiveSessionHitIndex]?.locator?.matchText || localSearchInput
-    : localSearchInput
+    ? effectiveSessionHits[effectiveSessionHitIndex]?.locator?.queryTerm || effectiveSessionHits[effectiveSessionHitIndex]?.locator?.matchText || committedSearchInput
+    : committedSearchInput
   const totalSearchHitCount = hasSessionNavigation ? effectiveSessionHits.length : allSearchMatches.length || effectiveSessionHits.length || 0
   const visibleSearchHitIndex = hasSessionNavigation
     ? effectiveSessionHitIndex
@@ -3289,7 +3305,7 @@ export default function SourcePageReader({
     sessionSearchCursorRef.current = effectiveSessionHitIndex
   }, [effectiveSessionHitIndex])
 
-  const searchDirectoryItemCount = localSearchInput.trim()
+  const searchDirectoryItemCount = committedSearchInput
     ? hasSessionNavigation || effectiveSearchSession?.hits?.length
       ? effectiveSearchSession?.hits?.length || 0
       : allSearchMatches.length
@@ -3297,7 +3313,7 @@ export default function SourcePageReader({
   const searchResultTotalPages = Math.max(1, Math.ceil(searchDirectoryItemCount / READER_SEARCH_RESULT_PAGE_SIZE))
   const searchResultPageSafe = Math.max(1, Math.min(searchResultPage, searchResultTotalPages))
   const visibleSearchDirectoryItems = useMemo<SearchDirectoryItem[]>(() => {
-    if (!localSearchInput.trim() || searchDirectoryItemCount <= 0) return []
+    if (!committedSearchInput || searchDirectoryItemCount <= 0) return []
     const start = (searchResultPageSafe - 1) * READER_SEARCH_RESULT_PAGE_SIZE
     const end = Math.min(searchDirectoryItemCount, start + READER_SEARCH_RESULT_PAGE_SIZE)
     if (!hasSessionNavigation && allSearchMatches.length) {
@@ -3312,7 +3328,7 @@ export default function SourcePageReader({
           index,
           key: `local-${hit.pageIndex}-${hit.elementIndex}-${hit.charIndex}-${index}`,
           pageLabel: `第 ${pageNum} 页`,
-          snippet: makeMarkedSnippet(elementText, localSearchInput, localChar),
+          snippet: makeMarkedSnippet(elementText, committedSearchInput, localChar),
           active: index === visibleSearchHitIndex,
           session: false,
         }
@@ -3329,12 +3345,12 @@ export default function SourcePageReader({
         index,
         key: `session-${hit.id}-${index}`,
         pageLabel: pageNum > 0 ? `第 ${pageNum} 页` : '正文',
-        snippet: hit.snippet || makeMarkedSnippet(pageText, hit.locator.queryTerm || localSearchInput, hit.locator.charStart || 0),
+        snippet: hit.snippet || makeMarkedSnippet(pageText, hit.locator.queryTerm || committedSearchInput, hit.locator.charStart || 0),
         active: index === effectiveSessionHitIndex,
         session: true,
       }
     })
-  }, [allSearchMatches, effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, localSearchInput, pageLocatorIndex, searchDirectoryItemCount, searchResultPageSafe, searchSourcePages, sortedPages, visibleSearchHitIndex])
+  }, [allSearchMatches, committedSearchInput, effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, pageLocatorIndex, searchDirectoryItemCount, searchResultPageSafe, searchSourcePages, sortedPages, visibleSearchHitIndex])
   const [readerScrollVersion, setReaderScrollVersion] = useState(0)
   const readerScrollVersionRef = useRef(0)
   const refreshReaderPosition = () => {
@@ -3494,6 +3510,9 @@ export default function SourcePageReader({
         ? anchor?.querySelector('[data-reader-toc-target="active"]')
         : null
       const target = activeMark || tocTarget || anchor
+      if (pendingSearchTarget?.active && Number.isFinite(Number(pendingSearchTarget.hitIndex))) {
+        revealSourceSearchHit(Number(pendingSearchTarget.hitIndex))
+      }
       if (pendingSearchTarget?.text) tocJumpSuppressUntilRef.current = performance.now() + 1200
       const scroller = readerScrollRef.current
       if (target && scroller) {
@@ -3556,8 +3575,8 @@ export default function SourcePageReader({
     jumpToIndex(pageIndex)
   }
 
-  useEffect(() => {
-    scrollToPendingAnchor(80)
+  useLayoutEffect(() => {
+    scrollToPendingAnchor(pendingSearchTargetRef.current?.active ? 0 : 80)
   }, [safeIndex, viewMode, renderedActiveSearchHit?.pageIndex, renderedActiveSearchHit?.elementIndex, renderedActiveSearchHit?.occurrenceIndex])
 
   useEffect(() => {
@@ -3571,22 +3590,71 @@ export default function SourcePageReader({
     jumpToIndex(pageIndex >= 0 ? pageIndex : value - 1)
   }
 
+  const revealSourceSearchHit = (hitIndex: number): boolean => {
+    const root = readerScrollRef.current
+    const target = root?.querySelector<HTMLElement>(`[data-reader-search-hit-index="${hitIndex}"]`)
+    if (!root || !target) return false
+    root.querySelectorAll<HTMLElement>('[data-search-active="true"]').forEach((mark) => {
+      mark.removeAttribute('data-search-active')
+      mark.setAttribute('data-reader-search-hit', 'true')
+      mark.style.background = mark.dataset.searchIdleColor || ''
+    })
+    target.setAttribute('data-search-active', 'true')
+    target.setAttribute('data-reader-search-hit', 'active')
+    target.style.background = target.dataset.searchActiveColor || ''
+    const targetRect = target.getBoundingClientRect()
+    const scrollerRect = root.getBoundingClientRect()
+    const comfortableTop = scrollerRect.top + root.clientHeight * 0.18
+    const comfortableBottom = scrollerRect.top + root.clientHeight * 0.78
+    if (targetRect.top < comfortableTop || targetRect.bottom > comfortableBottom) {
+      root.scrollTo({
+        top: root.scrollTop + targetRect.top - scrollerRect.top - root.clientHeight * 0.42,
+        behavior: 'auto',
+      })
+    }
+    return true
+  }
+
+  const syncSourceSearchNavigation = (hitIndex: number, total: number) => {
+    instantSearchHitIndexRef.current = hitIndex
+    if (searchCounterRef.current) {
+      searchCounterRef.current.textContent = total > 0 ? `${hitIndex + 1}/${total}` : '0/0'
+    }
+    readerScrollRef.current
+      ?.querySelectorAll<HTMLElement>('[data-reader-search-result-active="true"]')
+      .forEach((item) => item.removeAttribute('data-reader-search-result-active'))
+    readerScrollRef.current
+      ?.querySelector<HTMLElement>(`[data-reader-search-result-index="${hitIndex}"]`)
+      ?.setAttribute('data-reader-search-result-active', 'true')
+  }
+
+  useLayoutEffect(() => {
+    if (!committedSearchInput || visibleSearchHitIndex < 0) return
+    instantSearchHitIndexRef.current = visibleSearchHitIndex
+    revealSourceSearchHit(visibleSearchHitIndex)
+    syncSourceSearchNavigation(visibleSearchHitIndex, totalSearchHitCount)
+  }, [committedSearchInput, safeIndex, searchMatches, viewMode, visibleSearchHitIndex])
+
   const activateReaderSearchHit = (hit: ReaderSearchMatch, cursorIndex: number, token = nextSearchNavigationToken()) => {
+    const hitIndex = hit.globalIndex ?? cursorIndex
+    const isVisible = hit.pageIndex === safeIndex || visiblePageIndices.includes(hit.pageIndex)
+    if (isVisible) revealSourceSearchHit(hitIndex)
     localSearchCursorRef.current = cursorIndex
     sessionSearchCursorRef.current = -1
-    setSearchCursor(cursorIndex)
-    setSessionSearchCursor(-1)
     pendingSearchTargetRef.current = {
       anchorId: sortedPages[hit.pageIndex] ? getElementAnchorId(sortedPages[hit.pageIndex], hit.pageIndex, hit.elementIndex) : '',
       active: true,
-      hitIndex: hit.globalIndex ?? cursorIndex,
+      hitIndex,
       token,
     }
-    if (hit.pageIndex === safeIndex || visiblePageIndices.includes(hit.pageIndex)) {
-      scrollToPendingAnchor(0, token)
-    } else {
+    if (!isVisible) {
+      setSearchCursor(cursorIndex)
+      setSessionSearchCursor(-1)
       jumpToIndex(hit.pageIndex)
+      return
     }
+    syncSourceSearchNavigation(cursorIndex, allSearchMatches.length)
+    pendingSearchTargetRef.current = null
   }
 
   const activateSessionSearchHit = (sessionIndex: number, sessionOverride?: SearchSessionState | null, token = nextSearchNavigationToken()) => {
@@ -3594,13 +3662,14 @@ export default function SourcePageReader({
     if (!session?.hits?.length) return false
     const boundedIndex = (sessionIndex + session.hits.length) % session.hits.length
     const hit = session.hits[boundedIndex]
+    appliedIndexedSearchKeyRef.current = `${session.query}:${session.hits.length}:${boundedIndex}:${hit?.id || ''}`
     const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit?.locator)
+    const isVisible = pageIndex === safeIndex || visiblePageIndices.includes(pageIndex)
+    if (isVisible) revealSourceSearchHit(boundedIndex)
     sessionSearchCursorRef.current = boundedIndex
     localSearchCursorRef.current = -1
-    setSessionSearchCursor(boundedIndex)
-    setSearchCursor(-1)
     if (pageIndex >= 0) {
-      const anchorHit = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || localSearchInput)
+      const anchorHit = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
       pendingSearchTargetRef.current = {
         anchorId: getElementAnchorId(sortedPages[pageIndex], pageIndex, anchorHit.elementIndex),
         active: true,
@@ -3615,8 +3684,14 @@ export default function SourcePageReader({
         tocJumpSuppressUntilRef.current = performance.now() + 900
         if (previousTocKey !== tocKey) setActiveTocJumpKey(tocKey)
       }
-      if (pageIndex === safeIndex || visiblePageIndices.includes(pageIndex)) scrollToPendingAnchor(0, token)
-      else jumpToIndex(pageIndex)
+      if (!isVisible) {
+        setSessionSearchCursor(boundedIndex)
+        setSearchCursor(-1)
+        jumpToIndex(pageIndex)
+      } else {
+        syncSourceSearchNavigation(boundedIndex, session.hits.length)
+        pendingSearchTargetRef.current = null
+      }
       if (tocKey) {
         window.setTimeout(() => {
           if (!isSearchNavigationCurrent(token)) return
@@ -3647,7 +3722,6 @@ export default function SourcePageReader({
     setSessionSearchCursor(-1)
     localSearchCursorRef.current = -1
     sessionSearchCursorRef.current = -1
-    setLocalSearchSession(null)
     appliedIndexedSearchKeyRef.current = ''
     setSearchResultPage(1)
     if (incomingSearchSessionKey) setDismissedSearchSessionKey(incomingSearchSessionKey)
@@ -3762,10 +3836,10 @@ export default function SourcePageReader({
   }
 
   useLayoutEffect(() => {
-    if (!localSearchInput.trim() || hasSessionNavigation || searchCursor >= 0 || !allSearchMatches.length) return
+    if (!committedSearchInput || hasSessionNavigation || searchCursor >= 0 || !allSearchMatches.length) return
     const targetIndex = sessionLocalSearchIndex >= 0 ? sessionLocalSearchIndex : 0
     activateReaderSearchHit(allSearchMatches[targetIndex], targetIndex)
-  }, [allSearchMatches, hasSessionNavigation, localSearchInput, searchCursor, sessionLocalSearchIndex])
+  }, [allSearchMatches, committedSearchInput, hasSessionNavigation, searchCursor, sessionLocalSearchIndex])
 
   const jumpToSearchHit = (direction: 1 | -1) => {
     const token = nextSearchNavigationToken()
@@ -3805,6 +3879,20 @@ export default function SourcePageReader({
       activateReaderSearchHit(hit, next, token)
       return
     }
+  }
+
+  const commitLocalSearch = () => {
+    const nextKeyword = localSearchInput.trim()
+    if (nextKeyword === committedSearchInput) return
+    emittedLocalSearchKeywordRef.current = nextKeyword
+    localSearchEditedRef.current = true
+    setLocalSearchEdited(true)
+    localSearchCursorRef.current = -1
+    sessionSearchCursorRef.current = -1
+    setSearchCursor(-1)
+    setSessionSearchCursor(-1)
+    setReaderHighlightColor('')
+    onSearchKeywordChange?.(nextKeyword)
   }
 
   const jumpToSearchDirectoryItem = (item: SearchDirectoryItem) => {
@@ -4323,6 +4411,7 @@ export default function SourcePageReader({
               key={item.key}
               type="button"
               data-reader-search-result-item="true"
+              data-reader-search-result-index={item.index}
               data-reader-search-result-active={item.active ? 'true' : undefined}
               onClick={() => jumpToSearchDirectoryItem(item)}
               style={{
@@ -4689,24 +4778,25 @@ export default function SourcePageReader({
             value={localSearchInput}
             onChange={(event) => {
               const nextKeyword = event.target.value
-              const trimmed = nextKeyword.trim()
-              emittedLocalSearchKeywordRef.current = nextKeyword
-              localSearchEditedRef.current = true
-              setLocalSearchEdited(true)
               setLocalSearchInput(nextKeyword)
-              localSearchCursorRef.current = -1
-              sessionSearchCursorRef.current = -1
-              setSearchCursor(-1)
-              setSessionSearchCursor(-1)
-              setLocalSearchSession(trimmed ? { query: trimmed, hits: [], activeHitIndex: -1, status: 'searching' } : null)
-              setReaderHighlightColor('')
-              onSearchKeywordChange?.(nextKeyword)
+              if (!nextKeyword) {
+                emittedLocalSearchKeywordRef.current = ''
+                localSearchEditedRef.current = true
+                setLocalSearchEdited(true)
+                localSearchCursorRef.current = -1
+                sessionSearchCursorRef.current = -1
+                setSearchCursor(-1)
+                setSessionSearchCursor(-1)
+                setReaderHighlightColor('')
+                onSearchKeywordChange?.('')
+              }
             }}
+            onPressEnter={() => commitLocalSearch()}
             placeholder="页内检索"
             style={{ width: 170 }}
           />
           <Button size="small" title="上一处页内命中" icon={<LeftOutlined />} disabled={!canNavigateSearchHits} onClick={() => jumpToSearchHit(-1)} />
-          <Text data-reader-search-counter="true" style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{searchCounterText}</Text>
+          <Text ref={searchCounterRef} data-reader-search-counter="true" style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{searchCounterText}</Text>
           <Button size="small" title="下一处页内命中" icon={<RightOutlined />} data-reader-search-next="true" disabled={!canNavigateSearchHits} onClick={() => jumpToSearchHit(1)} />
           <Popover trigger="click" placement="bottomRight" content={displaySettingsPanel}>
             <Button size="small" icon={<SettingOutlined />}>显示设置</Button>
@@ -4770,7 +4860,7 @@ export default function SourcePageReader({
                   onClose={() => setTranslationOpen(false)}
                 />
               ) : (
-                <SourcePageSpread rowPages={visiblePages} pageIndices={visiblePageIndices} pageCount={pageCount} pageMetrics={readerPageMetrics} adaptivePages={isEbook} fontSize={fontSize} lineHeight={lineHeight} theme={theme} searchKeyword={renderedSearchKeyword} activeSearchHit={renderedActiveSearchHit} searchMatches={searchMatches} pendingTocTarget={pendingTocTarget} aiLayoutEnabled={aiLayoutEnabled} aiLayoutByPageId={aiLayoutByPageId} aiLayoutLoading={aiLayoutLoading} aiLayoutErrors={aiLayoutErrors} highlightColor={effectiveHighlightColor} noteHighlightsByElement={readerNoteHighlightsByElement} onSelectedTextChange={onSelectedTextChange} onReaderSelection={updateReaderSelection} displayScript={displayScript} searchActiveOnly={false} />
+                <MemoizedSourcePageSpread rowPages={visiblePages} pageIndices={visiblePageIndices} pageCount={pageCount} pageMetrics={readerPageMetrics} adaptivePages={isEbook} fontSize={fontSize} lineHeight={lineHeight} theme={theme} searchKeyword={renderedSearchKeyword} searchMatches={searchMatches} pendingTocTarget={pendingTocTarget} aiLayoutEnabled={aiLayoutEnabled} aiLayoutByPageId={aiLayoutByPageId} aiLayoutLoading={aiLayoutLoading} aiLayoutErrors={aiLayoutErrors} highlightColor={effectiveHighlightColor} noteHighlightsByElement={readerNoteHighlightsByElement} onSelectedTextChange={onSelectedTextChange} onReaderSelection={updateReaderSelection} displayScript={displayScript} searchActiveOnly={false} />
               )}
             </div>
           ) : (

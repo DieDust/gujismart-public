@@ -57,6 +57,7 @@ export function createSearchSnapshot(input: { criteriaKey: string; nowMs?: numbe
     const oldest = snapshots.keys().next().value
     if (!oldest) break
     snapshots.delete(oldest)
+    aggregateSummaries.delete(oldest)
   }
   return snapshot
 }

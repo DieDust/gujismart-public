@@ -8,7 +8,7 @@ const definitions: Record<string, SettingDefinition> = {
   batch_size: { key: 'batch_size', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '5', min: 1, max: 100 },
   retry_count: { key: 'retry_count', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '3', min: 0, max: 20 },
   auto_ocr_after_import: { key: 'auto_ocr_after_import', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
-  auto_ai_after_ocr: { key: 'auto_ai_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
+  auto_ai_after_ocr: { key: 'auto_ai_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
   auto_delete_pdf_assets_after_ocr: { key: 'auto_delete_pdf_assets_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
   prefer_facsimile_proof_layout: { key: 'prefer_facsimile_proof_layout', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
 }

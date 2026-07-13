@@ -1,5 +1,35 @@
 # 更新日志 / Changelog
 
+## 1.1.1 - 2026-07-13
+
+### 中文
+
+#### 改进
+
+- 优化阅读模式“上一处/下一处”检索定位，降低同页和跨页连续切换的停顿，并保持完整命中、当前页优先和正确阅读顺序。
+- 修复版式还原模式的关键词高亮、当前页起始与回车确认检索，并修正全库检索的文献数量、命中数量和分页说明。
+- 优化批量文献与文件夹删除反馈：界面先移除项目，数据库与索引清理在后台继续，减少大批量删除时的卡顿。
+- 新安装默认关闭“OCR 后自动 AI 分析”，需要时可在设置中手动开启；已有用户明确保存的设置保持不变。
+
+#### 下载
+
+- `GujiSmart-1.1.1-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.1-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Improvements
+
+- Optimized Previous/Next reader search navigation to reduce pauses across same-page and cross-page matches while preserving complete results, current-page priority, and reading order.
+- Fixed keyword highlighting, current-page start, and Enter-to-search behavior in facsimile mode, and corrected document counts, hit counts, and pagination text in library-wide search.
+- Improved bulk document and folder deletion feedback: items disappear from the interface first while database and search-index cleanup continues in the background.
+- New installations now keep “Automatically run AI analysis after OCR” disabled until the user enables it; explicitly saved settings for existing users remain unchanged.
+
+#### Downloads
+
+- `GujiSmart-1.1.1-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.1.1-Portable-x64.exe` for portable use.
+
 ## 1.1.0 - 2026-07-12
 
 ### 中文

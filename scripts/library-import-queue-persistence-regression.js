@@ -30,6 +30,12 @@ const processImportJobBody = sliceBetween(
   'const drainImportQueue = async',
   'Library import job processor',
 )
+const drainImportQueueBody = sliceBetween(
+  librarySource,
+  'const drainImportQueue = async',
+  'const enqueueImportJob =',
+  'Library import queue drain',
+)
 const flushOcrStatusBufferBody = sliceBetween(
   librarySource,
   'const flushOcrStatusBuffer = useCallback',
@@ -198,9 +204,23 @@ assert(
   'Library import batches should schedule non-blocking interim list refreshes while resetting to the first sorted page after import.',
 )
 assert(
-  librarySource.includes('const IMPORT_LIST_REFRESH_BATCHES = 1')
-    && processImportJobBody.includes("if ((batchIndex + 1) % IMPORT_LIST_REFRESH_BATCHES === 0 && batchIndex !== importBatches.length - 1) {\n          scheduleImportListRefresh()\n        }"),
-  'Library import should schedule a debounced list refresh after every completed import batch so new documents appear promptly.',
+  librarySource.includes('const IMPORT_LIST_REFRESH_BATCHES = 4')
+    && librarySource.includes('const importListRefreshBatchCountRef = useRef<Map<number, number>>(new Map())')
+    && processImportJobBody.includes('const completedRefreshBatches = (importListRefreshBatchCountRef.current.get(job.id) || 0) + 1')
+    && processImportJobBody.includes('completedRefreshBatches % IMPORT_LIST_REFRESH_BATCHES === 0 && hasMoreImportBatches'),
+  'Library import should throttle interim list refreshes while keeping progress visible during large jobs.',
+)
+assert(
+  processImportJobBody.includes('const hasMoreSelectionBatches = Boolean(job.selectionId && !job.selectionDone)')
+    && processImportJobBody.includes('if (!hasMoreSelectionBatches) {\n        importListRefreshBatchCountRef.current.delete(job.id)\n        await refreshLibraryAfterImport()')
+    && processImportJobBody.includes('} else if (job.filePaths.length > 0 && (importedCount > 0 || duplicateCount > 0)) {\n        scheduleImportListRefresh()')
+    && !processImportJobBody.includes('cancelScheduledImportListRefresh()\n        await refreshLibraryAfterImport()'),
+  'Directory imports should defer the authoritative library refresh until the final selection batch while surfacing partial successes after an interrupted batch.',
+)
+assert(
+  drainImportQueueBody.includes('if (job.filePaths.length === 0) {\n          await loadBaseData()\n        } else {\n          scheduleBaseDataRefresh()')
+    && !drainImportQueueBody.includes('await loadBaseData()\n        await delay(0)'),
+  'Directory import refills should not recompute sidebar counts after every file batch.',
 )
 assert(
   processImportJobBody.includes('const previewAutoOcrBackground = await window.api.getSetting(\'auto_ocr_after_import\')')
@@ -236,8 +256,8 @@ assert(
 )
 assert(
   processImportJobBody.includes('readyForAutoOcr = await preparePdfPagesForOcrAfterImport(')
-    && processImportJobBody.includes('if (readyForAutoOcr) scheduleImportListRefresh()'),
-  'Non-Paddle import auto-OCR should prepare page images before registering runnable persistent items.',
+    && !processImportJobBody.includes('if (readyForAutoOcr) scheduleImportListRefresh()'),
+  'Non-Paddle import auto-OCR should prepare page images without reloading the library after every file.',
 )
 assert(
   handleBatchOcrBody.includes("await runOcrInConfiguredBatches(targetIds, engine, 'batch-ocr'")

@@ -49,6 +49,24 @@ const deleteJobBody = sliceBetween(
   'function waitForDocumentDeleteShutdown',
   'document delete job body',
 )
+const markDeletingBody = sliceBetween(
+  documentsIpc,
+  'function markDocumentsDeleting',
+  'function markDocumentsDeleteFailed',
+  'document delete marker body',
+)
+const deleteByIdsBody = sliceBetween(
+  documentsIpc,
+  'async function deleteDocumentsByIds',
+  "ipcMain.handle('documents:savePages'",
+  'document delete submission body',
+)
+const fileCleanupBody = sliceBetween(
+  documentsIpc,
+  'async function cleanupDeletedDocumentFilesInBackground',
+  'function scheduleDocumentDeleteJob',
+  'document file cleanup body',
+)
 const resetSearchTablesBody = sliceBetween(
   database,
   'export function resetRebuildableSearchTables',
@@ -76,6 +94,15 @@ assertNotIncludes(deleteFtsBody, 'DELETE FROM search_segments_fts WHERE rowid IN
 assertNotIncludes(deleteFtsBody, 'DELETE FROM search_segments_trigram WHERE rowid IN', 'external-content trigram FTS should not be cleaned with raw DELETE')
 assertIncludes(deleteJobBody, 'if (deleteResult.recoveredSearchIndexIssue)', 'delete job should branch after recovering a rebuildable search-index issue')
 assertIncludes(deleteJobBody, 'queueAllDocumentsReindex()', 'delete job should rebuild search indexes for remaining documents after reset')
+assertIncludes(markDeletingBody, 'scheduleDatabaseSave()', 'delete marker should defer WAL checkpoint work off the IPC response path')
+assertNotIncludes(markDeletingBody, 'saveDatabase()', 'delete marker should not synchronously checkpoint the database')
+assertNotIncludes(deleteByIdsBody, 'getDeleteCleanupTasks(', 'delete submission should not inspect every document directory synchronously')
+assertNotIncludes(deleteByIdsBody, 'getAffectedTagIdsForDelete(', 'delete submission should not scan tag relations synchronously')
+assertIncludes(deleteJobBody, 'getDeleteCleanupTasks', 'background delete job should prepare safe cleanup targets')
+assertIncludes(deleteJobBody, 'const tagIds = getAffectedTagIdsForDelete(docIds)', 'background delete job should capture affected tags before deleting relations')
+assertNotIncludes(documentsIpc, 'scheduleDocumentDeleteJob(existingIds, tagIds)', 'interrupted delete recovery should use the same nonblocking scheduler contract')
+assertIncludes(fileCleanupBody, 'DELETE_FILE_CLEANUP_CONCURRENCY', 'document file cleanup should use bounded concurrency')
+assertIncludes(fileCleanupBody, 'await Promise.all(workers)', 'document file cleanup should wait for its bounded workers')
 
 assertIncludes(resetSearchTablesBody, 'DROP TABLE IF EXISTS search_segments_trigram', 'reset should drop trigram FTS')
 assertIncludes(resetSearchTablesBody, 'DROP TABLE IF EXISTS search_segments_fts', 'reset should drop segment FTS')

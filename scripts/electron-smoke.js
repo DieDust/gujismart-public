@@ -1184,14 +1184,54 @@ async function verifyReaderSearchKeepsActiveVisibleAcrossManyPageFlips(window, u
   }
 
   await assertActiveVisible('initial')
+  const navigationLatencies = []
+  const highlightLatencies = []
   for (let step = 1; step <= 30; step += 1) {
     const previousEpoch = await window.locator('[data-search-navigation-epoch]').first().getAttribute('data-search-navigation-epoch').then((value) => Number(value || 0)).catch(() => 0)
-    await nextSearchButton.click()
+    const navigationStartedAt = Date.now()
+    const highlightLatency = await window.evaluate(() => new Promise((resolve, reject) => {
+      const button = document.querySelector('button[data-reader-search-next="true"]')
+      const root = document.querySelector('[data-reader-scroll="true"]')
+      const before = root?.querySelector('mark[data-search-active="true"]')?.getAttribute('data-search-hit-index') || ''
+      if (!(button instanceof HTMLButtonElement) || !root) {
+        reject(new Error('Missing reader search controls for latency measurement'))
+        return
+      }
+      const startedAt = performance.now()
+      const timeout = window.setTimeout(() => {
+        observer.disconnect()
+        reject(new Error('Reader search highlight did not change within 2 seconds'))
+      }, 2000)
+      const observer = new MutationObserver(() => {
+        const after = root.querySelector('mark[data-search-active="true"]')?.getAttribute('data-search-hit-index') || ''
+        if (!after || after === before) return
+        window.clearTimeout(timeout)
+        observer.disconnect()
+        resolve(performance.now() - startedAt)
+      })
+      observer.observe(root, { attributes: true, childList: true, subtree: true, attributeFilter: ['data-search-active'] })
+      button.click()
+    }))
+    highlightLatencies.push(Number(highlightLatency))
     await window.waitForFunction((previous) => {
       const node = document.querySelector('[data-search-navigation-epoch]')
       return Number(node?.getAttribute('data-search-navigation-epoch') || 0) > previous
     }, previousEpoch, { timeout: 2000 })
     await assertActiveVisible(`step ${step}`)
+    navigationLatencies.push(Date.now() - navigationStartedAt)
+  }
+  const sortedLatencies = [...navigationLatencies].sort((left, right) => left - right)
+  const p95Latency = sortedLatencies[Math.max(0, Math.ceil(sortedLatencies.length * 0.95) - 1)] || 0
+  const maxLatency = sortedLatencies[sortedLatencies.length - 1] || 0
+  const sortedHighlightLatencies = [...highlightLatencies].sort((left, right) => left - right)
+  const p95HighlightLatency = sortedHighlightLatencies[Math.max(0, Math.ceil(sortedHighlightLatencies.length * 0.95) - 1)] || 0
+  const maxHighlightLatency = sortedHighlightLatencies[sortedHighlightLatencies.length - 1] || 0
+  console.log(`[smoke] Reader search navigation latency: visible p95=${p95HighlightLatency.toFixed(1)}ms max=${maxHighlightLatency.toFixed(1)}ms; harness p95=${p95Latency}ms max=${maxLatency}ms`)
+  if (p95HighlightLatency > 50) {
+    throw new Error(`Expected visible reader search highlight p95 latency <= 50ms, saw ${p95HighlightLatency.toFixed(1)}ms (max ${maxHighlightLatency.toFixed(1)}ms)`)
+  }
+  if (p95Latency > 350) {
+    throw new Error(`Expected reader previous/next search p95 latency <= 350ms, saw ${p95Latency}ms (max ${maxLatency}ms)`)
   }
 }
 
@@ -1320,6 +1360,32 @@ async function verifyReaderSearchSyncsAfterManualPageFlip(window, userDataDir) {
   const afterNext = await getSearchState()
   if (!afterNext.counter.includes('2/')) {
     throw new Error(`Expected search next after manual page flip to continue from original active index, saw before=${JSON.stringify(beforeNext)} after=${JSON.stringify(afterNext)}`)
+  }
+
+  for (let step = 0; step < 2; step += 1) {
+    const before = await getSearchState()
+    await pageNextButton.click()
+    await window.waitForFunction((previousLeaf) => {
+      const node = document.querySelector('[data-reader-current-leaf]')
+      return Number(node?.getAttribute('data-reader-current-leaf') || 0) > previousLeaf
+    }, before.currentLeaf, { timeout: 2500 }).catch(() => {})
+  }
+  const beforeDraft = await getSearchState()
+  const searchInput = window.locator('input[data-reader-search-input="true"]').first()
+  await searchInput.fill('\u666e\u901a\u6bb5\u843d')
+  await window.waitForTimeout(350)
+  const afterDraft = await getSearchState()
+  if (afterDraft.currentLeaf !== beforeDraft.currentLeaf || afterDraft.counter !== beforeDraft.counter) {
+    throw new Error(`Expected an uncommitted search draft to keep page and search cursor unchanged, saw before=${JSON.stringify(beforeDraft)} after=${JSON.stringify(afterDraft)}`)
+  }
+  await searchInput.press('Enter')
+  await window.waitForFunction((previousCounter) => {
+    const counter = document.querySelector('[data-reader-search-counter="true"]')?.textContent || ''
+    return counter !== previousCounter && /\d+\s*\/\s*\d+/.test(counter)
+  }, beforeDraft.counter, { timeout: 5000 })
+  const afterCommit = await getSearchState()
+  if (afterCommit.currentLeaf < beforeDraft.currentLeaf) {
+    throw new Error(`Expected committed search to start at the current reading page, saw before=${JSON.stringify(beforeDraft)} after=${JSON.stringify(afterCommit)}`)
   }
 }
 

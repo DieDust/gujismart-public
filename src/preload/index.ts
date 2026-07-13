@@ -237,6 +237,8 @@ type IpcUnsubscribe = () => void
 const api = {
   readFileBuffer: (filePath: string): Promise<ArrayBuffer> =>
     ipcRenderer.invoke('fs:readFileBuffer', filePath),
+  isReadableFile: (filePath: string): Promise<boolean> =>
+    ipcRenderer.invoke('fs:isReadableFile', filePath),
   readImageAsDataURL: (filePath: string): Promise<string> =>
     ipcRenderer.invoke('fs:readImageAsDataURL', filePath),
   readRemoteImageAsDataURL: (imageUrl: string): Promise<string> =>

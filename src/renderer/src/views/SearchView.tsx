@@ -540,8 +540,6 @@ async function applyViewerHitCounts(
 
   return {
     ...response,
-    totalDocuments: groups.length,
-    totalHits: groups.reduce((sum, group) => sum + group.totalHits, 0),
     groups,
   }
 }
@@ -1541,6 +1539,12 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const groupedPage = groupedResponse?.page || searchPage
   const groupedTotalPages = groupedResponse?.totalPages || 1
+  const groupedResultStart = groupedResponse?.totalDocuments
+    ? (groupedPage - 1) * SEARCH_PAGE_SIZE + 1
+    : 0
+  const groupedResultEnd = groupedResponse
+    ? Math.min(groupedResponse.totalDocuments, groupedPage * SEARCH_PAGE_SIZE)
+    : 0
   const showGroupedPagination = searchMode === 'fulltext'
     && !!groupedResponse
     && groupedResponse.totalDocuments > SEARCH_PAGE_SIZE
@@ -1897,7 +1901,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         {loading
           ? '正在检索...'
           : groupedResponse
-            ? `找到 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 处命中；第 ${groupedPage}/${groupedTotalPages} 页，每页 ${SEARCH_PAGE_SIZE} 篇；列表仅展示每篇前几条片段，导出会使用完整命中`
+            ? `找到 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 处命中；当前显示第 ${groupedResultStart}-${groupedResultEnd} 篇；列表仅展示每篇前几条片段，导出会使用完整命中`
             : results.length > 0 ? `找到 ${results.length} 条结果` : ''}
       </div>
       {searchConditionsChanged ? (

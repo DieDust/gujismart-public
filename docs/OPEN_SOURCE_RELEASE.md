@@ -19,7 +19,7 @@
 创建候选提交前，检查以下内容：
 
 - `package.json`、`package-lock.json`、`CHANGELOG.md` 和计划发布的 `vX.Y.Z` 使用同一版本。
-- README 截图来自当前版本，使用隔离数据库和合成数据。
+- README 截图必须与当前可见界面和说明一致，并使用隔离数据库和合成数据。没有可见 UI 变化时沿用已核验截图，不因版本号或后台实现变化重复拍摄。
 - Release notes 中英文内容一致，并列出 Setup 和 Portable 两种下载。
 - `dist/`、`out/`、`data/`、`node_modules/`、日志、数据库、真实文献和 API Key 没有进入 Git 跟踪。
 - 工作区没有与发布无关的修改。
@@ -66,7 +66,7 @@ Get-FileHash dist\GujiSmart-X.Y.Z-Portable-x64.exe -Algorithm SHA256
 - Setup 和 Portable 都能生成，`smoke:packaged` 能从打包成品启动应用。
 - 只有两个面向用户的 `.exe` 会进入 Release；`.blockmap` 和 `latest.yml` 不上传。
 - `npm audit` 和 `npm audit --omit=dev` 没有未处理的高危问题。
-- 所有截图经过人工目视检查，不能用旧截图临时顶替新版截图。
+- 所有截图经过人工目视检查。只有界面发生可见变化、截图内容已经过期、与当前默认行为冲突或存在隐私风险时才重拍；纯性能、后台逻辑和版本号更新不要求换图。
 
 本地测试失败时禁止 push 标签。修复后必须重新运行完整门禁，不能只运行最后失败的单项。
 
@@ -132,12 +132,14 @@ npm ci
   -> check
   -> build:win
   -> smoke:packaged
+  -> 校验标签、package.json 与两个 EXE 文件名一致
   -> 上传 workflow artifact
-  -> 创建 GitHub Release
-  -> 上传两个 exe
+  -> 创建草稿 GitHub Release
+  -> 上传并远程核对两个 exe
+  -> 核对成功后转为公开 Release
 ```
 
-在 `Check`、`Build Windows packages` 或 `Smoke test packaged application` 未成功前，不得创建公开 Release。维护者必须等待原 workflow 结束，不能因为暂时没有输出就再次推送标签。
+在 `Check`、`Build Windows packages`、`Smoke test packaged application` 或资产核对未成功前，不得创建公开 Release。Release workflow 只能先创建草稿；两个 EXE 均上传并确认名称、数量正确后才能公开。任何一步失败都应删除未完成草稿但保留不可变标签，修复后使用下一个补丁版本。维护者必须等待原 workflow 结束，不能因为暂时没有输出就再次推送标签。
 
 运行：
 
@@ -185,7 +187,7 @@ $release = gh release view vX.Y.Z --repo DieDust/gujismart-public --json assets,
 | 最后的 Electron 测试在 CI 超时 180 秒 | 测试依赖本地遗留的 `out/main/index.js`，干净 Runner 尚未 build | 完整应用测试必须自行准备构建入口；验证时先清理 `out/`，不能以本机旧产物通过作为证据 |
 | `main` 与标签同时推送，CI 和 Release 重复执行失败检查 | 没有先用 main CI 验证候选提交 | 先推 `main` 并等待 CI 成功，再且只再推一次标签 |
 | 同一个 `v1.1.0` 标签被多次删除和重建 | 标签创建得太早，后续用移动标签修复发布 | 远程标签不可移动；Release 失败后使用下一个补丁版本 |
-| README 发布后仍显示旧界面 | 删除含真实数据的新截图后，回退到旧安全截图但没有重拍当前版本 | 截图属于候选冻结内容；必须用当前版本、隔离数据库和合成数据重拍并逐张目视检查 |
+| README 发布后仍显示旧界面 | 删除含真实数据的新截图后，回退到已经过时的安全截图且没有复核 | 截图属于候选冻结内容；有可见界面变化或内容过期时才用隔离数据库和合成数据重拍，无 UI 变化时沿用并逐张目视检查 |
 | GitHub 监控命令 TLS 超时 | 本地到 GitHub API 的短暂网络故障 | 查询同一个 run 的真实状态；网络错误不得触发重复 push、tag 或打包 |
 | 担心安装包混入无关文件 | 本地 `dist/out/data` 与 Release 资产边界没有在每次发布前重新核对 | 发布前检查 ignore；安装包由 Actions 从标签构建；Release 只上传两个 `.exe` |
 

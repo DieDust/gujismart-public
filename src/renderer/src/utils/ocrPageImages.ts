@@ -50,12 +50,7 @@ export async function runLimited<T>(
 export async function isReadablePageImagePath(imagePath: unknown): Promise<boolean> {
   const normalizedPath = typeof imagePath === 'string' ? imagePath.trim() : ''
   if (!normalizedPath) return false
-  try {
-    await window.api.readImageAsDataURL(normalizedPath)
-    return true
-  } catch {
-    return false
-  }
+  return window.api.isReadableFile(normalizedPath)
 }
 
 function normalizePageNums(values: Array<number | string | null | undefined>): number[] {
@@ -134,7 +129,7 @@ export async function ensurePdfPageImagesForOcr(
 ): Promise<EnsurePdfPageImagesForOcrResult> {
   const docId = typeof docOrId === 'string' ? docOrId : docOrId.id
   const baseDoc = typeof docOrId === 'string' ? null : docOrId
-  const latestDoc = await window.api.getDocument(docId).catch(() => null)
+  const latestDoc = await window.api.getDocumentLight(docId).catch(() => null)
   const detail = latestDoc || baseDoc
   const initialPageNums = options.pageNums?.length
     ? normalizePageNums(options.pageNums)
@@ -161,7 +156,7 @@ export async function ensurePdfPageImagesForOcr(
   }
 
   await window.api.initializePdfPages(docId, pageCount)
-  const refreshedDoc = await window.api.getDocument(docId)
+  const refreshedDoc = await window.api.getDocumentLight(docId)
   const pageNums = options.pageNums?.length
     ? normalizePageNums(options.pageNums).filter((pageNum) => pageNum <= pageCount)
     : Array.from({ length: pageCount }, (_item, index) => index + 1)

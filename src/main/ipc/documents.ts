@@ -262,27 +262,10 @@ interface PageOcrVersionDetailRow extends PageOcrVersion {
   ocr_result?: string | null
 }
 
-const deletePathInBackground = (task: DeletePathTask): void => {
-  setImmediate(() => {
-    const decision = inspectManagedDeleteTarget({
-      dataDir: getDataDir(),
-      docId: task.docId,
-      targetPath: task.path,
-      kind: task.kind,
-    })
-    if (!decision.allowed || !decision.canonicalTarget) {
-      console.warn(`[Documents] Skipped unsafe cleanup for ${task.docId}: ${decision.reason || 'unknown-reason'}`)
-      return
-    }
-    rm(decision.canonicalTarget, { recursive: true, force: true }).catch((error) => {
-      console.error(`[Documents] Failed to delete ${task.label}:`, error)
-    })
-  })
-}
-
 const DELETE_SQL_CHUNK_SIZE = 200
 const DELETE_ROW_CHUNK_SIZE = 500
 const DELETE_SLOW_STEP_MS = 700
+const DELETE_FILE_CLEANUP_CONCURRENCY = 2
 const activeDocumentDeleteIds = new Set<string>()
 const activeDocumentDeleteJobs = new Set<Promise<void>>()
 const activeDocumentImportJobs = new Set<Promise<void>>()
@@ -472,7 +455,7 @@ function markDocumentsDeleting(docIds: string[]): void {
       ['deleting', now, ...chunkIds],
     )
   })
-  saveDatabase()
+  scheduleDatabaseSave()
 }
 
 function markDocumentsDeleteFailed(docIds: string[], error: unknown): void {
@@ -541,22 +524,49 @@ function refreshDeletedDocumentTags(tagIds: string[]): void {
   }
 }
 
-function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]): void {
-  tasks.forEach(deletePathInBackground)
+async function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]): Promise<void> {
+  let nextTaskIndex = 0
+  const workerCount = Math.min(DELETE_FILE_CLEANUP_CONCURRENCY, tasks.length)
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextTaskIndex < tasks.length) {
+      const task = tasks[nextTaskIndex]
+      nextTaskIndex += 1
+      const decision = inspectManagedDeleteTarget({
+        dataDir: getDataDir(),
+        docId: task.docId,
+        targetPath: task.path,
+        kind: task.kind,
+      })
+      if (!decision.allowed || !decision.canonicalTarget) {
+        if (decision.reason !== 'target-missing') {
+          console.warn(`[Documents] Skipped unsafe cleanup for ${task.docId}: ${decision.reason || 'unknown-reason'}`)
+        }
+        continue
+      }
+      try {
+        await rm(decision.canonicalTarget, { recursive: true, force: true })
+      } catch (error) {
+        console.error(`[Documents] Failed to delete ${task.label}:`, error)
+      }
+    }
+  })
+  await Promise.all(workers)
 }
 
-function scheduleDocumentDeleteJob(docIds: string[], cleanupTasks: DeletePathTask[], tagIds: string[]): void {
+function scheduleDocumentDeleteJob(docIds: string[]): void {
   const job = new Promise<void>((resolve) => {
     setImmediate(() => {
       void (async () => {
         try {
+          const tagIds = getAffectedTagIdsForDelete(docIds)
           const deleteResult = await deleteDocumentData(docIds)
           if (deleteResult.recoveredSearchIndexIssue) {
             queueAllDocumentsReindex()
           }
           notifySearchContentChanged()
           refreshDeletedDocumentTags(tagIds)
-          cleanupDeletedDocumentFilesInBackground(cleanupTasks)
+          const cleanupTasks = getDeleteCleanupTasks(docIds.map((id) => ({ id })))
+          await cleanupDeletedDocumentFilesInBackground(cleanupTasks)
           scheduleDatabaseSave()
         } catch (error) {
           console.error('[Documents] Background document delete failed:', error)
@@ -676,11 +686,8 @@ export function resumeInterruptedDocumentDeletes(): InterruptedDocumentDeleteRec
   if (existingIds.length === 0) return { queuedDocuments: 0, cleanupTasks: 0 }
 
   existingIds.forEach((docId) => activeDocumentDeleteIds.add(docId))
-  const existingIdSet = new Set(existingIds)
-  const cleanupTasks = getDeleteCleanupTasks(docs.filter((doc) => existingIdSet.has(doc.id)))
-  const tagIds = getAffectedTagIdsForDelete(existingIds)
-  scheduleDocumentDeleteJob(existingIds, cleanupTasks, tagIds)
-  return { queuedDocuments: existingIds.length, cleanupTasks: cleanupTasks.length }
+  scheduleDocumentDeleteJob(existingIds)
+  return { queuedDocuments: existingIds.length, cleanupTasks: existingIds.length }
 }
 
 function resolveImportOcrEngine(value: unknown): OcrEngine {
@@ -5018,12 +5025,9 @@ export function registerDocumentIpc(): void {
 
     if (submittedIds.length > 0) {
       submittedIds.forEach((docId) => activeDocumentDeleteIds.add(docId))
-      const submittedDocSet = new Set(submittedIds)
-      const cleanupTasks = getDeleteCleanupTasks(docs.filter((doc) => submittedDocSet.has(doc.id)))
-      const tagIds = getAffectedTagIdsForDelete(submittedIds)
       markDocumentsDeleting(submittedIds)
       markLibraryStateCacheDirty()
-      scheduleDocumentDeleteJob(submittedIds, cleanupTasks, tagIds)
+      scheduleDocumentDeleteJob(submittedIds)
     }
 
     const deletedIds = docIds.filter((docId) => existingIds.has(docId))

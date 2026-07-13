@@ -5,6 +5,7 @@ import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { exportDocument } from '../export'
 import { checkLuaTeX, checkLuatexCn, generateTeX, compileTeX } from '../typeset'
 import { readFileSync, existsSync } from 'fs'
+import { open } from 'fs/promises'
 import type {
   AppUpdateAsset,
   AppUpdateInfo,
@@ -1147,6 +1148,21 @@ export function registerTypesetIpc(): void {
 }
 
 export function registerFsIpc(): void {
+  ipcMain.handle('fs:isReadableFile', async (_event, filePath: string): Promise<boolean> => {
+    try {
+      const safePath = assertAllowedLocalFilePath(filePath)
+      const handle = await open(safePath, 'r')
+      try {
+        const fileStat = await handle.stat()
+        return fileStat.isFile() && fileStat.size > 0
+      } finally {
+        await handle.close()
+      }
+    } catch {
+      return false
+    }
+  })
+
   ipcMain.handle('fs:readFileBuffer', async (_event, filePath: string): Promise<ArrayBuffer> => {
     try {
       const safePath = assertAllowedLocalFilePath(filePath)

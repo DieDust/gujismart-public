@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Setup Node
         uses: actions/setup-node@v6
@@ -39,11 +41,18 @@ jobs:
             $tag = '${{ github.ref_name }}'
           }
 
-          if (-not $tag -or -not $tag.StartsWith('v')) {
+          if (-not $tag -or $tag -notmatch '^v\d+\.\d+\.\d+$') {
             throw "Release tag must look like v0.9.9, got '$tag'."
           }
 
+          $version = $tag.Substring(1)
+          $packageVersion = (Get-Content -LiteralPath 'package.json' -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          if ($packageVersion -ne $version) {
+            throw "Release tag $tag does not match package.json version $packageVersion."
+          }
+
           "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Install dependencies
         run: npm ci
@@ -56,6 +65,20 @@ jobs:
 
       - name: Smoke test packaged application
         run: npm run smoke:packaged
+
+      - name: Verify release assets
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.version }}
+        run: |
+          $expected = @(
+            "GujiSmart-$env:RELEASE_VERSION-Setup-x64.exe",
+            "GujiSmart-$env:RELEASE_VERSION-Portable-x64.exe"
+          ) | Sort-Object
+          $actual = @(Get-ChildItem -Path dist -File -Filter '*.exe' | Select-Object -ExpandProperty Name | Sort-Object)
+          if ($actual.Count -ne 2 -or (Compare-Object $expected $actual)) {
+            throw "Release assets must be exactly: $($expected -join ', '); got: $($actual -join ', ')."
+          }
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v7
@@ -75,27 +98,51 @@ jobs:
             throw 'Release tag is required.'
           }
 
+          $version = $tag.Substring(1)
+          $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw -Encoding UTF8
+          $escapedVersion = [regex]::Escape($version)
+          $match = [regex]::Match($changelog, "(?ms)^##\s+$escapedVersion\b.*?(?=^##\s+|\z)")
+          if (-not $match.Success) {
+            throw "Cannot find CHANGELOG.md section for $version."
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP "gujismart-$tag-release-notes.md"
+          $match.Value.Trim() | Set-Content -LiteralPath $notesPath -Encoding UTF8
+          $expectedNames = @(
+            "GujiSmart-$version-Setup-x64.exe",
+            "GujiSmart-$version-Portable-x64.exe"
+          )
+          $assets = @($expectedNames | ForEach-Object { Join-Path (Resolve-Path 'dist') $_ })
+          if ($assets.Count -ne 2 -or @($assets | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -gt 0) {
+            throw "Both expected release assets must exist: $($expectedNames -join ', ')."
+          }
+
           gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists. Public release assets are immutable; use a new patch version."
+          }
+
+          gh release create $tag --title "GujiSmart $tag" --notes-file $notesPath --draft
           if ($LASTEXITCODE -ne 0) {
-            $version = $tag.TrimStart('v')
-            $changelog = Get-Content -LiteralPath 'CHANGELOG.md' -Raw -Encoding UTF8
-            $escapedVersion = [regex]::Escape($version)
-            $match = [regex]::Match($changelog, "(?ms)^##\s+$escapedVersion\b.*?(?=^##\s+|\z)")
-            if (-not $match.Success) {
-              throw "Cannot find CHANGELOG.md section for $version."
+            throw "Failed to create draft release for $tag."
+          }
+          try {
+            & gh release upload $tag @assets
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to upload release assets for $tag."
             }
 
-            $notesPath = Join-Path $env:RUNNER_TEMP "gujismart-$tag-release-notes.md"
-            $match.Value.Trim() | Set-Content -LiteralPath $notesPath -Encoding UTF8
-            gh release create $tag --title "GujiSmart $tag" --notes-file $notesPath
+            $remoteAssets = @(gh release view $tag --json assets --jq '.assets[].name') | Sort-Object
+            $expectedAssets = @($expectedNames | Sort-Object)
+            if ($remoteAssets.Count -ne 2 -or (Compare-Object $expectedAssets $remoteAssets)) {
+              throw "Remote release assets do not match the expected pair. Got: $($remoteAssets -join ', ')."
+            }
+
+            gh release edit $tag --draft=false
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to publish draft release $tag after asset verification."
+            }
+          } catch {
+            gh release delete $tag --yes 2>$null
+            throw
           }
-
-          $assets = Get-ChildItem -Path dist -File |
-            Where-Object { $_.Extension -eq '.exe' } |
-            ForEach-Object { $_.FullName }
-
-          if (-not $assets -or $assets.Count -eq 0) {
-            throw 'No release assets were produced.'
-          }
-
-          & gh release upload $tag @assets --clobber

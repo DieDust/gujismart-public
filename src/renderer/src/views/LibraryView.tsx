@@ -26,6 +26,7 @@ import {
   ThunderboltOutlined,
   UnorderedListOutlined
 } from '@ant-design/icons'
+import { startTransition } from 'react'
 import {
   Alert,
   Button,
@@ -78,7 +79,7 @@ const LIST_ROW_MIN_HEIGHT = 96
 const LIST_ROW_MAX_HEIGHT = 188
 const DEFAULT_IMPORT_BATCH_SIZE = 5
 const MAX_IMPORT_BATCH_SIZE = 20
-const IMPORT_LIST_REFRESH_BATCHES = 1
+const IMPORT_LIST_REFRESH_BATCHES = 4
 const LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT = 1000
 const LARGE_PDF_PREVIEW_IDLE_DELAY_MS = 30_000
 const AUTO_OCR_PDF_PREVIEW_IDLE_DELAY_MS = 60_000
@@ -1833,7 +1834,8 @@ export default function LibraryView({
     setSearchKey,
     updateDocumentInList,
     updateDocumentsInList,
-    removeDocumentFromList
+    removeDocumentFromList,
+    removeDocumentsFromList
   } = useDocumentStore()
   const { folders, setFolders } = useFolderStore()
 
@@ -1909,6 +1911,7 @@ export default function LibraryView({
   const ocrStatusFlushTimerRef = useRef<number | null>(null)
   const healthRefreshTimerRef = useRef<number | null>(null)
   const importListRefreshTimerRef = useRef<number | null>(null)
+  const importListRefreshBatchCountRef = useRef<Map<number, number>>(new Map())
   const deferredPdfPreviewQueueRef = useRef<PdfPreviewQueueItem[]>([])
   const deferredPdfPreviewTimerRef = useRef<number | null>(null)
   const smartSectionRef = useRef<HTMLDivElement | null>(null)
@@ -3369,12 +3372,43 @@ export default function LibraryView({
     setBatchNewTagName('')
   }
 
+  const applySubmittedDocumentDeletion = useCallback((deletedIds: string[], exitBatchMode: boolean) => {
+    const uniqueDeletedIds = Array.from(new Set(deletedIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    if (uniqueDeletedIds.length === 0) return
+    const deletedIdSet = new Set(uniqueDeletedIds)
+    const previousDocuments = documentsRef.current
+    const nextDocuments = previousDocuments.filter((document) => !deletedIdSet.has(document.id))
+    const removedLoadedCount = previousDocuments.length - nextDocuments.length
+    const nextDocumentTotal = Math.max(0, documentTotal - uniqueDeletedIds.length)
+    documentsRef.current = nextDocuments
+    listOffsetRef.current = Math.max(0, listOffsetRef.current - removedLoadedCount)
+    patchLibraryWarmCache(currentLibraryScopeKey, {
+      documents: nextDocuments,
+      documentTotal: nextDocumentTotal,
+      listOffset: listOffsetRef.current,
+      listHasMore: listHasMoreRef.current,
+    })
+    libraryContentRef.current
+      ?.querySelectorAll<HTMLElement>('[data-library-document-card="true"]')
+      .forEach((card) => {
+        if (!deletedIdSet.has(String(card.dataset.documentId || ''))) return
+        card.hidden = true
+      })
+    window.requestAnimationFrame(() => {
+      startTransition(() => {
+        setDocumentTotal(nextDocumentTotal)
+        removeDocumentsFromList(uniqueDeletedIds)
+        if (exitBatchMode) setBatchMode(false)
+      })
+    })
+  }, [currentLibraryScopeKey, documentTotal, removeDocumentsFromList])
+
   const handleDelete = async (event: StopPropagationEvent, docId: string) => {
     event.stopPropagation()
     try {
       const success = await window.api.deleteDocument(docId)
       if (success) {
-        removeDocumentFromList(docId)
+        applySubmittedDocumentDeletion([docId], false)
         message.success('已提交后台删除')
       }
     } catch (error) {
@@ -3555,14 +3589,12 @@ export default function LibraryView({
     try {
       const targetIds = [...selectedIds]
       const result = await window.api.deleteDocumentsBatch(targetIds)
-      result.deletedIds.forEach(removeDocumentFromList)
+      applySubmittedDocumentDeletion(result.deletedIds, true)
       if (result.failedIds.length > 0) {
         message.warning(`已提交 ${result.successCount} 篇后台删除，${result.failedIds.length} 篇提交失败`)
       } else {
         message.success(`已提交 ${result.successCount} 篇文献后台删除`)
       }
-      clearSelection()
-      setBatchMode(false)
     } catch (error) {
       console.error('[Library] 批量删除文献失败:', error)
       message.error('批量删除文献失败')
@@ -3579,7 +3611,7 @@ export default function LibraryView({
       onOk: async () => {
         try {
           const result = await window.api.deleteZeroPageDocuments()
-          result.deletedIds.forEach(removeDocumentFromList)
+          removeDocumentsFromList(result.deletedIds)
           if (result.successCount === 0) {
             message.info('没有发现零页文献')
           } else if (result.failedIds.length > 0) {
@@ -4196,7 +4228,6 @@ export default function LibraryView({
                 duration: 0,
               })
               readyForAutoOcr = await preparePdfPagesForOcrAfterImport(result.id, pdfWorkPath, fileIndex, totalFileCount, engine)
-              if (readyForAutoOcr) scheduleImportListRefresh()
             }
             if (previewAutoOcrConfigReady && readyForAutoOcr) {
               autoOcrItems.push({ docId: result.id, sourceOrder: fileIndex, sourceType: result.sourceType || 'pdf-file' })
@@ -4281,8 +4312,14 @@ export default function LibraryView({
           }
         }
 
-        if ((batchIndex + 1) % IMPORT_LIST_REFRESH_BATCHES === 0 && batchIndex !== importBatches.length - 1) {
-          scheduleImportListRefresh()
+        if (settledBatchFileCount > 0) {
+          const completedRefreshBatches = (importListRefreshBatchCountRef.current.get(job.id) || 0) + 1
+          importListRefreshBatchCountRef.current.set(job.id, completedRefreshBatches)
+          const hasMoreImportBatches = batchIndex !== importBatches.length - 1
+            || Boolean(job.selectionId && !job.selectionDone)
+          if (completedRefreshBatches % IMPORT_LIST_REFRESH_BATCHES === 0 && hasMoreImportBatches) {
+            scheduleImportListRefresh()
+          }
         }
         startPdfImageWorkflowQueue(
           pdfPreviewQueue,
@@ -4317,7 +4354,13 @@ export default function LibraryView({
       if ((importedCount > 0 || duplicateCount > 0) && failedResults.length > 0) {
         message.warning({ content: `${failedResults.length} 个文件未能导入：${failedResults[0].error || '未知错误'}`, duration: 6 })
       }
-      await refreshLibraryAfterImport()
+      const hasMoreSelectionBatches = Boolean(job.selectionId && !job.selectionDone)
+      if (!hasMoreSelectionBatches) {
+        importListRefreshBatchCountRef.current.delete(job.id)
+        await refreshLibraryAfterImport()
+      } else if (job.filePaths.length > 0 && (importedCount > 0 || duplicateCount > 0)) {
+        scheduleImportListRefresh()
+      }
 
       if (autoOcrTaskJobId && persistedAutoOcrCount > 0) {
         const started = await window.api.startImportAutoOcrTask(autoOcrTaskJobId)
@@ -4429,7 +4472,11 @@ export default function LibraryView({
           persistImportQueueSnapshot()
         }
         if (remainingBeforeRefill > 0) break
-        await loadBaseData()
+        if (job.filePaths.length === 0) {
+          await loadBaseData()
+        } else {
+          scheduleBaseDataRefresh()
+        }
         await delay(0)
       }
     } finally {
@@ -4440,6 +4487,7 @@ export default function LibraryView({
       if (importQueueRef.current.length === 0
         && !activeImportJobRef.current
         && authorizationRequiredJobsRef.current.length === 0) {
+        importListRefreshBatchCountRef.current.clear()
         setImportQueueLength(0)
         queuedImportFilePathsRef.current.clear()
         clearPersistedImportQueue()

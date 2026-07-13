@@ -359,6 +359,35 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     lastSelectedDocumentIdRef.current = null
   }, [])
 
+  const removeDeletedDocumentsFromFolderContent = useCallback((deletedIds: string[]) => {
+    const deletedIdSet = new Set(deletedIds)
+    if (deletedIdSet.size === 0) return
+    setFolderContent((current) => {
+      if (!current) return current
+      const documents = current.documents.filter((document) => !deletedIdSet.has(document.id))
+      const removedLoadedCount = current.documents.length - documents.length
+      if (removedLoadedCount === 0) return current
+      const totalDocumentCount = Math.max(0, current.total_document_count - removedLoadedCount)
+      return {
+        ...current,
+        documents,
+        total_document_count: totalDocumentCount,
+        has_more: documents.length < totalDocumentCount,
+      }
+    })
+    setSelectedDocumentIds((current) => current.filter((id) => !deletedIdSet.has(id)))
+    setCoverSources((current) => {
+      let changed = false
+      const next = { ...current }
+      deletedIdSet.forEach((id) => {
+        if (!Object.prototype.hasOwnProperty.call(next, id)) return
+        delete next[id]
+        changed = true
+      })
+      return changed ? next : current
+    })
+  }, [])
+
   const emitStateChange = useCallback((folderId = selectedFolderId) => {
     onStateChange?.({
       selectedFolderId: folderId,
@@ -466,7 +495,8 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
   }, [contentLoading, folderContent?.documents.length, initialState, loading, selectedFolderId])
 
   useEffect(() => {
-    const handleChanged = () => {
+    const handleChanged = (event: Event) => {
+      if (event instanceof CustomEvent && event.detail?.source === 'folders-delete') return
       void loadOverview()
       void loadFolderContent(selectedFolderId)
     }
@@ -695,21 +725,20 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       onOk: async () => {
         try {
           const result = await window.api.deleteDocumentsBatch(uniqueDocIds)
+          removeDeletedDocumentsFromFolderContent(result.deletedIds)
           if (result.failedIds.length > 0) {
             message.warning(`已提交 ${result.successCount} 篇后台删除，${result.failedIds.length} 篇提交失败`)
           } else {
             message.success(`已提交 ${result.successCount} 篇文献后台删除`)
           }
-          setSelectedDocumentIds([])
-          await loadOverview()
-          await loadFolderContent(selectedFolderId)
-          window.dispatchEvent(new Event(LIBRARY_RELATIONS_CHANGED_EVENT))
+          void loadOverview()
+          window.dispatchEvent(new CustomEvent(LIBRARY_RELATIONS_CHANGED_EVENT, { detail: { source: 'folders-delete' } }))
         } catch (error) {
           message.error(getErrorMessage(error, '删除文献失败'))
         }
       },
     })
-  }, [loadFolderContent, loadOverview, selectedFolderId])
+  }, [loadOverview, removeDeletedDocumentsFromFolderContent])
 
   const getActionDocIds = useCallback((docId: string) => {
     return selectedDocumentIdSet.has(docId) && selectedDocumentIds.length > 0 ? selectedDocumentIds : [docId]

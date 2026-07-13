@@ -1,4 +1,5 @@
-﻿import { Children, cloneElement, isValidElement, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+﻿import { Children, cloneElement, isValidElement, memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useLayoutEffect } from 'react'
 import { Button, Empty, Input, Modal, Pagination, Popover, Segmented, Select, Slider, Space, Spin, Switch, Typography, message } from 'antd'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -33,9 +34,11 @@ import {
   hexToRgba,
   normalizeHighlightColor,
 } from '../utils/highlightColors'
+import { findFirstSearchHitAtOrAfterPage } from '../utils/readerSearchNavigation'
 
 const { Text } = Typography
 const READER_SEARCH_RESULT_PAGE_SIZE = 10
+const EMPTY_READER_NOTE_HIGHLIGHTS: ReaderNoteHighlight[] = []
 const toSimplified = OpenCC.Converter({ from: 'tw', to: 'cn' })
 const toTraditional = OpenCC.Converter({ from: 'cn', to: 'tw' })
 
@@ -75,7 +78,6 @@ type SearchDirectoryItem = {
   key: string
   pageLabel: string
   snippet: string
-  active: boolean
 }
 type ReaderNoteItem = Pick<ResearchNote, 'id' | 'doc_id' | 'page_num' | 'excerpt' | 'note' | 'kind' | 'color' | 'locator_json' | 'source_id' | 'created_at' | 'updated_at'>
 type ReaderNoteHighlight = {
@@ -467,7 +469,7 @@ function buildTextPages(pages: EbookPage[]): TextPage[] {
         href,
       }
     })
-    .filter((page) => page.text)
+    .filter((page) => page.text || page.sourcePage?.has_text || page.sourcePage?.has_ocr_text)
 }
 
 function getTextPageCitationPageNum(page: TextPage | null | undefined): number | null {
@@ -535,10 +537,6 @@ function findTextPageIndexByLocator(textPages: TextPage[], locator?: SearchHitLo
     const pageIdIndex = textPages.findIndex((page) => String(page.id || '') === pageId)
     if (pageIdIndex >= 0) return pageIdIndex
   }
-  const targetPageIndex = getLocatorPageIndex(locator)
-  if (targetPageIndex >= 0 && targetPageIndex < textPages.length) {
-    return targetPageIndex
-  }
   const href = String(locator.href || '')
   if (href) {
     const hrefIndex = textPages.findIndex((page) => sameHrefPath(page.href || '', href))
@@ -548,6 +546,10 @@ function findTextPageIndexByLocator(textPages: TextPage[], locator?: SearchHitLo
   if (targetPageNum >= 0) {
     const pageNumIndex = textPages.findIndex((page) => Number(page.sourcePageNum) === targetPageNum)
     if (pageNumIndex >= 0) return pageNumIndex
+  }
+  const targetPageIndex = getLocatorPageIndex(locator)
+  if (targetPageIndex >= 0 && targetPageIndex < textPages.length) {
+    return targetPageIndex
   }
   return -1
 }
@@ -1030,6 +1032,8 @@ function highlightText(
         data-ebook-search-hit={displayIndex}
         data-search-hit-index={displayIndex}
         data-search-active={active ? 'true' : undefined}
+        data-search-active-color={activeColor}
+        data-search-idle-color={hexToRgba(markColor, 0.56)}
         style={{
           background: active ? activeColor : hexToRgba(markColor, 0.56),
           color: getHighlightTextColor(markColor),
@@ -1132,6 +1136,34 @@ function renderTextContent(
     </ReactMarkdown>
   )
 }
+
+const MemoizedReaderTextContent = memo(function MemoizedReaderTextContent({
+  text,
+  keyword,
+  startIndex,
+  displayScript,
+  highlightColor,
+  noteHighlights,
+}: {
+  text: string
+  keyword: string
+  startIndex: number
+  displayScript: ReaderDisplayScript
+  highlightColor: string
+  noteHighlights: ReaderNoteHighlight[]
+}) {
+  return renderTextContent(
+    text,
+    keyword,
+    -1,
+    startIndex,
+    undefined,
+    displayScript,
+    highlightColor,
+    false,
+    noteHighlights,
+  )
+})
 
 function makeSnippet(text: string, center: number, size = 420): string {
   const start = Math.max(0, center - Math.floor(size / 2))
@@ -1446,6 +1478,7 @@ export default function EbookReader({
   const epubHighlightedCfiRef = useRef<string[]>([])
   const textPagesRef = useRef<TextPage[]>([])
   const appliedIncomingLocatorKeyRef = useRef('')
+  const localSearchStartPageRef = useRef(-1)
   const [tocOpen, setTocOpen] = useState(true)
   const [viewMode, setViewMode] = useState<ViewMode>('spread')
   const [fontSize, setFontSize] = useState(17)
@@ -1459,6 +1492,7 @@ export default function EbookReader({
   const [epubSearchLoading, setEpubSearchLoading] = useState(false)
   const [epubReadyKey, setEpubReadyKey] = useState(0)
   const [localSearch, setLocalSearch] = useState(searchKeyword)
+  const [locallyCommittedSearchQuery, setLocallyCommittedSearchQuery] = useState('')
   const [textPageIndex, setTextPageIndex] = useState(Math.max(0, currentPageIndex || 0))
   const [searchCursor, setSearchCursor] = useState(-1)
   const [searchNavigationEpoch, setSearchNavigationEpoch] = useState(0)
@@ -1483,10 +1517,13 @@ export default function EbookReader({
   const themed = themeStyles[theme]
   const textPages = useMemo(() => buildTextPages(pages), [pages])
   const textPage = textPages[Math.max(0, Math.min(textPages.length - 1, textPageIndex))]
-  const effectiveTextSearchQuery = localSearchSession?.query || localSearch
+  const effectiveTextSearchQuery = localSearchSession?.query || searchKeyword.trim()
   const textHits = useMemo(() => findTextMatches(textPages, effectiveTextSearchQuery), [effectiveTextSearchQuery, textPages])
   const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === effectiveTextSearchQuery.trim()
-  const sessionTextHits = !isEpub && hasMatchingSearchSession ? effectiveSearchSession?.hits || [] : []
+  const usesLocalReadingOrder = locallyCommittedSearchQuery === effectiveTextSearchQuery.trim()
+  const sessionTextHits = !usesLocalReadingOrder && !isEpub && hasMatchingSearchSession
+    ? effectiveSearchSession?.hits || []
+    : []
   const activeSessionHitIndex = sessionTextHits.length
     ? searchCursor >= 0 && searchCursor < sessionTextHits.length
       ? searchCursor
@@ -1504,14 +1541,13 @@ export default function EbookReader({
   const textSearchLabel = textSearchTotal ? `${Math.max(0, activeTextSearchIndex) + 1}/${textSearchTotal}` : '0/0'
   const canNavigateTextSearch = textSearchTotal > 0
   const searchDirectoryItems = useMemo<SearchDirectoryItem[]>(() => {
-    if (!localSearch.trim()) return []
+    if (!effectiveTextSearchQuery.trim()) return []
     if (isEpub) {
       return epubSearchHits.map((hit, index) => ({
         index,
         key: `${hit.segmentId}-${hit.occurrenceIndex}-${index}`,
         pageLabel: hit.href || `EPUB ${hit.sectionIndex + 1}`,
-        snippet: hit.excerpt || makeMarkedSnippet(hit.href || '', localSearch, 0),
-        active: index === searchCursor,
+        snippet: hit.excerpt || makeMarkedSnippet(hit.href || '', effectiveTextSearchQuery, 0),
       }))
     }
     if (sessionTextHits.length) {
@@ -1525,7 +1561,6 @@ export default function EbookReader({
           key: `${hit.id}-${index}`,
           pageLabel: pageLabel > 0 ? `第 ${pageLabel} 页` : '文本',
           snippet,
-          active: index === activeSessionHitIndex,
         }
       })
     }
@@ -1535,11 +1570,10 @@ export default function EbookReader({
         index,
         key: `${hit.pageIndex}-${hit.charIndex}-${hit.occurrenceIndex}`,
         pageLabel: page?.sourcePageNum ? `第 ${page.sourcePageNum} 页` : `阅读节 ${hit.pageIndex + 1}`,
-        snippet: makeMarkedSnippet(page?.text || '', localSearch, hit.charIndex),
-        active: index === searchCursor,
+        snippet: makeMarkedSnippet(page?.text || '', effectiveTextSearchQuery, hit.charIndex),
       }
     })
-  }, [activeSessionHitIndex, effectiveTextSearchQuery, epubSearchHits, isEpub, localSearch, searchCursor, sessionTextHits, textHits, textPages])
+  }, [effectiveTextSearchQuery, epubSearchHits, isEpub, sessionTextHits, textHits, textPages])
   const searchResultTotalPages = Math.max(1, Math.ceil(searchDirectoryItems.length / READER_SEARCH_RESULT_PAGE_SIZE))
   const searchResultPageSafe = Math.max(1, Math.min(searchResultPage, searchResultTotalPages))
   const visibleSearchDirectoryItems = searchDirectoryItems.slice(
@@ -1591,6 +1625,20 @@ export default function EbookReader({
     onContextTextChangeRef.current = onContextTextChange
   }, [onContextTextChange])
 
+  const revealTextSearchHit = (globalIndex: number): boolean => {
+    const root = textScrollRef.current
+    const node = root?.querySelector<HTMLElement>(`[data-ebook-search-hit="${globalIndex}"]`)
+    if (!root || !node) return false
+    root.querySelectorAll<HTMLElement>('[data-search-active="true"]').forEach((mark) => {
+      mark.removeAttribute('data-search-active')
+      mark.style.background = mark.dataset.searchIdleColor || ''
+    })
+    node.setAttribute('data-search-active', 'true')
+    node.style.background = node.dataset.searchActiveColor || ''
+    node.scrollIntoView({ block: 'center', behavior: 'auto' })
+    return true
+  }
+
   useEffect(() => {
     epubFlatTocRef.current = flatToc
   }, [flatToc])
@@ -1604,18 +1652,20 @@ export default function EbookReader({
     setSearchCursor(-1)
     setLocalSearchSession(null)
     setReaderHighlightColor('')
+    setLocallyCommittedSearchQuery((current) => current === searchKeyword.trim() ? current : '')
+    if (!searchKeyword.trim()) localSearchStartPageRef.current = -1
     if (searchKeyword.trim()) setDismissedSearchSessionKey('')
   }, [searchKeyword])
 
   useEffect(() => {
-    if (localSearch.trim()) {
+    if (effectiveTextSearchQuery.trim()) {
       setTocOpen(true)
       setReaderSidebarTab('search')
       setSearchResultPage(1)
       return
     }
     setSearchResultPage(1)
-  }, [localSearch])
+  }, [effectiveTextSearchQuery])
 
   useEffect(() => {
     const docId = document?.id
@@ -1664,6 +1714,17 @@ export default function EbookReader({
     if (isEpub || !document.id) return
     if (!effectiveTextSearchQuery.trim() || !textHits.length) return
     if (hasMatchingSearchSession && sessionTextHits.length) return
+    if (usesLocalReadingOrder) {
+      if (searchCursor >= 0) return
+      const localStartPageIndex = Math.max(0, localSearchStartPageRef.current)
+      const localHitIndex = findFirstSearchHitAtOrAfterPage(textHits, localStartPageIndex)
+      if (localHitIndex >= 0) {
+        setSearchCursor(localHitIndex)
+        const targetPageIndex = textHits[localHitIndex]?.pageIndex ?? localStartPageIndex
+        if (Number.isFinite(targetPageIndex)) setTextPageIndex(targetPageIndex)
+      }
+      return
+    }
     const locatorKey = getSearchLocatorKey(locator)
     if (locatorKey && appliedIncomingLocatorKeyRef.current !== locatorKey) {
       const locatorIndex = findTextHitIndexByLocator(textHits, locator)
@@ -1676,12 +1737,13 @@ export default function EbookReader({
       }
     }
     if (searchCursor >= 0) return
-    const currentPageHitIndex = textHits.findIndex((hit) => hit.pageIndex === Math.max(0, currentPageIndex || 0))
-    const currentPageKey = `page:${document.id}:${effectiveTextSearchQuery}:${Math.max(0, currentPageIndex || 0)}`
+    const localStartPageIndex = Math.max(0, currentPageIndex || 0)
+    const currentPageHitIndex = findFirstSearchHitAtOrAfterPage(textHits, localStartPageIndex)
+    const currentPageKey = `page:${document.id}:${effectiveTextSearchQuery}:${localStartPageIndex}`
     if (currentPageHitIndex >= 0 && appliedIncomingLocatorKeyRef.current !== currentPageKey) {
       appliedIncomingLocatorKeyRef.current = currentPageKey
       setSearchCursor(currentPageHitIndex)
-      const targetPageIndex = textHits[currentPageHitIndex]?.pageIndex ?? Math.max(0, currentPageIndex || 0)
+      const targetPageIndex = textHits[currentPageHitIndex]?.pageIndex ?? localStartPageIndex
       if (Number.isFinite(targetPageIndex) && targetPageIndex >= 0) setTextPageIndex(targetPageIndex)
       return
     }
@@ -1696,7 +1758,7 @@ export default function EbookReader({
       const targetPageIndex = textHits[initialIndex]?.pageIndex ?? 0
       if (Number.isFinite(targetPageIndex)) setTextPageIndex(targetPageIndex)
     }
-  }, [currentPageIndex, effectiveSearchSession, effectiveTextSearchQuery, hasMatchingSearchSession, isEpub, locator, searchCursor, sessionTextHits.length, textHits, textPages])
+  }, [currentPageIndex, effectiveSearchSession, effectiveTextSearchQuery, hasMatchingSearchSession, isEpub, locator, searchCursor, sessionTextHits.length, textHits, textPages, usesLocalReadingOrder])
 
   useEffect(() => {
     if (isEpub || !hasMatchingSearchSession || !sessionTextHits.length) return
@@ -1947,14 +2009,10 @@ export default function EbookReader({
     })
   }, [activeHref, fontSize, isEpub, lineHeight, location, readerNotes, textPage?.sourcePageNum, textPageIndex, textPages, theme, viewMode, visibleTextPages])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!activeTextHit || isEpub) return
-    const timer = window.setTimeout(() => {
-      const node = textScrollRef.current?.querySelector<HTMLElement>(`[data-ebook-search-hit="${activeTextHit.globalIndex}"]`)
-      node?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    }, 40)
-    return () => window.clearTimeout(timer)
-  }, [activeTextHit, isEpub])
+    revealTextSearchHit(activeTextHit.globalIndex)
+  }, [activeTextHit, isEpub, searchNavigationEpoch, textPageIndex, viewMode])
 
   useEffect(() => {
     if (!pendingReaderNoteId || isEpub) return
@@ -1970,7 +2028,7 @@ export default function EbookReader({
     if (!isEpub) return
     const rendition = renditionRef.current
     const book = bookRef.current
-    const query = localSearch.trim()
+    const query = effectiveTextSearchQuery.trim()
     const taskId = epubSearchTaskRef.current + 1
     epubSearchTaskRef.current = taskId
     clearEpubSearchHighlights(rendition, epubHighlightedCfiRef.current)
@@ -2008,7 +2066,7 @@ export default function EbookReader({
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [epubReadyKey, isEpub, localSearch, locator, searchSession])
+  }, [effectiveTextSearchQuery, epubReadyKey, isEpub, locator, searchSession])
 
   useEffect(() => {
     if (!isEpub) return
@@ -2056,13 +2114,15 @@ export default function EbookReader({
     if (isEpub || !textHits.length) return
     if (sessionTextHits.length) return
     if (searchCursor < 0) {
-      const initialIndex = findInitialTextSearchIndex(textHits, locator, effectiveSearchSession)
+      const initialIndex = usesLocalReadingOrder && localSearchStartPageRef.current >= 0
+        ? findFirstSearchHitAtOrAfterPage(textHits, localSearchStartPageRef.current)
+        : findInitialTextSearchIndex(textHits, locator, effectiveSearchSession)
       if (initialIndex >= 0) setSearchCursor(initialIndex)
       return
     }
     const nextPageIndex = textHits[searchCursor]?.pageIndex
     if (Number.isFinite(nextPageIndex) && !visibleTextPageIndices.includes(nextPageIndex)) setTextPageIndex(nextPageIndex)
-  }, [effectiveSearchSession, isEpub, locator, searchCursor, sessionTextHits.length, textHits, visibleTextPageIndices])
+  }, [effectiveSearchSession, isEpub, locator, searchCursor, sessionTextHits.length, textHits, usesLocalReadingOrder, visibleTextPageIndices])
 
   const jumpTextPage = (nextIndex: number) => {
     const bounded = Math.max(0, Math.min(textPages.length - 1, nextIndex))
@@ -2459,11 +2519,23 @@ export default function EbookReader({
     if (!textHits.length) return
     const current = searchCursor >= 0 ? searchCursor : 0
     const next = (current + direction + textHits.length) % textHits.length
+    const nextHit = textHits[next]
+    revealTextSearchHit(nextHit.globalIndex)
     setSearchCursor(next)
     setSearchNavigationEpoch((value) => value + 1)
-    const nextHit = textHits[next]
     if (viewMode === 'spread' && visibleTextPageIndices.includes(nextHit.pageIndex)) return
     jumpTextPage(nextHit.pageIndex)
+  }
+
+  const commitSearchDraft = () => {
+    const nextKeyword = localSearch.trim()
+    if (nextKeyword === searchKeyword.trim()) return
+    setLocallyCommittedSearchQuery(nextKeyword)
+    localSearchStartPageRef.current = textPageIndex
+    setSearchCursor(-1)
+    setLocalSearchSession(null)
+    setReaderHighlightColor('')
+    onSearchKeywordChange?.(nextKeyword)
   }
 
   const jumpToSearchDirectoryItem = (index: number) => {
@@ -2712,21 +2784,22 @@ export default function EbookReader({
         }}
       >
         <Space direction="vertical" size={6} style={{ width: '100%', flex: 1 }}>
-          {visibleSearchDirectoryItems.map((item) => (
-            <button
+          {visibleSearchDirectoryItems.map((item) => {
+            const active = item.index === (sessionTextHits.length ? activeSessionHitIndex : searchCursor)
+            return <button
               key={item.key}
               type="button"
               data-reader-search-result-item="true"
-              data-reader-search-result-active={item.active ? 'true' : undefined}
+              data-reader-search-result-active={active ? 'true' : undefined}
               onClick={() => jumpToSearchDirectoryItem(item.index)}
               style={{
                 width: '100%',
-                border: `1px solid ${item.active ? 'rgba(112,75,35,0.46)' : 'rgba(112,75,35,0.24)'}`,
+                border: `1px solid ${active ? 'rgba(112,75,35,0.46)' : 'rgba(112,75,35,0.24)'}`,
                 borderRadius: 6,
                 padding: '8px 9px',
                 textAlign: 'left',
                 cursor: 'pointer',
-                background: item.active ? 'rgba(184, 134, 83, 0.34)' : 'rgba(72,45,18,0.10)',
+                background: active ? 'rgba(184, 134, 83, 0.34)' : 'rgba(72,45,18,0.10)',
                 color: '#3e2b18',
                 fontSize: 12,
                 lineHeight: 1.55,
@@ -2738,7 +2811,7 @@ export default function EbookReader({
               </div>
               <span>{renderMarkedSnippet(item.snippet, localSearch, displayScript)}</span>
             </button>
-          ))}
+          })}
         </Space>
         {searchDirectoryItems.length > READER_SEARCH_RESULT_PAGE_SIZE ? (
           <div
@@ -2892,8 +2965,9 @@ export default function EbookReader({
               if (!page) return null
               const pageIndex = visibleTextPageIndices[offset] ?? textPageIndex + offset
               const pageHitStartIndex = textHits.filter((hit) => hit.pageIndex < pageIndex).length
-              const activePageHitIndex = activeTextHit && activeTextHit.pageIndex === pageIndex ? activeTextHit.globalIndex : -1
-              const noteHighlights = effectiveTextSearchQuery.trim() ? [] : readerNoteHighlightsByPage.get(pageIndex) || []
+              const noteHighlights = effectiveTextSearchQuery.trim()
+                ? EMPTY_READER_NOTE_HIGHLIGHTS
+                : readerNoteHighlightsByPage.get(pageIndex) || EMPTY_READER_NOTE_HIGHLIGHTS
               const isCurrent = pageIndex === textPageIndex
               return (
                 <article
@@ -2927,7 +3001,14 @@ export default function EbookReader({
                   </div>
                   <div>
                     {page.text
-                      ? renderTextContent(page.text, effectiveTextSearchQuery, activePageHitIndex, pageHitStartIndex, undefined, displayScript, effectiveHighlightColor, searchActiveOnly, noteHighlights)
+                      ? <MemoizedReaderTextContent
+                          text={page.text}
+                          keyword={effectiveTextSearchQuery}
+                          startIndex={pageHitStartIndex}
+                          displayScript={displayScript}
+                          highlightColor={effectiveHighlightColor}
+                          noteHighlights={noteHighlights}
+                        />
                       : <Text style={{ color: themed.muted }}>暂无文本</Text>}
                   </div>
                 </article>
@@ -3113,7 +3194,19 @@ export default function EbookReader({
             prefix={<SearchOutlined />}
             allowClear
             value={localSearch}
-            onChange={(event) => { setLocalSearch(event.target.value); setSearchCursor(-1); setLocalSearchSession(null); setReaderHighlightColor(''); onSearchKeywordChange?.(event.target.value) }}
+            onChange={(event) => {
+              const nextValue = event.target.value
+              setLocalSearch(nextValue)
+              if (!nextValue) {
+                setLocallyCommittedSearchQuery('')
+                localSearchStartPageRef.current = -1
+                setSearchCursor(-1)
+                setLocalSearchSession(null)
+                setReaderHighlightColor('')
+                onSearchKeywordChange?.('')
+              }
+            }}
+            onPressEnter={commitSearchDraft}
             placeholder="搜索文内关键词"
             style={{ width: 170 }}
           />

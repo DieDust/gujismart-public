@@ -49,12 +49,26 @@ async function run() {
     assert.strictEqual(modules.snapshots.validateSearchSnapshot(first.snapshotId, { criteriaKey: 'beta', nowMs: 1_060 }).validation, 'stale')
     const second = modules.snapshots.createSearchSnapshot({ criteriaKey: 'beta', nowMs: 2_000, ttlMs: 100 })
     assert.strictEqual(modules.snapshots.validateSearchSnapshot(second.snapshotId, { criteriaKey: 'beta', nowMs: 2_101 }).validation, 'expired')
-    const bounded = Array.from({ length: 129 }, (_, index) => modules.snapshots.createSearchSnapshot({
-      criteriaKey: `bounded-${index}`,
-      nowMs: 3_000 + index,
-      ttlMs: 10_000,
-    }))
+    const boundedFirst = modules.snapshots.createSearchSnapshot({ criteriaKey: 'bounded-0', nowMs: 3_000, ttlMs: 10_000 })
+    modules.snapshots.recordSearchSnapshotAggregate(boundedFirst.snapshotId, {
+      query: 'bounded',
+      totalDocuments: 1,
+      totalHits: 2,
+      status: 'complete',
+      warnings: [],
+      exactness: 'exact',
+      coverage: { returnedDocuments: 1, returnedHits: 2, totalsExact: true },
+    })
+    const bounded = [
+      boundedFirst,
+      ...Array.from({ length: 128 }, (_, index) => modules.snapshots.createSearchSnapshot({
+        criteriaKey: `bounded-${index + 1}`,
+        nowMs: 3_001 + index,
+        ttlMs: 10_000,
+      })),
+    ]
     assert.strictEqual(modules.snapshots.validateSearchSnapshot(bounded[0].snapshotId, { nowMs: 3_200 }).validation, 'not-found')
+    assert.strictEqual(modules.snapshots.getSearchSnapshotAggregate(bounded[0].snapshotId), null, 'evicted snapshot aggregate should be released')
     assert.strictEqual(modules.snapshots.validateSearchSnapshot(bounded[128].snapshotId, { nowMs: 3_200 }).validation, 'active')
 
     const canonical = modules.canonical.resolveCanonicalPageContent('page-1')

@@ -164,7 +164,7 @@ if (imageViewerSource.includes('if (coordinateSourceSize?.preserveServiceCoordin
   throw new Error('image viewer must not bypass display mapping solely because service coordinates were preserved')
 }
 assertImageViewerIncludes('const rect = getBoxRect(box, boxCoordinateScale)', 'image viewer should render original-image OCR boxes in the displayed page image coordinate basis')
-assertDocumentViewIncludes("const shouldLoadSearchPages = shouldUseSourcePageReader || documentMode === 'proof'", 'proof mode search should load document-wide search pages')
+assertDocumentViewIncludes("const shouldLoadSearchPages = documentMode === 'proof'", 'coordinate-aware proof search should load document-wide search pages without duplicating reader search payloads')
 assertDocumentViewIncludes('readerSearchPages.map((page, fallbackIndex)', 'proof mode search should count hits across loaded document search pages')
 assertDocumentViewIncludes('firstMatchAtOrAfterCurrentPage', 'proof mode search should start from the current page when full-document hits load')
 assertDocumentViewIncludes('loadPagesAround(match.pageIndex, 5)', 'proof mode next/previous search navigation should preload the target page')

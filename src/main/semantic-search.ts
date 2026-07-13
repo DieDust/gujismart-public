@@ -341,6 +341,22 @@ const searchFilterDocIdsCache = new Map<string, { createdAt: number; docIds: str
 const folderScopeIdsCache = new Map<string, { createdAt: number; folderIds: string[] }>()
 const postingRowsCache = new Map<string, { createdAt: number; rows: SearchHitRow[] }>()
 const trigramCoverageCache = new Map<string, { createdAt: number; missingDocIds: string[] }>()
+const DOCUMENT_SEARCH_SESSION_CACHE_TTL_MS = 30_000
+const DOCUMENT_SEARCH_SESSION_CACHE_MAX_ENTRIES = 24
+const DOCUMENT_SEARCH_SESSION_CACHE_MAX_TOTAL_HITS = 12_000
+const DOCUMENT_SEARCH_SESSION_CACHE_MAX_HITS_PER_ENTRY = 5_000
+
+interface DocumentSearchSessionCacheEntry {
+  createdAt: number
+  lastAccessAt: number
+  hitCount: number
+  session: SearchSessionState
+}
+
+const documentSearchSessionCache = new Map<string, DocumentSearchSessionCacheEntry>()
+let documentSearchSessionCacheHits = 0
+let documentSearchSessionCacheMisses = 0
+let documentSearchSessionCacheEvictions = 0
 
 type TimedSearchCacheEntry = { createdAt: number }
 
@@ -364,6 +380,83 @@ function setBoundedSearchCacheEntry<T extends TimedSearchCacheEntry>(cache: Map<
     .sort((left, right) => left[1].createdAt - right[1].createdAt)
     .slice(0, overflowCount)
     .forEach(([key]) => cache.delete(key))
+}
+
+function cloneDocumentSearchSession(session: SearchSessionState): SearchSessionState {
+  return { ...session, hits: [...session.hits] }
+}
+
+function deleteDocumentSearchSessionCacheEntry(cacheKey: string): void {
+  if (!documentSearchSessionCache.delete(cacheKey)) return
+  documentSearchSessionCacheEvictions += 1
+}
+
+function pruneDocumentSearchSessionCache(now = Date.now()): void {
+  for (const [cacheKey, entry] of documentSearchSessionCache.entries()) {
+    if (now - entry.createdAt >= DOCUMENT_SEARCH_SESSION_CACHE_TTL_MS) {
+      deleteDocumentSearchSessionCacheEntry(cacheKey)
+    }
+  }
+
+  let totalHits = [...documentSearchSessionCache.values()].reduce((sum, entry) => sum + entry.hitCount, 0)
+  while (
+    documentSearchSessionCache.size > DOCUMENT_SEARCH_SESSION_CACHE_MAX_ENTRIES
+    || totalHits > DOCUMENT_SEARCH_SESSION_CACHE_MAX_TOTAL_HITS
+  ) {
+    const oldest = [...documentSearchSessionCache.entries()]
+      .sort((left, right) => left[1].lastAccessAt - right[1].lastAccessAt)[0]
+    if (!oldest) break
+    totalHits -= oldest[1].hitCount
+    deleteDocumentSearchSessionCacheEntry(oldest[0])
+  }
+}
+
+function getCachedDocumentSearchSession(cacheKey: string): SearchSessionState | null {
+  const now = Date.now()
+  pruneDocumentSearchSessionCache(now)
+  const cached = documentSearchSessionCache.get(cacheKey)
+  if (!cached) {
+    documentSearchSessionCacheMisses += 1
+    return null
+  }
+  cached.lastAccessAt = now
+  documentSearchSessionCache.delete(cacheKey)
+  documentSearchSessionCache.set(cacheKey, cached)
+  documentSearchSessionCacheHits += 1
+  return cloneDocumentSearchSession(cached.session)
+}
+
+function setCachedDocumentSearchSession(cacheKey: string, session: SearchSessionState): void {
+  if (session.hits.length > DOCUMENT_SEARCH_SESSION_CACHE_MAX_HITS_PER_ENTRY) return
+  const now = Date.now()
+  documentSearchSessionCache.set(cacheKey, {
+    createdAt: now,
+    lastAccessAt: now,
+    hitCount: session.hits.length,
+    session: cloneDocumentSearchSession(session),
+  })
+  pruneDocumentSearchSessionCache(now)
+}
+
+function clearDocumentSearchSessionCache(): void {
+  documentSearchSessionCache.clear()
+}
+
+export function getDocumentSearchSessionCacheDiagnostics(): {
+  size: number
+  cachedHits: number
+  hits: number
+  misses: number
+  evictions: number
+} {
+  pruneDocumentSearchSessionCache()
+  return {
+    size: documentSearchSessionCache.size,
+    cachedHits: [...documentSearchSessionCache.values()].reduce((sum, entry) => sum + entry.hitCount, 0),
+    hits: documentSearchSessionCacheHits,
+    misses: documentSearchSessionCacheMisses,
+    evictions: documentSearchSessionCacheEvictions,
+  }
 }
 
 const queuedReindexDocIds = new Set<string>()
@@ -584,6 +677,7 @@ function markSearchIndexDirty(): void {
   searchFilterDocIdsCache.clear()
   postingRowsCache.clear()
   trigramCoverageCache.clear()
+  clearDocumentSearchSessionCache()
 }
 
 export function isSearchIndexReindexQueuedInMemory(docId: string): boolean {
@@ -3662,6 +3756,24 @@ export function getDocumentSearchHits(docId: string, query: string, options?: Se
       status: 'idle',
     }
   }
+  const requestedLimit = Number(options?.limit || 600)
+  const resolvedLimit = Number.isFinite(requestedLimit) ? requestedLimit : 600
+  const generationBeforeSearch = getLibrarySearchGeneration()
+  const cacheKey = stableStringify({
+    type: 'document-search-session',
+    databasePath: getDatabaseFilePath(),
+    generation: generationBeforeSearch,
+    docId,
+    query,
+    normalizedQuery,
+    limit: resolvedLimit,
+    resultMode: options?.resultMode || 'preview',
+    contextMode: options?.contextMode || 'standard',
+    translationScope: options?.translationScope || 'all',
+  })
+  const cached = getCachedDocumentSearchSession(cacheKey)
+  if (cached) return cached
+
   const status = getCurrentSearchIndexStatus(docId)
   const indexReady = isUsableSearchIndexStatus(docId, status)
   if (!indexReady) {
@@ -3671,11 +3783,10 @@ export function getDocumentSearchHits(docId: string, query: string, options?: Se
   if (segments.length === 0) {
     segments = loadPageSegmentsForDocument(docId)
   }
-  const requestedLimit = Number(options?.limit || 600)
   const hits = buildHitsFromRows(
     segments.map((segment) => ({ ...segment, rank: 0 })),
     normalizedQuery,
-    Number.isFinite(requestedLimit) ? requestedLimit : 600,
+    resolvedLimit,
     options,
   )
     .sort((left, right) => (
@@ -3683,13 +3794,17 @@ export function getDocumentSearchHits(docId: string, query: string, options?: Se
       || left.locator.segmentOrdinal - right.locator.segmentOrdinal
       || left.locator.charStart - right.locator.charStart
     ))
-  return {
+  const session: SearchSessionState = {
     query,
     hits,
     activeHitIndex: hits.length > 0 ? 0 : -1,
     status: hits.length > 0 ? 'ready' : indexReady ? 'empty' : 'searching',
     phase: indexReady ? 'complete' : 'verifying',
   }
+  if (indexReady && getLibrarySearchGeneration() === generationBeforeSearch) {
+    setCachedDocumentSearchSession(cacheKey, session)
+  }
+  return session
 }
 
 export function getDocumentSearchHitPage(docId: string, query: string, options?: SearchOptions): SearchDocumentHitPage {

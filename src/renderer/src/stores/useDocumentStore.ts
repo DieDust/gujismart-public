@@ -28,6 +28,7 @@ interface DocumentState {
   updateDocumentInList: (id: string, data: Partial<DocumentListItem>) => void
   updateDocumentsInList: (patches: Array<{ id: string; data: Partial<DocumentListItem> }>) => void
   removeDocumentFromList: (id: string) => void
+  removeDocumentsFromList: (ids: string[]) => void
 }
 
 export const useDocumentStore = create<DocumentState>((set, get) => ({
@@ -76,8 +77,13 @@ export const useDocumentStore = create<DocumentState>((set, get) => ({
     })
     return changed ? { documents } : state
   }),
-  removeDocumentFromList: (id) => set((state) => ({
-    documents: state.documents.filter(d => d.id !== id),
-    selectedIds: state.selectedIds.filter(i => i !== id)
-  }))
+  removeDocumentFromList: (id) => get().removeDocumentsFromList([id]),
+  removeDocumentsFromList: (ids) => set((state) => {
+    if (ids.length === 0) return state
+    const removedIds = new Set(ids)
+    const documents = state.documents.filter((document) => !removedIds.has(document.id))
+    const selectedIds = state.selectedIds.filter((id) => !removedIds.has(id))
+    if (documents.length === state.documents.length && selectedIds.length === state.selectedIds.length) return state
+    return { documents, selectedIds }
+  })
 }))

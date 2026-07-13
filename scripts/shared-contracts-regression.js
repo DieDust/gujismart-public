@@ -1,5 +1,5 @@
 const assert = require('assert')
-const { mkdtempSync, rmSync } = require('fs')
+const { mkdtempSync, readFileSync, rmSync } = require('fs')
 const os = require('os')
 const path = require('path')
 const { buildSync } = require('esbuild')
@@ -79,11 +79,18 @@ try {
   const settings = bundle('src/shared/setting-definitions.ts', 'settings.cjs')
   assert.strictEqual(settings.getSettingDefinition('llm_api_key').sensitivity, 'protected')
   assert.strictEqual(settings.getSettingDefinition('theme').rendererVisible, true)
+  assert.strictEqual(settings.getSettingDefinition('auto_ai_after_ocr').defaultValue, 'false')
   assert.deepStrictEqual(settings.validateSettingValue('batch_size', '10'), { key: 'batch_size', value: '10', known: true })
   assert.deepStrictEqual(settings.validateSettingValue('auto_ocr_after_import', 'TRUE'), { key: 'auto_ocr_after_import', value: 'true', known: true })
   assert.deepStrictEqual(settings.validateSettingValue('future_compatible_key', 'value'), { key: 'future_compatible_key', value: 'value', known: false })
   assert.throws(() => settings.validateSettingValue('batch_size', '0'), /setting_value_out_of_range/)
   assert.throws(() => settings.validateSettingValue('auto_ocr_after_import', 'yes'), /setting_value_invalid_boolean/)
+
+  const settingsView = readFileSync(path.join(root, 'src/renderer/src/views/SettingsView.tsx'), 'utf8')
+  const ocrIpc = readFileSync(path.join(root, 'src/main/ipc/ocr.ts'), 'utf8')
+  assert.ok(settingsView.includes('const [autoAi, setAutoAi] = useState(false)'))
+  assert.ok(settingsView.includes("setAutoAi(settings.auto_ai_after_ocr === 'true')"))
+  assert.ok(ocrIpc.includes("if (autoAi?.value === 'true' && !hasFinalPendingPageFailure"))
 
   console.log('Shared task, error, and setting contract regression checks passed.')
 } finally {

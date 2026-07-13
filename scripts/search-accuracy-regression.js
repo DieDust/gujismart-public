@@ -302,6 +302,52 @@ async function run() {
     }
     matrixReports.push(assertSingleCharacterCountMatrix(search, countDocIds, countMatrix.targetChar, expectedCountHitsByDoc, 'after-reindex'))
 
+    const cacheQuery = countMatrix.targetChar
+    const cacheDocId = countDocIds[countDocIds.length - 1]
+    const cacheStatsBefore = search.getDocumentSearchSessionCacheDiagnostics()
+    const coldStartedAt = performance.now()
+    const firstHitPage = search.getDocumentSearchHitPage(cacheDocId, cacheQuery, {
+      page: 1,
+      pageSize: 1,
+      resultMode: 'all',
+    })
+    const coldElapsedMs = performance.now() - coldStartedAt
+    const cacheStatsAfterFirstPage = search.getDocumentSearchSessionCacheDiagnostics()
+    const warmStartedAt = performance.now()
+    const secondHitPage = search.getDocumentSearchHitPage(cacheDocId, cacheQuery, {
+      page: 2,
+      pageSize: 1,
+      resultMode: 'all',
+    })
+    const warmElapsedMs = performance.now() - warmStartedAt
+    const cachedSession = search.getDocumentSearchHits(cacheDocId, cacheQuery, {
+      limit: 20_000,
+      resultMode: 'all',
+    })
+    const cacheStatsAfterReuse = search.getDocumentSearchSessionCacheDiagnostics()
+    assert.strictEqual(cacheStatsAfterFirstPage.misses, cacheStatsBefore.misses + 1, 'first document hit page should compute one session')
+    assert.ok(cacheStatsAfterReuse.hits >= cacheStatsAfterFirstPage.hits + 2, 'later pages and matching session requests should reuse the computed session')
+    assert.deepStrictEqual(
+      [...firstHitPage.hits, ...secondHitPage.hits].map((hit) => hit.id),
+      cachedSession.hits.slice(0, 2).map((hit) => hit.id),
+      'cached pagination must preserve the exact hit order',
+    )
+    assert.strictEqual(firstHitPage.totalHits, cachedSession.hits.length, 'cached pagination must preserve the exact hit multiset size')
+
+    search.notifySearchContentChanged()
+    const cacheStatsAfterInvalidation = search.getDocumentSearchSessionCacheDiagnostics()
+    search.getDocumentSearchHitPage(cacheDocId, cacheQuery, { page: 1, pageSize: 1, resultMode: 'all' })
+    const cacheStatsAfterRecompute = search.getDocumentSearchSessionCacheDiagnostics()
+    assert.strictEqual(cacheStatsAfterInvalidation.size, 0, 'content invalidation should release cached document hit sessions')
+    assert.strictEqual(cacheStatsAfterRecompute.misses, cacheStatsAfterInvalidation.misses + 1, 'content invalidation should force an exact recomputation')
+    for (let index = 0; index < 25; index += 1) {
+      search.getDocumentSearchHits(cacheDocId, `cache-boundary-miss-${index}`, { limit: 20_000, resultMode: 'all' })
+    }
+    const boundedCacheStats = search.getDocumentSearchSessionCacheDiagnostics()
+    assert.ok(boundedCacheStats.size <= 24, 'document hit session cache should remain entry-bounded')
+    assert.ok(boundedCacheStats.evictions > cacheStatsAfterRecompute.evictions, 'document hit session cache should evict least-recently-used entries')
+    console.log(`Document hit session cache: cold=${coldElapsedMs.toFixed(2)}ms warm=${warmElapsedMs.toFixed(2)}ms hits=${firstHitPage.totalHits}`)
+
     console.log(`Single-character count matrix (${countMatrix.targetChar})`)
     for (const report of matrixReports) {
       console.log(`- ${report.actualTotalHits}/${report.expectedTotalHits} hits matched: ${JSON.stringify(report.actualHitsByDoc)}`)

@@ -410,7 +410,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   })
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionKey>('automation')
   const [autoOcr, setAutoOcr] = useState(true)
-  const [autoAi, setAutoAi] = useState(true)
+  const [autoAi, setAutoAi] = useState(false)
   const [autoDeletePdfAssets, setAutoDeletePdfAssets] = useState(false)
   const [preferFacsimileProofLayout, setPreferFacsimileProofLayout] = useState(true)
   const [metadataTagBindingEnabled, setMetadataTagBindingEnabled] = useState(false)
@@ -597,7 +597,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           void window.api.setDefaultOcrEngine('paddle', 'paddle').catch((error) => console.warn('[SettingsView] 迁移旧混合 OCR 默认项失败', error))
         }
         setAutoOcr(settings.auto_ocr_after_import !== 'false')
-        setAutoAi(settings.auto_ai_after_ocr !== 'false')
+        setAutoAi(settings.auto_ai_after_ocr === 'true')
         setAutoDeletePdfAssets(settings.auto_delete_pdf_assets_after_ocr === 'true')
         setPreferFacsimileProofLayout(settings.prefer_facsimile_proof_layout !== 'false')
         const nextMetadataTagBindingEnabled = settings.metadata_tag_binding_enabled === 'true'

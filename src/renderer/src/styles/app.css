@@ -3841,6 +3841,21 @@ body.is-app-tab-dragging * {
   background: var(--gs-ink-deep) !important;
 }
 
+mark[data-ebook-search-hit][data-search-active="true"] {
+  border-color: rgba(120, 53, 15, 0.92) !important;
+  outline: 2px solid rgba(255, 255, 255, 0.88) !important;
+  box-shadow: 0 0 0 3px rgba(120, 53, 15, 0.82), 0 0 0 6px rgba(255, 176, 32, 0.26) !important;
+  z-index: 3 !important;
+}
+
+mark[data-reader-search-hit-index][data-search-active="true"] {
+  border-color: rgba(120, 53, 15, 0.92) !important;
+  outline: 2px solid rgba(255, 255, 255, 0.88) !important;
+  box-shadow: 0 0 0 3px rgba(120, 53, 15, 0.82), 0 0 0 6px rgba(255, 176, 32, 0.26) !important;
+  font-weight: 700 !important;
+  z-index: 3 !important;
+}
+
 .excerpt-edit-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 160px;
