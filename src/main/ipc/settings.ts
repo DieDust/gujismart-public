@@ -26,6 +26,7 @@ import type {
   LlmProviderProfileState,
   LlmProviderProfilesResult,
   OcrEngine,
+  PaddleOcrTokenPoolState,
   Setting,
   SettingSetResult,
   SettingsMap,
@@ -84,6 +85,13 @@ import {
   writePublicSetting,
 } from '../settings-security'
 import { validateSettingValue } from '../../shared/setting-definitions'
+import {
+  acquirePaddleOcrToken,
+  addPaddleOcrToken,
+  getPaddleOcrTokenPoolState,
+  removePaddleOcrToken,
+  setPaddleOcrTokenEnabled,
+} from '../paddle-ocr-token-pool'
 
 const PROJECT_GITHUB_REPO = 'DieDust/gujismart-public'
 const PROJECT_RELEASES_URL = `https://github.com/${PROJECT_GITHUB_REPO}/releases`
@@ -722,7 +730,37 @@ export function registerSettingsIpc(): void {
     const draftSecret = credentialDraftRef
       ? consumeCredentialDraft(event.sender.id, 'paddleocr_api_key', credentialDraftRef)
       : ''
-    return fetchPaddleOcrModels(String(draftSecret || readProtectedSetting('paddleocr_api_key') || ''))
+    const savedToken = draftSecret || (() => {
+      try {
+        return acquirePaddleOcrToken().token
+      } catch {
+        return readProtectedSetting('paddleocr_api_key') || ''
+      }
+    })()
+    return fetchPaddleOcrModels(String(savedToken))
+  })
+
+  ipcMain.handle('settings:paddleOcrTokens:list', async (): Promise<PaddleOcrTokenPoolState> => {
+    return getPaddleOcrTokenPoolState()
+  })
+
+  ipcMain.handle('settings:paddleOcrTokens:add', async (event, label: string, credentialDraftRef: string): Promise<PaddleOcrTokenPoolState> => {
+    const token = consumeCredentialDraft(event.sender.id, 'paddleocr_api_key', credentialDraftRef)
+    const state = addPaddleOcrToken(label, token)
+    saveDatabase()
+    return state
+  })
+
+  ipcMain.handle('settings:paddleOcrTokens:remove', async (_event, id: string): Promise<PaddleOcrTokenPoolState> => {
+    const state = removePaddleOcrToken(String(id || ''))
+    saveDatabase()
+    return state
+  })
+
+  ipcMain.handle('settings:paddleOcrTokens:setEnabled', async (_event, id: string, enabled: boolean): Promise<PaddleOcrTokenPoolState> => {
+    const state = setPaddleOcrTokenEnabled(String(id || ''), Boolean(enabled))
+    saveDatabase()
+    return state
   })
 
   ipcMain.handle('settings:getLocalPaddleOcrStatus', async (): Promise<LocalPaddleOcrStatus> => {

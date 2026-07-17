@@ -651,8 +651,9 @@ assert(
   'batched OCR saves should defer per-chunk TOC invalidation, finalization, and database checkpoints.',
 )
 assert(
-  ocrSaveChunkSize >= 50,
-  'OCR result save batches should be large enough to avoid hundreds of SQLite transactions for multi-thousand-page PDFs.',
+  ocrSaveChunkSize >= 4 && ocrSaveChunkSize <= 16
+    && savePageOcrResultsBatchedBody.includes('await yieldToEventLoop()'),
+  'OCR result save batches should bound synchronous gzip/file work and yield between transactions so large saves do not freeze the main process.',
 )
 assert(
   savePageOcrResultsBatchedBody.includes('tocDirtyDocIds.forEach(markDocumentTocDirty)')
@@ -723,8 +724,8 @@ assert(
   'processDocumentOcr finally block should coalesce deferred TOC invalidation and checkpoint it once.',
 )
 assert(
-  ocrPostprocessChunkSize >= 50,
-  'OCR result post-processing batches should be large enough to avoid hundreds of scheduling rounds for multi-thousand-page PDFs.',
+  ocrPostprocessChunkSize >= 8 && ocrPostprocessChunkSize <= 32,
+  'OCR result post-processing batches should balance scheduling overhead with bounded main-process CPU work.',
 )
 assert(
   postProcessPdfOcrResultsBatchedBody.includes('index += OCR_RESULT_POSTPROCESS_CHUNK_SIZE')
@@ -764,10 +765,10 @@ assert(
   'PDF OCR async fallback save path should post-process only unfinished resume pages and map whole-PDF guarded results by original page number.',
 )
 assert(
-  asyncPdfBranchBody.includes('const missingAsyncPdfImagePage = findMissingReadablePageImage(pagesForOcr)')
-    && asyncPdfBranchBody.includes('const asyncPdfPageImagePages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)')
-    && asyncPdfBranchBody.includes('pagesForOcr = pagesForOcr.map((page) => asyncPdfPageImagesById.get(page.id) || page)'),
-  'PDF async OCR should still generate and attach local page images before uploading the source PDF.',
+  !asyncPdfBranchBody.includes('const missingAsyncPdfImagePage = findMissingReadablePageImage(pagesForOcr)')
+    && !asyncPdfBranchBody.includes('await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)')
+    && ocrIpcSource.includes('await ensurePageImageForOcrFallback(page, pdfPath, signal)'),
+  'PDF async OCR should upload immediately and generate local page images only for pages that need fallback OCR.',
 )
 assert(
   ocrIpcSource.includes('function hasSequentialPageRecords')

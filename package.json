@@ -1,6 +1,6 @@
 {
   "name": "gujismart",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
   "main": "./out/main/index.js",
   "author": "DieDust",
@@ -64,7 +64,8 @@
     "check:ocr-benchmark": "node scripts/ocr-pipeline-benchmark.js",
     "check:pdf-text-layer": "node scripts/pdf-text-layer-preflight-regression.js",
     "check:local-ocr-retirement": "node scripts/local-ocr-retirement-regression.js",
-    "check:ocr-provider-management": "node scripts/ocr-provider-management-regression.js",
+    "check:ocr-provider-management": "node scripts/ocr-provider-management-regression.js && npm run check:paddle-ocr-token-pool",
+    "check:paddle-ocr-token-pool": "node scripts/paddle-ocr-token-pool-regression.js && electron scripts/paddle-ocr-token-pool-integration-regression.js",
     "check:batch-processor-save": "node scripts/batch-processor-save-regression.js",
     "check:startup-nonblocking": "node scripts/startup-nonblocking-regression.js",
     "check:database-busy": "node scripts/database-busy-retry-regression.js",

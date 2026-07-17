@@ -12,6 +12,7 @@ const sharedTypes = read('src/shared/types.ts')
 const settingsView = read('src/renderer/src/views/SettingsView.tsx')
 const onboarding = read('src/renderer/src/components/OnboardingWizard.tsx')
 const appView = read('src/renderer/src/App.tsx')
+const paddleTokenPool = read('src/main/paddle-ocr-token-pool.ts')
 
 assert.ok(mainIndex.includes('initializeSettingsSecurity'), 'main startup must initialize credential migration before IPC registration')
 assert.ok(settingsIpc.includes('getRendererSettingsSnapshot'), 'settings IPC must build a redacted renderer snapshot')
@@ -33,7 +34,10 @@ for (const relativePath of [
 ]) {
   const source = read(relativePath)
   assert.ok(!/SELECT\s+value\s+FROM\s+settings[^\n]+(?:llm|vision_ocr|paddleocr)_api_key/i.test(source), `${relativePath} must not read protected credentials with SQL`)
-  assert.ok(source.includes('readProtectedSetting'), `${relativePath} must use the main-only credential reader`)
+  const delegatesToSecurePaddlePool = relativePath === 'src/main/ocr.ts'
+    && source.includes("from './paddle-ocr-token-pool'")
+    && paddleTokenPool.includes('readProtectedSetting')
+  assert.ok(source.includes('readProtectedSetting') || delegatesToSecurePaddlePool, `${relativePath} must use the main-only credential reader or the secure Paddle token pool`)
 }
 
 assert.ok(backup.includes('credentialsExcluded: true'), 'backup manifest must declare that credentials are excluded')

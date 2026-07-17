@@ -1,5 +1,49 @@
 # 更新日志 / Changelog
 
+## 1.1.2 - 2026-07-17
+
+### 中文
+
+#### 新增
+
+- 飞桨云端 OCR 支持配置多个 API Token。用户可设置主 Token、启用或停用备用 Token，并查看各 Token 的可用、限额或失效状态；额度耗尽或凭证失效时会自动切换到下一枚可用 Token。
+- 大型 PDF 的异步 OCR 支持按失败分段续跑：已完成的分段不会重复识别，仅重试失败或结果异常的部分，兼顾处理速度、额度消耗与结果完整性。
+- 单页重新 OCR 增加“顺时针旋转后识别”，适合横置表格和横向页面；识别结果会映射回原始页面坐标，继续兼容校对与版式还原。
+
+#### 改进
+
+- 优化数百页、数百 MB PDF 的导入与保存流程：不再于异步 PDF OCR 前预先生成全部页面图片，并将结果保存、结构整理和质量检查拆成小批次执行，减少长时间停在 0%、界面无响应和保存阶段卡顿。
+- 优化首次启动和文献库加载：延后后台恢复任务、放宽大型文献库加载超时并为瞬时失败增加重试，降低首次进入空白、加载错误或切换页面后才恢复的概率。
+- 新文献或没有阅读偏好记录的文献默认进入版式还原模式；已有用户明确保存的阅读模式偏好保持不变。
+- 修正横置真实表格可能被异步 PDF OCR 的异常结果检测误判、导致单页 OCR 回退失败的问题，同时保留可疑重复内容的质量保护。
+- OCR Token 继续由主进程安全保存，旧版单 Token 设置可直接升级，无需迁移数据库或重新导入文献。
+
+#### 下载
+
+- `GujiSmart-1.1.2-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.2-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- Paddle cloud OCR now supports multiple API tokens. Users can select a primary token, enable or disable fallbacks, inspect token status, and automatically rotate when a token is exhausted or invalid.
+- Large-PDF asynchronous OCR can resume by failed segment: completed segments are preserved while only failed or suspicious parts are retried, reducing repeated work and quota usage without sacrificing completeness.
+- Single-page OCR now offers clockwise-rotated recognition for sideways tables and landscape content, with coordinates mapped back to the original page for proofreading and facsimile rendering.
+
+#### Improvements
+
+- Optimized import and persistence for PDFs with hundreds of pages or hundreds of megabytes. Page images are no longer generated up front for asynchronous PDF OCR, and saving, structure processing, and quality checks yield in small batches to reduce frozen progress and interface stalls.
+- Improved first launch and library loading by delaying background recovery, allowing more time for large libraries, and retrying transient failures.
+- New documents, or documents without a saved reader preference, now open in facsimile mode by default; explicitly saved preferences remain unchanged.
+- Fixed genuine sideways tables being rejected by the asynchronous PDF OCR anomaly detector and then failing single-page fallback, while retaining protection against suspicious repeated output.
+- Paddle OCR credentials remain securely stored in the main process. Existing single-token settings upgrade directly without a database migration or document re-import.
+
+#### Downloads
+
+- `GujiSmart-1.1.2-Setup-x64.exe` for normal Windows installation.
+- `GujiSmart-1.1.2-Portable-x64.exe` for portable use.
+
 ## 1.1.1 - 2026-07-13
 
 ### 中文

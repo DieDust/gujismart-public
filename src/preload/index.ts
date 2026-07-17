@@ -122,6 +122,7 @@ import type {
   LocalPaddleOcrDownloadProgress,
   LocalPaddleOcrSource,
   LocalPaddleOcrStatus,
+  PaddleOcrTokenPoolState,
   LlmProviderProfile,
   LlmProviderProfileState,
   LlmProviderProfilesResult,
@@ -770,6 +771,18 @@ const api = {
       ipcRenderer.invoke('settings:listPaddleOcrModels', draft?.draftRef),
     )
   },
+  getPaddleOcrTokenPool: (): Promise<PaddleOcrTokenPoolState> =>
+    ipcRenderer.invoke('settings:paddleOcrTokens:list'),
+  addPaddleOcrToken: (label: string, apiKey: string): Promise<PaddleOcrTokenPoolState> => {
+    return prepareCredentialDraft('paddleocr_api_key', apiKey).then((draft) => {
+      if (!draft) throw new Error('PaddleOCR API Token 不能为空')
+      return ipcRenderer.invoke('settings:paddleOcrTokens:add', label, draft.draftRef)
+    })
+  },
+  removePaddleOcrToken: (id: string): Promise<PaddleOcrTokenPoolState> =>
+    ipcRenderer.invoke('settings:paddleOcrTokens:remove', id),
+  setPaddleOcrTokenEnabled: (id: string, enabled: boolean): Promise<PaddleOcrTokenPoolState> =>
+    ipcRenderer.invoke('settings:paddleOcrTokens:setEnabled', id, enabled),
   getLocalPaddleOcrStatus: (): Promise<LocalPaddleOcrStatus> =>
     ipcRenderer.invoke('settings:getLocalPaddleOcrStatus'),
   checkLocalPaddleOcrSources: (): Promise<LocalPaddleOcrSource[]> =>

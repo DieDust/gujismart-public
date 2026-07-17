@@ -154,7 +154,7 @@ assert(
     && !asyncPdfOptionalPayloadBody.includes('merge_layout_blocks')
     && submitAsyncPdfJobBody.includes("formData.append('optionalPayload', JSON.stringify(submitOptions.optionalPayload))")
     && recognizePdfAsyncBody.includes('const optionalPayload = getAsyncPdfOptionalPayload(options?.ocrOptions, model)')
-    && recognizePdfAsyncBody.includes('}, { pageRanges: chunk.pageRanges, optionalPayload })'),
+    && recognizePdfAsyncBody.includes('{ pageRanges: chunk.pageRanges, optionalPayload }'),
   'Async PDF OCR should send official camelCase PaddleOCR web settings that avoid ignored options and document-preprocessor coordinate drift.',
 )
 assert(
@@ -296,18 +296,27 @@ assert(
 )
 assert(
   createPdfChunkPlanBody.includes('const fallbackTotalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)')
+    && createPdfChunkPlanBody.includes('const hasKnownFallbackPageCount =')
+    && createPdfChunkPlanBody.includes('&& hasKnownFallbackPageCount')
     && createPdfChunkPlanBody.includes('forceChunking = false')
-    && createPdfChunkPlanBody.includes('!forceChunking')
-    && createPdfChunkPlanBody.includes('canAttemptWholePdfUpload(stats.size, fallbackTotalPages)')
-    && createPdfChunkPlanBody.includes('canAttemptWholePdfUpload(stats.size, totalPages)')
-    && createPdfChunkPlanBody.includes('fullFileUpload: true')
+    && ocrSource.includes('const ASYNC_PDF_MAX_PAGES_PER_JOB = 100')
+    && createPdfChunkPlanBody.includes('fallbackTotalPages <= ASYNC_PDF_MAX_PAGES_PER_JOB')
+    && createPdfChunkPlanBody.includes('totalPages <= ASYNC_PDF_MAX_PAGES_PER_JOB')
+    && createPdfChunkPlanBody.includes('estimatedPagesPerChunk = Math.min(estimatedPagesPerChunk, ASYNC_PDF_MAX_PAGES_PER_JOB)')
+    && ocrSource.includes('cannot be uploaded as one PaddleOCR job after chunking failed')
     && createPdfChunkPlanBody.indexOf('const fallbackTotalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)') < createPdfChunkPlanBody.indexOf('let totalPages = isQpdfPdfChunkingEnabled()'),
-  'PDFs with a known page count should prefer full-file async upload instead of preemptively chunking by local 50MB/1000-page guards.',
+  'PDFs must use the official 100-page job boundary, verify unknown total page counts, and never fall back to an oversized whole-file job.',
+)
+const riskyPageImageHardIssueBody = sliceBetween(
+  ocrIpcSource,
+  'function getRiskyPageImageHardIssue',
+  'function getRiskyPageImageNonTableHardIssue',
+  'page-image OCR quality guard',
 )
 assert(
   recognizePdfAsyncBody.includes("status: 'uploading'")
     && recognizePdfAsyncBody.includes("state: 'uploading'")
-    && recognizePdfAsyncBody.indexOf("status: 'uploading'") < recognizePdfAsyncBody.indexOf('const jobId = await submitAsyncPdfJob'),
+    && recognizePdfAsyncBody.indexOf("status: 'uploading'") < recognizePdfAsyncBody.indexOf('const submission = await submitAsyncPdfJob'),
   'Async PDF OCR should emit an uploading phase before the fetch upload blocks on the network.',
 )
 assert(
@@ -424,9 +433,14 @@ assert(
   'Batch page-image OCR should pass upload image metadata into OCR post-processing.',
 )
 assert(
-  ocrIpcSource.includes('const uploadImage = await prepareImageForOcrUpload(page.image_path)')
-    && ocrIpcSource.includes('postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions, { signal, uploadImage })'),
-  'Single-page rerun OCR and safe page-image OCR should share upload coordinate metadata handling.',
+  ocrIpcSource.includes('const uploadImage = await prepareImageForOcrUpload(recognitionImagePath)')
+    && ocrIpcSource.includes('postProcessRecognizedPageResult(initialResult, recognitionImagePath, resolvedOptions, { signal, uploadImage })')
+    && ocrIpcSource.includes('mapClockwiseOcrResultToSourcePage(processed, sourceSize.width, sourceSize.height)'),
+  'Single-page rerun OCR should preserve upload coordinate metadata and map manually rotated OCR coordinates back to the source page.',
+)
+assert(
+  !riskyPageImageHardIssueBody.includes('getLikelyAsyncPdfTableMisclassification'),
+  'Actual page-image OCR must not reject genuine tables using an async-PDF table-misclassification heuristic.',
 )
 assert(
   ocrIpcSource.includes('const HEAVY_PDF_DOC_SIZE_BYTES = 200 * 1024 * 1024')
@@ -487,7 +501,7 @@ assert(
 )
 assert(
   waitForAsyncPdfResultBody.includes('try {')
-    && waitForAsyncPdfResultBody.includes('statusPayload = await queryAsyncPdfJob(jobId, signal)')
+    && waitForAsyncPdfResultBody.includes('statusPayload = await queryAsyncPdfJob(jobId, lease, signal)')
     && waitForAsyncPdfResultBody.includes('retryingStatusQuery: true')
     && waitForAsyncPdfResultBody.includes('statusQueryError: failure.message')
     && waitForAsyncPdfResultBody.includes('waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS')

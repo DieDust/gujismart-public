@@ -169,8 +169,8 @@ class BatchProcessor {
 
   private resolveOcrOptions(docType?: string | null): Required<PageOcrOptions> {
     return docType === '\u53e4\u7c4d'
-      ? { profile: 'guji_print_vertical' as const, secondPass: 'local_segmentation' as const }
-      : { profile: 'general' as const, secondPass: 'none' as const }
+      ? { profile: 'guji_print_vertical' as const, secondPass: 'local_segmentation' as const, imageRotation: 0 as const }
+      : { profile: 'general' as const, secondPass: 'none' as const, imageRotation: 0 as const }
   }
 
   private async ensurePageRecords(docId: string, pageCount: number): Promise<BatchPageRow[]> {

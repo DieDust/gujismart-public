@@ -8,10 +8,21 @@ const tempRoot = mkdtempSync(join(__dirname, '.tmp-ocr-pdf-resume-'))
 const bundlePath = join(tempRoot, 'ocr-pdf-resume-bundle.cjs')
 const entryPath = join(tempRoot, 'ocr-pdf-resume-entry.js')
 const databaseStubPath = join(tempRoot, 'database-stub.js')
+const settingsSecurityStubPath = join(tempRoot, 'settings-security-stub.js')
 
 writeFileSync(databaseStubPath, `
   const settings = new Map([
     ['paddleocr_api_key', 'test-token'],
+    ['paddleocr_token_pool', JSON.stringify({
+      version: 1,
+      primaryLabel: 'Account 1',
+      primaryEnabled: true,
+      entries: [{
+        id: '11111111-1111-1111-1111-111111111111',
+        label: 'Account 2',
+        enabled: true,
+      }],
+    })],
     ['ocr_async_model', 'PaddleOCR-VL-1.6'],
     ['ocr_async_pdf_chunk_concurrency', '1'],
     ['ocr_upload_timeout_seconds', '10'],
@@ -24,6 +35,17 @@ writeFileSync(databaseStubPath, `
       : Array.from(settings.keys()).find((item) => text.includes(item))
     return key && settings.has(key) ? { value: settings.get(key) } : null
   }
+`)
+
+writeFileSync(settingsSecurityStubPath, `
+  exports.readProtectedSetting = (key) => key === 'paddleocr_api_key'
+    ? 'test-token'
+    : key === 'paddleocr_token:11111111-1111-1111-1111-111111111111'
+    ? 'backup-token'
+    : ''
+  exports.getCredentialPublicState = () => ({ configured: true, version: 1, state: 'available', last4: 'oken' })
+  exports.writeProtectedSetting = () => ({ configured: true, version: 1, state: 'available', last4: 'oken' })
+  exports.revokeProtectedSetting = () => true
 `)
 
 writeFileSync(entryPath, `
@@ -46,8 +68,15 @@ async function buildBundle() {
       name: 'stub-database',
       setup(build) {
         build.onResolve({ filter: /^\.\/database$/ }, (args) => {
-          if (args.importer.replace(/\\/g, '/').endsWith('/src/main/ocr.ts')) {
+          const importer = args.importer.replace(/\\/g, '/')
+          if (importer.endsWith('/src/main/ocr.ts') || importer.endsWith('/src/main/paddle-ocr-token-pool.ts')) {
             return { path: databaseStubPath }
+          }
+          return null
+        })
+        build.onResolve({ filter: /^\.\/settings-security$/ }, (args) => {
+          if (args.importer.replace(/\\/g, '/').endsWith('/src/main/paddle-ocr-token-pool.ts')) {
+            return { path: settingsSecurityStubPath }
           }
           return null
         })
@@ -125,6 +154,61 @@ function installMockAsyncFetch() {
   }
 
   return uploads
+}
+
+function installTokenFailoverFetch() {
+  const uploads = []
+  const submissionTokens = []
+  let jobIndex = 0
+  let rejectedPrimaryAfterFirstChunk = false
+
+  global.fetch = async (input, init = {}) => {
+    const url = String(input)
+    const method = String(init.method || 'GET').toUpperCase()
+
+    if (method === 'POST' && url.includes('/api/v2/ocr/jobs')) {
+      const token = String(new Headers(init.headers).get('authorization') || '').replace(/^Bearer\s+/i, '')
+      submissionTokens.push(token)
+      const upload = await readUploadedPdf(init.body)
+      if (uploads.length === 1 && token === 'test-token' && !rejectedPrimaryAfterFirstChunk) {
+        rejectedPrimaryAfterFirstChunk = true
+        return new Response(JSON.stringify({ error_code: 429, error_msg: 'daily page quota exceeded' }), { status: 429 })
+      }
+      const jobId = `failover-job-${jobIndex}`
+      jobIndex += 1
+      uploads.push({ jobId, token, ...upload })
+      return new Response(JSON.stringify({ data: { jobId } }), { status: 200 })
+    }
+
+    if (method === 'GET' && url.includes('/api/v2/ocr/jobs/')) {
+      const jobId = url.slice(url.lastIndexOf('/') + 1)
+      const upload = uploads.find((item) => item.jobId === jobId)
+      assert.ok(upload, `unknown failover job id ${jobId}`)
+      return new Response(JSON.stringify({
+        data: {
+          status: 'completed',
+          completedPages: upload.pageCount,
+          totalPages: upload.pageCount,
+          jsonUrl: `mock://failover-result/${jobId}`,
+        },
+      }), { status: 200 })
+    }
+
+    if (method === 'GET' && url.startsWith('mock://failover-result/')) {
+      const jobId = url.slice(url.lastIndexOf('/') + 1)
+      const upload = uploads.find((item) => item.jobId === jobId)
+      assert.ok(upload, `unknown failover result job id ${jobId}`)
+      return new Response(JSON.stringify({
+        layoutParsingResults: Array.from({ length: upload.pageCount }, (_, index) => ({
+          markdown: `chunk page ${index + 1}`,
+        })),
+      }), { status: 200 })
+    }
+
+    throw new Error(`unexpected failover fetch: ${method} ${url}`)
+  }
+
+  return { uploads, submissionTokens }
 }
 
 function installRegressingProgressFetch() {
@@ -263,7 +347,7 @@ async function runResumeScenario(ocr, pdfPath) {
     resultCount: 2,
   }])
   assert.ok(progressEvents.some((payload) => payload.chunkStartPage === 3 && payload.chunkEndPage === 5))
-  assert.ok(progressEvents.some((payload) => payload.fullFileUpload === true && payload.uploadPageCount === 5))
+  assert.ok(progressEvents.some((payload) => payload.fullFileUpload === true && payload.uploadPageCount === 2))
   assert.ok(!progressEvents.some((payload) => payload.fallbackWholePdf === true))
 }
 
@@ -361,42 +445,15 @@ async function runWholePdfFallbackScenario(ocr, pdfPath) {
   }
 
   try {
-    const chunks = []
-    const results = await ocr.recognizePdfAsync(pdfPath, (payload) => {
+    await assert.rejects(() => ocr.recognizePdfAsync(pdfPath, (payload) => {
       progressEvents.push(payload)
     }, {
       model: 'PaddleOCR-VL-1.6',
       targetPageNums: [3, 5],
-      onChunkComplete: (chunk) => {
-        chunks.push({
-          pageCount: chunk.pageCount,
-          totalPages: chunk.totalPages,
-          sourcePageIndexes: chunk.sourcePageIndexes,
-          resultCount: chunk.results.length,
-          resultMarkdowns: chunk.results.map((result) => result && result.markdown),
-        })
-      },
-    })
+    }), /cannot be uploaded as one PaddleOCR job/)
 
-    assert.strictEqual(results.length, 2)
-    assert.deepStrictEqual(results.map((result) => result && result.markdown), ['page 3', 'page 5'])
-    assert.strictEqual(uploads.length, 1)
-    assert.strictEqual(uploads[0].pageCount, 1001)
-    assert.deepStrictEqual(uploads[0].sizes.slice(0, 5), [
-      { width: 201, height: 301 },
-      { width: 202, height: 302 },
-      { width: 203, height: 303 },
-      { width: 204, height: 304 },
-      { width: 205, height: 305 },
-    ])
-    assert.deepStrictEqual(chunks, [{
-      pageCount: 2,
-      totalPages: 1001,
-      sourcePageIndexes: [2, 4],
-      resultCount: 2,
-      resultMarkdowns: ['page 3', 'page 5'],
-    }])
-    assert.ok(progressEvents.some((payload) => payload.fallbackWholePdf === true && payload.uploadPageCount === 1001))
+    assert.strictEqual(uploads.length, 0)
+    assert.ok(!progressEvents.some((payload) => payload.fallbackWholePdf === true))
   } finally {
     PDFDocument.prototype.copyPages = originalCopyPages
     if (originalQpdfChunking === undefined) {
@@ -429,7 +486,6 @@ async function runWholePdfFallbackWhenLoadFailsScenario(ocr, pdfPath) {
     }, {
       model: 'PaddleOCR-VL-1.6',
       targetPageNums: [3, 5],
-      fallbackPageCount: 5,
       onChunkComplete: (chunk) => {
         chunks.push({
           pageCount: chunk.pageCount,
@@ -452,7 +508,7 @@ async function runWholePdfFallbackWhenLoadFailsScenario(ocr, pdfPath) {
       resultCount: 2,
       resultMarkdowns: ['page 3', 'page 5'],
     }])
-    assert.ok(progressEvents.some((payload) => payload.fallbackWholePdf === true && payload.uploadPageCount === 5))
+    assert.ok(progressEvents.some((payload) => payload.fallbackWholePdf === true && payload.uploadPageCount === 2))
   } finally {
     PDFDocument.load = originalLoad
     if (originalQpdfChunking === undefined) {
@@ -482,11 +538,35 @@ async function runEmptyTargetScenario(ocr, pdfPath) {
   assert.strictEqual(chunks.length, 0)
 }
 
+async function runTokenFailoverChunkResumeScenario(ocr, pdfPath) {
+  const { uploads, submissionTokens } = installTokenFailoverFetch()
+  const chunks = []
+  const results = await ocr.recognizePdfAsync(pdfPath, undefined, {
+    model: 'PaddleOCR-VL-1.6',
+    fallbackPageCount: 205,
+    onChunkComplete: (chunk) => {
+      chunks.push({
+        pageCount: chunk.pageCount,
+        sourcePageIndexes: chunk.sourcePageIndexes,
+      })
+    },
+  })
+
+  assert.strictEqual(results.length, 205)
+  assert.deepStrictEqual(uploads.map((upload) => upload.pageCount), [100, 100, 5])
+  assert.deepStrictEqual(uploads.map((upload) => upload.token), ['test-token', 'backup-token', 'backup-token'])
+  assert.deepStrictEqual(submissionTokens, ['test-token', 'test-token', 'backup-token', 'backup-token'])
+  assert.deepStrictEqual(chunks.map((chunk) => chunk.pageCount), [100, 100, 5])
+  assert.deepStrictEqual(chunks.map((chunk) => chunk.sourcePageIndexes[0]), [0, 100, 200])
+}
+
 async function run() {
   const pdfPath = join(tempRoot, 'source.pdf')
   const largePdfPath = join(tempRoot, 'large-source.pdf')
+  const failoverPdfPath = join(tempRoot, 'failover-source.pdf')
   await createTestPdf(pdfPath)
   await createTestPdf(largePdfPath, 1001)
+  await createTestPdf(failoverPdfPath, 205)
   await buildBundle()
   const { ocr } = require(bundlePath)
   await runResumeScenario(ocr, pdfPath)
@@ -495,6 +575,7 @@ async function run() {
   await runQpdfChunkingScenario(ocr, largePdfPath)
   await runWholePdfFallbackScenario(ocr, largePdfPath)
   await runWholePdfFallbackWhenLoadFailsScenario(ocr, pdfPath)
+  await runTokenFailoverChunkResumeScenario(ocr, failoverPdfPath)
   await runEmptyTargetScenario(ocr, pdfPath)
   console.log('OCR PDF resume regression passed')
 }

@@ -64,6 +64,21 @@ assertIncludes(
 )
 assertIncludes(
   documentView,
+  "const [documentMode, setDocumentMode] = useState<DocumentMode>('proof')",
+  '没有历史阅读状态的新文献应默认进入校对/版式还原模式。',
+)
+assertIncludes(
+  documentView,
+  "const [proofViewMode, setProofViewMode] = useState<ProofViewMode>('facsimile')",
+  '版式还原候选文献应默认显示版式还原视图。',
+)
+assertIncludes(
+  documentView,
+  "if (canRestoreDocumentMode && state.document_mode === 'read') setDocumentMode('read')",
+  '已有用户阅读模式选择仍应优先于新的默认模式。',
+)
+assertIncludes(
+  documentView,
   "view_mode: readerViewMode",
   '保存文献阅读位置时必须使用当前阅读版式，不能硬编码双页。',
 )

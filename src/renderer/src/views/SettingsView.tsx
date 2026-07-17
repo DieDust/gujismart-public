@@ -22,7 +22,7 @@ import {
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type OcrEngine, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type OcrEngine, type PaddleOcrTokenPoolState, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
 
@@ -450,6 +450,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [localPaddleDownloadProgress, setLocalPaddleDownloadProgress] = useState<LocalPaddleOcrDownloadProgress | null>(null)
   const [paddleOcrModelOptions, setPaddleOcrModelOptions] = useState<string[]>([])
   const [paddleOcrModelsLoading, setPaddleOcrModelsLoading] = useState(false)
+  const [paddleOcrTokenPool, setPaddleOcrTokenPool] = useState<PaddleOcrTokenPoolState>({ entries: [], activeTokenId: null, configuredCount: 0, enabledCount: 0 })
+  const [paddleOcrTokenBusy, setPaddleOcrTokenBusy] = useState(false)
   const [llmModelOptions, setLlmModelOptions] = useState<string[]>([])
   const [visionModelOptions, setVisionModelOptions] = useState<string[]>([])
   const [llmModelsLoading, setLlmModelsLoading] = useState(false)
@@ -613,6 +615,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           nextPdfRepositoryStatus,
           nextAppVersion,
           nextResearchProjects,
+          nextPaddleOcrTokenPool,
         ] = await Promise.all([
           window.api.listLlmProviderProfiles(),
           window.api.listVisionOcrProviderProfiles(),
@@ -621,6 +624,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           window.api.listPdfRepositories(),
           window.api.getVersion(),
           window.api.listResearchProjects(),
+          window.api.getPaddleOcrTokenPool(),
         ])
         setLlmProfiles(llmProfileState.profiles || [])
         setActiveLlmProfileId(llmProfileState.activeId || '')
@@ -650,6 +654,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         setPdfRepositoryStatus(nextPdfRepositoryStatus)
         setAppVersion(nextAppVersion)
         setResearchProjects(nextResearchProjects)
+        setPaddleOcrTokenPool(nextPaddleOcrTokenPool)
+        setCredentialHints((current) => ({
+          ...current,
+          paddleocr_api_key: nextPaddleOcrTokenPool.configuredCount > 0
+            ? `已安全保存 ${nextPaddleOcrTokenPool.configuredCount} 个 Token`
+            : '',
+        }))
       } catch (error) {
         console.error('加载设置失败:', error)
       } finally {
@@ -855,12 +866,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           await window.api.setSetting(key, String(value))
         }
       }
-      for (const key of ['llm_api_key', 'paddleocr_api_key', 'vision_ocr_api_key'] as const) {
+      for (const key of ['llm_api_key', 'vision_ocr_api_key'] as const) {
         const draft = String(values[key] || '')
         if (draft) {
           await window.api.saveCredential(key, draft)
           setCredentialHints((current) => ({ ...current, [key]: `已安全保存（末四位 ${draft.slice(-4)}）` }))
         }
+      }
+      const paddleTokenDraft = String(values.paddleocr_api_key || '').trim()
+      if (paddleTokenDraft) {
+        const state = await window.api.addPaddleOcrToken(`Token ${paddleOcrTokenPool.configuredCount + 1}`, paddleTokenDraft)
+        setPaddleOcrTokenPool(state)
+        setCredentialHints((current) => ({ ...current, paddleocr_api_key: `已安全保存 ${state.configuredCount} 个 Token` }))
+        form.setFieldValue('paddleocr_api_key', '')
       }
       await window.api.setSetting('auto_ocr_after_import', autoOcr ? 'true' : 'false')
       await window.api.setSetting('auto_ai_after_ocr', autoAi ? 'true' : 'false')
@@ -941,6 +959,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     autoOcr,
     batchSize,
     form,
+    paddleOcrTokenPool.configuredCount,
     preferFacsimileProofLayout,
     retryCount,
     setSettingsDirty,
@@ -1116,6 +1135,54 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       message.warning(getErrorMessage(error, '拉取飞桨 OCR 官方模型列表失败，可继续手动输入模型 ID'))
     } finally {
       setPaddleOcrModelsLoading(false)
+    }
+  }
+
+  const handleAddPaddleOcrToken = async () => {
+    const token = String(form.getFieldValue('paddleocr_api_key') || '').trim()
+    if (!token) {
+      message.warning('请先填写要添加的 PaddleOCR API Token')
+      return
+    }
+    setPaddleOcrTokenBusy(true)
+    try {
+      const state = await window.api.addPaddleOcrToken(`Token ${paddleOcrTokenPool.configuredCount + 1}`, token)
+      setPaddleOcrTokenPool(state)
+      setCredentialHints((current) => ({ ...current, paddleocr_api_key: `已安全保存 ${state.configuredCount} 个 Token` }))
+      form.setFieldValue('paddleocr_api_key', '')
+      message.success(`Token 已加入轮询池，当前共 ${state.configuredCount} 个`)
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '添加 PaddleOCR Token 失败'))
+    } finally {
+      setPaddleOcrTokenBusy(false)
+    }
+  }
+
+  const handleRemovePaddleOcrToken = async (id: string) => {
+    setPaddleOcrTokenBusy(true)
+    try {
+      const state = await window.api.removePaddleOcrToken(id)
+      setPaddleOcrTokenPool(state)
+      setCredentialHints((current) => ({
+        ...current,
+        paddleocr_api_key: state.configuredCount > 0 ? `已安全保存 ${state.configuredCount} 个 Token` : '',
+      }))
+      message.success('Token 已删除')
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '删除 PaddleOCR Token 失败'))
+    } finally {
+      setPaddleOcrTokenBusy(false)
+    }
+  }
+
+  const handleSetPaddleOcrTokenEnabled = async (id: string, enabled: boolean) => {
+    setPaddleOcrTokenBusy(true)
+    try {
+      setPaddleOcrTokenPool(await window.api.setPaddleOcrTokenEnabled(id, enabled))
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '更新 PaddleOCR Token 状态失败'))
+    } finally {
+      setPaddleOcrTokenBusy(false)
     }
   }
 
@@ -1854,20 +1921,73 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       <Alert
         type="info"
         showIcon
-        message="用于 OCR 文字识别"
+        message="用于 OCR 文字识别，支持多 Token 自动接力"
         description={(
           <Space direction="vertical" size={4}>
             <Text type="secondary">飞桨 PaddleOCR API Token 可在飞桨 AI Studio 的 PaddleOCR 服务页申请。</Text>
+            <Text type="secondary">软件会连续使用当前 Token；遇到 429 额度耗尽或 403 Token 无效时自动切换。长 PDF 最多按 100 页分段，成功分段立即保存，只重试失败分段。</Text>
             <a href={PADDLE_OCR_APPLY_URL} target="_blank" rel="noreferrer">
               <LinkOutlined /> 前往申请飞桨 PaddleOCR API
             </a>
           </Space>
         )}
       />
+      <Form.Item label="添加 API Token" name="paddleocr_api_key" extra={credentialHints.paddleocr_api_key || 'Token 只会加密保存在本机；重复 Token 不会再次添加。'}>
+        <Input.Password
+          prefix={<KeyOutlined />}
+          placeholder="粘贴一个新的 PaddleOCR API Token"
+          onPressEnter={() => void handleAddPaddleOcrToken()}
+          suffix={<Button type="link" size="small" loading={paddleOcrTokenBusy} onClick={() => void handleAddPaddleOcrToken()}>添加</Button>}
+        />
+      </Form.Item>
+      <List
+        size="small"
+        bordered
+        loading={paddleOcrTokenBusy}
+        locale={{ emptyText: '尚未添加 PaddleOCR API Token' }}
+        dataSource={paddleOcrTokenPool.entries}
+        renderItem={(entry) => {
+          const statusLabel = entry.status === 'active'
+            ? '当前使用'
+            : entry.status === 'quota_exhausted'
+              ? '今日额度已用完'
+              : entry.status === 'invalid'
+                ? 'Token 无效'
+                : '待命'
+          const statusColor = entry.status === 'active'
+            ? 'green'
+            : entry.status === 'quota_exhausted'
+              ? 'orange'
+              : entry.status === 'invalid'
+                ? 'red'
+                : 'default'
+          return (
+            <List.Item
+              actions={[
+                <Switch
+                  key="enabled"
+                  size="small"
+                  checked={entry.enabled}
+                  checkedChildren="启用"
+                  unCheckedChildren="停用"
+                  onChange={(enabled) => void handleSetPaddleOcrTokenEnabled(entry.id, enabled)}
+                />,
+                <Popconfirm key="delete" title="删除这个 Token？删除后无法恢复。" onConfirm={() => void handleRemovePaddleOcrToken(entry.id)}>
+                  <Button type="text" danger size="small" icon={<DeleteOutlined />} aria-label={`删除 ${entry.label}`} />
+                </Popconfirm>,
+              ]}
+            >
+              <List.Item.Meta
+                title={<Space size={8}><Text>{entry.label}</Text><Tag color={statusColor}>{statusLabel}</Tag></Space>}
+                description={entry.lastError
+                  ? `末四位 ${entry.last4} · ${entry.lastError}`
+                  : `末四位 ${entry.last4}${entry.primary ? ' · 兼容原有配置' : ''}`}
+              />
+            </List.Item>
+          )
+        }}
+      />
       <div className="settings-form-grid">
-        <Form.Item label="API Token" name="paddleocr_api_key" extra={credentialHints.paddleocr_api_key || '例如：abc123def456...'}>
-          <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.paddleocr_api_key ? '留空将保留已保存 Token' : '请输入 PaddleOCR API Token'} />
-        </Form.Item>
         <Form.Item label="PDF 异步 OCR 模型" name="ocr_async_model" extra="默认使用 PaddleOCR-VL-1.6；可拉取官方模型，也可手动输入模型 ID。">
           <AutoComplete options={paddleOcrModelOptions.map((model) => ({ value: model, label: model }))}>
             <Input suffix={<Button type="text" size="small" loading={paddleOcrModelsLoading} onClick={() => void fetchPaddleOcrModelOptions()}>拉取</Button>} />

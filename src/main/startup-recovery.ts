@@ -54,6 +54,7 @@ const STARTUP_PDF_PAGE_RECORD_INIT_LIMIT = 1000
 const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
+const STARTUP_RECOVERY_DELAY_MS = 3000
 
 async function startupRecoveryCheckpoint(): Promise<boolean> {
   await yieldToEventLoop()
@@ -886,7 +887,7 @@ export function scheduleStartupRecovery(): void {
     message: '准备检查上次未完成的任务',
   })
   startupRecoveryPromise = new Promise((resolve) => {
-    setImmediate(() => {
+    setTimeout(() => {
       void runStartupRecovery()
       .catch((error) => {
         console.warn('[Main] Startup recovery failed', error)
@@ -902,7 +903,7 @@ export function scheduleStartupRecovery(): void {
         startupRecoveryPromise = null
         resolve()
       })
-    })
+    }, STARTUP_RECOVERY_DELAY_MS).unref?.()
   })
 }
 

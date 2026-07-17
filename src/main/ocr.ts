@@ -8,7 +8,12 @@ import { PDFDocument } from 'pdf-lib'
 import { queryOne } from './database'
 import { isAbortError } from '../shared/errors'
 import { ensureOcrResultIr } from '../shared/ocr-ir'
-import { readProtectedSetting } from './settings-security'
+import {
+  acquirePaddleOcrToken,
+  isPaddleOcrTokenFailure,
+  markPaddleOcrTokenFailure,
+  type PaddleOcrTokenLease,
+} from './paddle-ocr-token-pool'
 import type { OcrBoundingBox, OcrProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult, OcrRecognizeWordResult, OcrSecondPass, PageOcrOptions } from '../shared/types'
 export type { OcrProfile, OcrSecondPass, PageOcrOptions } from '../shared/types'
 
@@ -175,7 +180,10 @@ const OCR_LOCAL_IMAGE_COORDINATE_ALIGNMENT_VERSION = 1
 const ASYNC_PDF_MAX_FILE_SIZE = 50 * 1024 * 1024
 const ASYNC_PDF_TARGET_CHUNK_SIZE = 49 * 1024 * 1024
 const ASYNC_PDF_HEAVY_TARGET_CHUNK_SIZE = 32 * 1024 * 1024
-const ASYNC_PDF_MAX_PAGES_PER_JOB = 1000
+// The official hosted API only processes the first 100 pages of one submitted
+// file. This boundary also lets a failed chunk switch tokens without re-running
+// chunks whose results have already been persisted.
+const ASYNC_PDF_MAX_PAGES_PER_JOB = 100
 const PDF_LIB_CHUNK_PLAN_MAX_FILE_SIZE = ASYNC_PDF_MAX_FILE_SIZE
 const ASYNC_POLL_MIN_INTERVAL_MS = 1200
 const ASYNC_POLL_BASE_INTERVAL_MS = 5000
@@ -199,10 +207,12 @@ const QPDF_PAGE_COUNT_TIMEOUT_MS = 30 * 1000
 const DEFAULT_GUJI_OPTIONS: Required<PageOcrOptions> = {
   profile: 'guji_print_vertical',
   secondPass: 'local_segmentation',
+  imageRotation: 0,
 }
 const DEFAULT_GENERAL_OPTIONS: Required<PageOcrOptions> = {
   profile: 'general',
   secondPass: 'none',
+  imageRotation: 0,
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {
@@ -344,16 +354,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-function getToken(): string {
-  const token = readProtectedSetting('paddleocr_api_key')
-
-  if (!token) {
-    throw new Error('尚未配置 PaddleOCR API Token，请先到设置页完成配置。')
-  }
-
-  return token
-}
-
 function getNumericSetting(key: string, fallback: number, max: number): number {
   const row = queryOne("SELECT value FROM settings WHERE key = ?", [key]) as { value?: string } | null
   const parsed = Number(row?.value || fallback)
@@ -476,9 +476,8 @@ function isRetryableFailure(status?: number, code?: number | string): boolean {
 function isAsyncOcrQueueBusyError(error: Error & { status?: number; code?: number | string }): boolean {
   const message = String(error.message || '').toLowerCase()
   return (
-    error.status === 429
-    || String(error.code || '') === '429'
-    || /queue|busy|rate.?limit|too many|throttle|capacity/.test(message)
+    String(error.code || '') === '10010'
+    || /queue|busy|submission queue|capacity/.test(message)
     || /队列|排队|繁忙|稍后|限流|频繁|并发|提交队列已满/.test(message)
   )
 }
@@ -514,11 +513,13 @@ function resolveOcrOptions(options?: PageOcrOptions): Required<PageOcrOptions> {
     return {
       profile: 'guji_print_vertical',
       secondPass: options.secondPass || 'local_segmentation',
+      imageRotation: options.imageRotation === 90 ? 90 : 0,
     }
   }
   return {
     profile: 'general',
     secondPass: options?.secondPass || 'none',
+    imageRotation: options?.imageRotation === 90 ? 90 : 0,
   }
 }
 
@@ -3538,7 +3539,7 @@ export async function postProcessRecognizedPageResult(
     : workingResult
   const autoVertical = !preserveServiceCoordinates && imagePath && resolved.profile !== 'guji_print_vertical' && shouldAutoUseVerticalPostProcessing(coordinateTightenedInput)
   if (autoVertical) {
-    resolved = { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
+    resolved = { ...resolved, profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
   }
   if (preserveServiceCoordinates) {
     const serviceCoordinateResult = isOcrResultPayload(coordinateTightenedInput) ? coordinateTightenedInput : normalizePageResult(coordinateTightenedInput)
@@ -3842,7 +3843,6 @@ interface OcrRuntimeOptions {
 
 async function requestSyncRecognition(base64Image: string, options: SyncRecognitionOptions = {}): Promise<OcrResultPayload> {
   throwIfAborted(options.signal)
-  const token = getToken()
   const imageBase64 = base64Image.replace(/^data:image\/[a-z]+;base64,/, '')
   const preferVertical = Boolean(options.preferVertical)
 
@@ -3857,46 +3857,91 @@ async function requestSyncRecognition(base64Image: string, options: SyncRecognit
     textDetLimitSideLen: preferVertical ? 2000 : undefined,
   }
 
-  const response = await fetchWithTimeout(SYNC_OCR_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Authorization: `token ${token}`,
-      'Content-Type': 'application/json',
+  const excludedTokenIds = new Set<string>()
+  while (true) {
+    const lease = acquirePaddleOcrToken(excludedTokenIds)
+    try {
+      const response = await fetchWithTimeout(SYNC_OCR_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `token ${lease.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+        signal: options.signal,
+      }, getOcrUploadTimeoutMs(), 'OCR 上传超时，请在设置中调大“上传超时”，或降低上传最长边/JPEG 质量后重试。')
+
+      const data = await response.json().catch(() => ({})) as JsonRecord
+      if (!response.ok) {
+        const detail = getApiErrorMessage(data, '')
+        const error = new Error(`OCR 接口请求失败，状态码 ${response.status}${detail ? `：${detail}` : ''}`) as Error & { status?: number; code?: number | string }
+        error.status = response.status
+        const code = getApiErrorCode(data)
+        if (code !== undefined) error.code = code
+        throw error
+      }
+
+      const errorCode = readRecordValue(data, 'errorCode')
+      if (errorCode && errorCode !== 0) {
+        const error = new Error(`OCR 失败：${data.errorMsg || '未知错误'}`) as Error & { code?: number | string }
+        error.code = errorCode as number | string
+        throw error
+      }
+
+      const snakeErrorCode = readRecordValue(data, 'error_code')
+      if (snakeErrorCode && snakeErrorCode !== 0) {
+        const error = new Error(`OCR 失败：${data.error_msg || '未知错误'}`) as Error & { code?: number | string }
+        error.code = snakeErrorCode as number | string
+        throw error
+      }
+
+      const resultPayload = readRecordValue(data, 'result')
+      if (!resultPayload) {
+        throw new Error('OCR 失败：接口没有返回识别结果')
+      }
+
+      const layoutResults = asUnknownArray(readRecordValue(resultPayload, 'layoutParsingResults'))
+      const firstPage = layoutResults[0] || {}
+      return normalizePageResult(firstPage)
+    } catch (error) {
+      if (isOcrAbortError(error)) throw error
+      if (!isPaddleOcrTokenFailure(error)) throw error
+      markPaddleOcrTokenFailure(lease, error)
+      excludedTokenIds.add(lease.id)
+    }
+  }
+}
+
+export function mapClockwiseOcrResultToSourcePage(
+  result: OcrRecognizeResult,
+  sourceWidth: number,
+  sourceHeight: number,
+): OcrRecognizeResult {
+  const record = result as OcrResultPayload
+  const processing = isJsonRecord(record.guji_processing) ? record.guji_processing : {}
+  const mapped: OcrResultPayload = {
+    ...record,
+    page_width: sourceWidth,
+    page_height: sourceHeight,
+    source_image_width: sourceWidth,
+    source_image_height: sourceHeight,
+    layout_result: Array.isArray(record.layout_result)
+      ? record.layout_result.map((block) => rotateClockwiseLayoutBlockCoordinatesToSource(block, sourceWidth))
+      : record.layout_result,
+    words_result: Array.isArray(record.words_result)
+      ? record.words_result.map((word) => rotateClockwiseWordCoordinatesToSource(word, sourceWidth))
+      : record.words_result,
+    guji_processing: {
+      ...processing,
+      manual_image_rotation: 'clockwise_90',
+      ocr_coordinate_rotation_corrected: 'clockwise_to_source',
     },
-    body: JSON.stringify(payload),
-    signal: options.signal,
-  }, getOcrUploadTimeoutMs(), 'OCR 上传超时，请在设置中调大“上传超时”，或降低上传最长边/JPEG 质量后重试。')
-
-  if (!response.ok) {
-    const error = new Error(`OCR 接口请求失败，状态码 ${response.status}`) as Error & { status?: number }
-    error.status = response.status
-    throw error
   }
-
-  const data = await response.json() as JsonRecord
-
-  const errorCode = readRecordValue(data, 'errorCode')
-  if (errorCode && errorCode !== 0) {
-    const error = new Error(`OCR 失败：${data.errorMsg || '未知错误'}`) as Error & { code?: number | string }
-    error.code = errorCode as number | string
-    throw error
-  }
-
-  const snakeErrorCode = readRecordValue(data, 'error_code')
-  if (snakeErrorCode && snakeErrorCode !== 0) {
-    const error = new Error(`OCR 失败：${data.error_msg || '未知错误'}`) as Error & { code?: number | string }
-    error.code = snakeErrorCode as number | string
-    throw error
-  }
-
-  const resultPayload = readRecordValue(data, 'result')
-  if (!resultPayload) {
-    throw new Error('OCR 失败：接口没有返回识别结果')
-  }
-
-  const layoutResults = asUnknownArray(readRecordValue(resultPayload, 'layoutParsingResults'))
-  const firstPage = layoutResults[0] || {}
-  return normalizePageResult(firstPage)
+  // The IR was built against the temporary rotated image. Removing it forces
+  // the storage normalizer to rebuild IR coordinates from the mapped blocks.
+  delete mapped.gujismart_ir
+  delete mapped.ir_text
+  return mapped
 }
 
 export async function recognizeImage(base64Image: string, options: SyncRecognitionOptions = {}): Promise<OcrResultPayload> {
@@ -4079,6 +4124,11 @@ interface AsyncPdfSubmitOptions {
   optionalPayload?: JsonRecord
 }
 
+interface AsyncPdfJobSubmission {
+  jobId: string
+  lease: PaddleOcrTokenLease
+}
+
 function getAsyncPdfOptionalPayload(_options?: PageOcrOptions, model?: AsyncOcrModel): JsonRecord | undefined {
   if (model && !/^PaddleOCR-VL(?:-|$)/i.test(model) && !/^PP-Structure/i.test(model)) {
     return undefined
@@ -4098,9 +4148,9 @@ function getAsyncPdfOptionalPayload(_options?: PageOcrOptions, model?: AsyncOcrM
   }
 }
 
-function getAsyncAuthHeaders(): Record<string, string> {
+function getAsyncAuthHeaders(token: string): Record<string, string> {
   return {
-    Authorization: `Bearer ${getToken()}`,
+    Authorization: `Bearer ${token}`,
   }
 }
 
@@ -4386,12 +4436,19 @@ async function createPdfChunkPlan(
   const stats = await stat(filePath)
   throwIfAborted(signal)
   const fallbackTotalPages = getFallbackPdfPageCount(targetPageNums, fallbackPageCount)
+  const hasKnownFallbackPageCount = Number.isFinite(Number(fallbackPageCount))
+    && Math.floor(Number(fallbackPageCount)) > 0
   if (
     !forceChunking
+    && hasKnownFallbackPageCount
     && canAttemptWholePdfUpload(stats.size, fallbackTotalPages)
+    && fallbackTotalPages <= ASYNC_PDF_MAX_PAGES_PER_JOB
   ) {
     const targetPageIndexes = normalizeTargetPageIndexes(fallbackTotalPages, targetPageNums)
-    const directPageRangeChunkSize = requireFullFileUpload ? 0 : normalizeAsyncPdfPageRangeChunkSize(pageRangeChunkSize, targetPageIndexes.length)
+    const requestedPageRangeChunkSize = normalizeAsyncPdfPageRangeChunkSize(pageRangeChunkSize, targetPageIndexes.length)
+    const directPageRangeChunkSize = requireFullFileUpload
+      ? 0
+      : requestedPageRangeChunkSize || Math.min(ASYNC_PDF_MAX_PAGES_PER_JOB, targetPageIndexes.length)
     return {
       sourcePdf: null,
       sourcePath: filePath,
@@ -4488,8 +4545,12 @@ async function createPdfChunkPlan(
   if (
     !forceChunking
     && canAttemptWholePdfUpload(stats.size, totalPages)
+    && totalPages <= ASYNC_PDF_MAX_PAGES_PER_JOB
   ) {
-    const directPageRangeChunkSize = requireFullFileUpload ? 0 : normalizeAsyncPdfPageRangeChunkSize(pageRangeChunkSize, targetPageIndexes.length)
+    const requestedPageRangeChunkSize = normalizeAsyncPdfPageRangeChunkSize(pageRangeChunkSize, targetPageIndexes.length)
+    const directPageRangeChunkSize = requireFullFileUpload
+      ? 0
+      : requestedPageRangeChunkSize || Math.min(ASYNC_PDF_MAX_PAGES_PER_JOB, targetPageIndexes.length)
     return {
       sourcePdf,
       sourcePath: filePath,
@@ -4682,6 +4743,10 @@ function createWholePdfFallbackChunk(plan: PdfChunkPlan, filePath: string, targe
   const sourcePageIndexes = plan.targetPageIndexes.slice(targetCursor)
   if (sourcePageIndexes.length <= 0) return null
 
+  if (plan.totalPages > ASYNC_PDF_MAX_PAGES_PER_JOB) {
+    throw new Error(`PDF has ${plan.totalPages} pages and cannot be uploaded as one PaddleOCR job after chunking failed: ${(error as Error)?.message || String(error)}`)
+  }
+
   const fallbackReason = String((error as Error)?.message || error || 'PDF 分片失败')
   console.warn('[OCR] PDF chunking failed; falling back to whole PDF upload', error)
   return {
@@ -4773,13 +4838,15 @@ async function submitAsyncPdfJob(
   signal?: AbortSignal,
   onQueueBusy?: (payload: { attempt: number; waitMs: number; errorMessage: string }) => void,
   submitOptions: AsyncPdfSubmitOptions = {},
-): Promise<string> {
+  excludedTokenIds: Set<string> = new Set(),
+): Promise<AsyncPdfJobSubmission> {
   return asyncSubmitLimit(async () => {
     let attempt = 0
     let lastError: Error | null = null
     throwIfAborted(signal)
     const fileBlob = await createPdfUploadBlob(filePath)
     let maxAttempts = MAX_RETRY_ATTEMPTS
+    let lease = acquirePaddleOcrToken(excludedTokenIds)
 
     while (attempt < maxAttempts) {
       throwIfAborted(signal)
@@ -4796,7 +4863,7 @@ async function submitAsyncPdfJob(
 
         const response = await fetchWithTimeout(ASYNC_OCR_ENDPOINT, {
           method: 'POST',
-          headers: getAsyncAuthHeaders(),
+          headers: getAsyncAuthHeaders(lease.token),
           body: formData,
           signal,
         }, getOcrUploadTimeoutMs(), 'PDF 上传超时，请在设置中调大“上传超时”，或稍后重试。')
@@ -4816,27 +4883,21 @@ async function submitAsyncPdfJob(
           error.code = apiErrorCode
           throw error
         }
-        if (false && !response.ok) {
-          const error = new Error(`异步 OCR 提交失败，状态码 ${response.status}`) as Error & { status?: number }
-          error.status = response.status
-          throw error
-        }
-
-        if (false && payload?.error_code && payload.error_code !== 0) {
-          const error = new Error(`异步 OCR 提交失败：${payload.error_msg || '未知错误'}`) as Error & { code?: number | string }
-          error.code = payload.error_code
-          throw error
-        }
-
         const jobId = payload?.data?.jobId || payload?.result?.jobId || payload?.jobId
         if (!jobId) {
           throw new Error('异步 OCR 提交失败：未返回 jobId')
         }
-        return jobId as string
+        return { jobId: jobId as string, lease }
       } catch (error) {
         if (isOcrAbortError(error)) throw error
         const failure = error as Error & { status?: number; code?: number | string }
         lastError = failure
+        if (isPaddleOcrTokenFailure(failure)) {
+          markPaddleOcrTokenFailure(lease, failure)
+          excludedTokenIds.add(lease.id)
+          lease = acquirePaddleOcrToken(excludedTokenIds)
+          continue
+        }
         attempt += 1
         const queueBusy = isAsyncOcrQueueBusyError(failure)
         if (queueBusy) {
@@ -4861,22 +4922,25 @@ async function submitAsyncPdfJob(
   })
 }
 
-async function queryAsyncPdfJob(jobId: string, signal?: AbortSignal): Promise<AsyncJobStatusPayload> {
+async function queryAsyncPdfJob(jobId: string, lease: PaddleOcrTokenLease, signal?: AbortSignal): Promise<AsyncJobStatusPayload> {
   return asyncPollLimit(async () => {
     throwIfAborted(signal)
     const response = await fetchWithTimeout(`${ASYNC_OCR_ENDPOINT}/${jobId}`, {
       method: 'GET',
-      headers: getAsyncAuthHeaders(),
+      headers: getAsyncAuthHeaders(lease.token),
       signal,
     }, ASYNC_STATUS_QUERY_TIMEOUT_MS, 'PDF OCR 状态查询超时，正在重新查询服务端处理进度。')
 
+    const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
-      const error = new Error(`异步 OCR 查询失败，状态码 ${response.status}`) as Error & { status?: number }
+      const detail = getApiErrorMessage(payload, '')
+      const error = new Error(`异步 OCR 查询失败，状态码 ${response.status}${detail ? `：${detail}` : ''}`) as Error & { status?: number; code?: number | string }
       error.status = response.status
+      const code = getApiErrorCode(payload)
+      if (code !== undefined) error.code = code
       throw error
     }
 
-    const payload = await response.json()
     if (payload?.error_code && payload.error_code !== 0) {
       const error = new Error(`异步 OCR 查询失败：${payload.error_msg || '未知错误'}`) as Error & { code?: number | string }
       error.code = payload.error_code
@@ -4887,7 +4951,7 @@ async function queryAsyncPdfJob(jobId: string, signal?: AbortSignal): Promise<As
   })
 }
 
-async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: AsyncJobStatusPayload) => void, signal?: AbortSignal): Promise<string> {
+async function waitForAsyncPdfResult(jobId: string, lease: PaddleOcrTokenLease, onProgress?: (payload: AsyncJobStatusPayload) => void, signal?: AbortSignal): Promise<string> {
   let allPagesCompletedAt = 0
   let lastProgressAt = Date.now()
   let lastProgressSignature = ''
@@ -4897,10 +4961,11 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
     pollCount += 1
     let statusPayload: AsyncJobStatusPayload
     try {
-      statusPayload = await queryAsyncPdfJob(jobId, signal)
+      statusPayload = await queryAsyncPdfJob(jobId, lease, signal)
     } catch (error) {
       if (isOcrAbortError(error)) throw error
       const failure = error as Error & { status?: number; code?: number | string }
+      if (isPaddleOcrTokenFailure(failure)) throw failure
       if (!isRetryableNetworkFailure(failure)) throw failure
       const waitingMs = Date.now() - lastProgressAt
       if (waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS) {
@@ -4972,7 +5037,10 @@ async function waitForAsyncPdfResult(jobId: string, onProgress?: (payload: Async
     }
 
     if (state === 'failed' || state === 'error') {
-      throw new Error(statusPayload.errorMsg || statusPayload.errorMessage || 'PaddleOCR 异步任务失败，但接口没有返回失败原因。请稍后重试，或在设置中切换 OCR 模型后再试。')
+      const error = new Error(statusPayload.errorMsg || statusPayload.errorMessage || 'PaddleOCR 异步任务失败，但接口没有返回失败原因。请稍后重试，或在设置中切换 OCR 模型后再试。') as Error & { code?: number | string }
+      const code = getApiErrorCode(statusPayload)
+      if (code !== undefined) error.code = code
+      throw error
     }
 
     await sleep(getAsyncPollDelayMs({
@@ -5186,7 +5254,12 @@ async function normalizeAsyncPdfChunkResults(pagePayloads: unknown[], chunk: Pdf
   if (chunk.fallbackWholePdf && chunk.sourcePageIndexes.length === 0) {
     return normalizedPageResults
   }
-  const resultPageIndexes = chunk.resultPageIndexes || chunk.sourcePageIndexes
+  // Some Paddle deployments ignore pageRanges and return the whole uploaded
+  // PDF. Detect that wider result instead of assigning its first pages to the
+  // requested sparse page indexes.
+  const resultPageIndexes = chunk.fullFileUpload && normalizedPageResults.length > chunk.sourcePageIndexes.length
+    ? normalizedPageResults.map((_, index) => index)
+    : chunk.resultPageIndexes || chunk.sourcePageIndexes
   const resultsByPageIndex = new Map<number, OcrResultPayload>()
   resultPageIndexes.forEach((pageIndex, index) => {
     const result = normalizedPageResults[index]
@@ -5318,44 +5391,67 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
         uploadPageCount: chunk.uploadPageCount,
         progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
       })
-      const jobId = await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
-        onProgress?.({
-          status: 'queued',
-          state: 'queued',
-          errorMessage: queuePayload.errorMessage,
-          chunkIndex: chunkIndex + 1,
-          totalChunks,
-          chunkStartPage,
-          chunkEndPage,
-          completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
-          totalPages,
-          fallbackWholePdf: chunk.fallbackWholePdf,
-          fallbackReason: chunk.fallbackReason,
-          fullFileUpload: chunk.fullFileUpload,
-          uploadPageCount: chunk.uploadPageCount,
-          progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
-        })
-      }, { pageRanges: chunk.pageRanges, optionalPayload })
-      const jsonUrl = await waitForAsyncPdfResult(jobId, (payload) => {
-        const chunkCompleted = getChunkCompletedPages(chunk, payload)
-        const chunkTotal = getTotalPages(payload, chunk.uploadPageCount || chunk.pageCount)
-        completedByChunk[chunkIndex] = Math.max(completedByChunk[chunkIndex] || 0, chunkCompleted)
-        const completedPages = Math.min(getCompletedPagesAcrossChunks(), totalPages)
-        onProgress?.({
-          ...payload,
-          chunkIndex: chunkIndex + 1,
-          totalChunks,
-          chunkStartPage,
-          chunkEndPage,
-          completedPages,
-          totalPages,
-          fallbackWholePdf: chunk.fallbackWholePdf,
-          fallbackReason: chunk.fallbackReason,
-          fullFileUpload: chunk.fullFileUpload,
-          uploadPageCount: chunk.uploadPageCount,
-          progress: chunkTotal > 0 ? completedPages / Math.max(1, totalPages) : payload.progress,
-        })
-      }, signal)
+      const excludedTokenIds = new Set<string>()
+      let jsonUrl = ''
+      while (!jsonUrl) {
+        const submission = await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
+          onProgress?.({
+            status: 'queued',
+            state: 'queued',
+            errorMessage: queuePayload.errorMessage,
+            chunkIndex: chunkIndex + 1,
+            totalChunks,
+            chunkStartPage,
+            chunkEndPage,
+            completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+            totalPages,
+            fallbackWholePdf: chunk.fallbackWholePdf,
+            fallbackReason: chunk.fallbackReason,
+            fullFileUpload: chunk.fullFileUpload,
+            uploadPageCount: chunk.uploadPageCount,
+            progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+          })
+        }, { pageRanges: chunk.pageRanges, optionalPayload }, excludedTokenIds)
+        try {
+          jsonUrl = await waitForAsyncPdfResult(submission.jobId, submission.lease, (payload) => {
+            const chunkCompleted = getChunkCompletedPages(chunk, payload)
+            const chunkTotal = getTotalPages(payload, chunk.uploadPageCount || chunk.pageCount)
+            completedByChunk[chunkIndex] = Math.max(completedByChunk[chunkIndex] || 0, chunkCompleted)
+            const completedPages = Math.min(getCompletedPagesAcrossChunks(), totalPages)
+            onProgress?.({
+              ...payload,
+              chunkIndex: chunkIndex + 1,
+              totalChunks,
+              chunkStartPage,
+              chunkEndPage,
+              completedPages,
+              totalPages,
+              fallbackWholePdf: chunk.fallbackWholePdf,
+              fallbackReason: chunk.fallbackReason,
+              fullFileUpload: chunk.fullFileUpload,
+              uploadPageCount: chunk.uploadPageCount,
+              progress: chunkTotal > 0 ? completedPages / Math.max(1, totalPages) : payload.progress,
+            })
+          }, signal)
+        } catch (error) {
+          if (!isPaddleOcrTokenFailure(error)) throw error
+          markPaddleOcrTokenFailure(submission.lease, error)
+          excludedTokenIds.add(submission.lease.id)
+          completedByChunk[chunkIndex] = 0
+          onProgress?.({
+            status: 'queued',
+            state: 'queued',
+            errorMessage: `${submission.lease.label} 额度已用完或 Token 无效，正在切换下一个 Token，只重试第 ${chunkStartPage}-${chunkEndPage} 页。`,
+            chunkIndex: chunkIndex + 1,
+            totalChunks,
+            chunkStartPage,
+            chunkEndPage,
+            completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+            totalPages,
+            progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+          })
+        }
+      }
       throwIfAborted(signal)
       const pagePayloads = await fetchAsyncPdfJsonLines(jsonUrl, model, signal)
       const normalizedChunkResults = await normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)

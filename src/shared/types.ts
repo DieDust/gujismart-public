@@ -538,6 +538,26 @@ export interface LocalPaddleOcrDownloadProgress {
   message?: string
   error?: string
 }
+
+export type PaddleOcrTokenRuntimeStatus = 'active' | 'ready' | 'quota_exhausted' | 'invalid'
+
+export interface PaddleOcrTokenPoolEntry {
+  id: string
+  label: string
+  last4: string
+  enabled: boolean
+  primary: boolean
+  status: PaddleOcrTokenRuntimeStatus
+  unavailableUntil?: string
+  lastError?: string
+}
+
+export interface PaddleOcrTokenPoolState {
+  entries: PaddleOcrTokenPoolEntry[]
+  activeTokenId: string | null
+  configuredCount: number
+  enabledCount: number
+}
 export type OcrProfile = 'general' | 'guji_print_vertical'
 export type OcrSecondPass = 'none' | 'local_segmentation' | 'cloud_column_ocr'
 export type SearchExportFormat = 'txt' | 'markdown' | 'csv' | 'json'
@@ -555,6 +575,8 @@ export type TypesetTemplate = '四库全书' | '四库全书彩色' | '红楼梦
 export interface PageOcrOptions {
   profile?: OcrProfile
   secondPass?: OcrSecondPass
+  /** Rotate the page image clockwise before OCR; coordinates are mapped back to the source page. */
+  imageRotation?: 0 | 90
 }
 
 export interface OcrRegionRerecognitionOptions {

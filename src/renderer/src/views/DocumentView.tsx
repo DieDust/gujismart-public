@@ -1408,8 +1408,8 @@ export default function DocumentView({
   const [readerSearchResultPage, setReaderSearchResultPage] = useState(1)
   const [readerViewportHeight, setReaderViewportHeight] = useState(typeof window !== 'undefined' ? window.innerHeight : 800)
   const [readerPageIndex, setReaderPageIndex] = useState(0)
-  const [documentMode, setDocumentMode] = useState<DocumentMode>('read')
-  const [proofViewMode, setProofViewMode] = useState<ProofViewMode>('text')
+  const [documentMode, setDocumentMode] = useState<DocumentMode>('proof')
+  const [proofViewMode, setProofViewMode] = useState<ProofViewMode>('facsimile')
   const [proofViewTouched, setProofViewTouched] = useState(false)
   const [facsimileTranslationOpen, setFacsimileTranslationOpen] = useState(false)
   const [preferFacsimileProofLayout, setPreferFacsimileProofLayout] = useState(true)
@@ -2539,8 +2539,8 @@ export default function DocumentView({
     const initialTargetPageIndex = resolveStableLocatorPageIndex([], stableLocator, locator, initialPageIndex)
     setCurrentPageIndex(initialTargetPageIndex)
     setReaderPageIndex(initialTargetPageIndex)
-    setDocumentMode('read')
-    setProofViewMode('text')
+    setDocumentMode('proof')
+    setProofViewMode('facsimile')
     setProofViewTouched(false)
     setFacsimileTranslationOpen(false)
     setLocalSearchKeyword(highlightExcerpt || searchKeyword)
@@ -2726,7 +2726,7 @@ export default function DocumentView({
       const latestReaderVirtualPages = readerVirtualPagesRef.current
       const latestSortedPages = sortedPagesRef.current
       const canRestoreDocumentMode = !documentModeTouchedRef.current
-      if (canRestoreDocumentMode && state.view_mode === 'single') setDocumentMode('read')
+      if (canRestoreDocumentMode && state.document_mode === 'read') setDocumentMode('read')
       const savedLocationKey = String(state.location_key || '')
       setInitialReaderLocationKey(savedLocationKey)
 
@@ -3118,8 +3118,8 @@ export default function DocumentView({
         },
       })
       if (result.cachedPageNums.includes(page.page_num)) return true
-      const latestDoc = await window.api.getDocument(doc.id).catch(() => null)
-      const latestPage = latestDoc?.pages?.find((item) => item.id === page.id || Number(item.page_num || 0) === page.page_num)
+      const latestPages = await window.api.getDocumentPagesRange(doc.id, page.page_num, page.page_num).catch(() => [])
+      const latestPage = latestPages.find((item) => item.id === page.id || Number(item.page_num || 0) === page.page_num)
       return result.ready && await isReadablePageImagePath(latestPage?.image_path || page.image_path)
     } finally {
       message.destroy(messageKey)
@@ -3587,7 +3587,7 @@ export default function DocumentView({
       if (count > 0) {
         message.success('OCR 识别成功')
       } else {
-        const latest = await window.api.getDocument(doc.id)
+        const latest = await window.api.getDocumentLight(doc.id)
         message.error(`OCR failed: ${latest?.error_message || 'Unknown error'}`)
       }
       if (currentPage?.id) {
@@ -3873,7 +3873,7 @@ export default function DocumentView({
     if (nextState && readerStateReady) saveReaderStateNow(nextState)
   }
 
-  const handleRerunCurrentPageOcr = async () => {
+  const handleRerunCurrentPageOcr = async (imageRotation: 0 | 90 = 0) => {
     if (!currentPage?.id) return
     const targetPageId = currentPage.id
     setOcrProcessing(true)
@@ -3885,6 +3885,7 @@ export default function DocumentView({
       await window.api.rerunPageOcr(targetPageId, {
         profile: shouldUseVerticalOcr ? 'guji_print_vertical' : 'general',
         secondPass: shouldUseVerticalOcr ? 'local_segmentation' : 'none',
+        imageRotation,
       })
       await refreshDocumentKeepPage(targetPageId)
       await loadCurrentPageOcrVersions(targetPageId)
@@ -3898,7 +3899,7 @@ export default function DocumentView({
         delete next[targetPageId]
         return next
       })
-      message.success('已重新识别本页 OCR')
+      message.success(imageRotation === 90 ? '已横向重新识别本页 OCR' : '已重新识别本页 OCR')
     } catch (error: unknown) {
       console.error(error)
       message.error(`OCR failed: ${getErrorMessage(error, 'Unknown error')}`)
@@ -4565,6 +4566,11 @@ export default function DocumentView({
       return
     }
 
+    if (key === 'rerun-ocr-landscape') {
+      void handleRerunCurrentPageOcr(90)
+      return
+    }
+
     if (key === 'rerun-vision-ocr') {
       void handleRerunCurrentPageVisionOcr()
       return
@@ -4671,6 +4677,7 @@ export default function DocumentView({
 
   const ocrActionItems: MenuProps['items'] = [
     { key: 'rerun-ocr', label: '用飞桨 OCR 重识别本页' },
+    { key: 'rerun-ocr-landscape', label: '横向 OCR 本页（顺时针旋转）' },
     { key: 'rerun-vision-ocr', label: '用视觉 OCR 重识别本页' },
     ...(shouldUseVerticalOcr || facsimileProofCandidate ? [{ key: 'enhance-guji', label: '增强本页竖排识别' }] : []),
     { key: 'rerun-layout', label: '重排本页版面' },
@@ -5751,7 +5758,7 @@ export default function DocumentView({
                 {currentPageProofStatus === 'completed' ? '取消本页校对完成' : '标记本页校对完成'}
               </Button>
               <Space.Compact size="small">
-                <Button size="small" icon={<ScanOutlined />} loading={ocrProcessing} onClick={handleRerunCurrentPageOcr} disabled={!currentPage?.id}>
+                <Button size="small" icon={<ScanOutlined />} loading={ocrProcessing} onClick={() => void handleRerunCurrentPageOcr()} disabled={!currentPage?.id}>
                   重新 OCR 本页
                 </Button>
                 <Dropdown menu={{ items: ocrActionItems, onClick: handleOcrActionMenuClick }} trigger={['click']} disabled={!currentPage?.id}>

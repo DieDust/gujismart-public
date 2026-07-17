@@ -28,6 +28,7 @@ import {
   recognizePdfAsync,
   recognizeTraditional,
   normalizePageResult,
+  mapClockwiseOcrResultToSourcePage,
   shouldUseAsyncPdfOcr,
 } from '../ocr'
 import { emitBackgroundTaskStatus } from '../background-tasks'
@@ -86,8 +87,9 @@ const AUTO_METADATA_TIMEOUT_MS = 120_000
 const AUTO_METADATA_QUEUE_TIMEOUT_MS = 30 * 60_000
 const AUTO_METADATA_START_DELAY_MS = 5_000
 const OCR_PAGE_INSERT_CHUNK_SIZE = 50
-const OCR_RESULT_SAVE_CHUNK_SIZE = 50
-const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = 50
+const OCR_RESULT_SAVE_CHUNK_SIZE = 8
+const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = 16
+const OCR_DOCUMENT_REPROCESS_CHUNK_SIZE = 8
 const OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE = 25
 const OCR_ASYNC_PDF_GUJI_LARGE_PAGE_RANGE_CHUNK_SIZE = 80
 const OCR_ASYNC_PDF_GUJI_LARGE_PAGE_THRESHOLD = 180
@@ -154,11 +156,22 @@ type PdfJsModule = {
   AnnotationMode?: { DISABLE?: number }
 }
 type CanvasLike = {
-  getContext: (context: '2d') => Record<string, unknown>
+  getContext: (context: '2d') => CanvasContextLike
   toBuffer: (mime: 'image/jpeg', quality?: number) => Buffer
+}
+type CanvasImageLike = { width: number; height: number }
+type CanvasContextLike = Record<string, unknown> & {
+  translate: (x: number, y: number) => void
+  rotate: (angle: number) => void
+  drawImage: (image: CanvasImageLike, x: number, y: number) => void
+  getImageData?: (sx: number, sy: number, sw: number, sh: number) => { data: Uint8ClampedArray | Uint8Array }
+  fillText?: (text: string, x: number, y: number, maxWidth?: number) => void
+  save?: () => void
+  restore?: () => void
 }
 type CanvasModule = {
   createCanvas: (width: number, height: number) => CanvasLike
+  loadImage: (source: string | Buffer) => Promise<CanvasImageLike>
 }
 
 const feijiangOcrReferenceCache = new Map<string, Promise<FeijiangOcrReference | null>>()
@@ -1767,12 +1780,13 @@ function resolveDocOcrOptions(docType?: string | null, overrides?: PageOcrOption
   return {
     profile: overrides?.profile || base.profile,
     secondPass: overrides?.secondPass || base.secondPass,
+    imageRotation: overrides?.imageRotation === 90 ? 90 : 0,
   }
 }
 
 function getVerticalFallbackOcrOptions(ocrOptions: Required<PageOcrOptions>): Required<PageOcrOptions> {
   if (ocrOptions.profile === 'guji_print_vertical') return ocrOptions
-  return { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
+  return { ...ocrOptions, profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
 }
 
 function getPageOcrResultRecord(page: Pick<OcrPageRow, 'ocr_result'>): JsonRecord | null {
@@ -2460,13 +2474,26 @@ async function recognizeSinglePageWithResolvedOptions(
   signal?: AbortSignal,
 ): Promise<OcrRecognizeResult> {
   throwIfOcrCanceled(signal)
-  const uploadImage = await prepareImageForOcrUpload(page.image_path)
-  throwIfOcrCanceled(signal)
-  const base64Image = uploadImage.buffer.toString('base64')
-  const initialResult = resolvedOptions.profile === 'guji_print_vertical'
-    ? await recognizeTraditional(base64Image, { signal })
-    : await recognizeImage(base64Image, { signal })
-  return postProcessRecognizedPageResult(initialResult, page.image_path, resolvedOptions, { signal, uploadImage })
+  const rotatedImagePath = resolvedOptions.imageRotation === 90
+    ? await writeTemporaryRotatedOcrImage(page)
+    : null
+  const recognitionImagePath = rotatedImagePath || page.image_path
+  try {
+    const uploadImage = await prepareImageForOcrUpload(recognitionImagePath)
+    throwIfOcrCanceled(signal)
+    const base64Image = uploadImage.buffer.toString('base64')
+    const initialResult = resolvedOptions.profile === 'guji_print_vertical'
+      ? await recognizeTraditional(base64Image, { signal })
+      : await recognizeImage(base64Image, { signal })
+    const processed = await postProcessRecognizedPageResult(initialResult, recognitionImagePath, resolvedOptions, { signal, uploadImage })
+    if (!rotatedImagePath) return processed
+    const sourceSize = getPageImageSize(page.image_path)
+    return sourceSize
+      ? mapClockwiseOcrResultToSourcePage(processed, sourceSize.width, sourceSize.height)
+      : processed
+  } finally {
+    if (rotatedImagePath) await rm(rotatedImagePath, { force: true }).catch(() => undefined)
+  }
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -2522,6 +2549,27 @@ async function writeTemporaryOcrCropImage(page: OcrPageWithImage, spec: PageImag
   if (!existsSync(storageDir)) mkdirSync(storageDir, { recursive: true })
   const pageNum = Math.max(1, Math.round(Number(page.page_num || 1)))
   const destPath = join(storageDir, `page_${pageNum}_${spec.id}_${nanoid(8)}.jpg`)
+  await writeFile(destPath, jpeg)
+  return destPath
+}
+
+async function writeTemporaryRotatedOcrImage(page: OcrPageWithImage): Promise<string> {
+  const canvasModule = await loadCanvas()
+  const source = await canvasModule.loadImage(page.image_path)
+  const sourceWidth = Math.max(1, Math.round(Number(source.width || 0)))
+  const sourceHeight = Math.max(1, Math.round(Number(source.height || 0)))
+  if (sourceWidth <= 1 || sourceHeight <= 1) throw new Error('无法读取当前页图，不能执行横向 OCR。')
+  const canvas = canvasModule.createCanvas(sourceHeight, sourceWidth)
+  const context = canvas.getContext('2d')
+  context.translate(sourceHeight, 0)
+  context.rotate(Math.PI / 2)
+  context.drawImage(source, 0, 0)
+  const jpeg = canvas.toBuffer('image/jpeg', 88)
+  if (jpeg.length <= 0) throw new Error('横向 OCR 页图旋转失败。')
+  const storageDir = join(getDataDir(), 'storage', page.doc_id, 'ocr-fallback')
+  if (!existsSync(storageDir)) mkdirSync(storageDir, { recursive: true })
+  const pageNum = Math.max(1, Math.round(Number(page.page_num || 1)))
+  const destPath = join(storageDir, `page_${pageNum}_clockwise_${nanoid(8)}.jpg`)
   await writeFile(destPath, jpeg)
   return destPath
 }
@@ -3151,7 +3199,7 @@ function getRiskyPageImageRetryOptions(
   docType?: string | null,
 ): Required<PageOcrOptions> | null {
   if (primaryOptions.profile === 'guji_print_vertical') return null
-  return { profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
+  return { ...primaryOptions, profile: 'guji_print_vertical', secondPass: 'local_segmentation' }
 }
 
 function getRiskyPageImageResultScore(result: OcrPageResultPayload, imagePath?: string | null): number {
@@ -3207,8 +3255,11 @@ function getRiskyPageImageHardIssue(
   imagePath: string | null | undefined,
   ocrOptions: Required<PageOcrOptions>,
 ): string | null {
+  // A table returned from an actual page-image OCR request can be legitimate
+  // (especially for sideways statistical tables). The async-PDF detector is
+  // only valid for PDF service results and previously rejected genuine tables
+  // during "rerun current page".
   return getRiskyPageImageNonTableHardIssue(result, imagePath, ocrOptions)
-    || getLikelyAsyncPdfTableMisclassification(result, imagePath, ocrOptions)
 }
 
 function getRiskyPageImageNonTableHardIssue(
@@ -3674,6 +3725,7 @@ function getGujiOcrOptionsForResult(result: OcrRecognizeResult): Required<PageOc
       : secondPass === 'none'
         ? 'none'
         : 'local_segmentation',
+    imageRotation: 0,
   }
 }
 
@@ -4316,17 +4368,23 @@ async function rerecognizeLowQualityPageRegions(
   }
 }
 
-function reprocessDocumentOcrStructure(docId: string): string[] {
-  const rows = hydratePagePayloadRows(queryAll<DocumentPage>(
+async function reprocessDocumentOcrStructure(docId: string): Promise<string[]> {
+  const rawRows = queryAll<DocumentPage>(
     `SELECT *
      FROM pages
      WHERE doc_id = ? AND ocr_status = 'completed'
      ORDER BY page_num`,
     [docId],
-  ))
-  const pagesWithResults = rows
-    .map((page) => ({ page, result: parseJsonRecord(page.ocr_result) }))
-    .filter((item): item is { page: DocumentPage; result: OcrResultRecord } => Boolean(item.result))
+  )
+  const pagesWithResults: Array<{ page: DocumentPage; result: OcrResultRecord }> = []
+  for (let index = 0; index < rawRows.length; index += OCR_DOCUMENT_REPROCESS_CHUNK_SIZE) {
+    const rows = hydratePagePayloadRows(rawRows.slice(index, index + OCR_DOCUMENT_REPROCESS_CHUNK_SIZE))
+    rows.forEach((page) => {
+      const result = parseJsonRecord(page.ocr_result)
+      if (result) pagesWithResults.push({ page, result })
+    })
+    if (index + OCR_DOCUMENT_REPROCESS_CHUNK_SIZE < rawRows.length) await yieldToEventLoop()
+  }
   if (pagesWithResults.length === 0) return []
 
   const generatedAt = new Date().toISOString()
@@ -4342,63 +4400,68 @@ function reprocessDocumentOcrStructure(docId: string): string[] {
   )
   const changedPageIds: string[] = []
 
-  transaction(() => {
-    pagesWithResults.forEach(({ page, result }, index) => {
-      const irPage = documentIr.pages[index]
-      if (!irPage) return
-      const sourceResult = structureResults[index] || result
-      const envelope = {
-        schemaVersion: OCR_IR_SCHEMA_VERSION,
-        generator: 'GujiSmart' as const,
-        pipelineVersion: OCR_IR_PIPELINE_VERSION,
-        generatedAt,
-        page: {
-          ...irPage,
-          pageIndex: Number(page.page_num || irPage.pageIndex || index + 1),
-        },
-      }
-      const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)
-      const preferredGujiText = isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText
-        ? rawFeijiangReferenceText
-        : getGujiOcrOptionsForResult(sourceResult)
-          ? getPreferredGujiServiceText(sourceResult)
-          : ''
-      const irText = deriveOcrTextFromIr(envelope)
-      const text = preferredGujiText || irText
-      const nextResultBase: OcrResultRecord = {
-        ...sourceResult,
-        text,
-        words_result: deriveOcrWordsResultFromIr(envelope),
-        gujismart_ir: envelope,
-        ir_text: irText,
-        normalization: {
-          ...(isJsonRecord(result.normalization) ? result.normalization : {}),
-          schema_version: OCR_IR_SCHEMA_VERSION,
-          pipeline_version: OCR_IR_PIPELINE_VERSION,
-          generated_at: generatedAt,
-          document_postprocessed: true,
-        },
-      }
-      const nextResult = preferredGujiText
-        ? isFeijiangReferenceRecoveredResult(result)
-          ? preserveRawGujiReferenceText(nextResultBase, preferredGujiText, { page, generatedAt })
-          : preservePreferredGujiServiceText(nextResultBase, preferredGujiText)
-        : nextResultBase
-      const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', JSON.stringify(nextResult))
-      const preparedText = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_text', text)
-      run(
-        'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ? WHERE id = ?',
-        [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, page.id],
-      )
-      run(
-        `UPDATE page_ocr_versions
-         SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, updated_at = ?
-         WHERE page_id = ? AND is_active = 1`,
-        [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, generatedAt, page.id],
-      )
-      changedPageIds.push(page.id)
+  for (let offset = 0; offset < pagesWithResults.length; offset += OCR_DOCUMENT_REPROCESS_CHUNK_SIZE) {
+    const batch = pagesWithResults.slice(offset, offset + OCR_DOCUMENT_REPROCESS_CHUNK_SIZE)
+    transaction(() => {
+      batch.forEach(({ page, result }, batchIndex) => {
+        const index = offset + batchIndex
+        const irPage = documentIr.pages[index]
+        if (!irPage) return
+        const sourceResult = structureResults[index] || result
+        const envelope = {
+          schemaVersion: OCR_IR_SCHEMA_VERSION,
+          generator: 'GujiSmart' as const,
+          pipelineVersion: OCR_IR_PIPELINE_VERSION,
+          generatedAt,
+          page: {
+            ...irPage,
+            pageIndex: Number(page.page_num || irPage.pageIndex || index + 1),
+          },
+        }
+        const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)
+        const preferredGujiText = isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText
+          ? rawFeijiangReferenceText
+          : getGujiOcrOptionsForResult(sourceResult)
+            ? getPreferredGujiServiceText(sourceResult)
+            : ''
+        const irText = deriveOcrTextFromIr(envelope)
+        const text = preferredGujiText || irText
+        const nextResultBase: OcrResultRecord = {
+          ...sourceResult,
+          text,
+          words_result: deriveOcrWordsResultFromIr(envelope),
+          gujismart_ir: envelope,
+          ir_text: irText,
+          normalization: {
+            ...(isJsonRecord(result.normalization) ? result.normalization : {}),
+            schema_version: OCR_IR_SCHEMA_VERSION,
+            pipeline_version: OCR_IR_PIPELINE_VERSION,
+            generated_at: generatedAt,
+            document_postprocessed: true,
+          },
+        }
+        const nextResult = preferredGujiText
+          ? isFeijiangReferenceRecoveredResult(result)
+            ? preserveRawGujiReferenceText(nextResultBase, preferredGujiText, { page, generatedAt })
+            : preservePreferredGujiServiceText(nextResultBase, preferredGujiText)
+          : nextResultBase
+        const preparedResult = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', JSON.stringify(nextResult))
+        const preparedText = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_text', text)
+        run(
+          'UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ? WHERE id = ?',
+          [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, page.id],
+        )
+        run(
+          `UPDATE page_ocr_versions
+           SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, updated_at = ?
+           WHERE page_id = ? AND is_active = 1`,
+          [preparedResult.value, preparedResult.ref, preparedText.value, preparedText.ref, generatedAt, page.id],
+        )
+        changedPageIds.push(page.id)
+      })
     })
-  })
+    if (offset + OCR_DOCUMENT_REPROCESS_CHUNK_SIZE < pagesWithResults.length) await yieldToEventLoop()
+  }
   return changedPageIds
 }
 
@@ -5595,23 +5658,9 @@ async function processDocumentOcr(
         pagesForOcr = getPagesNeedingOcr(pages, resumeThisAttempt)
         completedBefore = resumeThisAttempt ? getCompletedOcrPageCount(pages) : 0
       }
-      const missingAsyncPdfImagePage = findMissingReadablePageImage(pagesForOcr)
-      if (missingAsyncPdfImagePage) {
-        emitOcrStatus(event, {
-          docId,
-          status: 'processing',
-          phase: 'ocr',
-          progress: getDocProgress(getCompleted(), totalDocs, getCombinedDocFraction(0, pagesForOcr.length)),
-          completedPages: completedBefore,
-          totalPages: getDocTotalPages(),
-          pageNum: missingAsyncPdfImagePage.page_num || undefined,
-          message: `正在生成 OCR 页面图：${completedBefore}/${getDocTotalPages()} 页`,
-        })
-        const asyncPdfPageImagePages = await ensurePageImagesForOcrRoute(pagesForOcr, pdfPath, signal)
-        const asyncPdfPageImagesById = new Map(asyncPdfPageImagePages.map((page) => [page.id, page]))
-        pages = pages.map((page) => asyncPdfPageImagesById.get(page.id) || page)
-        pagesForOcr = pagesForOcr.map((page) => asyncPdfPageImagesById.get(page.id) || page)
-      }
+      // Do not render every page before asynchronous PDF OCR. Large documents
+      // can start uploading immediately; only suspicious/failed pages render a
+      // local image later through ensurePageImageForOcrFallback().
       let savedAsyncPageCount = completedBefore
       let lastAsyncDisplayedPageCount = completedBefore
       const asyncPdfOcrOptions = asyncPdfRouteRisk?.ocrOptions || ocrOptions
@@ -6022,7 +6071,7 @@ async function processDocumentOcr(
       )
     }
 
-    const reprocessedPageIds = reprocessDocumentOcrStructure(docId)
+    const reprocessedPageIds = await reprocessDocumentOcrStructure(docId)
     reprocessedPageIds.forEach((pageId) => deferredFinalizePageIds.add(pageId))
     if (reprocessedPageIds.length > 0) deferredDatabaseSaveNeeded = true
 
@@ -6432,7 +6481,7 @@ export function registerOcrIpc(): void {
   ipcMain.handle('documents:reprocessOcrStructure', async (_event, docId: string): Promise<number> => {
     const safeDocId = String(docId || '').trim()
     if (!safeDocId) return 0
-    const changedPageIds = reprocessDocumentOcrStructure(safeDocId)
+    const changedPageIds = await reprocessDocumentOcrStructure(safeDocId)
     if (changedPageIds.length > 0) {
       markDocumentTocDirty(safeDocId)
       markSearchIndexStaleForPages(changedPageIds)

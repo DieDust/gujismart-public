@@ -130,7 +130,8 @@ const HEALTH_REPORT_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_REFRESH_DEBOUNCE_MS = 600
 const SMART_COUNTS_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_BUSY_RETRY_DELAYS_MS = [800, 1600, 3200]
-const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 12_000
+const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 60_000
+const LIBRARY_LIST_BUSY_RETRY_DELAYS_MS = [500, 1200, 2400]
 
 type SmartViewCountKey =
   | 'all'
@@ -215,6 +216,16 @@ function applyLibraryStateCacheToTags(tags: TagItem[], cache?: LibraryStateCache
 function isTransientDatabaseBusyError(error: unknown): boolean {
   const message = getErrorMessage(error, '').toLowerCase()
   return /database is locked|database is busy|sqlite_busy|sqlite_locked|busy timeout/.test(message)
+}
+
+function isTransientLibraryLoadError(error: unknown): boolean {
+  const errorMessage = getErrorMessage(error, '').toLowerCase()
+  return isTransientDatabaseBusyError(error)
+    || /文献列表加载超时|request timed out|ipc.*timeout|temporarily unavailable/.test(errorMessage)
+}
+
+function waitForLibraryRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs))
 }
 
 function withLibraryRequestTimeout<T>(promise: Promise<T>, timeoutMs = LIBRARY_LIST_REQUEST_TIMEOUT_MS): Promise<T> {
@@ -2305,11 +2316,25 @@ export default function LibraryView({
     }
 
     try {
-      const page = await withLibraryRequestTimeout(window.api.listDocumentsPage(buildListOptions(activeFilter, {
+      const listOptions = buildListOptions(activeFilter, {
         limit,
         offset,
         search: options?.search,
-      })))
+      })
+      let page: Awaited<ReturnType<typeof window.api.listDocumentsPage>> | null = null
+      let lastError: unknown = null
+      for (let attempt = 0; attempt <= LIBRARY_LIST_BUSY_RETRY_DELAYS_MS.length; attempt += 1) {
+        try {
+          page = await withLibraryRequestTimeout(window.api.listDocumentsPage(listOptions))
+          break
+        } catch (error) {
+          lastError = error
+          if (!isTransientLibraryLoadError(error) || attempt >= LIBRARY_LIST_BUSY_RETRY_DELAYS_MS.length) throw error
+          await waitForLibraryRetry(LIBRARY_LIST_BUSY_RETRY_DELAYS_MS[attempt])
+          if (requestId !== listRequestSeqRef.current) return
+        }
+      }
+      if (!page) throw lastError || new Error('加载文献列表失败')
       if (requestId !== listRequestSeqRef.current) return
 
       const nextItems = applySmartFilterDocuments(page.items, activeFilter)
