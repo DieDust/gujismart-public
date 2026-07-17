@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from 'react'
-import { Form, Input, Select, Card, Button, Typography, message, Switch, Slider, InputNumber, Alert, Space, Tag, Popconfirm, List, AutoComplete, Modal, Tooltip, Progress } from 'antd'
+import { Form, Input, Select, Card, Button, Typography, message, Switch, Slider, InputNumber, Alert, Space, Tag, Popconfirm, List, AutoComplete, Modal, Tooltip, Progress, Segmented } from 'antd'
 import {
   BookOutlined,
   KeyOutlined,
@@ -26,6 +26,84 @@ import { getErrorMessage } from '@shared/errors'
 import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type McpSetupInfo, type OcrEngine, type PaddleOcrTokenPoolState, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
+
+/** AI 客户端：国内默认 Trae，可在设置页切换。 */
+type McpClientId = 'trae' | 'cursor' | 'claude' | 'codex' | 'other'
+
+const MCP_CLIENT_OPTIONS: Array<{
+  id: McpClientId
+  label: string
+  hint: string
+  steps: string[]
+  /** 主按钮：复制 JSON / Codex 一键写入 */
+  mode: 'json' | 'codex'
+}> = [
+  {
+    id: 'trae',
+    label: 'Trae',
+    hint: '国内常用 · 粘贴 JSON 到 MCP 设置',
+    mode: 'json',
+    steps: [
+      '打开上面的「允许 AI 工具访问文献库」。',
+      '点「复制 MCP 配置 JSON」。',
+      '打开 Trae → 设置 → MCP，添加或编辑服务器，把 JSON 粘贴进去（名称 gujismart，类型 STDIO）。',
+      '保存后重启 Trae（或按软件提示刷新 MCP），再在对话里问文献库问题。',
+    ],
+  },
+  {
+    id: 'cursor',
+    label: 'Cursor',
+    hint: '粘贴 JSON 到 MCP Servers',
+    mode: 'json',
+    steps: [
+      '打开上面的「允许 AI 工具访问文献库」。',
+      '点「复制 MCP 配置 JSON」。',
+      '打开 Cursor → Settings → MCP → Add new MCP server / 编辑配置文件，粘贴 JSON。',
+      '保存后重启 Cursor 或刷新 MCP，再在对话里使用。',
+    ],
+  },
+  {
+    id: 'claude',
+    label: 'Claude',
+    hint: 'Claude 桌面版 · JSON',
+    mode: 'json',
+    steps: [
+      '打开上面的「允许 AI 工具访问文献库」。',
+      '点「复制 MCP 配置 JSON」。',
+      '打开 Claude 桌面版的 MCP / 本地工具配置，粘贴 JSON（与 Cursor 同结构）。',
+      '保存并重启 Claude 桌面版后再试。',
+    ],
+  },
+  {
+    id: 'codex',
+    label: 'Codex',
+    hint: '一键写入配置或对照表单',
+    mode: 'codex',
+    steps: [
+      '打开上面的「允许 AI 工具访问文献库」。',
+      '点「一键写入 Codex 配置」（推荐），或按下方对照表手填。',
+      '完全退出并重新打开 Codex。',
+      '若只能用「连接至自定义 MCP」表单：类型选 STDIO，按对照表逐项粘贴。',
+    ],
+  },
+  {
+    id: 'other',
+    label: '其他',
+    hint: '通用 STDIO / JSON',
+    mode: 'json',
+    steps: [
+      '打开上面的「允许 AI 工具访问文献库」。',
+      '点「复制 MCP 配置 JSON」。',
+      '在你的 AI 客户端里添加 STDIO 类型 MCP 服务器，粘贴 JSON；或按 command / args 手填。',
+      '保存并重启客户端后再试。网页版、不支持 MCP 的 AI 无法使用。',
+    ],
+  },
+]
+
+const MCP_CLIENT_SEGMENTED_OPTIONS = MCP_CLIENT_OPTIONS.map((item) => ({
+  label: item.label,
+  value: item.id,
+}))
 
 type SettingsSectionKey =
   | 'automation'
@@ -457,6 +535,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [paddleOcrTokenBusy, setPaddleOcrTokenBusy] = useState(false)
   const [mcpSetup, setMcpSetup] = useState<McpSetupInfo | null>(null)
   const [mcpBusy, setMcpBusy] = useState(false)
+  /** 默认 Trae（国内较常用），可切换 Cursor / Claude / Codex 等 */
+  const [mcpClientId, setMcpClientId] = useState<McpClientId>('trae')
   const [llmModelOptions, setLlmModelOptions] = useState<string[]>([])
   const [visionModelOptions, setVisionModelOptions] = useState<string[]>([])
   const [llmModelsLoading, setLlmModelsLoading] = useState(false)
@@ -753,11 +833,12 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     return setup
   }, [mcpSetup])
 
-  const handleCopyMcpConfig = useCallback(async () => {
+  const handleCopyMcpConfig = useCallback(async (clientLabel?: string) => {
     try {
       const setup = await ensureMcpSetupEnabled()
       await navigator.clipboard.writeText(setup.configs.cursorJson)
-      message.success('JSON 配置已复制（适合 Cursor / Claude / Trae）。')
+      const name = clientLabel || '当前客户端'
+      message.success(`JSON 配置已复制，可粘贴到 ${name} 的 MCP 设置。`)
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '复制失败，请手动全选下方文本复制'))
     }
@@ -796,7 +877,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     try {
       const next = await window.api.rotateMcpAgentToken()
       setMcpSetup(next)
-      message.success('已换新连接令牌。请重新点「一键写入 Codex」或复制配置。')
+      message.success('已换新连接令牌。请在下方重新复制配置或写入客户端。')
     } catch (error: unknown) {
       message.error(getErrorMessage(error, '更换令牌失败'))
     } finally {
@@ -3373,7 +3454,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             showIcon
             style={{ marginBottom: 12 }}
             message="给不会敲命令的人用"
-            description="Codex 不能凭空“自己发现”本机软件（安全限制），但可以一键写入它的配置文件，或复制对照表填表单。AI 只能只读检索，不能删除、改设置或读密钥。"
+            description="先打开下方开关，再选择你用的 AI 客户端（Trae / Cursor / Claude / Codex 等），按该客户端的说明复制配置即可。AI 只能只读检索文献库，不能删除、改设置或读密钥。"
           />
           <Card size="small" title="允许 AI 访问本机文献库" loading={mcpBusy && !mcpSetup}>
             <Space direction="vertical" size={12} style={{ width: '100%' }}>
@@ -3382,7 +3463,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   <Text strong>允许 AI 工具访问文献库</Text>
                   <br />
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    关闭后，AI 客户端即使带着旧配置也无法连接。
+                    关闭后，任何 AI 客户端即使带着旧配置也无法连接。
                   </Text>
                 </div>
                 <Switch
@@ -3393,156 +3474,208 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   onChange={(checked) => void handleMcpEnabledChange(checked)}
                 />
               </div>
-              <Space wrap>
-                <Button type="primary" loading={mcpBusy} onClick={() => void handleWriteCodexConfig()}>
-                  一键写入 Codex 配置（推荐）
-                </Button>
-                <Button icon={<CopyOutlined />} loading={mcpBusy} onClick={() => void handleCopyCodexForm()}>
-                  复制 Codex 表单填写说明
-                </Button>
-                <Button icon={<CopyOutlined />} loading={mcpBusy} onClick={() => void handleCopyMcpConfig()}>
-                  复制 JSON（Cursor / Claude / Trae）
-                </Button>
-                <Button loading={mcpBusy} onClick={() => void handleRotateMcpToken()}>
-                  更换连接令牌
-                </Button>
-              </Space>
-              {mcpSetup ? (
-                <>
-                  <Alert
-                    type="success"
-                    showIcon
-                    message="用 Codex 时怎么连（最简单）"
-                    description={(
-                      <ol style={{ margin: '8px 0 0', paddingLeft: 18 }}>
-                        <li>打开上面的开关。</li>
-                        <li>点「一键写入 Codex 配置」。</li>
-                        <li><strong>完全退出并重新打开 Codex</strong>。</li>
-                        <li>若必须手填「连接至自定义 MCP」表单，请看下方对照表：左边是 Codex 表单项，右边是填什么。</li>
-                      </ol>
-                    )}
-                  />
 
-                  <Card
-                    size="small"
-                    type="inner"
-                    title="Codex 手动表单对照（哪一行填什么）"
-                    extra={(
-                      <Button size="small" type="link" icon={<CopyOutlined />} onClick={() => void handleCopyCodexForm()}>
-                        复制整表说明
-                      </Button>
-                    )}
-                  >
-                    <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-                      打开 Codex → 连接至自定义 MCP。下面每一行对应表单里的一项；点右侧「复制」可只复制该值。
-                    </Text>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                      {([
-                        { label: '名称', value: mcpSetup.codexForm?.name || 'gujismart', hint: '固定填这个即可' },
-                        { label: '类型', value: 'STDIO', hint: '点选 STDIO，不要选「流式 HTTP」' },
-                        { label: '启动命令', value: mcpSetup.command, hint: '整段粘贴到「启动命令」输入框' },
-                        {
-                          label: '工作目录',
-                          value: mcpSetup.cwd || mcpSetup.codexForm?.cwd || '（留空）',
-                          hint: mcpSetup.cwd ? '有值就整段粘贴' : '没有就留空，不要乱填',
-                        },
-                        { label: '环境变量', value: '（留空）', hint: '一般不用填；不要点添加' },
-                        { label: '环境变量传递', value: '（留空）', hint: '一般不用填' },
-                      ] as Array<{ label: string; value: string; hint: string }>).map((row) => (
-                        <div
-                          key={row.label}
-                          style={{
-                            display: 'grid',
-                            gridTemplateColumns: '110px 1fr auto',
-                            gap: 8,
-                            alignItems: 'start',
-                            padding: '8px 10px',
-                            borderRadius: 8,
-                            background: 'var(--gs-bg-elevated, rgba(0,0,0,0.04))',
-                          }}
-                        >
-                          <div>
-                            <Text strong>{row.label}</Text>
-                            <br />
-                            <Text type="secondary" style={{ fontSize: 11 }}>{row.hint}</Text>
-                          </div>
-                          <Text code style={{ wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>{row.value}</Text>
-                          <Button
-                            size="small"
-                            icon={<CopyOutlined />}
-                            disabled={row.value.startsWith('（')}
-                            onClick={() => void copyMcpField(row.label, row.value)}
-                          >
-                            复制
+              <div>
+                <Text strong style={{ display: 'block', marginBottom: 8 }}>你用的是哪家 AI 客户端？</Text>
+                <Segmented
+                  block
+                  value={mcpClientId}
+                  options={MCP_CLIENT_SEGMENTED_OPTIONS}
+                  onChange={(value) => setMcpClientId(value as McpClientId)}
+                />
+                <Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+                  {MCP_CLIENT_OPTIONS.find((item) => item.id === mcpClientId)?.hint || ''}
+                  {' · '}国内常用可先选 Trae；换客户端时在此切换即可。
+                </Text>
+              </div>
+
+              {(() => {
+                const client = MCP_CLIENT_OPTIONS.find((item) => item.id === mcpClientId) || MCP_CLIENT_OPTIONS[0]
+                const isCodex = client.mode === 'codex'
+                return (
+                  <>
+                    <Space wrap>
+                      {isCodex ? (
+                        <>
+                          <Button type="primary" loading={mcpBusy} onClick={() => void handleWriteCodexConfig()}>
+                            一键写入 Codex 配置（推荐）
                           </Button>
-                        </div>
-                      ))}
-                    </div>
+                          <Button icon={<CopyOutlined />} loading={mcpBusy} onClick={() => void handleCopyCodexForm()}>
+                            复制 Codex 表单填写说明
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          type="primary"
+                          icon={<CopyOutlined />}
+                          loading={mcpBusy}
+                          onClick={() => void handleCopyMcpConfig(client.label)}
+                        >
+                          复制 MCP 配置 JSON（{client.label}）
+                        </Button>
+                      )}
+                      <Button loading={mcpBusy} onClick={() => void handleRotateMcpToken()}>
+                        更换连接令牌
+                      </Button>
+                    </Space>
 
-                    <div style={{ marginTop: 14 }}>
-                      <Text strong>参数（对应表单里「参数」+「添加参数」）</Text>
-                      <br />
-                      <Text type="secondary" style={{ fontSize: 12 }}>
-                        有几行就点几次「+ 添加参数」，每行框里只贴下面的一项（不要把多行粘成一坨）。
-                      </Text>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
-                        {(mcpSetup.args || []).map((arg, index) => (
-                          <div
-                            key={`${index}-${arg}`}
-                            style={{
-                              display: 'grid',
-                              gridTemplateColumns: '110px 1fr auto',
-                              gap: 8,
-                              alignItems: 'start',
-                              padding: '8px 10px',
-                              borderRadius: 8,
-                              background: 'var(--gs-bg-elevated, rgba(0,0,0,0.04))',
-                            }}
+                    {mcpSetup ? (
+                      <>
+                        <Alert
+                          type="success"
+                          showIcon
+                          message={`连接 ${client.label}（按步骤做）`}
+                          description={(
+                            <ol style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+                              {client.steps.map((step) => (
+                                <li key={step}>{step}</li>
+                              ))}
+                            </ol>
+                          )}
+                        />
+
+                        {isCodex ? (
+                          <Card
+                            size="small"
+                            type="inner"
+                            title="Codex 手动表单对照（哪一行填什么）"
+                            extra={(
+                              <Button size="small" type="link" icon={<CopyOutlined />} onClick={() => void handleCopyCodexForm()}>
+                                复制整表说明
+                              </Button>
+                            )}
                           >
-                            <Text strong>参数 {index + 1}</Text>
-                            <Text code style={{ wordBreak: 'break-all' }}>{arg}</Text>
-                            <Button size="small" icon={<CopyOutlined />} onClick={() => void copyMcpField(`参数 ${index + 1}`, arg)}>
-                              复制
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                            <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                              打开 Codex → 连接至自定义 MCP。下面每一行对应表单里的一项；点右侧「复制」可只复制该值。类型请选 <Text strong>STDIO</Text>。
+                            </Text>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                              {([
+                                { label: '名称', value: mcpSetup.codexForm?.name || 'gujismart', hint: '固定填这个即可' },
+                                { label: '类型', value: 'STDIO', hint: '点选 STDIO，不要选「流式 HTTP」' },
+                                { label: '启动命令', value: mcpSetup.command, hint: '整段粘贴到「启动命令」输入框' },
+                                {
+                                  label: '工作目录',
+                                  value: mcpSetup.cwd || mcpSetup.codexForm?.cwd || '（留空）',
+                                  hint: mcpSetup.cwd ? '有值就整段粘贴' : '没有就留空，不要乱填',
+                                },
+                                { label: '环境变量', value: '（留空）', hint: '一般不用填；不要点添加' },
+                                { label: '环境变量传递', value: '（留空）', hint: '一般不用填' },
+                              ] as Array<{ label: string; value: string; hint: string }>).map((row) => (
+                                <div
+                                  key={row.label}
+                                  style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: '110px 1fr auto',
+                                    gap: 8,
+                                    alignItems: 'start',
+                                    padding: '8px 10px',
+                                    borderRadius: 8,
+                                    background: 'var(--gs-bg-elevated, rgba(0,0,0,0.04))',
+                                  }}
+                                >
+                                  <div>
+                                    <Text strong>{row.label}</Text>
+                                    <br />
+                                    <Text type="secondary" style={{ fontSize: 11 }}>{row.hint}</Text>
+                                  </div>
+                                  <Text code style={{ wordBreak: 'break-all', whiteSpace: 'pre-wrap' }}>{row.value}</Text>
+                                  <Button
+                                    size="small"
+                                    icon={<CopyOutlined />}
+                                    disabled={row.value.startsWith('（')}
+                                    onClick={() => void copyMcpField(row.label, row.value)}
+                                  >
+                                    复制
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
 
-                    <div style={{ marginTop: 12 }}>
-                      <Text type="secondary">整表说明文本（与上面相同，方便一次复制）</Text>
-                      <Input.TextArea
-                        value={mcpSetup.configs.codexFormText}
-                        readOnly
-                        autoSize={{ minRows: 6, maxRows: 12 }}
-                        style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12, marginTop: 6 }}
-                      />
-                    </div>
-                  </Card>
+                            <div style={{ marginTop: 14 }}>
+                              <Text strong>参数（对应表单里「参数」+「添加参数」）</Text>
+                              <br />
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                有几行就点几次「+ 添加参数」，每行框里只贴下面的一项（不要把多行粘成一坨）。
+                              </Text>
+                              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                                {(mcpSetup.args || []).map((arg, index) => (
+                                  <div
+                                    key={`${index}-${arg}`}
+                                    style={{
+                                      display: 'grid',
+                                      gridTemplateColumns: '110px 1fr auto',
+                                      gap: 8,
+                                      alignItems: 'start',
+                                      padding: '8px 10px',
+                                      borderRadius: 8,
+                                      background: 'var(--gs-bg-elevated, rgba(0,0,0,0.04))',
+                                    }}
+                                  >
+                                    <Text strong>参数 {index + 1}</Text>
+                                    <Text code style={{ wordBreak: 'break-all' }}>{arg}</Text>
+                                    <Button size="small" icon={<CopyOutlined />} onClick={() => void copyMcpField(`参数 ${index + 1}`, arg)}>
+                                      复制
+                                    </Button>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
 
-                  <div>
-                    <Text type="secondary">连接令牌摘要（已含在参数 --mcp-token 里，一般不用单独填）</Text>
-                    <br />
-                    <Text code>{mcpSetup.tokenPreview}</Text>
-                  </div>
-                  <div>
-                    <Text type="secondary">数据目录（已含在参数 --data-dir 里）</Text>
-                    <br />
-                    <Text code style={{ wordBreak: 'break-all' }}>{mcpSetup.dataDir}</Text>
-                  </div>
-                  <div>
-                    <Text type="secondary">JSON 配置预览（Cursor / Claude / Trae，不是 Codex 表单）</Text>
-                    <Input.TextArea
-                      value={mcpSetup.configs.cursorJson}
-                      readOnly
-                      autoSize={{ minRows: 6, maxRows: 12 }}
-                      style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12, marginTop: 6 }}
-                    />
-                  </div>
-                </>
-              ) : (
-                <Text type="secondary">正在读取连接信息…</Text>
-              )}
+                            <div style={{ marginTop: 12 }}>
+                              <Text type="secondary">整表说明文本（与上面相同，方便一次复制）</Text>
+                              <Input.TextArea
+                                value={mcpSetup.configs.codexFormText}
+                                readOnly
+                                autoSize={{ minRows: 6, maxRows: 12 }}
+                                style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12, marginTop: 6 }}
+                              />
+                            </div>
+                          </Card>
+                        ) : (
+                          <Card
+                            size="small"
+                            type="inner"
+                            title={`${client.label} · MCP 配置 JSON`}
+                            extra={(
+                              <Button
+                                size="small"
+                                type="link"
+                                icon={<CopyOutlined />}
+                                onClick={() => void handleCopyMcpConfig(client.label)}
+                              >
+                                复制 JSON
+                              </Button>
+                            )}
+                          >
+                            <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+                              粘贴到 {client.label} 的 MCP 设置。类型为 <Text strong>STDIO</Text>；路径与令牌已写在 JSON 里，不必自己找盘符。
+                            </Text>
+                            <Input.TextArea
+                              value={mcpSetup.configs.cursorJson}
+                              readOnly
+                              autoSize={{ minRows: 8, maxRows: 14 }}
+                              style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12 }}
+                            />
+                          </Card>
+                        )}
+
+                        <div>
+                          <Text type="secondary">连接令牌摘要（已含在配置里，一般不用单独填）</Text>
+                          <br />
+                          <Text code>{mcpSetup.tokenPreview}</Text>
+                        </div>
+                        <div>
+                          <Text type="secondary">数据目录（已含在配置里）</Text>
+                          <br />
+                          <Text code style={{ wordBreak: 'break-all' }}>{mcpSetup.dataDir}</Text>
+                        </div>
+                      </>
+                    ) : (
+                      <Text type="secondary">正在读取连接信息…</Text>
+                    )}
+                  </>
+                )
+              })()}
             </Space>
           </Card>
         </section>

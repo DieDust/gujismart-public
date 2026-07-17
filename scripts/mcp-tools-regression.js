@@ -47,8 +47,8 @@ assert.ok(cli.includes('initDatabase') && cli.includes('runMcpStdioServer'), 'CL
 assert.ok(cli.includes('redirectConsoleToStderr') || cli.includes('stderr'), 'logs must not go to stdout')
 assert.ok(launcher.includes('esbuild') && launcher.includes('electron'), 'launcher should bundle and run under Electron')
 
-assert.ok(docs.includes('一键复制') || docs.includes('小白'), 'user docs should describe beginner one-click flow')
-assert.ok(docs.includes('library_search'), 'docs should list tools')
+assert.ok(docs.includes('小白') || docs.includes('AI 客户端'), 'user docs should describe beginner multi-client flow')
+assert.ok(docs.includes('Trae') && docs.includes('library_search'), 'docs should cover Trae and list tools')
 assert.strictEqual(packageJson.scripts.mcp, 'node scripts/gujismart-mcp.js', 'package.json mcp script')
 assert.ok(String(packageJson.scripts['check:mcp'] || '').includes('mcp-tools-regression'), 'check:mcp script')
 
@@ -57,8 +57,10 @@ assert.ok(connection.includes('assertMcpTokenAllowed'), 'MCP mode must validate 
 assert.ok(mainIndex.includes('mcpLaunch.isMcp') && mainIndex.includes('runMcpStdioServer'), 'main process must support --mcp headless mode')
 assert.ok(settingsIpc.includes("settings:mcp:getSetup") && settingsIpc.includes("settings:mcp:setEnabled"), 'settings IPC for MCP')
 assert.ok(preload.includes('getMcpSetupInfo') && preload.includes('setMcpAgentEnabled'), 'preload MCP APIs')
-assert.ok(settingsView.includes('AI 工具连接') && settingsView.includes('一键写入 Codex'), 'settings UI for beginners + Codex')
-assert.ok(settingsView.includes('handleCopyMcpConfig') && settingsView.includes('handleWriteCodexConfig'), 'settings UI can copy/write config')
+assert.ok(settingsView.includes('AI 工具连接') && settingsView.includes('mcpClientId'), 'settings UI for multi-client MCP setup')
+assert.ok(settingsView.includes("id: 'trae'") && settingsView.includes("id: 'codex'"), 'settings UI lists Trae and Codex among clients')
+assert.ok(settingsView.includes('Segmented') && settingsView.includes('handleCopyMcpConfig'), 'settings UI can switch clients and copy JSON')
+assert.ok(settingsView.includes('handleWriteCodexConfig') && settingsView.includes('一键写入 Codex'), 'Codex one-click write remains available')
 assert.ok(connection.includes('writeCodexMcpConfig') && connection.includes('.codex'), 'can write ~/.codex/config.toml')
 assert.ok(settingsIpc.includes('settings:mcp:writeCodexConfig'), 'settings IPC writeCodexConfig')
 assert.ok(preload.includes('writeCodexMcpConfig'), 'preload writeCodexMcpConfig')

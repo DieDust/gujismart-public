@@ -236,10 +236,10 @@ export function getMcpSetupInfo(): McpSetupInfo {
       codexToml,
       beginnerSteps: [
         '1. 打开「允许 AI 工具访问文献库」。',
-        '2. 若用 Codex：点「一键写入 Codex 配置」，然后重启 Codex。',
-        '3. 若 Codex 只有表单：点「复制 Codex 填写说明」，按名称/命令/参数逐项粘贴（类型选 STDIO）。',
-        '4. 若用 Cursor / Claude / Trae：点「一键复制 JSON 配置」粘贴到 MCP 设置。',
-        '5. 在 AI 里直接问文献库问题；不必自己找盘符，也不必开网页。',
+        '2. 在设置页选择你的 AI 客户端（Trae / Cursor / Claude / Codex / 其他）。',
+        '3. Trae、Cursor、Claude：复制 MCP 配置 JSON，粘贴到对应客户端的 MCP 设置。',
+        '4. Codex：点「一键写入 Codex 配置」，或按表单对照填写（类型选 STDIO）。',
+        '5. 重启对应 AI 客户端后，直接问文献库问题；不必自己找盘符。',
       ],
     },
   }

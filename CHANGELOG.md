@@ -6,7 +6,7 @@
 
 #### 新增
 
-- **AI 工具连接（小白向）**：设置 →「AI 工具连接」支持开关、一键写入 Codex 配置、复制 Codex 表单逐项对照（名称 / STDIO / 启动命令 / 参数）、以及 Cursor/Claude/Trae 的 JSON 配置；类型请选 **STDIO**。
+- **AI 工具连接（小白向）**：设置 →「AI 工具连接」可切换 **Trae（默认）/ Cursor / Claude / Codex / 其他**；JSON 客户端一键复制 MCP 配置，Codex 支持一键写入配置或手动表单对照（名称 / STDIO / 启动命令 / 参数）。
 - Headless MCP：本机 Agent 可不打开界面只读检索文献库（`library_search` 等工具）。见设置页与 `docs/MCP.md`。
 
 #### 下载
@@ -18,7 +18,7 @@
 
 #### Added
 
-- Beginner-friendly **AI tool connection** in Settings: enable switch, one-click write Codex config, Codex form field map (name / STDIO / command / args), and JSON for Cursor/Claude/Trae. Use type **STDIO**.
+- Beginner-friendly **AI tool connection** in Settings with a client switcher (**Trae** default / Cursor / Claude / Codex / Other): copy MCP JSON for JSON clients; Codex one-click config write or form field map (name / STDIO / command / args).
 - Headless MCP for read-only library access without opening the UI. See Settings and `docs/MCP.md`.
 
 #### Downloads
