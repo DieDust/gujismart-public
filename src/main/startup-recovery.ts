@@ -2,10 +2,10 @@ import { existsSync } from 'fs'
 import { readdir, rename, rm, stat } from 'fs/promises'
 import { tmpdir } from 'os'
 import { dirname, extname, join } from 'path'
-import { getDataDir, queryAll, run, saveDatabase, transaction } from './database'
+import { getDataDir, queryAll, run, scheduleDatabaseSave, transaction } from './database'
 import { recoverInterruptedOcrJobs, type OcrRecoverySummary } from './ocr-recovery'
 import { resumeInterruptedDocumentDeletes, type InterruptedDocumentDeleteRecoverySummary } from './ipc/documents'
-import { batchProcessor, type BatchQueueResumeSummary } from './batch-processor'
+import type { BatchQueueResumeSummary } from './batch-processor'
 import { getPdfPageCountFast } from './pdf-info'
 import { isSearchIndexReindexQueuedInMemory, isSearchIndexUsableForDocument, markSearchIndexStaleForDocuments } from './semantic-search'
 import { emitBackgroundTaskStatus } from './background-tasks'
@@ -50,11 +50,13 @@ let startupRecoveryCancelRequested = false
 
 const RECOVERABLE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp'])
 const ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL = 4
+const ORPHAN_STORAGE_CLEANUP_MAX_PER_STARTUP = 40
 const STARTUP_PDF_PAGE_RECORD_INIT_LIMIT = 1000
 const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
-const STARTUP_RECOVERY_DELAY_MS = 3000
+// Give the first library paint a short grace period, then recover queues so OCR is not stuck forever.
+const STARTUP_RECOVERY_DELAY_MS = 8_000
 
 async function startupRecoveryCheckpoint(): Promise<boolean> {
   await yieldToEventLoop()
@@ -154,92 +156,107 @@ function resetInterruptedAiLayoutCacheRows(): number {
 }
 
 function reconcileCompletedOcrDocuments(): number {
+  // Open path: status-only promotion. Never scan page body text on startup.
+  // Only look at documents already marked incomplete to keep the probe bounded.
   const rows = queryAll<{ id: string }>(
     `SELECT d.id
      FROM documents d
      WHERE COALESCE(d.import_status, '') <> 'deleting'
        AND COALESCE(d.page_count, 0) > 0
-       AND (
-         COALESCE(d.ocr_status, '') <> 'completed'
-         OR COALESCE(d.import_status, '') <> 'processed'
-         OR d.error_message IS NOT NULL
+       AND COALESCE(d.ocr_status, '') IN ('pending', 'queued', 'processing')
+       AND NOT EXISTS (
+         SELECT 1
+         FROM pages p
+         WHERE p.doc_id = d.id
+           AND COALESCE(p.ocr_status, '') <> 'completed'
+         LIMIT 1
        )
-       AND (
-       SELECT COUNT(*)
-       FROM pages p
-       WHERE p.doc_id = d.id
-           AND COALESCE(p.ocr_status, '') = 'completed'
-           AND ${completedPageContentPredicate('p')}
-       ) >= COALESCE(d.page_count, 0)`,
-  )
-  const docIds = rows.map((row) => row.id).filter(Boolean)
-  if (docIds.length === 0) return 0
-
-  const placeholders = docIds.map(() => '?').join(', ')
-  run(
-    `UPDATE documents
-     SET ocr_status = 'completed',
-         import_status = 'processed',
-         error_message = NULL,
-         updated_at = ?
-     WHERE id IN (${placeholders})`,
-    [new Date().toISOString(), ...docIds],
-  )
-  markSearchIndexPendingForRecoveredDocuments(docIds)
-  return docIds.length
-}
-
-function findRecoveredOcrDocumentsNeedingSearchIndex(): string[] {
-  return queryAll<{ id: string }>(
-    `SELECT DISTINCT d.id
-     FROM documents d
-     WHERE COALESCE(d.import_status, '') <> 'deleting'
        AND EXISTS (
          SELECT 1
          FROM pages p
          WHERE p.doc_id = d.id
-           AND ${completedPageContentPredicate('p')}
-       )
-       AND (
-         NOT EXISTS (
-           SELECT 1
-           FROM search_index_status s
-           WHERE s.doc_id = d.id
-             AND s.status = 'ready'
-         )
-         OR EXISTS (
-           SELECT 1
-           FROM search_index_status s
-           WHERE s.doc_id = d.id
-             AND s.status IN ('queued', 'processing', 'pending', 'error')
-         )
+         LIMIT 1
        )`,
-  ).map((row) => row.id).filter((docId) => docId && !isSearchIndexUsableForDocument(docId))
+  )
+  const docIds = rows.map((row) => row.id).filter(Boolean)
+  if (docIds.length === 0) return 0
+
+  const now = new Date().toISOString()
+  for (let index = 0; index < docIds.length; index += 200) {
+    const chunk = docIds.slice(index, index + 200)
+    const placeholders = chunk.map(() => '?').join(', ')
+    run(
+      `UPDATE documents
+       SET ocr_status = 'completed',
+           import_status = 'processed',
+           error_message = NULL,
+           updated_at = ?
+       WHERE id IN (${placeholders})`,
+      [now, ...chunk],
+    )
+  }
+  markSearchIndexPendingForRecoveredDocuments(docIds)
+  return docIds.length
+}
+
+/**
+ * Open-path search recovery must stay ID-scoped.
+ * Full-library content predicates on pages freeze multi-GB installs for minutes.
+ */
+function findRecoveredOcrDocumentsNeedingSearchIndex(candidateDocIds: string[]): string[] {
+  const uniqueDocIds = [...new Set(candidateDocIds.map((id) => String(id || '').trim()).filter(Boolean))]
+  if (uniqueDocIds.length === 0) return []
+
+  const needing: string[] = []
+  for (let index = 0; index < uniqueDocIds.length; index += 200) {
+    const chunk = uniqueDocIds.slice(index, index + 200)
+    const placeholders = chunk.map(() => '?').join(', ')
+    const rows = queryAll<{ id: string }>(
+      `SELECT d.id
+       FROM documents d
+       WHERE d.id IN (${placeholders})
+         AND COALESCE(d.import_status, '') <> 'deleting'
+         AND (
+           NOT EXISTS (
+             SELECT 1
+             FROM search_index_status s
+             WHERE s.doc_id = d.id
+               AND s.status = 'ready'
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM search_index_status s
+             WHERE s.doc_id = d.id
+               AND s.status IN ('queued', 'processing', 'pending', 'error')
+           )
+         )`,
+      chunk,
+    )
+    for (const row of rows) {
+      if (row.id && !isSearchIndexUsableForDocument(row.id)) needing.push(row.id)
+    }
+  }
+  return needing
 }
 
 function markSearchIndexPendingForRecoveredDocuments(docIds: string[]): void {
   const uniqueDocIds = [...new Set(docIds.map((docId) => String(docId || '').trim()).filter(Boolean))]
   if (uniqueDocIds.length === 0) return
 
+  const now = new Date().toISOString()
   for (let index = 0; index < uniqueDocIds.length; index += 200) {
     const chunk = uniqueDocIds.slice(index, index + 200)
     const placeholders = chunk.map(() => '?').join(', ')
+    // Status-only gate: do not TRIM/scan page text bodies during open recovery.
     const searchableDocIds = queryAll<{ id: string }>(
       `SELECT d.id
        FROM documents d
        WHERE d.id IN (${placeholders})
-         AND COALESCE(d.import_status, '') <> 'deleting'
-         AND EXISTS (
-           SELECT 1
-           FROM pages p
-           WHERE p.doc_id = d.id
-             AND ${completedPageContentPredicate('p')}
-         )`,
+         AND COALESCE(d.import_status, '') <> 'deleting'`,
       chunk,
     ).map((row) => row.id).filter(Boolean)
     if (searchableDocIds.length === 0) continue
 
-    const now = new Date().toISOString()
     searchableDocIds.forEach((docId) => {
       run(
         `INSERT INTO search_index_status (doc_id, status, source_hash, segment_count, error_message, indexed_at, updated_at)
@@ -559,13 +576,27 @@ async function removeOrphanStorageDirs(): Promise<number> {
   const storageRoot = join(getDataDir(), 'storage')
   if (!existsSync(storageRoot)) return 0
 
+  // Large libraries: scanning/deleting storage trees on open causes sustained disk
+  // I/O with a frozen UI (CPU near 0%, disk high). Skip automatic orphan cleanup;
+  // manual maintenance / next idle session can reclaim later.
+  const documentCount = Number(queryAll<{ count: number }>('SELECT COUNT(*) as count FROM documents')[0]?.count || 0)
+  if (documentCount >= 200) {
+    console.log(`[Startup Recovery] Skipping orphan storage cleanup on open for large library (documents=${documentCount})`)
+    return 0
+  }
+
   const knownDocIds = new Set(queryAll<{ id: string }>('SELECT id FROM documents').map((row) => row.id).filter(Boolean))
   const entries = await readdir(storageRoot, { withFileTypes: true })
   let removed = 0
+  let scanned = 0
   for (const entry of entries) {
     if ((!entry.isDirectory() && !entry.isSymbolicLink()) || entry.name.startsWith('.')) continue
     if (RESERVED_STORAGE_DIR_NAMES.has(entry.name)) continue
     if (knownDocIds.has(entry.name)) continue
+    if (removed >= ORPHAN_STORAGE_CLEANUP_MAX_PER_STARTUP) {
+      console.log(`[Startup Recovery] Orphan storage cleanup capped at ${ORPHAN_STORAGE_CLEANUP_MAX_PER_STARTUP} dirs for this startup`)
+      break
+    }
     const targetPath = join(storageRoot, entry.name)
     const decision = inspectManagedDeleteTarget({
       dataDir: getDataDir(),
@@ -579,7 +610,8 @@ async function removeOrphanStorageDirs(): Promise<number> {
     }
     await rm(decision.canonicalTarget, { recursive: true, force: true })
     removed += 1
-    if (removed % ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL === 0) {
+    scanned += 1
+    if (scanned % ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL === 0) {
       await yieldToEventLoop()
       if (startupRecoveryCancelRequested) break
     }
@@ -588,17 +620,37 @@ async function removeOrphanStorageDirs(): Promise<number> {
 }
 
 async function recoverInterruptedPdfCompressionSources(): Promise<number> {
+  // Limit cold-start recovery work. Full-library PDF existsSync walks make
+  // just-opened windows look frozen on large corpora.
+  const MAX_PDF_COMPRESSION_RECOVERY_CANDIDATES = 80
   const rows = queryAll<DocumentFilePathRow>(
     `SELECT id, file_path
      FROM documents
      WHERE COALESCE(import_status, '') <> 'deleting'
-       AND lower(COALESCE(file_path, '')) LIKE '%.pdf'`,
+       AND lower(COALESCE(file_path, '')) LIKE '%.pdf'
+       AND (
+         COALESCE(import_status, '') IN ('processing', 'unstored', '')
+         OR COALESCE(error_message, '') LIKE '%压缩%'
+         OR lower(COALESCE(error_message, '')) LIKE '%compression%'
+         OR COALESCE(error_message, '') LIKE '%qpdf%'
+         OR COALESCE(error_message, '') LIKE '%.original-%'
+       )
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+    [MAX_PDF_COMPRESSION_RECOVERY_CANDIDATES],
   )
 
   let recovered = 0
-  for (const row of rows) {
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]
     const filePath = String(row.file_path || '').trim()
-    if (!filePath || existsSync(filePath)) continue
+    if (!filePath || existsSync(filePath)) {
+      if (index % 20 === 0) {
+        await yieldToEventLoop()
+        if (startupRecoveryCancelRequested) break
+      }
+      continue
+    }
 
     const storageDir = dirname(filePath)
     if (!existsSync(storageDir)) continue
@@ -626,6 +678,7 @@ async function recoverInterruptedPdfCompressionSources(): Promise<number> {
       row.id,
     ])
     recovered += 1
+    await yieldToEventLoop()
     if (startupRecoveryCancelRequested) break
   }
 
@@ -715,7 +768,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       || ocr.recoveredBatchItems > 0
       || ocr.removedOrphanedBatchItems > 0
     ) {
-      saveDatabase()
+      scheduleDatabaseSave({ minDelayMs: 30_000 })
     }
     emitStartupRecoveryStatus({
       status: 'completed',
@@ -757,17 +810,25 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     progress: 0.75,
     message: '正在恢复搜索索引和清理孤立文件',
   })
-  markSearchIndexStaleForDocuments(resetSearchIndexDocIds)
-  const recoveredOcrSearchDocIds = (
-    ocr.recoveredDocuments > 0
-    || ocr.recoveredPages > 0
-    || ocr.completedDocuments > 0
-    || completedOcrDocuments > 0
-  )
-    ? findRecoveredOcrDocumentsNeedingSearchIndex()
-    : []
+  // Mark search status only. Do NOT schedule background reindex during recovery —
+  // reindex workers rewrite large segment tables and dominate disk right after open.
+  // Never full-scan pages content for "documents needing index" — only the IDs we
+  // already touched in this recovery pass.
+  markSearchIndexPendingForRecoveredDocuments(resetSearchIndexDocIds)
+  const recoveredOcrSearchDocIds = findRecoveredOcrDocumentsNeedingSearchIndex(resetSearchIndexDocIds)
   reindexedRecoveredOcrDocuments = recoveredOcrSearchDocIds.length
-  markSearchIndexStaleForDocuments(recoveredOcrSearchDocIds)
+  markSearchIndexPendingForRecoveredDocuments(recoveredOcrSearchDocIds)
+  const deferredReindexDocIds = [...new Set([...resetSearchIndexDocIds, ...recoveredOcrSearchDocIds].filter(Boolean))]
+  if (deferredReindexDocIds.length > 0) {
+    setTimeout(() => {
+      try {
+        markSearchIndexStaleForDocuments(deferredReindexDocIds)
+        console.log(`[Startup Recovery] Deferred search reindex queued for ${deferredReindexDocIds.length} document(s)`)
+      } catch (error) {
+        console.warn('[Startup Recovery] Deferred search reindex failed', error)
+      }
+    }, 90_000).unref?.()
+  }
 
   removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs)
   if (await startupRecoveryCheckpoint()) return finishCanceled()
@@ -780,7 +841,28 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     message: '正在接续未完成的删除任务',
   })
   deletingDocuments = resumeInterruptedDocumentDeletes()
-  resumedBatchQueue = batchProcessor.resumePendingQueueFromDatabase()
+  // Count interrupted batch items, but do not start OCR/batch workers during recovery.
+  // Immediate resume competes with the first library paint and freezes large installs.
+  const pendingBatchRows = queryAll<{ id: string; batch_id: string | null }>(
+    `SELECT b.id, b.batch_id
+     FROM batch_queue b
+     INNER JOIN documents d ON d.id = b.doc_id
+     WHERE b.status IN ('pending', 'processing')
+       AND COALESCE(d.import_status, '') <> 'deleting'`,
+  )
+  resumedBatchQueue = {
+    resumedJobs: new Set(pendingBatchRows.map((row) => String(row.batch_id || 'default'))).size,
+    resumedItems: pendingBatchRows.length,
+    completedItems: 0,
+    skippedItems: 0,
+  }
+  if (pendingBatchRows.length > 0) {
+    // Leave batch OCR queued after open. Auto-resume of 100+ items still causes
+    // perceived freezes while the library list is loading. Manual continue only.
+    console.log(
+      `[Startup Recovery] ${pendingBatchRows.length} batch OCR item(s) left queued (not auto-started on open)`,
+    )
+  }
 
   if (
     resetSearchIndexJobs > 0
@@ -803,7 +885,8 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     || ocr.recoveredBatchItems > 0
     || ocr.removedOrphanedBatchItems > 0
   ) {
-    saveDatabase()
+    // Long delay: keep UI interactive after recovery mutations.
+    scheduleDatabaseSave({ minDelayMs: 30_000 })
     console.log(
       `[Startup Recovery] OCR docs=${ocr.recoveredDocuments}, pages=${ocr.recoveredPages}, completedPages=${ocr.recoveredCompletedPages}, ` +
       `batch=${ocr.recoveredBatchItems}; orphanBatch=${ocr.removedOrphanedBatchItems}; ` +

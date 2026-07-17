@@ -77,6 +77,32 @@ export function pagePayloadRefExists(ref: string | null | undefined): boolean {
   return !!absolutePath && existsSync(absolutePath)
 }
 
+// Hot-path cache: open/proof/search repeatedly hydrate the same page payload refs.
+// Completeness is unchanged — this only avoids re-reading and gunzipping identical files.
+const PAGE_PAYLOAD_READ_CACHE_MAX = 256
+const pagePayloadReadCache = new Map<string, string | null>()
+
+function rememberPagePayloadRead(cacheKey: string, value: string | null): string | null {
+  if (pagePayloadReadCache.has(cacheKey)) pagePayloadReadCache.delete(cacheKey)
+  pagePayloadReadCache.set(cacheKey, value)
+  while (pagePayloadReadCache.size > PAGE_PAYLOAD_READ_CACHE_MAX) {
+    const oldest = pagePayloadReadCache.keys().next().value
+    if (oldest === undefined) break
+    pagePayloadReadCache.delete(oldest)
+  }
+  return value
+}
+
+export function invalidatePagePayloadReadCache(ref?: string | null): void {
+  if (!ref) {
+    pagePayloadReadCache.clear()
+    return
+  }
+  const absolutePath = resolvePayloadPath(ref)
+  if (!absolutePath) return
+  pagePayloadReadCache.delete(absolutePath)
+}
+
 export function buildPagePayloadRef(docId: string, pageId: string, field: string, value: string): string {
   const hash = createHash('sha256').update(value).digest('hex')
   const prefix = hash.slice(0, 2)
@@ -99,18 +125,29 @@ export function writePagePayloadRef(docId: string, pageId: string, field: string
       value,
     })))
   }
+  // New writes supersede any prior cached value for this path.
+  pagePayloadReadCache.delete(absolutePath)
   return ref
 }
 
 export function readPagePayloadValue(ref: string | null | undefined): string | null {
   if (!ref) return null
   const absolutePath = resolvePayloadPath(ref)
-  if (!absolutePath || !existsSync(absolutePath)) return null
+  if (!absolutePath) return null
+  if (pagePayloadReadCache.has(absolutePath)) {
+    const cached = pagePayloadReadCache.get(absolutePath) ?? null
+    // LRU bump
+    pagePayloadReadCache.delete(absolutePath)
+    pagePayloadReadCache.set(absolutePath, cached)
+    return cached
+  }
+  if (!existsSync(absolutePath)) return rememberPagePayloadRead(absolutePath, null)
   try {
     const parsed = JSON.parse(gunzipSync(readFileSync(absolutePath)).toString('utf-8')) as { value?: unknown }
-    return typeof parsed.value === 'string' ? parsed.value : null
+    const value = typeof parsed.value === 'string' ? parsed.value : null
+    return rememberPagePayloadRead(absolutePath, value)
   } catch {
-    return null
+    return rememberPagePayloadRead(absolutePath, null)
   }
 }
 

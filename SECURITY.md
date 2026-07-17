@@ -26,3 +26,12 @@ Include:
 ## Electron Boundary
 
 Renderer code should use the preload `window.api` surface. New IPC handlers should validate input, avoid arbitrary filesystem access, and return typed DTOs instead of raw internal objects when possible.
+
+## Local AI Tool Access (MCP)
+
+GujiSmart can expose a **local, opt-in, read-only** MCP interface for desktop agents (Cursor, Claude Desktop, Codex, Trae, etc.).
+
+- MCP is **disabled by default** until the user enables it in Settings → AI 工具连接.
+- The interface must not return API keys, arbitrary filesystem paths as readable content, or destructive write tools.
+- Token rotation and disabling the switch must invalidate previous agent configs.
+- Do not document or ship real user data directories, private corpus names, or absolute maintainer paths in public docs.

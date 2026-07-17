@@ -555,16 +555,18 @@ export default function AiPanel({
 
     const loadScopeOptions = async () => {
       try {
-        const [tags, folders, documents, projects] = await Promise.all([
+        const [tags, folders, documentPage, projects] = await Promise.all([
           window.api.listTags(),
           window.api.listFolders(),
-          window.api.listDocuments({ limit: 1000 }),
+          // Paginated list is enough for scope pickers; full-library fan-out was expensive.
+          // Users can still search within AI scope by tag/folder without loading every title.
+          window.api.listDocumentsPage({ limit: 200, offset: 0, sortKey: 'updatedAt', sortDirection: 'desc' }),
           window.api.listResearchProjects()
         ])
 
         setTagOptions(tags.map((item) => ({ value: item.id, label: item.name })))
         setFolderOptions(folders.map((item) => ({ value: item.id, label: item.name })))
-        setDocumentOptions(documents.map((item) => ({ value: item.id, label: item.title || '未命名文献' })))
+        setDocumentOptions((documentPage.items || []).map((item) => ({ value: item.id, label: item.title || '未命名文献' })))
         setResearchProjects(projects)
       } catch (error) {
         console.error(error)

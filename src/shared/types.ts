@@ -539,7 +539,48 @@ export interface LocalPaddleOcrDownloadProgress {
   error?: string
 }
 
-export type PaddleOcrTokenRuntimeStatus = 'active' | 'ready' | 'quota_exhausted' | 'invalid'
+export type PaddleOcrTokenRuntimeStatus = 'active' | 'ready' | 'quota_exhausted' | 'rate_limited' | 'invalid'
+
+/** Beginner-friendly MCP / AI-tool connection info from Settings. */
+export interface McpClientConfigBundle {
+  cursorJson: string
+  claudeJson: string
+  genericJson: string
+  /** Plain text that maps 1:1 to Codex "自定义 MCP" form fields. */
+  codexFormText: string
+  /** Codex CLI ~/.codex/config.toml fragment. */
+  codexToml: string
+  beginnerSteps: string[]
+}
+
+export interface McpCodexFormFields {
+  name: string
+  type: 'STDIO'
+  command: string
+  args: string[]
+  cwd: string
+  env: Array<{ key: string; value: string }>
+}
+
+export interface McpSetupInfo {
+  enabled: boolean
+  dataDir: string
+  execPath: string
+  command: string
+  args: string[]
+  cwd?: string
+  token: string
+  tokenPreview: string
+  packaged: boolean
+  codexForm: McpCodexFormFields
+  configs: McpClientConfigBundle
+}
+
+export interface McpWriteCodexResult {
+  ok: boolean
+  path: string
+  message: string
+}
 
 export interface PaddleOcrTokenPoolEntry {
   id: string

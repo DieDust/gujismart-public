@@ -19,6 +19,13 @@ import { resumePendingImportAutoOcrTasks, shutdownOcrRuntime } from './ipc/ocr'
 import { shutdownBookTranslationRuntime, shutdownDocumentDeleteRuntime, shutdownDocumentImportRuntime } from './ipc/documents'
 import { batchProcessor } from './batch-processor'
 import { initializeSettingsSecurity } from './settings-security'
+import { assertMcpTokenAllowed, parseMcpCliArgs } from './mcp/connection'
+import { runMcpStdioServer } from './mcp/stdio-server'
+
+const mcpLaunch = parseMcpCliArgs(process.argv.slice(1))
+if (mcpLaunch.dataDir) {
+  process.env.GUJISMART_DATA_DIR = resolve(mcpLaunch.dataDir)
+}
 
 let mainWindow: BrowserWindow | null = null
 let quitConfirmed = false
@@ -28,7 +35,9 @@ let runtimeShutdownPromise: Promise<void> | null = null
 let startupMaintenanceScheduled = false
 let importAutoOcrRecoveryScheduled = false
 let fileCapabilitySweepTimer: NodeJS.Timeout | null = null
-const STARTUP_MAINTENANCE_DELAY_MS = 15_000
+const STARTUP_MAINTENANCE_DELAY_MS = 45_000
+// Resume interrupted OCR soon after first paint, but not immediately on load.
+const IMPORT_AUTO_OCR_RESUME_DELAY_MS = 15_000
 const FILE_CAPABILITY_SWEEP_INTERVAL_MS = 60_000
 
 type ConsoleMethodName = 'log' | 'info' | 'warn' | 'error' | 'debug'
@@ -243,9 +252,22 @@ function createWindow(): void {
   mainWindow.webContents.on('did-finish-load', () => {
     console.log(`[Main] Renderer finished loading: ${mainWindow?.webContents.getURL() || ''}`)
     showMainWindowFallback('did-finish-load')
+    // Never resume bulk OCR on the first paint path. Interrupted auto-OCR can
+    // immediately saturate CPU/disk and make a just-opened window "Not Responding".
     if (!importAutoOcrRecoveryScheduled && mainWindow && !mainWindow.isDestroyed()) {
       importAutoOcrRecoveryScheduled = true
-      resumePendingImportAutoOcrTasks(mainWindow.webContents)
+      const sender = mainWindow.webContents
+      setTimeout(() => {
+        if (sender.isDestroyed()) return
+        try {
+          const resumed = resumePendingImportAutoOcrTasks(sender)
+          if (resumed > 0) {
+            console.log(`[Main] Deferred resume of ${resumed} import auto-OCR task(s) after interactive grace`)
+          }
+        } catch (error) {
+          console.warn('[Main] Failed to resume pending import auto-OCR tasks', error)
+        }
+      }, IMPORT_AUTO_OCR_RESUME_DELAY_MS).unref?.()
     }
     if (rendererRecoveryResetTimer) {
       clearTimeout(rendererRecoveryResetTimer)
@@ -478,47 +500,73 @@ protocol.registerSchemesAsPrivileged([
   }
 ])
 
-app.whenReady()
-  .then(async () => {
-    protocol.handle('local-resource', (request) => {
-      const filePath = assertAllowedLocalResourceUrl(request.url)
-      return streamFileResponse(filePath, request)
+if (mcpLaunch.isMcp) {
+  // Headless MCP mode: no BrowserWindow. AI clients spawn this process over stdio.
+  const toErr = (...args: unknown[]) => {
+    process.stderr.write(`${args.map(String).join(' ')}\n`)
+  }
+  console.log = toErr
+  console.info = toErr
+  console.warn = toErr
+  console.debug = toErr
+
+  app.whenReady()
+    .then(async () => {
+      await initDatabase()
+      initializeSettingsSecurity()
+      assertMcpTokenAllowed(mcpLaunch.token)
+      process.stderr.write('[Main] GujiSmart MCP mode (no UI)\n')
+      await runMcpStdioServer()
+    })
+    .catch((error) => {
+      process.stderr.write(`[Main] MCP failed: ${error instanceof Error ? error.message : String(error)}\n`)
+      app.exit(1)
+    })
+} else {
+  app.whenReady()
+    .then(async () => {
+      protocol.handle('local-resource', (request) => {
+        const filePath = assertAllowedLocalResourceUrl(request.url)
+        return streamFileResponse(filePath, request)
+      })
+
+      await initDatabase()
+      initializeSettingsSecurity()
+      registerAllIpcHandlers()
+      fileCapabilitySweepTimer = setInterval(() => {
+        fileCapabilityService.sweepExpired()
+        importSelectionService.sweepExpired()
+      }, FILE_CAPABILITY_SWEEP_INTERVAL_MS)
+      fileCapabilitySweepTimer.unref?.()
+      createWindow()
+      // Delay allow-list preload further: reading every document file_path from SQLite
+      // then statting/canonicalizing them causes open-path disk pressure on large libraries.
+      setTimeout(() => {
+        try {
+          allowManagedFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
+        } catch (error) {
+          console.warn('[Main] Failed to preload stored local resource paths', error)
+        }
+      }, Math.max(STARTUP_MAINTENANCE_DELAY_MS, 60_000)).unref?.()
+      startAutoBackupScheduler()
+
+      app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+          createWindow()
+        }
+      })
+    })
+    .catch((error) => {
+      console.error('[Main] Failed to initialize application', error)
+      app.quit()
     })
 
-    await initDatabase()
-    initializeSettingsSecurity()
-    registerAllIpcHandlers()
-    fileCapabilitySweepTimer = setInterval(() => {
-      fileCapabilityService.sweepExpired()
-      importSelectionService.sweepExpired()
-    }, FILE_CAPABILITY_SWEEP_INTERVAL_MS)
-    fileCapabilitySweepTimer.unref?.()
-    createWindow()
-    setTimeout(() => {
-      try {
-        allowManagedFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
-      } catch (error) {
-        console.warn('[Main] Failed to preload stored local resource paths', error)
-      }
-    }, STARTUP_MAINTENANCE_DELAY_MS).unref?.()
-    startAutoBackupScheduler()
-
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow()
-      }
+  app.on('window-all-closed', () => {
+    void shutdownApplicationRuntime().finally(() => {
+      app.quit()
     })
   })
-  .catch((error) => {
-    console.error('[Main] Failed to initialize application', error)
-    app.quit()
-  })
-
-app.on('window-all-closed', () => {
-  void shutdownApplicationRuntime().finally(() => {
-    app.quit()
-  })
-})
+}
 
 app.on('before-quit', (event) => {
   if (runtimeShutdownStarted) return

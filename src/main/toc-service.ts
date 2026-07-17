@@ -1,5 +1,6 @@
 import { runAiTask } from './ai'
 import { queryAll, queryOne, run, scheduleDatabaseSave, transaction } from './database'
+import { hydratePagePayloadRows } from './page-payload-store'
 import { normalizeChineseSearchText } from './text-normalization'
 import type { OcrRecognizeLayoutBlock, OcrRecognizeResult, TocItemSource, TocItemStatus, TocItemV2 } from '../shared/types'
 
@@ -955,10 +956,27 @@ function parseTocEntryLine(line: string): { title: string; level: number; hinted
 }
 
 function getPages(docId: string): PageRow[] {
-  return queryAll<PageRow>(
-    'SELECT id, page_num, ocr_text, proofed_text, ocr_result FROM pages WHERE doc_id = ? ORDER BY page_num ASC',
+  // Hydrate externalized text/layout refs so rule TOC and binding stay complete
+  // when page payloads were offloaded from SQLite.
+  return hydratePagePayloadRows(queryAll<PageRow & {
+    ocr_text_ref?: string | null
+    proofed_text_ref?: string | null
+    ocr_result_ref?: string | null
+  }>(
+    `SELECT
+       id,
+       page_num,
+       ocr_text,
+       ocr_text_ref,
+       proofed_text,
+       proofed_text_ref,
+       ocr_result,
+       ocr_result_ref
+     FROM pages
+     WHERE doc_id = ?
+     ORDER BY page_num ASC`,
     [docId],
-  )
+  ))
 }
 
 function fromRow(row: TocRow): TocItemV2 {

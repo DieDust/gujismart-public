@@ -4,7 +4,12 @@ import { buildCumulativeFolderDocumentCounts } from './folder-scope'
 
 const CACHE_KEY = 'library-sidebar-v1'
 const CACHE_VERSION = 'library-sidebar-v3-cumulative-folder-counts'
-let refreshScheduled = false
+// Keep first paint free: dirty-cache rebuild is expensive COUNT work on large libraries.
+const LIBRARY_STATE_CACHE_REFRESH_DELAY_MS = 12_000
+const LIBRARY_STATE_CACHE_COLD_START_DELAY_MS = 18_000
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+let refreshRunning = false
+let refreshPending = false
 
 const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   all: 0,
@@ -88,17 +93,32 @@ function emptyCache(dirty = true): LibraryStateCache {
   }
 }
 
-function scheduleLibraryStateCacheRefresh(delayMs = 1500): void {
-  if (refreshScheduled) return
-  refreshScheduled = true
-  setTimeout(() => {
-    refreshScheduled = false
+function scheduleLibraryStateCacheRefresh(delayMs = LIBRARY_STATE_CACHE_REFRESH_DELAY_MS): void {
+  // Always re-arm the timer so import/OCR storms coalesce into one rebuild.
+  if (refreshTimer) {
+    clearTimeout(refreshTimer)
+    refreshTimer = null
+  }
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null
+    if (refreshRunning) {
+      refreshPending = true
+      return
+    }
+    refreshRunning = true
     try {
       refreshLibraryStateCache()
-    } catch {
-      refreshScheduled = false
+    } catch (error) {
+      console.warn('[LibraryStateCache] Refresh failed', error)
+    } finally {
+      refreshRunning = false
+      if (refreshPending) {
+        refreshPending = false
+        scheduleLibraryStateCacheRefresh(Math.max(1000, Math.floor(LIBRARY_STATE_CACHE_REFRESH_DELAY_MS / 2)))
+      }
     }
-  }, delayMs).unref?.()
+  }, Math.max(0, delayMs))
+  refreshTimer.unref?.()
 }
 
 function normalizeCache(payload: unknown, row?: CacheRow | null, source: LibraryStateCache['source'] = 'cache'): LibraryStateCache {
@@ -138,12 +158,16 @@ function readCacheRow(): CacheRow | null {
 
 export function getLibraryStateCache(): LibraryStateCache {
   const row = readCacheRow()
-  if (!row?.cache_json) return emptyCache(true)
+  if (!row?.cache_json) {
+    scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_COLD_START_DELAY_MS)
+    return emptyCache(true)
+  }
   try {
     const cache = normalizeCache(JSON.parse(row.cache_json), row, row.dirty === 0 ? 'cache' : 'snapshot')
-    if (cache.dirty) scheduleLibraryStateCacheRefresh(200)
+    if (cache.dirty) scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_REFRESH_DELAY_MS)
     return cache
   } catch {
+    scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_COLD_START_DELAY_MS)
     return emptyCache(true)
   }
 }
@@ -153,61 +177,10 @@ function buildMissingMetadataCondition(keys: string[]): string {
   return `TRIM(COALESCE(${checks}, '')) = ''`
 }
 
-function buildPageContentAvailableCondition(alias = 'p'): string {
-  return `(
-    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
-    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
-    OR (
-      COALESCE(${alias}.ocr_status, '') = 'completed'
-      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
-    )
-    OR (
-      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
-      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
-      AND NOT (
-        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
-        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
-      )
-    )
-  )`
-}
-
-function buildDocumentTextPageCountExpression(alias = 'd'): string {
-  return `(SELECT COUNT(*) FROM pages p_text_count WHERE p_text_count.doc_id = ${alias}.id AND ${buildPageContentAvailableCondition('p_text_count')})`
-}
-
-function buildDocumentCompletedPageCountExpression(alias = 'd'): string {
-  return `(SELECT COUNT(*) FROM pages p_ocr_count WHERE p_ocr_count.doc_id = ${alias}.id AND p_ocr_count.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p_ocr_count')})`
-}
-
-function buildDocumentOcrCompleteCondition(alias = 'd'): string {
-  const pageCount = `COALESCE(${alias}.page_count, 0)`
-  return `(
-    ${pageCount} > 0
-    AND (
-      ${buildDocumentCompletedPageCountExpression(alias)} >= ${pageCount}
-      OR ${buildDocumentTextPageCountExpression(alias)} >= ${pageCount}
-    )
-  )`
-}
-
 function buildOcrIncompleteCondition(): string {
-  return `(
-    NOT EXISTS (
-      SELECT 1
-      FROM pages p_any
-      WHERE p_any.doc_id = d.id
-      LIMIT 1
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM pages p_incomplete
-      WHERE p_incomplete.doc_id = d.id
-        AND COALESCE(p_incomplete.ocr_status, '') <> 'completed'
-        AND NOT (${buildPageContentAvailableCondition('p_incomplete')})
-      LIMIT 1
-    )
-  )`
+  // Sidebar counts must stay document-level. Page-content correlated scans freeze
+  // large libraries during startup and after bulk import.
+  return `COALESCE(d.ocr_status, '') <> 'completed'`
 }
 
 function buildMissingMetadataFilter(): string {

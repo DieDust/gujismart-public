@@ -11,6 +11,8 @@ npm run check
 npm run build
 ```
 
+- `npm run mcp -- --data-dir <path>` starts the **headless MCP server** (no UI) for AI tools; see [MCP.md](MCP.md).
+- `npm run check:mcp` verifies MCP tool definitions, stdio server contract, and launcher wiring.
 - `npm run check` runs TypeScript, mojibake detection, and open-source hygiene checks.
 - `npm run check:function-contract` verifies that critical `window.api` members for OCR, import, reading, search, AI, research, citation, settings, and backup remain exposed.
 - `npm run check:status-envelope` verifies the shared status/error envelope and its OCR progress integration.

@@ -19,7 +19,7 @@ import type {
   LibraryDocumentSortDirection,
   LibraryDocumentSortKey,
 } from '../../shared/types'
-import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { getLibraryStateCache, markLibraryStateCacheDirty } from '../library-state-cache'
 import { buildCumulativeFolderDocumentCounts, resolveFolderAndDescendantIds } from '../folder-scope'
 import { allowManagedFileAccessPaths } from '../file-access'
 import { importSelectionService } from '../import-selections'
@@ -68,7 +68,11 @@ function folderParentWhere(parentId: string | null): { sql: string; params: unkn
 }
 
 function listFoldersWithCounts(): Folder[] {
-  const counts = buildCumulativeFolderDocumentCounts()
+  // Never recompute cumulative counts on folders:list. That scan freezes large
+  // libraries during the first paint. Counts come from library-state-cache and
+  // are refreshed in the background after open.
+  const cache = getLibraryStateCache()
+  const counts = cache.folderDocumentCounts || {}
   return queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order, created_at')
     .map((folder) => ({ ...folder, document_count: counts[folder.id] || 0 }))
 }

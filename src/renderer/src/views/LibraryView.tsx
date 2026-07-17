@@ -4,6 +4,7 @@ import {
   BookOutlined,
   CheckOutlined,
   CheckSquareOutlined,
+  CloseCircleOutlined,
   CloseOutlined,
   DeleteOutlined,
   DownOutlined,
@@ -84,6 +85,9 @@ const LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT = 1000
 const LARGE_PDF_PREVIEW_IDLE_DELAY_MS = 30_000
 const AUTO_OCR_PDF_PREVIEW_IDLE_DELAY_MS = 60_000
 const PDF_PREVIEW_LIST_REFRESH_BATCH_SIZE = 10
+const PDF_PREVIEW_THUMBNAIL_SCALE = 0.9
+const MAX_EAGER_PDF_PREVIEW_PER_BATCH = 8
+const BULK_IMPORT_PREVIEW_DEFER_FILE_COUNT = 30
 const VIRTUAL_LIST_MIN_DOCUMENTS = 8
 const GRID_CARD_INITIAL_RENDER_COUNT = 72
 const GRID_CARD_RENDER_BATCH_SIZE = 48
@@ -130,8 +134,8 @@ const HEALTH_REPORT_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_REFRESH_DEBOUNCE_MS = 600
 const SMART_COUNTS_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_BUSY_RETRY_DELAYS_MS = [800, 1600, 3200]
-const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 60_000
-const LIBRARY_LIST_BUSY_RETRY_DELAYS_MS = [500, 1200, 2400]
+const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 90_000
+const LIBRARY_LIST_BUSY_RETRY_DELAYS_MS = [800, 2000, 4000, 8000]
 
 type SmartViewCountKey =
   | 'all'
@@ -959,7 +963,7 @@ function getOcrProgressText(info: OcrProgressInfo): string {
   }
 
   if (info.phase === 'queued' || info.status === 'queued') {
-    return info.message || 'OCR 排队中，等待空闲识别通道'
+    return info.message || 'OCR 已排队：等待前面文献让出识别通道（大 PDF 通常串行，不是卡死）'
   }
 
   if (info.phase === 'ai') {
@@ -985,7 +989,10 @@ function getOcrProgressPercent(info: OcrProgressInfo): number {
 }
 
 function renderOcrProgress(info?: OcrProgressInfo, onCancel?: (docId: string, event: MouseEvent<HTMLElement>) => void) {
-  if (!info || !shouldShowOcrProgress(info)) return null
+  if (!info) return null
+  if (!(info.status === 'queued' || info.phase === 'queued' || shouldShowOcrProgress(info) || info.status === 'processing' || info.phase === 'ocr' || info.phase === 'saving')) {
+    return null
+  }
   const percent = Math.max(0, Math.min(100, getOcrProgressPercent(info)))
   const barColor = info.status === 'error' || info.aiStatus === 'error'
     ? '#ff4d4f'
@@ -1115,6 +1122,12 @@ function renderBookTranslationProgress(info?: BookTranslationProgressInfo) {
   )
 }
 
+function isDocumentOcrJobActive(doc: Pick<DocumentItem, 'ocr_status' | 'import_status'>): boolean {
+  return doc.ocr_status === 'queued'
+    || doc.ocr_status === 'processing'
+    || doc.import_status === 'processing'
+}
+
 function shouldShowOcrProgress(info?: OcrProgressInfo): boolean {
   if (!info) return false
   if (info.status === 'queued' || info.phase === 'queued') return true
@@ -1142,14 +1155,15 @@ function isActiveOcrProgress(info?: OcrProgressInfo): boolean {
 
 function isStaleOcrProgressForDocument(info: OcrProgressInfo | undefined, doc: DocumentItem): boolean {
   if (!info) return false
+  // Live OCR jobs must keep their progress bar even when page-text heuristics look "complete"
+  // (common during force re-run / partial page completion).
+  if (isDocumentOcrJobActive(doc)) return false
   if (isDocumentOcrTextComplete(doc)) {
     if (info.aiStatus === 'processing') {
       return doc.metadata_status === 'auto' || doc.metadata_status === 'confirmed'
     }
     return true
   }
-  const ocrStillActive = doc.ocr_status === 'queued' || doc.ocr_status === 'processing' || doc.import_status === 'processing'
-  if (ocrStillActive) return false
 
   if (info.aiStatus === 'processing') {
     return doc.metadata_status === 'auto' || doc.metadata_status === 'confirmed'
@@ -1165,8 +1179,55 @@ function isStaleOcrProgressForDocument(info: OcrProgressInfo | undefined, doc: D
   return false
 }
 
+function buildFallbackOcrProgressInfo(doc: DocumentItem, previous?: OcrProgressInfo): OcrProgressInfo {
+  const queued = doc.ocr_status === 'queued'
+  const totalPages = Number(previous?.totalPages || doc.page_count || 0) || undefined
+  return {
+    docId: doc.id,
+    status: queued ? 'queued' : 'processing',
+    phase: queued ? 'queued' : (previous?.phase === 'saving' ? 'saving' : 'ocr'),
+    progress: Number(previous?.progress || 0),
+    completedPages: previous?.completedPages,
+    totalPages,
+    message: previous?.message || (queued
+      ? 'OCR 已排队：等待前面文献让出识别通道'
+      : 'OCR 进行中（若刚刷新列表，进度会在下一轮状态推送后更新）'),
+    errorMessage: previous?.errorMessage,
+    aiStatus: previous?.aiStatus,
+    canceled: previous?.canceled,
+    updatedAt: previous?.updatedAt || Date.now(),
+  }
+}
+
+/**
+ * Prefer live IPC progress; if missing, reconstruct a bar from document DB status
+ * so cards still show progress after list refresh / missed events / pagination.
+ */
+function resolveOcrProgressInfo(doc: DocumentItem, info?: OcrProgressInfo): OcrProgressInfo | undefined {
+  if (info && !isStaleOcrProgressForDocument(info, doc) && shouldShowOcrProgress(info)) {
+    return info
+  }
+  if (isDocumentOcrJobActive(doc)) {
+    if (info && !isStaleOcrProgressForDocument(info, doc)) {
+      return {
+        ...buildFallbackOcrProgressInfo(doc, info),
+        ...info,
+        status: info.status === 'completed' || info.status === 'error' || info.status === 'canceled'
+          ? (doc.ocr_status === 'queued' ? 'queued' : 'processing')
+          : info.status,
+        updatedAt: info.updatedAt || Date.now(),
+      }
+    }
+    return buildFallbackOcrProgressInfo(doc, info)
+  }
+  if (info && shouldShowOcrProgress(info) && !isStaleOcrProgressForDocument(info, doc)) {
+    return info
+  }
+  return undefined
+}
+
 function shouldShowOcrProgressForDocument(doc: DocumentItem, info?: OcrProgressInfo): boolean {
-  return shouldShowOcrProgress(info) && !isStaleOcrProgressForDocument(info, doc)
+  return Boolean(resolveOcrProgressInfo(doc, info))
 }
 
 function shouldShowDocumentErrorMessage(doc: DocumentItem, info?: OcrProgressInfo): boolean {
@@ -1400,8 +1461,8 @@ function getDocumentListRowHeight(doc: DocumentItem | undefined, context: Docume
   let height = LIST_ROW_MIN_HEIGHT
 
   if (folderCount > 0) height += 28
-  if (shouldShowDocumentErrorMessage(doc, context.ocrProgressByDoc[doc.id])) height += 36
-  if (shouldShowDocumentReviewMessage(doc, context.ocrProgressByDoc[doc.id])) height += 36
+  if (shouldShowDocumentErrorMessage(doc, resolveOcrProgressInfo(doc, context.ocrProgressByDoc[doc.id]))) height += 36
+  if (shouldShowDocumentReviewMessage(doc, resolveOcrProgressInfo(doc, context.ocrProgressByDoc[doc.id]))) height += 36
   if (shouldShowOcrProgressForDocument(doc, context.ocrProgressByDoc[doc.id])) height += 48
   if (shouldShowBookTranslationProgress(context.bookTranslationProgressByDoc[doc.id])) height += 48
   if (tagCount > 0) height += 30
@@ -1440,7 +1501,7 @@ function DocumentVirtualRow({
   const displayAuthor = getDisplayMetadataText(doc.author)
   const displayDynasty = getDisplayMetadataText(doc.dynasty)
   const availableFolders = context.folders.filter((item) => !docFolderIds.includes(item.id))
-  const progressInfo = context.ocrProgressByDoc[doc.id]
+  const progressInfo = resolveOcrProgressInfo(doc, context.ocrProgressByDoc[doc.id])
   const bookTranslationProgressInfo = context.bookTranslationProgressByDoc[doc.id]
   const pdfAssetState = getPdfAssetState(doc)
 
@@ -1744,7 +1805,7 @@ function DocumentVirtualRow({
                 页面待复核：{doc.error_message}
               </div>
             ) : null}
-            {shouldShowOcrProgressForDocument(doc, progressInfo) ? renderOcrProgress(progressInfo, context.handleCancelOcr) : null}
+            {progressInfo ? renderOcrProgress(progressInfo, context.handleCancelOcr) : null}
             {renderBookTranslationProgress(bookTranslationProgressInfo)}
             {visibleTags.length > 0 ? (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
@@ -1856,7 +1917,7 @@ export default function LibraryView({
   const [batchMode, setBatchMode] = useState(false)
   const [showSynthesisModal, setShowSynthesisModal] = useState(false)
   const [metadataEditorVisible, setMetadataEditorVisible] = useState(false)
-  const [editingDoc, setEditingDoc] = useState<DocumentDetail | null>(null)
+  const [editingDoc, setEditingDoc] = useState<Pick<DocumentDetail, 'id' | 'title' | 'author' | 'doc_type' | 'metadata'> | null>(null)
   const [taggingDocId, setTaggingDocId] = useState<string | null>(null)
   const [taggingChecked, setTaggingChecked] = useState<string[]>([])
   const [newFolderName, setNewFolderName] = useState('')
@@ -1886,6 +1947,7 @@ export default function LibraryView({
   const [authorizationRequiredJobs, setAuthorizationRequiredJobs] = useState<LibraryImportQueueJobSnapshotV2[]>([])
   const [importOcrEngine, setImportOcrEngine] = useState<OcrEngine>('paddle')
   const [libraryInitialLoadDone, setLibraryInitialLoadDone] = useState(false)
+  const [libraryListLoadError, setLibraryListLoadError] = useState<string | null>(null)
   const [documentTotal, setDocumentTotal] = useState(0)
   const [unfiledDocumentTotal, setUnfiledDocumentTotal] = useState(0)
   const [smartViewCounts, setSmartViewCounts] = useState<Record<SmartViewCountKey, number>>(EMPTY_SMART_VIEW_COUNTS)
@@ -2356,6 +2418,11 @@ export default function LibraryView({
             delete next[doc.id]
             changed = true
           }
+          // Seed missing progress for active OCR jobs so bars survive list refresh / pagination.
+          if (!next[doc.id] && isDocumentOcrJobActive(doc)) {
+            next[doc.id] = buildFallbackOcrProgressInfo(doc)
+            changed = true
+          }
         }
         if (changed) ocrProgressByDocRef.current = next
         return changed ? next : current
@@ -2373,10 +2440,30 @@ export default function LibraryView({
         listOffset: nextOffset,
         listHasMore: listHasMoreRef.current,
       })
-      if (!append) setLibraryInitialLoadDone(true)
+      if (!append) {
+        setLibraryInitialLoadDone(true)
+        setLibraryListLoadError(null)
+      }
     } catch (error) {
       console.error(error)
-      message.error(getErrorMessage(error, '加载文献列表失败'))
+      // Never blank an existing library on transient load failure (busy DB / timeout during OCR).
+      // Keep previous documents and schedule a silent retry so the UI does not look like an empty library.
+      const keepExisting = !append && documentsRef.current.length > 0
+      const errorMessage = getErrorMessage(error, '数据库正忙或加载超时')
+      if (!append) setLibraryListLoadError(errorMessage)
+      message.error({
+        content: keepExisting
+          ? `文献列表暂时加载失败：${errorMessage}。已保留当前列表，稍后自动重试。`
+          : `加载文献列表失败：${errorMessage}。正在自动重试，请稍候…`,
+        key: 'library-list-load',
+        duration: 6,
+      })
+      if (!append && requestId === listRequestSeqRef.current) {
+        window.setTimeout(() => {
+          if (listRequestSeqRef.current !== requestId) return
+          void loadDocuments(activeFilter, { silent: true, reset: true, search: options?.search })
+        }, 3500)
+      }
     } finally {
       if (append) {
         listLoadingMoreRef.current = false
@@ -2623,7 +2710,11 @@ export default function LibraryView({
   }, [scheduleBaseDataRefresh, scheduleHealthReportRefresh, scheduleImportListRefresh, updateDocumentsInList])
 
   useEffect(() => {
-    void loadBaseData()
+    // Yield one frame so the shell can paint before the first heavy IPC burst.
+    const timer = window.setTimeout(() => {
+      void loadBaseData()
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [loadBaseData])
 
   useEffect(() => {
@@ -3004,7 +3095,12 @@ export default function LibraryView({
       libraryContentRef.current?.scrollTo({ top: 0 })
     }
     const canWarmRefresh = libraryWarmCache?.scopeKey === scopeKey && libraryWarmCache.documents.length > 0
-    void loadDocuments(filter, { reset: shouldResetList, silent: canWarmRefresh })
+    // Stagger list load slightly after base data so main process is not hit by
+    // folders+listPage+cache rebuild at the exact same tick after open.
+    const timer = window.setTimeout(() => {
+      void loadDocuments(filter, { reset: shouldResetList, silent: canWarmRefresh })
+    }, shouldResetList ? 40 : 0)
+    return () => window.clearTimeout(timer)
   }, [clearSelection, currentLibraryScopeKey, filter, loadDocuments])
 
   useEffect(() => {
@@ -3770,7 +3866,8 @@ export default function LibraryView({
 
     try {
       setImportProgressText(`正在生成第 ${fileIndex + 1}/${totalFiles} 个 PDF 的首页预览`)
-      const firstPage = await renderPdfFilePageToImage(filePath, 1)
+      // Thumbnail scale keeps bulk import from saturating renderer CPU/GPU.
+      const firstPage = await renderPdfFilePageToImage(filePath, 1, PDF_PREVIEW_THUMBNAIL_SCALE)
       await window.api.cachePageImage(docId, 1, firstPage.dataUrl)
     } catch (error) {
       console.warn('[Library] PDF 首页预览生成失败，稍后打开文档时会重试', error)
@@ -3931,11 +4028,48 @@ export default function LibraryView({
     message.loading({ content: '正在停止 OCR 上传...', key: `ocr-progress-${docId}`, duration: 0 })
     try {
       await window.api.cancelOcr(docId)
-      message.info({ content: '已取消 OCR 上传，已完成页面会保留', key: `ocr-progress-${docId}`, duration: 4 })
+      message.info({ content: '已取消 OCR，已完成页面会保留；该文献不会再被旧队列自动续跑', key: `ocr-progress-${docId}`, duration: 4 })
       updateDocumentInList(docId, { ocr_status: 'pending', import_status: 'stored', error_message: 'OCR 已取消' })
     } catch (error) {
       console.error('[Library] 取消 OCR 失败', error)
       message.error({ content: `取消 OCR 失败：${getErrorMessage(error, '未知错误')}`, key: `ocr-progress-${docId}`, duration: 5 })
+    }
+  }
+
+  const handleCancelAllPendingOcr = async () => {
+    message.loading({ content: '正在停止全部 OCR 队列…', key: 'ocr-cancel-all', duration: 0 })
+    try {
+      const result = await window.api.cancelAllPendingOcr()
+      setOcrProgressByDoc((current) => {
+        const next: Record<string, OcrProgressInfo> = {}
+        Object.entries(current).forEach(([docId, info]) => {
+          if (info.status === 'queued' || info.status === 'processing' || info.phase === 'queued' || info.phase === 'ocr' || info.phase === 'saving') {
+            next[docId] = {
+              ...info,
+              status: 'canceled',
+              phase: 'canceled',
+              message: 'OCR 已取消',
+              errorMessage: 'OCR 已取消',
+              canceled: true,
+              updatedAt: Date.now(),
+            }
+          } else {
+            next[docId] = info
+          }
+        })
+        ocrProgressByDocRef.current = next
+        return next
+      })
+      message.success({
+        content: `已停止 OCR 队列：取消 ${result.canceledDocuments} 篇文献、${result.canceledJobs} 个后台任务。已完成页面会保留。`,
+        key: 'ocr-cancel-all',
+        duration: 6,
+      })
+      message.destroy(OCR_ACTIVITY_MESSAGE_KEY)
+      await loadDocuments(filter, { silent: true })
+    } catch (error) {
+      console.error('[Library] 全部停止 OCR 失败', error)
+      message.error({ content: `全部停止 OCR 失败：${getErrorMessage(error, '未知错误')}`, key: 'ocr-cancel-all', duration: 6 })
     }
   }
 
@@ -4259,7 +4393,10 @@ export default function LibraryView({
             }
             if (engine !== 'local_paddle' && engine !== 'vision_model' && engine !== 'hybrid') {
               const previewItem = { docId: result.id, filePath: pdfWorkPath, fileIndex, totalFiles: totalFileCount, pageCount: result.pageCount }
-              if (Number(result.pageCount || 0) >= LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT) {
+              const bulkImport = totalFileCount >= BULK_IMPORT_PREVIEW_DEFER_FILE_COUNT
+              const largePdf = Number(result.pageCount || 0) >= LARGE_PDF_PREVIEW_DEFER_PAGE_COUNT
+              // Keep only a small eager preview window so bulk import stays interactive.
+              if (largePdf || bulkImport || pdfPreviewQueue.length >= MAX_EAGER_PDF_PREVIEW_PER_BATCH) {
                 deferredPdfPreviewQueue.push(previewItem)
               } else {
                 pdfPreviewQueue.push(previewItem)
@@ -4902,8 +5039,9 @@ export default function LibraryView({
   }
 
   const handleRetryDocument = async (doc: DocumentItem) => {
-    const progressInfo = ocrProgressByDoc[doc.id]
-    if (isDocumentOcrTextComplete(doc)) {
+    const progressInfo = resolveOcrProgressInfo(doc, ocrProgressByDoc[doc.id])
+    // Only treat as finished when the document is no longer in an active OCR job.
+    if (isDocumentOcrTextComplete(doc) && !isDocumentOcrJobActive(doc)) {
       message.destroy(`ocr-error-${doc.id}`)
       message.success({ content: '这篇文献 OCR 已完成，已为你刷新列表状态', key: `retry-${doc.id}`, duration: 3 })
       setOcrProgressByDoc((current) => {
@@ -4924,7 +5062,7 @@ export default function LibraryView({
       return
     }
 
-    if (isActiveOcrProgress(progressInfo)) {
+    if (isDocumentOcrJobActive(doc) || isActiveOcrProgress(progressInfo)) {
       message.info({ content: '该文献 OCR 正在继续处理中，请等待完成或先停止上传', key: `retry-${doc.id}`, duration: 4 })
       return
     }
@@ -4950,7 +5088,7 @@ export default function LibraryView({
         retry_count: 0,
         last_retry_at: null,
       })
-      const latestDoc = await window.api.getDocument(doc.id)
+      const latestDoc = await window.api.getDocumentLight(doc.id)
       const storedEngine = parseDocMetadata(latestDoc || doc).ocr_engine
       const retryEngine = isOcrEngine(storedEngine) ? storedEngine : undefined
       const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || 'paddle', `retry-${doc.id}`)
@@ -5125,8 +5263,16 @@ export default function LibraryView({
 
   const openMetadataEditor = async (docId: string) => {
     try {
-      const doc = await window.api.getDocument(docId)
-      setEditingDoc(doc)
+      // Metadata editor only needs document fields, not full page OCR payloads.
+      const doc = await window.api.getDocumentLight(docId)
+      if (!doc) throw new Error('文献不存在')
+      setEditingDoc({
+        id: doc.id,
+        title: doc.title,
+        author: doc.author,
+        doc_type: doc.doc_type,
+        metadata: doc.metadata,
+      })
       setMetadataEditorVisible(true)
     } catch (error) {
       console.error(error)
@@ -6081,6 +6227,18 @@ export default function LibraryView({
                 <Button size="small" icon={<CheckSquareOutlined />} onClick={() => setBatchMode(true)}>
                   批量处理
                 </Button>
+                <Popconfirm
+                  title="停止全部 OCR 队列？"
+                  description="会取消排队中和正在处理的 OCR（已完成页面保留）。重启后也不会再自动续跑这些任务。"
+                  okText="全部停止"
+                  cancelText="返回"
+                  okButtonProps={{ danger: true }}
+                  onConfirm={() => void handleCancelAllPendingOcr()}
+                >
+                  <Button size="small" danger icon={<CloseCircleOutlined />}>
+                    停止全部 OCR
+                  </Button>
+                </Popconfirm>
                 <Button
                   size="small"
                   icon={<FileSearchOutlined />}
@@ -6273,7 +6431,12 @@ export default function LibraryView({
           {loading ? (
             <div className="empty-state"><Spin size="large" /></div>
           ) : documents.length === 0 ? (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有文献，把 PDF、图片或文件夹拖到这里开始导入" />
+            <Empty
+              image={Empty.PRESENTED_IMAGE_SIMPLE}
+              description={libraryListLoadError
+                ? `文献列表暂时无法加载：${libraryListLoadError}。这通常是启动恢复/OCR 占用数据库导致，正在自动重试…`
+                : '还没有文献，把 PDF、图片或文件夹拖到这里开始导入'}
+            />
           ) : viewMode === 'list' && documents.length < VIRTUAL_LIST_MIN_DOCUMENTS ? (
             <div style={{ width: '100%', paddingTop: 4 }}>
               {documents.map((doc, index) => (
@@ -6335,7 +6498,7 @@ export default function LibraryView({
                 : []
               const displayAuthor = getDisplayMetadataText(doc.author)
               const displayDynasty = getDisplayMetadataText(doc.dynasty)
-              const progressInfo = ocrProgressByDoc[doc.id]
+              const progressInfo = resolveOcrProgressInfo(doc, ocrProgressByDoc[doc.id])
               const bookTranslationProgressInfo = bookTranslationProgressByDoc[doc.id]
               const pdfAssetState = getPdfAssetState(doc)
 
@@ -6866,7 +7029,7 @@ export default function LibraryView({
                       </div>
                     ) : null}
 
-                    {shouldShowOcrProgressForDocument(doc, progressInfo) ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
+                    {progressInfo ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
                     {renderBookTranslationProgress(bookTranslationProgressInfo)}
                   </div>
                 </Dropdown>

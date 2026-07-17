@@ -19,8 +19,9 @@ let ftsAvailable = false
 let searchTrigramFtsAvailable = false
 let searchSegmentsFtsNeedsRebuild = false
 const TOC_RULE_ENGINE_VERSION = '2026-06-05-ocr-structure-v7'
-const DATABASE_CHECKPOINT_MIN_INTERVAL_MS = 2000
-const DATABASE_CHECKPOINT_DEFER_MS = 800
+const DATABASE_CHECKPOINT_MIN_INTERVAL_MS = 5000
+// Defer WAL checkpoints so bulk OCR/delete writes do not stall UI IPC immediately after each batch.
+const DATABASE_CHECKPOINT_DEFER_MS = 2500
 const STARTUP_DATABASE_MAINTENANCE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT = 100_000
 const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_SEGMENT_LIMIT = 500_000
@@ -56,13 +57,14 @@ function runWithBusyRetry(operation: () => void): void {
   throw lastError
 }
 
-function checkpointDatabase(options?: { retryBusy?: boolean }): boolean {
+function checkpointDatabase(options?: { retryBusy?: boolean; mode?: 'PASSIVE' | 'TRUNCATE' }): boolean {
   if (!db) return false
+  const mode = options?.mode || 'PASSIVE'
   try {
     if (options?.retryBusy) {
-      runWithBusyRetry(() => db?.pragma('wal_checkpoint(PASSIVE)'))
+      runWithBusyRetry(() => db?.pragma(`wal_checkpoint(${mode})`))
     } else {
-      db.pragma('wal_checkpoint(PASSIVE)')
+      db.pragma(`wal_checkpoint(${mode})`)
     }
     lastDatabaseCheckpointAt = Date.now()
     return true
@@ -2606,7 +2608,9 @@ export async function initDatabase(): Promise<void> {
   ensureFts(db)
 
   seedDefaultData(db)
-  saveDatabase()
+  // Do not checkpoint at all during open. Even a deferred 45s checkpoint can still
+  // freeze the UI with high disk and ~0% CPU while SQLite rewrites a huge WAL.
+  // Checkpoints happen on clean exit or later write-driven saves after the user is interactive.
   console.log('[Database] Initialization complete')
 }
 
@@ -2832,11 +2836,24 @@ export function saveDatabase(): void {
   }
 }
 
-export function scheduleDatabaseSave(): void {
-  if (!db || !dbFilePath || deferredDatabaseSaveTimer) return
+export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void {
+  if (!db || !dbFilePath) return
 
   const elapsed = Date.now() - lastDatabaseCheckpointAt
-  const delay = Math.max(DATABASE_CHECKPOINT_DEFER_MS, DATABASE_CHECKPOINT_MIN_INTERVAL_MS - elapsed)
+  const requestedMinDelay = Math.max(0, Math.round(Number(options?.minDelayMs || 0)))
+  const delay = Math.max(
+    DATABASE_CHECKPOINT_DEFER_MS,
+    DATABASE_CHECKPOINT_MIN_INTERVAL_MS - elapsed,
+    requestedMinDelay,
+  )
+
+  // If a longer delay is requested while a short timer is already pending, re-arm.
+  if (deferredDatabaseSaveTimer) {
+    if (requestedMinDelay <= 0) return
+    clearTimeout(deferredDatabaseSaveTimer)
+    deferredDatabaseSaveTimer = null
+  }
+
   deferredDatabaseSaveTimer = setTimeout(() => {
     deferredDatabaseSaveTimer = null
     if (!db || !dbFilePath) return
@@ -2849,10 +2866,19 @@ export function scheduleDatabaseSave(): void {
       console.error('[Database] Deferred save failed', error)
     }
   }, delay)
+  deferredDatabaseSaveTimer.unref?.()
 }
 
 export function closeDatabase(): void {
-  saveDatabase()
+  try {
+    // Prefer shrinking WAL on clean exit so the next cold start opens quickly.
+    // Fall back to passive checkpoint if truncate is busy.
+    if (!checkpointDatabase({ retryBusy: true, mode: 'TRUNCATE' })) {
+      checkpointDatabase({ retryBusy: true, mode: 'PASSIVE' })
+    }
+  } catch (error) {
+    console.error('[Database] Close checkpoint failed', error)
+  }
 
   if (db) {
     db.close()

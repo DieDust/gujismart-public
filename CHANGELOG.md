@@ -1,5 +1,105 @@
 # 更新日志 / Changelog
 
+## 1.1.5 - 2026-07-17
+
+### 中文
+
+#### 新增
+
+- **AI 工具连接（小白向）**：设置 →「AI 工具连接」支持开关、一键写入 Codex 配置、复制 Codex 表单逐项对照（名称 / STDIO / 启动命令 / 参数）、以及 Cursor/Claude/Trae 的 JSON 配置；类型请选 **STDIO**。
+- Headless MCP：本机 Agent 可不打开界面只读检索文献库（`library_search` 等工具）。见设置页与 `docs/MCP.md`。
+
+#### 下载
+
+- `GujiSmart-1.1.5-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.5-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- Beginner-friendly **AI tool connection** in Settings: enable switch, one-click write Codex config, Codex form field map (name / STDIO / command / args), and JSON for Cursor/Claude/Trae. Use type **STDIO**.
+- Headless MCP for read-only library access without opening the UI. See Settings and `docs/MCP.md`.
+
+#### Downloads
+
+- `GujiSmart-1.1.5-Setup-x64.exe`
+- `GujiSmart-1.1.5-Portable-x64.exe`
+
+## 1.1.4 - 2026-07-17
+
+### 中文
+
+#### 新增
+
+- **AI 工具连接（MCP）**：设置里「AI 工具连接」一键开关 + **一键复制配置**；AI 客户端用本机程序 `--mcp` 只读访问文献库，**不必打开界面、不必手填盘符**。见设置页与 `docs/MCP.md`。
+
+#### 改进
+
+- 修正飞桨多 Token 对 HTTP 429 的误判：接口返回「请求频率过高」时只做短时限流冷却（约 90 秒），不再标成「今日额度已用完」并整天禁用该 Token。
+- 真正的单日页数/额度耗尽与限流分开处理；升级后会清理此前误存的「假额度」记录。
+- 继续减轻 OCR 写库与批量删除对主进程的阻塞：payload 先落盘再短事务、删除分批分片并让出事件循环，降低点设置/列表时的未响应概率。
+
+#### 下载
+
+- `GujiSmart-1.1.4-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.4-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- **AI tool connection (MCP)**: Settings → “AI 工具连接” with enable switch and one-click copy config. Clients launch the app with `--mcp` for read-only library access without opening the UI or hand-editing drive letters. See Settings and `docs/MCP.md`.
+
+#### Improvements
+
+- Fixed multi-token Paddle OCR mishandling of HTTP 429: rate-limit responses (“too many requests”) now cool down for about 90 seconds instead of being marked as daily quota exhausted for the rest of the day.
+- Daily page/credit exhaustion and temporary rate limiting are classified separately; false “quota exhausted” runtime marks from earlier builds are cleared on upgrade.
+- Further reduced main-process freezes during OCR saves and bulk deletes via short SQL transactions, batched deletes, and deferred WAL checkpoints.
+
+#### Downloads
+
+- `GujiSmart-1.1.4-Setup-x64.exe`
+- `GujiSmart-1.1.4-Portable-x64.exe`
+
+## 1.1.3 - 2026-07-17
+
+### 中文
+
+#### 改进
+
+- 重写启动 OCR 恢复逻辑：打开时只重置明确中断的 `queued/processing` 状态，不再对全库 `pages` 做正文内容扫描与批量重写，避免大库存启动后长时间“未响应”、磁盘占满。
+- 启动恢复不再自动续跑批量 OCR / 导入自动 OCR；未完成任务保持排队，需用户手动继续，避免打开瞬间磁盘打满。
+- 搜索索引恢复改为仅处理本轮已触碰的文献 ID，避免打开路径上的全库正文谓词扫描。
+- 大幅减轻写库/删除卡主进程：OCR 结果先写 payload 文件再做短事务；删除按小批次与小行块推进并让出事件循环；推迟 WAL checkpoint。
+- OCR 队列调度改为有界 worker 池，按并发分波领取任务；大批量续跑不再一次挂起上百个 Promise 或对每篇文献做重 SQL。
+- 单篇/全部取消 OCR 会同步清理持久化队列，避免“点了取消仍被续跑”。
+- 文献库列表在数据库忙碌时保留已有数据并自动重试，不再误显示“还没有文献”。
+- 正在 OCR 的文献在列表刷新后仍会显示进度条。
+
+#### 下载
+
+- `GujiSmart-1.1.3-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.3-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Improvements
+
+- Rewrote startup OCR recovery to only reset clearly interrupted `queued/processing` rows instead of full-table page content scans/rewrites that froze large libraries on open.
+- Startup recovery no longer auto-starts batch OCR / import-auto OCR; unfinished work stays queued until the user continues, preventing disk saturation right after open.
+- Search-index recovery is limited to document IDs touched in the current recovery pass, avoiding full-library content predicates on the open path.
+- Reduced freezes during library writes/deletes: OCR payload files are prepared outside short SQL transactions; deletes advance in small document/row batches with event-loop yields; WAL checkpoints are deferred.
+- OCR scheduling now uses a bounded worker pool and concurrency-sized claim waves so large resume queues no longer hang the main process.
+- Cancel OCR now clears persisted queue rows so canceled work is not revived after restart.
+- Library list keeps existing data and retries on transient database busy/timeout instead of showing a false empty library.
+- Active OCR documents keep a progress bar after list refresh.
+
+#### Downloads
+
+- `GujiSmart-1.1.3-Setup-x64.exe`
+- `GujiSmart-1.1.3-Portable-x64.exe`
+
 ## 1.1.2 - 2026-07-17
 
 ### 中文

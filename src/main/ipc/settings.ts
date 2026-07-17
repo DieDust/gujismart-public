@@ -37,7 +37,15 @@ import type {
   TypesetTemplate,
   VisionOcrConnectionTestPayload,
   VisionOcrConnectionTestResult,
+  McpSetupInfo,
+  McpWriteCodexResult,
 } from '../../shared/types'
+import {
+  getMcpSetupInfo,
+  rotateMcpAgentToken,
+  setMcpAgentEnabled,
+  writeCodexMcpConfig,
+} from '../mcp/connection'
 import {
   backupData,
   compactAutoBackups,
@@ -661,6 +669,24 @@ function ensureUniqueExportPath(dirPath: string, fileName: string, usedPaths: Se
 }
 
 export function registerSettingsIpc(): void {
+  ipcMain.handle('settings:mcp:getSetup', async (): Promise<McpSetupInfo> => {
+    return getMcpSetupInfo()
+  })
+
+  ipcMain.handle('settings:mcp:setEnabled', async (_event, enabled: boolean): Promise<McpSetupInfo> => {
+    setMcpAgentEnabled(Boolean(enabled))
+    return getMcpSetupInfo()
+  })
+
+  ipcMain.handle('settings:mcp:rotateToken', async (): Promise<McpSetupInfo> => {
+    rotateMcpAgentToken()
+    return getMcpSetupInfo()
+  })
+
+  ipcMain.handle('settings:mcp:writeCodexConfig', async (): Promise<McpWriteCodexResult> => {
+    return writeCodexMcpConfig()
+  })
+
   ipcMain.handle('settings:credential:prepare', async (event, key: string, value: string) => {
     const ownerId = event.sender.id
     if (!registeredCredentialDraftOwners.has(ownerId)) {

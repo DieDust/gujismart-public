@@ -30,6 +30,7 @@
 - 检索与证据：支持全文检索、语义扩展检索、保存检索和摘录保存。
 - AI 辅助：支持 OpenAI 兼容接口，用于元数据提取、文献问答、总结和跨文献综合。
 - 研究写作：支持研究项目、摘录、引用模板和 Markdown/JSON 等导出。
+- AI 工具连接（MCP）：设置中一键开关与配置复制；本机 Agent（Cursor / Claude / Codex / Trae 等）可只读检索文献库，无需打开界面。详见 [docs/MCP.md](docs/MCP.md)。
 
 ## 技术栈
 
@@ -56,32 +57,40 @@ npm run typecheck
 npm run check
 npm run build
 npm run smoke
+npm run check:mcp
 ```
 
 - `npm run typecheck`：运行 TypeScript 类型检查。
-- `npm run check`：运行类型检查、乱码检查和开源卫生检查。
+- `npm run check`：运行类型检查、合同回归、乱码检查和开源卫生检查。
 - `npm run build`：构建 Electron main、preload 和 renderer。
 - `npm run smoke`：运行 Electron 冒烟测试。
+- `npm run check:mcp`：检查 AI 工具（MCP）合同与只读工具集成。
+- `npm run mcp`：开发态 headless MCP 启动（需数据目录；最终用户优先用设置页一键配置）。
 
 更多回归测试和脚本卫生规则见 [docs/SCRIPTS.md](docs/SCRIPTS.md)。维护者发布新版本前必须遵循 [开源发布操作规范](docs/OPEN_SOURCE_RELEASE.md)。依赖本地私有文献库的人工 QA 脚本不进入公开仓库。
 
 ## 配置说明
 
-应用优先使用本地 SQLite 数据库保存文献、OCR 结果、标签、项目和设置。开发模式下数据位于项目内的 `data/` 目录；构建后的应用会使用 Electron 的用户数据目录。
+应用使用本地 SQLite 与托管目录保存文献、OCR 结果、标签、项目和设置。
+
+- 开发模式：数据默认在项目内的 `data/` 目录。
+- 安装版 / 便携版：数据默认在可执行文件同级的 `data/` 目录（设置 → 数据管理 →「打开数据目录」可确认）。
+- 也可用环境变量 `GUJISMART_DATA_DIR` 指定数据根目录。
 
 AI/OCR 相关 API Key 不应写入仓库，请在应用设置页中配置。开源贡献时不要提交真实数据库、真实文献、用户目录、日志或临时调试输出。
 飞桨云端 OCR 的多 Token 接力、100 页分段和失败分段续跑规则见 [PaddleOCR 多 Token 接力说明](docs/PADDLE_OCR_TOKEN_POOL.md)。
+AI 工具连接（MCP）见 [docs/MCP.md](docs/MCP.md)。
 如需本地调试环境变量，请复制 `.env.example` 为 `.env`，并只在本机填写真实值。
 
 ## 项目结构
 
 ```text
-src/main/        Electron main 进程、数据库、OCR、AI、导出和 IPC handler
+src/main/        Electron main 进程、数据库、OCR、AI、导出、IPC 与 MCP
 src/preload/     安全暴露给 renderer 的 window.api
 src/renderer/    React 前端界面、状态和工具函数
 src/shared/      main/preload/renderer 共享类型、常量和跨进程工具
-scripts/         冒烟测试、回归测试和仓库维护脚本
-docs/            使用文档和截图素材
+scripts/         冒烟测试、回归测试、MCP 启动器和仓库维护脚本
+docs/            使用文档、开源发布规范与截图素材
 ```
 
 架构边界、IPC 合同和命名规则见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。脚本分类见 [docs/SCRIPTS.md](docs/SCRIPTS.md)。后续整理方向见 [docs/ROADMAP.md](docs/ROADMAP.md)。

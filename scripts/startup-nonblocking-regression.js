@@ -31,7 +31,7 @@ const runStartupRecoveryStart = startupRecovery.indexOf('export async function r
 const firstRecoveryCheckpoint = startupRecovery.indexOf('if (await startupRecoveryCheckpoint()) return finishCanceled()', runStartupRecoveryStart)
 const recoverOcrJobs = startupRecovery.indexOf('ocr = recoverInterruptedOcrJobs()', runStartupRecoveryStart)
 const resumeDeletes = startupRecovery.indexOf('deletingDocuments = resumeInterruptedDocumentDeletes()', runStartupRecoveryStart)
-const resumeBatchQueue = startupRecovery.indexOf('resumedBatchQueue = batchProcessor.resumePendingQueueFromDatabase()', runStartupRecoveryStart)
+const resumeBatchQueue = startupRecovery.indexOf('batchProcessor.resumePendingQueueFromDatabase()', runStartupRecoveryStart)
 const finalPreResumeCheckpoint = startupRecovery.lastIndexOf('if (await startupRecoveryCheckpoint()) return finishCanceled()', resumeDeletes)
 const recoverableBatchOcrItemsBody = sliceBetween(
   ocrIpc,
@@ -101,9 +101,28 @@ assert(
   'Auto-backup scheduler should defer the first due-backup check instead of copying backup data during startup.',
 )
 assert(
-  mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 15_000')
-    && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowManagedFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex),
-  'Startup resource allow-list preloading should be delayed so large libraries do not block the first window.',
+  mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 45_000')
+    && mainIndex.includes('const IMPORT_AUTO_OCR_RESUME_DELAY_MS = 15_000')
+    && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowManagedFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex)
+    && mainIndex.includes('resumePendingImportAutoOcrTasks(sender)')
+    && !/did-finish-load[\s\S]{0,220}resumePendingImportAutoOcrTasks\(mainWindow\.webContents\)/.test(mainIndex),
+  'Startup resource allow-list preloading and import auto-OCR resume should be delayed so large libraries do not block the first window.',
+)
+assert(
+  ocrIpc.includes('export function resumePendingImportAutoOcrTasks')
+    && ocrIpc.includes('left queued (not auto-started on open)')
+    && ocrIpc.includes('runBoundedDocumentWorkers')
+    && ocrIpc.includes('limit: concurrency')
+    && !ocrIpc.includes('Math.min(200, Math.max(1, config.batchSize))')
+    && /export function resumePendingImportAutoOcrTasks[\s\S]{0,900}return 0/.test(ocrIpc),
+  'Import-auto OCR open path may only repair leases and must not auto-start the full queue; workers stay bounded.',
+)
+assert(
+  startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 8_000')
+    && startupRecovery.includes('left queued (not auto-started on open)')
+    && !/setTimeout\(\(\) => \{[\s\S]{0,260}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery)
+    && !/runStartupRecovery[\s\S]{0,4000}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery),
+  'Batch OCR must stay queued after open recovery; auto-start of large queues freezes the first paint.',
 )
 assert(
   database.includes('export function runDeferredStartupDatabaseMaintenance')
@@ -190,8 +209,15 @@ assert(
 assert(
   finalPreResumeCheckpoint > runStartupRecoveryStart
     && resumeDeletes > finalPreResumeCheckpoint
-    && resumeBatchQueue > resumeDeletes,
-  'Canceled startup recovery should not launch resumed delete or batch OCR jobs during app shutdown.',
+    && startupRecovery.includes('left queued (not auto-started on open)')
+    && !startupRecovery.includes('batchProcessor.resumePendingQueueFromDatabase()'),
+  'Startup recovery must not auto-start batch OCR on the open path; leave items queued for manual continue.',
+)
+assert(
+  startupRecovery.includes('function findRecoveredOcrDocumentsNeedingSearchIndex(candidateDocIds: string[])')
+    && startupRecovery.includes('Never full-scan pages content')
+    && !/function findRecoveredOcrDocumentsNeedingSearchIndex\(\): string\[]/.test(startupRecovery),
+  'Search-index recovery discovery must stay ID-scoped, never full-library page content scans.',
 )
 assert(
   /export function scheduleStartupRecovery\(\)[\s\S]{0,160}startupRecoveryCancelRequested = false/.test(startupRecovery)
@@ -294,11 +320,12 @@ assert(
     && !recoverableBatchOcrItemsBody.includes('saveDatabase()')
     && ocrIpc.includes('releaseAllLegacyBatchClaims()')
     && ocrIpc.includes('let recoverableQueueItemIdsByDocId = new Map<string, string>()')
-    && ocrIpc.includes('recoverableQueueItemIdsByDocId = persistForRecovery')
+    && ocrIpc.includes('createRecoverableBatchOcrItems(chunk, documentConcurrency)')
+    && ocrIpc.includes('runBoundedDocumentWorkers')
     && ocrIpc.includes("updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
     && ocrIpc.includes('!ocrRuntimeShuttingDown')
     && ocrIpc.includes("result.success ? 'completed' : 'failed'"),
-  'Paddle batch OCR should persist through the shared scheduler, retain the legacy projection, and release leases on shutdown.',
+  'Paddle batch OCR should persist through the shared scheduler in chunks, run a bounded worker pool, and release leases on shutdown.',
 )
 assert(
   batchProcessor.includes('async shutdownRuntime')

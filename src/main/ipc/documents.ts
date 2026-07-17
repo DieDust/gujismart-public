@@ -262,8 +262,11 @@ interface PageOcrVersionDetailRow extends PageOcrVersion {
   ocr_result?: string | null
 }
 
-const DELETE_SQL_CHUNK_SIZE = 200
-const DELETE_ROW_CHUNK_SIZE = 500
+const DELETE_SQL_CHUNK_SIZE = 100
+// Keep each DELETE small so the main process can service UI IPC between chunks.
+const DELETE_ROW_CHUNK_SIZE = 80
+// Never wipe dozens of documents in one uninterrupted SQL storm.
+const DELETE_DOC_BATCH_SIZE = 4
 const DELETE_SLOW_STEP_MS = 700
 const DELETE_FILE_CLEANUP_CONCURRENCY = 2
 const activeDocumentDeleteIds = new Set<string>()
@@ -357,24 +360,42 @@ async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
       await yieldToEventLoop()
     }
 
+    // Segment FTS delete must stay batched. A single full-document INSERT…SELECT
+    // on large libraries freezes the main process for seconds.
     if (!isSearchSegmentsFtsRebuildNeeded()) {
-      run(
-        `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
-         SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
-         FROM search_index_segments
-         WHERE doc_id IN (${placeholders})
-           AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
-        chunkIds,
-      )
-      if (isSearchTrigramFtsAvailable()) {
-        run(
-          `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
-           SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+      while (true) {
+        const segmentRows = queryAll<{ rowid: number; title: string | null; normalized_text: string | null; text: string | null }>(
+          `SELECT rowid, title, normalized_text, text
            FROM search_index_segments
            WHERE doc_id IN (${placeholders})
-             AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
-          chunkIds,
+             AND TRIM(COALESCE(normalized_text, text, '')) != ''
+           LIMIT ?`,
+          [...chunkIds, DELETE_ROW_CHUNK_SIZE],
         )
+        if (segmentRows.length === 0) break
+        transaction(() => {
+          for (const row of segmentRows) {
+            run(
+              `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+               VALUES ('delete', ?, ?, ?)`,
+              [row.rowid, String(row.title || ''), String(row.normalized_text || row.text || '')],
+            )
+            if (isSearchTrigramFtsAvailable()) {
+              run(
+                `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+                 VALUES ('delete', ?, ?)`,
+                [row.rowid, String(row.normalized_text || row.text || '')],
+              )
+            }
+          }
+        })
+        // Physically remove the segment rows we just unindexed so the LIMIT loop advances.
+        const rowPlaceholders = segmentRows.map(() => '?').join(', ')
+        run(
+          `DELETE FROM search_index_segments WHERE rowid IN (${rowPlaceholders})`,
+          segmentRows.map((row) => row.rowid),
+        )
+        await yieldToEventLoop()
       }
     }
   })
@@ -487,24 +508,33 @@ async function deleteDocumentData(docIds: string[]): Promise<DeleteDocumentDataR
   }
 
   await runSearchIndexStep('search_ngram_index', () => deleteRowsByDocIdsAsync('search_ngram_index', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('metadata_candidates', () => deleteRowsByDocIdsAsync('metadata_candidates', docIds))
   await timeDeleteStepAsync('page_ocr_versions', () => deleteRowsByDocIdsAsync('page_ocr_versions', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('page_ai_layout_cache', () => deleteRowsByDocIdsAsync('page_ai_layout_cache', docIds))
   await timeDeleteStepAsync('page_translation_cache', () => deleteRowsByDocIdsAsync('page_translation_cache', docIds))
   await timeDeleteStepAsync('page_translation_units', () => deleteRowsByDocIdsAsync('page_translation_units', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('document_toc_items', () => deleteRowsByDocIdsAsync('document_toc_items', docIds))
   await timeDeleteStepAsync('reader_state', () => deleteRowsByDocIdsAsync('reader_state', docIds))
   await timeDeleteStepAsync('ai_document_summaries', () => deleteRowsByDocIdsAsync('ai_document_summaries', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('research_notes', () => deleteRowsByDocIdsAsync('research_notes', docIds))
   await timeDeleteStepAsync('research_project_documents', () => deleteRowsByDocIdsAsync('research_project_documents', docIds))
   await timeDeleteStepAsync('ai_results', () => deleteRowsByDocIdsAsync('ai_results', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('ai_chat_turns', () => deleteAiChatTurnsByDocIdsAsync(docIds))
   await timeDeleteStepAsync('ai_chat_sessions', () => deleteRowsByDocIdsAsync('ai_chat_sessions', docIds))
   await timeDeleteStepAsync('batch_queue', () => deleteRowsByDocIdsAsync('batch_queue', docIds))
+  await yieldToEventLoop()
   await runSearchIndexStep('fts', () => deleteFtsRowsByDocIdsAsync(docIds))
+  // Segments may already be removed during FTS cleanup; this pass is a residual sweep.
   await runSearchIndexStep('search_index_segments', () => deleteRowsByDocIdsAsync('search_index_segments', docIds))
   await runSearchIndexStep('search_index_status', () => deleteRowsByDocIdsAsync('search_index_status', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('pages', () => deleteRowsByDocIdsAsync('pages', docIds))
+  await yieldToEventLoop()
   await timeDeleteStepAsync('document_folders', () => deleteRowsByDocIdsAsync('document_folders', docIds))
   await timeDeleteStepAsync('document_tags', () => deleteRowsByDocIdsAsync('document_tags', docIds))
   await timeDeleteStepAsync('documents', async () => {
@@ -557,17 +587,26 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
   const job = new Promise<void>((resolve) => {
     setImmediate(() => {
       void (async () => {
+        const affectedTagIds = new Set<string>()
+        let recoveredSearchIndexIssue = false
         try {
-          const tagIds = getAffectedTagIdsForDelete(docIds)
-          const deleteResult = await deleteDocumentData(docIds)
-          if (deleteResult.recoveredSearchIndexIssue) {
+          // Process a few documents at a time so list/settings IPC can run between batches.
+          for (let offset = 0; offset < docIds.length; offset += DELETE_DOC_BATCH_SIZE) {
+            const batch = docIds.slice(offset, offset + DELETE_DOC_BATCH_SIZE)
+            getAffectedTagIdsForDelete(batch).forEach((tagId) => affectedTagIds.add(tagId))
+            const deleteResult = await deleteDocumentData(batch)
+            if (deleteResult.recoveredSearchIndexIssue) recoveredSearchIndexIssue = true
+            await yieldToEventLoop()
+          }
+          if (recoveredSearchIndexIssue) {
             queueAllDocumentsReindex()
           }
           notifySearchContentChanged()
-          refreshDeletedDocumentTags(tagIds)
+          refreshDeletedDocumentTags([...affectedTagIds])
           const cleanupTasks = getDeleteCleanupTasks(docIds.map((id) => ({ id })))
           await cleanupDeletedDocumentFilesInBackground(cleanupTasks)
-          scheduleDatabaseSave()
+          // Long delay: avoid checkpoint fighting the next UI paint after bulk delete.
+          scheduleDatabaseSave({ minDelayMs: 15_000 })
         } catch (error) {
           console.error('[Documents] Background document delete failed:', error)
           markDocumentsDeleteFailed(docIds, error)
@@ -782,7 +821,11 @@ async function ensureDeferredPdfPageRecordsReadyForRead(doc: Pick<Document, 'id'
   if (pageCount <= 0) return
   const total = Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM pages WHERE doc_id = ?', [doc.id])?.count || 0)
   if (total < pageCount) {
+    const startedAt = Date.now()
     await insertMissingDocumentPageRecords(doc.id, pageCount)
+    logSlowDocumentStep(`ensureDeferredPdfPageRecords:${doc.id}:${pageCount}`, startedAt)
+    // Yield so open-document IPC does not immediately chain more main-thread work.
+    await yieldToEventLoop()
   }
   const nextMetadata = clearDeferredPdfPageRecordMarker(doc.id)
   if (nextMetadata !== null) doc.metadata = nextMetadata
@@ -2806,32 +2849,19 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
     ...(Array.isArray(options?.folderIds) ? options.folderIds : []),
   ].map((value) => String(value || '').trim()).filter(Boolean)
   const scopedFolderIds = resolveFolderAndDescendantIds(requestedFolderIds)
+  // Intentionally avoid full-table joins on pages/research_notes here.
+  // Page stats are attached only for the limited result page (see attachPageStatsForDocuments).
   let sql = forCount
     ? 'SELECT COUNT(DISTINCT d.id) as total FROM documents d'
     : `SELECT
         d.*,
-        COALESCE(page_counts.actual_page_count, 0) as actual_page_count,
-        COALESCE(page_counts.text_page_count, 0) as text_page_count,
-        COALESCE(page_counts.ocr_completed_page_count, 0) as ocr_completed_page_count,
-        COALESCE(page_counts.image_page_count, 0) as image_page_count,
-        COALESCE(note_counts.research_note_count, 0) as research_note_count,
+        0 as actual_page_count,
+        0 as text_page_count,
+        0 as ocr_completed_page_count,
+        0 as image_page_count,
+        0 as research_note_count,
         0 as search_segment_count
-      FROM documents d
-      LEFT JOIN (
-        SELECT
-          p.doc_id,
-          COUNT(*) as actual_page_count,
-          SUM(CASE WHEN ${buildPageContentAvailableCondition('p')} THEN 1 ELSE 0 END) as text_page_count,
-          SUM(CASE WHEN p.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p')} THEN 1 ELSE 0 END) as ocr_completed_page_count,
-          SUM(CASE WHEN p.image_path IS NOT NULL AND TRIM(p.image_path) <> '' THEN 1 ELSE 0 END) as image_page_count
-        FROM pages p
-        GROUP BY p.doc_id
-      ) page_counts ON page_counts.doc_id = d.id
-      LEFT JOIN (
-        SELECT rn.doc_id, COUNT(*) as research_note_count
-        FROM research_notes rn
-        GROUP BY rn.doc_id
-      ) note_counts ON note_counts.doc_id = d.id`
+      FROM documents d`
 
   const params: unknown[] = []
   const conditions: string[] = []
@@ -2864,33 +2894,12 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
     params.push(options.docType)
   }
   if (options?.ocrIncomplete) {
-    conditions.push(`(
-      NOT EXISTS (
-        SELECT 1
-        FROM pages p_any
-        WHERE p_any.doc_id = d.id
-        LIMIT 1
-      )
-      OR EXISTS (
-        SELECT 1
-        FROM pages p_incomplete
-        WHERE p_incomplete.doc_id = d.id
-          AND COALESCE(p_incomplete.ocr_status, '') <> 'completed'
-          AND NOT (${buildPageContentAvailableCondition('p_incomplete')})
-        LIMIT 1
-      )
-    )`)
+    // Document-level status is maintained by OCR completion paths and is far cheaper
+    // than correlated page-content scans across the whole library.
+    conditions.push(`COALESCE(d.ocr_status, '') <> 'completed'`)
   } else if (options?.ocrStatus) {
-    if (options.ocrStatus === 'completed') {
-      conditions.push(`(d.ocr_status = ? OR ${buildDocumentOcrCompleteCondition('d')})`)
-      params.push(options.ocrStatus)
-    } else if (options.ocrStatus === 'pending') {
-      conditions.push(`(d.ocr_status = ? AND NOT ${buildDocumentOcrCompleteCondition('d')})`)
-      params.push(options.ocrStatus)
-    } else {
-      conditions.push('d.ocr_status = ?')
-      params.push(options.ocrStatus)
-    }
+    conditions.push('d.ocr_status = ?')
+    params.push(options.ocrStatus)
   }
   if (options?.importStatus) {
     conditions.push('d.import_status = ?')
@@ -3032,7 +3041,16 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
     return { sql, params }
   }
 
-  sql += ` GROUP BY d.id ORDER BY ${buildDocumentListOrderBy(options)}`
+  // GROUP BY is only needed when joins can multiply rows (tags/folders).
+  const needsGroupBy = Boolean(
+    options?.tagId
+    || (Array.isArray(options?.tagIds) && options.tagIds.length > 0)
+    || (scopedFolderIds.length > 0),
+  )
+  if (needsGroupBy) {
+    sql += ' GROUP BY d.id'
+  }
+  sql += ` ORDER BY ${buildDocumentListOrderBy(options)}`
   sql += ' LIMIT ? OFFSET ?'
   params.push(options?.limit || 1000, options?.offset || 0)
 
@@ -3083,12 +3101,17 @@ function parsePageOcrMeta(page: PageOcrMetaRow): { has_ocr_text: boolean; needs_
   if (!page.ocr_result) {
     return { has_ocr_text: hasInlineText, needs_layout_attention: false }
   }
+  // Fast path: when plain text is already available, skip expensive full OCR JSON
+  // quality inspection for reading windows. Layout attention is a soft UI hint only.
+  if (hasInlineText) {
+    return { has_ocr_text: true, needs_layout_attention: false }
+  }
 
   try {
     const parsed = typeof page.ocr_result === 'string' ? JSON.parse(page.ocr_result) : page.ocr_result
     const blocks = isJsonRecord(parsed) && Array.isArray(parsed.layout_result) ? parsed.layout_result : []
     const ir = getOcrPageIr(parsed)
-    const hasText = hasInlineText || hasStructuredOcrText(parsed)
+    const hasText = hasStructuredOcrText(parsed)
     return {
       has_ocr_text: hasText,
       needs_layout_attention: blocks.some((block) => isJsonRecord(block) && !!block.needs_enhancement)
@@ -3126,10 +3149,38 @@ function repairStoredGujiOcrPageForRead(page: DocumentPage): boolean {
   return true
 }
 
+// Avoid re-running coordinate repair + JSON rewrite on every reading-window scroll.
+const repairedGujiOcrPageIds = new Set<string>()
+const REPAIRED_GUJI_OCR_PAGE_IDS_MAX = 4000
+
+function rememberRepairedGujiOcrPage(pageId: string): void {
+  if (!pageId) return
+  repairedGujiOcrPageIds.add(pageId)
+  if (repairedGujiOcrPageIds.size <= REPAIRED_GUJI_OCR_PAGE_IDS_MAX) return
+  const overflow = repairedGujiOcrPageIds.size - REPAIRED_GUJI_OCR_PAGE_IDS_MAX
+  let removed = 0
+  for (const id of repairedGujiOcrPageIds) {
+    repairedGujiOcrPageIds.delete(id)
+    removed += 1
+    if (removed >= overflow) break
+  }
+}
+
 function repairStoredGujiOcrPagesForRead(pages: DocumentPage[]): void {
   let repairedCount = 0
   for (const page of pages) {
-    if (repairStoredGujiOcrPageForRead(page)) repairedCount += 1
+    const pageId = String(page.id || '')
+    if (pageId && repairedGujiOcrPageIds.has(pageId)) {
+      Object.assign(page, parsePageOcrMeta(page))
+      continue
+    }
+    if (repairStoredGujiOcrPageForRead(page)) {
+      repairedCount += 1
+      rememberRepairedGujiOcrPage(pageId)
+    } else if (pageId) {
+      // Even when no rewrite is needed, remember so we skip the stringify compare next time.
+      rememberRepairedGujiOcrPage(pageId)
+    }
     Object.assign(page, parsePageOcrMeta(page))
   }
   if (repairedCount > 0) {
@@ -3281,9 +3332,106 @@ function normalizeDocumentSourceAssetsForRead<T extends { image_path?: string | 
   doc.metadata = JSON.stringify({ ...metadata, pdf_asset_state: state })
 }
 
-function attachDocumentRelations(documents: DocumentListItem[]): DocumentListItem[] {
+interface DocumentListPageStatsRow {
+  doc_id: string
+  actual_page_count?: number | null
+  text_page_count?: number | null
+  ocr_completed_page_count?: number | null
+  image_page_count?: number | null
+  research_note_count?: number | null
+}
+
+function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentListItem[] {
   if (documents.length === 0) return documents
   const docIds = documents.map((doc) => doc.id).filter(Boolean)
+  if (docIds.length === 0) return documents
+  const placeholders = docIds.map(() => '?').join(', ')
+
+  // Lightweight page stats only for the current result page.
+  // Avoid scanning ocr_result JSON blobs; status/ref columns are enough for list UI.
+  // Use NULLIF so empty proofed_text does not hide a non-empty ocr_text (COALESCE alone would).
+  const pageRows = queryAll<DocumentListPageStatsRow>(
+    `SELECT
+       p.doc_id,
+       COUNT(*) as actual_page_count,
+       SUM(
+         CASE
+           WHEN COALESCE(p.ocr_status, '') = 'completed'
+             OR TRIM(COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '')) <> ''
+             OR TRIM(COALESCE(NULLIF(p.proofed_text_ref, ''), NULLIF(p.ocr_text_ref, ''), NULLIF(p.ocr_result_ref, ''), '')) <> ''
+           THEN 1 ELSE 0
+         END
+       ) as text_page_count,
+       SUM(CASE WHEN COALESCE(p.ocr_status, '') = 'completed' THEN 1 ELSE 0 END) as ocr_completed_page_count,
+       SUM(CASE WHEN p.image_path IS NOT NULL AND TRIM(p.image_path) <> '' THEN 1 ELSE 0 END) as image_page_count
+     FROM pages p
+     WHERE p.doc_id IN (${placeholders})
+     GROUP BY p.doc_id`,
+    docIds,
+  )
+  const noteRows = queryAll<DocumentListPageStatsRow>(
+    `SELECT rn.doc_id, COUNT(*) as research_note_count
+     FROM research_notes rn
+     WHERE rn.doc_id IN (${placeholders})
+     GROUP BY rn.doc_id`,
+    docIds,
+  )
+
+  const pageStatsByDoc = new Map(pageRows.map((row) => [row.doc_id, row]))
+  const noteStatsByDoc = new Map(noteRows.map((row) => [row.doc_id, Number(row.research_note_count || 0)]))
+
+  return documents.map((doc) => {
+    const stats = pageStatsByDoc.get(doc.id)
+    return {
+      ...doc,
+      actual_page_count: Number(stats?.actual_page_count || 0),
+      text_page_count: Number(stats?.text_page_count || 0),
+      ocr_completed_page_count: Number(stats?.ocr_completed_page_count || 0),
+      image_page_count: Number(stats?.image_page_count || 0),
+      research_note_count: noteStatsByDoc.get(doc.id) || 0,
+      search_segment_count: 0,
+    }
+  })
+}
+
+function resolveListPdfAssetInfo(
+  doc: Pick<Document, 'id' | 'file_path'> & {
+    metadata?: string | null
+    image_page_count?: number | null
+    ocr_status?: string | null
+  },
+): { state: VerifiedPdfAssetState; imagePageCount: number; metadata: string } {
+  const metadata = parseDocumentMetadata(doc.metadata)
+  const imagePageCount = Math.max(0, Number(doc.image_page_count || 0))
+  const explicitState = String(metadata.pdf_asset_state || '').trim()
+  const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
+  const filePath = resolveManagedStoragePath(String(doc.file_path || '').trim(), doc.id)
+  const looksLikePdf = extname(filePath).toLowerCase() === '.pdf'
+
+  // List views must stay cheap: trust document metadata + page image counts.
+  // Filesystem probes are deferred to open/detail paths.
+  let state: VerifiedPdfAssetState = 'unknown'
+  if (looksLikePdf || imagePageCount > 0) {
+    state = 'available'
+  } else if (explicitState === 'text_only' || explicitState === 'available' || hasPdfFingerprint) {
+    state = explicitState === 'available' ? 'available' : 'text_only'
+  } else if (explicitState === 'unknown' || !explicitState) {
+    state = 'unknown'
+  } else {
+    state = 'text_only'
+  }
+
+  return {
+    state,
+    imagePageCount: state === 'available' ? imagePageCount : 0,
+    metadata: JSON.stringify({ ...metadata, pdf_asset_state: state }),
+  }
+}
+
+function attachDocumentRelations(documents: DocumentListItem[]): DocumentListItem[] {
+  if (documents.length === 0) return documents
+  const documentsWithStats = attachPageStatsForDocuments(documents)
+  const docIds = documentsWithStats.map((doc) => doc.id).filter(Boolean)
   const placeholders = docIds.map(() => '?').join(', ')
 
   const tagRows = queryAll<DocumentTagRelationRow>(
@@ -3316,7 +3464,7 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
     foldersByDoc.set(row.doc_id, rows)
   })
 
-  const normalizedDocuments = normalizeCompletedOcrDocuments(documents)
+  const normalizedDocuments = normalizeCompletedOcrDocuments(documentsWithStats)
 
   return normalizedDocuments.map((doc) => {
     const tags = tagsByDoc.get(doc.id) || []
@@ -3325,7 +3473,7 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
     const storedPageCount = Number(doc.page_count || 0)
     const relocatedFilePath = doc.file_path ? resolveManagedStoragePath(doc.file_path, doc.id) : doc.file_path
     const relocatedThumbPath = doc.thumb_path ? resolveManagedStoragePath(doc.thumb_path, doc.id) : doc.thumb_path
-    const pdfAssetInfo = getVerifiedPdfAssetInfo(doc)
+    const pdfAssetInfo = resolveListPdfAssetInfo(doc)
     return {
       ...doc,
       file_path: relocatedFilePath,
@@ -3343,6 +3491,11 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
       folder_names: folders.map((folder) => folder.name).join('|'),
     }
   })
+}
+
+/** Shared by IPC and headless MCP/agent tools. */
+export function listDocumentsPage(options?: ListDocumentOptions): DocumentListPage {
+  return listDocumentPage(options)
 }
 
 function listDocumentPage(options?: ListDocumentOptions): DocumentListPage {
@@ -4378,7 +4531,8 @@ export function registerDocumentIpc(): void {
       pages: canonicalPages,
       tags,
       folders,
-      metadata_candidates: getMetadataCandidates(id)
+      // Full get is rarely used by the reader; candidates stay available via metadata APIs.
+      metadata_candidates: getMetadataCandidates(id),
     }
   })
 
@@ -4423,12 +4577,14 @@ export function registerDocumentIpc(): void {
     }
     normalizeDocumentSourceAssetsForRead(doc, pages)
 
+    // Opening a document never needed live metadata candidates for reading/proof.
+    // Keep the field for contract stability; candidates load via dedicated metadata APIs.
     return {
       ...doc,
       pages,
       tags,
       folders,
-      metadata_candidates: getMetadataCandidates(id)
+      metadata_candidates: [],
     }
   })
 
@@ -4496,6 +4652,9 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:getSearchPages', async (_event, docId: string): Promise<DocumentPage[]> => {
+    // Proof/reader search needs page text and layout boxes, not canonical artifacts.
+    // Skipping attachCanonicalPageContent avoids extra artifact-table scans per open search.
+    // Completeness: every page with text/OCR is still returned; no page is filtered out.
     const pages = hydratePagePayloadRows(queryAll<DocumentSearchPageRow>(
       `SELECT
         id,
@@ -4518,13 +4677,17 @@ export function registerDocumentIpc(): void {
       ORDER BY page_num`,
       [docId],
     ))
-    return attachCanonicalPageContent(pages.map((page) => ({
-      ...page,
-      ...parsePageOcrMeta(page),
-      image_path: null,
-      has_text: String(page.proofed_text || page.ocr_text || '').trim().length > 0,
-      __search_text_only: true,
-    })))
+    return pages.map((page) => {
+      const hasInlineText = String(page.proofed_text || page.ocr_text || '').trim().length > 0
+      return {
+        ...page,
+        has_ocr_text: hasInlineText || Boolean(page.ocr_result),
+        needs_layout_attention: false,
+        image_path: null,
+        has_text: hasInlineText,
+        __search_text_only: true,
+      }
+    })
   })
 
   ipcMain.handle('documents:getReadingWindow', async (_event, docId: string, pageIndex?: number, radius?: number): Promise<DocumentReadingWindow | null> => {

@@ -123,6 +123,8 @@ import type {
   LocalPaddleOcrSource,
   LocalPaddleOcrStatus,
   PaddleOcrTokenPoolState,
+  McpSetupInfo,
+  McpWriteCodexResult,
   LlmProviderProfile,
   LlmProviderProfileState,
   LlmProviderProfilesResult,
@@ -412,6 +414,8 @@ const api = {
     ipcRenderer.invoke('ocr:recognize', base64Image, mode),
   cancelOcr: (docId: string): Promise<boolean> =>
     ipcRenderer.invoke('ocr:cancelDocument', docId),
+  cancelAllPendingOcr: (): Promise<{ canceledJobs: number; canceledDocuments: number }> =>
+    ipcRenderer.invoke('ocr:cancelAllPending'),
   batchOcr: (docIds: string[], options?: BatchOcrOptions): Promise<number> =>
     ipcRenderer.invoke('documents:batchOcr', docIds, options),
   createImportAutoOcrTask: (options: ImportAutoOcrTaskCreateOptions): Promise<ImportAutoOcrTaskCreateResult> =>
@@ -771,6 +775,14 @@ const api = {
       ipcRenderer.invoke('settings:listPaddleOcrModels', draft?.draftRef),
     )
   },
+  getMcpSetupInfo: (): Promise<McpSetupInfo> =>
+    ipcRenderer.invoke('settings:mcp:getSetup'),
+  setMcpAgentEnabled: (enabled: boolean): Promise<McpSetupInfo> =>
+    ipcRenderer.invoke('settings:mcp:setEnabled', enabled),
+  rotateMcpAgentToken: (): Promise<McpSetupInfo> =>
+    ipcRenderer.invoke('settings:mcp:rotateToken'),
+  writeCodexMcpConfig: (): Promise<McpWriteCodexResult> =>
+    ipcRenderer.invoke('settings:mcp:writeCodexConfig'),
   getPaddleOcrTokenPool: (): Promise<PaddleOcrTokenPoolState> =>
     ipcRenderer.invoke('settings:paddleOcrTokens:list'),
   addPaddleOcrToken: (label: string, apiKey: string): Promise<PaddleOcrTokenPoolState> => {

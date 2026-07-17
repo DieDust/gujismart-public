@@ -1075,7 +1075,8 @@ export default function App() {
   }
 
   const refreshDocumentTabTitle = (tabId: string, docId: string) => {
-    void window.api.getDocument(docId)
+    // Light detail only — full getDocument hydrates every page OCR payload.
+    void window.api.getDocumentLight(docId)
       .then((document) => {
         const nextTitle = String(document?.title || '').trim()
         if (!nextTitle) return

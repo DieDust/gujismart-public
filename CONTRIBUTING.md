@@ -22,7 +22,10 @@ Run focused regression scripts when touching related areas:
 npm run test:search
 npm run test:evidence-qa
 npm run smoke
+npm run check:mcp
 ```
+
+When changing MCP / AI-tool connection surfaces, also update `docs/MCP.md` and keep tools read-only by default.
 
 Manual corpus QA scripts require private local data and are intentionally kept outside the public repository. Do not add scripts, default paths, document IDs, or fallback keywords that depend on a maintainer's private library.
 

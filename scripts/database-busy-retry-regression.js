@@ -22,15 +22,26 @@ assert(
   'Main database write transactions should acquire the writer lock before doing read-then-write OCR work',
 )
 assert(
-  databaseSource.includes('function checkpointDatabase(options?: { retryBusy?: boolean }): boolean')
-    && databaseSource.includes("db.pragma('wal_checkpoint(PASSIVE)')")
+  databaseSource.includes('function checkpointDatabase(options?: { retryBusy?: boolean; mode?: \'PASSIVE\' | \'TRUNCATE\' }): boolean')
+    && databaseSource.includes('wal_checkpoint(${mode})')
     && databaseSource.includes('if (!checkpointDatabase())')
     && databaseSource.includes('scheduleDatabaseSave()'),
   'Deferred database checkpoints should skip busy locks and reschedule instead of blocking the main process',
 )
 assert(
-  databaseSource.includes('checkpointDatabase({ retryBusy: true })'),
-  'Explicit database saves should still retry busy checkpoints briefly before shutdown or manual save',
+  databaseSource.includes("checkpointDatabase({ retryBusy: true, mode: 'TRUNCATE' })")
+    && databaseSource.includes("checkpointDatabase({ retryBusy: true, mode: 'PASSIVE' })"),
+  'Clean shutdown should try TRUNCATE then fall back to PASSIVE checkpoint so large WAL does not block the next cold start',
+)
+assert(
+  /export async function initDatabase\(\): Promise<void> \{[\s\S]*?Initialization complete/.test(databaseSource)
+    && !/export async function initDatabase\(\): Promise<void> \{[\s\S]*?scheduleDatabaseSave\([\s\S]*?Initialization complete/.test(databaseSource)
+    && !/export async function initDatabase\(\): Promise<void> \{[\s\S]*?saveDatabase\(\)[\s\S]*?Initialization complete/.test(databaseSource),
+  'Database init must not checkpoint WAL during open; large WAL rewrite freezes the UI with high disk and near-zero CPU',
+)
+assert(
+  databaseSource.includes('export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void'),
+  'Deferred database saves should accept an interactive-grace minDelay so open-path work can stay responsive',
 )
 assert(
   searchWorkerSource.includes('const WORKER_DATABASE_BUSY_TIMEOUT_MS = 10000'),

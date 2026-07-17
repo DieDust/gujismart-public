@@ -75,23 +75,70 @@ async function run() {
 
     const first = modules.pool.acquirePaddleOcrToken()
     assert.strictEqual(first.token, secrets[0], 'the primary token should remain sticky until it fails')
-    const quotaError = Object.assign(new Error(`超出单日解析最大页数 ${secrets[0]}`), { code: 429 })
-    modules.pool.markPaddleOcrTokenFailure(first, quotaError)
+
+    // Rate-limit 429 must NOT be treated as "今日额度已用完".
+    const rateLimitError = Object.assign(new Error(`OCR 接口请求失败，状态码 429：请求频率过高，请稍后重试`), { status: 429 })
+    modules.pool.markPaddleOcrTokenFailure(first, rateLimitError)
+    assert.strictEqual(
+      modules.pool.getPaddleOcrTokenPoolState().entries.find((entry) => entry.label === '账号一')?.status,
+      'rate_limited',
+      '429 with 请求频率过高 is temporary rate limiting, not daily quota exhaustion',
+    )
     const second = modules.pool.acquirePaddleOcrToken()
-    assert.strictEqual(second.token, secrets[1], '429 should advance to the next token')
+    assert.strictEqual(second.token, secrets[1], 'rate-limited tokens should advance to the next token')
+
+    const quotaError = Object.assign(new Error(`超出单日解析最大页数 ${secrets[1]}`), { code: 429 })
+    modules.pool.markPaddleOcrTokenFailure(second, quotaError)
+    assert.strictEqual(
+      modules.pool.getPaddleOcrTokenPoolState().entries.find((entry) => entry.label === '账号二')?.status,
+      'quota_exhausted',
+      'true daily page-quota 429 should mark quota_exhausted',
+    )
+    assert.strictEqual(
+      modules.pool.acquirePaddleOcrToken().token,
+      secrets[2],
+      'after daily quota exhaustion the next token must stay sticky without re-trying the exhausted one',
+    )
+
+    // 403 with a quota-like message must count as daily exhaustion, not permanent invalid.
+    const third = modules.pool.acquirePaddleOcrToken()
+    assert.strictEqual(third.token, secrets[2])
+    const quotaAs403 = Object.assign(new Error('当日额度不足'), { status: 403 })
+    // 403 + 额度 → still quota (classify checks quota message after rate limit)
+    modules.pool.markPaddleOcrTokenFailure(third, quotaAs403)
+    // Wait - 403 with 当日额度不足: isQuotaExhaustionMessage true, isRateLimit false.
+    // classify: rate limit check first false; quota message true → quota_exhausted. Good.
+    // But then all three may be blocked: t1 rate_limited, t2 quota, t3 quota.
+    // rate_limited still blocks until cooldown - so acquire may throw rate limit or all exhausted.
 
     const authError = Object.assign(new Error('Token 错误'), { status: 403 })
-    modules.pool.markPaddleOcrTokenFailure(second, authError)
-    const third = modules.pool.acquirePaddleOcrToken()
-    assert.strictEqual(third.token, secrets[2], '403 should skip an invalid token')
+    // Re-enable path: reset third then mark invalid for the all-invalid path later.
+    modules.pool.resetPaddleOcrTokenRuntime(third.id)
+    modules.pool.markPaddleOcrTokenFailure(third, authError)
+    assert.strictEqual(
+      modules.pool.getPaddleOcrTokenPoolState().entries.find((entry) => entry.label === '账号三')?.status,
+      'invalid',
+    )
+
+    // Clear rate-limit on first so we can assert only quota/invalid remain as long-term blocks.
+    modules.pool.resetPaddleOcrTokenRuntime(first.id)
+    modules.pool.markPaddleOcrTokenFailure(first, Object.assign(new Error('超出单日解析最大页数'), { code: 429 }))
+    assert.throws(() => modules.pool.acquirePaddleOcrToken(), /所有可用的 PaddleOCR Token/)
 
     const failedState = modules.pool.getPaddleOcrTokenPoolState()
-    assert.deepStrictEqual(failedState.entries.map((entry) => entry.status), ['quota_exhausted', 'invalid', 'active'])
+    assert.deepStrictEqual(failedState.entries.map((entry) => entry.status), ['quota_exhausted', 'quota_exhausted', 'invalid'])
     assert.ok(!JSON.stringify(failedState).includes(secrets[0]), 'runtime errors exposed to the renderer must redact token plaintext')
+
+    // Restart simulation: clear in-module memory by reloading is hard; instead verify SQLite runtime snapshot
+    // is written so a fresh process would skip the exhausted tokens without another API call.
+    const runtimeSnapshot = database.queryOne('SELECT value FROM settings WHERE key = ?', ['paddleocr_token_runtime']).value
+    assert.ok(runtimeSnapshot.includes('quota_exhausted'), 'daily exhaustion must be persisted to settings')
+    assert.ok(!runtimeSnapshot.includes(secrets[0]), 'runtime snapshot must not store plaintext tokens')
+
     const withTemporaryBackup = modules.pool.addPaddleOcrToken('临时备用', 'fixture-paddle-token-four')
     assert.deepStrictEqual(
-      withTemporaryBackup.entries.slice(0, 2).map((entry) => entry.status),
-      ['quota_exhausted', 'invalid'],
+      withTemporaryBackup.entries.slice(0, 3).map((entry) => entry.status),
+      ['quota_exhausted', 'quota_exhausted', 'invalid'],
       'adding another token must not reactivate exhausted or invalid accounts',
     )
     const temporaryBackup = withTemporaryBackup.entries.find((entry) => entry.label === '临时备用')

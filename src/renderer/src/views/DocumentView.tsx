@@ -2146,7 +2146,15 @@ export default function DocumentView({
       }
       setDoc(normalizedDoc)
       const targetIndex = resolveStableLocatorPageIndex(normalizedDoc.pages || [], stableLocator, locator, initialPageIndex)
-      void loadPagesAround(targetIndex, 4)
+      // First paint with a smaller window, then expand for adjacent-page readiness.
+      // Completeness is unchanged: any page is still loaded on demand when navigated.
+      void loadPagesAround(targetIndex, 2).then(() => {
+        if (activeDocumentIdRef.current !== targetDocId) return
+        window.setTimeout(() => {
+          if (activeDocumentIdRef.current !== targetDocId) return
+          void loadPagesAround(targetIndex, 4)
+        }, 280)
+      })
     } catch (error) {
       console.error(error)
       message.error('加载文献详情失败')
@@ -2689,6 +2697,8 @@ export default function DocumentView({
   const hasReaderSearchQuery = Boolean(localSearchKeyword.trim())
   useEffect(() => {
     const requestId = ++searchPagesRequestIdRef.current
+    // Only proof mode needs whole-book page payloads for local layout/text match expansion.
+    // Read mode already uses indexed document search hits (complete) without this bulk hydrate.
     const shouldLoadSearchPages = documentMode === 'proof'
     if (!documentId || !hasReaderSearchQuery || !shouldLoadSearchPages) {
       setReaderSearchPages([])

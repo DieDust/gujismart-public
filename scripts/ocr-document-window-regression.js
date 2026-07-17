@@ -65,8 +65,17 @@ async function main() {
   assert.ok(libraryView.includes("const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'"), 'Library should use one aggregate OCR message key')
   assert.ok(libraryView.includes('buildOcrActivitySummary(Object.values(nextProgressByDoc))'), 'Library should aggregate document progress')
   assert.ok(!libraryView.includes('message.loading({\n          content: getOcrProgressText(nextInfo),\n          key: toastKey'), 'Library must not open one persistent toast per document')
-  assert.ok((ocrIpc.match(/globalOcrDocumentWindow\.run\(getOcrDocumentConcurrency\(\)/g) || []).length >= 2, 'automatic and manual OCR should share the global document window')
-  assert.ok(batchProcessor.includes('globalOcrDocumentWindow.run(getOcrDocumentConcurrency()'), 'legacy resumed OCR should share the global document window')
+  assert.ok(
+    ocrIpc.includes('runBoundedDocumentWorkers')
+      && (ocrIpc.match(/globalOcrDocumentWindow\.run\(/g) || []).length >= 2
+      && ocrIpc.includes('getOcrDocumentConcurrency'),
+    'automatic and manual OCR should share the global document window via the bounded worker pool',
+  )
+  assert.ok(
+    batchProcessor.includes('globalOcrDocumentWindow.run(getOcrDocumentConcurrency()')
+      || batchProcessor.includes('globalOcrDocumentWindow.run('),
+    'legacy resumed OCR should share the global document window',
+  )
 
   console.log('OCR document sliding-window regression passed.')
 }

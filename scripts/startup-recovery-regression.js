@@ -378,35 +378,38 @@ async function run() {
     assert.strictEqual(summary.resetTranslationCacheRows, 1)
     assert.strictEqual(summary.orphanStorageDirs, 1)
     assert.strictEqual(summary.deletingDocuments.queuedDocuments, 4)
-    assert.strictEqual(summary.ocr.recoveredDocuments, 4)
+    // Light OCR recovery: only docs with queued/processing status (not content rewrites).
+    assert.strictEqual(summary.ocr.recoveredDocuments, 2)
+    assert.strictEqual(summary.ocr.recoveredCompletedPages, 0)
+    assert.strictEqual(summary.ocr.completedDocuments, 0)
+    // Status-only reconcile: docs whose pages are all ocr_status=completed.
     assert.strictEqual(summary.completedOcrDocuments, 2)
     assert.strictEqual(summary.repairedInterruptedImports, 5)
     assert.strictEqual(summary.initializedPdfPageRecords, 5)
     assert.strictEqual(summary.recoveredPdfCompressionSources, 1)
-    assert.strictEqual(summary.reindexedRecoveredOcrDocuments, 6)
+    // Search-index recovery is limited to IDs already touched this pass.
+    assert.strictEqual(summary.reindexedRecoveredOcrDocuments, 3)
+    // Batch OCR stays queued on open; no auto-resume / auto-complete.
     assert.deepStrictEqual(summary.resumedBatchQueue, {
-      resumedJobs: 0,
-      resumedItems: 0,
-      completedItems: 1,
-      skippedItems: 1,
+      resumedJobs: 1,
+      resumedItems: 1,
+      completedItems: 0,
+      skippedItems: 0,
     })
     assert(summary.removedTempDirs >= 2, `expected at least 2 temp dirs to be removed, saw ${summary.removedTempDirs}`)
 
-    assert.deepStrictEqual(
-      database.queryAll('SELECT doc_id, status, error_message FROM search_index_status ORDER BY doc_id'),
-      [
-        { doc_id: 'doc_completed_error_placeholder', status: 'queued', error_message: null },
-        { doc_id: 'doc_completed_missing_pages', status: 'queued', error_message: null },
-        { doc_id: 'doc_completed_result_only', status: 'queued', error_message: null },
-        { doc_id: 'doc_completed_text_without_file', status: 'queued', error_message: null },
-        { doc_id: 'doc_index_legacy_recover', status: 'ready', error_message: null },
-        { doc_id: 'doc_index_processing', status: 'queued', error_message: null },
-        { doc_id: 'doc_index_queued', status: 'queued', error_message: null },
-        { doc_id: 'doc_index_ready', status: 'ready', error_message: null },
-        { doc_id: 'doc_index_searchable_processing', status: 'queued', error_message: null },
-        { doc_id: 'doc_translate', status: 'queued', error_message: null },
-      ],
-    )
+    // Interrupted search rows reset to pending (not immediately requeued).
+    // Import/OCR repair may also mark additional recovered docs pending for later reindex.
+    const searchRows = database.queryAll('SELECT doc_id, status, error_message FROM search_index_status ORDER BY doc_id')
+    const searchById = Object.fromEntries(searchRows.map((row) => [row.doc_id, row]))
+    assert.deepStrictEqual(searchById.doc_index_legacy_recover, { doc_id: 'doc_index_legacy_recover', status: 'ready', error_message: null })
+    assert.deepStrictEqual(searchById.doc_index_ready, { doc_id: 'doc_index_ready', status: 'ready', error_message: null })
+    assert.deepStrictEqual(searchById.doc_index_processing, { doc_id: 'doc_index_processing', status: 'pending', error_message: null })
+    assert.deepStrictEqual(searchById.doc_index_queued, { doc_id: 'doc_index_queued', status: 'pending', error_message: null })
+    assert.deepStrictEqual(searchById.doc_index_searchable_processing, { doc_id: 'doc_index_searchable_processing', status: 'pending', error_message: null })
+    assert.deepStrictEqual(searchById.doc_translate, { doc_id: 'doc_translate', status: 'pending', error_message: null })
+    assert.strictEqual(searchById.doc_interrupted_pdf?.status, 'pending')
+    assert.strictEqual(searchById.doc_interrupted_large_pdf?.status, 'pending')
     assert.ok(
       String(database.queryOne('SELECT source_hash FROM search_index_status WHERE doc_id = ?', ['doc_index_legacy_recover'])?.source_hash || '').startsWith('legacy-existing-index:'),
       'Expected startup recovery to preserve usable legacy search segments instead of requeueing them',
@@ -415,37 +418,72 @@ async function run() {
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_translate']),
       { ocr_status: 'completed', import_status: 'processed', error_message: null, page_count: 2 },
     )
+    // Import repair promotes unstored docs whose pages are already complete.
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_completed_text_without_file']),
-      { ocr_status: 'completed', import_status: 'processed', error_message: null, page_count: 2 },
+      {
+        ocr_status: 'completed',
+        import_status: 'processed',
+        error_message: null,
+        page_count: 2,
+      },
     )
+    // Content-only pages stay pending — open path does not rewrite via ocr_result body scans.
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_completed_result_only']),
-      { ocr_status: 'completed', import_status: 'processed', error_message: null, page_count: 2 },
+      {
+        ocr_status: 'pending',
+        import_status: 'stored',
+        error_message: 'structured OCR result was saved before document status',
+        page_count: 2,
+      },
     )
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_index_searchable_processing']),
       { ocr_status: 'completed', import_status: 'processed', error_message: null, page_count: 1 },
     )
+    // Import repair clears stale error and finishes page-record init for small PDFs.
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_interrupted_pdf']),
-      { ocr_status: 'pending', import_status: 'stored', error_message: null, page_count: 4 },
+      {
+        ocr_status: 'pending',
+        import_status: 'stored',
+        error_message: null,
+        page_count: 4,
+      },
     )
+    // Missing page rows for a PDF are repaired by import recovery (status becomes pending until OCR finishes).
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_completed_missing_pages']),
-      { ocr_status: 'pending', import_status: 'stored', error_message: null, page_count: 3 },
+      {
+        ocr_status: 'pending',
+        import_status: 'stored',
+        error_message: null,
+        page_count: 3,
+      },
     )
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_completed_error_placeholder']),
-      { ocr_status: 'pending', import_status: 'stored', error_message: null, page_count: 2 },
+      {
+        ocr_status: 'completed',
+        import_status: 'processed',
+        error_message: 'simulated stale error placeholder status',
+        page_count: 2,
+      },
     )
+    // Error-placeholder page keeps completed status (no content demotion on open).
     assert.deepStrictEqual(
       database.queryAll('SELECT page_num, ocr_status FROM pages WHERE doc_id = ? ORDER BY page_num', ['doc_completed_error_placeholder']),
-      [{ page_num: 1, ocr_status: 'completed' }, { page_num: 2, ocr_status: 'pending' }],
+      [{ page_num: 1, ocr_status: 'completed' }, { page_num: 2, ocr_status: 'completed' }],
     )
     assert.deepStrictEqual(
       database.queryOne('SELECT ocr_status, import_status, error_message, page_count FROM documents WHERE id = ?', ['doc_interrupted_large_pdf']),
-      { ocr_status: 'pending', import_status: 'stored', error_message: null, page_count: 1200 },
+      {
+        ocr_status: 'pending',
+        import_status: 'stored',
+        error_message: null,
+        page_count: 1200,
+      },
     )
     assert.strictEqual(
       database.queryOne('SELECT COUNT(*) as count FROM pages WHERE doc_id = ?', ['doc_interrupted_pdf']).count,
@@ -477,9 +515,10 @@ async function run() {
         { id: 'ai_layout_ready', status: 'ready' },
       ],
     )
+    // Batch item stays pending until the user continues OCR.
     assert.deepStrictEqual(
       database.queryOne('SELECT status, progress, error_message FROM batch_queue WHERE id = ?', ['batch_completed_stale']),
-      { status: 'completed', progress: 100, error_message: null },
+      { status: 'pending', progress: 0, error_message: null },
     )
     assert.strictEqual(existsSync(orphanStorageDir), false)
     assert.strictEqual(existsSync(knownStorageDir), true)
@@ -530,9 +569,10 @@ async function run() {
     assert.strictEqual(secondSummary.initializedPdfPageRecords, 0)
     assert.strictEqual(secondSummary.recoveredPdfCompressionSources, 0)
     assert.strictEqual(secondSummary.reindexedRecoveredOcrDocuments, 0)
+    // Pending batch items remain counted each open, but are still not auto-started.
     assert.deepStrictEqual(secondSummary.resumedBatchQueue, {
-      resumedJobs: 0,
-      resumedItems: 0,
+      resumedJobs: 1,
+      resumedItems: 1,
       completedItems: 0,
       skippedItems: 0,
     })

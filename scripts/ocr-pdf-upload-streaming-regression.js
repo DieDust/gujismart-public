@@ -449,10 +449,11 @@ assert(
   'OCR IPC should identify very large PDF documents before scheduling batch OCR work',
 )
 assert(
-  ocrIpcSource.includes('const heavyPdfLimit = createLimiter(1)')
-    && ocrIpcSource.includes('const heavyPdfDocIds = new Set<string>()')
-    && ocrIpcSource.includes('heavyPdfDocIds.has(docId) ? heavyPdfLimit : docLimit'),
-  'Heavy PDF OCR documents should use a dedicated single-document limiter instead of the normal batch concurrency',
+  ocrIpcSource.includes('const heavyPdfDocIds = new Set<string>()')
+    && ocrIpcSource.includes('globalOcrDocumentWindow.run(heavy ? 1 : documentConcurrency')
+    && ocrIpcSource.includes('runBoundedDocumentWorkers')
+    && ocrIpcSource.includes('isHeavyPdfOcrDocument'),
+  'Heavy PDF OCR documents should run at concurrency 1 inside the shared document window instead of the normal batch concurrency',
 )
 assert(
   recognizePdfAsyncBody.includes('let chunkCompleteQueue = Promise.resolve()')

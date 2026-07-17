@@ -67,42 +67,6 @@ function insertPage(database, id, docId, pageNum, status) {
   )
 }
 
-function insertStructuredResultOnlyPage(database, id, docId, pageNum) {
-  database.run(
-    'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [
-      id,
-      docId,
-      pageNum,
-      null,
-      null,
-      JSON.stringify({ words_result: [{ words: `structured result only ${pageNum}` }] }),
-      null,
-      'pending',
-      'pending',
-      new Date().toISOString(),
-    ],
-  )
-}
-
-function insertErrorResultOnlyPage(database, id, docId, pageNum) {
-  database.run(
-    'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [
-      id,
-      docId,
-      pageNum,
-      null,
-      null,
-      JSON.stringify({ source_type: 'ocr_error', error: 'quality failure placeholder', failed_at: new Date().toISOString() }),
-      null,
-      'completed',
-      'pending',
-      new Date().toISOString(),
-    ],
-  )
-}
-
 function getDoc(database, id) {
   return database.queryOne('SELECT ocr_status, import_status, error_message FROM documents WHERE id = ?', [id])
 }
@@ -120,6 +84,8 @@ async function run() {
     const { recovery } = modules
 
     await database.initDatabase()
+
+    // Interrupted mid-OCR: in-flight page statuses must reset to pending.
     insertDocument(database, 'doc_interrupted', {
       pageCount: 3,
       ocrStatus: 'processing',
@@ -130,6 +96,8 @@ async function run() {
     insertPage(database, 'page_interrupted_2', 'doc_interrupted', 2, 'processing')
     insertPage(database, 'page_interrupted_3', 'doc_interrupted', 3, 'queued')
 
+    // Document status wrong while every page is already completed — light recovery
+    // only resets status rows; it does NOT promote to completed via content scans.
     insertDocument(database, 'doc_finished_but_stale', {
       pageCount: 2,
       ocrStatus: 'processing',
@@ -145,6 +113,8 @@ async function run() {
       importStatus: 'processing',
     })
 
+    // Content exists but statuses are pending: light recovery must leave these alone
+    // (no full-table content rewrite on open).
     insertDocument(database, 'doc_content_but_pending', {
       pageCount: 2,
       ocrStatus: 'pending',
@@ -156,23 +126,14 @@ async function run() {
     database.run('UPDATE pages SET ocr_text = ? WHERE id = ?', ['recovered text 1', 'page_content_pending_1'])
     database.run('UPDATE pages SET proofed_text = ? WHERE id = ?', ['recovered proof 2', 'page_content_pending_2'])
 
-    insertDocument(database, 'doc_result_only_pending', {
+    // Pages in-flight while document status already drifted to pending.
+    insertDocument(database, 'doc_orphan_inflight_pages', {
       pageCount: 2,
       ocrStatus: 'pending',
       importStatus: 'stored',
-      errorMessage: 'structured result was saved before final status',
     })
-    insertStructuredResultOnlyPage(database, 'page_result_only_1', 'doc_result_only_pending', 1)
-    insertStructuredResultOnlyPage(database, 'page_result_only_2', 'doc_result_only_pending', 2)
-
-    insertDocument(database, 'doc_error_placeholder_completed', {
-      pageCount: 2,
-      ocrStatus: 'completed',
-      importStatus: 'processed',
-      errorMessage: null,
-    })
-    insertPage(database, 'page_error_placeholder_completed_1', 'doc_error_placeholder_completed', 1, 'completed')
-    insertErrorResultOnlyPage(database, 'page_error_placeholder_completed_2', 'doc_error_placeholder_completed', 2)
+    insertPage(database, 'page_orphan_1', 'doc_orphan_inflight_pages', 1, 'processing')
+    insertPage(database, 'page_orphan_2', 'doc_orphan_inflight_pages', 2, 'queued')
 
     insertDocument(database, 'doc_partial_large_pdf', {
       pageCount: 1200,
@@ -183,6 +144,7 @@ async function run() {
     })
     insertPage(database, 'page_partial_large_pdf_1', 'doc_partial_large_pdf', 1, 'completed')
 
+    // Deleting docs must be skipped.
     insertDocument(database, 'doc_deleting', {
       pageCount: 1,
       ocrStatus: 'processing',
@@ -206,62 +168,62 @@ async function run() {
     database.run('PRAGMA foreign_keys = ON')
 
     const summary = recovery.recoverInterruptedOcrJobs()
-    assert.strictEqual(summary.recoveredDocuments, 7)
-    assert.strictEqual(summary.recoveredPages, 3)
-    assert.strictEqual(summary.recoveredCompletedPages, 4)
+    // Interrupted by document status: interrupted, finished_but_stale, queued_no_pages, partial_large_pdf
+    // Plus orphan_inflight_pages (page statuses only).
+    assert.strictEqual(summary.recoveredDocuments, 5)
+    // processing/queued pages: interrupted(2) + orphan(2); deleting docs are skipped.
+    assert.strictEqual(summary.recoveredPages, 4)
+    assert.strictEqual(summary.recoveredCompletedPages, 0)
     assert.strictEqual(summary.recoveredBatchItems, 2)
     assert.strictEqual(summary.removedOrphanedBatchItems, 1)
-    assert.strictEqual(summary.completedDocuments, 3)
-    assert.strictEqual(summary.pendingDocuments, 4)
+    // Light recovery never promotes to completed via content scans.
+    assert.strictEqual(summary.completedDocuments, 0)
+    assert.strictEqual(summary.pendingDocuments, 5)
 
     assert.deepStrictEqual(getDoc(database, 'doc_interrupted'), {
       ocr_status: 'pending',
       import_status: 'stored',
-      error_message: null,
+      error_message: 'stale in-flight upload',
     })
     assert.deepStrictEqual(getPageStatuses(database, 'doc_interrupted'), ['completed', 'pending', 'pending'])
 
+    // Light recovery resets status only; does not complete fully-done docs.
     assert.deepStrictEqual(getDoc(database, 'doc_finished_but_stale'), {
-      ocr_status: 'completed',
-      import_status: 'processed',
-      error_message: null,
+      ocr_status: 'pending',
+      import_status: 'stored',
+      error_message: 'final status was not saved',
     })
     assert.deepStrictEqual(getPageStatuses(database, 'doc_finished_but_stale'), ['completed', 'completed'])
 
     assert.deepStrictEqual(getDoc(database, 'doc_queued_no_pages'), {
       ocr_status: 'pending',
       import_status: 'stored',
-      error_message: null,
+      error_message: '应用上次退出时 OCR 未完成，可继续识别',
     })
 
+    // Content-only cases untouched.
     assert.deepStrictEqual(getDoc(database, 'doc_content_but_pending'), {
-      ocr_status: 'completed',
-      import_status: 'processed',
-      error_message: null,
-    })
-    assert.deepStrictEqual(getPageStatuses(database, 'doc_content_but_pending'), ['completed', 'completed'])
-
-    assert.deepStrictEqual(getDoc(database, 'doc_result_only_pending'), {
-      ocr_status: 'completed',
-      import_status: 'processed',
-      error_message: null,
-    })
-    assert.deepStrictEqual(getPageStatuses(database, 'doc_result_only_pending'), ['completed', 'completed'])
-
-    assert.deepStrictEqual(getDoc(database, 'doc_error_placeholder_completed'), {
       ocr_status: 'pending',
       import_status: 'stored',
-      error_message: null,
+      error_message: 'page status was not finalized',
     })
-    assert.deepStrictEqual(getPageStatuses(database, 'doc_error_placeholder_completed'), ['completed', 'pending'])
+    assert.deepStrictEqual(getPageStatuses(database, 'doc_content_but_pending'), ['pending', 'pending'])
+
+    assert.deepStrictEqual(getDoc(database, 'doc_orphan_inflight_pages'), {
+      ocr_status: 'pending',
+      import_status: 'stored',
+      error_message: '应用上次退出时 OCR 未完成，可继续识别',
+    })
+    assert.deepStrictEqual(getPageStatuses(database, 'doc_orphan_inflight_pages'), ['pending', 'pending'])
 
     assert.deepStrictEqual(getDoc(database, 'doc_partial_large_pdf'), {
       ocr_status: 'pending',
       import_status: 'stored',
-      error_message: null,
+      error_message: 'large PDF was interrupted after the first chunk',
     })
     assert.deepStrictEqual(getPageStatuses(database, 'doc_partial_large_pdf'), ['completed'])
 
+    // Deleting docs and their pages must be left alone.
     assert.deepStrictEqual(getDoc(database, 'doc_deleting'), {
       ocr_status: 'processing',
       import_status: 'deleting',

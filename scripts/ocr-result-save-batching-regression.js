@@ -418,8 +418,13 @@ assert(
 )
 assert(
   savePageOcrResultsBody.includes('if (!options.deferDatabaseSave)')
-    && savePageOcrResultsBody.includes('scheduleDatabaseSave()'),
+    && /scheduleDatabaseSave\(/.test(savePageOcrResultsBody),
   'savePageOcrResults should skip scheduleDatabaseSave when deferred by its caller.',
+)
+assert(
+  savePageOcrResultsBody.includes('preparePagePayloadUpdate')
+    && savePageOcrResultsBody.indexOf('preparePagePayloadUpdate') < savePageOcrResultsBody.indexOf('transaction(() => {'),
+  'OCR payload file externalization must happen before the SQL write transaction so disk I/O does not freeze the UI.',
 )
 assert(
   savePageOcrResultsBody.includes('options.onTocDirtyDocIds?.([...tocDirtyDocIds])'),
@@ -617,12 +622,12 @@ assert(
   ocrIpcSource.includes('function markPageOcrVersionsInactive')
     && ocrIpcSource.includes('UPDATE page_ocr_versions SET is_active = 0 WHERE page_id IN')
     && savePageOcrResultsBody.includes('const versionWrites: OcrVersionWrite[] = []')
-    && savePageOcrResultsBody.includes('const shouldWriteOcrVersion = resultPayload && existingPage')
+    && savePageOcrResultsBody.includes('const shouldWriteOcrVersion = resultPayload && (')
     && savePageOcrResultsBody.includes("pageResult.status === 'error' && isOcrQualityFailureMessage(pageResult.error)")
     && savePageOcrResultsBody.includes('versionWrites.push({')
-    && savePageOcrResultsBody.includes('markPageOcrVersionsInactive(versionWrites.map((item) => item.pageId))')
-    && savePageOcrResultsBody.includes('upsertPageOcrVersion(item.pageId, engine, item.result, item.text, item.status, item.page')
-    && savePageOcrResultsBody.includes('deactivateExisting: false'),
+    && savePageOcrResultsBody.includes('markPageOcrVersionsInactive(preparedVersionWrites.map((entry) => entry.item.pageId))')
+    && savePageOcrResultsBody.includes('INSERT INTO page_ocr_versions')
+    && savePageOcrResultsBody.includes('ON CONFLICT(page_id, engine) DO UPDATE SET'),
   'savePageOcrResults should mark previous OCR versions inactive once per save batch before upserting active versions.',
 )
 assert(
@@ -651,7 +656,7 @@ assert(
   'batched OCR saves should defer per-chunk TOC invalidation, finalization, and database checkpoints.',
 )
 assert(
-  ocrSaveChunkSize >= 4 && ocrSaveChunkSize <= 16
+  ocrSaveChunkSize >= 2 && ocrSaveChunkSize <= 8
     && savePageOcrResultsBatchedBody.includes('await yieldToEventLoop()'),
   'OCR result save batches should bound synchronous gzip/file work and yield between transactions so large saves do not freeze the main process.',
 )
@@ -659,7 +664,7 @@ assert(
   savePageOcrResultsBatchedBody.includes('tocDirtyDocIds.forEach(markDocumentTocDirty)')
     && savePageOcrResultsBatchedBody.includes('options.onTocDirtyDocIds?.([...tocDirtyDocIds])')
     && savePageOcrResultsBatchedBody.includes('scheduleOcrFinalizeForPages(changedPageIds)')
-    && savePageOcrResultsBatchedBody.includes('scheduleDatabaseSave()'),
+    && /scheduleDatabaseSave\(/.test(savePageOcrResultsBatchedBody),
   'batched OCR saves should coalesce TOC invalidation, finalization, and checkpointing once after all chunks.',
 )
 assert(

@@ -58,6 +58,7 @@ import {
   recoverInterruptedImportAutoOcrTasks,
 } from '../import-auto-ocr-task'
 import {
+  cancelTaskJob,
   claimTaskItems,
   completeTaskItem,
   failTaskItem,
@@ -87,7 +88,8 @@ const AUTO_METADATA_TIMEOUT_MS = 120_000
 const AUTO_METADATA_QUEUE_TIMEOUT_MS = 30 * 60_000
 const AUTO_METADATA_START_DELAY_MS = 5_000
 const OCR_PAGE_INSERT_CHUNK_SIZE = 50
-const OCR_RESULT_SAVE_CHUNK_SIZE = 8
+// Small SQL transactions so the main process can still handle UI IPC while OCR is saving.
+const OCR_RESULT_SAVE_CHUNK_SIZE = 3
 const OCR_RESULT_POSTPROCESS_CHUNK_SIZE = 16
 const OCR_DOCUMENT_REPROCESS_CHUNK_SIZE = 8
 const OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE = 25
@@ -4830,10 +4832,12 @@ function resetPagesForFullOcrRerun(docId: string): void {
 }
 
 function hasIncompleteOcrPages(docId: string): boolean {
+  // Keep this cheap for batch enqueue of large queues. Content-predicate scans on
+  // every page row freeze the main process before any OCR work starts.
   const stats = queryOne<{ total: number; completed: number }>(
     `SELECT
        COUNT(*) as total,
-       SUM(CASE WHEN ocr_status = 'completed' AND ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed
+       SUM(CASE WHEN COALESCE(ocr_status, '') = 'completed' THEN 1 ELSE 0 END) as completed
      FROM pages
      WHERE doc_id = ?`,
     [docId],
@@ -4841,6 +4845,28 @@ function hasIncompleteOcrPages(docId: string): boolean {
   const total = Number(stats?.total || 0)
   const completed = Number(stats?.completed || 0)
   return total === 0 || completed < total
+}
+
+/** True worker pool: only `concurrency` tasks exist at once, pull next id when free. */
+async function runBoundedDocumentWorkers<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return
+  let nextIndex = 0
+  const workerCount = Math.max(1, Math.min(Math.floor(concurrency) || 1, items.length))
+  const runners = Array.from({ length: workerCount }, async () => {
+    while (!ocrRuntimeShuttingDown) {
+      const index = nextIndex
+      nextIndex += 1
+      if (index >= items.length) return
+      await worker(items[index], index)
+      // Keep the main event loop free for list/UI IPC between documents.
+      await yieldToEventLoop()
+    }
+  })
+  await Promise.all(runners)
 }
 
 function summarizeDocumentOcrPages(docId: string): { total: number; completed: number; failed: number; pending: number } {
@@ -5011,6 +5037,113 @@ function updateDocumentCanceledStatus(docId: string): void {
   scheduleDatabaseSave()
 }
 
+/** Cancel persisted queue rows for one document so resume cannot pick it up again. */
+function cancelPersistedOcrQueueForDocument(docId: string): void {
+  const safeDocId = String(docId || '').trim()
+  if (!safeDocId) return
+  const nowMs = Date.now()
+  const nowIso = new Date(nowMs).toISOString()
+  transaction(() => {
+    run(
+      `UPDATE batch_queue
+       SET status = 'failed',
+           error_message = ?,
+           completed_at = ?
+       WHERE doc_id = ?
+         AND status IN ('pending', 'processing')`,
+      [OCR_CANCELED_MESSAGE, nowIso, safeDocId],
+    )
+    // Import-auto OCR items store docId in domain_ref and input_json.
+    run(
+      `UPDATE task_items
+       SET status = 'canceled',
+           completion_kind = NULL,
+           active_attempt_id = NULL,
+           lease_owner = NULL,
+           lease_token = NULL,
+           leased_at = NULL,
+           lease_expires_at = NULL,
+           heartbeat_at = NULL,
+           completed_at = ?,
+           updated_at = ?,
+           error_json = ?
+       WHERE status IN ('queued', 'running', 'paused', 'error')
+         AND (
+           domain_ref = ?
+           OR json_extract(input_json, '$.docId') = ?
+         )`,
+      [
+        nowMs,
+        nowMs,
+        JSON.stringify({ code: 'ocr_canceled', message: OCR_CANCELED_MESSAGE, recoverable: false }),
+        safeDocId,
+        safeDocId,
+      ],
+    )
+  })
+  scheduleDatabaseSave()
+}
+
+function cancelAllPersistedOcrQueues(): { canceledJobs: number; canceledDocuments: number } {
+  const nowMs = Date.now()
+  const nowIso = new Date(nowMs).toISOString()
+  const resumableJobs = listResumableImportAutoOcrTasks()
+  resumableJobs.forEach((job) => {
+    try {
+      cancelTaskJob(job.id, { nowMs })
+    } catch (error) {
+      console.warn('[OCR] Failed to cancel import-auto job', job.id, error)
+    }
+  })
+
+  const queuedDocs = queryAll<{ id: string }>(
+    `SELECT id FROM documents
+     WHERE ocr_status IN ('queued', 'processing')
+        OR import_status = 'processing'`,
+  ).map((row) => row.id).filter(Boolean)
+
+  transaction(() => {
+    run(
+      `UPDATE batch_queue
+       SET status = 'failed',
+           error_message = ?,
+           completed_at = ?
+       WHERE status IN ('pending', 'processing')`,
+      [OCR_CANCELED_MESSAGE, nowIso],
+    )
+    if (queuedDocs.length > 0) {
+      for (let index = 0; index < queuedDocs.length; index += 200) {
+        const chunk = queuedDocs.slice(index, index + 200)
+        const placeholders = chunk.map(() => '?').join(', ')
+        run(
+          `UPDATE documents
+           SET ocr_status = CASE
+                 WHEN ocr_status IN ('queued', 'processing') THEN 'pending'
+                 ELSE ocr_status
+               END,
+               import_status = CASE
+                 WHEN import_status = 'processing' THEN 'stored'
+                 ELSE import_status
+               END,
+               error_message = ?,
+               updated_at = ?
+           WHERE id IN (${placeholders})`,
+          [OCR_CANCELED_MESSAGE, nowIso, ...chunk],
+        )
+        run(
+          `UPDATE pages
+           SET ocr_status = 'pending'
+           WHERE doc_id IN (${placeholders})
+             AND ocr_status IN ('queued', 'processing')`,
+          chunk,
+        )
+      }
+    }
+  })
+  scheduleDatabaseSave()
+  return { canceledJobs: resumableJobs.length, canceledDocuments: queuedDocs.length }
+}
+
 function markDocumentTocDirty(docId: string): void {
   run("DELETE FROM document_toc_items WHERE doc_id = ? AND source != 'manual'", [docId])
   clearDocumentTocAutogenAttempt(docId)
@@ -5042,115 +5175,188 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
   const guardedPageResults = pageResults.map(guardRepeatedOcrPageResult)
   const startedAt = Date.now()
   const changedPageIds: string[] = []
-  const changedDocIds = new Set<string>()
   const tocDirtyDocIds = new Set<string>()
-  let pageSnapshots = new Map<string, OcrSavePageSnapshot>()
   const versionWrites: OcrVersionWrite[] = []
 
-  transaction(() => {
-    pageSnapshots = getPageSnapshotsForOcrSave(guardedPageResults.map((pageResult) => pageResult.pageId))
-    for (const pageResult of guardedPageResults) {
-      const existingPage = pageSnapshots.get(pageResult.pageId)
-      const hasProofedText = String(existingPage?.proofed_text || '').trim().length > 0
-      const hasExistingOcrText = String(existingPage?.ocr_text || '').trim().length > 0
-      if (pageResult.status === 'error' && existingPage && hasExistingOcrText && !isOcrQualityFailureMessage(pageResult.error)) {
-        if (String(existingPage.ocr_status || '') !== 'completed') {
-          run(
-            `UPDATE pages
-             SET ocr_status = ?,
-                 proof_status = CASE WHEN ? THEN proof_status ELSE ? END
-             WHERE id = ?`,
-            [
-              'completed',
-              hasProofedText ? 1 : 0,
-              'pending',
-              pageResult.pageId,
-            ],
-          )
-          changedPageIds.push(pageResult.pageId)
-          changedDocIds.add(existingPage.doc_id)
-        }
-        continue
-      }
-      const normalizedCompleted = pageResult.status === 'completed' && pageResult.result
-        ? normalizeOcrResultForStorage(pageResult.result, existingPage, engine)
-        : null
-      const resultPayload = normalizedCompleted?.result || pageResult.result || (pageResult.error
-        ? {
-            source_type: 'ocr_error',
-            error: pageResult.error,
-            failed_at: new Date().toISOString(),
-          }
-        : null)
-      const resultText = normalizedCompleted?.text || pageResult.text
-      const resultJson = resultPayload ? JSON.stringify(resultPayload) : null
-      if (
-        existingPage
-        && String(existingPage.ocr_status || '') === pageResult.status
-        && String(existingPage.ocr_text || '') === String(resultText || '')
-        && String(existingPage.ocr_result || '') === String(resultJson || '')
-      ) {
-        continue
-      }
-      const preparedResult = existingPage
-        ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_result', resultJson)
-        : { value: resultJson, ref: null }
-      const preparedText = existingPage
-        ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_text', resultText)
-        : { value: String(resultText || ''), ref: null }
-      run(
-        `UPDATE pages
-         SET ocr_result = ?,
-             ocr_result_ref = ?,
-             ocr_text = ?,
-             ocr_text_ref = ?,
-             ocr_status = ?,
-             proof_status = CASE WHEN ? THEN proof_status ELSE ? END
-         WHERE id = ?`,
-        [
-          preparedResult.value,
-          preparedResult.ref,
-          preparedText.value,
-          preparedText.ref,
-          pageResult.status,
-          hasProofedText ? 1 : 0,
-          'pending',
-          pageResult.pageId,
-        ],
-      )
-      changedPageIds.push(pageResult.pageId)
-      if (existingPage?.doc_id) changedDocIds.add(existingPage.doc_id)
-      const existingText = String(existingPage?.ocr_text || '').trim()
-      const nextText = String(resultText || '').trim()
-      const existingResult = String(existingPage?.ocr_result || '')
-      const nextResult = String(resultJson || '')
-      const shouldInvalidateToc = pageResult.status === 'completed'
-        && existingPage?.doc_id
-        && (
-          String(existingPage.ocr_status || '') !== 'completed'
-          || existingText !== nextText
-          || existingResult !== nextResult
-      )
-      if (shouldInvalidateToc) tocDirtyDocIds.add(existingPage.doc_id)
-      const shouldWriteOcrVersion = resultPayload && existingPage && (
-        pageResult.status === 'completed'
-        || (pageResult.status === 'error' && isOcrQualityFailureMessage(pageResult.error))
-      )
-      if (shouldWriteOcrVersion) {
-        versionWrites.push({
+  // Phase 1 — read/hydrate + gzip payload files outside any SQL transaction.
+  // Holding a write transaction while doing disk I/O is the main freeze source.
+  const pageSnapshots = getPageSnapshotsForOcrSave(guardedPageResults.map((pageResult) => pageResult.pageId))
+  type PendingPageWrite = {
+    pageId: string
+    docId: string
+    status: string
+    hasProofedText: boolean
+    preparedResult: { value: string | null; ref: string | null }
+    preparedText: { value: string | null; ref: string | null }
+    invalidateToc: boolean
+  }
+  const pendingWrites: PendingPageWrite[] = []
+  const statusOnlyCompletions: Array<{ pageId: string; docId: string; hasProofedText: boolean }> = []
+
+  for (const pageResult of guardedPageResults) {
+    const existingPage = pageSnapshots.get(pageResult.pageId)
+    const hasProofedText = String(existingPage?.proofed_text || '').trim().length > 0
+    const hasExistingOcrText = String(existingPage?.ocr_text || '').trim().length > 0
+    if (pageResult.status === 'error' && existingPage && hasExistingOcrText && !isOcrQualityFailureMessage(pageResult.error)) {
+      if (String(existingPage.ocr_status || '') !== 'completed') {
+        statusOnlyCompletions.push({
           pageId: pageResult.pageId,
-          page: existingPage,
-          result: resultPayload,
-          text: resultText,
-          status: pageResult.status,
+          docId: existingPage.doc_id,
+          hasProofedText,
         })
       }
+      continue
     }
-    markPageOcrVersionsInactive(versionWrites.map((item) => item.pageId))
-    versionWrites.forEach((item) => {
-      upsertPageOcrVersion(item.pageId, engine, item.result, item.text, item.status, item.page, { deactivateExisting: false })
+    const normalizedCompleted = pageResult.status === 'completed' && pageResult.result
+      ? normalizeOcrResultForStorage(pageResult.result, existingPage, engine)
+      : null
+    const resultPayload = normalizedCompleted?.result || pageResult.result || (pageResult.error
+      ? {
+          source_type: 'ocr_error',
+          error: pageResult.error,
+          failed_at: new Date().toISOString(),
+        }
+      : null)
+    const resultText = normalizedCompleted?.text || pageResult.text
+    const resultJson = resultPayload ? JSON.stringify(resultPayload) : null
+    if (
+      existingPage
+      && String(existingPage.ocr_status || '') === pageResult.status
+      && String(existingPage.ocr_text || '') === String(resultText || '')
+      && String(existingPage.ocr_result || '') === String(resultJson || '')
+    ) {
+      continue
+    }
+    const preparedResult = existingPage
+      ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_result', resultJson)
+      : { value: resultJson, ref: null }
+    const preparedText = existingPage
+      ? preparePagePayloadUpdate(existingPage.doc_id, pageResult.pageId, 'ocr_text', resultText)
+      : { value: String(resultText || ''), ref: null }
+    if (!existingPage) continue
+    const existingText = String(existingPage.ocr_text || '').trim()
+    const nextText = String(resultText || '').trim()
+    const existingResult = String(existingPage.ocr_result || '')
+    const nextResult = String(resultJson || '')
+    const invalidateToc = pageResult.status === 'completed'
+      && (
+        String(existingPage.ocr_status || '') !== 'completed'
+        || existingText !== nextText
+        || existingResult !== nextResult
+      )
+    pendingWrites.push({
+      pageId: pageResult.pageId,
+      docId: existingPage.doc_id,
+      status: pageResult.status,
+      hasProofedText,
+      preparedResult,
+      preparedText,
+      invalidateToc,
     })
+    const shouldWriteOcrVersion = resultPayload && (
+      pageResult.status === 'completed'
+      || (pageResult.status === 'error' && isOcrQualityFailureMessage(pageResult.error))
+    )
+    if (shouldWriteOcrVersion) {
+      versionWrites.push({
+        pageId: pageResult.pageId,
+        page: existingPage,
+        result: resultPayload,
+        text: resultText,
+        status: pageResult.status,
+      })
+    }
+  }
+
+  // Phase 1b — prepare version payload files outside the transaction as well.
+  const preparedVersionWrites = versionWrites.flatMap((item) => {
+    if (!item.page) return []
+    const preparedText = preparePagePayloadUpdate(item.page.doc_id, item.pageId, 'ocr_text', item.text || '')
+    const preparedResult = preparePagePayloadUpdate(
+      item.page.doc_id,
+      item.pageId,
+      'ocr_result',
+      item.result ? JSON.stringify(item.result) : null,
+    )
+    return [{ item: { ...item, page: item.page }, preparedText, preparedResult }]
   })
+
+  // Phase 2 — short SQL-only transaction.
+  if (statusOnlyCompletions.length > 0 || pendingWrites.length > 0 || preparedVersionWrites.length > 0) {
+    transaction(() => {
+      for (const item of statusOnlyCompletions) {
+        run(
+          `UPDATE pages
+           SET ocr_status = ?,
+               proof_status = CASE WHEN ? THEN proof_status ELSE ? END
+           WHERE id = ?`,
+          ['completed', item.hasProofedText ? 1 : 0, 'pending', item.pageId],
+        )
+        changedPageIds.push(item.pageId)
+      }
+      for (const write of pendingWrites) {
+        run(
+          `UPDATE pages
+           SET ocr_result = ?,
+               ocr_result_ref = ?,
+               ocr_text = ?,
+               ocr_text_ref = ?,
+               ocr_status = ?,
+               proof_status = CASE WHEN ? THEN proof_status ELSE ? END
+           WHERE id = ?`,
+          [
+            write.preparedResult.value,
+            write.preparedResult.ref,
+            write.preparedText.value,
+            write.preparedText.ref,
+            write.status,
+            write.hasProofedText ? 1 : 0,
+            'pending',
+            write.pageId,
+          ],
+        )
+        changedPageIds.push(write.pageId)
+        if (write.invalidateToc) tocDirtyDocIds.add(write.docId)
+      }
+      markPageOcrVersionsInactive(preparedVersionWrites.map((entry) => entry.item.pageId))
+      const now = new Date().toISOString()
+      for (const entry of preparedVersionWrites) {
+        const page = entry.item.page
+        if (!page) continue
+        run(
+          `INSERT INTO page_ocr_versions (
+            id, doc_id, page_id, page_num, engine, label, ocr_text, ocr_text_ref, ocr_result, ocr_result_ref, status, is_active, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(page_id, engine) DO UPDATE SET
+            page_num = excluded.page_num,
+            label = excluded.label,
+            ocr_text = excluded.ocr_text,
+            ocr_text_ref = excluded.ocr_text_ref,
+            ocr_result = excluded.ocr_result,
+            ocr_result_ref = excluded.ocr_result_ref,
+            status = excluded.status,
+            is_active = excluded.is_active,
+            updated_at = excluded.updated_at`,
+          [
+            nanoid(),
+            page.doc_id,
+            entry.item.pageId,
+            page.page_num || null,
+            engine,
+            getEngineLabel(engine),
+            entry.preparedText.value,
+            entry.preparedText.ref,
+            entry.preparedResult.value,
+            entry.preparedResult.ref,
+            entry.item.status,
+            1,
+            now,
+            now,
+          ],
+        )
+      }
+    })
+  }
 
   const completedVersionWrites = versionWrites.filter((item) => item.status === 'completed')
   for (let offset = 0; offset < completedVersionWrites.length; offset += 200) {
@@ -5178,7 +5384,8 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
       scheduleOcrFinalizeForPages(changedPageIds)
     }
     if (!options.deferDatabaseSave) {
-      scheduleDatabaseSave()
+      // Prefer deferred checkpoint so OCR save does not stall UI right after write.
+      scheduleDatabaseSave({ minDelayMs: 8_000 })
     }
   }
   logSlowOcrStep(`save ${guardedPageResults.length} OCR page result(s), changed ${changedPageIds.length}`, startedAt)
@@ -6297,8 +6504,33 @@ async function processImportAutoOcrClaim(
     }
   }, IMPORT_AUTO_OCR_HEARTBEAT_MS)
 
+  // Honor cancel before clearing any cancel mark. Previously this deleted the
+  // cancel flag and forced queued docs to start again after user clicked stop.
+  if (canceledOcrDocIds.has(docId) || ocrRuntimeShuttingDown) {
+    failTaskItem({
+      itemId: claim.itemId,
+      leaseToken: claim.leaseToken,
+      error: {
+        code: 'ocr_canceled',
+        message: OCR_CANCELED_MESSAGE,
+        recoverable: false,
+      },
+    })
+    updateDocumentCanceledStatus(docId)
+    emitOcrStatus(event, {
+      docId,
+      status: 'canceled',
+      phase: 'canceled',
+      progress: getCompleted() / Math.max(totalCount, 1),
+      message: OCR_CANCELED_MESSAGE,
+      errorMessage: OCR_CANCELED_MESSAGE,
+      canceled: true,
+    })
+    queuedOcrDocIds.delete(docId)
+    return false
+  }
+
   queuedOcrDocIds.delete(docId)
-  canceledOcrDocIds.delete(docId)
   activeOcrTasks.set(docId, { controller, done })
   run(
     'UPDATE documents SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = NULL, updated_at = ? WHERE id = ?',
@@ -6316,6 +6548,7 @@ async function processImportAutoOcrClaim(
   })
 
   try {
+    if (canceledOcrDocIds.has(docId)) controller.abort()
     const result = await processDocumentOcr(event, docId, Math.max(totalCount, 1), getCompleted, engine, false, {
       signal: controller.signal,
     })
@@ -6365,9 +6598,9 @@ async function processImportAutoOcrClaim(
 
 async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promise<void> {
   const config = getImportAutoOcrTaskConfig(jobId)
-  const concurrency = getOcrDocumentConcurrency(config.batchSize)
-  const documentLimit = createLimiter(concurrency)
-  const heavyPdfLimit = createLimiter(1)
+  // Claim only as many items as we can actually run. Claiming 200 then Promise.all
+  // creates 200 status events + lease rows before any OCR page upload starts.
+  const concurrency = Math.max(1, getOcrDocumentConcurrency(config.batchSize))
   let completedCount = getImportAutoOcrTask(jobId).completedCount
   const workerId = `import-auto-ocr:${jobId}:${nanoid(6)}`
   pauseBackgroundSearchReindex()
@@ -6376,32 +6609,31 @@ async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promi
       const claims = claimTaskItems({
         jobId,
         workerId,
-        limit: Math.min(200, Math.max(1, config.batchSize)),
+        limit: concurrency,
         leaseMs: IMPORT_AUTO_OCR_LEASE_MS,
       })
       if (claims.length === 0) break
 
-      await Promise.all(claims.map((claim) => {
-        const docId = String(claim.input.docId || claim.domainRef || '').trim()
-        const limit = docId && isHeavyPdfOcrDocument(docId) ? heavyPdfLimit : documentLimit
-        if (docId) {
-          const doc = queryOne<{ page_count: number | null }>('SELECT page_count FROM documents WHERE id = ?', [docId])
-          emitOcrStatus(event, {
-            docId,
-            status: 'queued',
-            phase: 'queued',
-            progress: completedCount / Math.max(config.totalCount, 1),
-            completedPages: 0,
-            totalPages: Number(doc?.page_count || 0) || undefined,
-            message: '已加入全局 OCR 队列',
-          })
+      await runBoundedDocumentWorkers(claims, concurrency, async (claim) => {
+        if (ocrRuntimeShuttingDown) {
+          releaseTaskItemLease({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+          return
         }
-        return limit(() => globalOcrDocumentWindow.run(getOcrDocumentConcurrency(), async () => {
-          const success = await processImportAutoOcrClaim(event, claim, config.engine, config.totalCount, () => completedCount)
-          completedCount += 1
-          return success
-        }))
-      }))
+        const docId = String(claim.input.docId || claim.domainRef || '').trim()
+        const heavy = Boolean(docId && isHeavyPdfOcrDocument(docId))
+        // Heavy PDFs share the same global document window with limit 1 effectively
+        // via globalOcrDocumentWindow + sequential heavy preference inside process path.
+        await globalOcrDocumentWindow.run(heavy ? 1 : concurrency, async () => {
+          const success = await processImportAutoOcrClaim(
+            event,
+            claim,
+            config.engine,
+            config.totalCount,
+            () => completedCount,
+          )
+          if (success) completedCount += 1
+        })
+      })
       await yieldToEventLoop()
     }
   } finally {
@@ -6421,6 +6653,22 @@ function startImportAutoOcrTaskRun(event: OcrStatusEvent, jobId: string): Import
 }
 
 export function resumePendingImportAutoOcrTasks(sender: Electron.WebContents): number {
+  if (ocrRuntimeShuttingDown || sender.isDestroyed()) return 0
+  // Only repair leases on open. Auto-starting every pending job still competes with
+  // first-paint list loads on huge corpora. Jobs stay queued; user continues via
+  // 批量处理 / 停止全部 OCR / startImportAutoOcrTask.
+  const recovered = recoverInterruptedImportAutoOcrTasks()
+  const pending = listResumableImportAutoOcrTasks()
+  if (recovered > 0 || pending.length > 0) {
+    console.log(
+      `[OCR] Startup recovered ${recovered} interrupted item(s); ${pending.length} import-auto job(s) left queued (not auto-started on open)`,
+    )
+  }
+  return 0
+}
+
+/** User/explicit path: start all resumable import-auto OCR jobs with the bounded worker pool. */
+export function startAllResumableImportAutoOcrTasks(sender: Electron.WebContents): number {
   if (ocrRuntimeShuttingDown || sender.isDestroyed()) return 0
   recoverInterruptedImportAutoOcrTasks()
   const event: OcrStatusEvent = { sender }
@@ -6460,11 +6708,49 @@ export function registerOcrIpc(): void {
     const safeDocId = String(docId || '').trim()
     if (!safeDocId) return false
     canceledOcrDocIds.add(safeDocId)
+    queuedOcrDocIds.delete(safeDocId)
     const activeTask = activeOcrTasks.get(safeDocId)
     activeTask?.controller.abort()
+    // Also drop persisted queue rows; otherwise restart/resume re-picks the same doc.
+    cancelPersistedOcrQueueForDocument(safeDocId)
     updateDocumentCanceledStatus(safeDocId)
     emitOcrCanceledOrCompletedStatus(event, safeDocId, 0)
-    return Boolean(activeTask)
+    // Always true when status was updated — queued docs have no active AbortController.
+    return true
+  })
+
+  ipcMain.handle('ocr:cancelAllPending', async (event): Promise<{ canceledJobs: number; canceledDocuments: number }> => {
+    // Abort every in-flight document OCR first.
+    for (const [docId, task] of activeOcrTasks.entries()) {
+      canceledOcrDocIds.add(docId)
+      try {
+        task.controller.abort()
+      } catch {
+        // ignore
+      }
+    }
+    for (const docId of queuedOcrDocIds) {
+      canceledOcrDocIds.add(docId)
+    }
+    queuedOcrDocIds.clear()
+
+    const summary = cancelAllPersistedOcrQueues()
+    // Push UI cancel state for documents we know about from active maps / DB updates.
+    const canceledDocIds = queryAll<{ id: string }>(
+      `SELECT id FROM documents
+       WHERE error_message = ?
+         AND ocr_status IN ('pending', 'completed')
+       ORDER BY updated_at DESC
+       LIMIT 500`,
+      [OCR_CANCELED_MESSAGE],
+    ).map((row) => row.id)
+    for (const docId of canceledDocIds) {
+      emitOcrCanceledOrCompletedStatus(event, docId, 0)
+    }
+    console.log(
+      `[OCR] cancelAllPending: jobs=${summary.canceledJobs}, documents=${summary.canceledDocuments}`,
+    )
+    return summary
   })
 
   ipcMain.handle('ocr:recognize', async (_event, base64Image: string, mode: OcrRecognizeMode = 'accurate'): Promise<OcrRecognizeResult> => {
@@ -6496,86 +6782,91 @@ export function registerOcrIpc(): void {
     let successCount = 0
     let completedCount = 0
     const documentConcurrency = getOcrDocumentConcurrency(options?.concurrency)
-    const docLimit = createLimiter(documentConcurrency)
-    const heavyPdfLimit = createLimiter(1)
     const persistForRecovery = shouldPersistBatchOcrForRecovery(options)
     const forceFullRerunByDocId = new Map<string, boolean>()
     const heavyPdfDocIds = new Set<string>()
     const queuedDocIds: string[] = []
-    for (const docId of [...new Set(docIds.map((item) => String(item || '').trim()).filter(Boolean))]) {
-      const doc = queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [docId])
+    const uniqueDocIds = [...new Set(docIds.map((item) => String(item || '').trim()).filter(Boolean))]
+
+    // Enqueue scan must stay O(concurrency-friendly): never do heavy per-doc work for
+    // the entire 10k list without yielding, and never Promise.all the whole list.
+    for (let index = 0; index < uniqueDocIds.length; index += 1) {
+      const docId = uniqueDocIds[index]
+      const doc = queryOne<{ ocr_status: string; page_count: number | null }>('SELECT ocr_status, page_count FROM documents WHERE id = ?', [docId])
       if (!doc) continue
       if (activeOcrTasks.has(docId) || queuedOcrDocIds.has(docId)) {
         emitOcrAlreadyRunningStatus(event, docId)
         continue
       }
-      const hasIncompletePages = hasIncompleteOcrPages(docId)
       const forceFullRerun = options?.forceFullRerun === true
       forceFullRerunByDocId.set(docId, forceFullRerun)
       canceledOcrDocIds.delete(docId)
-      if (forceFullRerun || doc.ocr_status !== 'completed' || hasIncompletePages) {
-        queuedOcrDocIds.add(docId)
-        queuedDocIds.push(docId)
-        if (isHeavyPdfOcrDocument(docId)) heavyPdfDocIds.add(docId)
-      }
+      // Prefer document-level status; only hit pages table when status claims completed.
+      const needsWork = forceFullRerun
+        || doc.ocr_status !== 'completed'
+        || hasIncompleteOcrPages(docId)
+      if (!needsWork) continue
+      queuedOcrDocIds.add(docId)
+      queuedDocIds.push(docId)
+      // Defer heavy file-stat heavy-PDF detection until the worker actually claims the doc.
+      if (Number(doc.page_count || 0) >= 180) heavyPdfDocIds.add(docId)
+      if (index > 0 && index % 25 === 0) await yieldToEventLoop()
     }
+
     const shouldPauseSearchReindexForBatch = queuedDocIds.length > 0
-    if (shouldPauseSearchReindexForBatch) {
-      pauseBackgroundSearchReindex()
-    }
+    if (shouldPauseSearchReindexForBatch) pauseBackgroundSearchReindex()
     let recoverableQueueItemIdsByDocId = new Map<string, string>()
 
     try {
-    recoverableQueueItemIdsByDocId = persistForRecovery
-      ? createRecoverableBatchOcrItems(queuedDocIds, documentConcurrency)
-      : new Map<string, string>()
-
-    if (queuedDocIds.length > 0) {
-      const placeholders = queuedDocIds.map(() => '?').join(', ')
-      run(
-        `UPDATE documents SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = ?, updated_at = ? WHERE id IN (${placeholders})`,
-        ['queued', 'processing', 'pending', null, new Date().toISOString(), ...queuedDocIds],
-      )
-      scheduleDatabaseSave()
-
-      for (const docId of queuedDocIds) {
-        const doc = queryOne<{ page_count: number | null }>('SELECT page_count FROM documents WHERE id = ?', [docId])
-        emitOcrStatus(event, {
-          docId,
-          status: 'queued',
-          phase: 'queued',
-          progress: 0,
-          completedPages: 0,
-          totalPages: Number(doc?.page_count || 0) || undefined,
-          message: '已加入本批 OCR 队列，等待空闲识别通道',
-        })
+      // Persist recovery metadata in chunks so a 10k enqueue cannot freeze open.
+      if (persistForRecovery && queuedDocIds.length > 0) {
+        for (let offset = 0; offset < queuedDocIds.length; offset += 50) {
+          const chunk = queuedDocIds.slice(offset, offset + 50)
+          const partial = createRecoverableBatchOcrItems(chunk, documentConcurrency)
+          partial.forEach((itemId, docId) => recoverableQueueItemIdsByDocId.set(docId, itemId))
+          await yieldToEventLoop()
+        }
       }
-      await yieldToEventLoop()
-    }
 
-    await Promise.all(
-      queuedDocIds.map((docId) => {
-        const limit = heavyPdfDocIds.has(docId) ? heavyPdfLimit : docLimit
-        return limit(() => globalOcrDocumentWindow.run(getOcrDocumentConcurrency(), async () => {
-        if (ocrRuntimeShuttingDown) {
+      // Mark queued status in SQL chunks; do NOT fan out N IPC progress events up front.
+      // Workers emit per-doc queued/processing when they actually pick the document up.
+      if (queuedDocIds.length > 0) {
+        const now = new Date().toISOString()
+        for (let offset = 0; offset < queuedDocIds.length; offset += 100) {
+          const chunk = queuedDocIds.slice(offset, offset + 100)
+          const placeholders = chunk.map(() => '?').join(', ')
+          run(
+            `UPDATE documents SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = ?, updated_at = ? WHERE id IN (${placeholders})`,
+            ['queued', 'processing', 'pending', null, now, ...chunk],
+          )
+          await yieldToEventLoop()
+        }
+        scheduleDatabaseSave()
+      }
+
+      await runBoundedDocumentWorkers(queuedDocIds, documentConcurrency, async (docId) => {
+        if (ocrRuntimeShuttingDown || canceledOcrDocIds.has(docId)) {
           queuedOcrDocIds.delete(docId)
           return
         }
-        const controller = new AbortController()
-        const preCanceled = canceledOcrDocIds.has(docId)
         if (activeOcrTasks.has(docId)) {
           queuedOcrDocIds.delete(docId)
           emitOcrAlreadyRunningStatus(event, docId)
           return
         }
-        queuedOcrDocIds.delete(docId)
-        updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')
+
+        const heavy = heavyPdfDocIds.has(docId) || isHeavyPdfOcrDocument(docId)
+        if (heavy) heavyPdfDocIds.add(docId)
+
+        const controller = new AbortController()
+        const preCanceled = canceledOcrDocIds.has(docId)
         let resolveDone: () => void = () => undefined
         const done = new Promise<void>((resolve) => {
           resolveDone = resolve
         })
         activeOcrTasks.set(docId, { controller, done })
         if (preCanceled) controller.abort()
+
         try {
           const doc = queryOne<{ page_count: number | null }>('SELECT page_count FROM documents WHERE id = ?', [docId])
           emitOcrStatus(event, {
@@ -6585,47 +6876,48 @@ export function registerOcrIpc(): void {
             progress: completedCount / Math.max(queuedDocIds.length, 1),
             completedPages: 0,
             totalPages: Number(doc?.page_count || 0) || undefined,
-            message: 'OCR 识别中',
+            message: heavy ? '大 PDF 识别中（大文件串行，避免卡死）…' : 'OCR 识别中',
           })
+          updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')
           await yieldToEventLoop()
-          const result = await processDocumentOcr(
-            event,
-            docId,
-            Math.max(queuedDocIds.length, 1),
-            () => completedCount,
-            options?.engine,
-            forceFullRerunByDocId.get(docId) || false,
-            { signal: controller.signal },
-          )
-          completedCount += 1
-          if (result.success) successCount += 1
-          if (result.success || result.errorMessage !== OCR_CANCELED_MESSAGE || !ocrRuntimeShuttingDown) {
-            updateRecoverableBatchOcrItem(
-              recoverableQueueItemIdsByDocId,
+
+          await globalOcrDocumentWindow.run(heavy ? 1 : documentConcurrency, async () => {
+            const result = await processDocumentOcr(
+              event,
               docId,
-              result.success ? 'completed' : 'failed',
-              result.success ? undefined : result.errorMessage || OCR_CANCELED_MESSAGE,
+              Math.max(queuedDocIds.length, 1),
+              () => completedCount,
+              options?.engine,
+              forceFullRerunByDocId.get(docId) || false,
+              { signal: controller.signal },
             )
-          }
-          if (!result.success && result.errorMessage && result.errorMessage !== OCR_CANCELED_MESSAGE) {
-            emitOcrStatus(event, {
-              docId,
-              status: queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [docId])?.ocr_status || 'error',
-              progress: completedCount / Math.max(queuedDocIds.length, 1),
-              errorMessage: result.errorMessage,
-            })
-          }
+            completedCount += 1
+            if (result.success) successCount += 1
+            if (result.success || result.errorMessage !== OCR_CANCELED_MESSAGE || !ocrRuntimeShuttingDown) {
+              updateRecoverableBatchOcrItem(
+                recoverableQueueItemIdsByDocId,
+                docId,
+                result.success ? 'completed' : 'failed',
+                result.success ? undefined : result.errorMessage || OCR_CANCELED_MESSAGE,
+              )
+            }
+            if (!result.success && result.errorMessage && result.errorMessage !== OCR_CANCELED_MESSAGE) {
+              emitOcrStatus(event, {
+                docId,
+                status: queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [docId])?.ocr_status || 'error',
+                progress: completedCount / Math.max(queuedDocIds.length, 1),
+                errorMessage: result.errorMessage,
+              })
+            }
+          })
         } finally {
           if (activeOcrTasks.get(docId)?.controller === controller) {
             activeOcrTasks.delete(docId)
           }
           queuedOcrDocIds.delete(docId)
-          canceledOcrDocIds.delete(docId)
           resolveDone()
         }
-      }))
-      }),
-    )
+      })
     } finally {
       if (shouldPauseSearchReindexForBatch) {
         resumeBackgroundSearchReindex({ reason: 'ocr-batch-deferred' })

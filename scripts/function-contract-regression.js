@@ -52,6 +52,7 @@ const requiredApiGroups = {
     'checkVisionOcrConfig',
     'recognizeImage',
     'cancelOcr',
+    'cancelAllPendingOcr',
     'batchOcr',
     'reprocessOcrStructure',
     'resetPageOcr',
