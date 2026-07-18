@@ -2,6 +2,11 @@
  * Read-only library tools for headless MCP / AI agents.
  * Reuses the same search and list services as the desktop UI.
  * Never returns API keys or arbitrary filesystem contents.
+ *
+ * Response shape is intentionally compact by default so AI clients spend tokens on
+ * titles/excerpts/text rather than internal locator hashes. Pass detail:"full" when
+ * machine-readable StableReaderLocator fields are required for citation tooling.
+ * Desktop UI and non-MCP IPC paths are unaffected.
  */
 import type {
   ListDocumentOptions,
@@ -18,6 +23,11 @@ const MAX_SEARCH_LIMIT = 50
 const MAX_LIST_LIMIT = 50
 const MAX_PAGE_RANGE = 20
 const MAX_TEXT_CHARS = 12_000
+/** Default excerpt length for dialogue-oriented search hits. */
+const DEFAULT_EXCERPT_CHARS = 240
+const DEFAULT_SEARCH_LIMIT = 10
+const DEFAULT_HITS_PER_DOC = 3
+const MAX_HITS_PER_DOC = 8
 
 export interface McpToolDefinition {
   name: string
@@ -25,16 +35,25 @@ export interface McpToolDefinition {
   inputSchema: Record<string, unknown>
 }
 
+const DETAIL_PROP = {
+  detail: {
+    type: 'string',
+    enum: ['compact', 'full'],
+    description:
+      'Response verbosity. compact (default): dialogue-friendly fields only. full: include internal locator/hash metadata for citation tooling.',
+  },
+} as const
+
 export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'library_search',
     description:
-      'Full-text search across the GujiSmart literature library (same engine as the app Search view). Returns document groups with hit snippets and stable locators for citation.',
+      'Full-text search across the GujiSmart literature library (same engine as the app Search view). Default compact results: title, page, short excerpt, and a small ref {docId,pageNum}. Use detail:"full" only when you need full StableReaderLocator objects for resolve_evidence.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Search keyword or phrase' },
-        limit: { type: 'number', description: `Max documents to return (1-${MAX_SEARCH_LIMIT})` },
+        limit: { type: 'number', description: `Max documents to return (1-${MAX_SEARCH_LIMIT}, default ${DEFAULT_SEARCH_LIMIT})` },
         folderId: { type: 'string', description: 'Optional folder id scope' },
         tagId: { type: 'string', description: 'Optional tag id scope' },
         docIds: {
@@ -42,13 +61,15 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
           items: { type: 'string' },
           description: 'Optional document id allow-list',
         },
+        ...DETAIL_PROP,
       },
       required: ['query'],
     },
   },
   {
     name: 'list_documents',
-    description: 'Paginated document list with optional filters (title search, folder, tag, OCR status).',
+    description:
+      'Paginated document list with optional filters (title search, folder, tag, OCR status). Returns compact metadata only (no file paths).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -64,11 +85,15 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'get_document',
     description:
-      'Get document metadata and page inventory (no full OCR blobs). Includes tags and folders. Does not mark the document as opened.',
+      'Get document metadata (title, author, tags, folders, page counts). By default does not dump every page row; set includePages:true for the page inventory.',
     inputSchema: {
       type: 'object',
       properties: {
         docId: { type: 'string', description: 'Document id' },
+        includePages: {
+          type: 'boolean',
+          description: 'If true, include per-page id/ocrStatus/hasText list (can be large). Default false.',
+        },
       },
       required: ['docId'],
     },
@@ -76,7 +101,7 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'get_page_text',
     description:
-      'Read canonical OCR/proof text for one page or a small page range of a document.',
+      'Read canonical OCR/proof text for one page or a small page range. Default omits content hashes; use detail:"full" to include sourceHash.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -84,6 +109,7 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
         pageNum: { type: 'number', description: '1-based page number (required if pageId omitted)' },
         pageId: { type: 'string', description: 'Page row id (optional alternative to pageNum)' },
         endPageNum: { type: 'number', description: 'Inclusive end page for a range (optional)' },
+        ...DETAIL_PROP,
       },
       required: ['docId'],
     },
@@ -91,14 +117,15 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'resolve_evidence',
     description:
-      'Resolve a StableReaderLocator from search hits into verified source text for citation.',
+      'Resolve a StableReaderLocator (from library_search with detail:"full") into verified source text for citation. Prefer get_page_text(docId,pageNum) for ordinary reading.',
     inputSchema: {
       type: 'object',
       properties: {
         locator: {
           type: 'object',
-          description: 'StableReaderLocator object from library_search hits',
+          description: 'StableReaderLocator object from library_search hits when detail is full',
         },
+        ...DETAIL_PROP,
       },
       required: ['locator'],
     },
@@ -137,20 +164,37 @@ function clipText(text: string, max = MAX_TEXT_CHARS): string {
   return `${value.slice(0, max)}\n…[truncated ${value.length - max} chars]`
 }
 
+function isFullDetail(input: Record<string, unknown>): boolean {
+  const raw = String(input.detail || input.verbosity || 'compact').trim().toLowerCase()
+  return raw === 'full' || raw === 'verbose' || raw === 'debug'
+}
+
+/** Compact public document fields for AI (no filesystem paths, no DB dump). */
 function sanitizeDocListItem(item: Record<string, unknown>): Record<string, unknown> {
-  const {
-    file_path: _filePath,
-    thumb_path: _thumbPath,
-    ...rest
-  } = item
-  return {
-    ...rest,
-    has_local_file: Boolean(_filePath),
+  const id = String(item.id || item.documentId || '')
+  const out: Record<string, unknown> = {
+    id,
+    title: item.title ?? null,
+    author: item.author ?? null,
+    ocrStatus: item.ocr_status ?? item.ocrStatus ?? null,
+    pageCount: Number(item.page_count ?? item.pageCount ?? 0) || 0,
+    hasLocalFile: Boolean(item.file_path || item.has_local_file || item.hasLocalFile),
   }
+  if (item.year != null && String(item.year).trim()) out.year = item.year
+  if (item.publisher != null && String(item.publisher).trim()) out.publisher = item.publisher
+  if (item.dynasty != null && String(item.dynasty).trim()) out.dynasty = item.dynasty
+  return out
 }
 
 function toolError(code: string, message: string): { ok: false; code: string; message: string } {
   return { ok: false, code, message }
+}
+
+function compactHitRef(docId: string, pageNum: number | null | undefined): { docId: string; pageNum: number | null } {
+  return {
+    docId,
+    pageNum: pageNum == null || !Number.isFinite(Number(pageNum)) ? null : Number(pageNum),
+  }
 }
 
 export async function callLibraryTool(
@@ -163,7 +207,9 @@ export async function callLibraryTool(
     case 'library_search': {
       const query = String(input.query || '').trim()
       if (!query) return toolError('invalid_args', 'query is required')
-      const limit = clampLimit(input.limit, MAX_SEARCH_LIMIT, 20)
+      const full = isFullDetail(input)
+      const limit = clampLimit(input.limit, MAX_SEARCH_LIMIT, DEFAULT_SEARCH_LIMIT)
+      const hitsPerDoc = clampLimit(input.hitsPerDoc, MAX_HITS_PER_DOC, DEFAULT_HITS_PER_DOC)
       const options: SearchOptions = {
         limit,
         pageSize: Math.min(20, limit),
@@ -181,20 +227,42 @@ export async function callLibraryTool(
         query: response.query,
         totalDocuments: response.totalDocuments,
         totalHits: response.totalHits,
-        status: response.status,
-        warnings: response.warnings,
-        groups: (response.groups || []).slice(0, limit).map((group) => ({
-          documentId: group.docId,
-          title: group.title,
-          author: group.author,
-          hitCount: group.totalHits,
-          hits: (group.hits || group.topHits || []).slice(0, 8).map((hit) => ({
-            pageNum: hit.locator?.pageNum ?? null,
-            excerpt: clipText(String(hit.snippet || hit.locator?.matchText || ''), 800),
-            stableLocator: hit.stableLocator || null,
-            locator: hit.locator || null,
-          })),
-        })),
+        detail: full ? 'full' : 'compact',
+        // Omit noisy status/warnings unless full or non-empty useful warnings
+        ...(full || (response.warnings && response.warnings.length)
+          ? { status: response.status, warnings: response.warnings || [] }
+          : {}),
+        groups: (response.groups || []).slice(0, limit).map((group) => {
+          const documentId = String(group.docId || '')
+          const hits = (group.hits || group.topHits || []).slice(0, hitsPerDoc).map((hit) => {
+            const pageNum = hit.locator?.pageNum ?? null
+            const excerpt = clipText(String(hit.snippet || hit.locator?.matchText || ''), DEFAULT_EXCERPT_CHARS)
+            if (full) {
+              return {
+                pageNum,
+                excerpt,
+                ref: compactHitRef(documentId, pageNum),
+                stableLocator: hit.stableLocator || null,
+                locator: hit.locator || null,
+              }
+            }
+            return {
+              pageNum,
+              excerpt,
+              ref: compactHitRef(documentId, pageNum),
+            }
+          })
+          return {
+            documentId,
+            title: group.title,
+            author: group.author,
+            hitCount: group.totalHits,
+            hits,
+          }
+        }),
+        hint: full
+          ? undefined
+          : 'Use get_page_text with ref.docId + ref.pageNum to read more. Pass detail:"full" only if you need locator objects for resolve_evidence.',
       }
     }
 
@@ -222,22 +290,22 @@ export async function callLibraryTool(
       if (!docId) return toolError('invalid_args', 'docId is required')
       const doc = queryOne<Record<string, unknown>>('SELECT * FROM documents WHERE id = ?', [docId])
       if (!doc) return toolError('not_found', `Document not found: ${docId}`)
-      const pages = queryAll<{
-        id: string
-        page_num: number
-        ocr_status: string | null
-        has_text: number
-      }>(
-        `SELECT
-           id,
-           page_num,
-           ocr_status,
-           CASE WHEN TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> ''
-                  OR COALESCE(proofed_text_ref, ocr_text_ref, '') <> '' THEN 1 ELSE 0 END as has_text
-         FROM pages
-         WHERE doc_id = ?
-         ORDER BY page_num`,
-        [docId],
+      const includePages = Boolean(input.includePages)
+      const pageCount = Number(
+        queryOne<{ c: number }>('SELECT COUNT(*) as c FROM pages WHERE doc_id = ?', [docId])?.c
+        || doc.page_count
+        || 0,
+      )
+      const pagesWithText = Number(
+        queryOne<{ c: number }>(
+          `SELECT COUNT(*) as c FROM pages
+           WHERE doc_id = ?
+             AND (
+               TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> ''
+               OR COALESCE(proofed_text_ref, ocr_text_ref, '') <> ''
+             )`,
+          [docId],
+        )?.c || 0,
       )
       const tags = queryAll<{ id: string; name: string }>(
         'SELECT t.id, t.name FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? ORDER BY t.name',
@@ -248,26 +316,45 @@ export async function callLibraryTool(
         [docId],
       )
       const sanitized = sanitizeDocListItem(doc)
-      return {
-        ok: true,
-        document: {
-          ...sanitized,
-          page_count: Number(doc.page_count || pages.length || 0),
-          pages: pages.map((page) => ({
-            id: page.id,
-            pageNum: page.page_num,
-            ocrStatus: page.ocr_status,
-            hasText: Number(page.has_text || 0) > 0,
-          })),
-          tags,
-          folders,
-        },
+      const document: Record<string, unknown> = {
+        ...sanitized,
+        pageCount,
+        pagesWithText,
+        tags,
+        folders,
       }
+      if (includePages) {
+        const pages = queryAll<{
+          id: string
+          page_num: number
+          ocr_status: string | null
+          has_text: number
+        }>(
+          `SELECT
+             id,
+             page_num,
+             ocr_status,
+             CASE WHEN TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> ''
+                    OR COALESCE(proofed_text_ref, ocr_text_ref, '') <> '' THEN 1 ELSE 0 END as has_text
+           FROM pages
+           WHERE doc_id = ?
+           ORDER BY page_num`,
+          [docId],
+        )
+        document.pages = pages.map((page) => ({
+          id: page.id,
+          pageNum: page.page_num,
+          ocrStatus: page.ocr_status,
+          hasText: Number(page.has_text || 0) > 0,
+        }))
+      }
+      return { ok: true, document }
     }
 
     case 'get_page_text': {
       const docId = String(input.docId || '').trim()
       if (!docId) return toolError('invalid_args', 'docId is required')
+      const full = isFullDetail(input)
       const pageId = String(input.pageId || '').trim()
       const startPage = Math.max(1, Math.round(Number(input.pageNum || 0)) || 0)
       const endPage = Math.max(startPage, Math.round(Number(input.endPageNum || startPage)) || startPage)
@@ -298,13 +385,14 @@ export async function callLibraryTool(
       for (const row of pageRows) {
         try {
           const canonical = resolveCanonicalPageContent(row.id)
-          pages.push({
+          const entry: Record<string, unknown> = {
             pageId: row.id,
             pageNum: row.page_num,
             source: canonical.source,
             text: clipText(canonical.text),
-            sourceHash: canonical.sourceHash,
-          })
+          }
+          if (full) entry.sourceHash = canonical.sourceHash
+          pages.push(entry)
         } catch {
           pages.push({
             pageId: row.id,
@@ -323,20 +411,33 @@ export async function callLibraryTool(
       if (!locator || typeof locator !== 'object') {
         return toolError('invalid_args', 'locator object is required')
       }
+      const full = isFullDetail(input)
       try {
         const resolved = resolveSearchEvidence(locator)
-        return {
+        const base: Record<string, unknown> = {
           ok: true,
-          resolution: resolved.resolution,
           verificationStatus: resolved.verificationStatus,
           precision: resolved.precision,
           text: clipText(resolved.text || ''),
           reason: resolved.reason,
-          stableLocator: resolved.stableLocator,
           sourceKind: resolved.sourceKind,
-          contentVersion: resolved.contentVersion,
-          sourceHash: resolved.sourceHash,
+          ref: compactHitRef(
+            String(
+              (locator as { documentId?: string; docId?: string }).documentId
+              || (locator as { docId?: string }).docId
+              || resolved.stableLocator?.documentId
+              || '',
+            ),
+            (locator as { pageNum?: number }).pageNum ?? resolved.stableLocator?.pageNum ?? null,
+          ),
         }
+        if (full) {
+          base.resolution = resolved.resolution
+          base.stableLocator = resolved.stableLocator
+          base.contentVersion = resolved.contentVersion
+          base.sourceHash = resolved.sourceHash
+        }
+        return base
       } catch (error) {
         return toolError('resolve_failed', error instanceof Error ? error.message : String(error))
       }

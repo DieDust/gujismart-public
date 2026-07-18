@@ -1,5 +1,39 @@
 # 更新日志 / Changelog
 
+## 1.1.6 - 2026-07-18
+
+### 中文
+
+#### 修复
+
+- **Codex / Windows MCP 连不上**：修复在 Windows 上将完整 Electron 进程直接作为 MCP 时 stdin 立即断开、导致「正在重新连接」、工具列表为空的问题。现改为 `ELECTRON_RUN_AS_NODE` + `mcp-host.cjs` 宿主，一键写入 Codex 配置会带上必要环境变量。
+- 设置页 Codex 表单对照补充环境变量说明；打包产物包含 MCP 宿主脚本。
+
+#### 改进
+
+- **MCP 默认返回精简（compact）**：检索结果默认只返回标题、页码、短摘录与 `ref{docId,pageNum}`，不再默认灌入 locator/hash 等机读字段，减少 AI 上下文噪音；需要完整定位时传 `detail:"full"`。桌面端界面检索不受影响。
+
+#### 下载
+
+- `GujiSmart-1.1.6-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.6-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Fixes
+
+- **Codex / Windows MCP disconnect**: Fixed stdin closing immediately when the full Electron app was used as an MCP server on Windows (endless reconnect, empty tool list). MCP now runs via `ELECTRON_RUN_AS_NODE` + `mcp-host.cjs`; one-click Codex config writes the required env vars.
+- Codex form map documents env vars; packages ship the MCP host script.
+
+#### Improvements
+
+- **Compact MCP responses by default**: search hits return title, page, short excerpt, and `ref{docId,pageNum}` without locator/hash blobs; use `detail:"full"` for full locators. Desktop UI search is unchanged.
+
+#### Downloads
+
+- `GujiSmart-1.1.6-Setup-x64.exe`
+- `GujiSmart-1.1.6-Portable-x64.exe`
+
 ## 1.1.5 - 2026-07-17
 
 ### 中文

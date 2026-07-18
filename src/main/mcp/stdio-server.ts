@@ -7,7 +7,7 @@ import { MCP_TOOL_DEFINITIONS, callLibraryTool } from './library-tools'
 
 const SERVER_INFO = {
   name: 'gujismart',
-  version: '1.1.5',
+  version: '1.1.6',
 }
 
 type JsonRpcId = string | number | null
@@ -53,9 +53,13 @@ async function handleRequest(message: JsonRpcRequest): Promise<void> {
 
   try {
     if (method === 'initialize') {
+      const requested = String(params.protocolVersion || '2024-11-05')
       writeResult(id, {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
+        // Echo a version clients commonly accept; keep tools-only capability surface.
+        protocolVersion: requested || '2024-11-05',
+        capabilities: {
+          tools: { listChanged: false },
+        },
         serverInfo: SERVER_INFO,
       })
       return
@@ -67,6 +71,13 @@ async function handleRequest(message: JsonRpcRequest): Promise<void> {
 
     if (method === 'ping') {
       writeResult(id, {})
+      return
+    }
+
+    // Some clients probe optional surfaces; answer empty instead of method-not-found.
+    if (method === 'resources/list' || method === 'prompts/list' || method === 'resources/templates/list') {
+      const key = method.startsWith('resources') ? 'resources' : 'prompts'
+      writeResult(id, { [key]: [] })
       return
     }
 
@@ -87,11 +98,13 @@ async function handleRequest(message: JsonRpcRequest): Promise<void> {
         ? params.arguments
         : {}) as Record<string, unknown>
       const result = await callLibraryTool(name, args)
+      // Compact JSON (no pretty-print) — AI clients still parse structuredContent;
+      // text payload is for models that only read content[].text.
       writeResult(id, {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify(result),
           },
         ],
         structuredContent: result,
@@ -112,8 +125,9 @@ async function handleRequest(message: JsonRpcRequest): Promise<void> {
 
 /**
  * MCP over stdio: supports both Content-Length framing and newline JSON.
+ * Returns a Promise that resolves when stdin ends (keeps the process alive).
  */
-export async function runMcpStdioServer(): Promise<void> {
+export function runMcpStdioServer(): Promise<void> {
   // Prevent accidental logging from corrupting the MCP stream.
   const originalLog = console.log
   const originalInfo = console.info
@@ -129,7 +143,9 @@ export async function runMcpStdioServer(): Promise<void> {
   }
 
   let buffer = ''
+  // Windows/Electron: ensure flowing mode so MCP frames are delivered.
   process.stdin.setEncoding('utf8')
+  if (typeof process.stdin.resume === 'function') process.stdin.resume()
 
   const processBuffer = async () => {
     while (true) {
@@ -168,19 +184,26 @@ export async function runMcpStdioServer(): Promise<void> {
     }
   }
 
-  process.stdin.on('data', (chunk: string) => {
-    buffer += chunk
-    void processBuffer()
-  })
+  return new Promise((resolve) => {
+    process.stdin.on('data', (chunk: string) => {
+      buffer += chunk
+      void processBuffer()
+    })
 
-  process.stdin.on('end', () => {
-    console.log = originalLog
-    console.info = originalInfo
-    console.warn = originalWarn
-    process.exit(0)
-  })
+    process.stdin.on('end', () => {
+      console.log = originalLog
+      console.info = originalInfo
+      console.warn = originalWarn
+      resolve()
+    })
 
-  process.stderr.write('[gujismart-mcp] ready (stdio MCP, read-only library tools)\n')
+    process.stdin.on('error', (error) => {
+      process.stderr.write(`[gujismart-mcp] stdin error: ${error}\n`)
+      resolve()
+    })
+
+    process.stderr.write('[gujismart-mcp] ready (stdio MCP, read-only library tools)\n')
+  })
 }
 
 /** For regression tests without stdio loop. */

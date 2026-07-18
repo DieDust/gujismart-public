@@ -1,76 +1,51 @@
 /**
- * Headless GujiSmart MCP launcher (no UI window).
+ * Headless GujiSmart MCP launcher (stdio).
  *
- * Examples (use YOUR machine paths, not a fixed drive letter):
- *   npm run mcp -- --data-dir "/absolute/path/to/gujismart-data"
- *   GUJISMART_DATA_DIR=/absolute/path/to/data npm run mcp
+ * Important (Windows): full Electron app mode closes stdin immediately, so Codex/Cursor
+ * cannot complete the MCP handshake. We run the host under ELECTRON_RUN_AS_NODE instead.
  *
- * Wire this into Cursor / Claude Desktop / Trae as an MCP server command.
+ * Examples:
+ *   npm run mcp -- --data-dir "/absolute/path/to/gujismart-data" --mcp-token "<token>"
+ *
  * See docs/MCP.md.
  */
 const { spawn } = require('child_process')
-const { mkdtempSync, writeFileSync, rmSync } = require('fs')
-const { tmpdir } = require('os')
+const { existsSync, mkdirSync } = require('fs')
 const { join } = require('path')
-const { buildSync } = require('esbuild')
-const electronPath = require('electron')
 
 const root = join(__dirname, '..')
-const tempRoot = mkdtempSync(join(tmpdir(), 'gujismart-mcp-'))
-const entryPath = join(tempRoot, 'mcp-entry.js')
-const bundlePath = join(tempRoot, 'mcp-bundle.cjs')
+const hostPath = join(root, 'out', 'mcp', 'mcp-host.cjs')
 
-writeFileSync(
-  entryPath,
-  `require(${JSON.stringify(join(root, 'src', 'main', 'mcp', 'cli.ts'))})\n`,
-)
-
-try {
-  buildSync({
-    entryPoints: [entryPath],
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    outfile: bundlePath,
-    external: ['electron', 'better-sqlite3', '@napi-rs/canvas', 'playwright'],
-    alias: {
-      '@electron-toolkit/utils': join(root, 'scripts', 'stubs', 'electron-toolkit-utils.js'),
-    },
-    logLevel: 'silent',
-  })
-} catch (error) {
-  console.error('[gujismart-mcp] bundle failed', error)
-  rmSync(tempRoot, { recursive: true, force: true })
-  process.exit(1)
+function ensureHostBuilt() {
+  if (existsSync(hostPath)) return
+  // Lazy-build for dev / first use.
+  require('./build-mcp-host.js')
 }
 
-const childArgs = [bundlePath, ...process.argv.slice(2)]
+ensureHostBuilt()
+
+const electronPath = require('electron')
+const childArgs = [hostPath, ...process.argv.slice(2)]
 const child = spawn(electronPath, childArgs, {
   stdio: 'inherit',
+  cwd: root,
   env: {
     ...process.env,
-    ELECTRON_RUN_AS_NODE: undefined,
+    ELECTRON_RUN_AS_NODE: '1',
     GUJISMART_HEADLESS: '1',
+    GUJISMART_APP_PATH: root,
+    // Ensure native modules resolve from the app install, not the temp bundle path.
+    NODE_PATH: [join(root, 'node_modules'), process.env.NODE_PATH].filter(Boolean).join(process.platform === 'win32' ? ';' : ':'),
   },
   windowsHide: true,
 })
 
-const cleanup = () => {
-  try {
-    rmSync(tempRoot, { recursive: true, force: true })
-  } catch {
-    // ignore
-  }
-}
-
 child.on('exit', (code, signal) => {
-  cleanup()
   if (signal) process.kill(process.pid, signal)
   process.exit(code == null ? 1 : code)
 })
 
 child.on('error', (error) => {
-  console.error('[gujismart-mcp] failed to start electron', error)
-  cleanup()
+  console.error('[gujismart-mcp] failed to start MCP host', error)
   process.exit(1)
 })

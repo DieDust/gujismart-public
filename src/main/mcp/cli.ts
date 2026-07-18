@@ -30,13 +30,21 @@ function redirectConsoleToStderr(): void {
 async function main(): Promise<void> {
   redirectConsoleToStderr()
 
+  // Host args: mcp-host.cjs --data-dir ... --mcp-token ...
+  // Also accept electron main-style --mcp for compatibility.
   const mcpArgs = parseMcpCliArgs(process.argv.slice(1))
   if (mcpArgs.dataDir) {
     process.env.GUJISMART_DATA_DIR = resolve(mcpArgs.dataDir)
   }
 
-  // Disable GPU / single-instance noise for headless.
-  app.disableHardwareAcceleration()
+  // Under ELECTRON_RUN_AS_NODE the shim provides app; under full Electron disable GPU noise.
+  try {
+    if (typeof app.disableHardwareAcceleration === 'function') {
+      app.disableHardwareAcceleration()
+    }
+  } catch {
+    // ignore
+  }
 
   await app.whenReady()
 
@@ -70,12 +78,17 @@ async function main(): Promise<void> {
     } catch {
       // ignore
     }
-    app.exit(0)
+    try {
+      app.exit(0)
+    } catch {
+      process.exit(0)
+    }
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 
   await runMcpStdioServer()
+  shutdown()
 }
 
 main().catch((error) => {

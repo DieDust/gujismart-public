@@ -50,6 +50,20 @@ async function run() {
     const search = await tools.callLibraryTool('library_search', { query: 'test', limit: 5 })
     assert.strictEqual(search.ok, true)
     assert.ok(Array.isArray(search.groups))
+    assert.strictEqual(search.detail, 'compact')
+    // Compact mode must not dump full locator/hash blobs into default hits.
+    for (const group of search.groups) {
+      for (const hit of group.hits || []) {
+        assert.ok(hit.ref && hit.ref.docId, 'compact hit should include ref.docId')
+        assert.strictEqual(hit.locator, undefined)
+        assert.strictEqual(hit.stableLocator, undefined)
+        assert.ok(!('sourceHash' in hit), 'compact hit should omit sourceHash')
+      }
+    }
+
+    const searchFull = await tools.callLibraryTool('library_search', { query: 'test', limit: 3, detail: 'full' })
+    assert.strictEqual(searchFull.ok, true)
+    assert.strictEqual(searchFull.detail, 'full')
 
     const folders = await tools.callLibraryTool('list_folders', {})
     assert.strictEqual(folders.ok, true)

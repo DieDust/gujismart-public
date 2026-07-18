@@ -1,4 +1,4 @@
-# 开源准备状态（1.1.5 候选）
+# 开源准备状态（1.1.6 候选）
 
 本文记录当前仓库在公开前的准备情况。正式推送标签与创建 GitHub Release 仍须遵守 [OPEN_SOURCE_RELEASE.md](OPEN_SOURCE_RELEASE.md)。
 
@@ -19,25 +19,37 @@
 
 ## 当前版本候选
 
-- 计划版本：**1.1.5**
+- 计划版本：**1.1.6**
+- 标签计划：`v1.1.6`（仅在 main CI 成功后打一次）
 - 本地已生成（不入库，仅维护者测试用）：
-  - `dist/GujiSmart-1.1.5-Setup-x64.exe`
-  - `dist/GujiSmart-1.1.5-Portable-x64.exe`
-- 主要用户向变更：大库卡顿优化、飞桨 429/额度区分、AI 工具连接（MCP）与设置一键配置等。详见 `CHANGELOG.md`。
+  - `dist/GujiSmart-1.1.6-Setup-x64.exe`
+  - `dist/GujiSmart-1.1.6-Portable-x64.exe`
+  - 成品含 `resources/mcp/mcp-host.cjs`（Windows Codex MCP 修复所需）
+- 主要用户向变更：修复 Windows 上 Codex/MCP stdin 断开导致工具列表为空；MCP 改为 `ELECTRON_RUN_AS_NODE` + `mcp-host.cjs`；一键写入带必要 env。详见 `CHANGELOG.md` 1.1.6。
+
+## 候选提交应包含的文件（待 commit）
+
+- `package.json` / `package-lock.json` → 1.1.6
+- `CHANGELOG.md` 1.1.6 中英笔记
+- MCP 宿主：`scripts/build-mcp-host.js`、`scripts/stubs/electron-app-shim.js`、`scripts/gujismart-mcp.js`
+- MCP 核心：`src/main/mcp/{connection,cli,stdio-server}.ts`、`src/shared/types.ts`
+- UI / 文档：`SettingsView.tsx`、`docs/MCP.md`、本文件
+- 回归：`scripts/mcp-tools-regression.js`
+- `package.json` `build` 链增加 `build:mcp-host`；`extraResources` 打包 `mcp-host.cjs`
+
+**禁止提交：** `data/`、`dist/`、`out/`、`tmp/`、密钥、真实文献、本机 Codex token 配置。
 
 ## 发布前仍须完成（维护者操作）
 
-按 [OPEN_SOURCE_RELEASE.md](OPEN_SOURCE_RELEASE.md) 五阶段，当前仍属「冻结候选」之前或之中：
+按 [OPEN_SOURCE_RELEASE.md](OPEN_SOURCE_RELEASE.md) 五阶段：
 
 1. **工作区提交**  
-   将本轮功能与文档提交到 `main`（勿提交 `data/`、`dist/`、密钥、真实文献）。
-2. **干净环境完整门禁**（推送前）：
+   将 1.1.6 候选提交到 `main`（勿提交 `data/`、`dist/`、密钥）。
+2. **干净环境完整门禁**（推送前已在本机跑过一轮；若再改代码须重跑）：
 
    ```powershell
-   npm ci
    npm run check
    npm run smoke
-   npm audit
    npm audit --omit=dev
    npx electron-builder install-app-deps
    npm run build:win
@@ -48,21 +60,21 @@
    ```
 
 3. **维护者安装测试**  
-   使用同一候选提交的 Setup + Portable 做启动、兼容库、导入/OCR/检索/设置/MCP 冒烟；书面批准公开。
-4. **先 push `main`，等 CI 成功**，再打 **一次** `v1.1.5` 标签触发 Release（禁止 main 与 tag 同时推、禁止移动已推送标签）。
-5. **Release 只上传两个 exe**，notes 与 CHANGELOG 1.1.5 一致。
+   使用同一候选的 Setup + Portable：启动、库兼容、设置 → AI 工具连接 → Codex 一键写入后重启 Codex，确认 MCP 工具可加载（`library_stats` / 检索）。书面批准公开。
+4. **先 push `main`，等 CI 成功**，再打 **一次** `v1.1.6` 标签触发 Release（禁止 main 与 tag 同时推）。
+5. **Release 只上传两个 exe**，notes 与 CHANGELOG 1.1.6 一致。
 
 ## 公开内容注意
 
-- README 截图须为空库/合成数据；无界面可见变化时沿用并目视检查。
-- 文档禁止硬编码维护者本机绝对路径、真实文献 ID、私有语料名、API Key。
-- MCP 文档仅说明设置一键流程与工具名；不要求用户理解盘符。
-- `docs/refactor-audit/` 等为工程审阅材料，确认无隐私路径与密钥后再公开保留。
+- README 截图：本版无强制界面重拍要求（设置 MCP 文案有小更新，截图可沿用已核验图）。
+- 文档禁止硬编码维护者本机绝对路径、真实文献 ID、私有语料名、API Key / MCP token。
+- 升级用户须在 1.1.6 中 **重新一键写入** Codex/JSON 配置（旧 MCP 启动参数在 Windows 上无效）。
 
-## 本轮已在仓库内做的准备动作
+## 本轮本地已完成的准备动作
 
-- 更新 README / CONTRIBUTING / SECURITY 中与 MCP、数据目录、卫生相关的说明。
-- 保留并文档化 `docs/MCP.md`、`docs/OPEN_SOURCE_RELEASE.md`。
-- 确认 `check:opensource`、`check:mojibake`、`npm audit` 当前通过。
+- 版本与 lockfile 对齐 1.1.6；CHANGELOG 中英就绪。
+- MCP Windows 修复与 `mcp-host` 打包链路落地；`check` / `smoke` / `build:win` / `smoke:packaged` 通过。
+- `check:opensource`、`check:mojibake`、`npm audit --omit=dev` 通过。
+- `dist/`、`out/`、`data/` 仍被 gitignore。
 
-更新本文件日期：与 1.1.5 开源准备同步。
+更新本文件日期：2026-07-18，对应 1.1.6 开源准备。

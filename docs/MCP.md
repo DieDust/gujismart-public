@@ -24,7 +24,13 @@
 Codex **不能**在无配置时自己发现本机软件（安全设计）。可选：
 
 1. **推荐**：点 **「一键写入 Codex 配置」**，然后完全退出并重新打开 Codex。
-2. **手填表单**：类型选 **STDIO**，按设置页「手动表单对照」逐项粘贴名称、启动命令与参数。
+2. **手填表单**：类型选 **STDIO**，按设置页「手动表单对照」逐项粘贴名称、启动命令、参数，以及环境变量 **`ELECTRON_RUN_AS_NODE=1`**（Windows 必需，否则会一直「重新连接」）。
+
+说明：
+
+- `gujismart` **不会**出现在 Codex 左侧「插件」列表（那是 Documents/PDF 等内置插件）。
+- 配置成功后，在对话里直接问文献库即可；列表里可能显示「不支持身份验证 / 已启用」，这是本地 STDIO 的正常状态。
+- 若出现 Electron 弹窗 `Unable to find Electron app` 或 MCP「正在重新连接」，请重新点一键写入并完全重启 Codex（旧配置用全量 Electron 启 UI 会在 Windows 上断开 stdin）。
 
 > 只有网页版聊天、不支持 MCP 的 AI，无法用此功能。
 
@@ -49,13 +55,15 @@ npm run mcp -- --data-dir "<你的数据目录>" --mcp-token "<令牌>"
 
 | Tool | 作用 |
 |------|------|
-| `library_search` | 全库检索 |
-| `list_documents` | 文献列表 |
-| `get_document` | 元数据与页清单 |
-| `get_page_text` | 页正文 |
-| `resolve_evidence` | 出处解析 |
+| `library_search` | 全库检索（默认 **compact**：标题/页码/短摘录/`ref`；`detail:"full"` 才带完整 locator） |
+| `list_documents` | 文献列表（精简元数据，无本地路径） |
+| `get_document` | 元数据；默认不含逐页清单，`includePages:true` 才展开 |
+| `get_page_text` | 页正文（默认不含 content hash） |
+| `resolve_evidence` | 出处解析（需 full locator；日常阅读优先 `get_page_text`） |
 | `list_folders` / `list_tags` | 文件夹与标签 |
 | `library_stats` | 统计 |
+
+默认返回刻意压短，避免把 `sourceHash` / `contentVersion` / `sourceRanges` 等机读字段灌进 AI 上下文；桌面端界面检索不受影响。
 
 ## 开发自检
 

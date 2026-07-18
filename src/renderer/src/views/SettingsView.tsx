@@ -3558,7 +3558,20 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                                   value: mcpSetup.cwd || mcpSetup.codexForm?.cwd || '（留空）',
                                   hint: mcpSetup.cwd ? '有值就整段粘贴' : '没有就留空，不要乱填',
                                 },
-                                { label: '环境变量', value: '（留空）', hint: '一般不用填；不要点添加' },
+                                {
+                                  label: '环境变量',
+                                  value: (() => {
+                                    const fromMap = mcpSetup.env || {}
+                                    const fromForm = (mcpSetup.codexForm?.env || []).reduce((acc, row) => {
+                                      if (row.key) acc[row.key] = row.value
+                                      return acc
+                                    }, {} as Record<string, string>)
+                                    const merged = { ...fromForm, ...fromMap }
+                                    const text = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n')
+                                    return text || 'ELECTRON_RUN_AS_NODE=1'
+                                  })(),
+                                  hint: 'Windows 必须带 ELECTRON_RUN_AS_NODE=1，否则 MCP 会一直重连',
+                                },
                                 { label: '环境变量传递', value: '（留空）', hint: '一般不用填' },
                               ] as Array<{ label: string; value: string; hint: string }>).map((row) => (
                                 <div

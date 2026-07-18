@@ -569,6 +569,8 @@ export interface McpSetupInfo {
   command: string
   args: string[]
   cwd?: string
+  /** Required env for MCP host (e.g. ELECTRON_RUN_AS_NODE=1 on Windows). */
+  env?: Record<string, string>
   token: string
   tokenPreview: string
   packaged: boolean
