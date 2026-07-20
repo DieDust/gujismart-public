@@ -508,6 +508,21 @@ async function fetchPaddleOcrModels(_apiKey: string): Promise<string[]> {
   }
 }
 
+function normalizeLlmProfileBaseUrl(baseUrl: string): string {
+  return String(baseUrl || '').trim().replace(/\/+$/, '')
+}
+
+function llmProfileContentKey(profile: Pick<LlmProviderProfile, 'provider' | 'name' | 'baseUrl' | 'model'>): string {
+  const provider = String(profile.provider || profile.name || '').trim().toLowerCase()
+  const baseUrl = normalizeLlmProfileBaseUrl(profile.baseUrl).toLowerCase()
+  const model = String(profile.model || '').trim().toLowerCase()
+  return `${provider}|${baseUrl}|${model}`
+}
+
+function llmProfileEndpointKey(profile: Pick<LlmProviderProfile, 'baseUrl' | 'model'>): string {
+  return `${normalizeLlmProfileBaseUrl(profile.baseUrl).toLowerCase()}|${String(profile.model || '').trim().toLowerCase()}`
+}
+
 function parseLlmProviderProfiles(value: unknown, kind: 'llm' | 'vision_ocr'): LlmProviderProfile[] {
   if (!value || typeof value !== 'string') return []
   try {
@@ -518,7 +533,7 @@ function parseLlmProviderProfiles(value: unknown, kind: 'llm' | 'vision_ocr'): L
         id: String(item?.id || item?.name || '').trim(),
         name: String(item?.name || item?.provider || '').trim(),
         provider: String(item?.provider || item?.name || '').trim(),
-        baseUrl: String(item?.baseUrl || '').trim().replace(/\/+$/, ''),
+        baseUrl: normalizeLlmProfileBaseUrl(String(item?.baseUrl || '')),
         model: String(item?.model || '').trim(),
         updatedAt: item?.updatedAt ? String(item.updatedAt) : undefined,
         credential: getCredentialPublicState(`${kind}_profile:${String(item?.id || item?.name || '').trim()}`),
@@ -529,15 +544,128 @@ function parseLlmProviderProfiles(value: unknown, kind: 'llm' | 'vision_ocr'): L
   }
 }
 
+/** Persistable profiles only — never include ephemeral "current" rows. */
+function getStoredLlmProviderProfiles(): LlmProviderProfile[] {
+  return parseLlmProviderProfiles(getSettingValue(LLM_PROFILE_SETTINGS_KEY), 'llm')
+    .map((profile) => ({
+      ...profile,
+      // Always report the per-profile vault entry only (never paint every row with global llm_api_key).
+      credential: getCredentialPublicState(`llm_profile:${profile.id}`),
+    }))
+}
+
+/**
+ * Collapse duplicate saved profiles that share the same endpoint (baseUrl + model).
+ * Prefer the active id, then profiles with their own key, then newest updatedAt.
+ */
+function dedupeLlmProviderProfiles(
+  profiles: LlmProviderProfile[],
+  preferredId?: string,
+): { profiles: LlmProviderProfile[]; removedIds: string[] } {
+  const preferred = String(preferredId || '').trim()
+  const groups = new Map<string, LlmProviderProfile[]>()
+  for (const profile of profiles) {
+    const key = llmProfileEndpointKey(profile)
+    const list = groups.get(key) || []
+    list.push(profile)
+    groups.set(key, list)
+  }
+  const kept: LlmProviderProfile[] = []
+  const removedIds: string[] = []
+  for (const list of groups.values()) {
+    if (list.length === 1) {
+      kept.push(list[0])
+      continue
+    }
+    const ranked = [...list].sort((a, b) => {
+      if (preferred && a.id === preferred) return -1
+      if (preferred && b.id === preferred) return 1
+      const aKey = a.credential?.configured ? 1 : 0
+      const bKey = b.credential?.configured ? 1 : 0
+      if (aKey !== bKey) return bKey - aKey
+      const aTime = Date.parse(a.updatedAt || '') || 0
+      const bTime = Date.parse(b.updatedAt || '') || 0
+      return bTime - aTime
+    })
+    const winner = ranked[0]
+    kept.push(winner)
+    for (const loser of ranked.slice(1)) {
+      removedIds.push(loser.id)
+      // If winner has no key but loser does, migrate the secret before revoking.
+      if (!readProtectedSetting(`llm_profile:${winner.id}`)) {
+        const loserSecret = readProtectedSetting(`llm_profile:${loser.id}`)
+        if (loserSecret) writeProtectedSetting(`llm_profile:${winner.id}`, loserSecret)
+      }
+      revokeProtectedSetting(`llm_profile:${loser.id}`)
+    }
+  }
+  return { profiles: kept, removedIds }
+}
+
+function findStoredLlmProfileMatch(
+  profiles: LlmProviderProfile[],
+  candidate: Pick<LlmProviderProfile, 'id' | 'provider' | 'name' | 'baseUrl' | 'model'>,
+): LlmProviderProfile | undefined {
+  const id = String(candidate.id || '').trim()
+  if (id) {
+    const byId = profiles.find((item) => item.id === id)
+    if (byId) return byId
+  }
+  const contentKey = llmProfileContentKey(candidate)
+  const byContent = profiles.find((item) => llmProfileContentKey(item) === contentKey)
+  if (byContent) return byContent
+  const endpointKey = llmProfileEndpointKey(candidate)
+  return profiles.find((item) => llmProfileEndpointKey(item) === endpointKey)
+}
+
 function getLlmProviderProfiles(): LlmProviderProfile[] {
-  const stored = parseLlmProviderProfiles(getSettingValue(LLM_PROFILE_SETTINGS_KEY), 'llm')
+  const stored = getStoredLlmProviderProfiles()
   const current = getCurrentLlmProfile()
   if (!current.baseUrl || !current.model) return stored
+
   const byId = stored.find((item) => item.id === current.id)
   if (byId) {
-    return stored.map((item) => item.id === current.id ? { ...item, ...current, updatedAt: item.updatedAt } : item)
+    return stored.map((item) => {
+      if (item.id !== current.id) return item
+      return {
+        ...item,
+        name: current.name || item.name,
+        provider: current.provider || item.provider,
+        baseUrl: current.baseUrl || item.baseUrl,
+        model: current.model || item.model,
+        // Keep own profile credential; do not overwrite with global llm_api_key state.
+        credential: getCredentialPublicState(`llm_profile:${item.id}`),
+        updatedAt: item.updatedAt,
+      }
+    })
   }
-  return [current, ...stored]
+
+  // Stale active id but same endpoint already saved: reuse stored row, never inject a ghost duplicate.
+  const byEndpoint = findStoredLlmProfileMatch(stored, current)
+  if (byEndpoint) {
+    return stored.map((item) => {
+      if (item.id !== byEndpoint.id) return item
+      return {
+        ...item,
+        name: current.name || item.name,
+        provider: current.provider || item.provider,
+        baseUrl: current.baseUrl || item.baseUrl,
+        model: current.model || item.model,
+        credential: getCredentialPublicState(`llm_profile:${item.id}`),
+        updatedAt: item.updatedAt,
+      }
+    })
+  }
+
+  // Active config not yet saved as a named profile: expose global key only on this ephemeral row.
+  // Callers that persist must use getStoredLlmProviderProfiles(), never this ephemeral entry.
+  return [
+    {
+      ...current,
+      credential: getCredentialPublicState('llm_api_key'),
+    },
+    ...stored,
+  ]
 }
 
 function getCurrentVisionOcrProfile(): LlmProviderProfile {
@@ -598,7 +726,8 @@ function saveVisionOcrProviderProfiles(profiles: LlmProviderProfile[]): void {
 }
 
 function saveLlmProviderProfiles(profiles: LlmProviderProfile[]): void {
-  const normalized = profiles
+  const preferredId = String(getSettingValue('llm_active_provider_id') || '').trim()
+  const prepared = profiles
     .map((item) => {
       const id = String(item.id || item.name || '').trim()
       const apiKey = String(item.apiKey || '')
@@ -607,21 +736,32 @@ function saveLlmProviderProfiles(profiles: LlmProviderProfile[]): void {
         id,
         name: String(item.name || item.provider || '').trim(),
         provider: String(item.provider || item.name || '').trim(),
-        baseUrl: String(item.baseUrl || '').trim().replace(/\/+$/, ''),
+        baseUrl: normalizeLlmProfileBaseUrl(String(item.baseUrl || '')),
         model: String(item.model || '').trim(),
         updatedAt: item.updatedAt || new Date().toISOString(),
+        credential: getCredentialPublicState(`llm_profile:${id}`),
       }
     })
     .filter((item) => item.id && item.name && item.baseUrl && item.model)
+  const { profiles: deduped } = dedupeLlmProviderProfiles(prepared, preferredId)
+  const normalized = deduped.map((item) => ({
+    id: item.id,
+    name: item.name,
+    provider: item.provider,
+    baseUrl: item.baseUrl,
+    model: item.model,
+    updatedAt: item.updatedAt || new Date().toISOString(),
+  }))
   setSettingValue(LLM_PROFILE_SETTINGS_KEY, JSON.stringify(normalized))
 }
 
 function getCurrentLlmProfile(): LlmProviderProfile {
   const provider = getSettingValue('llm_provider') || 'DeepSeek'
-  const baseUrl = (getSettingValue('llm_base_url') || 'https://api.deepseek.com/v1').replace(/\/+$/, '')
+  const baseUrl = normalizeLlmProfileBaseUrl(getSettingValue('llm_base_url') || 'https://api.deepseek.com/v1')
   const model = getSettingValue('llm_model') || 'deepseek-chat'
+  const activeId = String(getSettingValue('llm_active_provider_id') || '').trim()
   return {
-    id: getSettingValue('llm_active_provider_id') || makeLlmProfileId(provider, baseUrl, model),
+    id: activeId || makeLlmProfileId(provider, baseUrl, model),
     name: provider,
     provider,
     baseUrl,
@@ -742,14 +882,27 @@ export function registerSettingsIpc(): void {
   })
 
   ipcMain.handle('settings:listModels', async (_event, payload?: ListModelsPayload): Promise<string[]> => {
-    const credentialKey = payload?.credentialKey === 'vision_ocr_api_key' ? 'vision_ocr_api_key' : 'llm_api_key'
+    const requested = payload?.credentialKey
+    const credentialKey =
+      requested === 'vision_ocr_api_key' || requested === 'embedding_api_key'
+        ? requested
+        : 'llm_api_key'
     const draftSecret = payload?.credentialDraftRef
       ? consumeCredentialDraft(_event.sender.id, credentialKey, payload.credentialDraftRef)
       : ''
-    return fetchOpenAiCompatibleModels(
-      String(payload?.baseUrl || getSettingValue('llm_base_url') || ''),
+    const defaultBase =
+      credentialKey === 'embedding_api_key'
+        ? getSettingValue('embedding_base_url') || 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+        : getSettingValue('llm_base_url') || ''
+    const models = await fetchOpenAiCompatibleModels(
+      String(payload?.baseUrl || defaultBase || ''),
       String(draftSecret || readProtectedSetting(credentialKey) || ''),
     )
+    if (credentialKey === 'embedding_api_key') {
+      const embeddingLike = models.filter((id) => /embed/i.test(id))
+      return embeddingLike.length > 0 ? embeddingLike : models
+    }
+    return models
   })
 
   ipcMain.handle('settings:listPaddleOcrModels', async (event, credentialDraftRef?: string): Promise<string[]> => {
@@ -862,48 +1015,96 @@ export function registerSettingsIpc(): void {
   })
 
   ipcMain.handle('settings:llmProfiles:list', async (): Promise<LlmProviderProfileState> => {
+    // Heal historical duplicates written when ephemeral "current" rows were persisted.
+    const preferredId = String(getSettingValue('llm_active_provider_id') || '').trim()
+    const stored = getStoredLlmProviderProfiles()
+    const { profiles: deduped, removedIds } = dedupeLlmProviderProfiles(stored, preferredId)
+    let healed = false
+    if (removedIds.length > 0 || deduped.length !== stored.length) {
+      saveLlmProviderProfiles(deduped)
+      healed = true
+    }
     const current = getCurrentLlmProfile()
+    const match = findStoredLlmProfileMatch(getStoredLlmProviderProfiles(), current)
+    if (match && preferredId !== match.id) {
+      // Point active id at the real stored row so UI "当前" and delete guards stay consistent.
+      setSettingValue('llm_active_provider_id', match.id)
+      healed = true
+    }
+    // If the working global key was never sealed into the active profile vault, copy it now.
+    // Vector index and multi-provider UI only trust llm_profile:{id}, not the transient global slot.
+    const activeId = String(getSettingValue('llm_active_provider_id') || '').trim() || match?.id || ''
+    if (activeId) {
+      const profileSecret = readProtectedSetting(`llm_profile:${activeId}`)
+      const globalSecret = readProtectedSetting('llm_api_key')
+      if (!profileSecret && globalSecret) {
+        writeProtectedSetting(`llm_profile:${activeId}`, globalSecret)
+        healed = true
+      }
+    }
+    if (healed) saveDatabase()
+    const nextCurrent = getCurrentLlmProfile()
     return {
-      activeId: current.id,
-      current,
+      activeId: String(getSettingValue('llm_active_provider_id') || '').trim() || nextCurrent.id,
+      current: nextCurrent,
       profiles: getLlmProviderProfiles(),
-      configValidation: getLlmProfileValidation(current),
+      configValidation: getLlmProfileValidation(nextCurrent),
     }
   })
 
   ipcMain.handle('settings:llmProfiles:saveCurrent', async (_event, name?: string): Promise<LlmProviderProfileState> => {
     const current = getCurrentLlmProfile()
     const profileName = String(name || current.name || current.provider || 'AI 服务商').trim()
-    const idBase = profileName || current.id
+    const stored = getStoredLlmProviderProfiles()
+    const existing = findStoredLlmProfileMatch(stored, {
+      id: current.id,
+      provider: profileName,
+      name: profileName,
+      baseUrl: current.baseUrl,
+      model: current.model,
+    })
     const profile: LlmProviderProfile = {
       ...current,
-      id: makeLlmProfileId(idBase, current.baseUrl, current.model),
+      id: existing?.id || makeLlmProfileId(profileName || current.id, current.baseUrl, current.model),
       name: profileName,
       provider: profileName,
       updatedAt: new Date().toISOString(),
     }
-    const profiles = getLlmProviderProfiles().filter((item) => item.id !== profile.id)
+    // Persist against stored list only — never re-save ephemeral rows from getLlmProviderProfiles().
+    const profiles = stored.filter((item) => item.id !== profile.id)
     const currentSecret = readProtectedSetting('llm_api_key')
     if (currentSecret) writeProtectedSetting(`llm_profile:${profile.id}`, currentSecret)
     saveLlmProviderProfiles([profile, ...profiles])
     setSettingValue('llm_active_provider_id', profile.id)
     setSettingValue('llm_provider', profile.provider)
+    setSettingValue('llm_base_url', profile.baseUrl)
+    setSettingValue('llm_model', profile.model)
     saveDatabase()
+    const nextCurrent = getCurrentLlmProfile()
     return {
       activeId: profile.id,
-      current: profile,
+      current: nextCurrent,
       profiles: getLlmProviderProfiles(),
-      configValidation: getLlmProfileValidation(profile),
+      configValidation: getLlmProfileValidation(nextCurrent),
     }
   })
 
   ipcMain.handle('settings:llmProfiles:upsert', async (event, profile: LlmProviderProfile, credentialDraftRef?: string): Promise<LlmProviderProfilesResult> => {
     if (profile && 'apiKey' in profile) throw new Error('profile_secret_requires_credential_draft')
     const provider = String(profile?.provider || profile?.name || '').trim()
-    const baseUrl = String(profile?.baseUrl || '').trim().replace(/\/+$/, '')
+    const baseUrl = normalizeLlmProfileBaseUrl(String(profile?.baseUrl || ''))
     const model = String(profile?.model || '').trim()
+    const stored = getStoredLlmProviderProfiles()
+    const requestedId = String(profile?.id || '').trim()
+    const existing = findStoredLlmProfileMatch(stored, {
+      id: requestedId,
+      provider,
+      name: String(profile?.name || provider || '').trim(),
+      baseUrl,
+      model,
+    })
     const next: LlmProviderProfile = {
-      id: String(profile?.id || '').trim() || makeLlmProfileId(provider, baseUrl, model),
+      id: existing?.id || requestedId || makeLlmProfileId(provider, baseUrl, model),
       name: String(profile?.name || profile?.provider || '').trim(),
       provider,
       baseUrl,
@@ -917,12 +1118,27 @@ export function registerSettingsIpc(): void {
     if (credentialDraftRef) {
       writeProtectedSetting(`llm_profile:${next.id}`, consumeCredentialDraft(event.sender.id, 'llm_api_key', credentialDraftRef))
       next.credential = getCredentialPublicState(`llm_profile:${next.id}`)
+    } else if (!readProtectedSetting(`llm_profile:${next.id}`)) {
+      // Leave-empty save: seal the working global key into this profile when it is (or becomes) the active one.
+      const activeId = String(getSettingValue('llm_active_provider_id') || '').trim()
+      const globalSecret = readProtectedSetting('llm_api_key')
+      if (globalSecret && (activeId === next.id || !activeId)) {
+        writeProtectedSetting(`llm_profile:${next.id}`, globalSecret)
+        next.credential = getCredentialPublicState(`llm_profile:${next.id}`)
+      }
+    } else {
+      next.credential = getCredentialPublicState(`llm_profile:${next.id}`)
     }
-    const profiles = getLlmProviderProfiles().filter((item) => item.id !== next.id)
+    // Drop same-id and same-endpoint duplicates; never persist ephemeral list rows.
+    const profiles = stored.filter((item) => (
+      item.id !== next.id
+      && llmProfileEndpointKey(item) !== llmProfileEndpointKey(next)
+    ))
     saveLlmProviderProfiles([next, ...profiles])
     saveDatabase()
+    const activeId = String(getSettingValue('llm_active_provider_id') || '').trim() || next.id
     return {
-      activeId: getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider') || next.id,
+      activeId,
       profiles: getLlmProviderProfiles(),
       configValidation,
     }
@@ -930,9 +1146,22 @@ export function registerSettingsIpc(): void {
 
   ipcMain.handle('settings:llmProfiles:switch', async (_event, profileId: string): Promise<LlmProviderProfileState> => {
     const id = String(profileId || '').trim()
-    const profiles = getLlmProviderProfiles()
+    // Switch only among persisted profiles; never materialize ghosts.
+    const profiles = getStoredLlmProviderProfiles()
     const profile = profiles.find((item) => item.id === id)
     if (!profile) throw new Error('未找到 AI 服务商配置')
+
+    // Seal the working global key into the profile we are leaving, so vector index / multi-provider
+    // can still see llm_profile:{previousId} after the active slot moves on.
+    const previousId = String(getSettingValue('llm_active_provider_id') || '').trim()
+    if (previousId && previousId !== profile.id) {
+      const previousProfileSecret = readProtectedSetting(`llm_profile:${previousId}`)
+      const globalSecret = readProtectedSetting('llm_api_key')
+      if (!previousProfileSecret && globalSecret) {
+        writeProtectedSetting(`llm_profile:${previousId}`, globalSecret)
+      }
+    }
+
     setSettingValue('llm_active_provider_id', profile.id)
     setSettingValue('llm_provider', profile.provider || profile.name)
     setSettingValue('llm_base_url', profile.baseUrl)
@@ -947,12 +1176,18 @@ export function registerSettingsIpc(): void {
 
   ipcMain.handle('settings:llmProfiles:delete', async (_event, profileId: string): Promise<LlmProviderProfilesResult> => {
     const id = String(profileId || '').trim()
-    const activeId = getSettingValue('llm_active_provider_id') || getSettingValue('llm_provider')
+    const activeId = String(getSettingValue('llm_active_provider_id') || '').trim()
     if (id && id === activeId) throw new Error('不能删除当前正在使用的 AI 服务商')
     if (id) revokeProtectedSetting(`llm_profile:${id}`)
-    saveLlmProviderProfiles(getLlmProviderProfiles().filter((item) => item.id !== id))
+    // Delete from stored list only so ephemeral current rows are never written back.
+    saveLlmProviderProfiles(getStoredLlmProviderProfiles().filter((item) => item.id !== id))
     saveDatabase()
-    return { activeId, profiles: getLlmProviderProfiles(), configValidation: getLlmProfileValidation(getCurrentLlmProfile()) }
+    const nextActiveId = String(getSettingValue('llm_active_provider_id') || '').trim()
+    return {
+      activeId: nextActiveId,
+      profiles: getLlmProviderProfiles(),
+      configValidation: getLlmProfileValidation(getCurrentLlmProfile()),
+    }
   })
 
   ipcMain.handle('settings:visionOcrProfiles:list', async (): Promise<LlmProviderProfileState> => {

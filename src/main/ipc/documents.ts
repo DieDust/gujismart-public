@@ -37,6 +37,7 @@ import {
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { applyManualLiteraturePageAnchor, recomputeLiteraturePageMap, resetLiteraturePageMap } from '../literature-page-map'
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
 import { inspectManagedDeleteTarget, type ManagedDeleteKind } from '../managed-path-boundary'
@@ -2930,6 +2931,15 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
   if (options?.favoritesOnly) {
     conditions.push('d.is_favorite = 1')
   }
+  if (options?.embeddingReady) {
+    // Only documents that finished embedding successfully (vector library ready).
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM embedding_index_status eis
+        WHERE eis.doc_id = d.id AND eis.status = 'ready'
+      )`,
+    )
+  }
   if (options?.healthFilter) {
     const authorExpression = `(
       TRIM(COALESCE(d.author, '')) = ''
@@ -3376,12 +3386,28 @@ function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentLis
      GROUP BY rn.doc_id`,
     docIds,
   )
+  const embeddingStatusRows = queryAll<{ doc_id: string; status?: string | null }>(
+    `SELECT doc_id, status FROM embedding_index_status WHERE doc_id IN (${placeholders})`,
+    docIds,
+  )
+  const embeddingChunkRows = queryAll<{ doc_id: string; c?: number | null }>(
+    `SELECT doc_id, COUNT(*) as c FROM embedding_chunks WHERE doc_id IN (${placeholders}) GROUP BY doc_id`,
+    docIds,
+  )
 
   const pageStatsByDoc = new Map(pageRows.map((row) => [row.doc_id, row]))
   const noteStatsByDoc = new Map(noteRows.map((row) => [row.doc_id, Number(row.research_note_count || 0)]))
+  const embeddingStatusByDoc = new Map(
+    embeddingStatusRows.map((row) => [row.doc_id, String(row.status || '').trim() || 'none']),
+  )
+  const embeddingChunkByDoc = new Map(
+    embeddingChunkRows.map((row) => [row.doc_id, Number(row.c || 0)]),
+  )
 
   return documents.map((doc) => {
     const stats = pageStatsByDoc.get(doc.id)
+    const embeddingStatus = embeddingStatusByDoc.get(doc.id) || 'none'
+    const embeddingChunks = embeddingChunkByDoc.get(doc.id) || 0
     return {
       ...doc,
       actual_page_count: Number(stats?.actual_page_count || 0),
@@ -3390,6 +3416,8 @@ function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentLis
       image_page_count: Number(stats?.image_page_count || 0),
       research_note_count: noteStatsByDoc.get(doc.id) || 0,
       search_segment_count: 0,
+      embedding_status: embeddingStatus,
+      embedding_chunk_count: embeddingChunks,
     }
   })
 }
@@ -4552,6 +4580,9 @@ export function registerDocumentIpc(): void {
         ocr_status,
         proof_status,
         created_at,
+        literature_page_num,
+        literature_page_source,
+        ocr_page_label,
         CASE WHEN TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> ''
                OR COALESCE(proofed_text_ref, ocr_text_ref, '') <> '' THEN 1 ELSE 0 END as has_text,
         CASE WHEN (ocr_result IS NOT NULL AND TRIM(ocr_result) <> '')
@@ -4688,6 +4719,35 @@ export function registerDocumentIpc(): void {
         __search_text_only: true,
       }
     })
+  })
+
+  ipcMain.handle('documents:recomputeLiteraturePages', async (_event, docId: string) => {
+    const id = String(docId || '').trim()
+    if (!id) throw new Error('docId is required')
+    return recomputeLiteraturePageMap(id)
+  })
+
+  ipcMain.handle(
+    'documents:applyLiteraturePageAnchor',
+    async (
+      _event,
+      docId: string,
+      physicalPageNum: number,
+      literaturePageNum: number,
+    ) => {
+      const id = String(docId || '').trim()
+      if (!id) throw new Error('docId is required')
+      const physical = Math.floor(Number(physicalPageNum) || 0)
+      const literature = Math.floor(Number(literaturePageNum) || 0)
+      if (physical < 1 || literature < 1) throw new Error('页码必须是大于 0 的整数')
+      return applyManualLiteraturePageAnchor(id, physical, literature)
+    },
+  )
+
+  ipcMain.handle('documents:resetLiteraturePages', async (_event, docId: string) => {
+    const id = String(docId || '').trim()
+    if (!id) throw new Error('docId is required')
+    return resetLiteraturePageMap(id)
   })
 
   ipcMain.handle('documents:getReadingWindow', async (_event, docId: string, pageIndex?: number, radius?: number): Promise<DocumentReadingWindow | null> => {

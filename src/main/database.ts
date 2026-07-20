@@ -1274,6 +1274,36 @@ CREATE TABLE IF NOT EXISTS search_index_status (
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS embedding_chunks (
+  segment_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  page_id TEXT,
+  page_num INTEGER,
+  model_id TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  embedding BLOB NOT NULL,
+  updated_at TEXT,
+  PRIMARY KEY (segment_id, model_id),
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS embedding_index_status (
+  doc_id TEXT PRIMARY KEY,
+  status TEXT DEFAULT 'pending',
+  segment_count INTEGER DEFAULT 0,
+  embedded_count INTEGER DEFAULT 0,
+  content_hash TEXT DEFAULT '',
+  error_message TEXT,
+  updated_at TEXT,
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS embedding_index_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 CREATE TABLE IF NOT EXISTS translation_context_snapshots (
   id TEXT PRIMARY KEY,
   context_hash TEXT NOT NULL UNIQUE,
@@ -1353,7 +1383,21 @@ VALUES ('library', 0, CAST(strftime('%s', 'now') AS INTEGER) * 1000);
 CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_insert AFTER INSERT ON documents BEGIN
   UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
 END;
-CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_update AFTER UPDATE ON documents BEGIN
+-- Ignore pure open/read bookkeeping (last_opened_at, read_status, rating, favorites)
+-- so opening a document from search does not invalidate the active search snapshot.
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_update AFTER UPDATE ON documents
+WHEN
+  COALESCE(NEW.title, '') IS NOT COALESCE(OLD.title, '')
+  OR COALESCE(NEW.author, '') IS NOT COALESCE(OLD.author, '')
+  OR COALESCE(NEW.dynasty, '') IS NOT COALESCE(OLD.dynasty, '')
+  OR COALESCE(NEW.doc_type, '') IS NOT COALESCE(OLD.doc_type, '')
+  OR COALESCE(NEW.file_path, '') IS NOT COALESCE(OLD.file_path, '')
+  OR COALESCE(NEW.import_status, '') IS NOT COALESCE(OLD.import_status, '')
+  OR COALESCE(NEW.ocr_status, '') IS NOT COALESCE(OLD.ocr_status, '')
+  OR COALESCE(NEW.proof_status, '') IS NOT COALESCE(OLD.proof_status, '')
+  OR COALESCE(NEW.metadata_status, '') IS NOT COALESCE(OLD.metadata_status, '')
+  OR COALESCE(NEW.metadata, '') IS NOT COALESCE(OLD.metadata, '')
+BEGIN
   UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
 END;
 CREATE TRIGGER IF NOT EXISTS trg_search_generation_documents_delete AFTER DELETE ON documents BEGIN
@@ -1362,7 +1406,19 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_insert AFTER INSERT ON pages BEGIN
   UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
 END;
-CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_update AFTER UPDATE ON pages BEGIN
+-- Only searchable page content / identity changes bump the library generation.
+CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_update AFTER UPDATE ON pages
+WHEN
+  COALESCE(NEW.doc_id, '') IS NOT COALESCE(OLD.doc_id, '')
+  OR COALESCE(NEW.page_num, -1) IS NOT COALESCE(OLD.page_num, -1)
+  OR COALESCE(NEW.ocr_text, '') IS NOT COALESCE(OLD.ocr_text, '')
+  OR COALESCE(NEW.proofed_text, '') IS NOT COALESCE(OLD.proofed_text, '')
+  OR COALESCE(NEW.ocr_text_ref, '') IS NOT COALESCE(OLD.ocr_text_ref, '')
+  OR COALESCE(NEW.proofed_text_ref, '') IS NOT COALESCE(OLD.proofed_text_ref, '')
+  OR COALESCE(NEW.ocr_result, '') IS NOT COALESCE(OLD.ocr_result, '')
+  OR COALESCE(NEW.ocr_result_ref, '') IS NOT COALESCE(OLD.ocr_result_ref, '')
+  OR COALESCE(NEW.ocr_status, '') IS NOT COALESCE(OLD.ocr_status, '')
+BEGIN
   UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
 END;
 CREATE TRIGGER IF NOT EXISTS trg_search_generation_pages_delete AFTER DELETE ON pages BEGIN
@@ -1980,6 +2036,46 @@ function stripLegacyTocMetadata(sqlite: NativeDatabase): void {
   tx()
 }
 
+function ensureSearchGenerationTriggers(sqlite: NativeDatabase): void {
+  // Existing installs keep old unconditional UPDATE triggers (CREATE IF NOT EXISTS).
+  // Recreate so opening a document (last_opened_at only) no longer invalidates search snapshots.
+  sqlite.exec(`
+    DROP TRIGGER IF EXISTS trg_search_generation_documents_update;
+    DROP TRIGGER IF EXISTS trg_search_generation_pages_update;
+
+    CREATE TRIGGER trg_search_generation_documents_update AFTER UPDATE ON documents
+    WHEN
+      COALESCE(NEW.title, '') IS NOT COALESCE(OLD.title, '')
+      OR COALESCE(NEW.author, '') IS NOT COALESCE(OLD.author, '')
+      OR COALESCE(NEW.dynasty, '') IS NOT COALESCE(OLD.dynasty, '')
+      OR COALESCE(NEW.doc_type, '') IS NOT COALESCE(OLD.doc_type, '')
+      OR COALESCE(NEW.file_path, '') IS NOT COALESCE(OLD.file_path, '')
+      OR COALESCE(NEW.import_status, '') IS NOT COALESCE(OLD.import_status, '')
+      OR COALESCE(NEW.ocr_status, '') IS NOT COALESCE(OLD.ocr_status, '')
+      OR COALESCE(NEW.proof_status, '') IS NOT COALESCE(OLD.proof_status, '')
+      OR COALESCE(NEW.metadata_status, '') IS NOT COALESCE(OLD.metadata_status, '')
+      OR COALESCE(NEW.metadata, '') IS NOT COALESCE(OLD.metadata, '')
+    BEGIN
+      UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+    END;
+
+    CREATE TRIGGER trg_search_generation_pages_update AFTER UPDATE ON pages
+    WHEN
+      COALESCE(NEW.doc_id, '') IS NOT COALESCE(OLD.doc_id, '')
+      OR COALESCE(NEW.page_num, -1) IS NOT COALESCE(OLD.page_num, -1)
+      OR COALESCE(NEW.ocr_text, '') IS NOT COALESCE(OLD.ocr_text, '')
+      OR COALESCE(NEW.proofed_text, '') IS NOT COALESCE(OLD.proofed_text, '')
+      OR COALESCE(NEW.ocr_text_ref, '') IS NOT COALESCE(OLD.ocr_text_ref, '')
+      OR COALESCE(NEW.proofed_text_ref, '') IS NOT COALESCE(OLD.proofed_text_ref, '')
+      OR COALESCE(NEW.ocr_result, '') IS NOT COALESCE(OLD.ocr_result, '')
+      OR COALESCE(NEW.ocr_result_ref, '') IS NOT COALESCE(OLD.ocr_result_ref, '')
+      OR COALESCE(NEW.ocr_status, '') IS NOT COALESCE(OLD.ocr_status, '')
+    BEGIN
+      UPDATE search_generation_state SET generation = generation + 1, updated_at = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE scope = 'library';
+    END;
+  `)
+}
+
 function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'pages', 'ocr_text_ref TEXT', 'ocr_text_ref')
   addColumnIfMissing(sqlite, 'pages', 'ocr_result_ref TEXT', 'ocr_result_ref')
@@ -1987,6 +2083,11 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'pages', 'active_ocr_artifact_id TEXT', 'active_ocr_artifact_id')
   addColumnIfMissing(sqlite, 'pages', 'proof_base_artifact_id TEXT', 'proof_base_artifact_id')
   addColumnIfMissing(sqlite, 'pages', 'proof_base_stale INTEGER NOT NULL DEFAULT 0', 'proof_base_stale')
+  // Printed / literature page number (continuity-resolved). Distinct from physical page_num.
+  addColumnIfMissing(sqlite, 'pages', 'literature_page_num INTEGER', 'literature_page_num')
+  addColumnIfMissing(sqlite, 'pages', 'literature_page_source TEXT', 'literature_page_source')
+  addColumnIfMissing(sqlite, 'pages', 'ocr_page_label INTEGER', 'ocr_page_label')
+  ensureSearchGenerationTriggers(sqlite)
 
   addColumnIfMissing(sqlite, 'documents', 'is_favorite INTEGER DEFAULT 0', 'is_favorite')
   addColumnIfMissing(sqlite, 'documents', 'favorite_at TEXT', 'favorite_at')
@@ -2255,6 +2356,42 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'ai_research_tasks', "error_message TEXT DEFAULT ''", 'error_message')
   addColumnIfMissing(sqlite, 'ai_research_records', "note TEXT DEFAULT ''", 'note')
   addColumnIfMissing(sqlite, 'ai_research_records', "status TEXT DEFAULT 'pending'", 'status')
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS embedding_chunks (
+      segment_id TEXT NOT NULL,
+      doc_id TEXT NOT NULL,
+      page_id TEXT,
+      page_num INTEGER,
+      model_id TEXT NOT NULL,
+      dim INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      updated_at TEXT,
+      PRIMARY KEY (segment_id, model_id),
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS embedding_index_status (
+      doc_id TEXT PRIMARY KEY,
+      status TEXT DEFAULT 'pending',
+      segment_count INTEGER DEFAULT 0,
+      embedded_count INTEGER DEFAULT 0,
+      content_hash TEXT DEFAULT '',
+      error_message TEXT,
+      updated_at TEXT,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS embedding_index_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_embedding_chunks_doc ON embedding_chunks(doc_id);
+    CREATE INDEX IF NOT EXISTS idx_embedding_chunks_model ON embedding_chunks(model_id);
+    CREATE INDEX IF NOT EXISTS idx_embedding_status_updated ON embedding_index_status(updated_at);
+  `)
 
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS page_ocr_versions (

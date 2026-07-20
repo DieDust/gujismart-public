@@ -1611,6 +1611,17 @@ function commitStagedSearchIndexForDocument(
   } catch (error) {
     console.warn('[SearchIndex] Failed to clean staging rows after index commit', error)
   }
+
+  // Optional auto vectorize / incremental re-embed for already tracked docs.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const embedding = require('./embedding-index') as {
+      notifyDocumentReadyForEmbedding?: (id: string) => void
+    }
+    embedding.notifyDocumentReadyForEmbedding?.(docId)
+  } catch {
+    // ignore
+  }
 }
 
 async function reindexDocumentInBackground(docId: string, totalCount: number, completedCount: number): Promise<SearchReindexDocumentResult> {
@@ -3533,13 +3544,25 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
     translationScope: options?.translationScope || 'all',
   })
   const requestedSnapshotId = String(options?.snapshotId || '').trim()
-  const requestedSnapshot = requestedSnapshotId
+  const requestedSnapshotValidation = requestedSnapshotId
     ? validateSearchSnapshot(requestedSnapshotId, { criteriaKey })
     : null
-  if (requestedSnapshot && requestedSnapshot.validation !== 'active') {
-    throw new Error(`search_snapshot_${requestedSnapshot.validation.replace('-', '_')}`)
+  // criteria-mismatch is a client bug; other failures (stale after open-doc, expired TTL,
+  // not-found after restart) must soft-recover so return-to-search still works.
+  if (requestedSnapshotValidation?.validation === 'criteria-mismatch') {
+    throw new Error('search_snapshot_criteria_mismatch')
   }
-  const currentGeneration = requestedSnapshot?.snapshot?.librarySearchGeneration ?? getLibrarySearchGeneration()
+  const activeRequestedSnapshot = requestedSnapshotValidation?.validation === 'active'
+    ? requestedSnapshotValidation
+    : null
+  if (requestedSnapshotId && !activeRequestedSnapshot) {
+    console.info(
+      '[Search] snapshot not reusable, soft-recovering',
+      requestedSnapshotId,
+      requestedSnapshotValidation?.validation || 'unknown',
+    )
+  }
+  const currentGeneration = activeRequestedSnapshot?.snapshot?.librarySearchGeneration ?? getLibrarySearchGeneration()
   const cacheKey = stableStringify({
     criteriaKey,
     generation: currentGeneration,
@@ -3562,18 +3585,18 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
       })
       return value
     }
-    if (requestedSnapshot?.snapshot) {
-      const finalValidation = validateSearchSnapshot(requestedSnapshot.snapshot.snapshotId, { criteriaKey })
-      if (finalValidation.validation !== 'active') {
-        throw new Error(`search_snapshot_${finalValidation.validation.replace('-', '_')}`)
+    if (activeRequestedSnapshot?.snapshot) {
+      const finalValidation = validateSearchSnapshot(activeRequestedSnapshot.snapshot.snapshotId, { criteriaKey })
+      if (finalValidation.validation === 'active' && finalValidation.snapshot) {
+        return recordAggregate(finalValidation.snapshot.snapshotId, {
+          ...response,
+          snapshotId: finalValidation.snapshot.snapshotId,
+          librarySearchGeneration: finalValidation.snapshot.librarySearchGeneration,
+          indexGenerationVectorHash: finalValidation.snapshot.indexGenerationVectorHash,
+          snapshotExpiresAt: finalValidation.snapshot.expiresAt,
+        })
       }
-      return recordAggregate(finalValidation.snapshot!.snapshotId, {
-        ...response,
-        snapshotId: finalValidation.snapshot!.snapshotId,
-        librarySearchGeneration: finalValidation.snapshot!.librarySearchGeneration,
-        indexGenerationVectorHash: finalValidation.snapshot!.indexGenerationVectorHash,
-        snapshotExpiresAt: finalValidation.snapshot!.expiresAt,
-      })
+      // Became invalid mid-query (e.g. concurrent content write) — issue a fresh snapshot.
     }
     const attached = attachSearchSnapshot(response, criteriaKey)
     return recordAggregate(attached.snapshotId, attached)
@@ -4472,7 +4495,7 @@ export function runSavedSearch(id: string): SavedSearchRunResult {
   }
   const payload = JSON.parse(savedSearch.filters || '{}') as SavedSearchPayload
   const keyword = String(payload.keyword || '').trim()
-  const mode = payload.mode === 'ai' ? 'ai' : 'fulltext'
+  const mode = payload.mode === 'ai' ? 'ai' : payload.mode === 'vector' ? 'vector' : 'fulltext'
   const filters: SearchOptions = {
     ...(payload.filters && typeof payload.filters === 'object' ? payload.filters : payload),
     sort: payload.sort,
@@ -4498,6 +4521,8 @@ export function runSavedSearch(id: string): SavedSearchRunResult {
       cacheHit: true,
     }
   }
+  // Vector / AI saved searches re-run on the client when cache misses (async APIs).
+  // Only full-text can be rebuilt synchronously here.
   const grouped = keyword && mode === 'fulltext' ? querySearchV2(keyword, filters) : null
   const results = grouped ? flattenGroupedResponse(grouped, 'fulltext') : []
   if (keyword && grouped) {

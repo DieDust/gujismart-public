@@ -55,7 +55,9 @@ npm run mcp -- --data-dir "<你的数据目录>" --mcp-token "<令牌>"
 
 | Tool | 作用 |
 |------|------|
-| `library_search` | 全库检索（默认 **compact**：标题/页码/短摘录/`ref`；`detail:"full"` 才带完整 locator） |
+| `library_search` | 全库 **关键词** 检索（默认 **compact**：标题/页码/短摘录/`ref`；`detail:"full"` 才带完整 locator） |
+| `vector_search` | **语义/向量** 检索（需用户在软件内建过向量索引；主题描述优于整词匹配） |
+| `vector_index_stats` | 向量索引状态（模型、段数、排队，不含密钥） |
 | `list_documents` | 文献列表（精简元数据，无本地路径） |
 | `get_document` | 元数据；默认不含逐页清单，`includePages:true` 才展开 |
 | `get_page_text` | 页正文（默认不含 content hash） |
@@ -64,6 +66,15 @@ npm run mcp -- --data-dir "<你的数据目录>" --mcp-token "<令牌>"
 | `library_stats` | 统计 |
 
 默认返回刻意压短，避免把 `sourceHash` / `contentVersion` / `sourceRanges` 等机读字段灌进 AI 上下文；桌面端界面检索不受影响。
+
+### 向量索引（软件内）
+
+1. 设置 → **向量索引**：配置 OpenAI 兼容 Embeddings Base URL / 模型；密钥可复用 LLM 或单独填写。  
+2. **「入库后自动向量化」默认关**；一般请在文献库 **批量处理 → 向量化所选文献**。  
+3. Agent 侧：`vector_search` 缩小候选 → `get_page_text` 精读；专名仍用 `library_search`。  
+
+**向量化对象（重要）**：只对入库后、已转成文字的**正文**做 embedding（与导出 TXT/MD 的页文同类：校对稿/OCR 纯文本分段）。  
+**不会**向量化 PDF 文件本身，也不会把 locator、坐标、hash、代码、路径等机读结构送进向量模型；检索结果里的 `ref` 只是指回某一页，方便再取正文。
 
 ## 开发自检
 

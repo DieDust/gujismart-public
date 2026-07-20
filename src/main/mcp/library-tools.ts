@@ -18,6 +18,7 @@ import { queryAll, queryOne } from '../database'
 import { listDocumentsPage } from '../ipc/documents'
 import { resolveSearchEvidence } from '../search-evidence-resolver'
 import { querySearchV2 } from '../semantic-search'
+import { getEmbeddingIndexStats, vectorSearch } from '../embedding-index'
 
 const MAX_SEARCH_LIMIT = 50
 const MAX_LIST_LIMIT = 50
@@ -148,6 +149,27 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
   {
     name: 'library_stats',
     description: 'High-level counts: documents, pages, folders, tags (read-only).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'vector_search',
+    description:
+      'Semantic / embedding search over the vector index (natural-language or topical queries). Prefer this for fuzzy themes; use library_search for exact keywords. Returns compact hits with score and ref; follow up with get_page_text. Requires the user to have built a vector index in Settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Natural language or topical query' },
+        limit: { type: 'number', description: `Max hits (1-${MAX_SEARCH_LIMIT})` },
+        folderId: { type: 'string' },
+        tagId: { type: 'string' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'vector_index_stats',
+    description:
+      'Vector index status: model, chunk counts, queued/ready docs, whether auto-on-ingest is enabled. Does not expose API keys.',
     inputSchema: { type: 'object', properties: {} },
   },
 ]
@@ -327,12 +349,14 @@ export async function callLibraryTool(
         const pages = queryAll<{
           id: string
           page_num: number
+          literature_page_num?: number | null
           ocr_status: string | null
           has_text: number
         }>(
           `SELECT
              id,
              page_num,
+             literature_page_num,
              ocr_status,
              CASE WHEN TRIM(COALESCE(NULLIF(proofed_text, ''), NULLIF(ocr_text, ''), '')) <> ''
                     OR COALESCE(proofed_text_ref, ocr_text_ref, '') <> '' THEN 1 ELSE 0 END as has_text
@@ -344,6 +368,7 @@ export async function callLibraryTool(
         document.pages = pages.map((page) => ({
           id: page.id,
           pageNum: page.page_num,
+          literaturePageNum: page.literature_page_num ?? null,
           ocrStatus: page.ocr_status,
           hasText: Number(page.has_text || 0) > 0,
         }))
@@ -359,21 +384,22 @@ export async function callLibraryTool(
       const startPage = Math.max(1, Math.round(Number(input.pageNum || 0)) || 0)
       const endPage = Math.max(startPage, Math.round(Number(input.endPageNum || startPage)) || startPage)
 
-      let pageRows: Array<{ id: string; page_num: number }>
+      let pageRows: Array<{ id: string; page_num: number; literature_page_num?: number | null }>
       if (pageId) {
-        const row = queryOne<{ id: string; page_num: number; doc_id: string }>(
-          'SELECT id, page_num, doc_id FROM pages WHERE id = ?',
+        const row = queryOne<{ id: string; page_num: number; literature_page_num?: number | null; doc_id: string }>(
+          'SELECT id, page_num, literature_page_num, doc_id FROM pages WHERE id = ?',
           [pageId],
         )
         if (!row || row.doc_id !== docId) return toolError('not_found', 'Page not found for document')
-        pageRows = [{ id: row.id, page_num: row.page_num }]
+        pageRows = [{ id: row.id, page_num: row.page_num, literature_page_num: row.literature_page_num }]
       } else {
         if (!startPage) return toolError('invalid_args', 'pageNum or pageId is required')
         if (endPage - startPage + 1 > MAX_PAGE_RANGE) {
           return toolError('invalid_args', `page range cannot exceed ${MAX_PAGE_RANGE} pages`)
         }
-        pageRows = queryAll<{ id: string; page_num: number }>(
-          `SELECT id, page_num FROM pages
+        // pageNum accepts physical index (default) for navigation compatibility.
+        pageRows = queryAll<{ id: string; page_num: number; literature_page_num?: number | null }>(
+          `SELECT id, page_num, literature_page_num FROM pages
            WHERE doc_id = ? AND page_num >= ? AND page_num <= ?
            ORDER BY page_num`,
           [docId, startPage, endPage],
@@ -383,11 +409,17 @@ export async function callLibraryTool(
 
       const pages = []
       for (const row of pageRows) {
+        const literaturePageNum = Number(row.literature_page_num || 0) > 0
+          ? Number(row.literature_page_num)
+          : null
         try {
           const canonical = resolveCanonicalPageContent(row.id)
           const entry: Record<string, unknown> = {
             pageId: row.id,
+            /** Physical / PDF order (for navigation). */
             pageNum: row.page_num,
+            /** Continuity-resolved printed literature page (prefer for citations). */
+            literaturePageNum,
             source: canonical.source,
             text: clipText(canonical.text),
           }
@@ -397,6 +429,7 @@ export async function callLibraryTool(
           pages.push({
             pageId: row.id,
             pageNum: row.page_num,
+            literaturePageNum,
             source: 'missing',
             text: '',
             error: 'canonical_content_unavailable',
@@ -478,6 +511,36 @@ export async function callLibraryTool(
         folders,
         tags,
         ocrCompletedDocuments: ocrCompleted,
+      }
+    }
+
+    case 'vector_search': {
+      const query = String(input.query || '').trim()
+      if (!query) return toolError('invalid_args', 'query is required')
+      const result = await vectorSearch(query, {
+        limit: clampLimit(input.limit, MAX_SEARCH_LIMIT, 15),
+        folderId: input.folderId ? String(input.folderId) : undefined,
+        tagId: input.tagId ? String(input.tagId) : undefined,
+      })
+      return result
+    }
+
+    case 'vector_index_stats': {
+      const stats = getEmbeddingIndexStats()
+      return {
+        ok: true,
+        modelId: stats.modelId,
+        dim: stats.dim,
+        autoOnIngest: stats.autoOnIngest,
+        apiKeyConfigured: stats.apiKeyConfigured,
+        chunks: stats.chunks,
+        docsReady: stats.docsReady,
+        docsQueued: stats.docsQueued,
+        docsProcessing: stats.docsProcessing,
+        docsError: stats.docsError,
+        docsPending: stats.docsPending,
+        queuePaused: stats.queuePaused,
+        message: stats.message,
       }
     }
 

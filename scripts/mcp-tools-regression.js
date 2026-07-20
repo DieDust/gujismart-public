@@ -26,6 +26,8 @@ const requiredTools = [
   'list_folders',
   'list_tags',
   'library_stats',
+  'vector_search',
+  'vector_index_stats',
 ]
 
 for (const name of requiredTools) {
@@ -37,6 +39,8 @@ assert.ok(tools.includes('querySearchV2'), 'library_search must use querySearchV
 assert.ok(tools.includes('listDocumentsPage'), 'list_documents must use listDocumentsPage')
 assert.ok(tools.includes('resolveSearchEvidence'), 'resolve_evidence must use resolveSearchEvidence')
 assert.ok(tools.includes('resolveCanonicalPageContent'), 'get_page_text must use canonical content')
+assert.ok(tools.includes('vectorSearch') || tools.includes('vector_search'), 'vector_search tool must exist')
+assert.ok(tools.includes('getEmbeddingIndexStats') || tools.includes('vector_index_stats'), 'vector_index_stats tool must exist')
 assert.ok(tools.includes('hasLocalFile') || tools.includes('has_local_file'), 'responses should not dump absolute file paths as content')
 assert.ok(tools.includes("detail: 'full'") || tools.includes('isFullDetail') || tools.includes("detail:\"full\""), 'MCP tools support compact/full detail modes')
 assert.ok(tools.includes('compactHitRef') || tools.includes('ref:'), 'search hits should expose compact ref for follow-up reads')

@@ -11,6 +11,8 @@ const definitions: Record<string, SettingDefinition> = {
   auto_ai_after_ocr: { key: 'auto_ai_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
   auto_delete_pdf_assets_after_ocr: { key: 'auto_delete_pdf_assets_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
   prefer_facsimile_proof_layout: { key: 'prefer_facsimile_proof_layout', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
+  /** First open of a document: read vs proof. Per-document manual switches still win via reader_state. */
+  prefer_read_mode_on_open: { key: 'prefer_read_mode_on_open', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
 }
 
 export const SETTING_DEFINITIONS: Readonly<Record<string, SettingDefinition>> = definitions

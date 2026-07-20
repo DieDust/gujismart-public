@@ -3,8 +3,9 @@ import { nanoid } from 'nanoid'
 import type { SearchSnapshotAggregateSummary, SearchSnapshotMetadata, SearchSnapshotValidationResult } from '../shared/types'
 import { queryOne } from './database'
 
-const DEFAULT_TTL_MS = 60_000
-const MAX_TTL_MS = 10 * 60_000
+// Long enough for open-document → return-to-search workflows (reading a hit).
+const DEFAULT_TTL_MS = 30 * 60_000
+const MAX_TTL_MS = 2 * 60 * 60_000
 const MAX_SNAPSHOTS = 128
 const snapshots = new Map<string, SearchSnapshotMetadata>()
 const aggregateSummaries = new Map<string, SearchSnapshotAggregateSummary>()

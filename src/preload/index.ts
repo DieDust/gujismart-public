@@ -47,6 +47,10 @@ import type {
   ImportAutoOcrTaskStartResult,
   BatchQueueItem,
   BatchStartResult,
+  EmbeddingIndexStats,
+  EmbeddingProgressEvent,
+  VectorSearchFailure,
+  VectorSearchResponse,
   BackupImportResult,
   BackupResult,
   BackupStatus,
@@ -221,7 +225,7 @@ import type {
   CompactAutoBackupResult,
 } from '../shared/types'
 
-type RendererCredentialKey = 'llm_api_key' | 'paddleocr_api_key' | 'vision_ocr_api_key'
+type RendererCredentialKey = 'llm_api_key' | 'paddleocr_api_key' | 'vision_ocr_api_key' | 'embedding_api_key'
 
 async function prepareCredentialDraft(key: RendererCredentialKey, value: string): Promise<CredentialDraftRef | null> {
   const secret = String(value || '')
@@ -256,6 +260,28 @@ const api = {
     ipcRenderer.invoke('documents:getPdfInfo', filePath),
   cachePageImage: (docId: string, pageNum: number, dataUrl: string): Promise<string> =>
     ipcRenderer.invoke('documents:cachePageImage', docId, pageNum, dataUrl),
+  recomputeLiteraturePages: (docId: string): Promise<{ updated: number; inferred: number; ocr: number; fallback: number; manual?: number }> =>
+    ipcRenderer.invoke('documents:recomputeLiteraturePages', docId),
+  applyLiteraturePageAnchor: (
+    docId: string,
+    physicalPageNum: number,
+    literaturePageNum: number,
+  ): Promise<{
+    updated: number
+    anchorPhysical: number
+    anchorLiterature: number
+    pages: Array<{ id: string; page_num: number; literature_page_num: number; literature_page_source: string }>
+  }> =>
+    ipcRenderer.invoke('documents:applyLiteraturePageAnchor', docId, physicalPageNum, literaturePageNum),
+  resetLiteraturePages: (docId: string): Promise<{
+    updated: number
+    inferred: number
+    ocr: number
+    fallback: number
+    manual: number
+    pages: Array<{ id: string; page_num: number; literature_page_num: number; literature_page_source: string }>
+  }> =>
+    ipcRenderer.invoke('documents:resetLiteraturePages', docId),
   cleanupPdfAssets: (docId: string): Promise<PdfAssetCleanupResult> =>
     ipcRenderer.invoke('documents:cleanupPdfAssets', docId),
   cleanupCompletedPdfAssets: (): Promise<CompletedPdfAssetCleanupResult> =>
@@ -763,7 +789,7 @@ const api = {
   listModels: (
     baseUrl: string,
     apiKey: string,
-    credentialKey: 'llm_api_key' | 'vision_ocr_api_key' = 'llm_api_key',
+    credentialKey: 'llm_api_key' | 'vision_ocr_api_key' | 'embedding_api_key' = 'llm_api_key',
   ): Promise<string[]> => {
     return prepareCredentialDraft(credentialKey, apiKey).then((draft) => {
       const payload: ListModelsPayload = { baseUrl, credentialKey, credentialDraftRef: draft?.draftRef }
@@ -783,6 +809,78 @@ const api = {
     ipcRenderer.invoke('settings:mcp:rotateToken'),
   writeCodexMcpConfig: (): Promise<McpWriteCodexResult> =>
     ipcRenderer.invoke('settings:mcp:writeCodexConfig'),
+  getEmbeddingIndexStats: (): Promise<EmbeddingIndexStats> =>
+    ipcRenderer.invoke('embedding:getStats'),
+  getEmbeddingProgressSnapshot: (): Promise<EmbeddingProgressEvent> =>
+    ipcRenderer.invoke('embedding:getProgressSnapshot'),
+  updateEmbeddingSettings: (input: {
+    autoOnIngest?: boolean
+    baseUrl?: string
+    model?: string
+    batchSize?: number
+    dimensions?: number | null
+    resetBatchSizeToProviderDefault?: boolean
+    useLlmCredentials?: boolean
+    sourceProfileId?: string | null
+  }): Promise<EmbeddingIndexStats> =>
+    ipcRenderer.invoke('embedding:updateSettings', input),
+  setEmbeddingApiKey: (apiKey: string): Promise<EmbeddingIndexStats> =>
+    ipcRenderer.invoke('embedding:setApiKey', apiKey),
+  enqueueDocumentsForEmbedding: (
+    docIds: string[],
+    options?: { force?: boolean },
+  ): Promise<{
+    queued: number
+    skipped: number
+    reindexed?: number
+    clearedChunks?: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:enqueueDocuments', docIds, options),
+  reindexDocumentsForEmbedding: (docIds: string[]): Promise<{
+    queued: number
+    skipped: number
+    reindexed: number
+    clearedChunks: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:reindexDocuments', docIds),
+  reindexAllReadyEmbeddings: (): Promise<{
+    queued: number
+    skipped: number
+    reindexed: number
+    clearedChunks: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:reindexAllReady'),
+  reindexStaleEmbeddings: (): Promise<{
+    queued: number
+    skipped: number
+    reindexed: number
+    clearedChunks: number
+    stale: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:reindexStale'),
+  requeueFailedEmbeddings: (): Promise<{
+    queued: number
+    skipped: number
+    reindexed?: number
+    clearedChunks?: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:requeueFailed'),
+  setEmbeddingQueuePaused: (paused: boolean): Promise<EmbeddingIndexStats> =>
+    ipcRenderer.invoke('embedding:setQueuePaused', paused),
+  vectorSearch: (
+    query: string,
+    options?: { limit?: number; folderId?: string; tagId?: string },
+  ): Promise<VectorSearchResponse | VectorSearchFailure> =>
+    ipcRenderer.invoke('embedding:search', query, options),
+  listEmbeddingModels: (): Promise<string[]> =>
+    ipcRenderer.invoke('embedding:listModels'),
+  onEmbeddingProgress: (callback: (data: EmbeddingProgressEvent) => void): IpcUnsubscribe => {
+    const handler = (_event: Electron.IpcRendererEvent, data: EmbeddingProgressEvent) => callback(data)
+    ipcRenderer.on('embedding:progress', handler)
+    return () => {
+      ipcRenderer.removeListener('embedding:progress', handler)
+    }
+  },
   getPaddleOcrTokenPool: (): Promise<PaddleOcrTokenPoolState> =>
     ipcRenderer.invoke('settings:paddleOcrTokens:list'),
   addPaddleOcrToken: (label: string, apiKey: string): Promise<PaddleOcrTokenPoolState> => {

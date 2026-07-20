@@ -3,7 +3,7 @@ import { queryAll, queryOne, run, scheduleDatabaseSave } from './database'
 import { buildCumulativeFolderDocumentCounts } from './folder-scope'
 
 const CACHE_KEY = 'library-sidebar-v1'
-const CACHE_VERSION = 'library-sidebar-v3-cumulative-folder-counts'
+const CACHE_VERSION = 'library-sidebar-v4-vectorized-smart-view'
 // Keep first paint free: dirty-cache rebuild is expensive COUNT work on large libraries.
 const LIBRARY_STATE_CACHE_REFRESH_DELAY_MS = 12_000
 const LIBRARY_STATE_CACHE_COLD_START_DELAY_MS = 18_000
@@ -23,6 +23,7 @@ const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   unproofed: 0,
   metadataPending: 0,
   unstored: 0,
+  vectorized: 0,
 }
 
 interface CacheRow {
@@ -67,6 +68,7 @@ function parseCounts(value: unknown): LibrarySmartViewCounts {
     unproofed: numberValue(source.unproofed),
     metadataPending: numberValue(source.metadataPending),
     unstored: numberValue(source.unstored),
+    vectorized: numberValue(source.vectorized),
   }
 }
 
@@ -238,6 +240,13 @@ function buildCache(): LibraryStateCache {
     unproofed: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("COALESCE(d.proof_status, 'pending') <> 'completed'")}`),
     metadataPending: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.metadata_status IN ('pending', 'review')")}`),
     unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE d.import_status = 'unstored'`),
+    vectorized: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(`EXISTS (
+         SELECT 1 FROM embedding_index_status eis
+         WHERE eis.doc_id = d.id AND eis.status = 'ready'
+       )`)}`,
+    ),
   }
   return {
     smartViewCounts,
@@ -270,6 +279,13 @@ function buildLightweightCache(dirty: boolean): LibraryStateCache {
     unproofed: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("COALESCE(d.proof_status, 'pending') <> 'completed'")}`),
     metadataPending: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.metadata_status IN ('pending', 'review')")}`),
     unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE d.import_status = 'unstored'`),
+    vectorized: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(`EXISTS (
+         SELECT 1 FROM embedding_index_status eis
+         WHERE eis.doc_id = d.id AND eis.status = 'ready'
+       )`)}`,
+    ),
   }
   return {
     smartViewCounts,

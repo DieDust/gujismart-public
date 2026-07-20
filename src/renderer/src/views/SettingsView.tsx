@@ -23,7 +23,7 @@ import {
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type McpSetupInfo, type OcrEngine, type PaddleOcrTokenPoolState, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type EmbeddingIndexStats, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type McpSetupInfo, type OcrEngine, type PaddleOcrTokenPoolState, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
 
@@ -116,6 +116,7 @@ type SettingsSectionKey =
   | 'visionOcr'
   | 'ai'
   | 'aiTools'
+  | 'embedding'
   | 'glossary'
   | 'about'
 
@@ -127,6 +128,7 @@ const SETTINGS_SECTIONS: Array<{ key: SettingsSectionKey; label: string; icon: R
   { key: 'data', label: '数据管理', icon: <DatabaseOutlined /> },
   { key: 'ocr', label: 'OCR', icon: <ApiOutlined /> },
   { key: 'ai', label: 'AI', icon: <ApiOutlined /> },
+  { key: 'embedding', label: '向量索引', icon: <ThunderboltOutlined /> },
   { key: 'aiTools', label: 'AI 工具连接', icon: <LinkOutlined /> },
   { key: 'glossary', label: '翻译术语表', icon: <BookOutlined /> },
   { key: 'about', label: '关于与版权', icon: <GithubOutlined /> },
@@ -146,6 +148,33 @@ const PRESET_ENDPOINTS = [
     models: ['ark-code-latest', 'doubao-seed-2.0-code', 'doubao-seed-2.0-pro', 'doubao-seed-2.0-lite', 'deepseek-v3.2', 'glm-4.7', 'glm-4-7', 'kimi-k2.5', 'kimi-k2-5', 'gpt-oss-120b'],
   },
 ]
+
+/** Embeddings 服务商预设：默认通义；不含 DeepSeek（无向量模型） */
+const EMBEDDING_PROVIDER_PRESETS = [
+  {
+    name: '通义千问',
+    // 百炼 OpenAI 兼容：https://dashscope.aliyuncs.com/compatible-mode/v1
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    // 官方模型与批次：v3/v4=10，v2/v1=25，qwen3.7=20（切换模型会自动限流）
+    models: ['text-embedding-v4', 'text-embedding-v3', 'qwen3.7-text-embedding', 'text-embedding-v2', 'text-embedding-v1'],
+  },
+  {
+    name: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    models: ['text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-ada-002'],
+  },
+  {
+    name: '硅基流动',
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    models: ['BAAI/bge-m3', 'BAAI/bge-large-zh-v1.5', 'netease-youdao/bce-embedding-base_v1'],
+  },
+  {
+    name: '智谱 GLM',
+    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    models: ['embedding-3', 'embedding-2'],
+  },
+]
+const DEFAULT_EMBEDDING_PROVIDER = EMBEDDING_PROVIDER_PRESETS[0]
 
 const VISION_PRESET_ENDPOINTS = [
   {
@@ -289,6 +318,7 @@ const SHORTCUT_ITEMS: Array<{ action: ShortcutAction; label: string; hint: strin
   { action: 'search', label: '检索', hint: '聚焦当前页面的检索框' },
   { action: 'selectAll', label: '文库全选', hint: '文库页进入批量模式并选中当前列表' },
   { action: 'invertSelection', label: '文库反选', hint: '文库页进入批量模式并反选当前列表' },
+  { action: 'copyDirectQuote', label: '复制直接引用', hint: '一键复制选中文本（带引用格式）；默认 Ctrl+D' },
 ]
 
 function formatDateTime(value?: string | null): string {
@@ -484,16 +514,18 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const loadingSettingsRef = useRef(true)
   const dirtyRef = useRef(false)
   const [saving, setSaving] = useState(false)
-  const [credentialHints, setCredentialHints] = useState<Record<'llm_api_key' | 'paddleocr_api_key' | 'vision_ocr_api_key', string>>({
+  const [credentialHints, setCredentialHints] = useState<Record<'llm_api_key' | 'paddleocr_api_key' | 'vision_ocr_api_key' | 'embedding_api_key', string>>({
     llm_api_key: '',
     paddleocr_api_key: '',
     vision_ocr_api_key: '',
+    embedding_api_key: '',
   })
   const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionKey>('automation')
   const [autoOcr, setAutoOcr] = useState(true)
   const [autoAi, setAutoAi] = useState(false)
   const [autoDeletePdfAssets, setAutoDeletePdfAssets] = useState(false)
   const [preferFacsimileProofLayout, setPreferFacsimileProofLayout] = useState(true)
+  const [preferReadModeOnOpen, setPreferReadModeOnOpen] = useState(true)
   const [metadataTagBindingEnabled, setMetadataTagBindingEnabled] = useState(false)
   const metadataTagBindingEnabledRef = useRef(false)
   const [pdfRepositoryStatus, setPdfRepositoryStatus] = useState<PdfRepositoryStatus | null>(null)
@@ -537,6 +569,19 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [mcpBusy, setMcpBusy] = useState(false)
   /** 默认 Trae（国内较常用），可切换 Cursor / Claude / Codex 等 */
   const [mcpClientId, setMcpClientId] = useState<McpClientId>('trae')
+  const [embeddingStats, setEmbeddingStats] = useState<EmbeddingIndexStats | null>(null)
+  const [embeddingBusy, setEmbeddingBusy] = useState(false)
+  const [embeddingApiKeyDraft, setEmbeddingApiKeyDraft] = useState('')
+  const [embeddingBaseUrlDraft, setEmbeddingBaseUrlDraft] = useState(DEFAULT_EMBEDDING_PROVIDER.baseUrl)
+  const [embeddingModelDraft, setEmbeddingModelDraft] = useState(DEFAULT_EMBEDDING_PROVIDER.models[0])
+  const [embeddingProviderName, setEmbeddingProviderName] = useState(DEFAULT_EMBEDDING_PROVIDER.name)
+  const [embeddingModelOptions, setEmbeddingModelOptions] = useState<string[]>([...DEFAULT_EMBEDDING_PROVIDER.models])
+  const [embeddingModelsLoading, setEmbeddingModelsLoading] = useState(false)
+  const [embeddingTestQuery, setEmbeddingTestQuery] = useState('')
+  const [embeddingTestResult, setEmbeddingTestResult] = useState('')
+  const [embeddingBatchSizeDraft, setEmbeddingBatchSizeDraft] = useState(10)
+  /** 0 = model default dimensions */
+  const [embeddingDimensionsDraft, setEmbeddingDimensionsDraft] = useState(0)
   const [llmModelOptions, setLlmModelOptions] = useState<string[]>([])
   const [visionModelOptions, setVisionModelOptions] = useState<string[]>([])
   const [llmModelsLoading, setLlmModelsLoading] = useState(false)
@@ -636,7 +681,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           vision_ocr_api_key: settings.vision_ocr_api_key_configured === 'true'
             ? `已安全保存（末四位 ${settings.vision_ocr_api_key_last4 || '****'}）`
             : '',
+          embedding_api_key: settings.embedding_api_key_configured === 'true'
+            ? `已安全保存（末四位 ${settings.embedding_api_key_last4 || '****'}）`
+            : '',
         })
+        try {
+          const emb = await window.api.getEmbeddingIndexStats()
+          setEmbeddingStats(emb)
+          const base = (emb.baseUrl || DEFAULT_EMBEDDING_PROVIDER.baseUrl).replace(/\/+$/, '')
+          const model = emb.model || DEFAULT_EMBEDDING_PROVIDER.models[0]
+          setEmbeddingBaseUrlDraft(base)
+          setEmbeddingModelDraft(model)
+          const matched = EMBEDDING_PROVIDER_PRESETS.find((item) => item.baseUrl.replace(/\/+$/, '') === base)
+          setEmbeddingProviderName(matched?.name || '自定义')
+          setEmbeddingModelOptions([
+            ...new Set([...(matched?.models || DEFAULT_EMBEDDING_PROVIDER.models), model].filter(Boolean)),
+          ])
+        } catch (error) {
+          console.warn('[SettingsView] load embedding stats failed', error)
+        }
         form.setFieldsValue({
           paddleocr_api_key: '',
           ocr_async_model: settings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : settings.ocr_async_model || 'PaddleOCR-VL-1.6',
@@ -687,6 +750,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         setAutoAi(settings.auto_ai_after_ocr === 'true')
         setAutoDeletePdfAssets(settings.auto_delete_pdf_assets_after_ocr === 'true')
         setPreferFacsimileProofLayout(settings.prefer_facsimile_proof_layout !== 'false')
+        setPreferReadModeOnOpen(settings.prefer_read_mode_on_open !== 'false')
         const nextMetadataTagBindingEnabled = settings.metadata_tag_binding_enabled === 'true'
         metadataTagBindingEnabledRef.current = nextMetadataTagBindingEnabled
         setMetadataTagBindingEnabled(nextMetadataTagBindingEnabled)
@@ -818,6 +882,242 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       setMcpBusy(false)
     }
   }, [])
+
+  /** Apply saved stats into editable form fields (only on enter section / after save). */
+  const suggestedEmbeddingModelsForBaseUrl = useCallback((baseUrl: string): string[] => {
+    const base = baseUrl.replace(/\/+$/, '')
+    const preset = EMBEDDING_PROVIDER_PRESETS.find((item) => item.baseUrl.replace(/\/+$/, '') === base)
+    if (preset) return [...preset.models]
+    if (/dashscope|aliyuncs|maas\.aliyuncs/i.test(base)) {
+      return ['text-embedding-v4', 'text-embedding-v3', 'qwen3.7-text-embedding', 'text-embedding-v2', 'text-embedding-v1']
+    }
+    if (/openai\.com/i.test(base)) return ['text-embedding-3-small', 'text-embedding-3-large']
+    if (/siliconflow/i.test(base)) return ['BAAI/bge-m3', 'BAAI/bge-large-zh-v1.5']
+    if (/bigmodel\.cn/i.test(base)) return ['embedding-3', 'embedding-2']
+    if (/volces\.com|volcengine/i.test(base)) return ['doubao-embedding', 'doubao-embedding-large']
+    return [...DEFAULT_EMBEDDING_PROVIDER.models]
+  }, [])
+
+  const hydrateEmbeddingFormFromStats = useCallback((stats: EmbeddingIndexStats) => {
+    const base = (stats.baseUrl || DEFAULT_EMBEDDING_PROVIDER.baseUrl).replace(/\/+$/, '')
+    const model = stats.model || DEFAULT_EMBEDDING_PROVIDER.models[0]
+    setEmbeddingBaseUrlDraft(base)
+    setEmbeddingModelDraft(model)
+    setEmbeddingBatchSizeDraft(Math.max(1, Number(stats.batchSize) || 10))
+    setEmbeddingDimensionsDraft(Math.max(0, Number(stats.dimensions) || 0))
+    const linked = (stats.linkedProfiles || []).find((item) => item.id === stats.sourceProfileId)
+    setEmbeddingProviderName(linked?.id || stats.sourceProfileId || '')
+    const suggested = suggestedEmbeddingModelsForBaseUrl(base)
+    setEmbeddingModelOptions([...new Set([...suggested, model].filter(Boolean))])
+  }, [suggestedEmbeddingModelsForBaseUrl])
+
+  /** Progress-only refresh — must NOT overwrite Base URL / model drafts while editing. */
+  const refreshEmbeddingStats = useCallback(async () => {
+    const stats = await window.api.getEmbeddingIndexStats()
+    setEmbeddingStats(stats)
+    return stats
+  }, [])
+
+  const handleSelectEmbeddingSourceProfile = useCallback(async (profileId: string) => {
+    setEmbeddingBusy(true)
+    try {
+      const stats = await window.api.updateEmbeddingSettings({ sourceProfileId: profileId })
+      setEmbeddingStats(stats)
+      hydrateEmbeddingFormFromStats(stats)
+      const suggested = suggestedEmbeddingModelsForBaseUrl(stats.baseUrl)
+      if (!suggested.includes(stats.model) && suggested[0]) {
+        setEmbeddingModelDraft(suggested[0])
+        setEmbeddingModelOptions(suggested)
+      }
+      const autoNote = stats.batchSizeAutoAdjusted
+        ? `；已自动把批次调为 ${stats.batchSize}（该服务商上限 ${stats.batchSizeCap}）`
+        : ''
+      message.success(`已选用「${stats.sourceProfileName || profileId}」${autoNote || '，请确认向量模型后保存'}`)
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '选用服务商失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [hydrateEmbeddingFormFromStats, suggestedEmbeddingModelsForBaseUrl])
+
+  const fetchEmbeddingModelOptions = useCallback(async () => {
+    const baseUrl = embeddingBaseUrlDraft.trim().replace(/\/+$/, '')
+    const fallbackModels = suggestedEmbeddingModelsForBaseUrl(baseUrl)
+    if (!embeddingStats?.sourceProfileId && !baseUrl) {
+      setEmbeddingModelOptions(fallbackModels)
+      message.warning('请先在左侧选择已在 AI 配置中心保存的服务商')
+      return
+    }
+    setEmbeddingModelsLoading(true)
+    try {
+      // Uses linked AI profile baseUrl + Key on main process.
+      const models = await window.api.listEmbeddingModels()
+      const merged = [...new Set([...fallbackModels, ...models, embeddingModelDraft].filter(Boolean))]
+      setEmbeddingModelOptions(merged)
+      if (models.length === 0) {
+        message.warning('该接口没有返回可用模型列表，可继续手动输入向量模型 ID')
+      } else {
+        message.success(`已拉取 ${models.length} 个模型（优先展示向量相关）`)
+      }
+    } catch (error: unknown) {
+      setEmbeddingModelOptions(fallbackModels)
+      message.warning(getErrorMessage(error, '拉取向量模型列表失败，可继续手动输入模型 ID'))
+    } finally {
+      setEmbeddingModelsLoading(false)
+    }
+  }, [embeddingBaseUrlDraft, embeddingModelDraft, embeddingStats?.sourceProfileId, suggestedEmbeddingModelsForBaseUrl])
+
+  const handleEmbeddingAutoChange = useCallback(async (enabled: boolean) => {
+    setEmbeddingBusy(true)
+    try {
+      const stats = await window.api.updateEmbeddingSettings({ autoOnIngest: enabled })
+      setEmbeddingStats(stats)
+      message.success(enabled ? '已开启：入库/正文就绪后自动向量化' : '已关闭自动向量化（默认手动批量）')
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '更新向量设置失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [])
+
+  const handleSaveEmbeddingSettings = useCallback(async () => {
+    setEmbeddingBusy(true)
+    try {
+      const stats = await window.api.updateEmbeddingSettings({
+        sourceProfileId: embeddingProviderName || embeddingStats?.sourceProfileId || null,
+        model: embeddingModelDraft.trim() || DEFAULT_EMBEDDING_PROVIDER.models[0],
+        batchSize: embeddingBatchSizeDraft,
+        dimensions: embeddingDimensionsDraft > 0 ? embeddingDimensionsDraft : 0,
+      })
+      setEmbeddingStats(stats)
+      hydrateEmbeddingFormFromStats(stats)
+      const dimNote = stats.dimensions > 0
+        ? `，维度 ${stats.dimensions}`
+        : (stats.dimensionsDefault ? `，维度默认 ${stats.dimensionsDefault}` : '')
+      if (stats.batchSizeAutoAdjusted) {
+        message.success(`已保存；批次已按模型上限自动调整为 ${stats.batchSize}（上限 ${stats.batchSizeCap}）${dimNote}`)
+      } else {
+        message.success(`向量设置已保存（批次 ${stats.batchSize}/${stats.batchSizeCap}${dimNote}）`)
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '保存向量设置失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [
+    embeddingBatchSizeDraft,
+    embeddingDimensionsDraft,
+    embeddingModelDraft,
+    embeddingProviderName,
+    embeddingStats?.sourceProfileId,
+    hydrateEmbeddingFormFromStats,
+  ])
+
+  const handleResetEmbeddingBatchSize = useCallback(async () => {
+    setEmbeddingBusy(true)
+    try {
+      const stats = await window.api.updateEmbeddingSettings({ resetBatchSizeToProviderDefault: true })
+      setEmbeddingStats(stats)
+      setEmbeddingBatchSizeDraft(stats.batchSize)
+      message.success(`已按服务商默认恢复批次为 ${stats.batchSize}（上限 ${stats.batchSizeCap}）`)
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '恢复默认批次失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [])
+
+  const handleRequeueFailedEmbeddings = useCallback(async () => {
+    setEmbeddingBusy(true)
+    try {
+      const result = await window.api.requeueFailedEmbeddings()
+      setEmbeddingStats(result.stats)
+      if (result.queued > 0) {
+        message.success(`已重新入队失败文献 ${result.queued} 篇，可在处理队列查看进度`)
+      } else {
+        message.info(result.skipped > 0 ? `没有可重试项（跳过 ${result.skipped}）` : '当前没有失败的向量化任务')
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '重试失败向量化失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [])
+
+  const handleReindexStaleEmbeddings = useCallback(async () => {
+    setEmbeddingBusy(true)
+    try {
+      const result = await window.api.reindexStaleEmbeddings()
+      setEmbeddingStats(result.stats)
+      if (result.queued > 0) {
+        message.success(
+          `已入队重建 ${result.queued} 篇（落后于当前模型 ${result.stale} 篇），清除旧段 ${result.clearedChunks}`,
+        )
+      } else {
+        message.info('没有落后于当前模型的文献（全部就绪或尚未向量化）')
+      }
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '重建过期向量失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [])
+
+  const handleReindexAllReadyEmbeddings = useCallback(async () => {
+    const ready = Number(embeddingStats?.docsReady || 0)
+    if (ready <= 0) {
+      message.info('当前没有已向量化完成的文献')
+      return
+    }
+    Modal.confirm({
+      title: '按当前模型重新向量化全部已索引文献？',
+      content: `将对 ${ready} 篇「已就绪」文献清除旧向量，并用当前模型（${embeddingStats?.model || 'embeddings'}）全部重建。耗时与 API 费用可能较高，请在空闲时执行。`,
+      okText: '全部重建',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setEmbeddingBusy(true)
+        try {
+          const result = await window.api.reindexAllReadyEmbeddings()
+          setEmbeddingStats(result.stats)
+          if (result.queued > 0) {
+            message.success(`已入队全部重建 ${result.queued} 篇，清除旧段 ${result.clearedChunks}。进度见处理队列。`)
+          } else {
+            message.info('没有可重建的文献')
+          }
+        } catch (error: unknown) {
+          message.error(getErrorMessage(error, '全部重新向量化失败'))
+        } finally {
+          setEmbeddingBusy(false)
+        }
+      },
+    })
+  }, [embeddingStats?.docsReady, embeddingStats?.model])
+
+  const handleEmbeddingQueuePause = useCallback(async (paused: boolean) => {
+    setEmbeddingBusy(true)
+    try {
+      const stats = await window.api.setEmbeddingQueuePaused(paused)
+      setEmbeddingStats(stats)
+      message.success(paused ? '已暂停向量化队列' : '已继续向量化队列')
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '更新队列状态失败'))
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (activeSettingsSection !== 'embedding') return
+    // Hydrate form once when entering this section; interval only updates progress.
+    void refreshEmbeddingStats()
+      .then((stats) => hydrateEmbeddingFormFromStats(stats))
+      .catch(() => undefined)
+    const timer = window.setInterval(() => {
+      void refreshEmbeddingStats().catch(() => undefined)
+    }, 4000)
+    return () => window.clearInterval(timer)
+  }, [activeSettingsSection, hydrateEmbeddingFormFromStats, refreshEmbeddingStats])
 
   const ensureMcpSetupEnabled = useCallback(async (): Promise<McpSetupInfo> => {
     let setup = mcpSetup
@@ -1060,6 +1360,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       await window.api.setSetting('auto_ai_after_ocr', autoAi ? 'true' : 'false')
       await window.api.setSetting('auto_delete_pdf_assets_after_ocr', autoDeletePdfAssets ? 'true' : 'false')
       await window.api.setSetting('prefer_facsimile_proof_layout', preferFacsimileProofLayout ? 'true' : 'false')
+      await window.api.setSetting('prefer_read_mode_on_open', preferReadModeOnOpen ? 'true' : 'false')
       const nextMetadataTagBindingEnabled = metadataTagBindingEnabledRef.current
       const metadataTagSetting = await window.api.setSetting('metadata_tag_binding_enabled', nextMetadataTagBindingEnabled ? 'true' : 'false')
       const metadataTagCleanup = nextMetadataTagBindingEnabled ? null : metadataTagSetting.metadataTagCleanup ?? null
@@ -1082,24 +1383,31 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       }
       if (values.llm_provider && values.llm_base_url && values.llm_model) {
         const providerName = String(values.llm_provider || 'custom').trim()
+        // Prefer updating the profile currently selected for edit; never always create a new id.
+        const editingId = String(selectedAiProviderId || '').startsWith('preset:')
+          || selectedAiProviderId === 'custom'
+          ? ''
+          : String(selectedAiProviderId || '').trim()
         const upserted = await window.api.upsertLlmProviderProfile({
-          id: '',
+          id: editingId,
           name: providerName,
           provider: providerName,
           baseUrl: String(values.llm_base_url || '').trim(),
           apiKey: String(values.llm_api_key || ''),
           model: String(values.llm_model || '').trim(),
         })
-        const profileId = findSavedProfileId(
-          upserted.profiles,
-          providerName,
-          String(values.llm_base_url || ''),
-          String(values.llm_model || ''),
-        )
+        const profileId = editingId
+          || findSavedProfileId(
+            upserted.profiles,
+            providerName,
+            String(values.llm_base_url || ''),
+            String(values.llm_model || ''),
+          )
         if (!profileId) throw new Error('AI 服务商配置保存失败')
         const state = await window.api.switchLlmProviderProfile(profileId)
         setLlmProfiles(state.profiles || [])
         setActiveLlmProfileId(state.activeId || '')
+        setSelectedAiProviderId(state.activeId || profileId)
         window.dispatchEvent(new CustomEvent(LLM_PROFILE_SYNC_EVENT, { detail: state }))
       }
       window.dispatchEvent(new Event(SHORTCUTS_CHANGED_EVENT))
@@ -1137,7 +1445,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     form,
     paddleOcrTokenPool.configuredCount,
     preferFacsimileProofLayout,
+    preferReadModeOnOpen,
     retryCount,
+    selectedAiProviderId,
     setSettingsDirty,
     syncAutoBackupDraft,
   ])
@@ -1182,6 +1492,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       llm_model: profile.model,
     })
     setLlmModelOptions(profile.model ? [String(profile.model)] : [])
+    // Do not reuse global key hint text as if it belonged to every profile.
   }
 
   const handleAddLlmProviderDraft = () => {
@@ -1443,20 +1754,29 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     try {
       const values = form.getFieldsValue()
       const providerName = String(values.llm_provider || 'custom').trim()
+      // Editing an existing saved row must update in place; presets/custom drafts create or merge by endpoint.
+      const editingId = selectedAiSavedProfile?.id
+        || (
+          String(selectedAiProviderId || '').startsWith('preset:')
+          || selectedAiProviderId === 'custom'
+            ? ''
+            : String(selectedAiProviderId || '').trim()
+        )
       const upserted = await window.api.upsertLlmProviderProfile({
-        id: '',
+        id: editingId || '',
         name: providerName,
         provider: providerName,
         baseUrl: String(values.llm_base_url || '').trim(),
         apiKey: String(values.llm_api_key || ''),
         model: String(values.llm_model || '').trim(),
       })
-      const profileId = findSavedProfileId(
-        upserted.profiles,
-        providerName,
-        String(values.llm_base_url || ''),
-        String(values.llm_model || ''),
-      )
+      const profileId = editingId
+        || findSavedProfileId(
+          upserted.profiles,
+          providerName,
+          String(values.llm_base_url || ''),
+          String(values.llm_model || ''),
+        )
       if (!profileId) throw new Error('AI 服务商配置保存失败')
       const result = await window.api.switchLlmProviderProfile(profileId)
       setLlmProfiles(result.profiles?.length ? result.profiles : upserted.profiles || [])
@@ -2310,6 +2630,33 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     return renderPaddleCloudEditor()
   }
 
+  const selectedAiKeyExtra = (() => {
+    if (selectedAiSavedProfile) {
+      if (selectedAiSavedProfile.credential?.configured) {
+        const last4 = selectedAiSavedProfile.credential.last4 || '****'
+        return `该服务商已单独保存 Key（末四位 ${last4}）。留空则保留，填写新 Key 后点「保存配置」可更新。`
+      }
+      if (selectedAiSavedProfile.id === activeLlmProfileId && credentialHints.llm_api_key) {
+        return `该服务商还没有独立 Key；右侧显示的「当前全局 Key」来自正在使用的 AI，不是每个服务商都有。请填写该服务商自己的 Key 并保存。`
+      }
+      return '该服务商尚未保存 API Key，请填写后点「保存配置」。'
+    }
+    if (String(selectedAiProviderId || '').startsWith('preset:')) {
+      return '这是预设模板，尚未加入你的服务商列表。填写 Key 后点「保存配置」才会真正保存。'
+    }
+    if (selectedAiProviderId === 'custom') {
+      return '自定义服务商：填写完整信息与 Key 后点「保存配置」。'
+    }
+    return credentialHints.llm_api_key
+      ? `${credentialHints.llm_api_key}（这是当前全局 Key；切换左侧服务商后以各服务商状态为准）`
+      : '请输入 API Key'
+  })()
+
+  const selectedAiKeyPlaceholder = selectedAiSavedProfile?.credential?.configured
+    || (selectedAiSavedProfile?.id === activeLlmProfileId && credentialHints.llm_api_key)
+    ? '留空将保留已保存 Key'
+    : '请输入该服务商的 API Key'
+
   const renderAiEditor = () => (
     <Space direction="vertical" size={12} style={{ width: '100%' }}>
       <div className="settings-provider-header">
@@ -2337,7 +2684,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         message="用于智能问答、翻译、摘要和元数据提取"
         description={(
           <Space direction="vertical" size={4}>
-            <Text type="secondary">左侧选择预设会填入接口地址和推荐模型；保存后会出现在左侧快捷切换列表。</Text>
+            <Text type="secondary">
+              左侧灰色「预设」只是模板；绿色「已保存 Key」才表示该服务商有独立密钥。点「保存配置」后才会写入左侧已保存列表。
+            </Text>
             <a href={DEEPSEEK_APPLY_URL} target="_blank" rel="noreferrer">
               <LinkOutlined /> 前往申请 DeepSeek API
             </a>
@@ -2351,8 +2700,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <Form.Item label="API Base URL" name="llm_base_url">
           <Input prefix={<ApiOutlined />} placeholder="https://api.deepseek.com/v1" />
         </Form.Item>
-        <Form.Item label="API Key" name="llm_api_key" extra={credentialHints.llm_api_key || undefined}>
-          <Input.Password prefix={<KeyOutlined />} placeholder={credentialHints.llm_api_key ? '留空将保留已保存 Key' : '请输入 API Key'} />
+        <Form.Item label="API Key" name="llm_api_key" extra={selectedAiKeyExtra}>
+          <Input.Password prefix={<KeyOutlined />} placeholder={selectedAiKeyPlaceholder} />
         </Form.Item>
         <Form.Item label="默认模型" name="llm_model">
           <AutoComplete
@@ -2436,6 +2785,16 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16, paddingTop: 16, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
               <div>
+                <Text strong style={{ color: 'var(--gs-text-primary)' }}>默认使用阅读模式</Text>
+                <br />
+                <Text type="secondary" style={{ fontSize: 13 }}>
+                  开启后，普通文献首次打开默认进入阅读模式；关闭则默认校对模式。你在该篇里手动切换过阅读/校对后，以后打开仍以你最后一次手动选择为准。
+                </Text>
+              </div>
+              <Switch checked={preferReadModeOnOpen} onChange={(checked) => { setPreferReadModeOnOpen(checked); markSettingsDirty() }} />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 16, paddingTop: 16, borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+              <div>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>元数据绑定标签</Text>
                 <br />
                 <Text type="secondary" style={{ fontSize: 13 }}>开启后，作者、年代、类型、关键词等元数据会自动同步为标签；关闭后只保存元数据。</Text>
@@ -2485,7 +2844,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               ))}
             </div>
             <Text type="secondary" style={{ display: 'block', marginTop: 12, fontSize: 12 }}>
-              可写 Ctrl+F、Alt+A、Esc、ArrowLeft。阅读器里上下方向键固定用于滚动正文，输入框内保留系统默认编辑快捷键。
+              可写 Ctrl+F、Ctrl+D、Alt+A、Esc、ArrowLeft。阅读器里上下方向键固定用于滚动正文，输入框内保留系统默认编辑快捷键。「复制直接引用」需先选中正文。
             </Text>
           </Card>
         </section>
@@ -3222,30 +3581,83 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <button type="button" className="settings-provider-add" onClick={handleAddLlmProviderDraft}>
                 <PlusOutlined /> 添加服务商
               </button>
-              {[
-                ...llmProfiles.map((profile) => ({ id: profile.id, label: profile.name, desc: profile.model, profile })),
-                ...visibleAiProviderPresets.map((preset) => ({ id: `preset:${preset.name}`, label: preset.name, desc: preset.baseUrl, preset })),
-              ].map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={`settings-provider-item${item.id === selectedAiProviderId ? ' active' : ''}`}
-                  onClick={() => {
-                    if ('profile' in item && item.profile) {
-                      handleSelectLlmProfileForEdit(item.profile)
-                    } else if ('preset' in item && item.preset) {
-                      handleProviderChange(item.preset.name)
-                    }
-                  }}
-                >
-                  <span className="settings-provider-dot" />
-                  <span>
-                    <strong>{item.label}</strong>
-                    <small>{item.desc || 'OpenAI compatible'}</small>
-                  </span>
-                  {item.id === activeLlmProfileId ? <Tag color="gold">当前</Tag> : null}
-                </button>
-              ))}
+              {llmProfiles.length > 0 ? (
+                <div style={{ padding: '6px 10px 2px', fontSize: 11, color: 'var(--gs-text-tertiary)' }}>已保存</div>
+              ) : null}
+              {llmProfiles.map((profile) => {
+                const isCurrent = profile.id === activeLlmProfileId
+                const isSelected = profile.id === selectedAiProviderId
+                const hasOwnKey = Boolean(profile.credential?.configured)
+                const host = (() => {
+                  try {
+                    return new URL(profile.baseUrl).host
+                  } catch {
+                    return profile.baseUrl
+                  }
+                })()
+                return (
+                  <button
+                    key={profile.id}
+                    type="button"
+                    className={`settings-provider-item${isSelected ? ' active' : ''}`}
+                    onClick={() => handleSelectLlmProfileForEdit(profile)}
+                  >
+                    <span className="settings-provider-dot" />
+                    <span>
+                      <strong>{profile.name}</strong>
+                      <small>
+                        {profile.model || '未设模型'}
+                        {host ? ` · ${host}` : ''}
+                      </small>
+                      <span style={{ display: 'block', marginTop: 4 }}>
+                        {isCurrent ? <Tag color="gold" style={{ marginInlineEnd: 4 }}>当前</Tag> : null}
+                        {hasOwnKey ? (
+                          <Tag color="green" style={{ marginInlineEnd: 4 }}>
+                            已保存 Key
+                            {profile.credential?.last4 ? ` ·${profile.credential.last4}` : ''}
+                          </Tag>
+                        ) : isCurrent && credentialHints.llm_api_key ? (
+                          <Tag color="gold" style={{ marginInlineEnd: 4 }}>当前全局 Key</Tag>
+                        ) : (
+                          <Tag style={{ marginInlineEnd: 4 }}>未保存 Key</Tag>
+                        )}
+                      </span>
+                    </span>
+                  </button>
+                )
+              })}
+              {visibleAiProviderPresets.length > 0 ? (
+                <div style={{ padding: '10px 10px 2px', fontSize: 11, color: 'var(--gs-text-tertiary)' }}>预设模板（未保存）</div>
+              ) : null}
+              {visibleAiProviderPresets.map((preset) => {
+                const presetId = `preset:${preset.name}`
+                const isSelected = selectedAiProviderId === presetId || (
+                  !selectedAiSavedProfile
+                  && String(form.getFieldValue('llm_provider') || '') === preset.name
+                  && String(form.getFieldValue('llm_base_url') || '').replace(/\/+$/, '') === preset.baseUrl.replace(/\/+$/, '')
+                )
+                return (
+                  <button
+                    key={presetId}
+                    type="button"
+                    className={`settings-provider-item${isSelected ? ' active' : ''}`}
+                    onClick={() => {
+                      setSelectedAiProviderId(presetId)
+                      handleProviderChange(preset.name)
+                    }}
+                  >
+                    <span className="settings-provider-dot" />
+                    <span>
+                      <strong>{preset.name}</strong>
+                      <small>{preset.baseUrl}</small>
+                      <span style={{ display: 'block', marginTop: 4 }}>
+                        <Tag style={{ marginInlineEnd: 4 }}>预设</Tag>
+                        <Tag>未保存</Tag>
+                      </span>
+                    </span>
+                  </button>
+                )
+              })}
             </div>
             <div className="settings-provider-panel">
               {renderAiEditor()}
@@ -3443,6 +3855,419 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               />
             </Space>
           </Card>
+        </section>
+
+        <section className="settings-section" hidden={activeSettingsSection !== 'embedding'}>
+          <div className="settings-section-title">
+            <ThunderboltOutlined /> 向量索引
+          </div>
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="与 AI 配置中心共用服务商与 API Key"
+            description="左侧选择你在「AI 配置中心」已保存的服务商（通义、火山等），自动复用其 Base URL 与 Key；这里只需再选向量模型。DeepSeek 等无向量能力的接口请勿用于向量化。默认手动批量向量化正文；可选入库后自动。"
+          />
+          <div className="settings-provider-shell">
+            <div className="settings-provider-list" aria-label="向量所用服务商">
+              <div style={{ padding: '8px 10px 4px', color: 'var(--gs-text-secondary)', fontSize: 12 }}>
+                来自 AI 配置中心
+              </div>
+              {(embeddingStats?.linkedProfiles || []).length === 0 ? (
+                <div style={{ padding: 12 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    暂无已保存服务商。请先到「AI」页添加并保存通义 / 火山等，再回到这里选用。
+                  </Text>
+                  <Button
+                    type="link"
+                    size="small"
+                    style={{ paddingLeft: 0 }}
+                    onClick={() => setActiveSettingsSection('ai')}
+                  >
+                    前往 AI 配置中心
+                  </Button>
+                </div>
+              ) : (
+                (embeddingStats?.linkedProfiles || []).map((profile) => {
+                  const active = profile.id === (embeddingStats?.sourceProfileId || embeddingProviderName)
+                  const noEmbedHint = /deepseek/i.test(profile.baseUrl) || /deepseek/i.test(profile.provider)
+                  const host = (() => {
+                    try {
+                      return new URL(profile.baseUrl).host
+                    } catch {
+                      return profile.baseUrl
+                    }
+                  })()
+                  const linkedLast4 = profile.keySource !== 'none' ? String(profile['apiKeyLast4'] || '') : ''
+                  const keySuffix = linkedLast4 ? ` ·${linkedLast4}` : ''
+                  const keyLabel =
+                    profile.keySource === 'profile'
+                      ? `已保存 Key${keySuffix}`
+                      : profile.keySource === 'active-global'
+                        ? `当前全局 Key${keySuffix}`
+                        : '未保存 Key'
+                  const keyColor =
+                    profile.keySource === 'profile' ? 'green' : profile.keySource === 'active-global' ? 'gold' : 'default'
+                  return (
+                    <button
+                      key={profile.id}
+                      type="button"
+                      className={`settings-provider-item${active ? ' active' : ''}`}
+                      onClick={() => {
+                        if (profile.keySource === 'none') {
+                          message.warning(
+                            `「${profile.name}」还没有独立保存的 API Key。请打开「AI 配置中心」→ 选中该服务商 → 重新粘贴 Key → 点「保存配置」（不要只点「设为当前」）。`,
+                          )
+                        }
+                        void handleSelectEmbeddingSourceProfile(profile.id)
+                      }}
+                    >
+                      <span className="settings-provider-dot" />
+                      <span>
+                        <strong>
+                          {profile.name}
+                          {active ? ' · 向量当前' : ''}
+                        </strong>
+                        <small>
+                          {profile.chatModel ? `${profile.chatModel} · ` : ''}
+                          {host}
+                        </small>
+                        <span style={{ display: 'block', marginTop: 4 }}>
+                          <Tag color={keyColor} style={{ marginInlineEnd: 4 }}>{keyLabel}</Tag>
+                          {noEmbedHint ? <Tag color="orange">可能无向量</Tag> : null}
+                        </span>
+                      </span>
+                    </button>
+                  )
+                })
+              )}
+            </div>
+            <div className="settings-provider-detail">
+              <Card size="small" loading={embeddingBusy && !embeddingStats} styles={{ body: { paddingTop: 12 } }}>
+                <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                  <Space wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <div>
+                      <Text strong style={{ fontSize: 16 }}>
+                        {embeddingStats?.sourceProfileName || '未选择服务商'}
+                      </Text>
+                      <br />
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {embeddingBaseUrlDraft || '请从左侧选择 AI 配置中心已保存的服务商'}
+                      </Text>
+                    </div>
+                    <Space wrap>
+                      <Button size="small" loading={embeddingBusy} icon={<ReloadOutlined />} onClick={() => void refreshEmbeddingStats()}>
+                        刷新
+                      </Button>
+                      <Button
+                        size="small"
+                        type="primary"
+                        loading={embeddingBusy}
+                        icon={<SaveOutlined />}
+                        disabled={!embeddingStats?.sourceProfileId && !embeddingProviderName}
+                        onClick={() => void handleSaveEmbeddingSettings()}
+                      >
+                        保存配置
+                      </Button>
+                    </Space>
+                  </Space>
+
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="接口与 API Key 来自左侧所选服务商"
+                    description="无需在此重复填写 Key。请确认该服务商支持 Embeddings（推荐通义 dashscope、硅基、OpenAI 等）。DeepSeek 对话端点通常不能做向量。"
+                  />
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+                    <div>
+                      <Text strong>入库后自动向量化</Text>
+                      <br />
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        默认关。打开后，新入库且正文分段就绪的文献自动入队（消耗 API）。
+                      </Text>
+                    </div>
+                    <Switch
+                      checked={Boolean(embeddingStats?.autoOnIngest)}
+                      loading={embeddingBusy}
+                      checkedChildren="开"
+                      unCheckedChildren="关"
+                      onChange={(checked) => void handleEmbeddingAutoChange(checked)}
+                    />
+                  </div>
+
+                  <div>
+                    <Text type="secondary">API Base URL（只读，随服务商）</Text>
+                    <Input value={embeddingBaseUrlDraft} readOnly style={{ marginTop: 4 }} />
+                  </div>
+
+                  <div>
+                    <Text type="secondary">API Key 状态：</Text>
+                    {(() => {
+                      const selected = (embeddingStats?.linkedProfiles || []).find(
+                        (item) => item.id === (embeddingStats?.sourceProfileId || embeddingProviderName),
+                      )
+                      if (!selected) {
+                        return <Tag style={{ marginLeft: 6 }}>未选择服务商</Tag>
+                      }
+                      if (selected.keySource === 'profile') {
+                        return (
+                          <Tag color="green" style={{ marginLeft: 6 }}>
+                            已绑定该服务商独立 Key
+                            {selected.apiKeyLast4 ? ` · 末四位 ${selected.apiKeyLast4}` : ''}
+                          </Tag>
+                        )
+                      }
+                      if (selected.keySource === 'active-global') {
+                        return (
+                          <Tag color="gold" style={{ marginLeft: 6 }}>
+                            仅当前 AI 全局 Key（建议在 AI 页对该服务商点「保存当前为服务商」写入独立 Key）
+                            {selected.apiKeyLast4 ? ` · 末四位 ${selected.apiKeyLast4}` : ''}
+                          </Tag>
+                        )
+                      }
+                      return (
+                        <Tag color="red" style={{ marginLeft: 6 }}>
+                          未保存 Key — 请到 AI 配置中心填写并保存该服务商
+                        </Tag>
+                      )
+                    })()}
+                  </div>
+
+                  <div>
+                    <Text type="secondary">向量模型 ID（通义兼容 OpenAI embeddings.create）</Text>
+                    <AutoComplete
+                      style={{ width: '100%', marginTop: 4 }}
+                      value={embeddingModelDraft}
+                      options={embeddingModelOptions.map((model) => ({ value: model, label: model }))}
+                      onChange={(value) => setEmbeddingModelDraft(String(value || ''))}
+                      onSelect={(value) => {
+                        const next = String(value || '')
+                        setEmbeddingModelDraft(next)
+                        // Selecting a known model immediately applies official batch/dimension limits.
+                        void window.api.updateEmbeddingSettings({ model: next }).then((stats) => {
+                          setEmbeddingStats(stats)
+                          setEmbeddingBatchSizeDraft(stats.batchSize)
+                          setEmbeddingDimensionsDraft(stats.dimensions)
+                          if (stats.batchSizeAutoAdjusted) {
+                            message.info(`已按「${next}」官方规格调整批次为 ${stats.batchSize}（上限 ${stats.batchSizeCap}）`)
+                          }
+                        }).catch(() => undefined)
+                      }}
+                      onDropdownVisibleChange={(open) => {
+                        if (open && embeddingModelOptions.length <= 1) void fetchEmbeddingModelOptions()
+                      }}
+                    >
+                      <Input
+                        placeholder="text-embedding-v4"
+                        suffix={(
+                          <Button
+                            type="text"
+                            size="small"
+                            loading={embeddingModelsLoading}
+                            onClick={() => void fetchEmbeddingModelOptions()}
+                          >
+                            拉取
+                          </Button>
+                        )}
+                      />
+                    </AutoComplete>
+                    {embeddingStats?.modelSpecNote ? (
+                      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+                        {embeddingStats.modelSpecNote}
+                      </Text>
+                    ) : null}
+                  </div>
+
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <div>
+                        <Text type="secondary">输出维度 dimensions（可选）</Text>
+                        <br />
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          对应官方可选维度；选「模型默认」则不传 dimensions（v3/v4 默认 1024）。
+                        </Text>
+                      </div>
+                      <Select
+                        style={{ minWidth: 160 }}
+                        value={embeddingDimensionsDraft > 0 ? embeddingDimensionsDraft : 0}
+                        onChange={(value) => setEmbeddingDimensionsDraft(Number(value) || 0)}
+                        options={[
+                          {
+                            value: 0,
+                            label: embeddingStats?.dimensionsDefault
+                              ? `模型默认（${embeddingStats.dimensionsDefault}）`
+                              : '模型默认',
+                          },
+                          ...(embeddingStats?.dimensionsOptions || []).map((dim) => ({
+                            value: dim,
+                            label: String(dim),
+                          })),
+                        ]}
+                      />
+                    </div>
+                    {(embeddingStats?.dimensionsOptions || []).length === 0 ? (
+                      <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+                        当前模型未登记可选维度（或固定维度），将使用接口返回值。
+                      </Text>
+                    ) : null}
+                  </div>
+
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <div>
+                        <Text type="secondary">单次请求批次 batch size（条文本）</Text>
+                        <br />
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {embeddingStats?.batchSizeHint
+                            || '按模型官方规格：v3/v4=10，v2/v1=25，qwen3.7=20。切换模型会自动调整。'}
+                        </Text>
+                      </div>
+                      <Space wrap>
+                        <InputNumber
+                          min={1}
+                          max={Math.max(1, Number(embeddingStats?.batchSizeCap) || 64)}
+                          value={embeddingBatchSizeDraft}
+                          onChange={(value) => setEmbeddingBatchSizeDraft(Math.max(1, Number(value) || 1))}
+                          style={{ width: 100 }}
+                        />
+                        <Button size="small" loading={embeddingBusy} onClick={() => void handleResetEmbeddingBatchSize()}>
+                          按模型默认
+                        </Button>
+                      </Space>
+                    </div>
+                    {embeddingStats ? (
+                      <div style={{ marginTop: 6 }}>
+                        <Tag color={embeddingBatchSizeDraft > (embeddingStats.batchSizeCap || 10) ? 'orange' : 'blue'}>
+                          生效 {embeddingStats.batchSize}
+                          {' · '}
+                          上限 {embeddingStats.batchSizeCap}
+                        </Tag>
+                        {embeddingBatchSizeDraft > (embeddingStats.batchSizeCap || 10) ? (
+                          <Text type="warning" style={{ fontSize: 12, marginLeft: 8 }}>
+                            超过官方上限，保存时会自动改为 {embeddingStats.batchSizeCap}
+                          </Text>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <Space wrap>
+                    <Button loading={embeddingModelsLoading} onClick={() => void fetchEmbeddingModelOptions()}>
+                      拉取向量模型列表
+                    </Button>
+                    <Button loading={embeddingBusy} onClick={() => void handleEmbeddingQueuePause(!(embeddingStats?.queuePaused))}>
+                      {embeddingStats?.queuePaused ? '继续队列' : '暂停队列'}
+                    </Button>
+                    <Button
+                      loading={embeddingBusy}
+                      disabled={!embeddingStats || embeddingStats.docsError <= 0}
+                      onClick={() => void handleRequeueFailedEmbeddings()}
+                    >
+                      重试失败{embeddingStats && embeddingStats.docsError > 0 ? `（${embeddingStats.docsError}）` : ''}
+                    </Button>
+                    <Button
+                      loading={embeddingBusy}
+                      disabled={!embeddingStats || Number(embeddingStats.docsStale || 0) <= 0}
+                      onClick={() => void handleReindexStaleEmbeddings()}
+                    >
+                      重建过期{embeddingStats && Number(embeddingStats.docsStale || 0) > 0 ? `（${embeddingStats.docsStale}）` : ''}
+                    </Button>
+                    <Button
+                      loading={embeddingBusy}
+                      disabled={!embeddingStats || embeddingStats.docsReady <= 0}
+                      onClick={() => void handleReindexAllReadyEmbeddings()}
+                    >
+                      全部重新向量化{embeddingStats && embeddingStats.docsReady > 0 ? `（${embeddingStats.docsReady}）` : ''}
+                    </Button>
+                  </Space>
+                  <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
+                    更换更强的向量模型后：可先「重建过期」（仅缺当前模型向量的书），或「全部重新向量化」整库按新模型重做。文献库多选也可用「重新向量化所选」。
+                  </Text>
+
+                  {embeddingStats ? (
+                    <Card size="small" type="inner" title="索引进度">
+                      <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                        <Text>
+                          向量模型：
+                          <Text code>{embeddingStats.modelId || embeddingStats.model}</Text>
+                          {embeddingStats.dim ? ` · ${embeddingStats.dim} 维` : ''}
+                        </Text>
+                        <Text>
+                          段向量：{embeddingStats.chunks}
+                          {' · '}就绪 {embeddingStats.docsReady}
+                          {' · '}排队 {embeddingStats.docsQueued}
+                          {' · '}处理中 {embeddingStats.docsProcessing}
+                          {' · '}失败 {embeddingStats.docsError}
+                          {Number(embeddingStats.docsStale || 0) > 0 ? (
+                            <>
+                              {' · '}
+                              <Text type="warning">过期 {embeddingStats.docsStale}</Text>
+                            </>
+                          ) : null}
+                        </Text>
+                        {embeddingStats.message ? <Text type="secondary">{embeddingStats.message}</Text> : null}
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          手动：文献库 → 批量处理 →「向量化所选文献」。进度会出现在文献卡片与「处理队列」。MCP：vector_search / vector_index_stats。
+                        </Text>
+                        <div style={{ marginTop: 4 }}>
+                          <Text strong>试搜（语义）</Text>
+                          <Space.Compact style={{ width: '100%', marginTop: 6 }}>
+                            <Input
+                              value={embeddingTestQuery}
+                              placeholder="输入主题描述，如：战犯改造与中日关系"
+                              onChange={(e) => setEmbeddingTestQuery(e.target.value)}
+                              onPressEnter={() => {
+                                const btn = document.getElementById('embedding-test-search-btn')
+                                btn?.click()
+                              }}
+                            />
+                            <Button
+                              id="embedding-test-search-btn"
+                              type="primary"
+                              loading={embeddingBusy}
+                              onClick={() => {
+                                void (async () => {
+                                  setEmbeddingBusy(true)
+                                  try {
+                                    const res = await window.api.vectorSearch(embeddingTestQuery.trim(), { limit: 8 })
+                                    if (!res.ok) {
+                                      setEmbeddingTestResult(res.message)
+                                      return
+                                    }
+                                    setEmbeddingTestResult(
+                                      res.hits.map((h, i) => `${i + 1}. [${h.score}] p${h.pageNum ?? '?'} ${h.title || h.documentId}\n   ${h.excerpt}`).join('\n\n')
+                                      || '无命中',
+                                    )
+                                  } catch (error: unknown) {
+                                    setEmbeddingTestResult(getErrorMessage(error, '语义试搜失败'))
+                                  } finally {
+                                    setEmbeddingBusy(false)
+                                  }
+                                })()
+                              }}
+                            >
+                              试搜
+                            </Button>
+                          </Space.Compact>
+                          {embeddingTestResult ? (
+                            <Input.TextArea
+                              value={embeddingTestResult}
+                              readOnly
+                              autoSize={{ minRows: 4, maxRows: 12 }}
+                              style={{ marginTop: 8, fontSize: 12 }}
+                            />
+                          ) : null}
+                        </div>
+                      </Space>
+                    </Card>
+                  ) : (
+                    <Text type="secondary">正在读取向量索引状态…</Text>
+                  )}
+                </Space>
+              </Card>
+            </div>
+          </div>
         </section>
 
         <section className="settings-section" hidden={activeSettingsSection !== 'aiTools'}>

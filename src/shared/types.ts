@@ -166,6 +166,7 @@ export type LibrarySmartViewCountKey =
   | 'unproofed'
   | 'metadataPending'
   | 'unstored'
+  | 'vectorized'
 
 export type LibrarySmartViewCounts = Record<LibrarySmartViewCountKey, number>
 
@@ -1270,6 +1271,8 @@ export interface ListDocumentOptions {
   yearFrom?: number
   yearTo?: number
   healthFilter?: LibraryHealthFilterType
+  /** When true, only documents with ready embedding index status. */
+  embeddingReady?: boolean
   sortKey?: LibraryDocumentSortKey
   sortDirection?: LibraryDocumentSortDirection
   limit?: number
@@ -1295,6 +1298,7 @@ export type LibraryFilterType =
   | 'metadataStatus'
   | 'proofStatus'
   | 'metadataPending'
+  | 'embeddingReady'
   | LibraryHealthFilterType
 
 export interface LibraryFilter {
@@ -1316,6 +1320,9 @@ export interface DocumentListItem extends Omit<Document, 'ocr_status' | 'proof_s
   pdf_asset_state?: 'available' | 'text_only' | 'unknown' | string
   research_note_count?: number
   search_segment_count?: number
+  /** ready | queued | processing | error | none (from embedding_index_status). */
+  embedding_status?: string
+  embedding_chunk_count?: number
   tag_names?: string
   tag_colors?: string
   tag_ids?: string
@@ -1369,7 +1376,88 @@ export interface TaskProgressEvent {
   message: string
 }
 
-export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance'
+export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance' | 'embedding-index'
+
+export interface EmbeddingLinkedProfile {
+  id: string
+  name: string
+  provider: string
+  baseUrl: string
+  chatModel: string
+  /** True only when this profile has its own vault entry, or is active and uses global llm_api_key. */
+  apiKeyConfigured: boolean
+  apiKeyLast4?: string
+  /**
+   * profile = llm_profile:{id} vault entry exists
+   * active-global = only the current AI key (llm_api_key), not a dedicated profile secret
+   * none = no key bound
+   */
+  keySource: 'profile' | 'active-global' | 'none'
+}
+
+export interface EmbeddingIndexStats {
+  modelId: string
+  dim: number | null
+  autoOnIngest: boolean
+  useLlmCredentials: boolean
+  sourceProfileId: string
+  sourceProfileName: string
+  baseUrl: string
+  model: string
+  /** Effective batch size used for /embeddings requests (already capped). */
+  batchSize: number
+  /** Model/provider hard cap for one /embeddings request (e.g. text-embedding-v4 = 10). */
+  batchSizeCap: number
+  /** User-requested batch before cap; equals batchSize when within limit. */
+  batchSizeRequested: number
+  /** Whether the last save/provider switch auto-clamped batch size. */
+  batchSizeAutoAdjusted: boolean
+  /** Short note for UI, e.g.「通义单次最多 10 条」. */
+  batchSizeHint?: string
+  /** Requested output dimensions; 0 = model default. */
+  dimensions: number
+  /** Allowed dimensions for current model (empty if not configurable). */
+  dimensionsOptions: number[]
+  dimensionsDefault: number | null
+  modelSpecNote?: string
+  apiKeyConfigured: boolean
+  docsReady: number
+  docsQueued: number
+  docsProcessing: number
+  docsError: number
+  docsPending: number
+  /** Marked ready but missing vectors for the currently selected model. */
+  docsStale?: number
+  chunks: number
+  queuePaused: boolean
+  message?: string
+  linkedProfiles: EmbeddingLinkedProfile[]
+}
+
+export interface VectorSearchHit {
+  documentId: string
+  title: string | null
+  author: string | null
+  pageNum: number | null
+  excerpt: string
+  score: number
+  ref: { docId: string; pageNum: number | null; segmentId?: string }
+}
+
+export interface VectorSearchResponse {
+  ok: true
+  query: string
+  modelId: string
+  totalHits: number
+  hits: VectorSearchHit[]
+  hint?: string
+}
+
+export interface VectorSearchFailure {
+  ok: false
+  code: string
+  message: string
+}
 export type BackgroundTaskStatus = 'queued' | 'processing' | 'completed' | 'error'
 
 export interface BackgroundTaskProgressEvent {
@@ -1384,6 +1472,31 @@ export interface BackgroundTaskProgressEvent {
   errorMessage?: string
   updatedAt: string
   taskState: TaskStateEnvelope
+}
+
+/** Per-document + queue aggregate progress for vectorization (mirrors OCR card/queue UX). */
+export type EmbeddingProgressStatus = 'queued' | 'processing' | 'ready' | 'error' | 'pending' | 'idle'
+
+export interface EmbeddingProgressEvent {
+  docId?: string
+  status: EmbeddingProgressStatus
+  /** 0–100 progress for the current document (segment coverage). */
+  progress: number
+  message?: string
+  embeddedCount?: number
+  segmentCount?: number
+  errorMessage?: string
+  /** Queue snapshot across the library. */
+  queueQueued: number
+  queueProcessing: number
+  queueReady: number
+  queueError: number
+  /** Session counters since the latest enqueue burst (for 处理队列). */
+  sessionTotal: number
+  sessionCompleted: number
+  sessionFailed: number
+  queuePaused: boolean
+  updatedAt: string
 }
 
 export type TranslationStyle = 'academic_smooth' | (string & {})
@@ -1605,7 +1718,17 @@ export interface MetadataReclassificationProgressEvent {
 export interface Page {
   id: string
   doc_id: string
+  /** Physical / PDF order (1-based image index in the library). */
   page_num: number
+  /**
+   * Continuous literature (printed) page number after OCR + continuity resolution.
+   * Prefer this for citations, export labels, and AI/MCP page mentions.
+   */
+  literature_page_num?: number | null
+  /** ocr | inferred | fallback */
+  literature_page_source?: string | null
+  /** Raw OCR-detected printed label before continuity smoothing. */
+  ocr_page_label?: number | null
   image_path: string | null
   ocr_text: string | null
   ocr_result: string | null
@@ -2146,7 +2269,7 @@ export interface VisionOcrConnectionTestResult extends VisionOcrConnectionTestSt
 export interface ListModelsPayload {
   baseUrl?: string
   credentialDraftRef?: string
-  credentialKey?: 'llm_api_key' | 'vision_ocr_api_key'
+  credentialKey?: 'llm_api_key' | 'vision_ocr_api_key' | 'embedding_api_key'
 }
 
 export interface LlmProviderProfileState {
@@ -3483,7 +3606,7 @@ export interface SaveSearchExcerptsResult {
 export interface SavedSearchRunResult {
   savedSearch: SavedSearch | null
   keyword: string
-  mode: 'fulltext' | 'ai'
+  mode: 'fulltext' | 'ai' | 'vector'
   filters: SearchOptions
   sort?: SearchOptions['sort']
   contextMode?: SearchOptions['contextMode']
@@ -3519,7 +3642,7 @@ export interface SavedSearchCachePayload {
 }
 
 export interface SavedSearchPayload extends SavedSearchFilters {
-  mode?: 'fulltext' | 'ai'
+  mode?: 'fulltext' | 'ai' | 'vector'
   filters?: SearchOptions
   sort?: SearchOptions['sort']
   contextMode?: SearchOptions['contextMode']

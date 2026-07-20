@@ -57,6 +57,7 @@ try {
   } = require(bundlePath)
 
   assert.deepStrictEqual([...PROTECTED_SETTING_KEYS].sort(), [
+    'embedding_api_key',
     'llm_api_key',
     'paddleocr_api_key',
     'vision_ocr_api_key',
@@ -65,11 +66,13 @@ try {
   const legacyLlmSecret = ['legacy', 'llm', 'secret'].join('-')
   const legacyPaddleSecret = ['legacy', 'paddle', 'secret'].join('-')
   const legacyVisionSecret = ['legacy', 'vision', 'secret'].join('-')
+  const legacyEmbeddingSecret = ['legacy', 'embedding', 'secret'].join('-')
   const repository = memoryRepository({
     theme: 'dark',
     llm_api_key: legacyLlmSecret,
     paddleocr_api_key: legacyPaddleSecret,
     vision_ocr_api_key: legacyVisionSecret,
+    embedding_api_key: legacyEmbeddingSecret,
   })
   const vault = memoryVault()
   const service = new ProtectedSettingsService({ repository, vault })

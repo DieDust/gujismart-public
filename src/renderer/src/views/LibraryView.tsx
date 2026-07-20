@@ -63,7 +63,7 @@ import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import { matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -130,6 +130,7 @@ const BACKGROUND_SEARCH_INDEX_MESSAGE_KEY = 'background-search-index'
 const BACKGROUND_HEALTH_REPORT_MESSAGE_KEY = 'background-health-report'
 const BACKGROUND_OCR_FINALIZE_MESSAGE_KEY = 'background-ocr-finalize'
 const BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY = 'background-startup-recovery'
+const BACKGROUND_EMBEDDING_MESSAGE_KEY = 'background-embedding-index'
 const HEALTH_REPORT_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_REFRESH_DEBOUNCE_MS = 600
 const SMART_COUNTS_REFRESH_DEBOUNCE_MS = 800
@@ -149,6 +150,7 @@ type SmartViewCountKey =
   | 'unproofed'
   | 'metadataPending'
   | 'unstored'
+  | 'vectorized'
 
 const EMPTY_SMART_VIEW_COUNTS: Record<SmartViewCountKey, number> = {
   all: 0,
@@ -162,6 +164,7 @@ const EMPTY_SMART_VIEW_COUNTS: Record<SmartViewCountKey, number> = {
   unproofed: 0,
   metadataPending: 0,
   unstored: 0,
+  vectorized: 0,
 }
 
 interface LibraryWarmCache {
@@ -604,6 +607,17 @@ interface BookTranslationProgressInfo {
   updatedAt: number
 }
 
+interface EmbeddingProgressInfo {
+  docId: string
+  status: string
+  progress: number
+  message?: string
+  embeddedCount?: number
+  segmentCount?: number
+  errorMessage?: string
+  updatedAt: number
+}
+
 const OCR_AI_TOAST_TIMEOUT_MS = 125_000
 const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'
 type StopPropagationEvent = Pick<MouseEvent, 'stopPropagation'>
@@ -712,6 +726,7 @@ interface DocumentCardContext {
   sortedSidebarTags: TagItem[]
   ocrProgressByDoc: Record<string, OcrProgressInfo>
   bookTranslationProgressByDoc: Record<string, BookTranslationProgressInfo>
+  embeddingProgressByDoc: Record<string, EmbeddingProgressInfo>
   taggingDocId: string | null
   taggingChecked: string[]
   handleRowClick: (docId: string, event?: MouseEvent<HTMLElement>) => void
@@ -886,6 +901,38 @@ function getPdfAssetTagMeta(doc: DocumentItem): { text: string; color: string; t
     return { text: '仅文本', color: 'orange', title: '本地 PDF 原文件或页图不可读，可从原件仓库或手动选择 PDF 补回' }
   }
   return { text: '原文未知', color: 'default', title: '未记录 PDF 原文件状态' }
+}
+
+function getEmbeddingStatusTagMeta(doc: DocumentItem): { text: string; color: string; title: string } | null {
+  const status = String(doc.embedding_status || '').trim()
+  const chunks = Number(doc.embedding_chunk_count || 0)
+  if (status === 'ready' || chunks > 0) {
+    return {
+      text: '已向量化',
+      color: 'cyan',
+      title: chunks > 0 ? `向量索引就绪（${chunks} 段）` : '向量索引就绪，可用于向量库检索',
+    }
+  }
+  if (status === 'processing') {
+    return { text: '向量化中', color: 'processing', title: '正在写入向量索引' }
+  }
+  if (status === 'queued') {
+    return { text: '向量排队', color: 'gold', title: '已排队等待向量化' }
+  }
+  if (status === 'error') {
+    return { text: '向量失败', color: 'error', title: '向量化失败，可在设置 → 向量索引重试' }
+  }
+  return null
+}
+
+function renderEmbeddingStatusTag(doc: DocumentItem) {
+  const meta = getEmbeddingStatusTagMeta(doc)
+  if (!meta) return null
+  return (
+    <Tooltip title={meta.title}>
+      <Tag color={meta.color} style={{ margin: 0 }}>{meta.text}</Tag>
+    </Tooltip>
+  )
 }
 
 function renderPdfAssetTag(doc: DocumentItem) {
@@ -1090,6 +1137,60 @@ function shouldShowBookTranslationProgress(info?: BookTranslationProgressInfo): 
   return false
 }
 
+function shouldShowEmbeddingProgress(info?: EmbeddingProgressInfo): boolean {
+  if (!info) return false
+  if (info.status === 'processing' || info.status === 'queued') return true
+  const age = Date.now() - Number(info.updatedAt || 0)
+  if (info.status === 'ready' && age < 12_000) return true
+  if (info.status === 'error' && age < 60_000) return true
+  if (info.status === 'pending' && age < 30_000) return true
+  return false
+}
+
+function getEmbeddingProgressText(info: EmbeddingProgressInfo): string {
+  if (info.status === 'ready') return info.message || '向量化完成'
+  if (info.status === 'error') {
+    return info.errorMessage ? `向量化失败：${info.errorMessage}` : (info.message || '向量化失败')
+  }
+  if (info.status === 'queued') return info.message || '已排队，等待向量化'
+  if (info.status === 'pending') return info.message || '等待正文分段就绪后再向量化'
+  if (info.embeddedCount !== undefined && info.segmentCount) {
+    return info.message || `向量化中：${info.embeddedCount}/${info.segmentCount} 段`
+  }
+  return info.message || '向量化中'
+}
+
+function renderEmbeddingProgress(info?: EmbeddingProgressInfo) {
+  if (!info || !shouldShowEmbeddingProgress(info)) return null
+  const percent = Math.max(0, Math.min(100, Math.round(Number(info.progress) || 0)))
+  const barColor = info.status === 'error'
+    ? '#ff4d4f'
+    : info.status === 'ready'
+      ? '#52c41a'
+      : info.status === 'queued' || info.status === 'pending'
+        ? '#faad14'
+        : '#13c2c2'
+  return (
+    <div
+      style={{
+        marginTop: 8,
+        padding: '7px 8px',
+        borderRadius: 6,
+        background: 'rgba(255,255,255,0.045)',
+        border: '1px solid rgba(255,255,255,0.08)',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--gs-text-secondary)', fontSize: 12, lineHeight: 1.4 }}>
+        <span style={{ minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{getEmbeddingProgressText(info)}</span>
+        <span style={{ flexShrink: 0 }}>{percent}%</span>
+      </div>
+      <div style={{ height: 4, marginTop: 6, borderRadius: 999, background: 'rgba(255,255,255,0.10)', overflow: 'hidden' }}>
+        <div style={{ width: `${percent}%`, height: '100%', borderRadius: 999, background: barColor, transition: 'width 0.2s ease' }} />
+      </div>
+    </div>
+  )
+}
+
 function renderBookTranslationProgress(info?: BookTranslationProgressInfo) {
   if (!info || !shouldShowBookTranslationProgress(info)) return null
   const percent = Math.max(0, Math.min(100, getBookTranslationProgressPercent(info)))
@@ -1267,6 +1368,195 @@ function renderDocumentHealthTags(doc: DocumentItem) {
   ))
 }
 
+/** Grouped batch actions — short top level, submenus expand to the right (Ant Design children). */
+function buildBatchMenuItems(): MenuProps['items'] {
+  return [
+    { key: 'import', label: '批量入库', icon: <InboxOutlined /> },
+    { key: 'select_all', label: '全选已加载', icon: <CheckSquareOutlined /> },
+    { type: 'divider' },
+    {
+      key: 'group_ocr',
+      label: 'OCR 识别',
+      icon: <ThunderboltOutlined />,
+      children: [
+        { key: 'ocr:paddle', label: '批量 OCR · 飞桨' },
+        { key: 'ocr:vision_model', label: '批量 OCR · 大模型' },
+        { type: 'divider' },
+        { key: 'ocr_force:paddle', label: '重新 OCR · 飞桨覆盖' },
+        { key: 'ocr_force:vision_model', label: '重新 OCR · 大模型覆盖' },
+        { key: 'retry_failed', label: '重试失败文献' },
+      ],
+    },
+    {
+      key: 'group_vector',
+      label: '向量索引',
+      icon: <ThunderboltOutlined />,
+      children: [
+        { key: 'vectorize', label: '向量化所选文献' },
+        { key: 'revectorize', label: '重新向量化所选（当前模型）' },
+      ],
+    },
+    {
+      key: 'group_organize',
+      label: '整理与 AI',
+      icon: <RobotOutlined />,
+      children: [
+        { key: 'metadata_extract', label: '批量抓取元数据' },
+        { key: 'add_tags', label: '批量添加标签' },
+        { key: 'add_folder', label: '批量加入文件夹' },
+        { key: 'synthesize', label: 'AI 文献综述' },
+      ],
+    },
+    {
+      key: 'export',
+      label: '批量导出',
+      icon: <ExportOutlined />,
+      children: [
+        { key: 'export:txt', label: '导出为 TXT 纯文本' },
+        { key: 'export:markdown', label: '导出为 Markdown' },
+        { key: 'export:tei-xml', label: '导出为 TEI-XML' },
+        { key: 'export:page-xml', label: '导出为 PAGE XML' },
+        { key: 'export:paddle-json', label: '导出为 Paddle JSON' },
+        { key: 'export:reading-pdf', label: '批量导出阅读模式 PDF' },
+        { key: 'export:layout-pdf', label: '批量导出排版模式 PDF' },
+      ],
+    },
+    { type: 'divider' },
+    {
+      key: 'group_storage',
+      label: '原文与存储',
+      icon: <PictureOutlined />,
+      children: [
+        { key: 'cleanup_pdf_assets', label: '删除所选原文件' },
+        { key: 'restore_pdf_assets', label: '补回所选原文' },
+      ],
+    },
+    {
+      key: 'group_danger',
+      label: '删除',
+      icon: <DeleteOutlined />,
+      danger: true,
+      children: [
+        { key: 'delete_selected', label: '删除所选文献', danger: true },
+        { key: 'delete_zero_page', label: '清除零页文献', danger: true },
+      ],
+    },
+  ]
+}
+
+/** Single-document context / more menu — primary actions first, heavy groups nested. */
+function buildDocumentMoreMenuItems(input: {
+  doc: DocumentItem
+  availableFolders: FolderItem[]
+  docFolderIds: string[]
+  docFolderNames: string[]
+  pdfAssetState: 'available' | 'text_only' | 'unknown'
+}): MenuProps['items'] {
+  const { doc, availableFolders, docFolderIds, docFolderNames, pdfAssetState } = input
+  const readMenuItems: MenuProps['items'] = (Object.keys(READ_STATUS_MAP) as ReadStatus[]).map((status) => ({
+    key: status,
+    label: READ_STATUS_MAP[status].text,
+    icon: getReadStatusIcon(status),
+  }))
+  const ratingMenuItems: MenuProps['items'] = [
+    { key: '0', label: '清除评分' },
+    ...[1, 2, 3, 4, 5].map((value) => ({
+      key: String(value),
+      label: `${'★'.repeat(value)}${'☆'.repeat(5 - value)}`,
+    })),
+  ]
+
+  return [
+    { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
+    { key: 'edit', label: '编辑元数据', icon: <EditOutlined /> },
+    { key: 'favorite', label: doc.is_favorite ? '取消星标' : '加入星标', icon: doc.is_favorite ? <StarFilled /> : <StarOutlined /> },
+    { type: 'divider' },
+    {
+      key: 'group_ocr',
+      label: 'OCR',
+      icon: <ThunderboltOutlined />,
+      children: [
+        ...(shouldShowRetryAction(doc)
+          ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
+          : []),
+        { key: 'rerun_ocr_book:paddle', label: '重新 OCR · 飞桨覆盖' },
+        { key: 'rerun_ocr_book:vision_model', label: '重新 OCR · 大模型覆盖' },
+      ],
+    },
+    {
+      key: 'group_ai',
+      label: 'AI 与翻译',
+      icon: <RobotOutlined />,
+      children: [
+        { key: 'ai_extract', label: 'AI 提取元数据' },
+        { type: 'divider' },
+        { key: 'translate_book:start:balanced', label: '整书翻译 · 均衡' },
+        { key: 'translate_book:start:fast', label: '整书翻译 · 快速' },
+        { key: 'translate_book:start:quality', label: '整书翻译 · 高质量' },
+        { key: 'translate_book:retry_failed', label: '仅重试失败页' },
+        { key: 'translate_book:clear_cache', label: '清除本书翻译缓存', danger: true },
+      ],
+    },
+    {
+      key: 'group_organize',
+      label: '整理',
+      icon: <TagOutlined />,
+      children: [
+        {
+          key: 'read_status',
+          label: '阅读状态',
+          icon: <ReadOutlined />,
+          children: readMenuItems,
+        },
+        {
+          key: 'rating',
+          label: '评分',
+          icon: <BookOutlined />,
+          children: ratingMenuItems,
+        },
+        { key: 'add_tag', label: '添加标签', icon: <TagOutlined /> },
+        {
+          key: 'add_to_folder',
+          label: '加入文件夹',
+          icon: <FolderAddOutlined />,
+          children: availableFolders.length > 0
+            ? availableFolders.map((item) => ({ key: `folder_${item.id}`, label: item.name }))
+            : [{ key: 'folder_none', label: '没有可加入的文件夹', disabled: true }],
+        },
+        ...(docFolderIds.length > 0
+          ? [{
+              key: 'remove_from_folder',
+              label: '移出文件夹',
+              icon: <FolderOpenOutlined />,
+              children: docFolderIds.map((folderId, folderIndex) => ({
+                key: `remove_folder_${folderId}`,
+                label: docFolderNames[folderIndex] || '未命名文件夹',
+              })),
+            }]
+          : []),
+      ],
+    },
+    ...(pdfAssetState === 'available' || pdfAssetState === 'text_only'
+      ? [
+          { type: 'divider' as const },
+          {
+            key: 'group_storage',
+            label: '原文与缓存',
+            icon: <PictureOutlined />,
+            children: [
+              ...(pdfAssetState === 'available'
+                ? [{ key: 'cleanup_pdf_assets', label: '删除原文件/页图缓存', icon: <PictureOutlined /> }]
+                : []),
+              ...(pdfAssetState === 'text_only'
+                ? [{ key: 'restore_pdf_assets', label: '补回原文', icon: <ImportOutlined /> }]
+                : []),
+            ],
+          },
+        ]
+      : []),
+  ]
+}
+
 function renderTagSummaryPopover(items: Array<import('react').ReactNode>, overflowLabel: string) {
   if (items.length === 0) return null
   return (
@@ -1322,6 +1612,10 @@ function getLocalSmartFilterPredicate(filter: LibraryFilter): ((doc: DocumentIte
     return (doc) => doc.ocr_status !== 'completed' || hasZeroPages(doc)
   }
 
+  if (filter.type === 'embeddingReady') {
+    return (doc) => String(doc.embedding_status || '') === 'ready' || Number(doc.embedding_chunk_count || 0) > 0
+  }
+
   return null
 }
 
@@ -1372,6 +1666,7 @@ function getFilterTitle(filter: LibraryFilter, folders: FolderItem[], tags: TagI
   if (filter.type === 'healthUnknownType') return '待分类'
   if (filter.type === 'healthTitleCleanup') return '标题/类型待整理'
   if (filter.type === 'importStatus') return '\u672a\u5165\u5e93\u6587\u732e'
+  if (filter.type === 'embeddingReady') return '已向量化'
   if (filter.type === 'docType') return filter.value || '\u6587\u732e\u7c7b\u578b'
   return '\u6587\u732e\u7ba1\u7406'
 }
@@ -1401,6 +1696,7 @@ function getFilterChipLabel(filter: LibraryFilter, folders: FolderItem[], tags: 
   if (filter.type === 'healthUnknownType') return '健康检查 / 待分类'
   if (filter.type === 'healthTitleCleanup') return '健康检查 / 标题或类型待整理'
   if (filter.type === 'importStatus') return '\u672a\u5165\u5e93\u6587\u732e'
+  if (filter.type === 'embeddingReady') return '智能视窗 / 已向量化'
   return ''
 }
 
@@ -1465,6 +1761,7 @@ function getDocumentListRowHeight(doc: DocumentItem | undefined, context: Docume
   if (shouldShowDocumentReviewMessage(doc, resolveOcrProgressInfo(doc, context.ocrProgressByDoc[doc.id]))) height += 36
   if (shouldShowOcrProgressForDocument(doc, context.ocrProgressByDoc[doc.id])) height += 48
   if (shouldShowBookTranslationProgress(context.bookTranslationProgressByDoc[doc.id])) height += 48
+  if (shouldShowEmbeddingProgress(context.embeddingProgressByDoc[doc.id])) height += 48
   if (tagCount > 0) height += 30
 
   return Math.min(LIST_ROW_MAX_HEIGHT, Math.max(LIST_ROW_MIN_HEIGHT, height))
@@ -1514,68 +1811,13 @@ function DocumentVirtualRow({
     { key: '0', label: '清除评分' },
     ...[1, 2, 3, 4, 5].map((value) => ({ key: String(value), label: `${'★'.repeat(value)}${'☆'.repeat(5 - value)}` })),
   ]
-  const moreMenuItems: MenuProps['items'] = [
-    { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
-    { key: 'edit', label: '编辑元数据', icon: <EditOutlined /> },
-    ...(shouldShowRetryAction(doc)
-      ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
-      : []),
-    {
-      key: 'rerun_ocr_book',
-      label: '重新 OCR 整本文献',
-      icon: <ThunderboltOutlined />,
-      children: [
-        { key: 'rerun_ocr_book:paddle', label: '用飞桨 OCR 覆盖' },
-        { key: 'rerun_ocr_book:vision_model', label: '用大模型 OCR 覆盖' },
-      ],
-    },
-    { key: 'ai_extract', label: 'AI 提取元数据', icon: <RobotOutlined /> },
-    {
-      key: 'translate_book',
-      label: '翻译整本书',
-      icon: <RobotOutlined />,
-      children: [
-        { key: 'translate_book:start:balanced', label: '均衡模式（推荐）' },
-        { key: 'translate_book:start:fast', label: '快速模式' },
-        { key: 'translate_book:start:quality', label: '高质量模式' },
-        { key: 'translate_book:retry_failed', label: '仅重试失败页' },
-        { key: 'translate_book:clear_cache', label: '清除本书翻译缓存', danger: true },
-      ],
-    },
-    { key: 'favorite', label: doc.is_favorite ? '取消星标' : '加入星标', icon: doc.is_favorite ? <StarFilled /> : <StarOutlined /> },
-    { key: 'read_status', label: '阅读状态', icon: <ReadOutlined />, children: readMenuItems },
-    { key: 'rating', label: '评分', icon: <BookOutlined />, children: ratingMenuItems },
-    {
-      key: 'add_tag',
-      label: '添加标签',
-      icon: <TagOutlined />,
-    },
-    {
-      key: 'add_to_folder',
-      label: '加入文件夹',
-      icon: <FolderAddOutlined />,
-      children: availableFolders.length > 0
-        ? availableFolders.map((item) => ({ key: `folder_${item.id}`, label: item.name }))
-        : [{ key: 'folder_none', label: '没有可加入的文件夹', disabled: true }],
-    },
-    ...(docFolderIds.length > 0 ? [{
-      key: 'remove_from_folder',
-      label: '移出文件夹',
-      icon: <FolderOpenOutlined />,
-      children: docFolderIds.map((folderId, folderIndex) => ({
-        key: `remove_folder_${folderId}`,
-        label: docFolderNames[folderIndex] || '未命名文件夹',
-      })),
-    }] : []),
-    ...(pdfAssetState === 'available' ? [
-      { type: 'divider' as const },
-      { key: 'cleanup_pdf_assets', label: '删除原文件/页图缓存', icon: <PictureOutlined /> },
-    ] : []),
-    ...(pdfAssetState === 'text_only' ? [
-      { type: 'divider' as const },
-      { key: 'restore_pdf_assets', label: '补回原文', icon: <ImportOutlined /> },
-    ] : []),
-  ]
+  const moreMenuItems: MenuProps['items'] = buildDocumentMoreMenuItems({
+    doc,
+    availableFolders,
+    docFolderIds,
+    docFolderNames,
+    pdfAssetState,
+  })
 
   const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
     domEvent.stopPropagation()
@@ -1746,6 +1988,7 @@ function DocumentVirtualRow({
               <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0 }}>{getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).text}</Tag>
               <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0 }}>{getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).text}</Tag>
               {renderPdfAssetTag(doc)}
+              {renderEmbeddingStatusTag(doc)}
               {renderDocumentHealthTags(doc)}
               <Tag color={READ_STATUS_MAP[doc.read_status]?.color || 'default'} style={{ margin: 0 }}>{READ_STATUS_MAP[doc.read_status]?.text || doc.read_status}</Tag>
               <Tag color={METADATA_STATUS_MAP[doc.metadata_status]?.color || 'default'} style={{ margin: 0 }}>{METADATA_STATUS_MAP[doc.metadata_status]?.text || doc.metadata_status}</Tag>
@@ -1807,6 +2050,7 @@ function DocumentVirtualRow({
             ) : null}
             {progressInfo ? renderOcrProgress(progressInfo, context.handleCancelOcr) : null}
             {renderBookTranslationProgress(bookTranslationProgressInfo)}
+            {renderEmbeddingProgress(context.embeddingProgressByDoc[doc.id])}
             {visibleTags.length > 0 ? (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                 {visibleTags.map((tagItem) => {
@@ -1959,6 +2203,7 @@ export default function LibraryView({
   const [libraryPageSize, setLibraryPageSize] = useState<LibraryPageSize>(() => getStoredLibraryPageSize())
   const [ocrProgressByDoc, setOcrProgressByDoc] = useState<Record<string, OcrProgressInfo>>({})
   const [bookTranslationProgressByDoc, setBookTranslationProgressByDoc] = useState<Record<string, BookTranslationProgressInfo>>({})
+  const [embeddingProgressByDoc, setEmbeddingProgressByDoc] = useState<Record<string, EmbeddingProgressInfo>>({})
   const [healthReport, setHealthReport] = useState<DocumentHealthReport | null>(null)
   const [healthLoading, setHealthLoading] = useState(false)
   const [healthPanelCollapsed, setHealthPanelCollapsed] = useState(true)
@@ -2342,6 +2587,7 @@ export default function LibraryView({
     if (activeFilter.type === 'metadataStatus' && activeFilter.value) options.metadataStatus = activeFilter.value
     if (activeFilter.type === 'proofStatus' && activeFilter.value) options.proofStatus = activeFilter.value
     if (activeFilter.type === 'metadataPending') options.metadataPending = true
+    if (activeFilter.type === 'embeddingReady') options.embeddingReady = true
     if (isHealthFilter(activeFilter)) options.healthFilter = activeFilter.type
 
     if (activeFilter.type === 'tag') {
@@ -2932,6 +3178,36 @@ export default function LibraryView({
             duration: 6,
           })
         }
+        return
+      }
+
+      if (event.kind === 'embedding-index') {
+        if (event.status === 'queued' || event.status === 'processing') {
+          message.loading({
+            content: `${event.message || '正在向量化文献'}${countText}`,
+            key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
+            duration: 0,
+          })
+          return
+        }
+        if (event.status === 'completed') {
+          message.success({
+            content: event.message || '向量化完成',
+            key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
+            duration: 4,
+          })
+          scheduleSmartViewCountsRefresh(200)
+          void loadDocuments(filter, { silent: true })
+          return
+        }
+        if (event.status === 'error') {
+          message.warning({
+            content: event.errorMessage ? `向量化失败：${event.errorMessage}` : event.message || '向量化失败',
+            key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
+            duration: 6,
+          })
+          scheduleSmartViewCountsRefresh(200)
+        }
       }
     }
 
@@ -2942,8 +3218,45 @@ export default function LibraryView({
       message.destroy(BACKGROUND_HEALTH_REPORT_MESSAGE_KEY)
       message.destroy(BACKGROUND_OCR_FINALIZE_MESSAGE_KEY)
       message.destroy(BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY)
+      message.destroy(BACKGROUND_EMBEDDING_MESSAGE_KEY)
     }
-  }, [filter, loadBaseData, loadDocuments, loadHealthReport, scheduleHealthReportRefresh])
+  }, [filter, loadBaseData, loadDocuments, loadHealthReport, scheduleHealthReportRefresh, scheduleSmartViewCountsRefresh])
+
+  useEffect(() => {
+    const applyEmbeddingEvent = (event: EmbeddingProgressEvent) => {
+      if (!event.docId) return
+      const docId = event.docId
+      setEmbeddingProgressByDoc((current) => ({
+        ...current,
+        [docId]: {
+          docId,
+          status: event.status,
+          progress: Number(event.progress) || 0,
+          message: event.message,
+          embeddedCount: event.embeddedCount,
+          segmentCount: event.segmentCount,
+          errorMessage: event.errorMessage,
+          updatedAt: Date.now(),
+        },
+      }))
+      // Mirror status onto the library card tags immediately (ready / queued / error…).
+      if (event.status === 'ready' || event.status === 'queued' || event.status === 'processing' || event.status === 'error') {
+        updateDocumentInList(docId, {
+          embedding_status: event.status === 'ready' ? 'ready' : event.status,
+          embedding_chunk_count: event.status === 'ready'
+            ? Math.max(Number(event.embeddedCount || 0), Number(event.segmentCount || 0))
+            : undefined,
+        })
+      }
+      if (event.status === 'ready' || event.status === 'error' || event.status === 'idle') {
+        scheduleSmartViewCountsRefresh(400)
+      }
+    }
+    const unsubscribe = window.api.onEmbeddingProgress(applyEmbeddingEvent)
+    return () => {
+      unsubscribe()
+    }
+  }, [scheduleSmartViewCountsRefresh, updateDocumentInList])
 
   useEffect(() => () => {
     if (healthRefreshTimerRef.current) {
@@ -3161,6 +3474,7 @@ export default function LibraryView({
       { key: 'proofed', label: `已校对 ${smartViewCounts.proofed}`, filter: { type: 'proofStatus' as const, value: 'completed' } },
       { key: 'unproofed', label: `未校对 ${smartViewCounts.unproofed}`, filter: { type: 'proofStatus' as const, value: 'pending' } },
       { key: 'metadata-pending', label: `未确认元数据 ${smartViewCounts.metadataPending}`, filter: { type: 'metadataPending' as const } },
+      { key: 'vectorized', label: `已向量化 ${smartViewCounts.vectorized ?? 0}`, filter: { type: 'embeddingReady' as const } },
       { key: 'unstored', label: `未入库 ${smartViewCounts.unstored}`, filter: { type: 'importStatus' as const, value: 'unstored' } }
     ]
   }, [smartViewCounts])
@@ -5451,58 +5765,71 @@ export default function LibraryView({
     })
   }
 
-  const batchMenuItems: MenuProps['items'] = [
-    { key: 'import', label: '批量入库', icon: <InboxOutlined /> },
-    {
-      key: 'ocr',
-      label: '批量 OCR 识别',
-      icon: <ThunderboltOutlined />,
-      children: [
-        { key: 'ocr:paddle', label: '用飞桨 OCR' },
-        { key: 'ocr:vision_model', label: '用大模型 OCR' },
-      ],
-    },
-    {
-      key: 'ocr_force',
-      label: '重新 OCR 已选文献',
-      icon: <ReloadOutlined />,
-      children: [
-        { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
-        { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
-      ],
-    },
-    { key: 'metadata_extract', label: '批量抓取元数据', icon: <RobotOutlined /> },
-    { key: 'add_tags', label: '批量添加标签', icon: <TagOutlined /> },
-    { key: 'add_folder', label: '批量加入文件夹', icon: <FolderAddOutlined /> },
-    { key: 'retry_failed', label: '重试失败文献', icon: <ReloadOutlined /> },
-    { key: 'select_all', label: '全选已加载', icon: <CheckSquareOutlined /> },
-    { key: 'synthesize', label: 'AI 文献综述', icon: <FileSearchOutlined /> },
-    {
-      key: 'export',
-      label: '批量导出',
-      icon: <ExportOutlined />,
-      children: [
-        { key: 'export:txt', label: '导出为 TXT 纯文本' },
-        { key: 'export:markdown', label: '导出为 Markdown' },
-        { key: 'export:tei-xml', label: '导出为 TEI-XML' },
-        { key: 'export:page-xml', label: '导出为 PAGE XML' },
-        { key: 'export:paddle-json', label: '导出为 Paddle JSON' },
-        { key: 'export:reading-pdf', label: '批量导出阅读模式 PDF' },
-        { key: 'export:layout-pdf', label: '批量导出排版模式 PDF' },
-      ],
-    },
-    { type: 'divider' },
-    { key: 'delete_selected', label: '删除所选文献', icon: <DeleteOutlined />, danger: true },
-    { key: 'delete_zero_page', label: '清除零页文献', icon: <DeleteOutlined />, danger: true },
-    { key: 'cleanup_pdf_assets', label: '删除所选原文件', icon: <PictureOutlined /> },
-    { key: 'restore_pdf_assets', label: '补回所选原文', icon: <ImportOutlined /> }
-  ]
+  const batchMenuItems: MenuProps['items'] = buildBatchMenuItems()
 
   const handleBatchMenu: MenuProps['onClick'] = ({ key }) => {
     if (key === 'import') void handleBatchImport()
     if (String(key).startsWith('ocr:')) void handleBatchOcr(String(key).replace('ocr:', '') as OcrEngine)
     if (String(key).startsWith('ocr_force:')) confirmBatchForceRerunOcr(String(key).replace('ocr_force:', '') as OcrEngine)
     if (key === 'metadata_extract') void handleBatchMetadataExtract()
+    if (key === 'vectorize') {
+      if (selectedIds.length === 0) {
+        message.info('请先选择文献')
+        return
+      }
+      void (async () => {
+        try {
+          const result = await window.api.enqueueDocumentsForEmbedding(selectedIds)
+          if (result.queued > 0) {
+            message.loading({
+              content: `已入队向量化 ${result.queued} 篇${result.skipped > 0 ? `，跳过 ${result.skipped} 篇` : ''}。进度见文献卡片与「处理队列」。`,
+              key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
+              duration: 0,
+            })
+          } else {
+            message.warning(
+              result.skipped > 0
+                ? `没有可向量化的文献（跳过 ${result.skipped} 篇：正文分段未就绪或文献无效）`
+                : '没有可向量化的文献',
+            )
+          }
+        } catch (error: unknown) {
+          message.error(getErrorMessage(error, '向量化入队失败'))
+        }
+      })()
+    }
+    if (key === 'revectorize') {
+      if (selectedIds.length === 0) {
+        message.info('请先选择文献')
+        return
+      }
+      Modal.confirm({
+        title: '按当前模型重新向量化？',
+        content: `将清除所选 ${selectedIds.length} 篇已有向量，并用设置中当前的 Embedding 模型重新生成。适合升级到更强模型后重建索引。会消耗 API 额度。`,
+        okText: '重新向量化',
+        cancelText: '取消',
+        onOk: async () => {
+          try {
+            const result = await window.api.reindexDocumentsForEmbedding(selectedIds)
+            if (result.queued > 0) {
+              message.loading({
+                content: `已入队重新向量化 ${result.queued} 篇（清除旧向量 ${result.clearedChunks} 段）。进度见卡片与处理队列。`,
+                key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
+                duration: 0,
+              })
+            } else {
+              message.warning(
+                result.skipped > 0
+                  ? `没有可重建的文献（跳过 ${result.skipped} 篇：正文分段未就绪）`
+                  : '没有可重新向量化的文献',
+              )
+            }
+          } catch (error: unknown) {
+            message.error(getErrorMessage(error, '重新向量化入队失败'))
+          }
+        },
+      })
+    }
     if (key === 'add_tags') {
       if (selectedIds.length === 0) {
         message.info('请先选择文献')
@@ -5675,6 +6002,7 @@ export default function LibraryView({
     sortedSidebarTags,
     ocrProgressByDoc,
     bookTranslationProgressByDoc,
+    embeddingProgressByDoc,
     taggingDocId,
     taggingChecked,
     handleRowClick,
@@ -5710,6 +6038,7 @@ export default function LibraryView({
     applyLibraryFilter,
     batchMode,
     bookTranslationProgressByDoc,
+    embeddingProgressByDoc,
     folders,
     handleAddToFolder,
     handleBatchMenu,
@@ -6516,76 +6845,13 @@ export default function LibraryView({
                 }))
               ]
 
-              const moreMenuItems: MenuProps['items'] = [
-                { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
-                { key: 'edit', label: '编辑元数据', icon: <EditOutlined /> },
-                ...(shouldShowRetryAction(doc)
-                  ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
-                  : []),
-                {
-                  key: 'rerun_ocr_book',
-                  label: '重新 OCR 整本文献',
-                  icon: <ThunderboltOutlined />,
-                  children: [
-                    { key: 'rerun_ocr_book:paddle', label: '用飞桨 OCR 覆盖' },
-                    { key: 'rerun_ocr_book:vision_model', label: '用大模型 OCR 覆盖' },
-                  ],
-                },
-                { key: 'ai_extract', label: 'AI 提取元数据', icon: <RobotOutlined /> },
-                {
-                  key: 'translate_book',
-                  label: '翻译整本书',
-                  icon: <RobotOutlined />,
-                  children: [
-                    { key: 'translate_book:start', label: '开始 / 继续翻译' },
-                    { key: 'translate_book:retry_failed', label: '仅重试失败页' },
-                    { key: 'translate_book:clear_cache', label: '清除本书翻译缓存', danger: true },
-                  ],
-                },
-                { key: 'favorite', label: doc.is_favorite ? '取消星标' : '加入星标', icon: doc.is_favorite ? <StarFilled /> : <StarOutlined /> },
-                {
-                  key: 'read_status',
-                  label: '阅读状态',
-                  icon: <ReadOutlined />,
-                  children: readMenuItems
-                },
-                {
-                  key: 'rating',
-                  label: '评分',
-                  icon: <BookOutlined />,
-                  children: ratingMenuItems
-                },
-                {
-                  key: 'add_tag',
-                  label: '添加标签',
-                  icon: <TagOutlined />,
-                },
-                {
-                  key: 'add_to_folder',
-                  label: '加入文件夹',
-                  icon: <FolderAddOutlined />,
-                  children: availableFolders.length > 0
-                    ? availableFolders.map((item) => ({ key: `folder_${item.id}`, label: item.name }))
-                    : [{ key: 'folder_none', label: '没有可加入的文件夹', disabled: true }]
-                },
-                ...(docFolderIds.length > 0 ? [{
-                  key: 'remove_from_folder',
-                  label: '移出文件夹',
-                  icon: <FolderOpenOutlined />,
-                  children: docFolderIds.map((folderId, index) => ({
-                    key: `remove_folder_${folderId}`,
-                    label: docFolderNames[index] || '未命名文件夹'
-                  }))
-                }] : []),
-                ...(pdfAssetState === 'available' ? [
-                  { type: 'divider' as const },
-                  { key: 'cleanup_pdf_assets', label: '删除原文件/页图缓存', icon: <PictureOutlined /> },
-                ] : []),
-                ...(pdfAssetState === 'text_only' ? [
-                  { type: 'divider' as const },
-                  { key: 'restore_pdf_assets', label: '补回原文', icon: <ImportOutlined /> },
-                ] : [])
-              ]
+              const moreMenuItems: MenuProps['items'] = buildDocumentMoreMenuItems({
+                doc,
+                availableFolders,
+                docFolderIds,
+                docFolderNames,
+                pdfAssetState,
+              })
 
               const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
                 domEvent.stopPropagation()
@@ -6607,6 +6873,11 @@ export default function LibraryView({
                 }
                 if (key === 'ai_extract') {
                   void handleAiExtractForDoc(doc.id)
+                  return
+                }
+                if (String(key).startsWith('translate_book:start:')) {
+                  const mode = String(key).replace('translate_book:start:', '') as BookTranslationOptions['mode']
+                  void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE, mode })
                   return
                 }
                 if (key === 'translate_book' || key === 'translate_book:start') {
@@ -6697,7 +6968,7 @@ export default function LibraryView({
                       background: isSelected ? 'rgba(24, 144, 255, 0.15)' : 'rgba(255,255,255,0.03)',
                       cursor: 'pointer',
                       transition: 'background 0.15s ease',
-                      minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowDocumentReviewMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) ? 176 : 140,
+                      minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowDocumentReviewMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) || shouldShowEmbeddingProgress(embeddingProgressByDoc[doc.id]) ? 176 : 140,
                       overflow: 'hidden'
                     }}
                     onMouseEnter={(event) => {
@@ -6767,6 +7038,7 @@ export default function LibraryView({
                         <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
                           {getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).text}
                         </Tag>
+                        {renderEmbeddingStatusTag(doc)}
                         {!batchMode ? (
                           <div
                             data-library-document-action="true"
@@ -7031,6 +7303,7 @@ export default function LibraryView({
 
                     {progressInfo ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
                     {renderBookTranslationProgress(bookTranslationProgressInfo)}
+                    {renderEmbeddingProgress(embeddingProgressByDoc[doc.id])}
                   </div>
                 </Dropdown>
               )

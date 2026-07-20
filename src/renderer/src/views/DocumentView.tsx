@@ -37,7 +37,7 @@ import { ensurePdfPageImagesForOcr as ensureOcrPageImages, isReadablePageImagePa
 import { extractPageText, getCitationPageNumber, getOcrBlockText, getOrderedOcrBlocks, getReadablePageElements, getReadablePageText, getTextFlowOcrBlocks, normalizeOcrTextForReading } from '../utils/ocrText'
 import { clampAiButtonPosition, clampFloatingPanelState, getDefaultFloatingPanelState } from '../utils/floatingViewport'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
-import { resolveDocumentCitation } from '../utils/citations'
+import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import { findSearchOccurrences, uniqueSearchTerms } from '../utils/searchHitCount'
 import { getErrorMessage } from '@shared/errors'
 import {
@@ -197,6 +197,8 @@ type ReaderPage = {
   id: string
   sourcePageIndex: number
   sourcePageNum: number
+  /** Printed / literature page for display (same as citation / TXT export). */
+  literaturePageNum: number
   sourcePageId?: string
   sourceStartChar: number
   sourceEndChar: number
@@ -382,6 +384,8 @@ function getBoxLocation(box: FacsimileLayoutBlock): unknown {
 }
 
 function normalizeDocumentPage(page: NormalizableDocumentPage): DocumentPage {
+  const literaturePageNum = Number((page as { literature_page_num?: number | null }).literature_page_num || 0)
+  const ocrPageLabel = Number((page as { ocr_page_label?: number | null }).ocr_page_label || 0)
   return {
     id: page.id,
     doc_id: page.doc_id,
@@ -393,6 +397,15 @@ function normalizeDocumentPage(page: NormalizableDocumentPage): DocumentPage {
     ocr_status: page.ocr_status,
     proof_status: page.proof_status,
     created_at: page.created_at,
+    // Keep printed-page calibration fields — dropping them made UI fall back to physical 1..N
+    // even after applyLiteraturePageAnchor succeeded in the database.
+    literature_page_num: Number.isFinite(literaturePageNum) && literaturePageNum > 0
+      ? Math.floor(literaturePageNum)
+      : ((page as { literature_page_num?: number | null }).literature_page_num ?? null),
+    literature_page_source: (page as { literature_page_source?: string | null }).literature_page_source ?? null,
+    ocr_page_label: Number.isFinite(ocrPageLabel) && ocrPageLabel > 0
+      ? Math.floor(ocrPageLabel)
+      : ((page as { ocr_page_label?: number | null }).ocr_page_label ?? null),
     has_ocr_text: page.has_ocr_text ?? (page.has_ocr_result ? true : undefined),
     needs_layout_attention: page.needs_layout_attention,
     has_text: page.has_text,
@@ -1307,10 +1320,13 @@ function buildReaderPages(sourcePages: DocumentViewPage[], fontSize: number, lin
       if (chunk) {
         const leadingTrim = rest.slice(0, take).indexOf(chunk)
         const sourceStartChar = sourceCursor + Math.max(0, leadingTrim)
+        const physicalPageNum = page.page_num || sourcePageIndex + 1
+        const literaturePageNum = getCitationPageNumber(page, physicalPageNum) || physicalPageNum
         readerPages.push({
           id: `${page.id || sourcePageIndex}-${segmentIndex}`,
           sourcePageIndex,
-          sourcePageNum: page.page_num || sourcePageIndex + 1,
+          sourcePageNum: physicalPageNum,
+          literaturePageNum,
           sourcePageId: page.id,
           sourceStartChar,
           sourceEndChar: sourceStartChar + chunk.length,
@@ -1359,6 +1375,8 @@ export default function DocumentView({
   const [pageInput, setPageInput] = useState('1')
   const [imageDataUrl, setImageDataUrl] = useState('')
   const [nextImageDataUrl, setNextImageDataUrl] = useState('')
+  /** True while the left-pane page image is being resolved (path / PDF render). */
+  const [pageImageLoading, setPageImageLoading] = useState(false)
   const [floatPanelOpen, setFloatPanelOpen] = useState(false)
   const [localSearchKeyword, setLocalSearchKeyword] = useState(searchKeyword)
   const [searchInputDraft, setSearchInputDraft] = useState(searchKeyword)
@@ -1413,6 +1431,9 @@ export default function DocumentView({
   const [proofViewTouched, setProofViewTouched] = useState(false)
   const [facsimileTranslationOpen, setFacsimileTranslationOpen] = useState(false)
   const [preferFacsimileProofLayout, setPreferFacsimileProofLayout] = useState(true)
+  /** Global default when a document has no manual mode yet. Default ON = open in reading mode. */
+  const [preferReadModeOnOpen, setPreferReadModeOnOpen] = useState(true)
+  const preferReadModeOnOpenRef = useRef(true)
   const [initialReaderLocationKey, setInitialReaderLocationKey] = useState('')
   const [readerStateReady, setReaderStateReady] = useState(false)
   const [pageOcrVersions, setPageOcrVersions] = useState<PageOcrVersion[]>([])
@@ -1445,6 +1466,8 @@ export default function DocumentView({
   const readerVisiblePageIndexRef = useRef(initialPageIndex)
   const readerStateLoadedRef = useRef(false)
   const documentModeTouchedRef = useRef(false)
+  /** Last mode the user explicitly requested; blocks stale restores from snapping the Segmented back. */
+  const intendedDocumentModeRef = useRef<DocumentMode>('proof')
   const documentModeSwitchSerialRef = useRef(0)
   const readerSaveTimerRef = useRef<number | null>(null)
   const readerPreferencesLoadedRef = useRef(false)
@@ -1873,7 +1896,16 @@ export default function DocumentView({
   const shouldUseManagedTextReader = shouldUseEbookReader || shouldUseTextReaderMode || shouldUseOcrSourceReader
   const shouldUseProofLayout = documentMode === 'proof'
   const shouldUseImageReaderMode = documentMode === 'read' && !shouldUseManagedTextReader
-  const shouldShowBookPreview = !!currentPage && !isPdfSource && !hasCurrentPageImage && !!getPageDisplayText(currentPage)
+  // Book-style text preview is only for pure-text reading without images.
+  // Never use it in proof mode (left pane must be original image or a clear empty state).
+  const shouldShowBookPreview = documentMode === 'read'
+    && shouldUseImageReaderMode
+    && !!currentPage
+    && !isPdfSource
+    && !hasCurrentPageImage
+    && !pageImageLoading
+    && !!getPageDisplayText(currentPage)
+  const canAttemptPageImageRecovery = isPdfSource || isTextOnlyPdf || !!String(doc?.file_path || '').trim()
   const readerVirtualPages = useMemo(
     () => documentMode !== 'read' || shouldPreferSourcePageReader
       ? []
@@ -2501,10 +2533,18 @@ export default function DocumentView({
     let cancelled = false
     const loadProofLayoutPreference = async () => {
       try {
-        const value = await window.api.getSetting('prefer_facsimile_proof_layout')
-        if (!cancelled) setPreferFacsimileProofLayout(value !== 'false')
+        const [facsimileValue, readModeValue] = await Promise.all([
+          window.api.getSetting('prefer_facsimile_proof_layout'),
+          window.api.getSetting('prefer_read_mode_on_open'),
+        ])
+        if (cancelled) return
+        setPreferFacsimileProofLayout(facsimileValue !== 'false')
+        // Missing key → default true (prefer reading mode on first open).
+        const preferRead = readModeValue !== 'false'
+        preferReadModeOnOpenRef.current = preferRead
+        setPreferReadModeOnOpen(preferRead)
       } catch (error) {
-        console.error('Failed to load proof layout preference', error)
+        console.error('Failed to load proof/read layout preference', error)
       }
     }
     void loadProofLayoutPreference()
@@ -2544,10 +2584,14 @@ export default function DocumentView({
     hasInitializedPageRef.current = false
     readerStateLoadedRef.current = false
     documentModeTouchedRef.current = false
+    // First open default: reading mode when setting is on (default); proof when off.
+    // Per-document reader_state still overrides after user manually toggled mode.
+    const defaultMode: DocumentMode = preferReadModeOnOpenRef.current ? 'read' : 'proof'
+    intendedDocumentModeRef.current = defaultMode
     const initialTargetPageIndex = resolveStableLocatorPageIndex([], stableLocator, locator, initialPageIndex)
     setCurrentPageIndex(initialTargetPageIndex)
     setReaderPageIndex(initialTargetPageIndex)
-    setDocumentMode('proof')
+    setDocumentMode(defaultMode)
     setProofViewMode('facsimile')
     setProofViewTouched(false)
     setFacsimileTranslationOpen(false)
@@ -2571,6 +2615,14 @@ export default function DocumentView({
     }
     void (async () => {
       try {
+        // Recompute printed/literature page map before first read so citations don't
+        // stick to physical 1..N when OCR labels already exist on older books.
+        try {
+          await window.api.recomputeLiteraturePages(targetDocId)
+        } catch (error) {
+          console.warn('[DocumentView] literature page recompute failed', targetDocId, error)
+        }
+        if (activeDocumentIdRef.current !== targetDocId) return
         const data = await window.api.getDocumentLight(targetDocId)
         if (activeDocumentIdRef.current !== targetDocId) return
         const normalizedDoc = normalizeDocumentDetail(data, targetDocId)
@@ -2589,20 +2641,33 @@ export default function DocumentView({
     })()
   }, [openContextKey])
 
+  // Ebooks never use proof layout — force read without fighting user mode toggles on scanned books.
+  useEffect(() => {
+    if (!doc || !isEbookDocument) return
+    if (documentMode === 'proof' || intendedDocumentModeRef.current === 'proof') {
+      intendedDocumentModeRef.current = 'read'
+      setDocumentMode('read')
+    }
+  }, [doc, documentMode, isEbookDocument])
+
   useEffect(() => {
     if (!doc) return
-    if (isEbookDocument && documentMode === 'proof') {
-      setDocumentMode('read')
-      return
-    }
     const maxIndex = doc.pages ? doc.pages.length - 1 : 0
     if (!hasInitializedPageRef.current) {
       hasInitializedPageRef.current = true
-      setCurrentPageIndex(resolveStableLocatorPageIndex(sortedPages, stableLocator, locator, initialPageIndex))
+      const initialIndex = resolveStableLocatorPageIndex(sortedPages, stableLocator, locator, initialPageIndex)
+      setCurrentPageIndex(initialIndex)
+      readerVisiblePageIndexRef.current = initialIndex
       return
     }
-    setCurrentPageIndex((value) => Math.min(value, maxIndex))
-  }, [doc, documentMode, initialPageIndex, isEbookDocument, locator, sortedPages, stableLocator])
+    // Only clamp when page count shrinks. Do NOT depend on documentMode — mode toggles
+    // must not re-enter page init logic (that caused Segmented flash / bounce).
+    setCurrentPageIndex((value) => {
+      const next = Math.min(value, Math.max(0, maxIndex))
+      if (next !== value) readerVisiblePageIndexRef.current = next
+      return next
+    })
+  }, [doc, initialPageIndex, locator, sortedPages, stableLocator])
 
   useEffect(() => {
     const query = effectiveSearchKeyword.trim()
@@ -2724,27 +2789,43 @@ export default function DocumentView({
     if (!doc || readerStateLoadedRef.current || searchKeyword) return
     const targetDocId = documentId
     readerStateLoadedRef.current = true
+    // Capture open generation so a later mode click (which bumps the serial) voids mode restore.
+    const restoreSerial = documentModeSwitchSerialRef.current
     let cancelled = false
     const applyRestoredPageIndex = (pageIndex: number) => {
+      // Page restore is fine even after mode click; only mode restore is gated.
+      if (cancelled || activeDocumentIdRef.current !== targetDocId) return
       const nextIndex = clampPageIndex(pageIndex, pageCountRef.current)
       setCurrentPageIndex(nextIndex)
+      readerVisiblePageIndexRef.current = nextIndex
       void loadPagesAround(nextIndex, 5)
+    }
+    /** Only apply saved mode if user has not clicked 阅读/校对 during this open. */
+    const tryRestoreDocumentMode = (mode: DocumentMode): boolean => {
+      if (cancelled || activeDocumentIdRef.current !== targetDocId) return false
+      if (documentModeSwitchSerialRef.current !== restoreSerial) return false
+      if (documentModeTouchedRef.current) return false
+      intendedDocumentModeRef.current = mode
+      setDocumentMode(mode)
+      return true
     }
     void window.api.getReaderState(targetDocId).then((state: ReaderState | null) => {
       if (cancelled || activeDocumentIdRef.current !== targetDocId || !state) return
       const latestPageCount = pageCountRef.current
       const latestReaderVirtualPages = readerVirtualPagesRef.current
       const latestSortedPages = sortedPagesRef.current
-      const canRestoreDocumentMode = !documentModeTouchedRef.current
-      if (canRestoreDocumentMode && state.document_mode === 'read') setDocumentMode('read')
       const savedLocationKey = String(state.location_key || '')
       setInitialReaderLocationKey(savedLocationKey)
 
-      if (canRestoreDocumentMode && state.document_mode === 'proof' && !isEbookDocumentRef.current) {
-        setDocumentMode('proof')
-        if (state.proof_view_mode === 'facsimile' || state.proof_view_mode === 'text') {
-          setProofViewMode(state.proof_view_mode)
-          setProofViewTouched(true)
+      // Mode restore is re-checked at apply time (not once at the start of this callback).
+      if (state.document_mode === 'read') {
+        tryRestoreDocumentMode('read')
+      } else if (state.document_mode === 'proof' && !isEbookDocumentRef.current) {
+        if (tryRestoreDocumentMode('proof')) {
+          if (state.proof_view_mode === 'facsimile' || state.proof_view_mode === 'text') {
+            setProofViewMode(state.proof_view_mode)
+            setProofViewTouched(true)
+          }
         }
         const savedProofLocationKey = String(state.proof_location_key || '')
         const proofPageMatch = savedProofLocationKey.match(/^page:(\d+)$/)
@@ -2983,6 +3064,7 @@ export default function DocumentView({
 
   useEffect(() => {
     if (!doc?.id || pageCount === 0 || shouldUseManagedTextReader || documentMode !== 'read') return
+    if (intendedDocumentModeRef.current !== 'read') return
     if (!readerStateReady) return
     if (temporaryNavigationRef.current) return
     const progress = pageCount <= 1 ? 1 : currentPageIndex / Math.max(1, pageCount - 1)
@@ -3018,6 +3100,7 @@ export default function DocumentView({
 
   useEffect(() => {
     if (!doc?.id || pageCount === 0 || documentMode !== 'proof') return
+    if (intendedDocumentModeRef.current !== 'proof') return
     if (!readerStateReady) return
     if (temporaryNavigationRef.current) return
     const nextState = buildProofReaderState(currentPageIndex)
@@ -3052,16 +3135,20 @@ export default function DocumentView({
     if (nextState && readerStateReady && !temporaryNavigationRef.current) {
       saveReaderStateSoon(nextState)
     }
-    if (virtualPage.sourcePageIndex !== currentPageIndex) {
-      setCurrentPageIndex(virtualPage.sourcePageIndex)
+    const sourceIndex = clampPageIndex(virtualPage.sourcePageIndex, pageCount)
+    readerVisiblePageIndexRef.current = sourceIndex
+    if (sourceIndex !== currentPageIndex) {
+      setCurrentPageIndex(sourceIndex)
     }
     setPageInput(String(readerPageIndex + 1))
-  }, [buildTextReaderState, currentPageIndex, readerPageIndex, readerStateReady, readerVirtualPages, saveReaderStateSoon, shouldUseTextReaderMode])
+  }, [buildTextReaderState, currentPageIndex, pageCount, readerPageIndex, readerStateReady, readerVirtualPages, saveReaderStateSoon, shouldUseTextReaderMode])
 
+  // Keep the shared "where am I" index in sync for every reading surface so
+  // read ↔ proof mode switches never fall back to a stale page 0/1.
   useEffect(() => {
-    if (documentMode !== 'read' || shouldUseEbookReader || shouldUseTextReaderMode) return
-    readerVisiblePageIndexRef.current = currentPageIndex
-  }, [currentPageIndex, documentMode, shouldUseEbookReader, shouldUseTextReaderMode])
+    if (documentMode !== 'read') return
+    readerVisiblePageIndexRef.current = clampPageIndex(currentPageIndex, pageCount)
+  }, [currentPageIndex, documentMode, pageCount])
 
   const loadPageImage = useCallback(async (page: DocumentViewPage | undefined, options?: { updateDoc?: boolean }): Promise<string> => {
     if (!page) return ''
@@ -3204,11 +3291,27 @@ export default function DocumentView({
     const loadCurrentImage = async () => {
       if (!currentPage) {
         setImageDataUrl('')
+        setPageImageLoading(false)
         return
       }
 
+      const cached = getCachedPageImage(currentPage)
+      if (cached) {
+        setImageDataUrl(cached)
+        setPageImageLoading(false)
+      } else {
+        setPageImageLoading(true)
+      }
+
       try {
-        const dataUrl = await loadPageImage(currentPage)
+        let dataUrl = await loadPageImage(currentPage)
+        // Proof needs a real page image for side-by-side comparison; try harder via PDF.
+        if (!dataUrl && shouldUseProofLayout && doc && currentPage.page_num) {
+          const recovered = await ensureCurrentPageImageCached(currentPage).catch(() => false)
+          if (recovered) {
+            dataUrl = await loadPageImage(currentPage)
+          }
+        }
         const nextDataUrl = shouldUseImageReaderMode && nextSpreadPage
           ? await loadPageImage(nextSpreadPage)
           : ''
@@ -3219,17 +3322,30 @@ export default function DocumentView({
         console.error('[DocumentView] failed to load image', error)
         if (!canceled) setImageDataUrl('')
         if (!canceled) setNextImageDataUrl('')
+      } finally {
+        if (!canceled) setPageImageLoading(false)
       }
     }
 
     if (doc && (shouldUseImageReaderMode || shouldUseProofLayout)) {
       void loadCurrentImage()
+    } else {
+      setPageImageLoading(false)
     }
 
     return () => {
       canceled = true
     }
-  }, [currentPage, doc, loadPageImage, nextSpreadPage, shouldUseImageReaderMode, shouldUseProofLayout])
+  }, [
+    currentPage,
+    doc,
+    ensureCurrentPageImageCached,
+    getCachedPageImage,
+    loadPageImage,
+    nextSpreadPage,
+    shouldUseImageReaderMode,
+    shouldUseProofLayout,
+  ])
 
   useEffect(() => {
     if (!shouldUseSourcePageReader) return
@@ -3835,52 +3951,97 @@ export default function DocumentView({
   }
 
   const switchDocumentMode = async (nextMode: DocumentMode) => {
-    if (nextMode === documentMode) return
+    // Always re-assert intention + serial first so in-flight getReaderState cannot snap back.
+    const previousMode = documentMode
+    const alreadyOnTarget = nextMode === documentMode && nextMode === intendedDocumentModeRef.current
     documentModeTouchedRef.current = true
+    intendedDocumentModeRef.current = nextMode
     const switchSerial = ++documentModeSwitchSerialRef.current
+
+    // Cancel any pending debounced save (often still carrying the previous mode).
     if (readerSaveTimerRef.current) {
       window.clearTimeout(readerSaveTimerRef.current)
       readerSaveTimerRef.current = null
     }
-    const activeSearchMatch = currentMatchIndex >= 0
-      ? (shouldUseTextReaderMode ? textReaderMatches[currentMatchIndex] : searchMatches[currentMatchIndex])
-      : null
-    const syncedPageIndex = clampPageIndex(
-      nextMode === 'proof' && activeSearchMatch
-        ? activeSearchMatch.pageIndex
-        : documentMode === 'read' ? readerVisiblePageIndexRef.current : currentPageIndex,
-      pageCount,
-    )
+
+    // Optimistic UI: flip Segmented immediately so the first click sticks.
+    setDocumentMode(nextMode)
+    if (alreadyOnTarget) {
+      // Still re-pin mode after a failed bounce, then stop if nothing else to do.
+      return
+    }
+
+    // Resolve the *source* page the user is currently looking at.
+    const resolveViewingSourcePageIndex = (): number => {
+      if (previousMode === 'read') {
+        if (shouldUseTextReaderMode) {
+          const virtual = readerVirtualPages[readerPageIndex]
+          if (virtual && Number.isFinite(Number(virtual.sourcePageIndex))) {
+            return clampPageIndex(Number(virtual.sourcePageIndex), pageCount)
+          }
+        }
+        const fromRef = Number(readerVisiblePageIndexRef.current)
+        if (Number.isFinite(fromRef) && fromRef >= 0) {
+          return clampPageIndex(fromRef, pageCount)
+        }
+      }
+      return clampPageIndex(currentPageIndex, pageCount)
+    }
+
+    const syncedPageIndex = resolveViewingSourcePageIndex()
+    readerVisiblePageIndexRef.current = syncedPageIndex
+
     if (nextMode === 'proof' && isTextOnlyPdf) {
       const restored = await handleRestorePdfAsset(sortedPages[syncedPageIndex] || currentPage)
-      if (documentModeSwitchSerialRef.current !== switchSerial) return
+      if (documentModeSwitchSerialRef.current !== switchSerial || intendedDocumentModeRef.current !== nextMode) return
       if (!restored) {
+        // Revert optimistic mode if PDF cannot be restored for proof.
+        intendedDocumentModeRef.current = previousMode
+        setDocumentMode(previousMode)
         message.warning('无法自动补回原始 PDF，请手动选择 PDF')
         return
       }
     }
-    if (documentModeSwitchSerialRef.current !== switchSerial) return
+    if (documentModeSwitchSerialRef.current !== switchSerial || intendedDocumentModeRef.current !== nextMode) return
+
     setCurrentPageIndex(syncedPageIndex)
-    if (nextMode === 'proof' && activeSearchMatch) {
+    setPageInput(String((sortedPages[syncedPageIndex]?.page_num || syncedPageIndex + 1)))
+    const activeSearchMatch = currentMatchIndex >= 0
+      ? (shouldUseTextReaderMode ? textReaderMatches[currentMatchIndex] : searchMatches[currentMatchIndex])
+      : null
+    if (nextMode === 'proof' && activeSearchMatch && activeSearchMatch.pageIndex === syncedPageIndex) {
       setActiveBoxIndex(activeSearchMatch.boxIndex)
+    } else if (nextMode === 'proof') {
+      setActiveBoxIndex(-1)
     }
     if (nextMode === 'read') {
-      readerVisiblePageIndexRef.current = syncedPageIndex
       const nextReaderPageIndex = getReaderPageIndexForSourcePage(syncedPageIndex)
       setReaderPageIndex(nextReaderPageIndex)
     } else {
       setImageDataUrl('')
       setNextImageDataUrl('')
+      setPageImageLoading(false)
       pageImageCacheRef.current.clear()
       if (doc?.file_path && String(doc.file_path).toLowerCase().endsWith('.pdf')) {
         releaseCachedPdfDocument(doc.file_path)
       }
     }
-    setDocumentMode(nextMode)
+
     const nextState = nextMode === 'proof'
       ? buildProofReaderState(syncedPageIndex)
       : buildPageReaderState(syncedPageIndex)
-    if (nextState && readerStateReady) saveReaderStateNow(nextState)
+    // Always persist the intended mode immediately (even during temporary search navigation).
+    if (nextState) {
+      if (readerSaveTimerRef.current) {
+        window.clearTimeout(readerSaveTimerRef.current)
+        readerSaveTimerRef.current = null
+      }
+      latestReaderStateRef.current = { ...latestReaderStateRef.current, ...nextState, document_mode: nextMode }
+      void window.api.saveReaderState(documentId, latestReaderStateRef.current).catch((error: unknown) => {
+        console.error('Failed to save reader state after mode switch', error)
+      })
+    }
+    void loadPagesAround(syncedPageIndex, 4)
   }
 
   const handleRerunCurrentPageOcr = async (imageRotation: 0 | 90 = 0) => {
@@ -4225,7 +4386,12 @@ export default function DocumentView({
       return
     }
     const internalPageNum = Number(currentPage.page_num || currentPageIndex + 1)
-    const citationPageNum = getCitationPageNumber(currentPage, internalPageNum)
+    const citationPageNum = getCitationPageNumber(
+      currentPage,
+      Number((currentPage as { literature_page_num?: number | null } | null)?.literature_page_num || 0) > 0
+        ? Number((currentPage as { literature_page_num?: number | null }).literature_page_num)
+        : internalPageNum,
+    )
     const displayPageNum = citationPageNum || internalPageNum
     const fallbackCitationText = `${doc.title || '未命名文献'}${displayPageNum ? `，第 ${displayPageNum} 页` : ''}`
     let citationText = fallbackCitationText
@@ -4611,6 +4777,47 @@ export default function DocumentView({
     window.dispatchEvent(new Event(SOURCE_PAGE_READER_RESET_VIEW_EVENT))
   }, [])
 
+  const copySelectedDirectQuote = useCallback(async () => {
+    const selected = (
+      window.getSelection()?.toString()
+      || selectedTextForAi
+      || ''
+    ).replace(/\s+/g, ' ').trim()
+    if (!selected) {
+      message.info('请先选择需要引用的文本')
+      return
+    }
+    if (!doc?.id) {
+      message.warning('当前文献尚未加载完成')
+      return
+    }
+    const page = currentPage || sortedPages[currentPageIndex] || null
+    const internalPageNum = Number(page?.page_num || currentPageIndex + 1) || null
+    const literaturePageNum = Number((page as { literature_page_num?: number | null } | null | undefined)?.literature_page_num || 0)
+    const citationPageNum = getCitationPageNumber(
+      page,
+      literaturePageNum > 0 ? literaturePageNum : internalPageNum,
+    ) || internalPageNum
+    const fallbackCitationText = `${doc.title || '未命名文献'}${citationPageNum ? `，第 ${citationPageNum} 页` : ''}`
+    let citationText = fallbackCitationText
+    try {
+      citationText = await resolveDocumentCitation(doc.id, {
+        docType: doc.doc_type,
+        pageNum: citationPageNum,
+      }) || fallbackCitationText
+    } catch (error) {
+      console.warn('Failed to generate direct-quote citation from active style, falling back to simple citation.', error)
+    }
+    const quote = buildDirectQuoteCitationText(selected, citationText)
+    try {
+      await navigator.clipboard.writeText(quote)
+      message.success('已复制直接引用')
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(getErrorMessage(error, '复制直接引用失败'))
+    }
+  }, [currentPage, currentPageIndex, doc, selectedTextForAi, sortedPages])
+
   useEffect(() => {
     if (!shortcuts) return
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -4631,6 +4838,12 @@ export default function DocumentView({
           focusReaderSearch()
           return
         }
+      }
+
+      if (shortcutMatches(event, shortcuts.copyDirectQuote) && !isEditableShortcutTarget(event.target)) {
+        event.preventDefault()
+        void copySelectedDirectQuote()
+        return
       }
 
       if (isEditableShortcutTarget(event.target)) return
@@ -4673,7 +4886,7 @@ export default function DocumentView({
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [focusReaderSearch, getReaderSearchInput, handleBack, navigateShortcutPage, resetReaderViewScale, scrollReaderContent, shortcuts, toggleReaderTranslation])
+  }, [copySelectedDirectQuote, focusReaderSearch, getReaderSearchInput, handleBack, navigateShortcutPage, resetReaderViewScale, scrollReaderContent, shortcuts, toggleReaderTranslation])
 
   const exportMenuItems: MenuProps['items'] = [
     { key: 'reading-pdf', label: '导出阅读模式 PDF' },
@@ -5051,15 +5264,18 @@ export default function DocumentView({
         {readerPages.map((page, index) => {
           const pageIndex = readerPageIndex + index
           const pageHitStartIndex = readerSearchMatches.filter((match) => match.pageIndex < pageIndex).length
+          const imageLabel = `影像 第 ${page.sourcePageNum} / ${pageCount} 页`
+          const literatureLabel = `文献 第 ${page.literaturePageNum || page.sourcePageNum} 页`
           return (
             <div
               key={page.id}
               onClick={handleReaderPageClick(index === 0 ? 'left' : 'right')}
               style={{
+                position: 'relative',
                 background: readerThemeStyle.page,
                 color: readerThemeStyle.text,
                 borderRadius: 6,
-                padding: '34px 38px',
+                padding: '34px 38px 44px',
                 boxShadow: '0 16px 40px rgba(0,0,0,0.35), inset 0 0 0 1px rgba(120,80,30,0.15)',
                 fontFamily: readerFontFamily,
                 fontSize: readerFontSize,
@@ -5072,10 +5288,37 @@ export default function DocumentView({
                 boxSizing: 'border-box',
               }}
             >
-              <div style={{ color: readerThemeStyle.muted, fontSize: 12, marginBottom: 18, textAlign: 'center', userSelect: 'none' }}>
-                阅读页 {readerPageIndex + index + 1} / {readerVirtualPageCount} · 原页 {page.sourcePageNum}{page.segmentIndex > 0 ? `-${page.segmentIndex + 1}` : ''}
+              <div
+                title="PDF/扫描影像页序"
+                style={{
+                  color: readerThemeStyle.muted,
+                  fontSize: 12,
+                  marginBottom: 18,
+                  textAlign: 'right',
+                  fontVariantNumeric: 'tabular-nums',
+                  userSelect: 'none',
+                }}
+              >
+                {imageLabel}
               </div>
               {renderBookText(page.text, effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex)}
+              <div
+                aria-label={literatureLabel}
+                title="书上印刷页码，与引用、TXT 导出一致"
+                style={{
+                  position: 'sticky',
+                  bottom: 0,
+                  marginTop: 18,
+                  color: readerThemeStyle.muted,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  fontVariantNumeric: 'tabular-nums',
+                  userSelect: 'none',
+                  pointerEvents: 'none',
+                }}
+              >
+                {literatureLabel}
+              </div>
             </div>
           )
         })}
@@ -5117,12 +5360,18 @@ export default function DocumentView({
         >
           {[{ page: currentPage, src: imageDataUrl }, { page: nextSpreadPage, src: nextImageDataUrl }]
             .filter((item): item is { page: DocumentViewPage; src: string } => Boolean(item.page))
-            .map((item, index) => (
+            .map((item, index) => {
+              const physical = Number(item.page.page_num || 0)
+              const literature = getCitationPageNumber(item.page, physical) || physical
+              const imageLabel = physical > 0 ? `影像 第 ${physical} / ${pageCount} 页` : ''
+              const literatureLabel = literature > 0 ? `文献 第 ${literature} 页` : ''
+              return (
             <button
               key={item.page.id}
               type="button"
               onClick={() => setCurrentPageIndex((value) => clampPageIndex(value + (index === 0 ? -2 : 2), pageCount))}
               style={{
+                position: 'relative',
                 border: 'none',
                 borderRadius: 6,
                 padding: 0,
@@ -5138,12 +5387,50 @@ export default function DocumentView({
               title={index === 0 ? '点击左页向前翻页' : '点击右页向后翻页'}
             >
               {item.src ? (
-                <img src={item.src} alt={`第 ${item.page.page_num} 页`} style={{ maxWidth: '100%', maxHeight: readerSpreadPageHeight, objectFit: 'contain', display: 'block' }} />
+                <img src={item.src} alt={imageLabel || `第 ${item.page.page_num} 页`} style={{ maxWidth: '100%', maxHeight: readerSpreadPageHeight, objectFit: 'contain', display: 'block' }} />
               ) : (
                 <Spin />
               )}
+              {imageLabel ? (
+                <span
+                  title="PDF/扫描影像页序"
+                  style={{
+                    position: 'absolute',
+                    right: 14,
+                    top: 12,
+                    color: 'rgba(255,245,220,0.88)',
+                    fontSize: 12,
+                    fontVariantNumeric: 'tabular-nums',
+                    textShadow: '0 1px 3px rgba(0,0,0,0.75)',
+                    pointerEvents: 'none',
+                    userSelect: 'none',
+                  }}
+                >
+                  {imageLabel}
+                </span>
+              ) : null}
+              {literatureLabel ? (
+                <span
+                  title="书上印刷页码，与引用、TXT 导出一致"
+                  style={{
+                    position: 'absolute',
+                    left: 14,
+                    bottom: 12,
+                    color: 'rgba(255,245,220,0.88)',
+                    fontSize: 12,
+                    fontWeight: 600,
+                    fontVariantNumeric: 'tabular-nums',
+                    textShadow: '0 1px 3px rgba(0,0,0,0.75)',
+                    pointerEvents: 'none',
+                    userSelect: 'none',
+                  }}
+                >
+                  {literatureLabel}
+                </span>
+              ) : null}
             </button>
-          ))}
+              )
+            })}
         </div>
       </div>
     </div>
@@ -5240,7 +5527,13 @@ export default function DocumentView({
           <Segmented
             size="small"
             value={isEbookDocument ? 'read' : documentMode}
-            onChange={(value) => void switchDocumentMode(value as DocumentMode)}
+            onChange={(value) => {
+              const nextMode = value as DocumentMode
+              // Pin intention immediately so any in-flight restore cannot snap Segmented back.
+              intendedDocumentModeRef.current = nextMode
+              documentModeTouchedRef.current = true
+              void switchDocumentMode(nextMode)
+            }}
             options={isEbookDocument
               ? [{ value: 'read', label: '阅读模式' }]
               : [
@@ -5426,6 +5719,45 @@ export default function DocumentView({
               clearReaderTranslationRuntime()
             }}
             onAddSelectedTerm={openQuickGlossaryTermModal}
+            onLiteraturePagesCalibrated={async (calibratedPages) => {
+              // Apply mapping from main process immediately (no re-fetch race).
+              if (Array.isArray(calibratedPages) && calibratedPages.length > 0) {
+                const litById = new Map(
+                  calibratedPages.map((page) => [
+                    String(page.id),
+                    {
+                      literature_page_num: page.literature_page_num,
+                      literature_page_source: page.literature_page_source,
+                    },
+                  ]),
+                )
+                const litByPhysical = new Map(
+                  calibratedPages.map((page) => [
+                    Number(page.page_num || 0),
+                    {
+                      literature_page_num: page.literature_page_num,
+                      literature_page_source: page.literature_page_source,
+                    },
+                  ]),
+                )
+                setDoc((previous) => {
+                  if (!previous || previous.id !== documentId) return previous
+                  return {
+                    ...previous,
+                    pages: previous.pages.map((page) => {
+                      const lit = litById.get(String(page.id))
+                        || litByPhysical.get(Number(page.page_num || 0))
+                      if (!lit) return page
+                      return normalizeDocumentPage({ ...page, ...lit })
+                    }),
+                  }
+                })
+              }
+              // Also refresh payloads so later navigations keep the calibrated numbers.
+              pageRangeInFlightRef.current.clear()
+              pageRangeRequestRef.current += 1
+              await loadPagesAround(currentPageIndex, Math.max(8, Math.min(40, pageCount || 8)))
+            }}
             onReaderStateChange={(state) => {
               if (!readerStateReady) return
               if (temporaryNavigationRef.current) return
@@ -5639,25 +5971,72 @@ export default function DocumentView({
                 onPrevPage={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value - 1, pageCount)) }}
                 onNextPage={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCount)) }}
               />
-            ) : shouldShowBookPreview ? (
+            ) : pageImageLoading ? (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Spin tip="正在加载原图…" />
+              </div>
+            ) : shouldUseProofLayout ? (
+              <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }}>
+                <Empty
+                  image={<FileImageOutlined style={{ fontSize: 48, opacity: 0.28 }} />}
+                  description={
+                    <div style={{ maxWidth: 320 }}>
+                      <div style={{ color: 'var(--gs-text-primary)', fontWeight: 600, marginBottom: 6 }}>本页暂无原图</div>
+                      <div style={{ color: 'var(--gs-text-secondary)', fontSize: 13, lineHeight: 1.6 }}>
+                        校对左侧应显示扫描页图。当前没有可用页图
+                        {canAttemptPageImageRecovery ? '（可尝试补回 PDF 或重新生成）' : '（也没有关联 PDF 源文件）'}
+                        。右侧仍可对照 OCR 文本校对。
+                      </div>
+                    </div>
+                  }
+                >
+                  <Space wrap style={{ marginTop: 12, justifyContent: 'center' }}>
+                    {canAttemptPageImageRecovery ? (
+                      <Button
+                        type="primary"
+                        size="small"
+                        loading={restoringPdf}
+                        onClick={() => void handleRestorePdfManually()}
+                      >
+                        补回 / 选择 PDF
+                      </Button>
+                    ) : null}
+                    {isPdfSource && currentPage ? (
+                      <Button
+                        size="small"
+                        onClick={() => void forceRenderCurrentPageImageFromPdf(currentPage)}
+                      >
+                        从 PDF 生成页图
+                      </Button>
+                    ) : null}
+                    {hasCurrentPageReadableText || hasAnyOcrText ? (
+                      <Button size="small" onClick={() => void switchDocumentMode('read')}>
+                        改用阅读模式
+                      </Button>
+                    ) : null}
+                  </Space>
+                </Empty>
+              </div>
+            ) : shouldShowBookPreview && currentPage ? (
               <div style={{ height: '100%', padding: 24, background: '#1c1712', overflow: 'auto' }}>
                 <div
                   style={{
                     minHeight: '100%',
                     display: 'grid',
-                    gridTemplateColumns: nextSpreadPage ? 'minmax(0, 1fr) minmax(0, 1fr)' : 'minmax(0, 720px)',
+                    // Left pane is narrow — always single column, never dual-page reading chrome.
+                    gridTemplateColumns: 'minmax(0, 720px)',
                     justifyContent: 'center',
                     gap: 18,
                     alignItems: 'stretch',
                   }}
                 >
-                  {[currentPage, nextSpreadPage].filter((page): page is DocumentViewPage => Boolean(page)).map((page) => {
-                    const pageIndex = sortedPages.findIndex((item) => item.id === page.id)
+                  {(() => {
+                    const page = currentPage
+                    const pageIndex = currentPageIndex
                     const pageHitStartIndex = searchMatches.filter((match) => match.pageIndex < pageIndex).length
                     return (
                       <div
                         key={page.id}
-                        onClick={() => setCurrentPageIndex(clampPageIndex(pageIndex, pageCount))}
                         style={{
                           background: '#fffaf0',
                           color: '#24190f',
@@ -5668,17 +6047,16 @@ export default function DocumentView({
                           fontSize: 17,
                           lineHeight: 1.9,
                           whiteSpace: 'pre-wrap',
-                          minHeight: 620,
-                          cursor: 'pointer',
+                          minHeight: 420,
                         }}
                       >
                         <div style={{ color: '#8a6a3c', fontSize: 12, marginBottom: 18, textAlign: 'center' }}>
-                          第 {page.page_num} 页
+                          第 {page.page_num} 页 · 无页图文本预览
                         </div>
                         {renderBookText(getPageReadingText(page), effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex)}
                       </div>
                     )
-                  })}
+                  })()}
                 </div>
               </div>
             ) : (
@@ -5851,6 +6229,15 @@ export default function DocumentView({
                 translationSkipped={currentFacsimileTranslationSkipped}
                 translationOpen={facsimileTranslationOpen}
                 translationMode={translationMode}
+                documentId={doc?.id || ''}
+                documentTitle={doc?.title || ''}
+                documentType={doc?.doc_type || null}
+                pageNum={currentPage?.page_num ?? null}
+                literaturePageNum={
+                  Number((currentPage as { literature_page_num?: number | null } | null | undefined)?.literature_page_num || 0) > 0
+                    ? Number((currentPage as { literature_page_num?: number | null }).literature_page_num)
+                    : null
+                }
                 onTranslationOpenChange={setFacsimileTranslationOpen}
                 onTranslationModeChange={setTranslationMode}
                 onTranslateCurrentPage={(text) => {

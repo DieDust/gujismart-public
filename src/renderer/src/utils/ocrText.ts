@@ -631,6 +631,11 @@ export function getOriginalPageNumber(page: OcrTextPage | null | undefined): num
 }
 
 export function getCitationPageNumber(page: OcrTextPage | null | undefined, fallback?: number | null): number | null {
+  // Prefer continuity-resolved literature page (DB field) when present.
+  const literature = Number((page as { literature_page_num?: number | null } | null | undefined)?.literature_page_num || 0)
+  if (Number.isFinite(literature) && literature > 0) return Math.floor(literature)
+
+  // Then raw OCR label, but only as a hint — full continuity is applied at OCR finalize.
   const originalPageNum = getOriginalPageNumber(page)
   if (originalPageNum) return originalPageNum
   const fallbackPageNum = Number(fallback ?? page?.page_num ?? 0)

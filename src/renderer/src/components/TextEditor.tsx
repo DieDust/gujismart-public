@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Input, Popconfirm, Space, Tag } from 'antd'
-import { HolderOutlined, RedoOutlined, RollbackOutlined, SaveOutlined, UndoOutlined } from '@ant-design/icons'
+import { Button, Dropdown, Input, Modal, Popconfirm, Space, Tag, message } from 'antd'
+import type { MenuProps } from 'antd'
+import { DeleteOutlined, HolderOutlined, RedoOutlined, RollbackOutlined, SaveOutlined, UndoOutlined } from '@ant-design/icons'
 import { getOcrBlockText, getRawOcrBlockText, getTextFlowOcrBlocks } from '../utils/ocrText'
 import { renderOcrInlineHighlighted, renderOcrInlineText } from '../utils/ocrInlineRender'
 import type { PageUpdatePayload } from '@shared/types'
@@ -229,20 +230,24 @@ export default function TextEditor({
   const handleUndo = useCallback(() => {
     if (historyIndex <= 0) return
     const nextIndex = historyIndex - 1
+    const nextData = history[nextIndex].map((item) => ({ ...item }))
     setHistoryIndex(nextIndex)
-    setLayoutData(history[nextIndex].map((item) => ({ ...item })))
+    setLayoutData(nextData)
     setEditingIndex(-1)
     setLocalActiveBoxIndex(null)
-  }, [history, historyIndex])
+    saveToDb(nextData)
+  }, [history, historyIndex, saveToDb])
 
   const handleRedo = useCallback(() => {
     if (historyIndex >= history.length - 1) return
     const nextIndex = historyIndex + 1
+    const nextData = history[nextIndex].map((item) => ({ ...item }))
     setHistoryIndex(nextIndex)
-    setLayoutData(history[nextIndex].map((item) => ({ ...item })))
+    setLayoutData(nextData)
     setEditingIndex(-1)
     setLocalActiveBoxIndex(null)
-  }, [history, historyIndex])
+    saveToDb(nextData)
+  }, [history, historyIndex, saveToDb])
 
   const handleSaveRegion = (index: number) => {
     const nextData = [...layoutData]
@@ -254,6 +259,36 @@ export default function TextEditor({
     setEditValue('')
     saveToDb(normalizedData)
   }
+
+  const handleDeleteBlock = useCallback((index: number) => {
+    if (index < 0 || index >= layoutData.length) {
+      message.warning('未找到要删除的文本块')
+      return
+    }
+    const target = layoutData[index]
+    const preview = (getRawOcrBlockText(target) || getOcrBlockText(target) || '').replace(/\s+/g, ' ').trim().slice(0, 48)
+    Modal.confirm({
+      title: '删除此文本块？',
+      content: preview
+        ? `将从本页校对文本与数据库中移除该块（${preview}${preview.length >= 48 ? '…' : ''}）。可用撤销恢复本次删除。`
+        : '将从本页校对文本与数据库中移除该块。可用撤销恢复本次删除。',
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        const nextData = normalizeManualReadingOrder(layoutData.filter((_, itemIndex) => itemIndex !== index))
+        setLayoutData(nextData)
+        pushHistory(nextData)
+        setEditingIndex(-1)
+        setEditValue('')
+        const nextActive = nextData.length === 0 ? null : Math.min(index, nextData.length - 1)
+        setLocalActiveBoxIndex(nextActive)
+        if (nextActive !== null) onLineFocus?.(nextActive, nextData[nextActive])
+        saveToDb(nextData)
+        message.success('已删除文本块并写入数据库')
+      },
+    })
+  }, [layoutData, onLineFocus, pushHistory, saveToDb])
 
   const handleReset = () => {
     const nextData = normalizeManualReadingOrder(originalLayout.map((box) => ({ ...box })))
@@ -425,9 +460,31 @@ export default function TextEditor({
               const shouldShift = shouldShiftForDrag(index, draggingIndex, dragInsertIndex, layoutData.length)
               const dragShift = (dragPreview?.height || 0) + 6
 
+              const blockMenuItems: MenuProps['items'] = [
+                {
+                  key: 'edit',
+                  label: '编辑文字',
+                  disabled: isEditingThis,
+                  onClick: () => {
+                    setEditingIndex(index)
+                    setEditValue(content)
+                    setLocalActiveBoxIndex(index)
+                    onLineFocus?.(index, box)
+                  },
+                },
+                { type: 'divider' },
+                {
+                  key: 'delete',
+                  icon: <DeleteOutlined />,
+                  label: '删除此文本块',
+                  danger: true,
+                  onClick: () => handleDeleteBlock(index),
+                },
+              ]
+
               return (
+                <Dropdown key={index} trigger={['contextMenu']} menu={{ items: blockMenuItems }}>
                 <div
-                  key={index}
                   ref={(element) => {
                     lineRefs.current[index] = element
                   }}
@@ -440,6 +497,10 @@ export default function TextEditor({
                       setEditingIndex(index)
                       setEditValue(content)
                     }
+                  }}
+                  onContextMenu={() => {
+                    setLocalActiveBoxIndex(index)
+                    onLineFocus?.(index, box)
                   }}
                   style={{
                     position: 'relative',
@@ -541,7 +602,20 @@ export default function TextEditor({
                             保存
                           </Button>
                         </Space>
-                      ) : null}
+                      ) : (
+                        <Button
+                          size="small"
+                          type="text"
+                          danger
+                          icon={<DeleteOutlined />}
+                          title="删除此文本块"
+                          aria-label="删除此文本块"
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            handleDeleteBlock(index)
+                          }}
+                        />
+                      )}
                     </div>
 
                     {isEditingThis ? (
@@ -557,6 +631,7 @@ export default function TextEditor({
                     )}
                   </div>
                 </div>
+                </Dropdown>
               )
             })}
           </div>

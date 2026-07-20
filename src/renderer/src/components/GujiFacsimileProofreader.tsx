@@ -1,9 +1,13 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode, type WheelEvent } from 'react'
-import { Button, Empty, Input, InputNumber, Popover, Segmented, Slider, Space, Switch, Tag } from 'antd'
+import { Button, Dropdown, Empty, Input, InputNumber, Modal, Popover, Segmented, Slider, Space, Switch, Tag, message } from 'antd'
+import type { MenuProps } from 'antd'
 import {
   CheckOutlined,
   ColumnWidthOutlined,
+  CopyOutlined,
+  DeleteOutlined,
   EditOutlined,
+  FormOutlined,
   MinusOutlined,
   PlusOutlined,
   RotateRightOutlined,
@@ -12,6 +16,8 @@ import {
   SettingOutlined,
   UndoOutlined,
 } from '@ant-design/icons'
+import { getErrorMessage } from '@shared/errors'
+import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import OpenCC from 'opencc-js'
 import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
 import { renderOcrInlineText } from '../utils/ocrInlineRender'
@@ -145,6 +151,12 @@ interface GujiFacsimileProofreaderProps {
   translationSkipped?: boolean
   translationOpen?: boolean
   translationMode?: TranslationMode
+  /** Citation context for "复制直接引用" (same contract as reading mode). */
+  documentId?: string
+  documentTitle?: string
+  documentType?: string | null
+  pageNum?: number | null
+  literaturePageNum?: number | null
   onTranslationOpenChange?: (open: boolean) => void
   onTranslationModeChange?: (mode: TranslationMode) => void
   onTranslateCurrentPage?: (text: string) => void
@@ -152,6 +164,12 @@ interface GujiFacsimileProofreaderProps {
   onSelectBox?: (index: number) => void
   onSave: (pageId: string, data: PageUpdatePayload) => void
   onTextSelectionChange?: (text: string) => void
+}
+
+type FacsimileTextSelection = {
+  text: string
+  x: number
+  y: number
 }
 
 function isUsableTranslationUnit(unit: TranslationUnitV1): boolean {
@@ -1583,7 +1601,9 @@ function clampZoom(value: number): number {
 }
 
 function shouldIgnoreCanvasDrag(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement && !!target.closest('button,input,textarea,.ant-slider,.ant-switch,[data-guji-block-index]')
+  return target instanceof HTMLElement && !!target.closest(
+    'button,input,textarea,.ant-slider,.ant-switch,[data-guji-block-index],[data-facsimile-translation-overlay],.reader-selection-toolbar',
+  )
 }
 
 function isGujiVerticalOcrResult(ocrResult: unknown): boolean {
@@ -1720,6 +1740,11 @@ export default function GujiFacsimileProofreader({
   translationSkipped = false,
   translationOpen: controlledTranslationOpen,
   translationMode = 'balanced',
+  documentId = '',
+  documentTitle = '',
+  documentType = null,
+  pageNum = null,
+  literaturePageNum = null,
   onTranslationOpenChange,
   onTranslationModeChange,
   onTranslateCurrentPage,
@@ -1758,6 +1783,8 @@ export default function GujiFacsimileProofreader({
   const [isPanning, setIsPanning] = useState(false)
   const [fontReadyVersion, setFontReadyVersion] = useState(0)
   const [pageImageNaturalSize, setPageImageNaturalSize] = useState<{ width: number; height: number } | null>(null)
+  const [textSelection, setTextSelection] = useState<FacsimileTextSelection | null>(null)
+  const [quoteCopying, setQuoteCopying] = useState(false)
   const layoutProfile = useMemo(() => getFacsimileLayoutProfile(ocrResult), [ocrResult])
   const effectivePreferVerticalLayout = useMemo(
     () => preferVerticalLayout || isGujiVerticalOcrResult(ocrResult),
@@ -2153,6 +2180,44 @@ export default function GujiFacsimileProofreader({
     commitBlocks(nextBlocks, editingIndex)
   }, [blocks, commitBlocks, editValue, editingIndex])
 
+  const handleDeleteBlock = useCallback((sourceIndex: number) => {
+    const target = blocks.find((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
+    if (!target) {
+      message.warning('未找到要删除的文本块')
+      return
+    }
+    const preview = getBlockText(target).replace(/\s+/g, ' ').trim().slice(0, 48)
+    Modal.confirm({
+      title: '删除此文本块？',
+      content: preview
+        ? `将从本页版式与数据库中移除该块（${preview}${preview.length >= 48 ? '…' : ''}）。可用撤销恢复本次删除。`
+        : '将从本页版式与数据库中移除该块。可用撤销恢复本次删除。',
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        const nextBlocks = blocks
+          .filter((block, index) => getBlockSourceIndex(block, index) !== sourceIndex)
+          .map((block, index) => ({
+            ...block,
+            reading_order: index,
+            __sourceIndex: index,
+          }))
+        if (nextBlocks.length === blocks.length) return
+        const reindexedActive = nextBlocks.length === 0
+          ? -1
+          : Math.min(sourceIndex, nextBlocks.length - 1)
+        commitBlocks(nextBlocks, reindexedActive >= 0 ? reindexedActive : undefined)
+        if (editingIndex === sourceIndex) {
+          setEditingIndex(-1)
+          setEditValue('')
+        }
+        if (reindexedActive < 0) onSelectBox?.(-1)
+        message.success('已删除文本块并写入数据库')
+      },
+    })
+  }, [blocks, commitBlocks, editingIndex, onSelectBox])
+
   const handleToggleBlockOrientation = useCallback((sourceIndex: number) => {
     const pageVerticalModeForToggle = effectivePreferVerticalLayout || isVerticalPage(blocks)
     const nextBlocks = blocks.map((block, index) => {
@@ -2180,10 +2245,97 @@ export default function GujiFacsimileProofreader({
     }
   }, [editingBlock, editingIndex])
 
+  const citationPageNum = useMemo(() => {
+    const literature = Number(literaturePageNum || 0)
+    if (Number.isFinite(literature) && literature > 0) return Math.floor(literature)
+    const physical = Number(pageNum || 0)
+    return Number.isFinite(physical) && physical > 0 ? Math.floor(physical) : null
+  }, [literaturePageNum, pageNum])
+
+  const resolveCitationText = useCallback(async (): Promise<string> => {
+    const fallback = `${documentTitle || '未命名文献'}${citationPageNum ? `，第 ${citationPageNum} 页` : ''}`
+    const docId = String(documentId || '').trim()
+    if (!docId) return fallback
+    try {
+      return await resolveDocumentCitation(docId, {
+        docType: documentType,
+        pageNum: citationPageNum,
+      }) || fallback
+    } catch (error) {
+      console.warn('Failed to generate facsimile citation from active style, falling back to simple citation.', error)
+      return fallback
+    }
+  }, [citationPageNum, documentId, documentTitle, documentType])
+
+  const copyPlainSelection = useCallback(async (text: string) => {
+    const selected = String(text || '').trim()
+    if (!selected) {
+      message.info('请先选择需要复制的文本')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(selected)
+      message.success('已复制原文')
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(getErrorMessage(error, '复制失败'))
+    }
+  }, [])
+
+  const copyDirectQuote = useCallback(async (text: string) => {
+    const selected = String(text || '').replace(/\s+/g, ' ').trim()
+    if (!selected) {
+      message.info('请先选择需要引用的文本')
+      return
+    }
+    setQuoteCopying(true)
+    try {
+      const citationText = await resolveCitationText()
+      const quote = buildDirectQuoteCitationText(selected, citationText)
+      await navigator.clipboard.writeText(quote)
+      message.success('已复制直接引用')
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(getErrorMessage(error, '复制直接引用失败'))
+    } finally {
+      setQuoteCopying(false)
+    }
+  }, [resolveCitationText])
+
   const captureSelection = useCallback(() => {
-    const selected = window.getSelection()?.toString().trim() || ''
-    if (selected) onTextSelectionChange?.(selected)
+    const selection = window.getSelection()
+    const selected = selection?.toString().replace(/\u00a0/g, ' ').trim() || ''
+    if (!selected || !selection?.rangeCount) {
+      setTextSelection(null)
+      onTextSelectionChange?.('')
+      return
+    }
+    const range = selection.getRangeAt(0)
+    const root = rootRef.current
+    const anchorNode = range.commonAncestorContainer
+    const anchorElement = anchorNode instanceof Element ? anchorNode : anchorNode.parentElement
+    if (root && anchorElement && !root.contains(anchorElement)) {
+      setTextSelection(null)
+      return
+    }
+    const rect = range.getBoundingClientRect()
+    if (!rect || (rect.width === 0 && rect.height === 0)) {
+      setTextSelection(null)
+      onTextSelectionChange?.(selected)
+      return
+    }
+    setTextSelection({
+      text: selected,
+      x: rect.left + rect.width / 2,
+      y: Math.max(12, rect.top - 42),
+    })
+    onTextSelectionChange?.(selected)
   }, [onTextSelectionChange])
+
+  // Clear floating selection UI when page changes.
+  useEffect(() => {
+    setTextSelection(null)
+  }, [pageId])
 
   const applyPageZoomDom = useCallback((zoom: number) => {
     const frame = pageFrameRef.current
@@ -2314,6 +2466,29 @@ export default function GujiFacsimileProofreader({
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 8, position: 'relative' }}>
+      {textSelection ? (
+        <div
+          className="reader-selection-toolbar"
+          style={{ left: textSelection.x, top: textSelection.y }}
+          onMouseDown={(event) => event.preventDefault()}
+        >
+          <Button
+            className="reader-selection-icon-button"
+            size="small"
+            icon={<CopyOutlined />}
+            title="复制原文"
+            onClick={() => void copyPlainSelection(textSelection.text)}
+          />
+          <Button
+            className="reader-selection-icon-button"
+            size="small"
+            icon={<FormOutlined />}
+            title="复制直接引用（Ctrl+D）"
+            loading={quoteCopying}
+            onClick={() => void copyDirectQuote(textSelection.text)}
+          />
+        </div>
+      ) : null}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
         <Space size={8} wrap>
           <Segmented size="small" value={displayScript} onChange={(value) => setDisplayScript(value as ProofDisplayScript)} options={[{ value: 'original', label: '原文' }, { value: 'simplified', label: '简' }, { value: 'traditional', label: '繁' }]} />
@@ -2507,7 +2682,7 @@ export default function GujiFacsimileProofreader({
                       alignItems: 'center',
                       gap: 4,
                       zIndex: 90,
-                      maxWidth: 'min(188px, calc(100% - 8px))',
+                      maxWidth: 'min(320px, calc(100% - 8px))',
                       padding: '2px 4px',
                       borderRadius: 6,
                       background: 'rgba(18, 18, 18, 0.92)',
@@ -2518,6 +2693,7 @@ export default function GujiFacsimileProofreader({
                     }}
                     onClick={(event) => event.stopPropagation()}
                     onDoubleClick={(event) => event.stopPropagation()}
+                    onMouseDown={(event) => event.stopPropagation()}
                   >
                     {!isEditing && !shouldRenderTable && !isImage ? (
                       <Button
@@ -2537,14 +2713,93 @@ export default function GujiFacsimileProofreader({
                     ) : (
                       <Tag color={orientation === 'vertical' ? 'purple' : 'geekblue'} style={{ marginInlineEnd: 0, flexShrink: 0 }}>{orientation === 'vertical' ? '竖排' : '横排'}</Tag>
                     )}
+                    {!isEditing && originalText.trim() ? (
+                      <Button
+                        size="small"
+                        icon={<CopyOutlined />}
+                        title="复制本块原文"
+                        aria-label="复制本块原文"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          void copyPlainSelection(originalText)
+                        }}
+                      />
+                    ) : null}
+                    {!isEditing && originalText.trim() ? (
+                      <Button
+                        size="small"
+                        icon={<FormOutlined />}
+                        title="复制直接引用（Ctrl+D）"
+                        aria-label="复制直接引用"
+                        loading={quoteCopying}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          void copyDirectQuote(originalText)
+                        }}
+                      />
+                    ) : null}
                     {!isEditing ? <Button size="small" icon={<EditOutlined />} title="编辑文字" aria-label="编辑文字" onClick={(event) => { event.stopPropagation(); setEditingIndex(sourceIndex); setEditValue(originalText); onSelectBox?.(sourceIndex) }} /> : null}
+                    {!isEditing ? (
+                      <Button
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        title="删除此文本块"
+                        aria-label="删除此文本块"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          handleDeleteBlock(sourceIndex)
+                        }}
+                      />
+                    ) : null}
                   </div>
                 ) : null}
+              <Dropdown
+                trigger={['contextMenu']}
+                menu={{
+                  items: [
+                    {
+                      key: 'edit',
+                      icon: <EditOutlined />,
+                      label: '编辑文字',
+                      disabled: isEditing || isImage,
+                      onClick: () => {
+                        setEditingIndex(sourceIndex)
+                        setEditValue(originalText)
+                        onSelectBox?.(sourceIndex)
+                      },
+                    },
+                    {
+                      key: 'copy',
+                      icon: <CopyOutlined />,
+                      label: '复制本块原文',
+                      disabled: !originalText.trim(),
+                      onClick: () => { void copyPlainSelection(originalText) },
+                    },
+                    {
+                      key: 'quote',
+                      icon: <FormOutlined />,
+                      label: '复制直接引用',
+                      disabled: !originalText.trim(),
+                      onClick: () => { void copyDirectQuote(originalText) },
+                    },
+                    { type: 'divider' },
+                    {
+                      key: 'delete',
+                      icon: <DeleteOutlined />,
+                      label: '删除此文本块',
+                      danger: true,
+                      onClick: () => handleDeleteBlock(sourceIndex),
+                    },
+                  ] satisfies MenuProps['items'],
+                }}
+              >
               <div
                 data-guji-block-index={sourceIndex}
                 onClick={(event) => { event.stopPropagation(); onSelectBox?.(sourceIndex) }}
                 onDoubleClick={(event) => { event.stopPropagation(); setEditingIndex(sourceIndex); setEditValue(originalText); onSelectBox?.(sourceIndex) }}
-                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: 'pointer', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4 }}
+                onContextMenu={() => onSelectBox?.(sourceIndex)}
+                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: 'text', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: 'text' }}
               >
                 {false ? (
                   <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 4, background: 'rgba(255,253,247,0.98)', borderRadius: 3 }}>
@@ -2569,6 +2824,7 @@ export default function GujiFacsimileProofreader({
                   <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 14, pointerEvents: 'none', background: 'linear-gradient(to bottom, rgba(255,253,247,0), rgba(255,253,247,0.92))' }} />
                 ) : null}
               </div>
+              </Dropdown>
               </Fragment>
             )
           })}
@@ -2614,10 +2870,11 @@ export default function GujiFacsimileProofreader({
                       ? 'rgba(255, 248, 204, 0.14)'
                       : 'transparent',
                   color: labelColor,
-                  cursor: 'pointer',
+                  cursor: 'text',
                   overflow: 'hidden',
                   padding,
                   zIndex: isActive ? 18 : keywordMatch ? 16 : 12,
+                  userSelect: 'text',
                 }}
               >
                 <div
@@ -2635,6 +2892,7 @@ export default function GujiFacsimileProofreader({
                     letterSpacing: 0,
                     textAlign: isTitleLabel(overlay.label) ? 'center' : 'start',
                     textIndent: overlay.orientation === 'horizontal' && isBodyTextLabel(overlay.label) ? '2em' : undefined,
+                    userSelect: 'text',
                   }}
                 >
                   {renderFormattedText(fittedLayout.text, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}

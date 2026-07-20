@@ -14,6 +14,7 @@ import { hydratePagePayloadRows } from './page-payload-store'
 import { attachCanonicalPageContent } from './canonical-content'
 import { writeAtomicExport } from './atomic-export-writer'
 import { persistExportArtifact, persistExportSnapshot } from './export-snapshots'
+import { recomputeLiteraturePageMap } from './literature-page-map'
 import type { Document, DocumentExportFormat, DocumentExportOptions, DocumentPage } from '../shared/types'
 
 marked.setOptions({
@@ -24,6 +25,14 @@ marked.setOptions({
 const MAX_VISUAL_PDF_PAGES = 160
 
 interface ExportPage extends DocumentPage {}
+
+/** Prefer continuity-resolved literature page for human-facing export labels. */
+function exportDisplayPageNum(page: Pick<ExportPage, 'page_num' | 'literature_page_num'>): number {
+  const literature = Number(page.literature_page_num || 0)
+  if (Number.isFinite(literature) && literature > 0) return Math.floor(literature)
+  const physical = Number(page.page_num || 0)
+  return Number.isFinite(physical) && physical > 0 ? Math.floor(physical) : 0
+}
 
 interface ExportPageOcrVersion {
   page_id: string
@@ -1015,7 +1024,7 @@ function buildFullText(pages: ExportPage[]): string {
   return pages
     .map((page) => {
       const text = getPageText(page)
-      return text ? `\n\n=== 第 ${page.page_num} 页 ===\n\n${text}` : ''
+      return text ? `\n\n=== 第 ${exportDisplayPageNum(page)} 页 ===\n\n${text}` : ''
     })
     .join('')
     .trim()
@@ -1132,7 +1141,7 @@ function getReadingExportHtml(title: string, pages: ExportPage[], metadata: Json
   const pageHtml = pages.map((page) => {
     const content = getReadingPageContentHtml(page, options)
     return `<section class="reader-page">
-      <div class="reader-page-marker">第 ${page.page_num} 页</div>
+      <div class="reader-page-marker">第 ${exportDisplayPageNum(page)} 页</div>
       ${content}
     </section>`
   }).join('\n')
@@ -1239,7 +1248,7 @@ function getGujiExportHtml(title: string, pages: ExportPage[], metadata: JsonRec
     }).join('\n')
 
     return `<section class="guji-page">
-      <div class="guji-page-header"><span>第 ${page.page_num} 页</span><span class="status">${proofStatus}</span></div>
+      <div class="guji-page-header"><span>第 ${exportDisplayPageNum(page)} 页</span><span class="status">${proofStatus}</span></div>
       <div class="guji-canvas" style="aspect-ratio:${bounds.width} / ${bounds.height};">
         ${imageUrl ? `<img class="guji-image" src="${imageUrl}" alt="page-${page.page_num}" />` : ''}
         <div class="guji-overlay">${blocksHtml}</div>
@@ -2533,6 +2542,15 @@ async function renderExportDocument(
 ) {
   const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [docId])
   if (!doc) throw new Error('文献不存在')
+
+  // Ensure literature (printed) page labels are materialised before any export.
+  // Older OCR'd books may still have NULL literature_page_num; without this step
+  // TXT/MD/HTML markers fall back to physical 1/2/3 ordering.
+  try {
+    recomputeLiteraturePageMap(docId)
+  } catch (error) {
+    console.warn('[Export] literature page map recompute failed', docId, error)
+  }
 
   const pages = attachCanonicalPageContent(withActiveOcrVersions(
     docId,

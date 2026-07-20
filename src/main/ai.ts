@@ -243,9 +243,23 @@ function getMetadataObject(doc: { metadata?: string | null }): JsonRecord {
 function getPageTexts(docId: string): Array<{ pageNum: number; text: string }> {
   const pages: Array<{ pageNum: number; text: string }> = []
   let cursor: string | null = null
+  // Map physical page_num -> literature_page_num for AI citations.
+  const literatureByPhysical = new Map(
+    queryAll<{ page_num: number; literature_page_num?: number | null }>(
+      'SELECT page_num, literature_page_num FROM pages WHERE doc_id = ?',
+      [docId],
+    ).map((row) => [Number(row.page_num || 0), Number(row.literature_page_num || 0)]),
+  )
   do {
     const page = listCanonicalPageContents(docId, { limit: 200, cursor })
-    pages.push(...page.items.map((item) => ({ pageNum: item.pageNum, text: item.text })))
+    pages.push(...page.items.map((item) => {
+      const physical = Number(item.pageNum || 0)
+      const literature = literatureByPhysical.get(physical) || 0
+      return {
+        pageNum: literature > 0 ? literature : physical,
+        text: item.text,
+      }
+    }))
     cursor = page.nextCursor
   } while (cursor)
   return pages

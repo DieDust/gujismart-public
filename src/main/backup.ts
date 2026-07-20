@@ -53,6 +53,7 @@ const PROTECTED_BACKUP_SETTING_KEYS = [
   'llm_api_key',
   'paddleocr_api_key',
   'vision_ocr_api_key',
+  'embedding_api_key',
 ] as const
 
 function redactProfileCredentials(value: string): { value: string; changed: boolean } {

@@ -6,6 +6,7 @@ export type ShortcutAction =
   | 'search'
   | 'selectAll'
   | 'invertSelection'
+  | 'copyDirectQuote'
 
 export type ShortcutMap = Record<ShortcutAction, string>
 
@@ -19,6 +20,7 @@ export const DEFAULT_SHORTCUTS: ShortcutMap = {
   search: 'Ctrl+F',
   selectAll: 'Ctrl+A',
   invertSelection: 'Ctrl+I',
+  copyDirectQuote: 'Ctrl+D',
 }
 
 export const SHORTCUT_SETTING_KEYS: Record<ShortcutAction, string> = {
@@ -29,6 +31,7 @@ export const SHORTCUT_SETTING_KEYS: Record<ShortcutAction, string> = {
   search: 'shortcut_search',
   selectAll: 'shortcut_select_all',
   invertSelection: 'shortcut_invert_selection',
+  copyDirectQuote: 'shortcut_copy_direct_quote',
 }
 
 const KEY_ALIASES: Record<string, string> = {

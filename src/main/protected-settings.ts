@@ -4,6 +4,7 @@ export const PROTECTED_SETTING_KEYS = [
   'llm_api_key',
   'paddleocr_api_key',
   'vision_ocr_api_key',
+  'embedding_api_key',
 ] as const
 
 export type ProtectedSettingKey = (typeof PROTECTED_SETTING_KEYS)[number]

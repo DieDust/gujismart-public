@@ -1,6 +1,6 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { memo } from 'react'
-import { Button, Empty, Input, Modal, Pagination, Popover, Segmented, Select, Slider, Space, Spin, Switch, Typography, message } from 'antd'
+import { Button, Empty, Input, InputNumber, Modal, Pagination, Popover, Segmented, Select, Slider, Space, Spin, Switch, Typography, message } from 'antd'
 import type { InputRef } from 'antd/es/input'
 import {
   BarsOutlined,
@@ -202,6 +202,13 @@ interface SourcePageReaderProps {
   onRetranslateTranslationUnit?: (payload: ReaderTranslationPayload, unitId: string) => Promise<void> | void
   onTranslationGlossaryProjectChange?: (projectId: string) => void
   onAddSelectedTerm?: () => void
+  /**
+   * After user calibrates literature pages from this physical sheet forward.
+   * Receives the full mapping written by main so the parent can update state immediately.
+   */
+  onLiteraturePagesCalibrated?: (
+    pages: Array<{ id: string; page_num: number; literature_page_num: number; literature_page_source: string }>,
+  ) => void | Promise<void>
   onReaderStateChange?: (state: {
     location_key: string
     progress: number
@@ -1540,6 +1547,40 @@ function getReaderCitationPageNum(page: ReaderSourcePage | null | undefined, fal
   return getCitationPageNumber(page, fallback ?? page?.page_num ?? null)
 }
 
+/**
+ * Display label for bottom-left「文献」only.
+ * Prefer stored literature_page_num (calibrated / recomputed). Do NOT fall back to
+ * OCR-detected footer numbers — those often differ from physical sheets (front matter)
+ * and made calibration look like it "changed to the wrong number".
+ */
+function getReaderLiteraturePageNum(page: ReaderSourcePage | null | undefined, pageIndex = 0): number {
+  const stored = Number((page as { literature_page_num?: number | null } | null | undefined)?.literature_page_num || 0)
+  if (Number.isFinite(stored) && stored > 0) return Math.floor(stored)
+  const physical = Number(page?.page_num || pageIndex + 1)
+  return Number.isFinite(physical) && physical > 0 ? Math.floor(physical) : pageIndex + 1
+}
+
+function getReaderPhysicalPageNum(page: ReaderSourcePage | null | undefined, pageIndex = 0): number {
+  const physical = Number(page?.page_num || pageIndex + 1)
+  return Number.isFinite(physical) && physical > 0 ? Math.floor(physical) : pageIndex + 1
+}
+
+/** Top-right: PDF / scan sheet index only. */
+function formatReaderImagePageLabel(page: ReaderSourcePage | null | undefined, pageIndex: number, pageCount: number): string {
+  const isEbookVirtual = String(parseMaybeRecord(page?.ocr_result).source_type || '') === 'ebook_virtual_page'
+  if (isEbookVirtual) return `阅读页 ${pageIndex + 1}/${pageCount}`
+  const physical = getReaderPhysicalPageNum(page, pageIndex)
+  return `影像 第 ${physical} / ${pageCount} 页`
+}
+
+/** Bottom-left: printed literature page (same as citation / TXT export). */
+function formatReaderLiteraturePageLabel(page: ReaderSourcePage | null | undefined, pageIndex: number): string {
+  const isEbookVirtual = String(parseMaybeRecord(page?.ocr_result).source_type || '') === 'ebook_virtual_page'
+  if (isEbookVirtual) return `阅读页 ${pageIndex + 1}`
+  const literature = getReaderLiteraturePageNum(page, pageIndex)
+  return `文献 第 ${literature} 页`
+}
+
 function buildReaderCitationText(title: string | null | undefined, pageNum: number | null): string {
   return `${title || '未命名文献'}${pageNum ? `，第 ${pageNum} 页` : ''}`
 }
@@ -2372,6 +2413,7 @@ function SourcePageSpread({
   noteHighlightsByElement,
   onSelectedTextChange,
   onReaderSelection,
+  onCalibrateLiteraturePage,
   displayScript = 'original',
   searchActiveOnly = false,
 }: {
@@ -2394,6 +2436,7 @@ function SourcePageSpread({
   noteHighlightsByElement: Map<string, ReaderNoteHighlight[]>
   onSelectedTextChange?: (text: string) => void
   onReaderSelection?: (pageIndex: number, elementIndex: number, event?: SelectionMouseEvent) => void
+  onCalibrateLiteraturePage?: (page: ReaderSourcePage, pageIndex: number) => void
   displayScript?: ReaderDisplayScript
   searchActiveOnly?: boolean
 }) {
@@ -2449,7 +2492,8 @@ function SourcePageSpread({
           const footnoteElementGroups = elementGroups.filter((item) => isFootnoteElement(item.element))
           const isAiLoading = !!(aiLayoutEnabled && pageId && aiLayoutLoading?.[pageId] && !aiText)
           const aiError = aiLayoutEnabled && pageId ? String(aiLayoutErrors?.[pageId] || '') : ''
-          const pageTitle = getReaderPageHeaderTitle(page, pageIndex)
+          const imagePageLabel = formatReaderImagePageLabel(page, pageIndex, pageCount)
+          const literaturePageLabel = formatReaderLiteraturePageLabel(page, pageIndex)
           return (
             <article
               key={page?.id || pageIndex}
@@ -2458,6 +2502,8 @@ function SourcePageSpread({
               data-reader-page-viewport="true"
               data-reader-page-index={pageIndex}
               data-reader-leaf-index={pageIndex}
+              data-reader-physical-page={getReaderPhysicalPageNum(page, pageIndex)}
+              data-reader-literature-page={getReaderLiteraturePageNum(page, pageIndex)}
               onMouseUp={(event) => {
                 const text = window.getSelection()?.toString()?.trim() || ''
                 onSelectedTextChange?.(text)
@@ -2469,9 +2515,22 @@ function SourcePageSpread({
                 ? { width: pageMetrics.pageWidth, height: pageMetrics.pageHeight, margin: '0 auto', background: themeStyle.page, color: themeStyle.text, border: `1px solid ${themeStyle.border}`, borderRadius: 6, boxShadow: '0 16px 40px rgba(0,0,0,0.35)', position: 'relative', overflow: 'hidden' }
                 : { minHeight: 'calc(100vh - 220px)', background: themeStyle.page, color: themeStyle.text, border: `1px solid ${themeStyle.border}`, borderRadius: 6, boxShadow: '0 16px 40px rgba(0,0,0,0.35)', position: 'relative', overflow: 'visible' }}
             >
-              <div style={{ position: 'absolute', top: 14, left: 24, right: 24, display: 'flex', justifyContent: 'space-between', color: themeStyle.muted, fontSize: 12, gap: 12 }}>
-                <span style={{ maxWidth: '68%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{transformReaderDisplayText(pageTitle, displayScript)}</span>
-                <span>{String(parseMaybeRecord(page?.ocr_result).source_type || '') === 'ebook_virtual_page' ? `阅读页 ${pageIndex + 1}/${pageCount}` : `第 ${page?.page_num || pageIndex + 1}/${pageCount} 页`}</span>
+              {/* Top-right only: physical / image sheet index. No page numbers on top-left. */}
+              <div
+                title="PDF/扫描影像页序，用于翻页定位"
+                style={{
+                  position: 'absolute',
+                  top: 14,
+                  right: 24,
+                  color: themeStyle.muted,
+                  fontSize: 12,
+                  fontVariantNumeric: 'tabular-nums',
+                  pointerEvents: 'none',
+                  userSelect: 'none',
+                  zIndex: 2,
+                }}
+              >
+                {imagePageLabel}
               </div>
               {aiLayoutEnabled && (isAiLoading || aiError) ? (
                 <div style={{ position: 'absolute', top: 34, left: 42, right: 42, zIndex: 4, display: 'flex', justifyContent: 'center', pointerEvents: 'none' }}>
@@ -2490,13 +2549,44 @@ function SourcePageSpread({
                 </div>
               ) : null}
               <div data-reader-content="true" style={adaptivePages
-                ? { height: pageMetrics.textHeight, margin: '48px 42px 24px', fontFamily: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif", fontSize, lineHeight, whiteSpace: 'normal', overflowWrap: 'break-word', textAlign: 'justify', overflow: 'hidden' }
-                : { margin: '58px 48px 42px', fontFamily: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif", fontSize, lineHeight, whiteSpace: 'normal', overflowWrap: 'break-word', textAlign: 'justify', overflow: 'visible' }}>
+                ? { height: pageMetrics.textHeight, margin: '48px 42px 36px', fontFamily: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif", fontSize, lineHeight, whiteSpace: 'normal', overflowWrap: 'break-word', textAlign: 'justify', overflow: 'hidden' }
+                : { margin: '58px 48px 48px', fontFamily: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif", fontSize, lineHeight, whiteSpace: 'normal', overflowWrap: 'break-word', textAlign: 'justify', overflow: 'visible' }}>
                 {bodyElementGroups.length
                   ? bodyElementGroups.map((group) => renderReaderElementGroup(group, theme, themeStyle, searchKeyword, effectiveHighlightColor, pendingTocTarget, page, pageIndex, onReaderSelection, searchKeyword.trim() || aiText ? [] : noteHighlightsByElement.get(`${pageIndex}:${group.index}`) || [], displayScript, searchActiveOnly))
                   : <Text style={{ color: themeStyle.muted }}>本页暂无可阅读文本</Text>}
                 {renderFootnoteGroup(footnoteElementGroups, theme, pendingTocTarget, searchKeyword, effectiveHighlightColor, displayScript, searchActiveOnly, noteHighlightsByElement, pageIndex)}
               </div>
+              {/* Bottom-left: printed literature page — click to calibrate from this sheet forward. */}
+              <button
+                type="button"
+                data-reader-page-footer="true"
+                aria-label={`${literaturePageLabel}，点击校准`}
+                title="点击校准文献页码：本页起向后按 +1 自动顺延（与引用/TXT 导出一致）"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onCalibrateLiteraturePage?.(page, pageIndex)
+                }}
+                style={{
+                  position: 'absolute',
+                  left: adaptivePages ? 18 : 26,
+                  bottom: adaptivePages ? 10 : 14,
+                  margin: 0,
+                  padding: '4px 8px',
+                  border: `1px solid ${theme === 'dark' ? 'rgba(216,211,200,0.28)' : 'rgba(94,68,42,0.28)'}`,
+                  borderRadius: 6,
+                  background: theme === 'dark' ? 'rgba(20,18,16,0.55)' : 'rgba(255,250,240,0.88)',
+                  color: themeStyle.muted,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  fontVariantNumeric: 'tabular-nums',
+                  letterSpacing: '0.02em',
+                  cursor: onCalibrateLiteraturePage ? 'pointer' : 'default',
+                  zIndex: 3,
+                  boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+                }}
+              >
+                {literaturePageLabel}
+              </button>
             </article>
           )
         })}
@@ -2526,6 +2616,7 @@ function areSourcePageSpreadPropsEqual(
     || previous.noteHighlightsByElement !== next.noteHighlightsByElement
     || previous.displayScript !== next.displayScript
     || previous.searchActiveOnly !== next.searchActiveOnly
+    || previous.onCalibrateLiteraturePage !== next.onCalibrateLiteraturePage
     || previous.pageIndices.length !== next.pageIndices.length
     || previous.searchMatches.length !== next.searchMatches.length) return false
   if (previous.pageIndices.some((value, index) => value !== next.pageIndices[index])) return false
@@ -2573,10 +2664,16 @@ export default function SourcePageReader({
   onRetranslateTranslationUnit,
   onTranslationGlossaryProjectChange,
   onAddSelectedTerm,
+  onLiteraturePagesCalibrated,
   onReaderStateChange,
 }: SourcePageReaderProps) {
   const [tocOpen, setTocOpen] = useState(true)
   const [viewMode, setViewMode] = useState<ViewMode>('spread')
+  const [literatureCalibrateOpen, setLiteratureCalibrateOpen] = useState(false)
+  const [literatureCalibrateSaving, setLiteratureCalibrateSaving] = useState(false)
+  const [literatureCalibratePhysical, setLiteratureCalibratePhysical] = useState(1)
+  const [literatureCalibrateValue, setLiteratureCalibrateValue] = useState<number | null>(1)
+  const [literatureCalibrateImageTotal, setLiteratureCalibrateImageTotal] = useState(1)
   const [fontSize, setFontSize] = useState(17)
   const [lineHeight, setLineHeight] = useState(1.9)
   const [theme, setTheme] = useState<ReaderTheme>('paper')
@@ -4610,7 +4707,7 @@ export default function SourcePageReader({
             className="reader-selection-icon-button"
             size="small"
             icon={<CopyOutlined />}
-            title="复制直接引用"
+            title="复制直接引用（Ctrl+D）"
             onClick={() => void copyDirectQuote()}
           />
         </div>
@@ -4642,14 +4739,138 @@ export default function SourcePageReader({
       >
         {summaryLoading ? <div style={{ padding: 32, textAlign: 'center' }}><RobotOutlined /> 正在生成摘要...</div> : <AiMarkdown content={summaryMarkdown} />}
       </Modal>
+      <Modal
+        title="校准文献页码"
+        open={literatureCalibrateOpen}
+        onCancel={() => {
+          if (literatureCalibrateSaving) return
+          setLiteratureCalibrateOpen(false)
+        }}
+        footer={[
+          <Button
+            key="reset"
+            danger
+            disabled={literatureCalibrateSaving}
+            onClick={() => {
+              Modal.confirm({
+                title: '重置全文文献页码？',
+                content: '将清除所有手动校准，并按 OCR 页脚与连续规则重新自动识别。适合改错后一键还原。',
+                okText: '重置为自动识别',
+                cancelText: '取消',
+                okButtonProps: { danger: true },
+                onOk: async () => {
+                  const docId = String(document?.id || '').trim()
+                  if (!docId) {
+                    message.error('文献未加载完成')
+                    return
+                  }
+                  setLiteratureCalibrateSaving(true)
+                  try {
+                    const result = await window.api.resetLiteraturePages(docId)
+                    await onLiteraturePagesCalibrated?.(result.pages || [])
+                    setLiteratureCalibrateOpen(false)
+                    message.success(`已重置文献页码（共 ${result.updated} 页，自动识别 ${result.ocr} 页，推断 ${result.inferred} 页）`)
+                  } catch (error: unknown) {
+                    console.error(error)
+                    message.error(getErrorMessage(error, '重置文献页码失败'))
+                    throw error
+                  } finally {
+                    setLiteratureCalibrateSaving(false)
+                  }
+                },
+              })
+            }}
+          >
+            重置全文
+          </Button>,
+          <Button
+            key="cancel"
+            disabled={literatureCalibrateSaving}
+            onClick={() => setLiteratureCalibrateOpen(false)}
+          >
+            取消
+          </Button>,
+          <Button
+            key="ok"
+            type="primary"
+            loading={literatureCalibrateSaving}
+            onClick={() => {
+              void (async () => {
+                const literature = Math.floor(Number(literatureCalibrateValue) || 0)
+                if (literature < 1) {
+                  message.warning('请填写大于 0 的文献页码')
+                  return
+                }
+                const docId = String(document?.id || '').trim()
+                if (!docId) {
+                  message.error('文献未加载完成')
+                  return
+                }
+                setLiteratureCalibrateSaving(true)
+                try {
+                  const result = await window.api.applyLiteraturePageAnchor(
+                    docId,
+                    literatureCalibratePhysical,
+                    literature,
+                  )
+                  await onLiteraturePagesCalibrated?.(result.pages || [])
+                  setLiteratureCalibrateOpen(false)
+                  const forwardCount = Math.max(0, (result.pages || []).filter((page) => page.page_num > result.anchorPhysical).length)
+                  message.success(
+                    `已将影像第 ${result.anchorPhysical} 页标为文献第 ${result.anchorLiterature} 页`
+                    + (forwardCount > 0 ? `，并向后自动顺延 ${forwardCount} 页` : ''),
+                  )
+                } catch (error: unknown) {
+                  console.error(error)
+                  message.error(getErrorMessage(error, '校准文献页码失败'))
+                } finally {
+                  setLiteratureCalibrateSaving(false)
+                }
+              })()
+            }}
+          >
+            应用并顺延后续页
+          </Button>,
+        ]}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Text type="secondary">
+            只需改当前这一页。本页起向后的页码会按 +1 规律自动生成；本页之前的页码保持不动。插图等不计页时可在下一页重新校准。
+            若改错了，可点「重置全文」清除手动标记并重新自动识别。
+          </Text>
+          <div>
+            <Text strong>当前影像页（只读）</Text>
+            <div style={{ marginTop: 6 }}>
+              影像 第 {literatureCalibratePhysical} / {literatureCalibrateImageTotal} 页
+            </div>
+          </div>
+          <div>
+            <Text strong>文献页码（书上印刷页）</Text>
+            <div style={{ marginTop: 6 }}>
+              <InputNumber
+                min={1}
+                max={99999}
+                value={literatureCalibrateValue ?? undefined}
+                onChange={(value) => setLiteratureCalibrateValue(typeof value === 'number' ? value : null)}
+                style={{ width: '100%' }}
+                placeholder="例如 63"
+              />
+            </div>
+          </div>
+        </Space>
+      </Modal>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '8px 16px', borderBottom: '1px solid rgba(255,255,255,0.06)', flexWrap: 'wrap' }}>
         <Space size={8} wrap>
           <Button size="small" icon={<BarsOutlined />} type={tocOpen ? 'primary' : 'default'} onClick={() => setTocOpen((value) => !value)}>目录</Button>
-          <Text style={{ color: 'var(--gs-text-secondary)', fontSize: 13 }}>
-            {isEbook ? `阅读页 ${safeIndex + 1} / ${pageCount}` : `第 ${activePage?.page_num || safeIndex + 1} / ${pageCount} 页`}
-          </Text>
+          {/* Page numbers live on the paper only: top-right = 影像, bottom-left = 文献. */}
           {sourceLabel ? (
             <span
+              title={
+                sourceLabel === '摘录' || sourceLabel.includes('摘录')
+                  ? '从摘录库跳转而来；圆点颜色为该条摘录的高亮色，不是页码状态'
+                  : `来源标记：${sourceLabel}`
+              }
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -4665,7 +4886,7 @@ export default function SourcePageReader({
               }}
             >
               <span aria-hidden="true" style={{ width: 9, height: 9, borderRadius: 999, background: effectiveHighlightColor }} />
-              {sourceLabel}
+              {sourceLabel === '摘录' ? '来自摘录' : sourceLabel}
             </span>
           ) : null}
           <Button size="small" icon={<LeftOutlined />} data-reader-page-prev="true" disabled={safeIndex <= 0} onClick={() => jumpToIndex(safeIndex - pageStep)} />
@@ -4860,7 +5081,41 @@ export default function SourcePageReader({
                   onClose={() => setTranslationOpen(false)}
                 />
               ) : (
-                <MemoizedSourcePageSpread rowPages={visiblePages} pageIndices={visiblePageIndices} pageCount={pageCount} pageMetrics={readerPageMetrics} adaptivePages={isEbook} fontSize={fontSize} lineHeight={lineHeight} theme={theme} searchKeyword={renderedSearchKeyword} searchMatches={searchMatches} pendingTocTarget={pendingTocTarget} aiLayoutEnabled={aiLayoutEnabled} aiLayoutByPageId={aiLayoutByPageId} aiLayoutLoading={aiLayoutLoading} aiLayoutErrors={aiLayoutErrors} highlightColor={effectiveHighlightColor} noteHighlightsByElement={readerNoteHighlightsByElement} onSelectedTextChange={onSelectedTextChange} onReaderSelection={updateReaderSelection} displayScript={displayScript} searchActiveOnly={false} />
+                <MemoizedSourcePageSpread
+                  rowPages={visiblePages}
+                  pageIndices={visiblePageIndices}
+                  pageCount={pageCount}
+                  pageMetrics={readerPageMetrics}
+                  adaptivePages={isEbook}
+                  fontSize={fontSize}
+                  lineHeight={lineHeight}
+                  theme={theme}
+                  searchKeyword={renderedSearchKeyword}
+                  searchMatches={searchMatches}
+                  pendingTocTarget={pendingTocTarget}
+                  aiLayoutEnabled={aiLayoutEnabled}
+                  aiLayoutByPageId={aiLayoutByPageId}
+                  aiLayoutLoading={aiLayoutLoading}
+                  aiLayoutErrors={aiLayoutErrors}
+                  highlightColor={effectiveHighlightColor}
+                  noteHighlightsByElement={readerNoteHighlightsByElement}
+                  onSelectedTextChange={onSelectedTextChange}
+                  onReaderSelection={updateReaderSelection}
+                  onCalibrateLiteraturePage={(page, pageIndex) => {
+                    if (isEbook) {
+                      message.info('电子书阅读页不支持文献页码校准')
+                      return
+                    }
+                    const physical = getReaderPhysicalPageNum(page, pageIndex)
+                    const literature = getReaderLiteraturePageNum(page, pageIndex)
+                    setLiteratureCalibratePhysical(physical)
+                    setLiteratureCalibrateValue(literature)
+                    setLiteratureCalibrateImageTotal(pageCount)
+                    setLiteratureCalibrateOpen(true)
+                  }}
+                  displayScript={displayScript}
+                  searchActiveOnly={false}
+                />
               )}
             </div>
           ) : (

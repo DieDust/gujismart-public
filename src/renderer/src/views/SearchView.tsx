@@ -1,6 +1,6 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Alert, Button, Card, Empty, Input, List, Modal, Pagination, Select, Space, Spin, Switch, Tag, Typography, message, type InputRef } from 'antd'
-import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutlined, RobotOutlined, SaveOutlined, SearchOutlined, StarOutlined } from '@ant-design/icons'
+import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutlined, RobotOutlined, SaveOutlined, SearchOutlined, StarOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { getErrorMessage } from '@shared/errors'
@@ -26,11 +26,12 @@ import type {
   SearchResult as FlatSearchResult,
   SearchSessionState,
   Tag as SharedTag,
+  VectorSearchHit,
 } from '@shared/types'
 
 const { Text, Title } = Typography
 
-type SearchMode = 'fulltext' | 'ai'
+type SearchMode = 'fulltext' | 'ai' | 'vector'
 type SearchSort = NonNullable<SearchOptions['sort']>
 type ContextMode = NonNullable<SearchOptions['contextMode']>
 type ExportFormat = SearchExportFormat
@@ -366,6 +367,24 @@ function getVisibleTags(tagNames: string[] | undefined, docType?: string | null,
   return visible
 }
 
+function parseSearchMode(value: unknown): SearchMode {
+  if (value === 'ai') return 'ai'
+  if (value === 'vector') return 'vector'
+  return 'fulltext'
+}
+
+function searchModeLabel(mode: SearchMode): string {
+  if (mode === 'ai') return 'AI'
+  if (mode === 'vector') return '向量'
+  return '全文'
+}
+
+function searchModeTagColor(mode: SearchMode): string {
+  if (mode === 'ai') return 'gold'
+  if (mode === 'vector') return 'cyan'
+  return 'blue'
+}
+
 function parseSavedSearchPayload(entry: SavedSearch): { keyword: string; mode: SearchMode; filters: SearchFilters; sort: SearchSort; contextMode: ContextMode } {
   try {
     const parsed = typeof entry.filters === 'string'
@@ -375,7 +394,7 @@ function parseSavedSearchPayload(entry: SavedSearch): { keyword: string; mode: S
     const filterPayload = isRecord(raw.filters) ? raw.filters : raw
     return {
       keyword: typeof raw.keyword === 'string' ? raw.keyword.trim() : '',
-      mode: raw.mode === 'ai' ? 'ai' : 'fulltext',
+      mode: parseSearchMode(raw.mode),
       filters: compactSearchFilters(filterPayload),
       sort: isSearchSort(raw.sort) ? raw.sort : 'relevance',
       contextMode: isContextMode(raw.contextMode) ? raw.contextMode : 'standard',
@@ -389,6 +408,43 @@ function parseSavedSearchPayload(entry: SavedSearch): { keyword: string; mode: S
       contextMode: 'standard',
     }
   }
+}
+
+/** Convert embedding hits into the same flat result shape used by the search UI (not merged with FTS). */
+function vectorHitsToFlatResults(hits: VectorSearchHit[], query: string): FlatSearchResult[] {
+  return (hits || []).map((hit, index) => {
+    const pageNum = Number(hit.pageNum || hit.ref?.pageNum || 1) || 1
+    const docId = String(hit.documentId || hit.ref?.docId || '')
+    const segmentId = String(hit.ref?.segmentId || `${docId}:${pageNum}:${index}`)
+    const score = Number(hit.score) || 0
+    return {
+      doc_id: docId,
+      page_num: pageNum,
+      occurrence_index: index,
+      snippet: String(hit.excerpt || ''),
+      rank: score,
+      relevance_score: score,
+      doc_title: String(hit.title || 'Untitled'),
+      doc_author: hit.author ?? null,
+      doc_type: '',
+      hit_field: 'vector',
+      matched_query: query,
+      locator: {
+        docId,
+        segmentId,
+        pageId: null,
+        pageNum,
+        pageIndex: Math.max(0, pageNum - 1),
+        href: null,
+        segmentOrdinal: 0,
+        charStart: 0,
+        charEnd: Math.min(80, String(hit.excerpt || '').length),
+        matchText: query,
+        queryTerm: query,
+        occurrenceIndex: index,
+      },
+    }
+  }).filter((item) => item.doc_id)
 }
 
 function getJumpKeyword(item: FlatSearchResult, inputValue: string, hitTerms: string[]): string {
@@ -625,6 +681,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const [inputValue, setInputValue] = useState(keyword || initialKeyword || '')
   const [searchMode, setSearchMode] = useState<SearchMode>('fulltext')
+  /** Mode of the results currently on screen (button may differ until user re-searches). */
+  const [executedSearchMode, setExecutedSearchMode] = useState<SearchMode | null>(null)
   const [searchSort, setSearchSort] = useState<SearchSort>('relevance')
   const [contextMode, setContextMode] = useState<ContextMode>('standard')
   const [exportFormat, setExportFormat] = useState<ExportFormat>('txt')
@@ -712,6 +770,10 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   )
   const hasSearchSnapshot = !!groupedResponse || results.length > 0
   const searchConditionsChanged = hasSearchSnapshot && !!executedSearchSignature && pendingSearchSignature !== executedSearchSignature
+  const resultsAreVector = executedSearchMode === 'vector'
+    || Boolean(groupedResponse?.warnings?.some((item) => String(item || '').includes('向量库语义检索')))
+  const resultsAreAi = executedSearchMode === 'ai'
+  const activeResultMode: SearchMode = resultsAreVector ? 'vector' : resultsAreAi ? 'ai' : (executedSearchMode || searchMode)
 
   const getSearchAnchorTop = (element: HTMLElement, container: HTMLElement) => {
     const elementRect = element.getBoundingClientRect()
@@ -1010,19 +1072,81 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         setResults(nextResults)
         setGroupedResponse(readerCountedGrouped)
         setExecutedSearchSignature(activeSignature)
+        setExecutedSearchMode('ai')
         persistHistoryEntry(activeKeyword, 'ai', overrideFilters, nextResults, nextAiState, readerCountedGrouped)
         if (activeSort !== 'hitCount') {
           refreshViewerHitCountsInBackground(grouped, activeKeyword, activeSort, activeSignature, 'ai', overrideFilters, nextResults, nextAiState)
         }
+      } else if (overrideMode === 'vector') {
+        // Standalone embedding search — never mixed into full-text FTS ranking.
+        const folderId = (overrideFilters.folderIds || [])[0]
+        const tagId = (overrideFilters.tagIds || [])[0]
+        const vectorRes = await window.api.vectorSearch(activeKeyword, {
+          limit: 40,
+          folderId: folderId || undefined,
+          tagId: tagId || undefined,
+        })
+        if (!vectorRes.ok) {
+          setAiSearchState(null)
+          setResults([])
+          setGroupedResponse(null)
+          setExecutedSearchSignature(activeSignature)
+          setExecutedSearchMode('vector')
+          message.warning(vectorRes.message || '向量检索失败')
+          return
+        }
+        const nextResults = vectorHitsToFlatResults(vectorRes.hits, activeKeyword)
+        const warnings = [
+          `向量库语义检索（与全文检索分开）· 模型 ${vectorRes.modelId || 'embeddings'}`,
+          vectorRes.hint || '',
+          (overrideFilters.folderIds || []).length > 1 ? '向量检索当前仅应用第一个文件夹筛选' : '',
+          (overrideFilters.tagIds || []).length > 1 ? '向量检索当前仅应用第一个标签筛选' : '',
+        ].filter(Boolean)
+        const grouped = groupFlatResults(nextResults, activeKeyword, warnings)
+        // Rank groups by vector score (higher first); keep all hits on each group for expand.
+        grouped.groups = [...grouped.groups]
+          .map((group) => ({
+            ...group,
+            hits: [...group.hits].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0)),
+            topHits: [...group.hits].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0)).slice(0, 3),
+            totalHits: group.hits.length,
+          }))
+          .sort((a, b) => {
+            const scoreA = Math.max(0, ...a.hits.map((h) => Number(h.score) || 0))
+            const scoreB = Math.max(0, ...b.hits.map((h) => Number(h.score) || 0))
+            return scoreB - scoreA || b.totalHits - a.totalHits
+          })
+        setAiSearchState(null)
+        setResults(nextResults)
+        setGroupedResponse(grouped)
+        setExecutedSearchSignature(activeSignature)
+        setExecutedSearchMode('vector')
+        persistHistoryEntry(activeKeyword, 'vector', overrideFilters, nextResults, null, grouped)
       } else {
         const reusableSnapshotId = overridePage > 1 && executedSearchSignature === activeSignature
           ? groupedResponse?.snapshotId
           : undefined
-        const grouped = await window.api.querySearchV2(activeKeyword, buildSearchOptions(overrideFilters, {
-          paged: true,
-          page: overridePage,
-          snapshotId: reusableSnapshotId,
-        }))
+        const runFulltextQuery = async (snapshotId?: string) => window.api.querySearchV2(
+          activeKeyword,
+          buildSearchOptions(overrideFilters, {
+            paged: true,
+            page: overridePage,
+            snapshotId,
+          }),
+        )
+        let grouped: SearchGroupedResponse
+        try {
+          grouped = await runFulltextQuery(reusableSnapshotId)
+        } catch (error) {
+          // Soft-recover: opening a document / snapshot expiry used to hard-fail pagination.
+          // Main process also soft-recovers; keep this as a client safety net.
+          const errorMessage = getErrorMessage(error, '')
+          if (reusableSnapshotId && errorMessage.includes('search_snapshot_')) {
+            grouped = await runFulltextQuery(undefined)
+          } else {
+            throw error
+          }
+        }
         const readerCountedGrouped = activeSort === 'hitCount'
           ? await applyViewerHitCounts(grouped, activeKeyword, activeSort)
           : grouped
@@ -1031,6 +1155,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         setAiSearchState(null)
         setResults(nextResults)
         setExecutedSearchSignature(activeSignature)
+        setExecutedSearchMode('fulltext')
         persistHistoryEntry(activeKeyword, 'fulltext', overrideFilters, nextResults, null, readerCountedGrouped)
         if (activeSort !== 'hitCount') {
           refreshViewerHitCountsInBackground(grouped, activeKeyword, activeSort, activeSignature, 'fulltext', overrideFilters, nextResults, null)
@@ -1040,9 +1165,35 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       console.error(error)
       const errorMessage = getErrorMessage(error, '')
       if (errorMessage.includes('search_snapshot_')) {
-        message.warning('检索结果已更新，请重新检索后继续翻页')
+        // Last-resort recovery for any remaining snapshot failures (should be rare).
+        message.warning('检索会话已过期，正在自动重新检索…')
+        try {
+          if (overrideMode === 'fulltext' || (!overrideMode && searchMode === 'fulltext')) {
+            const recovered = await window.api.querySearchV2(
+              (overrideKeyword ?? inputValue).trim(),
+              buildSearchOptions(overrideFilters, { paged: true, page: overridePage || 1 }),
+            )
+            const nextResults = flattenGroupedResults(recovered, 'fulltext').slice(0, 360)
+            setGroupedResponse(recovered)
+            setAiSearchState(null)
+            setResults(nextResults)
+            setExecutedSearchSignature(buildSearchSignature(
+              (overrideKeyword ?? inputValue).trim(),
+              overrideFilters,
+              'fulltext',
+              searchSort,
+              contextMode,
+            ))
+            setExecutedSearchMode('fulltext')
+            message.success('已自动刷新检索结果，可继续打开文献')
+            return
+          }
+        } catch (recoverError) {
+          console.error(recoverError)
+        }
+        message.warning('检索结果已更新，请点击搜索后继续')
       } else {
-        message.error('检索失败')
+        message.error(overrideMode === 'vector' ? getErrorMessage(error, '向量检索失败') : '检索失败')
       }
     } finally {
       setLoading(false)
@@ -1100,6 +1251,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     setInputValue(entry.keyword)
     setKeyword(entry.keyword)
     setSearchMode(entry.mode)
+    setExecutedSearchMode(entry.mode)
     setSearchPage(entry.groupedResponse?.page || 1)
     setExpandedHitDocId('')
     setDocumentHitPages({})
@@ -1112,10 +1264,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     setGroupedResponse(restoredGrouped)
     setResults(restoredResults)
     setExecutedSearchSignature(restoredSignature)
-    if (restoredGrouped) {
+    // Never re-count with full-text API for vector history (would look like keyword search).
+    if (restoredGrouped && entry.mode !== 'vector') {
       refreshViewerHitCountsInBackground(restoredGrouped, entry.keyword, searchSort, restoredSignature, entry.mode, entry.filters, restoredResults, entry.aiSearchState)
     }
-    message.success('已恢复历史检索')
+    message.success(entry.mode === 'vector' ? '已恢复向量库检索结果' : '已恢复历史检索')
   }
 
   const handleSaveCurrentSearch = () => {
@@ -1165,12 +1318,10 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       }
       const savedPayload = await window.api.runSavedSearch(entry.id)
       const restoredKeyword = savedPayload?.keyword || payload.keyword
-      const restoredMode = savedPayload?.mode || payload.mode
+      const restoredMode = parseSearchMode(savedPayload?.mode || payload.mode)
       const restoredFilters = compactSearchFilters(savedPayload?.filters || payload.filters)
       const restoredSort = savedPayload?.sort || payload.sort
       const restoredContextMode = savedPayload?.contextMode || payload.contextMode
-      const restoredGrouped = savedPayload?.grouped || null
-      const restoredResults = Array.isArray(savedPayload?.results) ? savedPayload.results : []
       setInputValue(restoredKeyword)
       setKeyword(restoredKeyword)
       setSearchMode(restoredMode)
@@ -1178,15 +1329,23 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       setContextMode(restoredContextMode)
       replaceFilters(restoredFilters)
       setAiSearchState(null)
-      setGroupedResponse(restoredGrouped)
-      setResults(restoredResults)
-      setSearchPage(restoredGrouped?.page || 1)
       setExpandedHitDocId('')
       setDocumentHitPages({})
       clearSearchReturnState()
-      setExecutedSearchSignature(buildSearchSignature(restoredKeyword, restoredFilters, restoredMode, restoredSort, restoredContextMode))
+      // Vector / AI: always re-run live search (vector needs embeddings API; keep modes separate).
+      if (restoredMode === 'vector' || restoredMode === 'ai' || !savedPayload?.cacheHit || !savedPayload?.grouped) {
+        await handleSearch(restoredKeyword, restoredFilters, restoredMode, 1)
+        message.success(restoredMode === 'vector' ? '已重新执行向量库检索' : '已重新执行检索')
+      } else {
+        const restoredGrouped = savedPayload.grouped
+        const restoredResults = Array.isArray(savedPayload.results) ? savedPayload.results : []
+        setGroupedResponse(restoredGrouped)
+        setResults(restoredResults)
+        setSearchPage(restoredGrouped?.page || 1)
+        setExecutedSearchSignature(buildSearchSignature(restoredKeyword, restoredFilters, restoredMode, restoredSort, restoredContextMode))
+        message.success(savedPayload.cacheHit ? '已从缓存恢复检索结果' : '文献库已变化，已重新检索并刷新缓存')
+      }
       await loadSavedSearches()
-      message.success(savedPayload?.cacheHit ? '已从缓存恢复检索结果' : '文献库已变化，已重新检索并刷新缓存')
     } catch (error) {
       console.error(error)
       message.error('恢复保存检索失败')
@@ -1357,7 +1516,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const handleSearchPageChange = (page: number) => {
     const activeKeyword = (keyword || inputValue).trim()
-    if (!activeKeyword || searchMode === 'ai') return
+    if (!activeKeyword || searchMode === 'ai' || searchMode === 'vector') return
     if (searchConditionsChanged) {
       message.info('检索条件已变化，请先点击搜索')
       return
@@ -1388,6 +1547,37 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     const activeKeyword = (keyword || inputValue).trim()
     if (!activeKeyword) {
       message.info('请先输入检索词')
+      return
+    }
+
+    // Use the mode of *results on screen*, not the toolbar button (user may switch button without re-search).
+    // Vector hits already live on the group — never call full-text hit API (keyword match would look like FTS).
+    if (activeResultMode === 'vector' || resultsAreVector) {
+      const allHits = [...(group.hits || [])].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
+      const pageSize = SEARCH_DOCUMENT_HIT_PAGE_SIZE
+      const totalHits = allHits.length > 0 ? allHits.length : Number(group.totalHits || 0)
+      const totalPages = Math.max(1, Math.ceil(Math.max(1, totalHits) / pageSize))
+      const safePage = Math.min(Math.max(1, page), totalPages)
+      const start = (safePage - 1) * pageSize
+      const pageHits = allHits.slice(start, start + pageSize)
+      setExpandedHitDocId(group.docId)
+      setDocumentHitPages((previous) => ({
+        ...previous,
+        [group.docId]: {
+          page: safePage,
+          loading: false,
+          payload: {
+            docId: group.docId,
+            query: activeKeyword,
+            page: safePage,
+            pageSize,
+            totalHits: allHits.length || totalHits,
+            totalPages,
+            hits: pageHits,
+            status: pageHits.length > 0 ? 'ready' : 'empty',
+          },
+        },
+      }))
       return
     }
 
@@ -1437,7 +1627,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     const activeKeyword = (keyword || inputValue).trim()
     const state = documentHitPages[group.docId]
-    if (!state?.payload || state.payload.query !== activeKeyword) {
+    // Vector / mode switch: always rebuild from current result groups so we never show FTS keyword hits.
+    if (activeResultMode === 'vector' || resultsAreVector || !state?.payload || state.payload.query !== activeKeyword) {
       void loadGroupedDocumentHitPage(group, 1)
       return
     }
@@ -1465,8 +1656,10 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       >
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'center', marginBottom: 8 }}>
           <Space size={6} wrap>
-            <Text strong style={{ color: 'var(--gs-text-primary)' }}>本文命中目录</Text>
-            <Tag color="gold">{payload?.totalHits ?? group.totalHits} 处</Tag>
+            <Text strong style={{ color: 'var(--gs-text-primary)' }}>
+              {resultsAreVector ? '本文语义片段' : '本文命中目录'}
+            </Text>
+            <Tag color="gold">{payload?.totalHits ?? group.totalHits} {resultsAreVector ? '条' : '处'}</Tag>
           </Space>
         </div>
         {state?.loading ? (
@@ -1496,15 +1689,18 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                   }}
                 >
                   <Tag color="blue">第 {hit.locator.pageNum || 1} 页</Tag>
+                  {resultsAreVector ? (
+                    <Tag color="cyan">相似度 {Number(hit.score || 0).toFixed(3)}</Tag>
+                  ) : null}
                   {hit.locator.translationSource ? <Tag color="gold">译文</Tag> : null}
                   <Tag color="default">#{globalIndex + 1}</Tag>
-                  {highlightSnippet(hit.snippet, highlightTerms)}
+                  {highlightSnippet(hit.snippet, resultsAreVector ? [] : highlightTerms)}
                 </button>
               )
             })}
           </Space>
         ) : (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无命中" />
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={resultsAreVector ? '暂无语义片段' : '暂无命中'} />
         )}
         {payload && payload.totalHits > payload.pageSize ? (
           <div
@@ -1550,6 +1746,12 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     && groupedResponse.totalDocuments > SEARCH_PAGE_SIZE
     && !searchConditionsChanged
 
+  const searchPlaceholder = searchMode === 'vector'
+    ? '输入主题或问题做语义检索（如：战犯改造与中日关系）…'
+    : searchMode === 'ai'
+      ? '输入研究问题，AI 会扩写关键词后检索…'
+      : '输入关键词、主题或研究问题...'
+
   return (
     <div ref={scrollContainerRef} style={{ padding: '24px 32px', height: '100%', overflow: 'auto' }}>
       <Title level={3} style={{ color: 'var(--gs-gold)', marginTop: 0 }}>文献检索</Title>
@@ -1561,7 +1763,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           prefix={<SearchOutlined />}
           value={inputValue}
           data-search-page-input="true"
-          placeholder="输入关键词、主题或研究问题..."
+          placeholder={searchPlaceholder}
           onChange={(event) => setInputValue(event.target.value)}
           onPressEnter={() => void handleSearch()}
           allowClear
@@ -1573,8 +1775,40 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginBottom: 10 }}>
         <Button.Group>
-          <Button type={searchMode === 'fulltext' ? 'primary' : 'default'} onClick={() => setSearchMode('fulltext')}>全文检索</Button>
-          <Button type={searchMode === 'ai' ? 'primary' : 'default'} onClick={() => setSearchMode('ai')}>AI 检索</Button>
+          <Button
+            type={searchMode === 'fulltext' ? 'primary' : 'default'}
+            onClick={() => {
+              setSearchMode('fulltext')
+              const q = inputValue.trim()
+              if (q && executedSearchMode && executedSearchMode !== 'fulltext') {
+                void handleSearch(q, filters, 'fulltext', 1)
+              }
+            }}
+          >
+            全文检索
+          </Button>
+          <Button
+            type={searchMode === 'vector' ? 'primary' : 'default'}
+            icon={<ThunderboltOutlined />}
+            onClick={() => {
+              setSearchMode('vector')
+              const q = inputValue.trim()
+              // Switching mode re-runs so results never stay as the other engine's hits.
+              if (q) void handleSearch(q, filters, 'vector', 1)
+            }}
+          >
+            向量库检索
+          </Button>
+          <Button
+            type={searchMode === 'ai' ? 'primary' : 'default'}
+            onClick={() => {
+              setSearchMode('ai')
+              const q = inputValue.trim()
+              if (q && executedSearchMode !== 'ai') void handleSearch(q, filters, 'ai', 1)
+            }}
+          >
+            AI 检索
+          </Button>
         </Button.Group>
         <Select
           value={filters.translationScope || 'all'}
@@ -1834,7 +2068,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                 onClick={() => void restoreSavedSearch(entry)}
                 style={{ maxWidth: 360, overflow: 'hidden', textOverflow: 'ellipsis' }}
               >
-                <Tag color={payload.mode === 'ai' ? 'gold' : 'blue'}>{payload.mode === 'ai' ? 'AI' : '全文'}</Tag>
+                <Tag color={searchModeTagColor(payload.mode)}>{searchModeLabel(payload.mode)}</Tag>
                 {entry.name || payload.keyword}
                 <DeleteOutlined onClick={(event) => void deleteSavedSearchEntry(event, entry.id)} />
               </Button>
@@ -1869,7 +2103,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                 onClick={() => restoreSearchHistory(entry)}
                 style={{ maxWidth: 420, overflow: 'hidden', textOverflow: 'ellipsis' }}
               >
-                <Tag color={entry.mode === 'ai' ? 'gold' : 'blue'}>{entry.mode === 'ai' ? 'AI' : '全文'}</Tag>
+                <Tag color={searchModeTagColor(entry.mode)}>{searchModeLabel(entry.mode)}</Tag>
                 {entry.keyword} {totalHits} 处命中
                 <DeleteOutlined
                   onClick={(event) => {
@@ -1897,18 +2131,42 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         </Card>
       ) : null}
 
+      {resultsAreVector && !loading ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="当前结果来自：向量库语义检索（不是关键词全文检索）"
+          description="按主题/语义相似度召回已向量化正文；高亮只是方便对照查询词，不代表改成了关键词检索。切换模式会自动按新模式重新搜索。"
+        />
+      ) : searchMode === 'vector' && !loading && !resultsAreVector ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="已选中「向量库检索」"
+          description="输入主题后点搜索，或点模式按钮将自动按向量检索重跑。与全文检索互不合并。"
+        />
+      ) : null}
+
       <div style={{ marginBottom: 12, color: 'var(--gs-text-secondary)' }}>
         {loading
-          ? '正在检索...'
+          ? (searchMode === 'vector' || activeResultMode === 'vector' ? '正在向量检索...' : '正在检索...')
           : groupedResponse
-            ? `找到 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 处命中；当前显示第 ${groupedResultStart}-${groupedResultEnd} 篇；列表仅展示每篇前几条片段，导出会使用完整命中`
+            ? (resultsAreVector
+              ? `语义命中 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 条片段（按相似度排序 · 非关键词全文）`
+              : `找到 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 处命中；当前显示第 ${groupedResultStart}-${groupedResultEnd} 篇；列表仅展示每篇前几条片段，导出会使用完整命中`)
             : results.length > 0 ? `找到 ${results.length} 条结果` : ''}
       </div>
       {searchConditionsChanged ? (
         <Alert
-          type={'info'}
+          type={'warning'}
           showIcon
-          message={'检索条件已变化，当前仍显示上一次检索结果；点击搜索后才会按新条件检索。'}
+          message={
+            searchMode !== activeResultMode
+              ? `模式已切换为「${searchModeLabel(searchMode)}」，当前列表仍是上次「${searchModeLabel(activeResultMode)}」的结果；点搜索或再次点模式将重新检索。`
+              : '检索条件已变化，当前仍显示上一次检索结果；点击搜索后才会按新条件检索。'
+          }
           style={{ marginBottom: 12 }}
         />
       ) : null}
@@ -1938,8 +2196,9 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                       {group.isFavorite ? <StarOutlined style={{ color: '#faad14', marginLeft: 8 }} /> : null}
                     </div>
                     <Space size={6}>
-                      {searchMode === 'ai' ? <Tag color={'purple'}>AI 检索</Tag> : null}
-                      <Tag color={'gold'}>{group.totalHits} 处命中</Tag>
+                      {resultsAreAi ? <Tag color={'purple'}>AI 检索</Tag> : null}
+                      {resultsAreVector ? <Tag color={'cyan'}>向量库 · 语义</Tag> : null}
+                      <Tag color={'gold'}>{group.totalHits} {resultsAreVector ? '条语义片段' : '处命中'}</Tag>
                       <Button size="small" onClick={() => openGroupedDocument(group)}>
                         打开文献
                       </Button>
@@ -1977,8 +2236,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                         }}
                       >
                         <Tag color={'blue'}>第 {hit.locator.pageNum || index + 1} 页</Tag>
+                        {resultsAreVector ? (
+                          <Tag color="cyan">相似度 {Number(hit.score || 0).toFixed(3)}</Tag>
+                        ) : null}
                         {hit.locator.translationSource ? <Tag color="gold">译文</Tag> : null}
-                        {highlightSnippet(hit.snippet, highlightTerms)}
+                        {highlightSnippet(hit.snippet, resultsAreVector ? [] : highlightTerms)}
                       </button>
                       ))}
                     </Space>
@@ -2037,7 +2299,9 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           renderItem={(item: FlatSearchResult) => {
             const inputHighlightKeywords = searchMode === 'ai'
               ? uniqueStrings([...aiHighlightKeywords, ...getKeywordCandidates(inputValue)])
-              : getKeywordCandidates(inputValue)
+              : searchMode === 'vector'
+                ? uniqueStrings([inputValue, item.matched_query || ''].filter(Boolean))
+                : getKeywordCandidates(inputValue)
             const baseHighlightKeywords = inputHighlightKeywords
             const hitTerms = getResultHitTerms(item, baseHighlightKeywords)
             const highlightTerms = inputHighlightKeywords
@@ -2083,6 +2347,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                       ) : null}
                       {item.hit_field === 'semantic' ? <Tag color={'purple'}>语义重排</Tag> : null}
                       {item.hit_field === 'ai_search' ? <Tag color={'purple'}>AI 检索</Tag> : null}
+                      {item.hit_field === 'vector' ? <Tag color={'cyan'}>向量 · 相似度 {Number(item.relevance_score ?? item.rank ?? 0).toFixed(3)}</Tag> : null}
                       {hitTerms.map((term) => <Tag key={`hit-${item.doc_id}-${item.page_num}-${term}`} color={'gold'}>命中：{term}</Tag>)}
                     </div>
                     <div style={{ color: 'var(--gs-text-secondary)', fontSize: 13, lineHeight: 1.65 }}>

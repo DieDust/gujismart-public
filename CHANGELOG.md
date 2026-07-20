@@ -1,5 +1,55 @@
 # 更新日志 / Changelog
 
+## Unreleased
+
+## 1.1.7 - 2026-07-20
+
+### 中文
+
+#### 新增
+
+- **向量库检索**：检索页独立「向量库检索」模式（与全文检索分开）；设置 →「向量索引」配置 OpenAI 兼容 Embeddings；文献库可批量向量化；MCP `vector_search` / `vector_index_stats`。
+- **文献页码（印刷页）**：OCR 后按连续关系推断印刷页码；阅读页显示「影像 / 文献」页码；点文献页可手动校准并顺延；支持「重置全文」恢复自动识别；导出 TXT/MD 等优先使用文献页；普遍无页码时回退物理页 1、2、3…
+- **校对删除文本块**：版式还原与普通文本校对均支持右键/按钮删除 OCR 文本块，并写回数据库。
+- **复制直接引用快捷键**：默认 `Ctrl+D`（设置 → 快捷键可改）；阅读/校对选中文本后一键复制带引用格式。
+- **版式还原校对**：支持划选/点块「复制原文」「复制直接引用」。
+- **默认打开阅读模式**：设置项「默认使用阅读模式」默认开启；单篇手动切换的模式仍优先。
+
+#### 修复
+
+- **全局检索 → 打开文献 → 再点另一篇**：不再因 `last_opened_at` 误判检索快照过期而提示「请重新检索」；快照失效时自动恢复。
+- **校对模式左侧无原图**：不再把双页阅读样式塞进窄栏；显示明确「本页暂无原图」并提供补 PDF / 生成页图 / 改阅读模式。
+- **阅读 ↔ 校对切换**：保留当前影像页，避免进度跳回首页或首次切换需点两次。
+- **期刊页脚页码**：改进 `·-63-·` / 多位印刷页识别，减少默认显示成个位数的问题。
+
+#### 下载
+
+- `GujiSmart-1.1.7-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.7-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- **Vector search mode** separate from full-text; embeddings settings; batch vectorize; MCP `vector_search` / `vector_index_stats`.
+- **Literature (printed) page numbers** with continuity inference, manual calibrate/reset, reading chrome labels; exports prefer literature pages; sparse anchors fall back to physical 1..N.
+- **Proof block delete** in facsimile and text proof modes (persisted to DB).
+- **Copy direct-quote shortcut** default `Ctrl+D` (configurable in Settings → Shortcuts).
+- **Facsimile proof**: copy plain text / direct citation from selection or block.
+- **Prefer read mode on open** setting (default on); per-document manual mode still wins.
+
+#### Fixes
+
+- **Search return flow**: opening a document no longer invalidates the search snapshot via `last_opened_at`; soft-recover when snapshots expire.
+- **Proof left pane without image**: clear empty state instead of dual-page reading chrome crammed into the side panel.
+- **Read ↔ proof switch**: keep the current source page; avoid first-switch bounce.
+- **Journal footer page labels**: better multi-digit / dotted footer extraction.
+
+#### Downloads
+
+- `GujiSmart-1.1.7-Setup-x64.exe`
+- `GujiSmart-1.1.7-Portable-x64.exe`
+
 ## 1.1.6 - 2026-07-18
 
 ### 中文

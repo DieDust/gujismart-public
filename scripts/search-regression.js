@@ -81,9 +81,27 @@ async function run() {
     const sameSnapshot = search.querySearchV2('渡', { limit: 80, page: 2, pageSize: 1, snapshotId: pagedSnapshot.snapshotId })
     assert.strictEqual(sameSnapshot.snapshotId, pagedSnapshot.snapshotId, 'Expected pagination to reuse the validated snapshot')
     database.run("UPDATE documents SET title = title || ' changed' WHERE id = 'doc_a'")
-    assert.throws(
-      () => search.querySearchV2('渡', { limit: 80, page: 2, pageSize: 1, snapshotId: pagedSnapshot.snapshotId }),
-      /search_snapshot_stale/,
+    // Stale snapshots must soft-recover (new snapshot) so open-doc → return-to-search never blocks users.
+    const recovered = search.querySearchV2('渡', { limit: 80, page: 2, pageSize: 1, snapshotId: pagedSnapshot.snapshotId })
+    assert.ok(recovered.snapshotId, 'Expected soft-recover to issue a fresh SearchSnapshot')
+    assert.notStrictEqual(
+      recovered.snapshotId,
+      pagedSnapshot.snapshotId,
+      'Stale snapshot must not be reused after library generation changes',
+    )
+    // Pure open-bookkeeping must NOT invalidate snapshots (last_opened_at / read_status only).
+    const stableSnapshot = search.querySearchV2('渡', { limit: 80, page: 1, pageSize: 1 })
+    database.run("UPDATE documents SET last_opened_at = ?, read_status = 'reading' WHERE id = 'doc_a'", [now])
+    const afterOpen = search.querySearchV2('渡', {
+      limit: 80,
+      page: 2,
+      pageSize: 1,
+      snapshotId: stableSnapshot.snapshotId,
+    })
+    assert.strictEqual(
+      afterOpen.snapshotId,
+      stableSnapshot.snapshotId,
+      'Opening a document (last_opened_at) must keep the search snapshot reusable',
     )
     const stableHit = response.groups.flatMap((group) => group.hits).find((hit) => hit.stableLocator?.precision === 'exact')
     assert.ok(stableHit, 'Expected verified search hits to include an exact StableReaderLocator v2')

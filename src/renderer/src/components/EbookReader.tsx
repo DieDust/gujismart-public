@@ -3051,7 +3051,7 @@ export default function EbookReader({
             className="reader-selection-icon-button"
             size="small"
             icon={<CopyOutlined />}
-            title="复制直接引用"
+            title="复制直接引用（Ctrl+D）"
             onClick={() => void copyDirectQuote()}
           />
         </div>
@@ -3091,6 +3091,11 @@ export default function EbookReader({
           </Text>
           {sourceLabel ? (
             <span
+              title={
+                sourceLabel === '摘录' || sourceLabel.includes('摘录')
+                  ? '从摘录库跳转而来；圆点颜色为该条摘录的高亮色，不是页码状态'
+                  : `来源标记：${sourceLabel}`
+              }
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -3106,7 +3111,7 @@ export default function EbookReader({
               }}
             >
               <span aria-hidden="true" style={{ width: 9, height: 9, borderRadius: 999, background: effectiveHighlightColor }} />
-              {sourceLabel}
+              {sourceLabel === '摘录' ? '来自摘录' : sourceLabel}
             </span>
           ) : null}
           <Button size="small" icon={<LeftOutlined />} onClick={goPrevious} />

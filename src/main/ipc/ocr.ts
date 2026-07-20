@@ -9,6 +9,7 @@ import { autoCleanupPdfAssetsIfEnabled, restorePdfAssetForDocument } from '../pd
 import { analyzePdfTextLayer } from '../pdf-preflight'
 import { allowFileAccessPath } from '../file-access'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { recomputeLiteraturePageMap } from '../literature-page-map'
 import { getPdfJsNodeDocumentOptions } from '../pdfjs-assets'
 import {
   findSuspiciousRepeatedOcrText,
@@ -4487,6 +4488,11 @@ function updatePageOcrState(pageId: string, result: OcrRecognizeResult, engine: 
   upsertPageOcrVersion(pageId, engine, normalized.result, text, 'completed', page)
   recordCompatibilityOcrArtifacts([{ pageId, engine, result: normalized.result, text }])
   markDocumentTocDirty(page.doc_id)
+  try {
+    recomputeLiteraturePageMap(page.doc_id)
+  } catch (error) {
+    console.warn('[OCR] literature page map recompute failed', page.doc_id, error)
+  }
 }
 
 async function savePageQualityFailureOcrError(
@@ -5012,6 +5018,13 @@ function updateDocumentStatusFromPages(docId: string, errorMessage?: string | nu
     'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?',
     [nextStatus, importStatus, errorValue, now, docId],
   )
+  if (nextStatus === 'completed' || completed || settledWithReviewPages) {
+    try {
+      recomputeLiteraturePageMap(docId)
+    } catch (error) {
+      console.warn('[OCR] literature page map recompute failed', docId, error)
+    }
+  }
   scheduleDatabaseSave()
 }
 
