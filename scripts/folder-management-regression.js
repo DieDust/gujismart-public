@@ -113,7 +113,7 @@ assertIncludes(foldersView, 'window.api.removeDocumentFromFolder(docId, currentF
 assertIncludes(foldersView, 'const runFolderOcrInConfiguredBatches = useCallback', 'FoldersView should route OCR actions through the guarded batch runner')
 assertIncludes(foldersView, 'ensurePdfPageImagesForOcr as ensureOcrPageImages', 'FoldersView should still be able to prepare page images for vision/hybrid OCR')
 assertIncludes(foldersView, "const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'", 'FoldersView should only prepare page images for OCR engines that need local page images')
-assertIncludes(foldersView, 'let ocrBatch = batch', 'FoldersView Paddle OCR should use the selected document batch directly')
+assertIncludes(foldersView, 'let ocrBatch = uniqueDocIds', 'FoldersView OCR should start from the full selected document list')
 assertIncludes(foldersView, 'if (requiresPageImagesBeforeOcr) {', 'FoldersView should gate page-image preparation by OCR engine')
 assertIncludes(foldersView, 'const result = await ensureOcrPageImages(docId, {', 'FoldersView should prepare page images only inside the gated branch')
 assertIncludes(foldersView, 'window.api.batchOcr(ocrBatch, {', 'FoldersView should submit the prepared or direct batch to OCR')
