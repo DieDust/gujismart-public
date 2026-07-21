@@ -260,24 +260,26 @@ assert(
   'Non-Paddle import auto-OCR should prepare page images without reloading the library after every file.',
 )
 assert(
-  handleBatchOcrBody.includes("await runOcrInConfiguredBatches(targetIds, engine, 'batch-ocr'")
-    && handleBatchOcrBody.includes("message.success({")
-    && handleBatchOcrBody.includes("message.error({ content: '批量 OCR 识别失败', key: 'batch-ocr' })"),
+  librarySource.includes("const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'")
+    && librarySource.includes("const OCR_RESULT_MESSAGE_KEY = 'ocr-result'")
+    && handleBatchOcrBody.includes('await runOcrInConfiguredBatches(targetIds, engine, OCR_ACTIVITY_MESSAGE_KEY')
+    && handleBatchOcrBody.includes('message.success({')
+    && handleBatchOcrBody.includes("message.error({ content: '批量 OCR 识别失败', key: OCR_RESULT_MESSAGE_KEY, duration: 6 })"),
   'Manual batch OCR handler structure should remain recognizable for duplicate refresh checks.',
 )
 assert(
-  !handleBatchOcrBody.includes("key: 'batch-ocr',\n      })\n      await loadDocuments()")
-    && handleBatchOcrBody.includes("message.error({ content: '批量 OCR 识别失败', key: 'batch-ocr' })\n      await loadDocuments(filter, { silent: true })"),
+  !handleBatchOcrBody.includes("key: OCR_RESULT_MESSAGE_KEY,\n        duration: 4,\n      })\n      await loadDocuments()")
+    && handleBatchOcrBody.includes("message.error({ content: '批量 OCR 识别失败', key: OCR_RESULT_MESSAGE_KEY, duration: 6 })\n      await loadDocuments(filter, { silent: true })"),
   'Manual batch OCR success path should rely on runOcrInConfiguredBatches refreshes while failure still refreshes the list.',
 )
 assert(
-  handleRetryDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || \'paddle\', `retry-${doc.id}`)')
-    && !handleRetryDocumentBody.includes("message.warning({ content: '重新处理未完成，请查看失败原因后再试', key: `retry-${doc.id}`, duration: 5 })\n      }\n      await loadDocuments(filter, { silent: true })"),
+  handleRetryDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || \'paddle\', OCR_ACTIVITY_MESSAGE_KEY)')
+    && !handleRetryDocumentBody.includes("message.warning({ content: '重新处理未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })\n      }\n      await loadDocuments(filter, { silent: true })"),
   'Single document retry success path should not await an extra list reload after runOcrInConfiguredBatches.',
 )
 assert(
-  handleForceRerunDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], engine, `rerun-ocr-${doc.id}`, { forceFullRerun: true })')
-    && !handleForceRerunDocumentBody.includes("message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: `rerun-ocr-${doc.id}`, duration: 5 })\n          }\n          await loadDocuments(filter, { silent: true })"),
+  handleForceRerunDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true })')
+    && !handleForceRerunDocumentBody.includes("message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })\n      }\n      await loadDocuments(filter, { silent: true })"),
   'Single document full OCR rerun success path should not await an extra list reload after runOcrInConfiguredBatches.',
 )
 assert(
@@ -286,15 +288,17 @@ assert(
   'Full OCR rerun should not block the library with a modal confirmation.',
 )
 assert(
-  handleRetryFailedDocumentsBody.includes("const successCount = await runOcrInConfiguredBatches(failedDocs.map((doc) => doc.id), 'paddle', 'retry-failed')")
-    && !handleRetryFailedDocumentsBody.includes("message.success({ content: `重试完成，成功处理 ${successCount}/${failedDocs.length} 篇`, key: 'retry-failed' })\n      await loadDocuments(filter, { silent: true })"),
+  handleRetryFailedDocumentsBody.includes("const successCount = await runOcrInConfiguredBatches(failedDocs.map((doc) => doc.id), 'paddle', OCR_ACTIVITY_MESSAGE_KEY)")
+    && !handleRetryFailedDocumentsBody.includes("message.success({ content: `重试完成，成功处理 ${successCount}/${failedDocs.length} 篇`, key: OCR_RESULT_MESSAGE_KEY, duration: 4 })\n      await loadDocuments(filter, { silent: true })"),
   'Failed-document retry success path should not await an extra list reload after runOcrInConfiguredBatches.',
 )
 assert(
   handleBatchImportBody.includes('const followEngine = importOcrEngine')
     && handleBatchImportBody.includes('const hasConfig = await hasOcrEngineConfig(followEngine)')
-    && handleBatchImportBody.includes("const count = await runOcrInConfiguredBatches(targetIds, followEngine, 'batch-follow-ocr')")
+    && handleBatchImportBody.includes('const count = await runOcrInConfiguredBatches(targetIds, followEngine, OCR_ACTIVITY_MESSAGE_KEY)')
     && handleBatchImportBody.includes('} else {\n        await loadDocuments()\n      }')
+    && handleBatchImportBody.includes("message.success({ content: `OCR 完成，成功识别 ${count} 篇文献`, key: OCR_RESULT_MESSAGE_KEY, duration: 4 })")
+    && !handleBatchImportBody.includes("duration: 4 })\n      }\n\n      await loadDocuments()")
     && !handleBatchImportBody.includes("message.success({ content: `OCR 完成，成功识别 ${count} 篇文献`, key: 'batch-follow-ocr' })\n      }\n\n      await loadDocuments()"),
   'Batch import should skip the extra final list reload when follow-up OCR already refreshed, while still refreshing when OCR is not started.',
 )
