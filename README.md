@@ -2,9 +2,11 @@
 
 文献管理（GujiSmart）是一个面向古籍与通用文献的本地研究工作台，围绕“导入资料、OCR 校对、检索证据、摘录到写作”的闭环整理个人文献库。
 
+最新安装包见 [GitHub Releases](https://github.com/DieDust/gujismart-public/releases)（当前 **v1.1.11+**）。完整图文教程见 [docs/文献管理-图文使用教程.md](docs/文献管理-图文使用教程.md)。
+
 ## 界面预览
 
-以下截图使用空库或合成示例数据，不包含真实用户文献。
+以下截图使用空库或合成示例数据，不包含真实用户文献。界面若有迭代，以软件内实际界面为准；维护者可用隔离数据目录重拍 `docs/images/tutorial-*.png`。
 
 | 欢迎页 | 文献库 |
 | --- | --- |
@@ -24,13 +26,16 @@
 
 ## 功能概览
 
-- 文献导入：支持 PDF、常见图片格式和本地文件夹归档。
-- OCR 与校对：支持批量 OCR、页面校对、原图对照、多版本识别结果，以及飞桨多 Token 额度接力。
-- 文献组织：支持标签、文件夹、收藏、阅读状态、评分和元数据维护。
-- 检索与证据：支持全文检索、语义扩展检索、保存检索和摘录保存。
-- AI 辅助：支持 OpenAI 兼容接口，用于元数据提取、文献问答、总结和跨文献综合。
-- 研究写作：支持研究项目、摘录、引用模板和 Markdown/JSON 等导出。
-- AI 工具连接（MCP）：设置中一键开关与配置复制；本机 Agent（Cursor / Claude / Codex / Trae 等）可只读检索文献库，无需打开界面。详见 [docs/MCP.md](docs/MCP.md)。
+- **文献导入**：支持 PDF、常见图片格式和本地文件夹归档；可开启导入后自动 OCR。
+- **OCR 与校对**：批量 OCR、飞桨多 Token 额度接力、视觉/混合 OCR、单页重识别；单页失败可入库并标出失败页；校对支持原图对照、鸟瞰定位、版式还原、多版本识别结果。
+- **原文管理**：PDF 原件仓库匹配与补回；可选“仅登记路径”不复制大文件；清理 OCR 原图只删软件目录内副本，不删外部源文件。
+- **页码与导出**：自然页码 / 文献（印刷）页码校准；导出可选页码模式。
+- **向量检索**：正文 Embedding 索引；文献库批量向量化（可先 OCR 再向量，已识别书不重复整本 OCR）；检索页独立向量库检索与文内命中导航。
+- **文献组织**：标签、文件夹、收藏、阅读状态、评分、智能筛选和元数据维护。
+- **检索与证据**：全文检索、语义扩展/AI 检索（视配置）、保存检索和摘录保存；向量证据导出。
+- **AI 辅助**：OpenAI 兼容接口，用于元数据提取、文献问答、总结和跨文献综合。
+- **研究写作**：研究项目、摘录、引用模板和 Markdown/JSON 等导出。
+- **AI 工具连接（MCP）**：设置中一键开关与配置复制；本机 Agent（Cursor / Claude / Codex / Trae 等）可只读检索文献库。详见 [docs/MCP.md](docs/MCP.md)。
 
 ## 技术栈
 
@@ -39,11 +44,15 @@
 - UI：Ant Design 5
 - 本地数据库：`better-sqlite3` + SQLite
 - OCR：PaddleOCR API / 视觉模型 OCR
-- AI：OpenAI 兼容接口
+- AI / 向量：OpenAI 兼容 Chat 与 Embeddings 接口
 
 ## 快速开始
 
+### 普通用户
+
 前往 [GitHub Releases](https://github.com/DieDust/gujismart-public/releases) 下载最新安装包即可。
+
+### 开发者
 
 ```bash
 npm install
@@ -85,7 +94,7 @@ AI 工具连接（MCP）见 [docs/MCP.md](docs/MCP.md)。
 ## 项目结构
 
 ```text
-src/main/        Electron main 进程、数据库、OCR、AI、导出、IPC 与 MCP
+src/main/        Electron main 进程、数据库、OCR、AI、向量、导出、IPC 与 MCP
 src/preload/     安全暴露给 renderer 的 window.api
 src/renderer/    React 前端界面、状态和工具函数
 src/shared/      main/preload/renderer 共享类型、常量和跨进程工具

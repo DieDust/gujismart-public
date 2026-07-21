@@ -398,11 +398,16 @@
   border-radius: 99px;
   background: var(--app-tab-group-color);
   opacity: 0.9;
+  transform-origin: center;
   pointer-events: none;
 }
 
+/* Collapsed groups only keep the chip width — never share flex space with expanded tabs. */
 .app-tab-group-segment.is-collapsed {
   flex: 0 0 auto;
+  width: auto;
+  max-width: none;
+  min-width: 0;
 }
 
 .app-tab-group-segment.is-active {
@@ -417,6 +422,18 @@
   height: 3px;
   opacity: 1;
   box-shadow: 0 0 8px color-mix(in srgb, var(--app-tab-group-color) 40%, transparent);
+}
+
+.app-tab-group-segment.is-just-created {
+  animation: app-tab-group-create 0.65s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.app-tab-group-segment.is-just-created::after {
+  animation: app-tab-group-underline-create 0.65s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.app-tab-group-segment.is-just-created .app-tab-group-chip {
+  animation: app-tab-group-chip-create 0.65s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .app-tab-group-segment[data-app-tab-group-dragging='true'] {
@@ -599,6 +616,15 @@
   padding: 0 3px 5px;
 }
 
+/* Icon density used to override segment flex and made collapsed groups keep growing. */
+.app-tab-strip[data-app-tab-density='compact'] .app-tab-group-segment.is-collapsed,
+.app-tab-strip[data-app-tab-density='tight'] .app-tab-group-segment.is-collapsed,
+.app-tab-strip[data-app-tab-density='icon'] .app-tab-group-segment.is-collapsed {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: none;
+}
+
 .app-tab-strip[data-app-tab-density='icon'] .app-tab-group-chip {
   flex: 0 0 34px;
   width: 34px;
@@ -693,6 +719,29 @@
   pointer-events: none;
 }
 
+.app-tab.is-group-drop-target {
+  z-index: 2;
+  overflow: visible;
+  color: var(--gs-text-primary);
+  background: rgba(212, 173, 132, 0.16) !important;
+  border-color: rgba(212, 173, 132, 0.72) !important;
+  box-shadow:
+    0 0 0 1px rgba(212, 173, 132, 0.28),
+    0 0 18px rgba(212, 173, 132, 0.28),
+    inset 0 0 0 1px rgba(212, 173, 132, 0.12);
+}
+
+.app-tab.is-group-drop-target::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 18px;
+  border: 1.5px dashed rgba(212, 173, 132, 0.72);
+  box-shadow: 0 0 12px rgba(212, 173, 132, 0.22);
+  animation: app-tab-group-target-pulse 0.9s ease-in-out infinite;
+  pointer-events: none;
+}
+
 .app-tab-drag-preview {
   position: fixed;
   z-index: 4000;
@@ -711,6 +760,80 @@
   transition: none;
 }
 
+.app-tab-drag-preview.is-group-intent {
+  border-color: rgba(212, 173, 132, 0.88) !important;
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.38),
+    0 0 0 2px rgba(212, 173, 132, 0.5),
+    0 0 22px rgba(212, 173, 132, 0.38);
+}
+
+.app-tab-drag-preview.is-force-group {
+  border-color: rgba(246, 200, 95, 0.95) !important;
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.4),
+    0 0 0 2px rgba(246, 200, 95, 0.55),
+    0 0 26px rgba(246, 200, 95, 0.42);
+}
+
+@keyframes app-tab-group-target-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes app-tab-group-create {
+  0% {
+    filter: brightness(1.35);
+    transform: scale(0.97);
+  }
+  45% {
+    filter: brightness(1.18);
+    transform: scale(1.02);
+  }
+  100% {
+    filter: brightness(1);
+    transform: scale(1);
+  }
+}
+
+@keyframes app-tab-group-underline-create {
+  0% {
+    opacity: 0;
+    transform: scaleX(0.2);
+    box-shadow: 0 0 0 transparent;
+  }
+  55% {
+    opacity: 1;
+    transform: scaleX(1.04);
+    box-shadow: 0 0 14px color-mix(in srgb, var(--app-tab-group-color) 55%, transparent);
+  }
+  100% {
+    opacity: 0.9;
+    transform: scaleX(1);
+    box-shadow: 0 0 0 transparent;
+  }
+}
+
+@keyframes app-tab-group-chip-create {
+  0% {
+    transform: scale(0.9);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--app-tab-group-color) 45%, transparent);
+  }
+  50% {
+    transform: scale(1.06);
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--app-tab-group-color) 0%, transparent);
+  }
+  100% {
+    transform: scale(1);
+    box-shadow: none;
+  }
+}
+
 .app-tab-group-drag-preview {
   position: fixed;
   z-index: 4000;
@@ -726,6 +849,31 @@
   pointer-events: none;
   will-change: transform;
   transition: none;
+}
+
+.app-tab-drop-indicator {
+  position: fixed;
+  z-index: 3500;
+  top: 0;
+  left: 0;
+  width: 2px;
+  height: 28px;
+  margin-left: -1px;
+  border-radius: 99px;
+  background: var(--gs-gold-light, #e8c9a0);
+  box-shadow: 0 0 10px rgba(212, 173, 132, 0.65);
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+  transition: opacity 80ms ease-out;
+}
+
+.app-tab-drag-preview.is-join-group {
+  border-color: rgba(124, 183, 255, 0.85) !important;
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.38),
+    0 0 0 2px rgba(124, 183, 255, 0.45),
+    0 0 20px rgba(124, 183, 255, 0.32);
 }
 
 .app-tab-strip.is-dragging,
@@ -818,6 +966,12 @@ body.is-app-tab-dragging * {
     transition: none;
   }
 
+  .app-tab.is-group-drop-target::before,
+  .app-tab-group-segment.is-just-created,
+  .app-tab-group-segment.is-just-created::after,
+  .app-tab-group-segment.is-just-created .app-tab-group-chip {
+    animation: none;
+  }
 }
 
 /* ====== 内容区域 ====== */

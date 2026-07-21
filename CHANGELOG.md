@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 1.1.11 - 2026-07-22
+
+### 中文
+
+#### 修复
+
+- **标签拖拽分组防误触**：默认仅目标标签中间 50% 建组，左右 25% 只换序。
+- **Shift/Alt + 拖拽建组**：按住 Shift 或 Alt 拖动后，丢到任意未分组标签的任意位置即可建组；纯点击不会建组。
+- **建组动效**：拖拽高亮、预览发光、新建分组动画，落点更清晰。
+- **折叠分组参与缩放**：折叠后按折叠后的可见宽度重算密度，不再按全展开标签挤压。
+- **拖到最右侧分组后**：分组左右缘可插到整组前/后，中间仍加入该组。
+- **拖拽更顺滑**：预览跟手、落点指示线、拖动中避免多余 React 重渲染。
+
+#### 下载
+
+- `GujiSmart-1.1.11-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.11-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Fixed
+
+- **Safer tab-group drag zones**: middle 50% creates a group; side 25% only reorders.
+- **Shift/Alt drag-to-group**: hold modifier while dragging to group on any part of an ungrouped tab; click alone does not group.
+- **Group create feedback**: target highlight, preview glow, and create animation.
+- **Collapsed groups in density math**: folded groups no longer reserve expanded tab width.
+- **Insert after rightmost group**: group edge zones place before/after the whole block.
+- **Smoother tab dragging**: immediate preview tracking, insertion indicator, fewer re-renders mid-drag.
+
+#### Downloads
+
+- `GujiSmart-1.1.11-Setup-x64.exe`
+- `GujiSmart-1.1.11-Portable-x64.exe`
+
 ## 1.1.10 - 2026-07-22
 
 ### 中文

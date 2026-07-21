@@ -47,6 +47,8 @@ type AppViewKey = WorkspaceViewKey
 type MenuItem = Required<MenuProps>['items'][number]
 type DatabaseUpgradePhase = 'idle' | 'precompact' | 'cleanup' | 'compact'
 type TabDropPosition = 'before' | 'after'
+type TabDropIntent = 'reorder' | 'group' | 'join-group'
+type AppTabStripTargetType = 'tab' | 'group'
 type AppTabDensity = 'normal' | 'compact' | 'tight' | 'icon'
 type AppTabPointerDrag = {
   tabId: string
@@ -60,9 +62,14 @@ type AppTabPointerDrag = {
   top: number
   moved: boolean
   previewElement: HTMLElement | null
-  targetGroupId: string | null
-  targetTabId: string | null
+  forceGroupModifier: boolean
+  /** Strip-level target: ungrouped tab or whole group segment. */
+  targetType: AppTabStripTargetType | null
+  targetId: string | null
   targetDropPosition: TabDropPosition | null
+  targetDropIntent: TabDropIntent | null
+  /** Last DOM highlight key to avoid redundant classList work. */
+  highlightKey: string | null
 }
 type AppTabGroupDragTarget = {
   type: 'tab' | 'group'
@@ -137,6 +144,9 @@ const LARGE_FREELIST_BYTES = 64 * 1024 * 1024
 const FREELIST_RATIO_RECOMMEND_THRESHOLD = 0.1
 const HOME_TAB_ID = 'home'
 const TAB_DRAG_ACTIVATION_DISTANCE = 4
+/** Default group zone is the middle 50%; left/right 25% stay reorder-only. Shift/Alt expands to 100%. */
+const TAB_GROUP_ZONE_SIDE_RATIO = 0.25
+const TAB_GROUP_CREATE_EFFECT_MS = 700
 const TAB_PREFERRED_WIDTH = 210
 const TAB_GROUP_CHIP_WIDTH = 96
 const TAB_COMPACT_SLOT_WIDTH = 118
@@ -175,6 +185,19 @@ function createHomeTab(): AppTab {
 
 function createTabGroupId(): string {
   return `tab-group:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`
+}
+
+function isForceGroupModifierActive(event: { shiftKey?: boolean; altKey?: boolean } | null | undefined): boolean {
+  return !!(event?.shiftKey || event?.altKey)
+}
+
+/** Middle 50% of the target tab creates a group; Shift/Alt makes the full tab a group zone. */
+function isTabGroupDropZone(sampleX: number, bounds: DOMRect, forceFullZone: boolean): boolean {
+  if (sampleX < bounds.left || sampleX > bounds.right) return false
+  if (forceFullZone) return true
+  const width = Math.max(1, bounds.width)
+  const ratio = (sampleX - bounds.left) / width
+  return ratio >= TAB_GROUP_ZONE_SIDE_RATIO && ratio <= (1 - TAB_GROUP_ZONE_SIDE_RATIO)
 }
 
 function getDefaultTabGroupTitle(index: number): string {
@@ -344,6 +367,36 @@ function reorderAppTabs(current: AppTab[], sourceId: string, targetId: string, p
   return next.every((tab, index) => tab === current[index]) ? current : next
 }
 
+/** Reorder a single tab relative to another tab or an entire group block (before first / after last). */
+function reorderAppTabToStripTarget(
+  current: AppTab[],
+  sourceId: string,
+  target: { type: AppTabStripTargetType; id: string; position: TabDropPosition },
+): AppTab[] {
+  if (target.type === 'tab') {
+    return reorderAppTabs(current, sourceId, target.id, target.position)
+  }
+  if (!sourceId || !target.id) return current
+  const sourceIndex = current.findIndex((tab) => tab.id === sourceId)
+  if (sourceIndex < 0) return current
+  const next = [...current]
+  const [source] = next.splice(sourceIndex, 1)
+  if (!source) return current
+  const groupIndexes = next
+    .map((tab, index) => (tab.groupId === target.id ? index : -1))
+    .filter((index) => index >= 0)
+  if (groupIndexes.length === 0) return current
+  const insertIndex = target.position === 'before'
+    ? Math.min(...groupIndexes)
+    : Math.max(...groupIndexes) + 1
+  // Placing before/after a group block always leaves the tab outside groups.
+  const placed = source.groupId ? { ...source, groupId: undefined } : source
+  next.splice(insertIndex, 0, placed)
+  return next.every((tab, index) => tab.id === current[index]?.id && tab.groupId === current[index]?.groupId)
+    ? current
+    : next
+}
+
 function reorderAppTabGroup(
   current: AppTab[],
   sourceGroupId: string,
@@ -462,7 +515,9 @@ export default function App() {
   const [tabMenuOpen, setTabMenuOpen] = useState(false)
   const [draggedTabId, setDraggedTabId] = useState<string | null>(null)
   const [draggedTabGroupId, setDraggedTabGroupId] = useState<string | null>(null)
-  const [dragOverTabGroupId, setDragOverTabGroupId] = useState<string | null>(null)
+  const [justCreatedTabGroupId, setJustCreatedTabGroupId] = useState<string | null>(null)
+  const justCreatedTabGroupTimerRef = useRef<number | null>(null)
+  const tabDropIndicatorRef = useRef<HTMLDivElement | null>(null)
   const [closedTabHistory, setClosedTabHistory] = useState<ClosedAppTabItem[]>([])
   const [shortcuts, setShortcuts] = useState<ShortcutMap | null>(null)
   const [siderCollapsed, setSiderCollapsed] = useState(() => initialWorkspace.siderCollapsed)
@@ -527,6 +582,10 @@ export default function App() {
     count + (item.type === 'tab' ? 1 : (item.group.collapsed ? 0 : item.tabs.length))
   ), 0)
   const tabStripGroupCount = tabStripItems.reduce((count, item) => count + (item.type === 'group' ? 1 : 0), 0)
+  const collapsedTabGroupCount = tabStripItems.reduce((count, item) => (
+    count + (item.type === 'group' && item.group.collapsed ? 1 : 0)
+  ), 0)
+  // Visual strip children: visible tabs + every group chip (collapsed chips still occupy a slot).
   const visibleTabUnitCount = visibleTabCount + tabStripGroupCount
   const inheritedTabGroupId = activeTab.groupId && tabGroupsById.has(activeTab.groupId)
     ? activeTab.groupId
@@ -539,6 +598,7 @@ export default function App() {
   const activeDocumentTab = activeTab.kind === 'document' ? activeTab : null
   const showFloatingActions = activeTab.kind !== 'document' && !libraryAiOpen
   const selectedMenuKeys = activeTab.kind === 'view' ? [activeTab.view] : []
+  // Ideal width must follow the collapsed strip: hidden group tabs do not reserve preferred width.
   const tabStripIdealWidth = (
     visibleTabCount * TAB_PREFERRED_WIDTH
     + tabStripGroupCount * TAB_GROUP_CHIP_WIDTH
@@ -609,25 +669,37 @@ export default function App() {
     if (!strip) return
 
     const measure = () => {
-      const tabCount = Math.max(1, visibleTabUnitCount)
-      const usableWidth = Math.max(
+      // Density follows the post-collapse layout: only visible tabs compress.
+      // Collapsed (and expanded) group chips reserve a fixed preferred chip width
+      // so folding a group immediately frees slot budget for the remaining tabs.
+      const visualItemCount = Math.max(1, visibleTabUnitCount)
+      const gapTotal = Math.max(0, visualItemCount - 1) * TAB_STRIP_GAP
+      const chipReserve = tabStripGroupCount * TAB_GROUP_CHIP_WIDTH
+      if (visibleTabCount <= 0) {
+        setTabDensity('normal')
+        return
+      }
+      const usableForTabs = Math.max(
         1,
         strip.clientWidth
           - TAB_STRIP_HORIZONTAL_PADDING
-          - Math.max(0, tabCount - 1) * TAB_STRIP_GAP,
+          - gapTotal
+          - chipReserve,
       )
-      setTabDensity(getTabDensityForSlot(usableWidth / tabCount))
+      setTabDensity(getTabDensityForSlot(usableForTabs / visibleTabCount))
     }
 
     measure()
     const resizeObserver = new ResizeObserver(measure)
     resizeObserver.observe(strip)
+    const rail = strip.parentElement
+    if (rail) resizeObserver.observe(rail)
     window.addEventListener('resize', measure)
     return () => {
       resizeObserver.disconnect()
       window.removeEventListener('resize', measure)
     }
-  }, [siderCollapsed, visibleTabUnitCount])
+  }, [collapsedTabGroupCount, siderCollapsed, tabStripGroupCount, visibleTabCount, visibleTabUnitCount])
 
   useEffect(() => {
     window.api.listFolders()
@@ -1260,6 +1332,18 @@ export default function App() {
     close()
   }
 
+  const markTabGroupJustCreated = (groupId: string) => {
+    if (justCreatedTabGroupTimerRef.current !== null) {
+      window.clearTimeout(justCreatedTabGroupTimerRef.current)
+      justCreatedTabGroupTimerRef.current = null
+    }
+    setJustCreatedTabGroupId(groupId)
+    justCreatedTabGroupTimerRef.current = window.setTimeout(() => {
+      setJustCreatedTabGroupId((current) => (current === groupId ? null : current))
+      justCreatedTabGroupTimerRef.current = null
+    }, TAB_GROUP_CREATE_EFFECT_MS)
+  }
+
   const createGroupForTab = (tabId: string) => {
     const groupId = createTabGroupId()
     setTabs((current) => {
@@ -1270,16 +1354,19 @@ export default function App() {
       })
       return nextTabs
     })
+    markTabGroupJustCreated(groupId)
   }
 
   const createGroupForTabs = (tabIds: string[]) => {
     const uniqueTabIds = Array.from(new Set(tabIds.filter(Boolean)))
     if (uniqueTabIds.length < 2) return
-    const groupId = createTabGroupId()
     const tabIdSet = new Set(uniqueTabIds)
+    const groupableTabs = tabsRef.current.filter((tab) => tabIdSet.has(tab.id) && !tab.groupId)
+    if (groupableTabs.length < 2) return
+    const groupId = createTabGroupId()
     setTabs((current) => {
-      const groupableTabs = current.filter((tab) => tabIdSet.has(tab.id) && !tab.groupId)
-      if (groupableTabs.length < 2) return current
+      const stillGroupable = current.filter((tab) => tabIdSet.has(tab.id) && !tab.groupId)
+      if (stillGroupable.length < 2) return current
       const nextTabs = current.map((tab) => (
         tabIdSet.has(tab.id) ? { ...tab, groupId } : tab
       ))
@@ -1289,6 +1376,7 @@ export default function App() {
       })
       return nextTabs
     })
+    markTabGroupJustCreated(groupId)
   }
 
   const moveTabToGroup = (tabId: string, groupId: string) => {
@@ -1432,22 +1520,221 @@ export default function App() {
     close()
   }
 
-  const getTabGroupDropTarget = (strip: HTMLElement, clientX: number, clientY: number): string | null => {
-    const elements = Array.from(strip.querySelectorAll<HTMLElement>('[data-app-tab-group-drop-target]'))
-    for (const element of elements) {
-      const groupId = element.dataset.appTabGroupDropTarget
-      if (!groupId) continue
-      const bounds = element.getBoundingClientRect()
-      if (
-        clientX >= bounds.left
-        && clientX <= bounds.right
-        && clientY >= bounds.top
-        && clientY <= bounds.bottom
-      ) {
-        return groupId
+  const clearTabDragHighlights = () => {
+    const strip = tabStripRef.current
+    if (strip) {
+      strip.querySelectorAll<HTMLElement>('.is-group-drop-target').forEach((element) => {
+        element.classList.remove('is-group-drop-target')
+      })
+      strip.querySelectorAll<HTMLElement>('.app-tab-group-segment.is-drop-target').forEach((element) => {
+        element.classList.remove('is-drop-target')
+      })
+    }
+    const indicator = tabDropIndicatorRef.current
+    if (indicator) {
+      indicator.style.opacity = '0'
+      indicator.dataset.active = 'false'
+    }
+  }
+
+  const updateTabDragPreviewPosition = (drag: AppTabPointerDrag | AppTabGroupPointerDrag) => {
+    const preview = drag.previewElement
+    if (!preview) return
+    const previewLeft = Math.min(
+      Math.max(6, drag.clientX - drag.grabOffsetX),
+      Math.max(6, window.innerWidth - drag.width - 6),
+    )
+    const previewTop = Math.min(
+      Math.max(6, drag.top - 2),
+      Math.max(6, window.innerHeight - drag.height - 6),
+    )
+    // Direct style write (no React) keeps the floating tab on the pointer.
+    preview.style.transform = `translate3d(${Math.round(previewLeft)}px, ${Math.round(previewTop)}px, 0)`
+  }
+
+  const showTabDropIndicator = (clientX: number, top: number, height: number) => {
+    const indicator = tabDropIndicatorRef.current
+    if (!indicator) return
+    indicator.style.opacity = '1'
+    indicator.style.transform = `translate3d(${Math.round(clientX)}px, ${Math.round(top)}px, 0)`
+    indicator.style.height = `${Math.round(height)}px`
+    indicator.dataset.active = 'true'
+  }
+
+  /**
+   * Resolve tab drop against top-level strip items (ungrouped tabs + group segments).
+   * - Group middle → join group; group sides → insert before/after the whole group (incl. rightmost).
+   * - Tab middle 50% (or full tab with Shift/Alt while dragging) → create group with ungrouped peer.
+   * - Otherwise reorder.
+   */
+  const resolveTabPointerDrop = (strip: HTMLElement, drag: AppTabPointerDrag) => {
+    const desiredCenter = drag.clientX - drag.grabOffsetX + drag.width / 2
+    const sourceTab = tabsRef.current.find((tab) => tab.id === drag.tabId)
+    const topLevelItems = Array.from(
+      strip.querySelectorAll<HTMLElement>(':scope > [data-app-tab-id], :scope > [data-app-tab-group-id]'),
+    )
+      .map((element) => {
+        const tabId = element.dataset.appTabId
+        const groupId = element.dataset.appTabGroupId
+        if (tabId && tabId === drag.tabId) return null
+        if (!tabId && !groupId) return null
+        return {
+          type: (groupId ? 'group' : 'tab') as AppTabStripTargetType,
+          id: groupId || tabId || '',
+          bounds: element.getBoundingClientRect(),
+          element,
+        }
+      })
+      .filter((item): item is { type: AppTabStripTargetType; id: string; bounds: DOMRect; element: HTMLElement } => (
+        !!item && !!item.id
+      ))
+
+    if (topLevelItems.length === 0) return null
+
+    let stripTarget: {
+      type: AppTabStripTargetType
+      id: string
+      position: TabDropPosition
+      bounds: DOMRect
+      element: HTMLElement
+    } | null = null
+    for (const item of topLevelItems) {
+      if (desiredCenter < item.bounds.left + item.bounds.width / 2) {
+        stripTarget = { ...item, position: 'before' }
+        break
+      }
+      stripTarget = { ...item, position: 'after' }
+    }
+    if (!stripTarget) return null
+
+    if (stripTarget.type === 'group') {
+      const overGroup = desiredCenter >= stripTarget.bounds.left && desiredCenter <= stripTarget.bounds.right
+      if (overGroup) {
+        const ratio = (desiredCenter - stripTarget.bounds.left) / Math.max(1, stripTarget.bounds.width)
+        // Side quarters: place the tab before/after the whole group (fixes "can't go past rightmost group").
+        if (ratio < TAB_GROUP_ZONE_SIDE_RATIO) {
+          return {
+            intent: 'reorder' as const,
+            targetType: 'group' as const,
+            targetId: stripTarget.id,
+            position: 'before' as const,
+            bounds: stripTarget.bounds,
+            element: stripTarget.element,
+          }
+        }
+        if (ratio > (1 - TAB_GROUP_ZONE_SIDE_RATIO)) {
+          return {
+            intent: 'reorder' as const,
+            targetType: 'group' as const,
+            targetId: stripTarget.id,
+            position: 'after' as const,
+            bounds: stripTarget.bounds,
+            element: stripTarget.element,
+          }
+        }
+        // Middle of a different group → join it.
+        if (sourceTab?.groupId !== stripTarget.id) {
+          return {
+            intent: 'join-group' as const,
+            targetType: 'group' as const,
+            targetId: stripTarget.id,
+            position: stripTarget.position,
+            bounds: stripTarget.bounds,
+            element: stripTarget.element,
+          }
+        }
+      } else {
+        return {
+          intent: 'reorder' as const,
+          targetType: 'group' as const,
+          targetId: stripTarget.id,
+          position: stripTarget.position,
+          bounds: stripTarget.bounds,
+          element: stripTarget.element,
+        }
       }
     }
-    return null
+
+    // Fine-grained tab anchors (includes nested tabs inside expanded groups).
+    const otherTabs = Array.from(strip.querySelectorAll<HTMLElement>('[data-app-tab-id]'))
+      .filter((element) => element.dataset.appTabId && element.dataset.appTabId !== drag.tabId)
+    let tabTarget: { tabId: string; position: TabDropPosition; bounds: DOMRect; element: HTMLElement } | null = null
+    for (const element of otherTabs) {
+      const tabId = element.dataset.appTabId
+      if (!tabId) continue
+      const bounds = element.getBoundingClientRect()
+      if (desiredCenter < bounds.left + bounds.width / 2) {
+        tabTarget = { tabId, position: 'before', bounds, element }
+        break
+      }
+      tabTarget = { tabId, position: 'after', bounds, element }
+    }
+
+    // Prefer top-level ungrouped tab when the strip target is that tab.
+    if (stripTarget.type === 'tab') {
+      const nearTab = tabsRef.current.find((tab) => tab.id === stripTarget.id)
+      const canCreateGroup = !!(sourceTab && nearTab && !sourceTab.groupId && !nearTab.groupId)
+      if (canCreateGroup) {
+        // Shift/Alt while dragging: any position relative to this tab creates a group.
+        // Without modifiers: only the middle 50% of the target tab.
+        if (
+          drag.forceGroupModifier
+          || isTabGroupDropZone(desiredCenter, stripTarget.bounds, false)
+        ) {
+          return {
+            intent: 'group' as const,
+            targetType: 'tab' as const,
+            targetId: stripTarget.id,
+            position: stripTarget.position,
+            bounds: stripTarget.bounds,
+            element: stripTarget.element,
+          }
+        }
+      }
+      return {
+        intent: 'reorder' as const,
+        targetType: 'tab' as const,
+        targetId: stripTarget.id,
+        position: stripTarget.position,
+        bounds: stripTarget.bounds,
+        element: stripTarget.element,
+      }
+    }
+
+    if (tabTarget) {
+      const nearTab = tabsRef.current.find((tab) => tab.id === tabTarget.tabId)
+      const canCreateGroup = !!(sourceTab && nearTab && !sourceTab.groupId && !nearTab.groupId)
+      if (canCreateGroup && (
+        drag.forceGroupModifier
+        || isTabGroupDropZone(desiredCenter, tabTarget.bounds, false)
+      )) {
+        return {
+          intent: 'group' as const,
+          targetType: 'tab' as const,
+          targetId: tabTarget.tabId,
+          position: tabTarget.position,
+          bounds: tabTarget.bounds,
+          element: tabTarget.element,
+        }
+      }
+      return {
+        intent: 'reorder' as const,
+        targetType: 'tab' as const,
+        targetId: tabTarget.tabId,
+        position: tabTarget.position,
+        bounds: tabTarget.bounds,
+        element: tabTarget.element,
+      }
+    }
+
+    return {
+      intent: 'reorder' as const,
+      targetType: stripTarget.type,
+      targetId: stripTarget.id,
+      position: stripTarget.position,
+      bounds: stripTarget.bounds,
+      element: stripTarget.element,
+    }
   }
 
   const captureTabLayout = () => {
@@ -1510,62 +1797,70 @@ export default function App() {
       if (!strip) return
 
       if (groupDrag?.moved) {
-        const previewLeft = Math.min(
-          Math.max(6, groupDrag.clientX - groupDrag.grabOffsetX),
-          Math.max(6, window.innerWidth - groupDrag.width - 6),
-        )
-        const previewTop = Math.min(
-          Math.max(6, groupDrag.top - 2),
-          Math.max(6, window.innerHeight - groupDrag.height - 6),
-        )
-        groupDrag.previewElement?.style.setProperty(
-          'transform',
-          `translate3d(${previewLeft}px, ${previewTop}px, 0)`,
-        )
-
-        const target = getTabGroupReorderTarget(strip, groupDrag)
-        groupDrag.target = target
+        // Preview is already updated on pointermove; only resolve hit-test here.
+        groupDrag.target = getTabGroupReorderTarget(strip, groupDrag)
+        if (groupDrag.target) {
+          const desiredCenter = groupDrag.clientX - groupDrag.grabOffsetX + groupDrag.width / 2
+          const items = Array.from(
+            strip.querySelectorAll<HTMLElement>(':scope > [data-app-tab-id], :scope > [data-app-tab-group-id]'),
+          )
+          let indicatorX = desiredCenter
+          for (const element of items) {
+            if (element.dataset.appTabGroupId === groupDrag.groupId) continue
+            const bounds = element.getBoundingClientRect()
+            const mid = bounds.left + bounds.width / 2
+            if (desiredCenter < mid) {
+              indicatorX = bounds.left - 1
+              break
+            }
+            indicatorX = bounds.right + 1
+          }
+          showTabDropIndicator(indicatorX, groupDrag.top, groupDrag.height)
+        }
         return
       }
 
       if (!drag?.moved) return
 
-      const previewLeft = Math.min(
-        Math.max(6, drag.clientX - drag.grabOffsetX),
-        Math.max(6, window.innerWidth - drag.width - 6),
-      )
-      const previewTop = Math.min(
-        Math.max(6, drag.top - 2),
-        Math.max(6, window.innerHeight - drag.height - 6),
-      )
-      drag.previewElement?.style.setProperty(
-        'transform',
-        `translate3d(${previewLeft}px, ${previewTop}px, 0)`,
-      )
+      const resolved = resolveTabPointerDrop(strip, drag)
+      drag.targetType = resolved?.targetType || null
+      drag.targetId = resolved?.targetId || null
+      drag.targetDropPosition = resolved?.position || null
+      drag.targetDropIntent = resolved?.intent || null
 
-      const nextTargetGroupId = getTabGroupDropTarget(strip, drag.clientX, drag.top + drag.height / 2)
-      if (drag.targetGroupId !== nextTargetGroupId) {
-        drag.targetGroupId = nextTargetGroupId
-        setDragOverTabGroupId(nextTargetGroupId)
-      }
+      const canCreateGroup = resolved?.intent === 'group'
+      const canJoinGroup = resolved?.intent === 'join-group'
+      const highlightKey = canCreateGroup
+        ? `group-tab:${resolved.targetId}`
+        : canJoinGroup
+          ? `join:${resolved.targetId}`
+          : resolved
+            ? `reorder:${resolved.targetType}:${resolved.targetId}:${resolved.position}`
+            : null
 
-      const desiredCenter = drag.clientX - drag.grabOffsetX + drag.width / 2
-      const otherTabs = Array.from(strip.querySelectorAll<HTMLElement>('[data-app-tab-id]'))
-        .filter((element) => element.dataset.appTabId !== drag.tabId)
-      let target: { tabId: string; position: TabDropPosition } | null = null
-      for (const element of otherTabs) {
-        const tabId = element.dataset.appTabId
-        if (!tabId) continue
-        const bounds = element.getBoundingClientRect()
-        if (desiredCenter < bounds.left + bounds.width / 2) {
-          target = { tabId, position: 'before' }
-          break
+      if (drag.highlightKey !== highlightKey) {
+        drag.highlightKey = highlightKey
+        clearTabDragHighlights()
+        if (canCreateGroup && resolved) {
+          resolved.element.classList.add('is-group-drop-target')
+        } else if (canJoinGroup && resolved) {
+          resolved.element.classList.add('is-drop-target')
+        } else if (resolved) {
+          const edgeX = resolved.position === 'before'
+            ? resolved.bounds.left - 1
+            : resolved.bounds.right + 1
+          showTabDropIndicator(edgeX, drag.top, drag.height)
         }
-        target = { tabId, position: 'after' }
+      } else if (resolved && resolved.intent === 'reorder') {
+        const edgeX = resolved.position === 'before'
+          ? resolved.bounds.left - 1
+          : resolved.bounds.right + 1
+        showTabDropIndicator(edgeX, drag.top, drag.height)
       }
-      drag.targetTabId = target?.tabId || null
-      drag.targetDropPosition = target?.position || null
 
+      drag.previewElement?.classList.toggle('is-group-intent', canCreateGroup)
+      drag.previewElement?.classList.toggle('is-force-group', canCreateGroup && drag.forceGroupModifier)
+      drag.previewElement?.classList.toggle('is-join-group', canJoinGroup)
     })
   }
 
@@ -1581,14 +1876,16 @@ export default function App() {
     const targetElement = drag
       ? tabStripRef.current?.querySelector<HTMLElement>(`[data-app-tab-id="${CSS.escape(drag.tabId)}"]`)
       : null
-    const droppedGroupId = drag?.targetGroupId || null
     const droppedTabId = drag?.tabId || ''
-    const droppedNearTabId = drag?.targetTabId || ''
+    const droppedTargetType = drag?.targetType || null
+    const droppedTargetId = drag?.targetId || ''
+    const droppedDropIntent = drag?.targetDropIntent || null
+    const droppedTargetDropPosition = drag?.targetDropPosition || null
     tabPointerDragRef.current = null
     document.body.classList.remove('is-app-tab-dragging')
+    clearTabDragHighlights()
 
     if (!drag?.moved || cancelled) {
-      setDragOverTabGroupId(null)
       drag?.previewElement?.remove()
       setDraggedTabId(null)
       suppressTabClickRef.current = false
@@ -1596,29 +1893,57 @@ export default function App() {
     }
 
     const finishDrop = () => {
-      setDragOverTabGroupId(null)
+      clearTabDragHighlights()
       const droppedTab = tabsRef.current.find((tab) => tab.id === droppedTabId)
-      if (droppedGroupId && droppedTabId && droppedTab?.groupId !== droppedGroupId) {
+      if (!droppedTab) return
+
+      if (droppedDropIntent === 'join-group' && droppedTargetId && droppedTab.groupId !== droppedTargetId) {
         pendingTabLayoutRef.current = captureTabLayout()
-        moveTabToGroup(droppedTabId, droppedGroupId)
+        moveTabToGroup(droppedTabId, droppedTargetId)
         return
       }
-      if (!droppedGroupId && droppedTab?.groupId) {
-        pendingTabLayoutRef.current = captureTabLayout()
-        removeTabFromGroup(droppedTabId)
-        return
-      }
-      const droppedNearTab = tabsRef.current.find((tab) => tab.id === droppedNearTabId)
-      if (!droppedGroupId && droppedTab && droppedNearTab && !droppedTab.groupId && !droppedNearTab.groupId) {
-        pendingTabLayoutRef.current = captureTabLayout()
-        createGroupForTabs([droppedTab.id, droppedNearTab.id])
-        return
-      }
-      if (drag.targetTabId && drag.targetDropPosition) {
-        const currentTabs = tabsRef.current
-        const nextTabs = reorderAppTabs(currentTabs, drag.tabId, drag.targetTabId, drag.targetDropPosition)
-        if (nextTabs !== currentTabs) {
+
+      // Only create a group after a real drag, in the group zone (middle 50%, or full tab with Shift/Alt).
+      if (droppedDropIntent === 'group' && droppedTargetType === 'tab' && droppedTargetId) {
+        const droppedNearTab = tabsRef.current.find((tab) => tab.id === droppedTargetId)
+        if (
+          droppedNearTab
+          && !droppedTab.groupId
+          && !droppedNearTab.groupId
+        ) {
           pendingTabLayoutRef.current = captureTabLayout()
+          createGroupForTabs([droppedTab.id, droppedNearTab.id])
+          return
+        }
+      }
+
+      if (droppedTargetId && droppedTargetDropPosition && droppedTargetType) {
+        let currentTabs = tabsRef.current
+        // Leave the current group when reordering next to a tab outside it.
+        if (droppedTab.groupId && droppedTargetType === 'tab') {
+          const targetTab = currentTabs.find((tab) => tab.id === droppedTargetId)
+          if (!targetTab || targetTab.groupId !== droppedTab.groupId) {
+            currentTabs = currentTabs.map((tab) => (
+              tab.id === droppedTabId ? { ...tab, groupId: undefined } : tab
+            ))
+          }
+        }
+        const nextTabs = reorderAppTabToStripTarget(
+          currentTabs,
+          drag.tabId,
+          { type: droppedTargetType, id: droppedTargetId, position: droppedTargetDropPosition },
+        )
+        if (nextTabs !== tabsRef.current) {
+          pendingTabLayoutRef.current = droppedTargetType === 'group'
+            ? captureTabStripItemLayout()
+            : captureTabLayout()
+          const groupMembershipChanged = nextTabs.some((tab) => {
+            const previous = tabsRef.current.find((item) => item.id === tab.id)
+            return previous?.groupId !== tab.groupId
+          })
+          if (groupMembershipChanged) {
+            setTabGroups((groups) => pruneTabGroupsForTabs(groups, nextTabs))
+          }
           tabsRef.current = nextTabs
           setTabs(nextTabs)
         }
@@ -1629,30 +1954,49 @@ export default function App() {
     const targetBounds = targetElement?.getBoundingClientRect()
     const previewBounds = previewElement?.getBoundingClientRect()
     const droppedTab = tabsRef.current.find((tab) => tab.id === droppedTabId)
-    const droppedNearTab = tabsRef.current.find((tab) => tab.id === droppedNearTabId)
-    const changesGroupMembership = !!(
-      (droppedGroupId && droppedTab?.groupId !== droppedGroupId)
-      || (!droppedGroupId && droppedTab?.groupId)
-      || (!droppedGroupId && droppedTab && droppedNearTab && !droppedTab.groupId && !droppedNearTab.groupId)
+    const willCreateGroup = droppedDropIntent === 'group'
+    const willJoinGroup = droppedDropIntent === 'join-group'
+    const willLeaveGroup = !!(
+      droppedTab?.groupId
+      && droppedDropIntent === 'reorder'
+      && droppedTargetId
+      && (
+        droppedTargetType === 'group'
+          ? droppedTargetId !== droppedTab.groupId
+          : tabsRef.current.find((tab) => tab.id === droppedTargetId)?.groupId !== droppedTab.groupId
+      )
     )
+    const changesGroupMembership = willCreateGroup || willJoinGroup || willLeaveGroup
     if (changesGroupMembership) {
       setDraggedTabId(null)
       finishDrop()
       if (previewElement) {
+        const baseTransform = previewElement.style.transform || 'translate3d(0, 0, 0)'
         const fadeAnimation = previewElement.animate(
-          [
-            { opacity: 1, transform: previewElement.style.transform },
-            { opacity: 0, transform: `${previewElement.style.transform} scale(0.98)` },
-          ],
-          { duration: 120, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
+          willCreateGroup
+            ? [
+                {
+                  opacity: 1,
+                  transform: baseTransform,
+                  boxShadow: '0 10px 24px rgba(0, 0, 0, 0.34), 0 0 0 2px rgba(212, 173, 132, 0.55), 0 0 22px rgba(212, 173, 132, 0.45)',
+                },
+                {
+                  opacity: 0,
+                  transform: `${baseTransform} scale(1.08)`,
+                  boxShadow: '0 0 0 rgba(0, 0, 0, 0), 0 0 28px rgba(212, 173, 132, 0.75)',
+                },
+              ]
+            : [
+                { opacity: 1, transform: baseTransform },
+                { opacity: 0, transform: `${baseTransform} scale(0.98)` },
+              ],
+          { duration: willCreateGroup ? 220 : 120, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
         )
         void fadeAnimation.finished
           .catch(() => {})
           .finally(() => {
             previewElement.remove()
           })
-      } else {
-        setDraggedTabId(null)
       }
       window.setTimeout(() => {
         suppressTabClickRef.current = false
@@ -1666,7 +2010,7 @@ export default function App() {
           { transform: `translate3d(${previewBounds.left}px, ${previewBounds.top}px, 0)` },
           { transform: `translate3d(${targetBounds.left}px, ${targetBounds.top}px, 0)` },
         ],
-        { duration: 160, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
+        { duration: 140, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
       )
       void settleAnimation.finished
         .catch(() => {})
@@ -1699,6 +2043,7 @@ export default function App() {
       : null
     tabGroupPointerDragRef.current = null
     document.body.classList.remove('is-app-tab-dragging')
+    clearTabDragHighlights()
 
     if (!drag?.moved || cancelled) {
       drag?.previewElement?.remove()
@@ -1760,15 +2105,20 @@ export default function App() {
       top: bounds.top,
       moved: false,
       previewElement: null,
-      targetGroupId: null,
-      targetTabId: null,
+      forceGroupModifier: isForceGroupModifierActive(event),
+      targetType: null,
+      targetId: null,
       targetDropPosition: null,
+      targetDropIntent: null,
+      highlightKey: null,
     }
 
     const handlePointerMove = (pointerEvent: PointerEvent) => {
       const drag = tabPointerDragRef.current
       if (!drag || pointerEvent.pointerId !== drag.pointerId) return
       drag.clientX = pointerEvent.clientX
+      // Only the drag gesture + held Shift/Alt can force-group — never a plain Shift click.
+      drag.forceGroupModifier = drag.moved && isForceGroupModifierActive(pointerEvent)
       if (!drag.moved) {
         const distance = Math.hypot(
           pointerEvent.clientX - drag.startClientX,
@@ -1776,6 +2126,7 @@ export default function App() {
         )
         if (distance < TAB_DRAG_ACTIVATION_DISTANCE) return
         drag.moved = true
+        drag.forceGroupModifier = isForceGroupModifierActive(pointerEvent)
         suppressTabClickRef.current = true
         const previewElement = tabElement.cloneNode(true) as HTMLElement
         previewElement.removeAttribute('data-app-tab-id')
@@ -1793,12 +2144,31 @@ export default function App() {
         document.body.classList.add('is-app-tab-dragging')
         window.getSelection()?.removeAllRanges()
       }
+      // Preview follows the pointer immediately; hit-testing stays on rAF for smoothness.
+      updateTabDragPreviewPosition(drag)
       pointerEvent.preventDefault()
+      scheduleTabDragFrame()
+    }
+    const handleModifierKeyChange = (keyboardEvent: KeyboardEvent) => {
+      const drag = tabPointerDragRef.current
+      if (!drag?.moved) return
+      drag.forceGroupModifier = isForceGroupModifierActive(keyboardEvent)
       scheduleTabDragFrame()
     }
     const handlePointerUp = (pointerEvent: PointerEvent) => {
       const drag = tabPointerDragRef.current
       if (!drag || pointerEvent.pointerId !== drag.pointerId) return
+      // Force-group only if this pointer session actually dragged.
+      drag.forceGroupModifier = drag.moved && isForceGroupModifierActive(pointerEvent)
+      // Resolve against the final pointer state so Shift/Alt on release is respected.
+      const strip = tabStripRef.current
+      if (drag.moved && strip) {
+        const resolved = resolveTabPointerDrop(strip, drag)
+        drag.targetType = resolved?.targetType || null
+        drag.targetId = resolved?.targetId || null
+        drag.targetDropPosition = resolved?.position || null
+        drag.targetDropIntent = resolved?.intent || null
+      }
       finishTabPointerDrag()
     }
     const handlePointerCancel = (pointerEvent: PointerEvent) => {
@@ -1809,10 +2179,14 @@ export default function App() {
     window.addEventListener('pointermove', handlePointerMove, { passive: false })
     window.addEventListener('pointerup', handlePointerUp)
     window.addEventListener('pointercancel', handlePointerCancel)
+    window.addEventListener('keydown', handleModifierKeyChange)
+    window.addEventListener('keyup', handleModifierKeyChange)
     tabPointerCleanupRef.current = () => {
       window.removeEventListener('pointermove', handlePointerMove)
       window.removeEventListener('pointerup', handlePointerUp)
       window.removeEventListener('pointercancel', handlePointerCancel)
+      window.removeEventListener('keydown', handleModifierKeyChange)
+      window.removeEventListener('keyup', handleModifierKeyChange)
     }
   }
 
@@ -1870,6 +2244,7 @@ export default function App() {
         document.body.classList.add('is-app-tab-dragging')
         window.getSelection()?.removeAllRanges()
       }
+      updateTabDragPreviewPosition(drag)
       pointerEvent.preventDefault()
       scheduleTabDragFrame()
     }
@@ -1936,6 +2311,7 @@ export default function App() {
   useEffect(() => () => {
     tabPointerCleanupRef.current?.()
     if (tabDragFrameRef.current !== null) window.cancelAnimationFrame(tabDragFrameRef.current)
+    if (justCreatedTabGroupTimerRef.current !== null) window.clearTimeout(justCreatedTabGroupTimerRef.current)
     tabReorderAnimationsRef.current.forEach((animation) => animation.cancel())
     tabPointerDragRef.current?.previewElement?.remove()
     tabGroupPointerDragRef.current?.previewElement?.remove()
@@ -2559,16 +2935,23 @@ export default function App() {
               data-app-tab-visible-count={visibleTabCount}
               style={{ '--app-tab-strip-ideal-width': `${tabStripIdealWidth}px` } as React.CSSProperties}
             >
+              <div
+                ref={tabDropIndicatorRef}
+                className="app-tab-drop-indicator"
+                data-app-tab-drop-indicator="true"
+                aria-hidden="true"
+              />
               {tabStripItems.map((item) => {
                 if (item.type === 'group') {
                   return (
                     <div
                       key={`group:${item.group.id}`}
-                      className={`app-tab-group-segment ${item.group.collapsed ? 'is-collapsed' : ''} ${item.active ? 'is-active' : ''} ${dragOverTabGroupId === item.group.id ? 'is-drop-target' : ''}`}
+                      className={`app-tab-group-segment ${item.group.collapsed ? 'is-collapsed' : ''} ${item.active ? 'is-active' : ''} ${justCreatedTabGroupId === item.group.id ? 'is-just-created' : ''}`}
                       data-app-tab-group-dragging={draggedTabGroupId === item.group.id ? 'true' : undefined}
                       data-app-tab-group-drop-target={item.group.id}
                       data-app-tab-group-id={item.group.id}
                       data-app-tab-group-collapsed={item.group.collapsed ? 'true' : undefined}
+                      data-app-tab-group-just-created={justCreatedTabGroupId === item.group.id ? 'true' : undefined}
                       style={{ '--app-tab-group-color': item.group.color } as React.CSSProperties}
                     >
                       <Popover

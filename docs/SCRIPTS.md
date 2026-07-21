@@ -2,6 +2,12 @@
 
 This project keeps public checks self-contained. New contributors should be able to run the default gates without private data, API keys, or local database snapshots.
 
+## Documentation helpers
+
+- `node scripts/generate-tutorial-docx.js`  
+  Rebuilds `docs/文献管理-图文使用教程.docx` from `docs/文献管理-图文使用教程.md` (requires `npm install docx --no-save`). If the primary `.docx` is open/locked, writes `文献管理-图文使用教程-1.1.10.docx` instead.  
+  Re-shoot empty-library screenshots into `docs/images/tutorial-*.png` before regenerating when the UI changes.
+
 ## Default Gates
 
 Run these before opening a pull request:
