@@ -167,8 +167,20 @@ export type LibrarySmartViewCountKey =
   | 'metadataPending'
   | 'unstored'
   | 'vectorized'
+  | 'notVectorized'
+  | 'embeddingQueued'
+  | 'embeddingProcessing'
+  | 'embeddingError'
 
 export type LibrarySmartViewCounts = Record<LibrarySmartViewCountKey, number>
+
+/** Vector-index refinement that can AND with folder/tag/all scope. */
+export type LibraryEmbeddingFilter =
+  | 'ready'
+  | 'not_ready'
+  | 'queued'
+  | 'processing'
+  | 'error'
 
 export interface LibraryStateCache {
   smartViewCounts: LibrarySmartViewCounts
@@ -1114,11 +1126,25 @@ export interface PdfRepositoryIndexResult {
   matchedCount: number
 }
 
+/** How PDF original is restored into the library. */
+export type PdfAssetRestoreStorageMode = 'copy' | 'link'
+
+export interface PdfAssetRestoreOptions {
+  /**
+   * When true, only register the source absolute path (no copy into app storage).
+   * Faster for large files; path must remain readable (external disk / NAS).
+   * When omitted, main process uses the `pdf_restore_link_only` setting.
+   */
+  linkOnly?: boolean
+}
+
 export interface PdfAssetRestoreResult {
   restored: boolean
   path?: string
   error?: string
   pdfCompression?: PdfCompressionSummary
+  /** copy = duplicated under data/storage; link = external path only */
+  storageMode?: PdfAssetRestoreStorageMode
 }
 
 export interface PdfCompressionSummary {
@@ -1273,6 +1299,11 @@ export interface ListDocumentOptions {
   healthFilter?: LibraryHealthFilterType
   /** When true, only documents with ready embedding index status. */
   embeddingReady?: boolean
+  /**
+   * Finer embedding status filter (preferred over embeddingReady).
+   * Can combine with folderIds/tagIds — e.g. folder ∩ not_ready.
+   */
+  embeddingFilter?: LibraryEmbeddingFilter
   sortKey?: LibraryDocumentSortKey
   sortDirection?: LibraryDocumentSortDirection
   limit?: number
@@ -1299,12 +1330,31 @@ export type LibraryFilterType =
   | 'proofStatus'
   | 'metadataPending'
   | 'embeddingReady'
+  | 'embeddingNotReady'
+  | 'embeddingQueued'
+  | 'embeddingProcessing'
+  | 'embeddingError'
   | LibraryHealthFilterType
 
 export interface LibraryFilter {
   type: LibraryFilterType
   value?: string
   tagIds?: string[]
+  /**
+   * Optional AND folder scope when `type` is a smart filter (e.g. 已向量化 ∩ 某文件夹).
+   * When `type === 'folder'`, use `value` as the folder id instead.
+   */
+  scopeFolderId?: string
+  /**
+   * Optional AND tag scope when `type` is a smart filter.
+   * When `type === 'tag'`, use `tagIds` / `value` instead.
+   */
+  scopeTagIds?: string[]
+  /**
+   * Optional AND refinement for vector status (folder/tag/all ∩ embedding state).
+   * Preferred over changing `type` to embedding* when combining scopes.
+   */
+  embeddingFilter?: LibraryEmbeddingFilter
 }
 
 export interface DocumentListItem extends Omit<Document, 'ocr_status' | 'proof_status' | 'import_status' | 'metadata_status' | 'metadata'> {
@@ -2345,6 +2395,13 @@ export type DocumentExportFormat =
   | 'layout-pdf'
   | 'layout-searchable-pdf'
 
+/**
+ * Page number label used in exports and reader UI:
+ * - literature: 文献页码（书上印刷/校准后的连续页码，默认）
+ * - natural: 自然页码（PDF/扫描影像物理页序 1…N）
+ */
+export type ExportPageNumberMode = 'literature' | 'natural'
+
 export interface DocumentExportOptions {
   facsimileFontScale?: number
   facsimileShowRules?: boolean
@@ -2355,6 +2412,8 @@ export interface DocumentExportOptions {
   readingPageWidth?: number
   readingTheme?: 'paper' | 'sepia' | 'dark'
   readingDisplayScript?: 'original' | 'simplified' | 'traditional'
+  /** Default: literature (文献页码). */
+  pageNumberMode?: ExportPageNumberMode
 }
 
 export interface DocumentExportBatchError {
@@ -3455,6 +3514,12 @@ export interface SearchSessionState {
   activeHitIndex: number
   status: 'idle' | 'searching' | 'ready' | 'empty' | 'error'
   phase?: SearchQueryStatus
+  /**
+   * Reader navigation engine for this session.
+   * - fulltext (default): in-document keyword hits; may expand via FTS.
+   * - vector: semantic hits; must not re-run keyword search; highlight by excerpt.
+   */
+  engine?: 'fulltext' | 'vector'
 }
 
 export interface SearchDocumentHitPage {
@@ -3549,6 +3614,13 @@ export interface SearchOptions {
   previewOnly?: boolean
   translationScope?: TranslationSearchScope
   snapshotId?: string
+  /**
+   * Export/preview path: use embedding vector search hits instead of full-text FTS.
+   * Desktop vector mode must set this so “导出命中摘录” does not re-run keyword search.
+   */
+  searchEngine?: 'fulltext' | 'vector'
+  /** Default: literature (文献页码). */
+  pageNumberMode?: ExportPageNumberMode
 }
 
 export interface SearchExportOptions {
@@ -3557,6 +3629,10 @@ export interface SearchExportOptions {
   citationTemplateId?: string
   previewOnly?: boolean
   format?: SearchExportFormat
+  /** When true / from vector search, export includes similarity scores and AI-oriented layout. */
+  searchEngine?: 'fulltext' | 'vector'
+  /** Default: literature (文献页码). */
+  pageNumberMode?: ExportPageNumberMode
 }
 
 export interface SearchExportPreviewItem {
@@ -3571,6 +3647,8 @@ export interface SearchExportPreviewItem {
   locatorText: string
   sourceType: string
   sourceKey: string
+  /** Cosine similarity for vector hits (0–1). */
+  score?: number | null
 }
 
 export interface SearchExportPreviewResult {

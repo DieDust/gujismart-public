@@ -151,6 +151,7 @@ import type {
   PageTranslationProgressEvent,
   PageTranslationResult,
   PdfAssetCleanupResult,
+  PdfAssetRestoreOptions,
   PdfAssetRestoreResult,
   PdfRepositoryIndexResult,
   PdfRepositoryStatus,
@@ -294,10 +295,10 @@ const api = {
     ipcRenderer.invoke('pdfRepository:remove', repositoryId),
   indexPdfRepositories: (): Promise<PdfRepositoryIndexResult> =>
     ipcRenderer.invoke('pdfRepository:index'),
-  restorePdfForDocument: (docId: string): Promise<PdfAssetRestoreResult> =>
-    ipcRenderer.invoke('pdfRepository:restoreForDocument', docId),
-  selectAndRestorePdfForDocument: (docId: string): Promise<PdfAssetRestoreResult> =>
-    ipcRenderer.invoke('pdfRepository:selectAndRestoreForDocument', docId),
+  restorePdfForDocument: (docId: string, options?: PdfAssetRestoreOptions): Promise<PdfAssetRestoreResult> =>
+    ipcRenderer.invoke('pdfRepository:restoreForDocument', docId, options),
+  selectAndRestorePdfForDocument: (docId: string, options?: PdfAssetRestoreOptions): Promise<PdfAssetRestoreResult> =>
+    ipcRenderer.invoke('pdfRepository:selectAndRestoreForDocument', docId, options),
 
   selectImportSources: (): Promise<CapabilityResult<ImportSelection>> =>
     ipcRenderer.invoke('documents:selectImportSources'),
@@ -867,9 +868,23 @@ const api = {
   }> => ipcRenderer.invoke('embedding:requeueFailed'),
   setEmbeddingQueuePaused: (paused: boolean): Promise<EmbeddingIndexStats> =>
     ipcRenderer.invoke('embedding:setQueuePaused', paused),
+  cancelDocumentsForEmbedding: (docIds: string[]): Promise<{
+    canceled: number
+    restoredReady: number
+    restoredPending: number
+    skipped: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:cancelDocuments', docIds),
+  cancelAllPendingEmbeddings: (): Promise<{
+    canceled: number
+    restoredReady: number
+    restoredPending: number
+    skipped: number
+    stats: EmbeddingIndexStats
+  }> => ipcRenderer.invoke('embedding:cancelAllPending'),
   vectorSearch: (
     query: string,
-    options?: { limit?: number; folderId?: string; tagId?: string },
+    options?: { limit?: number; folderId?: string; tagId?: string; docId?: string },
   ): Promise<VectorSearchResponse | VectorSearchFailure> =>
     ipcRenderer.invoke('embedding:search', query, options),
   listEmbeddingModels: (): Promise<string[]> =>

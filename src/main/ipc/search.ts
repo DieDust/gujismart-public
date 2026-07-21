@@ -27,9 +27,11 @@ import {
   saveSearch,
   semanticSearch
 } from '../semantic-search'
+import { vectorSearch } from '../embedding-index'
 import type {
   AiPlannedSearchResponse,
   CursorPage,
+  ExportPageNumberMode,
   SaveSearchExcerptsOptions,
   SaveSearchExcerptsResult,
   SavedSearch,
@@ -57,7 +59,26 @@ import type {
   StableReaderLocator,
 } from '../../shared/types'
 import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
+import { getLiteraturePageNumForPhysical } from '../literature-page-map'
 import { buildCitation, buildCitationByStyle, mapDocTypeToCitationFormat } from './citation'
+
+function resolveExportPageNumberMode(options?: { pageNumberMode?: ExportPageNumberMode } | null): ExportPageNumberMode {
+  return options?.pageNumberMode === 'natural' ? 'natural' : 'literature'
+}
+
+/** Resolve the page number shown in search exports / citations for a hit. */
+function resolveExportHitPageNum(
+  hit: SearchHit,
+  group: SearchDocumentGroup,
+  mode: ExportPageNumberMode,
+): number | null {
+  const physical = Number(hit.locator.pageNum || 0)
+  if (!Number.isFinite(physical) || physical <= 0) return null
+  if (mode === 'natural') return Math.floor(physical)
+  const literature = getLiteraturePageNumForPhysical(group.docId, physical)
+  if (literature != null && literature > 0) return literature
+  return Math.floor(physical)
+}
 
 interface SearchIndexSegmentRow {
   segment_id: string
@@ -132,9 +153,24 @@ interface SearchExportRecord {
   exportedAt: string
   sourceType: HitSourceResolution['sourceType']
   sourceKey: string
+  /** Cosine similarity for vector hits. */
+  score?: number | null
+  segmentId?: string | null
 }
 
 const SEARCH_EXCERPT_EXPORTER_VERSION = 'full-paragraph-v2'
+const VECTOR_EXCERPT_EXPORTER_VERSION = 'vector-evidence-v1'
+
+function formatSimilarityScore(score: unknown): string {
+  const value = Number(score)
+  if (!Number.isFinite(value)) return ''
+  // Keep 3–4 decimals so “0.520” style stays readable for humans and models.
+  return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')
+}
+
+function isVectorExportResponse(response: SearchGroupedResponse): boolean {
+  return (response.warnings || []).some((item) => /向量库语义检索|vector/i.test(String(item || '')))
+}
 
 function stripSnippetMarkers(value: string): string {
   return String(value || '').replace(/<</g, '').replace(/>>/g, '').replace(/\s+/g, ' ').trim()
@@ -387,10 +423,41 @@ function getHitSourceText(hit: SearchHit, allowQueueReindex = true): HitSourceRe
   return null
 }
 
+function getHitParagraphFromSnippet(hit: SearchHit): HitParagraphResolution | null {
+  const snippet = stripSnippetMarkers(String(hit.snippet || '')).replace(/\s+/g, ' ').trim()
+  if (!snippet || isEllipsisSnippetText(snippet)) return null
+  const sourceKey = `snippet:${hit.locator.docId}:${hit.locator.pageNum || 'p'}:${hit.locator.segmentId || hit.id || 'hit'}`
+  return {
+    key: `${sourceKey}:${stableHash(snippet)}`,
+    text: snippet,
+    source: {
+      text: snippet,
+      sourceKey,
+      sourceType: 'segment',
+      sourceStart: 0,
+      pageTextLength: 0,
+      segmentTextLength: snippet.length,
+      normalizedTextLength: snippet.length,
+      pageHasText: false,
+      segmentHasText: true,
+      normalizedHasText: true,
+    },
+    paragraphStart: 0,
+    paragraphEnd: snippet.length,
+    hitIndex: 0,
+    hitIndexStrategy: 'query-first',
+  }
+}
+
 function getHitParagraph(hit: SearchHit): HitParagraphResolution | null {
   const source = getHitSourceText(hit)
-  if (!source?.text) return null
-  if (source.sourceType !== 'page' && isEllipsisSnippetText(source.text)) return null
+  if (!source?.text) {
+    // Vector hits often carry a usable excerpt even when locator expand fails.
+    return getHitParagraphFromSnippet(hit)
+  }
+  if (source.sourceType !== 'page' && isEllipsisSnippetText(source.text)) {
+    return getHitParagraphFromSnippet(hit)
+  }
   const occurrenceIndex = Math.max(0, Number(hit.locator.occurrenceIndex || 0))
   const byMatch = findNthOccurrence(source.text, hit.locator.matchText || hit.locator.queryTerm, occurrenceIndex)
   const byMatchFirst = byMatch >= 0 ? byMatch : findNthOccurrence(source.text, hit.locator.matchText || hit.locator.queryTerm, 0)
@@ -510,9 +577,12 @@ function buildExportParagraphs(group: SearchDocumentGroup): ExportParagraphBuild
   }
 }
 
-function getLocationSuffix(hit: SearchHit): string {
+function getLocationSuffix(hit: SearchHit, displayPageNum?: number | null): string {
+  const pageNum = displayPageNum != null && displayPageNum > 0
+    ? displayPageNum
+    : (hit.locator.pageNum || null)
   const parts = [
-    hit.locator.pageNum ? `第 ${hit.locator.pageNum} 页` : '',
+    pageNum ? `第 ${pageNum} 页` : '',
     hit.locator.href ? `章节：${hit.locator.href}` : '',
   ].filter(Boolean)
   return parts.join('，')
@@ -574,9 +644,16 @@ function resolveCitationTemplateId(group: SearchDocumentGroup, options: SearchEx
   return defaultTemplate?.id
 }
 
-function formatHitCitation(group: SearchDocumentGroup, hit: SearchHit, options: SearchExportOptions): string {
+function formatHitCitation(
+  group: SearchDocumentGroup,
+  hit: SearchHit,
+  options: SearchExportOptions,
+  displayPageNum?: number | null,
+): string {
   const templateId = resolveCitationTemplateId(group, options)
-  const pageNum = hit.locator.pageNum || null
+  const pageNum = displayPageNum != null && displayPageNum > 0
+    ? displayPageNum
+    : (hit.locator.pageNum || null)
   const generatedCitation = options.citationMode !== 'simple' && options.citationStyleId
     ? buildCitationByStyle(group.docId, options.citationStyleId, group.docType, { pageNum })
     : templateId ? buildCitation(group.docId, templateId, { pageNum }) : null
@@ -588,7 +665,7 @@ function formatHitCitation(group: SearchDocumentGroup, hit: SearchHit, options: 
     group.author ? `${group.author}` : '',
     group.title || '未命名文献',
   ].filter(Boolean).join('，')
-  const location = getLocationSuffix(hit)
+  const location = getLocationSuffix(hit, pageNum)
   return [baseCitation, location].filter(Boolean).join('，')
 }
 
@@ -601,6 +678,7 @@ function buildExportRecords(
   const records: SearchExportRecord[] = []
   let missingHitCount = 0
   const exportedAt = new Date().toISOString()
+  const pageNumberMode = resolveExportPageNumberMode(options)
   response.groups.forEach((group) => {
     if (records.length >= maxRecords) return
     const { paragraphs, missingHits } = buildExportParagraphs(group)
@@ -608,30 +686,92 @@ function buildExportRecords(
     paragraphs.forEach((paragraph) => {
       if (records.length >= maxRecords) return
       const hit = paragraph.firstHit
+      const score = Number(hit.score)
+      const pageNum = resolveExportHitPageNum(hit, group, pageNumberMode)
       records.push({
         title: group.title || 'Untitled',
         author: group.author || null,
         docType: group.docType || '',
-        pageNum: hit.locator.pageNum || null,
+        pageNum,
         chapter: hit.locator.href || null,
         paragraph: paragraph.text,
         hitTerms: [...paragraph.terms],
         hitCount: paragraph.hitCount,
-        citation: formatHitCitation(group, hit, options),
+        citation: formatHitCitation(group, hit, options, pageNum),
         locator: hit.locator,
         stableLocator: hit.stableLocator,
         searchKeyword: keyword,
         exportedAt,
         sourceType: paragraph.sourceType,
         sourceKey: paragraph.sourceKey,
+        score: Number.isFinite(score) ? score : null,
+        segmentId: hit.locator.segmentId || null,
       })
     })
   })
+  // Vector exports: keep similarity ranking (high → low).
+  if (isVectorExportResponse(response) || options.searchEngine === 'vector') {
+    records.sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0))
+  }
+  return { records, missingHitCount }
+}
+
+/**
+ * Export one evidence item per vector hit (do not collapse by paragraph), for AI re-use.
+ */
+function buildVectorExportRecords(
+  response: SearchGroupedResponse,
+  keyword: string,
+  options: SearchExportOptions = {},
+  maxRecords = Number.POSITIVE_INFINITY,
+): { records: SearchExportRecord[]; missingHitCount: number } {
+  const records: SearchExportRecord[] = []
+  let missingHitCount = 0
+  const exportedAt = new Date().toISOString()
+  const pageNumberMode = resolveExportPageNumberMode(options)
+  const flatHits: Array<{ group: SearchDocumentGroup; hit: SearchHit }> = []
+  response.groups.forEach((group) => {
+    group.hits.forEach((hit) => flatHits.push({ group, hit }))
+  })
+  flatHits.sort((a, b) => (Number(b.hit.score) || 0) - (Number(a.hit.score) || 0))
+
+  for (const { group, hit } of flatHits) {
+    if (records.length >= maxRecords) break
+    const paragraph = getHitParagraph(hit)
+    if (!paragraph?.text) {
+      missingHitCount += 1
+      continue
+    }
+    const score = Number(hit.score)
+    const pageNum = resolveExportHitPageNum(hit, group, pageNumberMode)
+    records.push({
+      title: group.title || 'Untitled',
+      author: group.author || null,
+      docType: group.docType || '',
+      pageNum,
+      chapter: hit.locator.href || null,
+      paragraph: paragraph.text,
+      hitTerms: hit.locator.queryTerm ? [hit.locator.queryTerm] : [],
+      hitCount: 1,
+      citation: formatHitCitation(group, hit, options, pageNum),
+      locator: hit.locator,
+      stableLocator: hit.stableLocator,
+      searchKeyword: keyword,
+      exportedAt,
+      sourceType: paragraph.source.sourceType,
+      sourceKey: paragraph.source.sourceKey,
+      score: Number.isFinite(score) ? score : null,
+      segmentId: hit.locator.segmentId || null,
+    })
+  }
   return { records, missingHitCount }
 }
 
 function buildSearchExportPreview(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): SearchExportPreviewResult {
-  const { records, missingHitCount } = buildExportRecords(response, keyword, options, 3)
+  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
+  const { records, missingHitCount } = vectorMode
+    ? buildVectorExportRecords(response, keyword, options, 3)
+    : buildExportRecords(response, keyword, options, 3)
   const previewItems: SearchExportPreviewItem[] = records.slice(0, 3).map((record) => ({
     title: record.title,
     author: record.author,
@@ -641,12 +781,13 @@ function buildSearchExportPreview(response: SearchGroupedResponse, keyword: stri
     hitTerms: record.hitTerms,
     hitCount: record.hitCount,
     citation: record.citation,
-    locatorText: locatorToText(record.locator),
+    locatorText: locatorToText(record.locator, record.pageNum),
     sourceType: record.sourceType,
     sourceKey: record.sourceKey,
+    score: record.score ?? null,
   }))
   return {
-    exporterVersion: SEARCH_EXCERPT_EXPORTER_VERSION,
+    exporterVersion: vectorMode ? VECTOR_EXCERPT_EXPORTER_VERSION : SEARCH_EXCERPT_EXPORTER_VERSION,
     keyword,
     totalDocuments: response.totalDocuments,
     totalHits: response.totalHits,
@@ -656,20 +797,34 @@ function buildSearchExportPreview(response: SearchGroupedResponse, keyword: stri
   }
 }
 
-function locatorToText(locator: SearchHit['locator']): string {
+function locatorToText(locator: SearchHit['locator'], displayPageNum?: number | null): string {
+  const pageNum = displayPageNum != null && displayPageNum > 0
+    ? displayPageNum
+    : locator.pageNum
   return [
-    locator.pageNum ? `page=${locator.pageNum}` : '',
-    locator.segmentOrdinal !== undefined ? `segment=${locator.segmentOrdinal}` : '',
-    Number.isFinite(locator.charStart) ? `char=${locator.charStart}-${locator.charEnd}` : '',
-    locator.queryTerm ? `term=${locator.queryTerm}` : '',
-  ].filter(Boolean).join('; ')
+    pageNum ? `页码=${pageNum}` : '',
+    locator.segmentOrdinal !== undefined ? `段序=${locator.segmentOrdinal}` : '',
+    Number.isFinite(locator.charStart) ? `字符=${locator.charStart}-${locator.charEnd}` : '',
+    locator.queryTerm ? `检索词=${locator.queryTerm}` : '',
+    locator.segmentId ? `分段=${String(locator.segmentId).slice(0, 24)}` : '',
+  ].filter(Boolean).join('；')
 }
 
 function escapeCsvCell(value: unknown): string {
   return `"${String(value ?? '').replace(/"/g, '""')}"`
 }
 
-function buildSearchExcerptMarkdown(records: SearchExportRecord[], response: SearchGroupedResponse, keyword: string, missingHitCount: number): string {
+function buildSearchExcerptMarkdown(
+  records: SearchExportRecord[],
+  response: SearchGroupedResponse,
+  keyword: string,
+  missingHitCount: number,
+  options: SearchExportOptions = {},
+): string {
+  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
+  if (vectorMode) {
+    return buildVectorSearchExcerptMarkdown(records, response, keyword, missingHitCount)
+  }
   const lines = [
     '# Search Excerpts',
     '',
@@ -700,46 +855,184 @@ function buildSearchExcerptMarkdown(records: SearchExportRecord[], response: Sea
   return `\ufeff${lines.join('\n')}`
 }
 
-function buildSearchExcerptCsv(records: SearchExportRecord[]): string {
-  const headers = ['title', 'author', 'docType', 'pageNum', 'chapter', 'paragraph', 'hitTerms', 'hitCount', 'citation', 'locator', 'searchKeyword', 'exportedAt']
-  const rows = records.map((record) => [
-    record.title,
-    record.author || '',
-    record.docType,
-    record.pageNum || '',
-    record.chapter || '',
-    record.paragraph,
-    record.hitTerms.join('|'),
-    record.hitCount,
-    record.citation,
-    JSON.stringify(record.locator),
-    record.searchKeyword,
-    record.exportedAt,
-  ].map(escapeCsvCell).join(','))
+function buildSearchExcerptCsv(records: SearchExportRecord[], vectorMode = false): string {
+  const headers = vectorMode
+    ? ['rank', 'score', 'title', 'author', 'pageNum', 'paragraph', 'citation', 'segmentId', 'locator', 'searchKeyword', 'exportedAt']
+    : ['title', 'author', 'docType', 'pageNum', 'chapter', 'paragraph', 'hitTerms', 'hitCount', 'citation', 'locator', 'searchKeyword', 'exportedAt']
+  const rows = records.map((record, index) => (
+    vectorMode
+      ? [
+          index + 1,
+          formatSimilarityScore(record.score) || '',
+          record.title,
+          record.author || '',
+          record.pageNum || '',
+          record.paragraph,
+          record.citation,
+          record.segmentId || '',
+          JSON.stringify(record.locator),
+          record.searchKeyword,
+          record.exportedAt,
+        ]
+      : [
+          record.title,
+          record.author || '',
+          record.docType,
+          record.pageNum || '',
+          record.chapter || '',
+          record.paragraph,
+          record.hitTerms.join('|'),
+          record.hitCount,
+          record.citation,
+          JSON.stringify(record.locator),
+          record.searchKeyword,
+          record.exportedAt,
+        ]
+  ).map(escapeCsvCell).join(','))
   return `\ufeff${headers.join(',')}\n${rows.join('\n')}`
 }
 
-function buildSearchExcerptJson(records: SearchExportRecord[], response: SearchGroupedResponse, keyword: string, missingHitCount: number): string {
+function buildSearchExcerptJson(
+  records: SearchExportRecord[],
+  response: SearchGroupedResponse,
+  keyword: string,
+  missingHitCount: number,
+  options: SearchExportOptions = {},
+): string {
+  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
   return JSON.stringify({
+    kind: vectorMode ? 'vector_semantic_evidence' : 'fulltext_search_excerpts',
     keyword,
+    searchEngine: vectorMode ? 'vector' : 'fulltext',
+    exporterVersion: vectorMode ? VECTOR_EXCERPT_EXPORTER_VERSION : SEARCH_EXCERPT_EXPORTER_VERSION,
     totalDocuments: response.totalDocuments,
     totalHits: response.totalHits,
     missingHitCount,
     exportedAt: new Date().toISOString(),
-    records,
+    // AI-oriented field name for vector mode
+    evidence: vectorMode
+      ? records.map((record, index) => ({
+          rank: index + 1,
+          score: record.score ?? null,
+          similarity: formatSimilarityScore(record.score) || null,
+          title: record.title,
+          author: record.author,
+          pageNum: record.pageNum,
+          text: record.paragraph,
+          citation: record.citation,
+          ref: {
+            docId: record.locator.docId,
+            pageNum: record.pageNum,
+            segmentId: record.segmentId || record.locator.segmentId || null,
+          },
+          locator: record.locator,
+        }))
+      : undefined,
+    records: vectorMode ? undefined : records,
   }, null, 2)
+}
+
+function buildVectorSearchExcerptMarkdown(
+  records: SearchExportRecord[],
+  response: SearchGroupedResponse,
+  keyword: string,
+  missingHitCount: number,
+): string {
+  const modelHint = (response.warnings || []).find((item) => /模型/.test(String(item || ''))) || ''
+  const lines = [
+    '# 向量库语义证据导出',
+    '',
+    '面向粘贴给 AI 的结构化证据清单（按相似度从高到低）。',
+    '',
+    `- 查询：${keyword}`,
+    `- 引擎：向量库语义检索（非关键词全文）`,
+    `- 文献数：${response.totalDocuments}`,
+    `- 证据条数：${records.length}`,
+    `- 导出时间：${new Date().toLocaleString('zh-CN')}`,
+    ...(modelHint ? [`- ${modelHint}`] : []),
+    ...(missingHitCount > 0 ? [`- 跳过无法还原：${missingHitCount}`] : []),
+    '',
+    '---',
+    '',
+  ]
+  records.forEach((record, index) => {
+    const scoreText = formatSimilarityScore(record.score)
+    lines.push(`## 证据 ${index + 1}${scoreText ? ` · 相似度 ${scoreText}` : ''}`)
+    lines.push('')
+    lines.push(`- 文献：${record.title}`)
+    if (record.author) lines.push(`- 作者：${record.author}`)
+    if (record.pageNum) lines.push(`- 页码：第 ${record.pageNum} 页`)
+    if (scoreText) lines.push(`- 相似度 score：${scoreText}（余弦相似度，越高越相关）`)
+    lines.push(`- 引用：${record.citation}`)
+    lines.push(`- ref：docId=${record.locator.docId}; pageNum=${record.pageNum ?? ''}; segmentId=${record.segmentId || record.locator.segmentId || ''}`)
+    lines.push('')
+    lines.push('### 正文')
+    lines.push('')
+    lines.push(record.paragraph)
+    lines.push('')
+    lines.push('---')
+    lines.push('')
+  })
+  return `\ufeff${lines.join('\n')}`
+}
+
+function buildVectorSearchExcerptTxt(
+  records: SearchExportRecord[],
+  response: SearchGroupedResponse,
+  keyword: string,
+  missingHitCount: number,
+): string {
+  const modelHint = (response.warnings || []).find((item) => /模型/.test(String(item || ''))) || ''
+  const lines: string[] = [
+    `向量库语义证据导出（${VECTOR_EXCERPT_EXPORTER_VERSION}）`,
+    '说明：当前仅导出文本语义命中，供复制给外部 AI 使用；按相似度从高到低排列。',
+    `查询：${keyword}`,
+    `引擎：向量库语义检索（不是关键词全文检索）`,
+    `文献数：${response.totalDocuments}`,
+    `证据条数：${records.length}`,
+    `导出时间：${new Date().toLocaleString('zh-CN')}`,
+  ]
+  if (modelHint) lines.push(modelHint)
+  if (missingHitCount > 0) lines.push(`跳过无法还原：${missingHitCount}`)
+  lines.push('', '==============================', '')
+
+  records.forEach((record, index) => {
+    const scoreText = formatSimilarityScore(record.score)
+    lines.push(`[证据 ${index + 1}]`)
+    if (scoreText) lines.push(`相似度：${scoreText}`)
+    lines.push(`文献：${record.title}`)
+    if (record.author) lines.push(`作者：${record.author}`)
+    if (record.pageNum) lines.push(`页码：第 ${record.pageNum} 页`)
+    lines.push(`引用：${record.citation}`)
+    lines.push(`ref：docId=${record.locator.docId}; pageNum=${record.pageNum ?? ''}; segmentId=${record.segmentId || record.locator.segmentId || ''}`)
+    lines.push('正文：')
+    lines.push(record.paragraph)
+    lines.push('')
+    lines.push('------------------------------')
+    lines.push('')
+  })
+  return `\ufeff${lines.join('\n')}`
 }
 
 function buildSearchExcerptContent(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): string {
   const format = options.format || 'txt'
-  if (format === 'txt') return buildSearchExcerptTxt(response, keyword, options)
-  const { records, missingHitCount } = buildExportRecords(response, keyword, options)
+  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
+  const { records, missingHitCount } = vectorMode
+    ? buildVectorExportRecords(response, keyword, options)
+    : buildExportRecords(response, keyword, options)
   if (records.length === 0) {
-    throw new Error('No complete paragraphs were available for export. Please rebuild the search index or confirm OCR/proofed text exists.')
+    throw new Error(vectorMode
+      ? '没有可导出的向量证据。请确认已建立向量索引且本次检索有命中。'
+      : 'No complete paragraphs were available for export. Please rebuild the search index or confirm OCR/proofed text exists.')
   }
-  if (format === 'markdown') return buildSearchExcerptMarkdown(records, response, keyword, missingHitCount)
-  if (format === 'csv') return buildSearchExcerptCsv(records)
-  return buildSearchExcerptJson(records, response, keyword, missingHitCount)
+  if (format === 'txt') {
+    return vectorMode
+      ? buildVectorSearchExcerptTxt(records, response, keyword, missingHitCount)
+      : buildSearchExcerptTxt(response, keyword, options)
+  }
+  if (format === 'markdown') return buildSearchExcerptMarkdown(records, response, keyword, missingHitCount, options)
+  if (format === 'csv') return buildSearchExcerptCsv(records, vectorMode)
+  return buildSearchExcerptJson(records, response, keyword, missingHitCount, options)
 }
 
 function buildSearchExcerptTxt(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): string {
@@ -859,6 +1152,126 @@ function buildSearchExportDiagnostics(response: SearchGroupedResponse, keyword: 
     documents,
   }, null, 2)
 }
+async function resolveExportSearchResponse(keyword: string, options?: SearchOptions): Promise<SearchGroupedResponse> {
+  const query = String(keyword || '').trim()
+  const {
+    citationMode: _citationMode,
+    citationStyleId: _citationStyleId,
+    citationTemplateId: _citationTemplateId,
+    previewOnly: _previewOnly,
+    format: _format,
+    searchEngine,
+    ...searchOptions
+  } = options || {}
+
+  if (searchEngine === 'vector') {
+    const folderId = searchOptions.folderId
+      || (Array.isArray(searchOptions.folderIds) ? searchOptions.folderIds[0] : undefined)
+    const tagId = searchOptions.tagId
+      || (Array.isArray(searchOptions.tagIds) ? searchOptions.tagIds[0] : undefined)
+    const vectorRes = await vectorSearch(query, {
+      limit: Math.min(100, Math.max(Number(searchOptions?.limit || 40) || 40, 1)),
+      folderId: folderId ? String(folderId) : undefined,
+      tagId: tagId ? String(tagId) : undefined,
+    })
+    if (!vectorRes.ok) {
+      throw new Error(vectorRes.message || '向量检索失败，无法导出')
+    }
+    return buildGroupedResponseFromVectorHits(query, vectorRes.hits || [], vectorRes.modelId || '')
+  }
+
+  return querySearchV2(query, {
+    ...searchOptions,
+    limit: Math.max(Number(searchOptions?.limit || 0), 1000),
+    exhaustive: true,
+    resultMode: 'all',
+  })
+}
+
+function buildGroupedResponseFromVectorHits(
+  keyword: string,
+  hits: Array<{
+    documentId: string
+    title: string | null
+    author: string | null
+    pageNum: number | null
+    excerpt: string
+    score: number
+    ref?: { docId?: string; pageNum?: number | null; segmentId?: string }
+  }>,
+  modelId: string,
+): SearchGroupedResponse {
+  const groups = new Map<string, SearchDocumentGroup>()
+  hits.forEach((hit, index) => {
+    const docId = String(hit.documentId || hit.ref?.docId || '').trim()
+    if (!docId) return
+    const pageNum = Number(hit.pageNum || hit.ref?.pageNum || 0) || null
+    const segmentId = String(hit.ref?.segmentId || `${docId}:${pageNum || 0}:${index}`)
+    const score = Number(hit.score) || 0
+    const searchHit: SearchHit = {
+      id: `vector:${segmentId}`,
+      snippet: String(hit.excerpt || ''),
+      score,
+      locator: {
+        docId,
+        segmentId,
+        pageId: null,
+        pageNum,
+        pageIndex: pageNum && pageNum > 0 ? pageNum - 1 : 0,
+        href: null,
+        segmentOrdinal: 0,
+        charStart: 0,
+        charEnd: Math.min(120, String(hit.excerpt || '').length),
+        matchText: keyword,
+        queryTerm: keyword,
+        occurrenceIndex: index,
+      },
+    }
+    const existing = groups.get(docId)
+    if (existing) {
+      existing.hits.push(searchHit)
+      existing.totalHits = existing.hits.length
+      existing.score = Math.max(existing.score, score)
+      existing.topHits = [...existing.hits]
+        .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
+        .slice(0, 3)
+      return
+    }
+    groups.set(docId, {
+      docId,
+      title: String(hit.title || '未命名文献'),
+      author: hit.author ?? null,
+      docType: '',
+      totalHits: 1,
+      hits: [searchHit],
+      topHits: [searchHit],
+      score,
+    })
+  })
+
+  const groupList = [...groups.values()]
+    .map((group) => ({
+      ...group,
+      hits: [...group.hits].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0)),
+      topHits: [...group.hits].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0)).slice(0, 3),
+      totalHits: group.hits.length,
+    }))
+    .sort((a, b) => b.score - a.score || b.totalHits - a.totalHits)
+
+  const totalHits = groupList.reduce((sum, group) => sum + group.totalHits, 0)
+  return {
+    query: keyword,
+    totalDocuments: groupList.length,
+    totalHits,
+    groups: groupList,
+    warnings: [
+      `向量库语义检索导出 · 模型 ${modelId || 'embeddings'}`,
+      '导出优先使用页原文/检索段；无法还原时回退向量摘录片段。',
+    ],
+    status: 'complete',
+  }
+}
+
 async function exportSearchExcerpts(keyword: string, options?: SearchOptions): Promise<SearchExportResult> {
   const query = String(keyword || '').trim()
   if (!query) throw new Error('请先输入检索词')
@@ -877,21 +1290,10 @@ async function exportSearchExcerpts(keyword: string, options?: SearchOptions): P
       ? options.citationTemplateId.trim()
       : undefined,
     previewOnly: !!options?.previewOnly,
+    searchEngine: options?.searchEngine === 'vector' ? 'vector' : 'fulltext',
+    pageNumberMode: resolveExportPageNumberMode(options),
   }
-  const {
-    citationMode: _citationMode,
-    citationStyleId: _citationStyleId,
-    citationTemplateId: _citationTemplateId,
-    previewOnly: _previewOnly,
-    format: _format,
-    ...searchOptions
-  } = options || {}
-  const response = querySearchV2(query, {
-    ...searchOptions,
-    limit: Math.max(Number(searchOptions?.limit || 0), 1000),
-    exhaustive: true,
-    resultMode: 'all',
-  })
+  const response = await resolveExportSearchResponse(query, options)
   if (!response.totalHits) throw new Error('No search hits are available to export.')
   const content = buildSearchExcerptContent(response, query, exportConfig)
 
@@ -926,7 +1328,7 @@ async function exportSearchExcerpts(keyword: string, options?: SearchOptions): P
   }
 }
 
-function previewSearchExcerpts(keyword: string, options?: SearchOptions): SearchExportPreviewResult {
+async function previewSearchExcerpts(keyword: string, options?: SearchOptions): Promise<SearchExportPreviewResult> {
   const query = String(keyword || '').trim()
   if (!query) throw new Error('请先输入检索词')
   const requestedCitationMode = options?.citationMode
@@ -940,33 +1342,17 @@ function previewSearchExcerpts(keyword: string, options?: SearchOptions): Search
     citationTemplateId: typeof options?.citationTemplateId === 'string' && options.citationTemplateId.trim()
       ? options.citationTemplateId.trim()
       : undefined,
+    searchEngine: options?.searchEngine === 'vector' ? 'vector' : 'fulltext',
+    pageNumberMode: resolveExportPageNumberMode(options),
   }
-  const {
-    citationMode: _citationMode,
-    citationStyleId: _citationStyleId,
-    citationTemplateId: _citationTemplateId,
-    previewOnly: _previewOnly,
-    format: _format,
-    ...searchOptions
-  } = options || {}
-  const response = querySearchV2(query, {
-    ...searchOptions,
-    limit: Math.max(Number(searchOptions?.limit || 0), 1000),
-    exhaustive: true,
-    resultMode: 'all',
-  })
+  const response = await resolveExportSearchResponse(query, options)
   return buildSearchExportPreview(response, query, exportConfig)
 }
 
 async function exportSearchDiagnostics(keyword: string, options?: SearchOptions): Promise<SearchExportResult> {
   const query = String(keyword || '').trim()
   if (!query) throw new Error('请先输入检索词')
-  const response = querySearchV2(query, {
-    ...(options || {}),
-    limit: Math.max(Number(options?.limit || 0), 1000),
-    exhaustive: true,
-    resultMode: 'all',
-  })
+  const response = await resolveExportSearchResponse(query, options)
   if (!response.totalHits) throw new Error('当前检索没有可诊断的命中')
   const content = buildSearchExportDiagnostics(response, query)
 
@@ -996,7 +1382,7 @@ async function exportSearchDiagnostics(keyword: string, options?: SearchOptions)
   }
 }
 
-function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExcerptsOptions): SaveSearchExcerptsResult {
+async function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExcerptsOptions): Promise<SaveSearchExcerptsResult> {
   const query = String(keyword || '').trim()
   if (!query) throw new Error('Please enter a search keyword first.')
   const {
@@ -1006,14 +1392,10 @@ function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExcerptsO
     previewOnly: _previewOnly,
     format: _format,
     projectId,
-    ...searchOptions
+    searchEngine: _searchEngine,
+    ..._rest
   } = options || {}
-  const response = querySearchV2(query, {
-    ...searchOptions,
-    limit: Math.max(Number(searchOptions?.limit || 0), 1000),
-    exhaustive: true,
-    resultMode: 'all',
-  })
+  const response = await resolveExportSearchResponse(query, options)
   const { records } = buildExportRecords(response, query, {
     citationMode: 'simple',
   })

@@ -1,5 +1,5 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Alert, Button, Card, Empty, Input, List, Modal, Pagination, Select, Space, Spin, Switch, Tag, Typography, message, type InputRef } from 'antd'
+import { Alert, Button, Card, Empty, Input, List, Modal, Pagination, Radio, Select, Space, Spin, Switch, Tag, Tooltip, Typography, message, type InputRef } from 'antd'
 import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutlined, RobotOutlined, SaveOutlined, SearchOutlined, StarOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
@@ -17,6 +17,7 @@ import type {
   SavedSearch,
   SearchDocumentGroup,
   SearchDocumentHitPage,
+  ExportPageNumberMode,
   SearchExportFormat,
   SearchExportPreviewResult,
   SearchGroupedResponse,
@@ -417,11 +418,16 @@ function vectorHitsToFlatResults(hits: VectorSearchHit[], query: string): FlatSe
     const docId = String(hit.documentId || hit.ref?.docId || '')
     const segmentId = String(hit.ref?.segmentId || `${docId}:${pageNum}:${index}`)
     const score = Number(hit.score) || 0
+    const excerpt = String(hit.excerpt || '').replace(/\s+/g, ' ').trim()
+    // matchText is the paragraph excerpt so the reader can highlight semantic text, not the query string.
+    const matchText = excerpt
+      ? (excerpt.length <= 160 ? excerpt : excerpt.slice(0, 160))
+      : query
     return {
       doc_id: docId,
       page_num: pageNum,
       occurrence_index: index,
-      snippet: String(hit.excerpt || ''),
+      snippet: excerpt,
       rank: score,
       relevance_score: score,
       doc_title: String(hit.title || 'Untitled'),
@@ -438,8 +444,8 @@ function vectorHitsToFlatResults(hits: VectorSearchHit[], query: string): FlatSe
         href: null,
         segmentOrdinal: 0,
         charStart: 0,
-        charEnd: Math.min(80, String(hit.excerpt || '').length),
-        matchText: query,
+        charEnd: matchText.length,
+        matchText,
         queryTerm: query,
         occurrenceIndex: index,
       },
@@ -610,6 +616,58 @@ function buildFocusedSearchSession(query: string, hit?: SearchHit | null): Searc
   }
 }
 
+/** Prefer a stable excerpt substring so the reader can highlight semantic paragraphs (not the query term). */
+function pickVectorMatchText(snippet: string, query: string): string {
+  const clean = stripSnippetMarkers(snippet).replace(/\s+/g, ' ').trim()
+  if (!clean) return String(query || '').trim()
+  if (clean.length <= 160) return clean
+  return clean.slice(0, 160)
+}
+
+function normalizeVectorHitForReader(hit: SearchHit, query: string): SearchHit {
+  const matchText = pickVectorMatchText(hit.snippet || '', query)
+  return {
+    ...hit,
+    locator: {
+      ...hit.locator,
+      matchText,
+      queryTerm: query || hit.locator.queryTerm || matchText,
+      charStart: Number(hit.locator.charStart || 0),
+      charEnd: Math.max(Number(hit.locator.charEnd || 0), matchText.length),
+    },
+  }
+}
+
+/** In-document vector session: navigate/highlight semantic hits without full-text search. */
+function buildVectorDocumentSearchSession(
+  query: string,
+  hits: SearchHit[],
+  activeHit?: SearchHit | null,
+): SearchSessionState {
+  const q = String(query || '').trim()
+  const normalized = (hits || []).map((hit) => normalizeVectorHitForReader(hit, q))
+  let activeHitIndex = 0
+  if (activeHit) {
+    const byId = normalized.findIndex((hit) => hit.id === activeHit.id)
+    if (byId >= 0) {
+      activeHitIndex = byId
+    } else {
+      const bySeg = normalized.findIndex((hit) => (
+        hit.locator.segmentId === activeHit.locator.segmentId
+        && Number(hit.locator.pageNum || 0) === Number(activeHit.locator.pageNum || 0)
+      ))
+      activeHitIndex = bySeg >= 0 ? bySeg : 0
+    }
+  }
+  return {
+    query: q,
+    hits: normalized,
+    activeHitIndex: normalized.length ? Math.min(activeHitIndex, normalized.length - 1) : -1,
+    status: normalized.length > 0 ? 'ready' : 'empty',
+    engine: 'vector',
+  }
+}
+
 function getReliableLocatorPageIndex(locator: SearchHitLocator | null | undefined): number | undefined {
   const rawValue = locator?.pageIndex
   if (rawValue === null || rawValue === undefined) return undefined
@@ -686,6 +744,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const [searchSort, setSearchSort] = useState<SearchSort>('relevance')
   const [contextMode, setContextMode] = useState<ContextMode>('standard')
   const [exportFormat, setExportFormat] = useState<ExportFormat>('txt')
+  /** Default: 文献页码（书上印刷/校准页码）；可选自然页码（PDF/扫描物理页序）。 */
+  const [exportPageNumberMode, setExportPageNumberMode] = useState<ExportPageNumberMode>('literature')
   const [aiSearchState, setAiSearchState] = useState<AiSearchState | null>(null)
   const [searchHistory, setSearchHistory] = useState<SearchHistoryEntry[]>([])
   const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([])
@@ -739,7 +799,15 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const buildSearchOptions = (
     overrideFilters = filters,
-    options: { paged?: boolean; page?: number; resultMode?: 'preview' | 'all'; snapshotId?: string } = {},
+    options: {
+      paged?: boolean
+      page?: number
+      resultMode?: 'preview' | 'all'
+      snapshotId?: string
+      /** When exporting current on-screen vector results, force embedding path. */
+      forExport?: boolean
+      forceVector?: boolean
+    } = {},
   ) => ({
     ...compactFilterOptions(overrideFilters),
     limit: DEFAULT_SEARCH_GROUP_LIMIT,
@@ -748,7 +816,70 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     resultMode: options.resultMode || 'preview' as const,
     ...(options.paged ? { page: options.page || 1, pageSize: SEARCH_PAGE_SIZE } : {}),
     ...(options.snapshotId ? { snapshotId: options.snapshotId } : {}),
+    // Vector hits are not in FTS; export/preview/save must re-run vector_search.
+    ...((
+      options.forceVector
+      || options.forExport
+      || searchMode === 'vector'
+      || executedSearchMode === 'vector'
+    )
+      ? { searchEngine: 'vector' as const }
+      : {}),
   })
+
+  const formatExportVersionLabel = (version?: string | null): string => {
+    const value = String(version || '').trim()
+    if (!value) return ''
+    if (value === 'vector-evidence-v1' || /vector/i.test(value)) return '向量证据格式'
+    if (value === 'full-paragraph-v2' || /full-paragraph/i.test(value)) return '完整段落格式'
+    return value
+  }
+
+  /** 正文从哪里还原：不是“被截断”，而是导出时选用的文本来源。 */
+  const formatExportSourceTypeLabel = (sourceType?: string | null): string => {
+    const value = String(sourceType || '').trim()
+    if (value === 'page') return '整页文字'
+    if (value === 'segment') return '索引段落'
+    if (value === 'normalized-segment') return '规范化段落'
+    if (value === 'snippet') return '向量摘录'
+    return value || '正文来源'
+  }
+
+  const formatExportSourceTypeHint = (sourceType?: string | null): string => {
+    const value = String(sourceType || '').trim()
+    if (value === 'page') return '从该页 OCR/校对全文中还原的自然段（导出文件中为完整段，非界面截断）'
+    if (value === 'segment') return '从检索索引分段还原的正文'
+    if (value === 'normalized-segment') return '从规范化检索文本还原的正文'
+    if (value === 'snippet') return '无法还原整页时，使用向量检索返回的摘录片段'
+    return '导出正文的来源'
+  }
+
+  /** 预览底部定位行始终中文（兼容旧英文 locatorText）。 */
+  const formatExportLocatorDisplay = (locatorText?: string | null, pageNum?: number | null, term?: string | null): string => {
+    const raw = String(locatorText || '').trim()
+    if (!raw) {
+      const parts = [
+        pageNum ? `页码 ${pageNum}` : '',
+        term ? `检索词「${term}」` : '',
+      ].filter(Boolean)
+      return parts.join(' · ')
+    }
+    // English: page=3; segment=0; char=0-120; term=共产党
+    // Chinese already: 页码=3；段序=0
+    let text = raw
+      .replace(/page\s*=\s*/gi, '页码 ')
+      .replace(/segment\s*=\s*/gi, '段序 ')
+      .replace(/char\s*=\s*/gi, '字符范围 ')
+      .replace(/term\s*=\s*/gi, '检索词 ')
+      .replace(/segmentId\s*=\s*|分段\s*=\s*/gi, '分段 ')
+      .replace(/;/g, ' · ')
+      .replace(/；/g, ' · ')
+      .replace(/=\s*/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+    if (pageNum && !/页码/.test(text)) text = `页码 ${pageNum} · ${text}`
+    return text
+  }
 
   const buildSearchSignature = (
     activeKeyword = inputValue,
@@ -1003,13 +1134,21 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     setExportPreviewLoading(true)
     try {
+      const useVector = executedSearchMode === 'vector'
+        || searchMode === 'vector'
+        || Boolean(groupedResponse?.warnings?.some((item) => String(item || '').includes('向量库语义检索')))
       const payload = await window.api.previewSearchExportExcerpts(activeKeyword, {
-        ...buildSearchOptions(),
+        ...buildSearchOptions(filters, {
+          forExport: true,
+          forceVector: useVector,
+        }),
         limit: 1000,
         format: exportFormat,
         citationMode,
         citationStyleId: citationMode === 'auto' ? citationStyleIdOverride || selectedCitationStyleId : undefined,
         citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
+        searchEngine: useVector ? 'vector' : 'fulltext',
+        pageNumberMode: exportPageNumberMode,
       })
       setExportPreview(payload)
     } catch (error) {
@@ -1028,6 +1167,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     void (async () => {
       const defaultStyleId = await loadCitationTemplates(true)
+      setExportPageNumberMode('literature')
       setExportPreview(null)
       setExportModalOpen(true)
       window.setTimeout(() => void loadExportPreview(defaultStyleId), 0)
@@ -1210,7 +1350,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   useEffect(() => {
     if (!exportModalOpen) return
     void loadExportPreview()
-  }, [exportModalOpen, exportFormat, citationMode, selectedCitationStyleId, selectedCitationTemplateId, searchSort, contextMode, filterSignature])
+  }, [exportModalOpen, exportFormat, exportPageNumberMode, citationMode, selectedCitationStyleId, selectedCitationTemplateId, searchSort, contextMode, filterSignature])
 
   useEffect(() => {
     if (!shortcuts) return
@@ -1450,17 +1590,24 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       const activeCitationStyleId = citationMode === 'auto'
         ? selectedCitationStyleId || await loadCitationTemplates(true)
         : undefined
+      const useVector = activeResultMode === 'vector' || resultsAreVector
       const payload = await window.api.exportSearchExcerpts(activeKeyword, {
-        ...buildSearchOptions(),
+        ...buildSearchOptions(filters, { forExport: true, forceVector: useVector }),
         limit: 1000,
         format: exportFormat,
         citationMode,
         citationStyleId: activeCitationStyleId,
         citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
+        searchEngine: useVector ? 'vector' : 'fulltext',
+        pageNumberMode: exportPageNumberMode,
       })
       if (!payload?.canceled) {
         setExportModalOpen(false)
-        message.success(`已导出 ${payload.exportableParagraphs ?? payload.totalHits} 个完整段落，跳过 ${payload.skippedHits ?? 0} 条无法还原的命中`)
+        message.success(
+          activeResultMode === 'vector'
+            ? `已导出向量命中 ${payload.exportableParagraphs ?? payload.totalHits} 段（跳过 ${payload.skippedHits ?? 0} 条无法还原）`
+            : `已导出 ${payload.exportableParagraphs ?? payload.totalHits} 个完整段落，跳过 ${payload.skippedHits ?? 0} 条无法还原的命中`,
+        )
       }
     } catch (error: unknown) {
       console.error(error)
@@ -1478,9 +1625,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     setSavingExcerpts(true)
     try {
+      const useVector = activeResultMode === 'vector' || resultsAreVector
       const payload = await window.api.saveSearchExcerpts(activeKeyword, {
-        ...buildSearchOptions(),
+        ...buildSearchOptions(filters, { forExport: true, forceVector: useVector }),
         limit: 1000,
+        searchEngine: useVector ? 'vector' : 'fulltext',
       })
       message.success(`已保存 ${payload.savedCount} 条完整摘录，跳过 ${payload.skippedCount} 条重复摘录`)
     } catch (error: unknown) {
@@ -1499,9 +1648,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     setExportingDiagnostics(true)
     try {
+      const useVector = activeResultMode === 'vector' || resultsAreVector
       const payload = await window.api.exportSearchDiagnostics(activeKeyword, {
-        ...buildSearchOptions(),
+        ...buildSearchOptions(filters, { forExport: true, forceVector: useVector }),
         limit: 1000,
+        searchEngine: useVector ? 'vector' : 'fulltext',
       })
       if (!payload?.canceled) {
         message.success(`已导出诊断：${payload.totalDocuments} 篇文献、${payload.totalHits} 条命中`)
@@ -1527,9 +1678,24 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const openGroupedDocument = (group: SearchDocumentGroup, hit?: SearchHit) => {
     const activeHit = hit || group.hits[0]
-    const exactLegacyLocator = activeHit?.stableLocator?.precision === 'exact' ? activeHit.locator : undefined
+    const isVectorOpen = activeResultMode === 'vector' || resultsAreVector
     const activeKeyword = (keyword || inputValue || activeHit?.locator.queryTerm || '').trim()
     persistCurrentSearchReturnState()
+    // Vector open: carry this document's semantic hits into the reader (not FTS keywords).
+    if (isVectorOpen) {
+      const vectorHits = [...(group.hits || [])]
+      onSelectDoc?.({
+        docId: group.docId,
+        pageIndex: getStableLocatorPageIndex(activeHit),
+        keyword: activeKeyword,
+        sourceId: 'vector-search',
+        stableLocator: activeHit?.stableLocator,
+        openTranslation: Boolean(activeHit?.locator?.translationSource),
+        searchSession: buildVectorDocumentSearchSession(activeKeyword, vectorHits, activeHit),
+      })
+      return
+    }
+    const exactLegacyLocator = activeHit?.stableLocator?.precision === 'exact' ? activeHit.locator : undefined
     onSelectDoc?.({
       docId: group.docId,
       pageIndex: getStableLocatorPageIndex(activeHit),
@@ -1957,7 +2123,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         confirmLoading={exportingExcerpts}
       >
         <Space direction={'vertical'} size={12} style={{ width: '100%' }}>
-          <Text type={'secondary'}>{'导出关键词所在完整自然段，并附带引用、命中词和 locator。'}</Text>
+          <Text type={'secondary'}>
+            {activeResultMode === 'vector'
+              ? '向量导出：每条证据含相似度（如 0.520）、正文、引用与定位信息，按相关度排序，方便复制给外部 AI。'
+              : '导出关键词所在完整自然段，并附带引用、命中词和定位信息。'}
+          </Text>
           <Select
             value={exportFormat}
             onChange={(value) => setExportFormat(value)}
@@ -1969,6 +2139,24 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               { value: 'json', label: 'JSON' },
             ]}
           />
+          <div>
+            <Text style={{ display: 'block', marginBottom: 6 }}>页码类型</Text>
+            <Radio.Group
+              value={exportPageNumberMode}
+              onChange={(event) => setExportPageNumberMode(event.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+              options={[
+                { value: 'literature', label: '文献页码' },
+                { value: 'natural', label: '自然页码' },
+              ]}
+            />
+            <Text type="secondary" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
+              {exportPageNumberMode === 'natural'
+                ? '自然页码：PDF/扫描影像的物理页序（第 1…N 页）。'
+                : '文献页码：书上印刷/校准后的连续页码（默认，与阅读模式「文献页码」一致）。'}
+            </Text>
+          </div>
           <Select
             value={citationMode}
             onChange={(value) => setCitationMode(value)}
@@ -2018,9 +2206,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>导出预览</Text>
                 <Space size={8} wrap>
-                  <Tag color={'blue'}>{exportPreview?.exportableParagraphs ?? 0} 段</Tag>
+                  <Tag color={'blue'}>{exportPreview?.exportableParagraphs ?? 0} {activeResultMode === 'vector' ? '条证据' : '段'}</Tag>
                   <Tag color={(exportPreview?.skippedHits || 0) > 0 ? 'orange' : 'green'}>跳过 {exportPreview?.skippedHits ?? 0}</Tag>
-                  {exportPreview?.exporterVersion ? <Tag>{exportPreview.exporterVersion}</Tag> : null}
+                  {exportPreview?.exporterVersion ? (
+                    <Tag>{formatExportVersionLabel(exportPreview.exporterVersion)}</Tag>
+                  ) : null}
                 </Space>
               </div>
               {exportPreviewLoading ? (
@@ -2035,18 +2225,39 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                       <Space size={6} wrap style={{ marginBottom: 6 }}>
                         <Text strong>{item.title}</Text>
                         {item.pageNum ? <Tag>第 {item.pageNum} 页</Tag> : null}
-                        <Tag color={item.sourceType === 'page' ? 'green' : 'orange'}>{item.sourceType}</Tag>
+                        {typeof item.score === 'number' && Number.isFinite(item.score) ? (
+                          <Tag color="cyan">相似度 {item.score.toFixed(3)}</Tag>
+                        ) : null}
+                        <Tooltip title={formatExportSourceTypeHint(item.sourceType)}>
+                          <Tag color={item.sourceType === 'page' ? 'green' : 'orange'}>
+                            {formatExportSourceTypeLabel(item.sourceType)}
+                          </Tag>
+                        </Tooltip>
                         {item.hitTerms.slice(0, 3).map((term) => <Tag key={term} color={'gold'}>{term}</Tag>)}
                       </Space>
-                      <Text style={{ display: 'block', color: 'var(--gs-text-secondary)' }}>
-                        {item.paragraph.length > 220 ? `${item.paragraph.slice(0, 220)}...` : item.paragraph}
+                      <Text
+                        style={{
+                          display: 'block',
+                          color: 'var(--gs-text-secondary)',
+                          whiteSpace: 'pre-wrap',
+                          maxHeight: 160,
+                          overflowY: 'auto',
+                        }}
+                      >
+                        {item.paragraph}
                       </Text>
-                      <Text type={'secondary'} style={{ fontSize: 12 }}>{item.locatorText}</Text>
+                      <Text type={'secondary'} style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+                        定位：{formatExportLocatorDisplay(item.locatorText, item.pageNum, item.hitTerms[0])}
+                      </Text>
                     </div>
                   ))}
                 </Space>
               ) : (
-                <Text type={'secondary'}>{'没有可预览的完整段落。可以先运行诊断导出查看缺失原因。'}</Text>
+                <Text type={'secondary'}>
+                  {activeResultMode === 'vector'
+                    ? '没有可预览的向量证据。请确认已向量化且本次检索有命中。'
+                    : '没有可预览的完整段落。可以先运行诊断导出查看缺失原因。'}
+                </Text>
               )}
             </Space>
           </Card>
@@ -2309,6 +2520,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             const activeKeyword = (keyword || inputValue || item.locator?.queryTerm || jumpKeyword).trim()
             const focusedHit = buildSearchHitFromFlatResult(item, activeKeyword, jumpKeyword)
             const exactLegacyLocator = focusedHit?.stableLocator?.precision === 'exact' ? item.locator : undefined
+            const isVectorOpen = activeResultMode === 'vector' || resultsAreVector || searchMode === 'vector'
             return (
               <Card
                 size={'small'}
@@ -2316,6 +2528,17 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                 style={{ marginBottom: 10, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}
                 onClick={() => {
                   persistCurrentSearchReturnState()
+                  if (isVectorOpen && focusedHit) {
+                    onSelectDoc?.({
+                      docId: item.doc_id,
+                      pageIndex: getStableLocatorPageIndex(focusedHit),
+                      keyword: activeKeyword,
+                      sourceId: 'vector-search',
+                      stableLocator: focusedHit?.stableLocator,
+                      searchSession: buildVectorDocumentSearchSession(activeKeyword, [focusedHit], focusedHit),
+                    })
+                    return
+                  }
                   onSelectDoc?.({
                     docId: item.doc_id,
                     pageIndex: getStableLocatorPageIndex(focusedHit),

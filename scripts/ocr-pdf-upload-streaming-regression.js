@@ -271,15 +271,16 @@ assert(
 )
 assert(
   librarySource.includes('const runOcrInConfiguredBatches = async')
-    && librarySource.includes('const batches = chunkArray(uniqueDocIds, ocrBatchSize)')
     && librarySource.includes("const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'")
-    && librarySource.includes('let ocrBatch = batch')
+    && librarySource.includes('let ocrBatch = uniqueDocIds')
     && librarySource.includes('if (requiresPageImagesBeforeOcr) {')
-    && librarySource.includes('const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {')
+    && (librarySource.includes('const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {')
+      || librarySource.includes('const ready = await ensurePdfPageImagesForOcr(docId, OCR_ACTIVITY_MESSAGE_KEY, {'))
     && librarySource.includes("console.warn('[Library] OCR 前补齐 PDF 页图失败', docId, error)")
-    && librarySource.includes('successCount += await window.api.batchOcr(ocrBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })')
-    && !librarySource.includes('successCount = await window.api.batchOcr(ocrBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })'),
-  'Library Paddle OCR should upload PDFs directly with the configured document concurrency; local page-image caching must not block async PDF OCR.',
+    && librarySource.includes('successCount = await window.api.batchOcr(ocrBatch, {')
+    && librarySource.includes('concurrency: documentConcurrency')
+    && !librarySource.includes('const batches = chunkArray(uniqueDocIds, ocrBatchSize)'),
+  'Library Paddle OCR should enqueue the whole selection once and process with configured concurrency; page images only for local/vision/hybrid.',
 )
 assert(
   batchProcessorSource.includes('ocrOptions,')
@@ -450,10 +451,12 @@ assert(
 )
 assert(
   ocrIpcSource.includes('const heavyPdfDocIds = new Set<string>()')
-    && ocrIpcSource.includes('globalOcrDocumentWindow.run(heavy ? 1 : documentConcurrency')
+    && ocrIpcSource.includes('const slotLimit = heavy ? 1 : documentConcurrency')
+    && ocrIpcSource.includes('globalOcrDocumentWindow.run(slotLimit, async () => {')
     && ocrIpcSource.includes('runBoundedDocumentWorkers')
-    && ocrIpcSource.includes('isHeavyPdfOcrDocument'),
-  'Heavy PDF OCR documents should run at concurrency 1 inside the shared document window instead of the normal batch concurrency',
+    && ocrIpcSource.includes('isHeavyPdfOcrDocument')
+    && !ocrIpcSource.includes('if (Number(doc.page_count || 0) >= 180) heavyPdfDocIds.add(docId)'),
+  'Only true heavy PDFs (size/page thresholds) serialize; medium multi-hundred-page books keep batch concurrency.',
 )
 assert(
   recognizePdfAsyncBody.includes('let chunkCompleteQueue = Promise.resolve()')

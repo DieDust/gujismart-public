@@ -3,10 +3,11 @@ import { Button, Empty, Segmented, Space, Tag } from 'antd'
 import type { DocumentPage } from '@shared/types'
 
 type BirdDensity = 'small' | 'medium' | 'large'
+type BirdFilter = 'all' | 'ocr_error'
 
 type BirdPageItem = Pick<
   DocumentPage,
-  'id' | 'page_num' | 'proof_status' | 'ocr_text' | 'ocr_result' | 'has_ocr_text' | 'needs_layout_attention'
+  'id' | 'page_num' | 'proof_status' | 'ocr_status' | 'ocr_text' | 'ocr_result' | 'has_ocr_text' | 'needs_layout_attention'
 >
 
 interface PageBirdseyeGridProps {
@@ -27,6 +28,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
+function isOcrErrorPage(page: BirdPageItem): boolean {
+  return String(page.ocr_status || '').trim() === 'error'
+}
+
 function pageNeedsLayoutAttention(page: BirdPageItem): boolean {
   if (typeof page.needs_layout_attention === 'boolean') return page.needs_layout_attention
   if (!page.ocr_result) return false
@@ -41,6 +46,26 @@ function pageNeedsLayoutAttention(page: BirdPageItem): boolean {
   }
 }
 
+/** Compact page list for banner: 3、7-9、12 */
+function formatFailedPageList(pageNums: number[]): string {
+  const nums = [...new Set(pageNums.filter((n) => Number.isFinite(n) && n > 0))].sort((a, b) => a - b)
+  if (nums.length === 0) return ''
+  const parts: string[] = []
+  let start = nums[0]
+  let end = nums[0]
+  for (let i = 1; i <= nums.length; i += 1) {
+    const current = nums[i]
+    if (current === end + 1) {
+      end = current
+      continue
+    }
+    parts.push(start === end ? `${start}` : `${start}-${end}`)
+    start = current
+    end = current
+  }
+  return parts.join('、')
+}
+
 function getPageState(
   page: BirdPageItem,
   currentPageIndex: number,
@@ -52,6 +77,27 @@ function getPageState(
   textColor: string
   tagColor: string
 } {
+  // Current page still wins for navigation feedback, but keep OCR-error tag visible.
+  if (currentPageIndex === pageIndex && !isOcrErrorPage(page)) {
+    return {
+      label: '当前页',
+      borderColor: '#1677ff',
+      background: 'rgba(22, 119, 255, 0.18)',
+      textColor: '#91caff',
+      tagColor: 'blue',
+    }
+  }
+
+  if (isOcrErrorPage(page)) {
+    return {
+      label: currentPageIndex === pageIndex ? '当前·OCR失败' : 'OCR失败',
+      borderColor: '#ff4d4f',
+      background: 'rgba(255, 77, 79, 0.16)',
+      textColor: '#ffccc7',
+      tagColor: 'error',
+    }
+  }
+
   if (currentPageIndex === pageIndex) {
     return {
       label: '当前页',
@@ -100,18 +146,40 @@ export default function PageBirdseyeGrid({
 }: PageBirdseyeGridProps) {
   const densityMeta = DENSITY_META[density]
   const [windowIndex, setWindowIndex] = useState(0)
+  const [filter, setFilter] = useState<BirdFilter>('all')
+
+  const ocrErrorEntries = useMemo(
+    () => pages
+      .map((page, pageIndex) => ({ page, pageIndex }))
+      .filter(({ page }) => isOcrErrorPage(page)),
+    [pages],
+  )
+  const ocrErrorPageNums = useMemo(
+    () => ocrErrorEntries.map(({ page }) => Number(page.page_num || 0)).filter((n) => n > 0),
+    [ocrErrorEntries],
+  )
+  const ocrErrorPageList = useMemo(() => formatFailedPageList(ocrErrorPageNums), [ocrErrorPageNums])
+
+  const filteredEntries = useMemo(() => {
+    if (filter === 'ocr_error') return ocrErrorEntries
+    return pages.map((page, pageIndex) => ({ page, pageIndex }))
+  }, [filter, ocrErrorEntries, pages])
 
   useEffect(() => {
+    if (filter === 'ocr_error') {
+      setWindowIndex(0)
+      return
+    }
     setWindowIndex(Math.floor(currentPageIndex / densityMeta.batchSize))
-  }, [currentPageIndex, densityMeta.batchSize])
+  }, [currentPageIndex, densityMeta.batchSize, filter])
 
-  const totalWindows = Math.max(1, Math.ceil(pages.length / densityMeta.batchSize))
+  const totalWindows = Math.max(1, Math.ceil(filteredEntries.length / densityMeta.batchSize))
   const startIndex = windowIndex * densityMeta.batchSize
-  const endIndex = Math.min(pages.length, startIndex + densityMeta.batchSize)
+  const endIndex = Math.min(filteredEntries.length, startIndex + densityMeta.batchSize)
 
   const visiblePages = useMemo(
-    () => pages.slice(startIndex, endIndex).map((page, offset) => ({ page, pageIndex: startIndex + offset })),
-    [endIndex, pages, startIndex],
+    () => filteredEntries.slice(startIndex, endIndex),
+    [endIndex, filteredEntries, startIndex],
   )
 
   if (pages.length === 0) {
@@ -144,6 +212,17 @@ export default function PageBirdseyeGrid({
               { value: 'large', label: DENSITY_META.large.label },
             ]}
           />
+          {ocrErrorEntries.length > 0 ? (
+            <Segmented
+              size="small"
+              value={filter}
+              onChange={(value) => setFilter(value as BirdFilter)}
+              options={[
+                { value: 'all', label: '全部' },
+                { value: 'ocr_error', label: `OCR失败 ${ocrErrorEntries.length}` },
+              ]}
+            />
+          ) : null}
         </Space>
 
         <Space size={4} wrap>
@@ -151,13 +230,49 @@ export default function PageBirdseyeGrid({
             上一组
           </Button>
           <span style={{ fontSize: 12, color: 'var(--gs-text-secondary)' }}>
-            {startIndex + 1}-{endIndex} / {pages.length}
+            {filteredEntries.length === 0
+              ? '0'
+              : `${startIndex + 1}-${endIndex} / ${filteredEntries.length}`}
           </span>
           <Button size="small" disabled={windowIndex >= totalWindows - 1} onClick={() => setWindowIndex((value) => Math.min(totalWindows - 1, value + 1))}>
             下一组
           </Button>
         </Space>
       </div>
+
+      {ocrErrorEntries.length > 0 ? (
+        <div
+          style={{
+            flexShrink: 0,
+            margin: '8px 12px 0',
+            padding: '8px 10px',
+            borderRadius: 8,
+            background: 'rgba(255, 77, 79, 0.10)',
+            border: '1px solid rgba(255, 77, 79, 0.28)',
+            color: '#ffccc7',
+            fontSize: 12,
+            lineHeight: 1.55,
+          }}
+        >
+          <div style={{ marginBottom: 6, fontWeight: 500 }}>
+            OCR完成，第 {ocrErrorPageList || '?'} 页 OCR 未成功（共 {ocrErrorEntries.length} 页，点页码跳转）
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {ocrErrorEntries.map(({ page, pageIndex }) => (
+              <Button
+                key={page.id}
+                size="small"
+                danger
+                type={currentPageIndex === pageIndex ? 'primary' : 'default'}
+                onClick={() => onSelectPage(pageIndex)}
+                style={{ height: 24, paddingInline: 8, fontSize: 12 }}
+              >
+                第 {page.page_num || pageIndex + 1} 页
+              </Button>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div
         style={{
@@ -171,12 +286,15 @@ export default function PageBirdseyeGrid({
           alignContent: 'start',
         }}
       >
-        {visiblePages.map(({ page, pageIndex }) => {
+        {visiblePages.length === 0 ? (
+          <Empty description={filter === 'ocr_error' ? '没有 OCR 失败页' : '暂无页面'} style={{ gridColumn: '1 / -1', marginTop: 32 }} />
+        ) : visiblePages.map(({ page, pageIndex }) => {
           const state = getPageState(page, currentPageIndex, pageIndex)
           const hasOcr = typeof page.has_ocr_text === 'boolean'
             ? page.has_ocr_text
             : !!String(page.ocr_text || '').trim()
           const preview = String(page.ocr_text || '').trim().replace(/\s+/g, ' ').slice(0, 80)
+          const ocrFailed = isOcrErrorPage(page)
 
           return (
             <Button
@@ -219,8 +337,8 @@ export default function PageBirdseyeGrid({
                     minHeight: 0,
                   }}
                 >
-                  <Tag color={hasOcr ? 'processing' : 'default'} style={{ width: 'fit-content', margin: 0 }}>
-                    {hasOcr ? '有 OCR' : '无 OCR'}
+                  <Tag color={ocrFailed ? 'error' : hasOcr ? 'processing' : 'default'} style={{ width: 'fit-content', margin: 0 }}>
+                    {ocrFailed ? 'OCR 未成功' : hasOcr ? '有 OCR' : '无 OCR'}
                   </Tag>
 
                   <div
@@ -228,13 +346,17 @@ export default function PageBirdseyeGrid({
                       flex: 1,
                       minHeight: 0,
                       overflow: 'hidden',
-                      color: hasOcr ? 'var(--gs-text-secondary)' : state.textColor,
+                      color: ocrFailed ? state.textColor : hasOcr ? 'var(--gs-text-secondary)' : state.textColor,
                       fontSize: 12,
                       lineHeight: 1.6,
                       whiteSpace: 'normal',
                     }}
                   >
-                    {hasOcr ? preview || '本页已有 OCR 文本' : '本页还没有可用 OCR 文本'}
+                    {ocrFailed
+                      ? '本页识别失败，可打开后单独重试 OCR'
+                      : hasOcr
+                        ? preview || '本页已有 OCR 文本'
+                        : '本页还没有可用 OCR 文本'}
                   </div>
                 </div>
               </div>

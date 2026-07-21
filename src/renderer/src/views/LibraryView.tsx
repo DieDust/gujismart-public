@@ -24,6 +24,7 @@ import {
   StarFilled,
   StarOutlined,
   TagOutlined,
+  SettingOutlined,
   ThunderboltOutlined,
   UnorderedListOutlined
 } from '@ant-design/icons'
@@ -39,6 +40,7 @@ import {
   Modal,
   Popconfirm,
   Popover,
+  Radio,
   Segmented,
   Select,
   Space,
@@ -63,7 +65,7 @@ import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import { matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -74,6 +76,7 @@ const LIBRARY_SIDEBAR_LAYOUT_KEY = 'gujismart.library.sidebarLayout.v1'
 const LIBRARY_SORT_STORAGE_KEY = 'gujismart.library.sort.v1'
 const LIBRARY_PAGE_SIZE_STORAGE_KEY = 'gujismart.library.pageSize.v1'
 const LIBRARY_IMPORT_QUEUE_STORAGE_KEY = 'gujismart.library.importQueue.v1'
+const LIBRARY_SMART_VIEW_VISIBLE_KEY = 'gujismart.library.smartView.visible.v1'
 const DEFAULT_LIBRARY_PAGE_SIZE = 10
 const LIBRARY_PAGE_SIZE_OPTIONS = [10, 50, 100] as const
 const LIST_ROW_MIN_HEIGHT = 96
@@ -138,19 +141,7 @@ const BASE_DATA_BUSY_RETRY_DELAYS_MS = [800, 1600, 3200]
 const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 90_000
 const LIBRARY_LIST_BUSY_RETRY_DELAYS_MS = [800, 2000, 4000, 8000]
 
-type SmartViewCountKey =
-  | 'all'
-  | 'missingMetadata'
-  | 'unrecognized'
-  | 'suspiciousTitle'
-  | 'unknownType'
-  | 'favorite'
-  | 'unread'
-  | 'proofed'
-  | 'unproofed'
-  | 'metadataPending'
-  | 'unstored'
-  | 'vectorized'
+type SmartViewCountKey = LibrarySmartViewCountKey
 
 const EMPTY_SMART_VIEW_COUNTS: Record<SmartViewCountKey, number> = {
   all: 0,
@@ -165,6 +156,199 @@ const EMPTY_SMART_VIEW_COUNTS: Record<SmartViewCountKey, number> = {
   metadataPending: 0,
   unstored: 0,
   vectorized: 0,
+  notVectorized: 0,
+  embeddingQueued: 0,
+  embeddingProcessing: 0,
+  embeddingError: 0,
+}
+
+/** Catalog of smart-view chips (order = default display order). */
+const SMART_VIEW_CATALOG: Array<{
+  key: string
+  countKey: SmartViewCountKey
+  label: string
+  filter: LibraryFilter
+  /** Always show; cannot be hidden in customize panel. */
+  locked?: boolean
+}> = [
+  { key: 'all', countKey: 'all', label: '全部文献', filter: { type: 'all' }, locked: true },
+  { key: 'missing-metadata', countKey: 'missingMetadata', label: '缺元数据', filter: { type: 'healthMissingMetadata' } },
+  { key: 'unrecognized', countKey: 'unrecognized', label: 'OCR 未完成', filter: { type: 'ocrIncomplete' } },
+  { key: 'suspicious-title', countKey: 'suspiciousTitle', label: '题名疑似导入名', filter: { type: 'healthSuspiciousTitle' } },
+  { key: 'unknown-type', countKey: 'unknownType', label: '待分类', filter: { type: 'healthUnknownType' } },
+  { key: 'favorite', countKey: 'favorite', label: '星标', filter: { type: 'favorite' } },
+  { key: 'unread', countKey: 'unread', label: '未读', filter: { type: 'readStatus', value: 'unread' } },
+  { key: 'proofed', countKey: 'proofed', label: '已校对', filter: { type: 'proofStatus', value: 'completed' } },
+  { key: 'unproofed', countKey: 'unproofed', label: '未校对', filter: { type: 'proofStatus', value: 'pending' } },
+  { key: 'metadata-pending', countKey: 'metadataPending', label: '未确认元数据', filter: { type: 'metadataPending' } },
+  { key: 'vectorized', countKey: 'vectorized', label: '已向量化', filter: { type: 'all', embeddingFilter: 'ready' } },
+  { key: 'not-vectorized', countKey: 'notVectorized', label: '未向量化', filter: { type: 'all', embeddingFilter: 'not_ready' } },
+  { key: 'embedding-queued', countKey: 'embeddingQueued', label: '向量排队', filter: { type: 'all', embeddingFilter: 'queued' } },
+  { key: 'embedding-processing', countKey: 'embeddingProcessing', label: '向量化中', filter: { type: 'all', embeddingFilter: 'processing' } },
+  { key: 'embedding-error', countKey: 'embeddingError', label: '向量失败', filter: { type: 'all', embeddingFilter: 'error' } },
+  { key: 'unstored', countKey: 'unstored', label: '未入库', filter: { type: 'importStatus', value: 'unstored' } },
+]
+
+const DEFAULT_SMART_VIEW_VISIBLE_KEYS = SMART_VIEW_CATALOG.map((item) => item.key)
+
+function loadSmartViewVisibleKeys(): string[] {
+  try {
+    const raw = window.localStorage.getItem(LIBRARY_SMART_VIEW_VISIBLE_KEY)
+    if (!raw) return [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+    const allowed = new Set(SMART_VIEW_CATALOG.map((item) => item.key))
+    const keys = parsed.map((item) => String(item || '')).filter((key) => allowed.has(key))
+    // Always keep locked items.
+    for (const item of SMART_VIEW_CATALOG) {
+      if (item.locked && !keys.includes(item.key)) keys.unshift(item.key)
+    }
+    return keys.length > 0 ? keys : [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+  } catch {
+    return [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+  }
+}
+
+function saveSmartViewVisibleKeys(keys: string[]): void {
+  try {
+    window.localStorage.setItem(LIBRARY_SMART_VIEW_VISIBLE_KEY, JSON.stringify(keys))
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function getFilterEmbedding(filter: LibraryFilter): LibraryEmbeddingFilter | undefined {
+  if (filter.embeddingFilter) return filter.embeddingFilter
+  if (filter.type === 'embeddingReady') return 'ready'
+  if (filter.type === 'embeddingNotReady') return 'not_ready'
+  if (filter.type === 'embeddingQueued') return 'queued'
+  if (filter.type === 'embeddingProcessing') return 'processing'
+  if (filter.type === 'embeddingError') return 'error'
+  return undefined
+}
+
+function getFilterScopeFolderId(filter: LibraryFilter): string | undefined {
+  if (filter.type === 'folder' && filter.value) return filter.value
+  return filter.scopeFolderId || undefined
+}
+
+function getFilterScopeTagIds(filter: LibraryFilter): string[] {
+  if (filter.type === 'tag') return getActiveTagIds(filter)
+  return Array.isArray(filter.scopeTagIds) ? filter.scopeTagIds.filter(Boolean) : []
+}
+
+function isScopeOnlyFilter(filter: LibraryFilter): boolean {
+  return filter.type === 'all' || filter.type === 'folder' || filter.type === 'tag'
+}
+
+/** Merge a smart-view chip onto the current filter (AND with folder/tag scope when present). */
+function mergeSmartViewFilter(current: LibraryFilter, smart: LibraryFilter): LibraryFilter {
+  const scopeFolderId = getFilterScopeFolderId(current)
+  const scopeTagIds = getFilterScopeTagIds(current)
+  const smartEmbedding = getFilterEmbedding(smart)
+  const currentEmbedding = getFilterEmbedding(current)
+
+  // "全部文献" clears smart refinements but keeps folder/tag scope if user is browsing a scope.
+  if (smart.type === 'all' && !smartEmbedding && !smart.value) {
+    if (scopeFolderId) return { type: 'folder', value: scopeFolderId }
+    if (scopeTagIds.length > 0) return { type: 'tag', tagIds: scopeTagIds, value: scopeTagIds[0] }
+    return { type: 'all' }
+  }
+
+  // Embedding chips: toggle OR switch, keep folder/tag as primary scope.
+  if (smartEmbedding) {
+    if (currentEmbedding === smartEmbedding) {
+      // Toggle off embedding refinement.
+      if (scopeFolderId) return { type: 'folder', value: scopeFolderId }
+      if (scopeTagIds.length > 0) return { type: 'tag', tagIds: scopeTagIds, value: scopeTagIds[0] }
+      if (isScopeOnlyFilter(current) || current.type.startsWith('embedding')) return { type: 'all' }
+      const { embeddingFilter: _drop, ...rest } = current
+      return { ...rest, type: current.type }
+    }
+    if (scopeFolderId) {
+      return { type: 'folder', value: scopeFolderId, embeddingFilter: smartEmbedding }
+    }
+    if (scopeTagIds.length > 0) {
+      return { type: 'tag', tagIds: scopeTagIds, value: scopeTagIds[0], embeddingFilter: smartEmbedding }
+    }
+    // Keep other non-scope smart (e.g. favorite) and AND embedding.
+    if (!isScopeOnlyFilter(current) && !String(current.type).startsWith('embedding')) {
+      return {
+        type: current.type,
+        value: current.value,
+        tagIds: current.tagIds,
+        embeddingFilter: smartEmbedding,
+      }
+    }
+    return { type: 'all', embeddingFilter: smartEmbedding }
+  }
+
+  // Non-embedding smart chip: set as primary type, preserve folder/tag as scope*, keep embedding.
+  const next: LibraryFilter = {
+    type: smart.type,
+    value: smart.value,
+    tagIds: smart.tagIds,
+    embeddingFilter: currentEmbedding,
+  }
+  if (scopeFolderId) next.scopeFolderId = scopeFolderId
+  if (scopeTagIds.length > 0) next.scopeTagIds = scopeTagIds
+  return next
+}
+
+/** Apply folder/tag scope while preserving smart refinements (embedding + non-scope type). */
+function mergeScopeFilter(current: LibraryFilter, scope: LibraryFilter): LibraryFilter {
+  const embedding = getFilterEmbedding(current)
+  const isSmartPrimary = !isScopeOnlyFilter(current) && !String(current.type).startsWith('embedding')
+
+  if (scope.type === 'folder') {
+    if (isSmartPrimary) {
+      return {
+        type: current.type,
+        value: current.value,
+        tagIds: current.tagIds,
+        scopeFolderId: scope.value,
+        embeddingFilter: embedding,
+      }
+    }
+    return {
+      type: 'folder',
+      value: scope.value,
+      embeddingFilter: embedding,
+    }
+  }
+
+  if (scope.type === 'tag') {
+    const tagIds = getActiveTagIds(scope)
+    if (isSmartPrimary) {
+      return {
+        type: current.type,
+        value: current.value,
+        tagIds: current.tagIds,
+        scopeTagIds: tagIds,
+        embeddingFilter: embedding,
+      }
+    }
+    return {
+      type: 'tag',
+      tagIds,
+      value: tagIds[0],
+      embeddingFilter: embedding,
+    }
+  }
+
+  if (scope.type === 'all') {
+    if (isSmartPrimary) {
+      return {
+        type: current.type,
+        value: current.value,
+        tagIds: current.tagIds,
+        embeddingFilter: embedding,
+      }
+    }
+    return embedding ? { type: 'all', embeddingFilter: embedding } : { type: 'all' }
+  }
+
+  return scope
 }
 
 interface LibraryWarmCache {
@@ -441,11 +625,43 @@ function normalizeVisibleOcrEngine(value: unknown): OcrEngine {
 }
 
 function needsOcrWork(doc: DocumentItem, engine?: OcrEngine): boolean {
-  if (isDocumentOcrTextComplete(doc)) return false
+  // Status first: 待 OCR / queued / processing / error must stay eligible for batch OCR.
+  // Do NOT skip on text_page_count alone — that can mark incomplete books as “done”
+  // and leave them stuck on 待 OCR while never entering the queue.
   if (doc.import_status === 'error' || doc.ocr_status === 'error') return true
+  if (doc.ocr_status === 'queued' || doc.ocr_status === 'processing') return true
   if (doc.ocr_status !== 'completed') return true
+  if (!isDocumentOcrTextComplete(doc)) return true
   if ((engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid') && getEffectivePageCount(doc) > Number(doc.image_page_count || 0)) return true
   return false
+}
+
+/**
+ * Whether the book already has OCR body usable for text embedding.
+ * Broader than needsOcrWork: completed (incl. review pages) and partial text both count.
+ */
+function hasOcrBodyForEmbedding(doc: Pick<DocumentItem, 'ocr_status' | 'page_count' | 'actual_page_count' | 'text_page_count' | 'ocr_completed_page_count'>): boolean {
+  if (String(doc.ocr_status || '').trim() === 'completed') return true
+  if (isDocumentOcrTextComplete(doc)) return true
+  return Number(doc.text_page_count || 0) > 0 || Number(doc.ocr_completed_page_count || 0) > 0
+}
+
+/**
+ * "向量化 · 先 OCR 再向量" only auto-OCR books with no usable OCR body yet.
+ * Must NOT re-OCR completed books (including page-level review failures).
+ */
+function needsOcrBeforeEmbedding(doc: DocumentItem): boolean {
+  if (hasOcrBodyForEmbedding(doc)) return false
+  // Already in OCR queue/progress: do not start a second OCR for vectorize.
+  if (doc.ocr_status === 'queued' || doc.ocr_status === 'processing') return false
+  return true
+}
+
+/** Ordinary "向量化" only — ready / in-flight docs must use "重新向量化". */
+function needsEmbeddingWork(doc: Pick<DocumentItem, 'embedding_status'>): boolean {
+  const status = String(doc.embedding_status || '').trim()
+  if (status === 'ready' || status === 'queued' || status === 'processing') return false
+  return true
 }
 
 function shouldShowRetryAction(doc: DocumentItem): boolean {
@@ -615,11 +831,15 @@ interface EmbeddingProgressInfo {
   embeddedCount?: number
   segmentCount?: number
   errorMessage?: string
+  /** Optimistic cancel flag (mirrors OCR progress UI). */
+  canceled?: boolean
   updatedAt: number
 }
 
 const OCR_AI_TOAST_TIMEOUT_MS = 125_000
+/** Single shared toast for all OCR batch/retry/activity progress (never per-doc keys). */
 const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'
+const OCR_RESULT_MESSAGE_KEY = 'ocr-result'
 type StopPropagationEvent = Pick<MouseEvent, 'stopPropagation'>
 
 function isImmediateOcrProgressEvent(data: OcrProgressEvent): boolean {
@@ -744,6 +964,7 @@ interface DocumentCardContext {
   handleTaggingChange: (docId: string, nextChecked: string[]) => Promise<void>
   handleForceRerunDocument: (doc: DocumentItem, engine: OcrEngine) => Promise<void>
   handleCancelOcr: (docId: string, event?: MouseEvent<HTMLElement>) => Promise<void>
+  handleCancelEmbedding: (docId: string, event?: MouseEvent<HTMLElement>) => Promise<void>
   handleQuickAddTagToDocument: (docId: string, tagName: string) => Promise<void>
   openDocumentTagModal: (docId: string) => void
   handleAddToFolder: (docId: string, folderId: string) => Promise<void>
@@ -895,12 +1116,36 @@ function sanitizeHealthReport(report: DocumentHealthReport): DocumentHealthRepor
 function getPdfAssetTagMeta(doc: DocumentItem): { text: string; color: string; title: string } {
   const state = getPdfAssetState(doc)
   if (state === 'available') {
+    const metadata = (() => {
+      try {
+        const raw = typeof doc.metadata === 'string' ? JSON.parse(doc.metadata) : doc.metadata
+        return raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+      } catch {
+        return {}
+      }
+    })()
+    const linked = String(metadata.pdf_asset_storage || metadata.restored_storage_mode || '').trim() === 'linked'
+      || String(metadata.restored_storage_mode || '').trim() === 'link'
+    if (linked) {
+      return {
+        text: '链接原文',
+        color: 'cyan',
+        title: '已登记外部 PDF 路径（未复制到软件目录）。外盘/NAS 拔掉后将无法预览，可在设置关闭「仅登记路径」后重新复制补回。',
+      }
+    }
     return { text: '有原文', color: 'green', title: '软件目录中保留了 PDF 原文件或可用原图' }
   }
   if (state === 'text_only') {
     return { text: '仅文本', color: 'orange', title: '本地 PDF 原文件或页图不可读，可从原件仓库或手动选择 PDF 补回' }
   }
   return { text: '原文未知', color: 'default', title: '未记录 PDF 原文件状态' }
+}
+
+function getPdfRestoreSuccessMessage(result: { storageMode?: string } | null | undefined): string {
+  if (result?.storageMode === 'link') {
+    return '原文已链接补回（未复制到软件目录；请保持原 PDF 路径可用）'
+  }
+  return '原文已补回（已复制到软件目录）'
 }
 
 function getEmbeddingStatusTagMeta(doc: DocumentItem): { text: string; color: string; title: string } | null {
@@ -997,11 +1242,14 @@ function renderRatingStars(rating: number) {
   return `${'★'.repeat(rating)}${'☆'.repeat(Math.max(0, 5 - rating))}`
 }
 
-function getOcrBatchProgressMessage(engineLabel: string, batchIndex: number, totalBatches: number, batchSize: number, documentConcurrency: number): string {
-  const concurrencySuffix = documentConcurrency < batchSize
-    ? `，当前并发 ${documentConcurrency} 篇，其余自动排队`
-    : ''
-  return `正在用${engineLabel}后台识别第 ${batchIndex}/${totalBatches} 批（每批 ${batchSize} 篇${concurrencySuffix}）…`
+function getOcrBatchProgressMessage(engineLabel: string, totalCount: number): string {
+  return `正在用${engineLabel}识别 ${totalCount} 篇文献…`
+}
+
+/** Prefer a human-readable activity summary; fall back to batch progress text. */
+function mergeOcrToastContent(activitySummary: string | null, batchProgress?: string | null): string | null {
+  if (activitySummary && batchProgress) return `${activitySummary} · ${batchProgress}`
+  return activitySummary || batchProgress || null
 }
 
 function getOcrProgressText(info: OcrProgressInfo): string {
@@ -1010,7 +1258,7 @@ function getOcrProgressText(info: OcrProgressInfo): string {
   }
 
   if (info.phase === 'queued' || info.status === 'queued') {
-    return info.message || 'OCR 已排队：等待前面文献让出识别通道（大 PDF 通常串行，不是卡死）'
+    return info.message || 'OCR 已排队'
   }
 
   if (info.phase === 'ai') {
@@ -1139,6 +1387,10 @@ function shouldShowBookTranslationProgress(info?: BookTranslationProgressInfo): 
 
 function shouldShowEmbeddingProgress(info?: EmbeddingProgressInfo): boolean {
   if (!info) return false
+  if (info.canceled || info.status === 'canceled') {
+    const age = Date.now() - Number(info.updatedAt || 0)
+    return age < 12_000
+  }
   if (info.status === 'processing' || info.status === 'queued') return true
   const age = Date.now() - Number(info.updatedAt || 0)
   if (info.status === 'ready' && age < 12_000) return true
@@ -1148,28 +1400,46 @@ function shouldShowEmbeddingProgress(info?: EmbeddingProgressInfo): boolean {
 }
 
 function getEmbeddingProgressText(info: EmbeddingProgressInfo): string {
+  // Keep phrasing parallel to OCR: 「OCR 已取消…」「OCR 已排队…」「OCR 识别中：x/y 页」
+  if (info.canceled || info.status === 'canceled') {
+    return info.message || '向量化已取消，已有索引会保留；可稍后继续向量化'
+  }
   if (info.status === 'ready') return info.message || '向量化完成'
   if (info.status === 'error') {
     return info.errorMessage ? `向量化失败：${info.errorMessage}` : (info.message || '向量化失败')
   }
-  if (info.status === 'queued') return info.message || '已排队，等待向量化'
-  if (info.status === 'pending') return info.message || '等待正文分段就绪后再向量化'
+  if (info.status === 'queued') {
+    return info.message || '向量化已排队：等待前面文献让出处理通道（串行处理，不是卡死）'
+  }
+  if (info.status === 'pending') {
+    return info.message || '向量化已停止，可稍后继续（等待正文分段就绪）'
+  }
   if (info.embeddedCount !== undefined && info.segmentCount) {
     return info.message || `向量化中：${info.embeddedCount}/${info.segmentCount} 段`
   }
   return info.message || '向量化中'
 }
 
-function renderEmbeddingProgress(info?: EmbeddingProgressInfo) {
+function renderEmbeddingProgress(
+  info?: EmbeddingProgressInfo,
+  onCancel?: (docId: string, event: MouseEvent<HTMLElement>) => void,
+) {
   if (!info || !shouldShowEmbeddingProgress(info)) return null
   const percent = Math.max(0, Math.min(100, Math.round(Number(info.progress) || 0)))
+  // Color scheme aligned with OCR progress bar.
   const barColor = info.status === 'error'
     ? '#ff4d4f'
-    : info.status === 'ready'
-      ? '#52c41a'
-      : info.status === 'queued' || info.status === 'pending'
-        ? '#faad14'
-        : '#13c2c2'
+    : info.canceled || info.status === 'canceled'
+      ? '#8c8c8c'
+      : info.status === 'ready'
+        ? '#52c41a'
+        : info.status === 'queued' || info.status === 'pending'
+          ? '#faad14'
+          : '#1890ff'
+  const canCancel = Boolean(onCancel)
+    && !info.canceled
+    && info.status !== 'canceled'
+    && (info.status === 'queued' || info.status === 'processing')
   return (
     <div
       style={{
@@ -1182,7 +1452,20 @@ function renderEmbeddingProgress(info?: EmbeddingProgressInfo) {
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--gs-text-secondary)', fontSize: 12, lineHeight: 1.4 }}>
         <span style={{ minWidth: 0, overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{getEmbeddingProgressText(info)}</span>
-        <span style={{ flexShrink: 0 }}>{percent}%</span>
+        <span style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span>{percent}%</span>
+          {canCancel ? (
+            <Button
+              size="small"
+              danger
+              type="link"
+              style={{ height: 18, padding: 0, fontSize: 12, lineHeight: '18px' }}
+              onClick={(event) => onCancel?.(info.docId, event)}
+            >
+              {info.status === 'queued' ? '停止排队' : '停止向量化'}
+            </Button>
+          ) : null}
+        </span>
       </div>
       <div style={{ height: 4, marginTop: 6, borderRadius: 999, background: 'rgba(255,255,255,0.10)', overflow: 'hidden' }}>
         <div style={{ width: `${percent}%`, height: '100%', borderRadius: 999, background: barColor, transition: 'width 0.2s ease' }} />
@@ -1392,8 +1675,11 @@ function buildBatchMenuItems(): MenuProps['items'] {
       label: '向量索引',
       icon: <ThunderboltOutlined />,
       children: [
-        { key: 'vectorize', label: '向量化所选文献' },
-        { key: 'revectorize', label: '重新向量化所选（当前模型）' },
+        { key: 'vectorize', label: '批量向量化 · 先 OCR(飞桨) 再向量' },
+        { key: 'revectorize', label: '重新向量化 · 覆盖重建' },
+        { type: 'divider' },
+        { key: 'cancel_embedding', label: '停止所选向量化' },
+        { key: 'cancel_embedding_all', label: '停止全部向量化队列', danger: true },
       ],
     },
     {
@@ -1612,8 +1898,21 @@ function getLocalSmartFilterPredicate(filter: LibraryFilter): ((doc: DocumentIte
     return (doc) => doc.ocr_status !== 'completed' || hasZeroPages(doc)
   }
 
-  if (filter.type === 'embeddingReady') {
+  const embedding = getFilterEmbedding(filter)
+  if (embedding === 'ready') {
     return (doc) => String(doc.embedding_status || '') === 'ready' || Number(doc.embedding_chunk_count || 0) > 0
+  }
+  if (embedding === 'not_ready') {
+    return (doc) => String(doc.embedding_status || '') !== 'ready' && Number(doc.embedding_chunk_count || 0) <= 0
+  }
+  if (embedding === 'queued') {
+    return (doc) => String(doc.embedding_status || '') === 'queued'
+  }
+  if (embedding === 'processing') {
+    return (doc) => String(doc.embedding_status || '') === 'processing'
+  }
+  if (embedding === 'error') {
+    return (doc) => String(doc.embedding_status || '') === 'error'
   }
 
   return null
@@ -1622,10 +1921,35 @@ function getLocalSmartFilterPredicate(filter: LibraryFilter): ((doc: DocumentIte
 function isSameFilter(left: LibraryFilter, right: LibraryFilter): boolean {
   if (left.type !== right.type) return false
   if ((left.value || '') !== (right.value || '')) return false
+  if ((left.scopeFolderId || '') !== (right.scopeFolderId || '')) return false
+  if ((getFilterEmbedding(left) || '') !== (getFilterEmbedding(right) || '')) return false
+  const leftScopeTags = [...getFilterScopeTagIds(left)].sort()
+  const rightScopeTags = [...getFilterScopeTagIds(right)].sort()
+  if (leftScopeTags.length !== rightScopeTags.length) return false
+  if (!leftScopeTags.every((id, index) => id === rightScopeTags[index])) return false
   const leftIds = getActiveTagIds(left)
   const rightIds = getActiveTagIds(right)
   if (leftIds.length !== rightIds.length) return false
   return leftIds.every((id, index) => id === rightIds[index])
+}
+
+function isSmartViewFilterActive(current: LibraryFilter, smart: LibraryFilter): boolean {
+  const smartEmbedding = getFilterEmbedding(smart)
+  if (smart.type === 'all' && !smartEmbedding) {
+    return current.type === 'all' && !getFilterEmbedding(current) && !current.scopeFolderId && getFilterScopeTagIds(current).length === 0
+  }
+  if (smartEmbedding) {
+    return getFilterEmbedding(current) === smartEmbedding
+  }
+  if (current.type !== smart.type) return false
+  if ((current.value || '') !== (smart.value || '')) return false
+  const leftIds = getActiveTagIds(smart)
+  const rightIds = current.type === smart.type ? getActiveTagIds(current) : []
+  if (leftIds.length > 0) {
+    if (leftIds.length !== rightIds.length) return false
+    return leftIds.every((id, index) => id === rightIds[index])
+  }
+  return true
 }
 
 function applySmartFilterDocuments(documents: DocumentItem[], filter: LibraryFilter): DocumentItem[] {
@@ -1641,63 +1965,80 @@ function isHealthFilter(filter: LibraryFilter): filter is LibraryFilter & { type
 }
 
 function getFilterTitle(filter: LibraryFilter, folders: FolderItem[], tags: TagItem[]): string {
-  if (filter.type === 'all') return '\u6587\u732e\u7ba1\u7406'
-  if (filter.type === 'folder') {
-    if (filter.value === UNFILED_FOLDER_ID) return UNFILED_FOLDER_NAME
-    return folders.find((item) => item.id === filter.value)?.name || '\u6587\u4ef6\u5939'
+  const parts: string[] = []
+  const scopeFolderId = getFilterScopeFolderId(filter)
+  if (scopeFolderId) {
+    if (scopeFolderId === UNFILED_FOLDER_ID) parts.push(UNFILED_FOLDER_NAME)
+    else parts.push(folders.find((item) => item.id === scopeFolderId)?.name || '文件夹')
   }
-  if (filter.type === 'tag') {
-    const names = getActiveTagIds(filter)
-      .map((id) => tags.find((item) => item.id === id)?.name)
-      .filter(Boolean)
-    return names.length > 0 ? names.join('\u3001') : '\u6807\u7b7e\u7b5b\u9009'
+  const scopeTagIds = filter.type === 'tag' ? getActiveTagIds(filter) : getFilterScopeTagIds(filter)
+  if (scopeTagIds.length > 0) {
+    const names = scopeTagIds.map((id) => tags.find((item) => item.id === id)?.name).filter(Boolean)
+    if (names.length > 0) parts.push(names.join('、'))
   }
-  if (filter.type === 'favorite') return '\u661f\u6807\u6587\u732e'
-  if (filter.type === 'readStatus') return READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '\u9605\u8bfb\u72b6\u6001'
-  if (filter.type === 'metadataStatus') return METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '\u5143\u6570\u636e\u72b6\u6001'
-  if (filter.type === 'ocrIncomplete') return 'OCR 未完成文献'
-  if (filter.type === 'ocrStatus') return filter.value === 'pending' ? 'OCR 未完成文献' : getStatusMeta(OCR_STATUS_MAP, filter.value).text
-  if (filter.type === 'proofStatus') {
-    return filter.value === 'completed' ? '\u5df2\u6821\u5bf9' : '\u672a\u6821\u5bf9'
-  }
-  if (filter.type === 'metadataPending') return '\u672a\u786e\u8ba4\u5143\u6570\u636e'
-  if (filter.type === 'healthMissingMetadata') return '缺元数据'
-  if (filter.type === 'healthSuspiciousTitle') return '题名疑似导入名'
-  if (filter.type === 'healthUnknownType') return '待分类'
-  if (filter.type === 'healthTitleCleanup') return '标题/类型待整理'
-  if (filter.type === 'importStatus') return '\u672a\u5165\u5e93\u6587\u732e'
-  if (filter.type === 'embeddingReady') return '已向量化'
-  if (filter.type === 'docType') return filter.value || '\u6587\u732e\u7c7b\u578b'
-  return '\u6587\u732e\u7ba1\u7406'
+  if (filter.type === 'favorite') parts.push('星标文献')
+  else if (filter.type === 'readStatus') parts.push(READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '阅读状态')
+  else if (filter.type === 'metadataStatus') parts.push(METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '元数据状态')
+  else if (filter.type === 'ocrIncomplete') parts.push('OCR 未完成')
+  else if (filter.type === 'ocrStatus') parts.push(filter.value === 'pending' ? 'OCR 未完成' : getStatusMeta(OCR_STATUS_MAP, filter.value).text)
+  else if (filter.type === 'proofStatus') parts.push(filter.value === 'completed' ? '已校对' : '未校对')
+  else if (filter.type === 'metadataPending') parts.push('未确认元数据')
+  else if (filter.type === 'healthMissingMetadata') parts.push('缺元数据')
+  else if (filter.type === 'healthSuspiciousTitle') parts.push('题名疑似导入名')
+  else if (filter.type === 'healthUnknownType') parts.push('待分类')
+  else if (filter.type === 'healthTitleCleanup') parts.push('标题/类型待整理')
+  else if (filter.type === 'importStatus') parts.push('未入库文献')
+  else if (filter.type === 'docType') parts.push(filter.value || '文献类型')
+
+  const embedding = getFilterEmbedding(filter)
+  if (embedding) parts.push(embeddingFilterChipLabel(embedding))
+
+  if (parts.length === 0) return '文献管理'
+  return parts.join(' · ')
+}
+
+function embeddingFilterChipLabel(filter: LibraryEmbeddingFilter): string {
+  if (filter === 'ready') return '已向量化'
+  if (filter === 'not_ready') return '未向量化'
+  if (filter === 'queued') return '向量排队'
+  if (filter === 'processing') return '向量化中'
+  if (filter === 'error') return '向量失败'
+  return '向量'
 }
 
 function getFilterChipLabel(filter: LibraryFilter, folders: FolderItem[], tags: TagItem[]): string {
-  if (filter.type === 'folder' && filter.value) {
-    if (filter.value === UNFILED_FOLDER_ID) return `文件夹 / ${UNFILED_FOLDER_NAME}`
-    return `文件夹 / ${folders.find((item) => item.id === filter.value)?.name || '未命名'}`
+  const parts: string[] = []
+  const scopeFolderId = getFilterScopeFolderId(filter)
+  if (scopeFolderId) {
+    if (scopeFolderId === UNFILED_FOLDER_ID) parts.push(`文件夹 / ${UNFILED_FOLDER_NAME}`)
+    else parts.push(`文件夹 / ${folders.find((item) => item.id === scopeFolderId)?.name || '未命名'}`)
+  }
+  const scopeTagIds = getFilterScopeTagIds(filter)
+  if (scopeTagIds.length > 0 && filter.type !== 'tag') {
+    const names = scopeTagIds.map((id) => tags.find((item) => item.id === id)?.name).filter(Boolean)
+    if (names.length > 0) parts.push(`标签 / ${names.join('、')}`)
   }
   if (filter.type === 'tag') {
     const names = getActiveTagIds(filter)
       .map((id) => tags.find((item) => item.id === id)?.name)
       .filter(Boolean)
-    return names.length > 0 ? `标签 / ${names.join('、')}` : '标签筛选'
+    if (names.length > 0) parts.push(`标签 / ${names.join('、')}`)
   }
-  if (filter.type === 'favorite') return '\u661f\u6807\u6587\u732e'
-  if (filter.type === 'readStatus') return `阅读状态 / ${READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '未读'}`
-  if (filter.type === 'metadataStatus') return `元数据 / ${METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '待确认'}`
-  if (filter.type === 'ocrIncomplete') return 'OCR / 未完成'
-  if (filter.type === 'ocrStatus') return `OCR / ${filter.value === 'pending' ? '未完成' : getStatusMeta(OCR_STATUS_MAP, filter.value).text}`
-  if (filter.type === 'proofStatus') {
-    return filter.value === 'completed' ? '\u5df2\u6821\u5bf9' : '\u672a\u6821\u5bf9'
-  }
-  if (filter.type === 'metadataPending') return '\u672a\u786e\u8ba4\u5143\u6570\u636e'
-  if (filter.type === 'healthMissingMetadata') return '健康检查 / 缺元数据'
-  if (filter.type === 'healthSuspiciousTitle') return '健康检查 / 题名疑似导入名'
-  if (filter.type === 'healthUnknownType') return '健康检查 / 待分类'
-  if (filter.type === 'healthTitleCleanup') return '健康检查 / 标题或类型待整理'
-  if (filter.type === 'importStatus') return '\u672a\u5165\u5e93\u6587\u732e'
-  if (filter.type === 'embeddingReady') return '智能视窗 / 已向量化'
-  return ''
+  if (filter.type === 'favorite') parts.push('星标')
+  if (filter.type === 'readStatus') parts.push(`阅读 / ${READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '未读'}`)
+  if (filter.type === 'metadataStatus') parts.push(`元数据 / ${METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '待确认'}`)
+  if (filter.type === 'ocrIncomplete') parts.push('OCR / 未完成')
+  if (filter.type === 'ocrStatus') parts.push(`OCR / ${filter.value === 'pending' ? '未完成' : getStatusMeta(OCR_STATUS_MAP, filter.value).text}`)
+  if (filter.type === 'proofStatus') parts.push(filter.value === 'completed' ? '已校对' : '未校对')
+  if (filter.type === 'metadataPending') parts.push('未确认元数据')
+  if (filter.type === 'healthMissingMetadata') parts.push('健康检查 / 缺元数据')
+  if (filter.type === 'healthSuspiciousTitle') parts.push('健康检查 / 题名疑似导入名')
+  if (filter.type === 'healthUnknownType') parts.push('健康检查 / 待分类')
+  if (filter.type === 'healthTitleCleanup') parts.push('健康检查 / 标题或类型待整理')
+  if (filter.type === 'importStatus') parts.push('未入库')
+  const embedding = getFilterEmbedding(filter)
+  if (embedding) parts.push(`智能视窗 / ${embeddingFilterChipLabel(embedding)}`)
+  return parts.join(' · ')
 }
 
 function sortDocumentTags<T extends { name: string; color?: string | null; source?: string | null }>(tags: T[]): T[] {
@@ -1880,7 +2221,7 @@ function DocumentVirtualRow({
     if (key === 'cleanup_pdf_assets') {
       Modal.confirm({
         title: '删除原文件/页图缓存',
-        content: '只会删除软件数据目录里的 PDF 副本和页图缓存，不会删除 OCR 文本、检索结果，也不会修改 PDF 原件仓库。以后可从原件仓库补回。',
+        content: '只会删除软件数据目录（storage）内的 PDF 副本和页图缓存。绝不删除 OCR 文本、检索结果，也绝不删除 PDF 原件仓库 / NAS /「仅登记路径」指向的外部源文件。以后可从原件仓库或外盘补回。',
         okText: '删除原文件',
         cancelText: '取消',
         okButtonProps: { danger: true },
@@ -2045,12 +2386,12 @@ function DocumentVirtualRow({
                   textOverflow: 'ellipsis',
                 }}
               >
-                页面待复核：{doc.error_message}
+                {doc.error_message}
               </div>
             ) : null}
             {progressInfo ? renderOcrProgress(progressInfo, context.handleCancelOcr) : null}
             {renderBookTranslationProgress(bookTranslationProgressInfo)}
-            {renderEmbeddingProgress(context.embeddingProgressByDoc[doc.id])}
+            {renderEmbeddingProgress(context.embeddingProgressByDoc[doc.id], context.handleCancelEmbedding)}
             {visibleTags.length > 0 ? (
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
                 {visibleTags.map((tagItem) => {
@@ -2173,6 +2514,10 @@ export default function LibraryView({
   const [folderEditorParentId, setFolderEditorParentId] = useState<string | null>(null)
   const [batchTagModalOpen, setBatchTagModalOpen] = useState(false)
   const [batchTagCheckedIds, setBatchTagCheckedIds] = useState<string[]>([])
+  const [batchExportModalOpen, setBatchExportModalOpen] = useState(false)
+  const [pendingBatchExportFormat, setPendingBatchExportFormat] = useState<DocumentExportFormat | null>(null)
+  const [batchExportPageNumberMode, setBatchExportPageNumberMode] = useState<ExportPageNumberMode>('literature')
+  const [batchExporting, setBatchExporting] = useState(false)
   const [batchNewTagName, setBatchNewTagName] = useState('')
   const [documentTagModalDocId, setDocumentTagModalDocId] = useState<string | null>(null)
   const [documentTagNameInput, setDocumentTagNameInput] = useState('')
@@ -2204,6 +2549,12 @@ export default function LibraryView({
   const [ocrProgressByDoc, setOcrProgressByDoc] = useState<Record<string, OcrProgressInfo>>({})
   const [bookTranslationProgressByDoc, setBookTranslationProgressByDoc] = useState<Record<string, BookTranslationProgressInfo>>({})
   const [embeddingProgressByDoc, setEmbeddingProgressByDoc] = useState<Record<string, EmbeddingProgressInfo>>({})
+  /** Global embedding queue snapshot (for showing「停止全部向量化」only when the queue is live). */
+  const [embeddingQueueSnapshot, setEmbeddingQueueSnapshot] = useState<{
+    queueQueued: number
+    queueProcessing: number
+    queuePaused: boolean
+  } | null>(null)
   const [healthReport, setHealthReport] = useState<DocumentHealthReport | null>(null)
   const [healthLoading, setHealthLoading] = useState(false)
   const [healthPanelCollapsed, setHealthPanelCollapsed] = useState(true)
@@ -2224,6 +2575,8 @@ export default function LibraryView({
   const documentsRef = useRef<DocumentItem[]>([])
   const hasHydratedWarmCacheRef = useRef(false)
   const activeOcrToastKeysRef = useRef<Set<string>>(new Set())
+  /** Last batch-level progress line (shared toast); cleared when batches finish. */
+  const ocrBatchProgressTextRef = useRef<string | null>(null)
   const ocrProgressByDocRef = useRef<Record<string, OcrProgressInfo>>({})
   const ocrStatusBufferRef = useRef<Map<string, OcrProgressEvent>>(new Map())
   const ocrStatusFlushTimerRef = useRef<number | null>(null)
@@ -2575,24 +2928,31 @@ export default function LibraryView({
     if (activeFilter.type === 'ocrIncomplete') options.ocrIncomplete = true
     if (activeFilter.type === 'ocrStatus' && activeFilter.value) options.ocrStatus = activeFilter.value
     if (activeFilter.type === 'importStatus' && activeFilter.value) options.importStatus = activeFilter.value
-    if (activeFilter.type === 'folder' && activeFilter.value) {
-      if (activeFilter.value === UNFILED_FOLDER_ID) {
+
+    const scopeFolderId = getFilterScopeFolderId(activeFilter)
+    if (scopeFolderId) {
+      if (scopeFolderId === UNFILED_FOLDER_ID) {
         options.unfiledOnly = true
       } else {
-        options.folderIds = collectFolderDescendantIds(folders, activeFilter.value)
+        options.folderIds = collectFolderDescendantIds(folders, scopeFolderId)
       }
     }
+
     if (activeFilter.type === 'favorite') options.favoritesOnly = true
     if (activeFilter.type === 'readStatus' && activeFilter.value) options.readStatus = activeFilter.value
     if (activeFilter.type === 'metadataStatus' && activeFilter.value) options.metadataStatus = activeFilter.value
     if (activeFilter.type === 'proofStatus' && activeFilter.value) options.proofStatus = activeFilter.value
     if (activeFilter.type === 'metadataPending') options.metadataPending = true
-    if (activeFilter.type === 'embeddingReady') options.embeddingReady = true
+    const embeddingFilter = getFilterEmbedding(activeFilter)
+    if (embeddingFilter) options.embeddingFilter = embeddingFilter
     if (isHealthFilter(activeFilter)) options.healthFilter = activeFilter.type
 
     if (activeFilter.type === 'tag') {
       const tagIds = getActiveTagIds(activeFilter)
       if (tagIds.length > 0) options.tagIds = tagIds
+    } else {
+      const scopeTagIds = getFilterScopeTagIds(activeFilter)
+      if (scopeTagIds.length > 0) options.tagIds = scopeTagIds
     }
 
     return options
@@ -2789,12 +3149,64 @@ export default function LibraryView({
   }, [])
 
   const applyLibraryFilter = useCallback(async (nextFilter: LibraryFilter) => {
+    // Smart-view chips compose with folder/tag; folder/tag compose with smart refinements.
+    const isSmartCatalog = SMART_VIEW_CATALOG.some((item) => (
+      item.filter.type === nextFilter.type
+      && (item.filter.value || '') === (nextFilter.value || '')
+      && (getFilterEmbedding(item.filter) || '') === (getFilterEmbedding(nextFilter) || '')
+    )) || Boolean(getFilterEmbedding(nextFilter) && nextFilter.type === 'all')
+
+    if (isSmartCatalog || (getFilterEmbedding(nextFilter) !== undefined && nextFilter.type === 'all')) {
+      // Toggle same smart chip off when already active.
+      if (isSmartViewFilterActive(filter, nextFilter) && nextFilter.type !== 'all') {
+        setFilter(mergeSmartViewFilter(filter, { type: 'all' }))
+        return
+      }
+      if (nextFilter.type === 'all' && !getFilterEmbedding(nextFilter) && isSmartViewFilterActive(filter, nextFilter)) {
+        setFilter({ type: 'all' })
+        return
+      }
+      setFilter(mergeSmartViewFilter(filter, nextFilter))
+      return
+    }
+
+    if (nextFilter.type === 'folder' || nextFilter.type === 'tag') {
+      const sameFolder = nextFilter.type === 'folder'
+        && getFilterScopeFolderId(filter) === nextFilter.value
+      const sameTag = nextFilter.type === 'tag'
+        && isSameFilter(
+          { type: 'tag', tagIds: getFilterScopeTagIds(filter), value: getFilterScopeTagIds(filter)[0] },
+          nextFilter,
+        )
+      if (sameFolder || sameTag || isSameFilter(filter, nextFilter)) {
+        // Toggle folder/tag off → keep smart/embedding only.
+        const embedding = getFilterEmbedding(filter)
+        if (!isScopeOnlyFilter(filter) && filter.type !== 'folder' && filter.type !== 'tag') {
+          setFilter({
+            type: filter.type,
+            value: filter.value,
+            tagIds: filter.tagIds,
+            embeddingFilter: embedding,
+          })
+          return
+        }
+        setFilter(embedding ? { type: 'all', embeddingFilter: embedding } : { type: 'all' })
+        return
+      }
+      setFilter(mergeScopeFilter(filter, nextFilter))
+      return
+    }
+
     setFilter(nextFilter)
-  }, [setFilter])
+  }, [filter, setFilter])
 
   const toggleLibraryFilter = useCallback(async (nextFilter: LibraryFilter) => {
+    if (nextFilter.type === 'folder' || nextFilter.type === 'tag') {
+      await applyLibraryFilter(nextFilter)
+      return
+    }
     setFilter(isSameFilter(filter, nextFilter) ? { type: 'all' } : nextFilter)
-  }, [filter, setFilter])
+  }, [applyLibraryFilter, filter, setFilter])
 
   const closeHealthPanel = useCallback(() => {
     setHealthPanelCollapsed(true)
@@ -2942,9 +3354,10 @@ export default function LibraryView({
     }
 
     const activitySummary = buildOcrActivitySummary(Object.values(nextProgressByDoc))
-    if (activitySummary) {
+    const mergedOcrToast = mergeOcrToastContent(activitySummary, ocrBatchProgressTextRef.current)
+    if (mergedOcrToast) {
       activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
-      message.loading({ content: activitySummary, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
+      message.loading({ content: mergedOcrToast, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
     } else {
       activeOcrToastKeysRef.current.delete(OCR_ACTIVITY_MESSAGE_KEY)
       message.destroy(OCR_ACTIVITY_MESSAGE_KEY)
@@ -3224,6 +3637,11 @@ export default function LibraryView({
 
   useEffect(() => {
     const applyEmbeddingEvent = (event: EmbeddingProgressEvent) => {
+      setEmbeddingQueueSnapshot({
+        queueQueued: Number(event.queueQueued || 0),
+        queueProcessing: Number(event.queueProcessing || 0),
+        queuePaused: Boolean(event.queuePaused),
+      })
       if (!event.docId) return
       const docId = event.docId
       setEmbeddingProgressByDoc((current) => ({
@@ -3239,19 +3657,35 @@ export default function LibraryView({
           updatedAt: Date.now(),
         },
       }))
-      // Mirror status onto the library card tags immediately (ready / queued / error…).
-      if (event.status === 'ready' || event.status === 'queued' || event.status === 'processing' || event.status === 'error') {
+      // Mirror status onto the library card tags immediately (ready / queued / error / pending…).
+      if (
+        event.status === 'ready'
+        || event.status === 'queued'
+        || event.status === 'processing'
+        || event.status === 'error'
+        || event.status === 'pending'
+      ) {
         updateDocumentInList(docId, {
           embedding_status: event.status === 'ready' ? 'ready' : event.status,
           embedding_chunk_count: event.status === 'ready'
             ? Math.max(Number(event.embeddedCount || 0), Number(event.segmentCount || 0))
-            : undefined,
+            : event.status === 'pending'
+              ? Number(event.embeddedCount || 0)
+              : undefined,
         })
       }
-      if (event.status === 'ready' || event.status === 'error' || event.status === 'idle') {
+      if (event.status === 'ready' || event.status === 'error' || event.status === 'idle' || event.status === 'pending') {
         scheduleSmartViewCountsRefresh(400)
       }
     }
+    void window.api.getEmbeddingProgressSnapshot().then((snapshot) => {
+      if (!snapshot) return
+      setEmbeddingQueueSnapshot({
+        queueQueued: Number(snapshot.queueQueued || 0),
+        queueProcessing: Number(snapshot.queueProcessing || 0),
+        queuePaused: Boolean(snapshot.queuePaused),
+      })
+    }).catch(() => {})
     const unsubscribe = window.api.onEmbeddingProgress(applyEmbeddingEvent)
     return () => {
       unsubscribe()
@@ -3462,22 +3896,35 @@ export default function LibraryView({
     }
   }, [])
 
+  const [smartViewVisibleKeys, setSmartViewVisibleKeys] = useState<string[]>(() => loadSmartViewVisibleKeys())
+  const [smartViewCustomizeOpen, setSmartViewCustomizeOpen] = useState(false)
+
   const smartFilters = useMemo(() => {
-    return [
-      { key: 'all', label: `全部文献 ${smartViewCounts.all}`, filter: { type: 'all' as const } },
-      { key: 'missing-metadata', label: `缺元数据 ${smartViewCounts.missingMetadata}`, filter: { type: 'healthMissingMetadata' as const } },
-      { key: 'unrecognized', label: `OCR 未完成 ${smartViewCounts.unrecognized}`, filter: { type: 'ocrIncomplete' as const } },
-      { key: 'suspicious-title', label: `题名疑似导入名 ${smartViewCounts.suspiciousTitle}`, filter: { type: 'healthSuspiciousTitle' as const } },
-      { key: 'unknown-type', label: `待分类 ${smartViewCounts.unknownType}`, filter: { type: 'healthUnknownType' as const } },
-      { key: 'favorite', label: `星标 ${smartViewCounts.favorite}`, filter: { type: 'favorite' as const } },
-      { key: 'unread', label: `未读 ${smartViewCounts.unread}`, filter: { type: 'readStatus' as const, value: 'unread' } },
-      { key: 'proofed', label: `已校对 ${smartViewCounts.proofed}`, filter: { type: 'proofStatus' as const, value: 'completed' } },
-      { key: 'unproofed', label: `未校对 ${smartViewCounts.unproofed}`, filter: { type: 'proofStatus' as const, value: 'pending' } },
-      { key: 'metadata-pending', label: `未确认元数据 ${smartViewCounts.metadataPending}`, filter: { type: 'metadataPending' as const } },
-      { key: 'vectorized', label: `已向量化 ${smartViewCounts.vectorized ?? 0}`, filter: { type: 'embeddingReady' as const } },
-      { key: 'unstored', label: `未入库 ${smartViewCounts.unstored}`, filter: { type: 'importStatus' as const, value: 'unstored' } }
-    ]
-  }, [smartViewCounts])
+    const visible = new Set(smartViewVisibleKeys)
+    return SMART_VIEW_CATALOG
+      .filter((item) => item.locked || visible.has(item.key))
+      .map((item) => ({
+        key: item.key,
+        label: `${item.label} ${smartViewCounts[item.countKey] ?? 0}`,
+        filter: item.filter,
+      }))
+  }, [smartViewCounts, smartViewVisibleKeys])
+
+  const handleSmartViewVisibleChange = useCallback((key: string, checked: boolean) => {
+    const item = SMART_VIEW_CATALOG.find((entry) => entry.key === key)
+    if (item?.locked) return
+    setSmartViewVisibleKeys((previous) => {
+      const next = checked
+        ? (previous.includes(key) ? previous : [...previous, key])
+        : previous.filter((entry) => entry !== key)
+      // Preserve catalog order.
+      const ordered = SMART_VIEW_CATALOG.map((entry) => entry.key).filter((entry) => next.includes(entry) || SMART_VIEW_CATALOG.find((c) => c.key === entry)?.locked)
+      const locked = SMART_VIEW_CATALOG.filter((entry) => entry.locked).map((entry) => entry.key)
+      const merged = [...new Set([...locked, ...ordered])]
+      saveSmartViewVisibleKeys(merged)
+      return merged
+    })
+  }, [])
 
   const healthMetricItems = useMemo(() => {
     const countRowsWithIssues = (types: string[]) => healthReport?.rows.filter((row) => row.issues.some((issue) => types.includes(issue.type))).length || 0
@@ -3858,9 +4305,9 @@ export default function LibraryView({
       updateDocumentInList(doc.id, { file_path: null })
       await loadDocuments(filter, { silent: true })
       if (result.cleaned) {
-        message.success(`已删除原图副本和页图缓存，释放 ${formatBytes(result.bytesFreed)}`)
+        message.success(`已删除软件目录内的原图副本和页图缓存，释放 ${formatBytes(result.bytesFreed)}（外部源 PDF 不会删除）`)
       } else {
-        message.info('这篇文献没有可清理的本地原图副本')
+        message.info('这篇文献没有可清理的本地原图副本（外部链接原件不会被删除）')
       }
     } catch (error) {
       console.error(error)
@@ -3873,7 +4320,7 @@ export default function LibraryView({
       message.loading({ content: `正在补回“${doc.title || '未命名文献'}”的原文…`, key: `restore-pdf-${doc.id}`, duration: 0 })
       const result = await window.api.restorePdfForDocument(doc.id)
       if (result?.restored) {
-        message.success({ content: '原文已补回，可以进入校对模式', key: `restore-pdf-${doc.id}` })
+        message.success({ content: `${getPdfRestoreSuccessMessage(result)}，可以进入校对模式`, key: `restore-pdf-${doc.id}` })
         await loadDocuments(filter, { silent: true })
       } else {
         message.warning({ content: result?.error || '未在 PDF 原件仓库找到同内容文件', key: `restore-pdf-${doc.id}`, duration: 6 })
@@ -4074,7 +4521,7 @@ export default function LibraryView({
 
     Modal.confirm({
       title: '批量删除原文件',
-      content: `将删除 ${targets.length} 篇文献的软件目录内 PDF 副本和页图缓存；不会删除 OCR 文本，也不会修改 PDF 原件仓库。`,
+      content: `将删除 ${targets.length} 篇文献在软件数据目录内的 PDF 副本和页图缓存。绝不删除 OCR 文本，也绝不删除外部源 PDF / 原件仓库文件。`,
       okText: '删除原文件',
       cancelText: '取消',
       okButtonProps: { danger: true },
@@ -4107,26 +4554,46 @@ export default function LibraryView({
 
     message.loading({ content: `正在补回 ${targets.length} 篇文献原文…`, key: 'batch-restore-pdf', duration: 0 })
     let restoredCount = 0
+    let linkedCount = 0
     let failedCount = 0
     for (const doc of targets) {
       try {
         const result = await window.api.restorePdfForDocument(doc.id)
-        if (result?.restored) restoredCount += 1
-        else failedCount += 1
+        if (result?.restored) {
+          restoredCount += 1
+          if (result.storageMode === 'link') linkedCount += 1
+        } else failedCount += 1
       } catch (error) {
         failedCount += 1
         console.error(`[Library] 批量补回原文失败: ${doc.id}`, error)
       }
     }
     if (restoredCount > 0) {
-      message.success({ content: `已补回 ${restoredCount} 篇原文${failedCount ? `，${failedCount} 篇未找到` : ''}`, key: 'batch-restore-pdf', duration: 5 })
+      const linkHint = linkedCount > 0 ? `（其中 ${linkedCount} 篇仅登记路径）` : ''
+      message.success({
+        content: `已补回 ${restoredCount} 篇原文${linkHint}${failedCount ? `，${failedCount} 篇未找到` : ''}`,
+        key: 'batch-restore-pdf',
+        duration: 5,
+      })
     } else {
       message.warning({ content: '未能补回原文，请检查 PDF 原件仓库索引', key: 'batch-restore-pdf', duration: 6 })
     }
     await loadDocuments(filter, { silent: true })
   }
 
-  const handleBatchExport = async (format: DocumentExportFormat) => {
+  const openBatchExportModal = (format: DocumentExportFormat) => {
+    if (selectedIds.length === 0) {
+      message.info('请先选择文献')
+      return
+    }
+    setPendingBatchExportFormat(format)
+    setBatchExportPageNumberMode('literature')
+    setBatchExportModalOpen(true)
+  }
+
+  const handleBatchExport = async () => {
+    const format = pendingBatchExportFormat
+    if (!format) return
     if (selectedIds.length === 0) {
       message.info('请先选择文献')
       return
@@ -4143,9 +4610,15 @@ export default function LibraryView({
       'layout-searchable-pdf': '原图可搜索 PDF',
     }
 
+    setBatchExporting(true)
+    setBatchExportModalOpen(false)
     message.loading({ content: `正在准备导出 ${selectedIds.length} 篇文献…`, key: 'batch-export', duration: 0 })
     try {
-      const result = await window.api.exportDocumentsBatch(selectedIds, format, getFacsimileExportOptions(format))
+      const exportOptions: DocumentExportOptions = {
+        ...(getFacsimileExportOptions(format) || {}),
+        pageNumberMode: batchExportPageNumberMode,
+      }
+      const result = await window.api.exportDocumentsBatch(selectedIds, format, exportOptions)
       if (result?.canceled) {
         message.destroy('batch-export')
         return
@@ -4167,6 +4640,9 @@ export default function LibraryView({
     } catch (error) {
       console.error(error)
       message.error({ content: `批量导出失败：${(error as Error)?.message || '未知错误'}`, key: 'batch-export', duration: 6 })
+    } finally {
+      setBatchExporting(false)
+      setPendingBatchExportFormat(null)
     }
   }
 
@@ -4230,6 +4706,11 @@ export default function LibraryView({
       getEngineLabel: (value) => getOcrEngineLabel(value as OcrEngine),
       onProgress: (content, key) => {
         setImportProgressText(content)
+        // OCR-related prep always updates the single shared progress toast.
+        if (key === OCR_ACTIVITY_MESSAGE_KEY) {
+          showSharedOcrProgressToast(content)
+          return
+        }
         if (key) message.loading({ content, key, duration: 0 })
       },
     })
@@ -4252,33 +4733,79 @@ export default function LibraryView({
     return Math.max(1, Math.min(MAX_IMPORT_BATCH_SIZE, batchSize))
   }
 
+  const showSharedOcrProgressToast = (content: string) => {
+    ocrBatchProgressTextRef.current = content
+    const activitySummary = buildOcrActivitySummary(Object.values(ocrProgressByDocRef.current))
+    const merged = mergeOcrToastContent(activitySummary, content) || content
+    activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
+    message.loading({ content: merged, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
+  }
+
+  const clearSharedOcrProgressToast = (options?: { keepIfActiveDocs?: boolean }) => {
+    ocrBatchProgressTextRef.current = null
+    if (options?.keepIfActiveDocs) {
+      const activitySummary = buildOcrActivitySummary(Object.values(ocrProgressByDocRef.current))
+      if (activitySummary) {
+        activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
+        message.loading({ content: activitySummary, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
+        return
+      }
+    }
+    activeOcrToastKeysRef.current.delete(OCR_ACTIVITY_MESSAGE_KEY)
+    message.destroy(OCR_ACTIVITY_MESSAGE_KEY)
+  }
+
   const runOcrInConfiguredBatches = async (
     docIds: string[],
     engine: OcrEngine,
-    messageKey: string,
+    _messageKey: string,
     options?: BatchOcrOptions,
   ) => {
     const uniqueDocIds = Array.from(new Set(docIds.filter(Boolean)))
     if (uniqueDocIds.length === 0) return 0
 
     const configuredBatchSize = await getConfiguredBatchSize()
-    const ocrBatchSize = Math.max(1, Math.min(MAX_IMPORT_BATCH_SIZE, configuredBatchSize))
-    const documentConcurrency = ocrBatchSize
-    const batches = chunkArray(uniqueDocIds, ocrBatchSize)
+    // “每批 N 篇” = 文档并发 N（同时处理），不是“等 N 本全部跑完才收下一批”。
+    const documentConcurrency = Math.max(1, Math.min(MAX_IMPORT_BATCH_SIZE, configuredBatchSize))
     let successCount = 0
     let shouldRefreshAfterBatches = false
     const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'
 
-    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-      const batch = batches[batchIndex]
-      let ocrBatch = batch
+    // Mark every selected id as queued in UI immediately (user-visible “进队”).
+    const now = Date.now()
+    setOcrProgressByDoc((current) => {
+      const next = { ...current }
+      uniqueDocIds.forEach((docId) => {
+        next[docId] = {
+          ...(next[docId] || { docId, progress: 0 }),
+          docId,
+          status: 'queued',
+          phase: 'queued',
+          progress: 0,
+          message: `OCR 已入队，共 ${uniqueDocIds.length} 篇`,
+          updatedAt: now,
+        }
+      })
+      ocrProgressByDocRef.current = next
+      return next
+    })
+    updateDocumentsInList(uniqueDocIds.map((id) => ({
+      id,
+      data: { ocr_status: 'queued', import_status: 'processing', error_message: null },
+    })))
+
+    try {
+      let ocrBatch = uniqueDocIds
       if (requiresPageImagesBeforeOcr) {
         ocrBatch = []
-        for (let docIndex = 0; docIndex < batch.length; docIndex += 1) {
-          const docId = batch[docIndex]
+        for (let docIndex = 0; docIndex < uniqueDocIds.length; docIndex += 1) {
+          const docId = uniqueDocIds[docIndex]
           try {
-            const ready = await ensurePdfPageImagesForOcr(docId, messageKey, {
-              fileIndex: batchIndex * ocrBatchSize + docIndex,
+            showSharedOcrProgressToast(
+              `正在准备页图 ${docIndex + 1}/${uniqueDocIds.length}…`,
+            )
+            const ready = await ensurePdfPageImagesForOcr(docId, OCR_ACTIVITY_MESSAGE_KEY, {
+              fileIndex: docIndex,
               totalFiles: uniqueDocIds.length,
               engine,
             })
@@ -4302,19 +4829,26 @@ export default function LibraryView({
           await delay(0)
         }
       }
+
       if (ocrBatch.length === 0) {
         scheduleImportListRefresh()
-        continue
+        return 0
       }
-      message.loading({
-        content: getOcrBatchProgressMessage(getOcrEngineLabel(engine), batchIndex + 1, batches.length, ocrBatchSize, documentConcurrency),
-        key: messageKey,
-        duration: 0,
+
+      showSharedOcrProgressToast(
+        `正在识别 ${ocrBatch.length} 篇文献…`,
+      )
+      // Whole selection in one call: main marks all queued, then processes with concurrency.
+      successCount = await window.api.batchOcr(ocrBatch, {
+        engine,
+        forceFullRerun: options?.forceFullRerun,
+        concurrency: documentConcurrency,
       })
-      successCount += await window.api.batchOcr(ocrBatch, { engine, forceFullRerun: options?.forceFullRerun, concurrency: documentConcurrency })
       shouldRefreshAfterBatches = true
       scheduleImportListRefresh()
-      await delay(0)
+    } finally {
+      // Drop batch line; keep a single summary toast if docs are still processing via IPC.
+      clearSharedOcrProgressToast({ keepIfActiveDocs: true })
     }
 
     if (shouldRefreshAfterBatches) {
@@ -4379,11 +4913,121 @@ export default function LibraryView({
         key: 'ocr-cancel-all',
         duration: 6,
       })
+      ocrBatchProgressTextRef.current = null
+      activeOcrToastKeysRef.current.delete(OCR_ACTIVITY_MESSAGE_KEY)
       message.destroy(OCR_ACTIVITY_MESSAGE_KEY)
+      message.destroy(OCR_RESULT_MESSAGE_KEY)
       await loadDocuments(filter, { silent: true })
+      scheduleSmartViewCountsRefresh(200)
     } catch (error) {
       console.error('[Library] 全部停止 OCR 失败', error)
       message.error({ content: `全部停止 OCR 失败：${getErrorMessage(error, '未知错误')}`, key: 'ocr-cancel-all', duration: 6 })
+    }
+  }
+
+  const handleCancelEmbedding = async (docId: string, event?: MouseEvent<HTMLElement>) => {
+    event?.stopPropagation()
+    // Optimistic UI — same pattern as handleCancelOcr.
+    setEmbeddingProgressByDoc((current) => ({
+      ...current,
+      [docId]: {
+        ...(current[docId] || { docId, status: 'processing', progress: 0 }),
+        docId,
+        status: 'canceled',
+        progress: Number(current[docId]?.progress || 0),
+        message: '正在停止向量化…',
+        errorMessage: '向量化已取消',
+        canceled: true,
+        updatedAt: Date.now(),
+      },
+    }))
+    message.loading({ content: '正在停止向量化…', key: `embedding-cancel-${docId}`, duration: 0 })
+    try {
+      const result = await window.api.cancelDocumentsForEmbedding([docId])
+      if (result.canceled <= 0) {
+        message.info({ content: '该文献不在向量化队列中', key: `embedding-cancel-${docId}`, duration: 3 })
+        setEmbeddingProgressByDoc((current) => {
+          const next = { ...current }
+          delete next[docId]
+          return next
+        })
+        return
+      }
+      const restored = result.restoredReady > 0 ? 'ready' : 'pending'
+      setEmbeddingProgressByDoc((current) => ({
+        ...current,
+        [docId]: {
+          docId,
+          status: restored === 'ready' ? 'ready' : 'canceled',
+          progress: restored === 'ready' ? 100 : 0,
+          message: restored === 'ready'
+            ? '向量化已取消，已恢复为已向量化（原有索引保留）'
+            : '向量化已取消，可稍后继续',
+          canceled: restored !== 'ready',
+          updatedAt: Date.now(),
+        },
+      }))
+      updateDocumentInList(docId, {
+        embedding_status: restored,
+        embedding_chunk_count: restored === 'ready' ? undefined : 0,
+      })
+      message.info({
+        content: restored === 'ready'
+          ? '已停止向量化，并恢复为「已向量化」（原有索引保留）'
+          : '已停止向量化；该文献不会再被旧队列自动续跑',
+        key: `embedding-cancel-${docId}`,
+        duration: 4,
+      })
+      scheduleSmartViewCountsRefresh(200)
+    } catch (error) {
+      console.error('[Library] 停止向量化失败', error)
+      message.error({
+        content: `停止向量化失败：${getErrorMessage(error, '未知错误')}`,
+        key: `embedding-cancel-${docId}`,
+        duration: 5,
+      })
+    }
+  }
+
+  const handleCancelAllPendingEmbeddings = async () => {
+    message.loading({ content: '正在停止全部向量化队列…', key: 'embedding-cancel-all', duration: 0 })
+    try {
+      const result = await window.api.cancelAllPendingEmbeddings()
+      setEmbeddingQueueSnapshot({ queueQueued: 0, queueProcessing: 0, queuePaused: false })
+      setEmbeddingProgressByDoc((current) => {
+        const next: Record<string, EmbeddingProgressInfo> = { ...current }
+        Object.entries(current).forEach(([docId, info]) => {
+          if (info.status === 'queued' || info.status === 'processing') {
+            next[docId] = {
+              ...info,
+              status: 'canceled',
+              progress: 0,
+              message: '向量化已取消，可稍后继续',
+              errorMessage: '向量化已取消',
+              canceled: true,
+              updatedAt: Date.now(),
+            }
+          }
+        })
+        return next
+      })
+      message.success({
+        content: result.canceled > 0
+          ? `已停止向量化队列：取消 ${result.canceled} 篇（恢复已向量化 ${result.restoredReady} 篇，待继续 ${result.restoredPending} 篇）。已有索引会保留。`
+          : '当前没有排队中的向量化任务',
+        key: 'embedding-cancel-all',
+        duration: 6,
+      })
+      message.destroy(BACKGROUND_EMBEDDING_MESSAGE_KEY)
+      scheduleSmartViewCountsRefresh(200)
+      await loadDocuments(filter, { silent: true })
+    } catch (error) {
+      console.error('[Library] 全部停止向量化失败', error)
+      message.error({
+        content: `全部停止向量化失败：${getErrorMessage(error, '未知错误')}`,
+        key: 'embedding-cancel-all',
+        duration: 6,
+      })
     }
   }
 
@@ -5242,14 +5886,22 @@ export default function LibraryView({
   }, [droppedImportRequest, onDroppedImportHandled])
 
   const handleBatchOcr = async (engine: OcrEngine = 'paddle', options?: BatchOcrOptions) => {
+    // Prefer explicit multi-select. Never silently drop selected ids just because they
+    // are not in the currently rendered page of `documents`.
     const sourceIds = batchMode && selectedIds.length > 0
       ? selectedIds
       : documents.map((item) => item.id)
+    const resolveDoc = (id: string) => (
+      documents.find((item) => item.id === id)
+      || documentsRef.current.find((item) => item.id === id)
+    )
     const targetIds = options?.forceFullRerun
       ? sourceIds
       : sourceIds.filter((id) => {
-        const doc = documents.find((item) => item.id === id)
-        return doc && needsOcrWork(doc, engine)
+        const doc = resolveDoc(id)
+        // Not loaded in the list cache: still enqueue; main process skips if already complete.
+        if (!doc) return true
+        return needsOcrWork(doc, engine)
       })
     const skippedCount = sourceIds.length - targetIds.length
 
@@ -5270,26 +5922,27 @@ export default function LibraryView({
       return
     }
 
-    message.loading({
-      content: options?.forceFullRerun
+    showSharedOcrProgressToast(
+      options?.forceFullRerun
         ? `正在用${getOcrEngineLabel(engine)}重新 OCR ${targetIds.length} 篇文献…`
         : `正在用${getOcrEngineLabel(engine)}批量识别 ${targetIds.length} 篇文献${skippedCount > 0 ? `，已跳过 ${skippedCount} 篇已完成文献` : ''}…`,
-      key: 'batch-ocr',
-      duration: 0,
-    })
+    )
     try {
-      const successCount = await runOcrInConfiguredBatches(targetIds, engine, 'batch-ocr', {
+      const successCount = await runOcrInConfiguredBatches(targetIds, engine, OCR_ACTIVITY_MESSAGE_KEY, {
         forceFullRerun: options?.forceFullRerun,
       })
+      clearSharedOcrProgressToast({ keepIfActiveDocs: true })
       message.success({
         content: options?.forceFullRerun
           ? `${getOcrEngineLabel(engine)}重新 OCR 完成，成功处理 ${successCount} 篇文献`
           : `${getOcrEngineLabel(engine)}批量识别完成，成功处理 ${successCount} 篇文献${skippedCount > 0 ? `，跳过 ${skippedCount} 篇已完成文献` : ''}`,
-        key: 'batch-ocr',
+        key: OCR_RESULT_MESSAGE_KEY,
+        duration: 4,
       })
     } catch (error) {
       console.error(error)
-      message.error({ content: '批量 OCR 识别失败', key: 'batch-ocr' })
+      clearSharedOcrProgressToast()
+      message.error({ content: '批量 OCR 识别失败', key: OCR_RESULT_MESSAGE_KEY, duration: 6 })
       await loadDocuments(filter, { silent: true })
     }
   }
@@ -5381,7 +6034,7 @@ export default function LibraryView({
       return
     }
 
-    message.loading({ content: `正在重新处理“${doc.title || '未命名文献'}”…`, key: `retry-${doc.id}`, duration: 0 })
+    showSharedOcrProgressToast(`正在重新处理“${doc.title || '未命名文献'}”…`)
     message.destroy(`ocr-error-${doc.id}`)
     setOcrProgressByDoc((current) => {
       const { [doc.id]: _removed, ...rest } = current
@@ -5405,11 +6058,12 @@ export default function LibraryView({
       const latestDoc = await window.api.getDocumentLight(doc.id)
       const storedEngine = parseDocMetadata(latestDoc || doc).ocr_engine
       const retryEngine = isOcrEngine(storedEngine) ? storedEngine : undefined
-      const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || 'paddle', `retry-${doc.id}`)
+      const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || 'paddle', OCR_ACTIVITY_MESSAGE_KEY)
+      clearSharedOcrProgressToast({ keepIfActiveDocs: true })
       if (successCount > 0) {
-        message.success({ content: '重新处理完成', key: `retry-${doc.id}` })
+        message.success({ content: '重新处理完成', key: OCR_RESULT_MESSAGE_KEY, duration: 3 })
       } else {
-        message.warning({ content: '重新处理未完成，请查看失败原因后再试', key: `retry-${doc.id}`, duration: 5 })
+        message.warning({ content: '重新处理未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })
       }
     } catch (error) {
       console.error(error)
@@ -5419,7 +6073,8 @@ export default function LibraryView({
         ocr_status: 'error',
         error_message: `重试失败：${reason}`,
       })
-      message.error({ content: `重试失败：${reason}`, key: `retry-${doc.id}`, duration: 6 })
+      clearSharedOcrProgressToast()
+      message.error({ content: `重试失败：${reason}`, key: OCR_RESULT_MESSAGE_KEY, duration: 6 })
       await loadDocuments(filter, { silent: true })
     } finally {
       setImportProgressText('')
@@ -5439,17 +6094,19 @@ export default function LibraryView({
       return
     }
 
-    message.loading({ content: `正在用${getOcrEngineLabel(engine)}重新 OCR“${doc.title || '未命名文献'}”…`, key: `rerun-ocr-${doc.id}`, duration: 0 })
+    showSharedOcrProgressToast(`正在用${getOcrEngineLabel(engine)}重新 OCR“${doc.title || '未命名文献'}”…`)
     try {
-      const successCount = await runOcrInConfiguredBatches([doc.id], engine, `rerun-ocr-${doc.id}`, { forceFullRerun: true })
+      const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true })
+      clearSharedOcrProgressToast({ keepIfActiveDocs: true })
       if (successCount > 0) {
-        message.success({ content: '整本文献已重新 OCR', key: `rerun-ocr-${doc.id}` })
+        message.success({ content: '整本文献已重新 OCR', key: OCR_RESULT_MESSAGE_KEY, duration: 3 })
       } else {
-        message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: `rerun-ocr-${doc.id}`, duration: 5 })
+        message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })
       }
     } catch (error) {
       console.error(error)
-      message.error({ content: `重新 OCR 失败：${(error as Error)?.message || '未知错误'}`, key: `rerun-ocr-${doc.id}`, duration: 6 })
+      clearSharedOcrProgressToast()
+      message.error({ content: `重新 OCR 失败：${(error as Error)?.message || '未知错误'}`, key: OCR_RESULT_MESSAGE_KEY, duration: 6 })
       await loadDocuments(filter, { silent: true })
     }
   }
@@ -5461,7 +6118,7 @@ export default function LibraryView({
       return
     }
 
-    message.loading({ content: `正在重试 ${failedDocs.length} 篇失败文献…`, key: 'retry-failed', duration: 0 })
+    showSharedOcrProgressToast(`正在重试 ${failedDocs.length} 篇失败文献…`)
     failedDocs.forEach((doc) => {
       message.destroy(`ocr-error-${doc.id}`)
     })
@@ -5495,11 +6152,13 @@ export default function LibraryView({
           last_retry_at: null,
         })
       }
-      const successCount = await runOcrInConfiguredBatches(failedDocs.map((doc) => doc.id), 'paddle', 'retry-failed')
-      message.success({ content: `重试完成，成功处理 ${successCount}/${failedDocs.length} 篇`, key: 'retry-failed' })
+      const successCount = await runOcrInConfiguredBatches(failedDocs.map((doc) => doc.id), 'paddle', OCR_ACTIVITY_MESSAGE_KEY)
+      clearSharedOcrProgressToast({ keepIfActiveDocs: true })
+      message.success({ content: `重试完成，成功处理 ${successCount}/${failedDocs.length} 篇`, key: OCR_RESULT_MESSAGE_KEY, duration: 4 })
     } catch (error) {
       console.error(error)
-      message.error({ content: `重试失败：${(error as Error)?.message || '未知错误'}`, key: 'retry-failed', duration: 6 })
+      clearSharedOcrProgressToast()
+      message.error({ content: `重试失败：${(error as Error)?.message || '未知错误'}`, key: OCR_RESULT_MESSAGE_KEY, duration: 6 })
       await loadDocuments(filter, { silent: true })
     } finally {
       setImportProgressText('')
@@ -5535,9 +6194,10 @@ export default function LibraryView({
       const followEngine = importOcrEngine
       const hasConfig = await hasOcrEngineConfig(followEngine)
       if (hasConfig) {
-        message.loading({ content: '正在继续执行 OCR…', key: 'batch-follow-ocr', duration: 0 })
-        const count = await runOcrInConfiguredBatches(targetIds, followEngine, 'batch-follow-ocr')
-        message.success({ content: `OCR 完成，成功识别 ${count} 篇文献`, key: 'batch-follow-ocr' })
+        showSharedOcrProgressToast('正在继续执行 OCR…')
+        const count = await runOcrInConfiguredBatches(targetIds, followEngine, OCR_ACTIVITY_MESSAGE_KEY)
+        clearSharedOcrProgressToast({ keepIfActiveDocs: true })
+        message.success({ content: `OCR 完成，成功识别 ${count} 篇文献`, key: OCR_RESULT_MESSAGE_KEY, duration: 4 })
       } else {
         await loadDocuments()
       }
@@ -5779,17 +6439,104 @@ export default function LibraryView({
       }
       void (async () => {
         try {
-          const result = await window.api.enqueueDocumentsForEmbedding(selectedIds)
+          const resolveDoc = (id: string) => (
+            documents.find((item) => item.id === id)
+            || documentsRef.current.find((item) => item.id === id)
+          )
+          // Skip already vectorized / in-flight; same policy as OCR “跳过已完成”.
+          const targetIds = selectedIds.filter((id) => {
+            const doc = resolveDoc(id)
+            return doc ? needsEmbeddingWork(doc) : true
+          })
+          const preSkipped = selectedIds.length - targetIds.length
+          if (targetIds.length === 0) {
+            message.info(
+              preSkipped > 0
+                ? `所选 ${preSkipped} 篇均已向量化或正在进行中。若要覆盖重建，请用「重新向量化 · 覆盖重建」。`
+                : '没有需要向量化的文献',
+            )
+            return
+          }
+
+          // Text-only embedding: OCR body is required. Auto-run Paddle only when there is
+          // no usable OCR yet — never re-OCR completed books (incl. page-level review).
+          const needOcrIds = targetIds.filter((id) => {
+            const doc = resolveDoc(id)
+            return doc ? needsOcrBeforeEmbedding(doc) : true
+          })
+          const alreadyOcrIds = targetIds.filter((id) => !needOcrIds.includes(id))
+          let ocrRan = 0
+          let enqueueIds = alreadyOcrIds.filter((id) => {
+            const doc = resolveDoc(id)
+            return doc ? hasOcrBodyForEmbedding(doc) : false
+          })
+
+          if (needOcrIds.length > 0) {
+            const paddleReady = await hasOcrEngineConfig('paddle')
+            if (!paddleReady) {
+              if (enqueueIds.length === 0) {
+                message.warning(
+                  '当前仅支持「OCR 正文 → 文本向量化」。所选文献尚未 OCR，且未配置飞桨 Token。请到设置配置后重试，或先手动 OCR。',
+                )
+                return
+              }
+              message.warning(
+                `文本向量化需要 OCR 正文。有 ${needOcrIds.length} 篇未 OCR 且未配置飞桨，将仅处理已有 OCR 的 ${enqueueIds.length} 篇。`,
+              )
+            } else {
+              showSharedOcrProgressToast(
+                alreadyOcrIds.length > 0
+                  ? `文本向量化：${needOcrIds.length} 篇缺 OCR 将用飞桨识别，${alreadyOcrIds.length} 篇已有 OCR 直接向量化（不重跑）…`
+                  : `文本向量化需 OCR 正文：${needOcrIds.length} 篇用飞桨识别入库…`,
+              )
+              ocrRan = await runOcrInConfiguredBatches(needOcrIds, 'paddle', OCR_ACTIVITY_MESSAGE_KEY)
+              clearSharedOcrProgressToast({ keepIfActiveDocs: true })
+              // Wait a tick for OCR finalize / page text to settle, then refresh list.
+              await new Promise<void>((resolve) => { window.setTimeout(() => resolve(), 400) })
+              await loadDocuments(filter, { silent: true })
+              // Enqueue anything with usable OCR body (completed / partial text). Do not require full-page completeness.
+              enqueueIds = targetIds.filter((id) => {
+                const doc = resolveDoc(id)
+                  || documentsRef.current.find((item) => item.id === id)
+                if (!doc) return false
+                if (!needsEmbeddingWork(doc)) return false
+                return hasOcrBodyForEmbedding(doc)
+              })
+            }
+          }
+
+          if (enqueueIds.length === 0) {
+            message.warning(
+              ocrRan > 0
+                ? 'OCR 已跑完，但暂无可用正文可向量化（识别失败或正文为空）。请检查 OCR 结果后再试。'
+                : '没有可向量化的文献（需要先有 OCR 正文）',
+            )
+            return
+          }
+
+          message.loading({
+            content: ocrRan > 0
+              ? `OCR/入库已完成 ${ocrRan} 篇，正在建立检索分段并入队文本向量化…`
+              : `正在入队文本向量化 ${enqueueIds.length} 篇（基于 OCR 正文）…`,
+            key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
+            duration: 0,
+          })
+          // Main process rebuilds search segments from OCR text when missing, then queues embeddings.
+          const result = await window.api.enqueueDocumentsForEmbedding(enqueueIds)
+          const skippedTotal = preSkipped + Number(result.skipped || 0)
           if (result.queued > 0) {
             message.loading({
-              content: `已入队向量化 ${result.queued} 篇${result.skipped > 0 ? `，跳过 ${result.skipped} 篇` : ''}。进度见文献卡片与「处理队列」。`,
+              content: `已入队文本向量化 ${result.queued} 篇`
+                + (ocrRan > 0 ? `（已先飞桨 OCR ${needOcrIds.length} 篇）` : '')
+                + (skippedTotal > 0 ? `，已跳过 ${skippedTotal} 篇` : '')
+                + '。进度见文献卡片与「处理队列」。',
               key: BACKGROUND_EMBEDDING_MESSAGE_KEY,
               duration: 0,
             })
           } else {
             message.warning(
-              result.skipped > 0
-                ? `没有可向量化的文献（跳过 ${result.skipped} 篇：正文分段未就绪或文献无效）`
+              skippedTotal > 0
+                ? `没有可向量化的文献（跳过 ${skippedTotal} 篇：已完成、进行中、或缺 OCR 正文/检索分段）。已完成的请用「重新向量化」。`
                 : '没有可向量化的文献',
             )
           }
@@ -5800,12 +6547,12 @@ export default function LibraryView({
     }
     if (key === 'revectorize') {
       if (selectedIds.length === 0) {
-        message.info('请先选择文献')
+        message.info('请先选择需要重新向量化的文献')
         return
       }
       Modal.confirm({
         title: '按当前模型重新向量化？',
-        content: `将清除所选 ${selectedIds.length} 篇已有向量，并用设置中当前的 Embedding 模型重新生成。适合升级到更强模型后重建索引。会消耗 API 额度。`,
+        content: `将清除所选 ${selectedIds.length} 篇已有向量，并用设置中当前的 Embedding 模型重新生成（类似「重新 OCR」覆盖）。适合升级模型后重建索引，会消耗 API 额度。`,
         okText: '重新向量化',
         cancelText: '取消',
         onOk: async () => {
@@ -5845,10 +6592,40 @@ export default function LibraryView({
       setBatchFolderTargetId(null)
       setBatchFolderModalOpen(true)
     }
+    if (key === 'cancel_embedding') {
+      if (selectedIds.length === 0) {
+        message.info('请先选择要停止向量化的文献')
+        return
+      }
+      void (async () => {
+        try {
+          const result = await window.api.cancelDocumentsForEmbedding(selectedIds)
+          message.success(
+            result.canceled > 0
+              ? `已停止所选向量化 ${result.canceled} 篇（恢复已向量化 ${result.restoredReady} 篇，待继续 ${result.restoredPending} 篇）。已有索引会保留。`
+              : '所选文献均不在向量化队列中',
+          )
+          scheduleSmartViewCountsRefresh(200)
+          await loadDocuments(filter, { silent: true })
+        } catch (error: unknown) {
+          message.error(getErrorMessage(error, '停止所选向量化失败'))
+        }
+      })()
+    }
+    if (key === 'cancel_embedding_all') {
+      Modal.confirm({
+        title: '停止全部向量化队列？',
+        content: '会取消排队中和正在处理的向量化（已有完整向量索引会保留并恢复为「已向量化」）。重启后也不会再自动续跑这些任务。',
+        okText: '全部停止',
+        cancelText: '返回',
+        okButtonProps: { danger: true },
+        onOk: () => handleCancelAllPendingEmbeddings(),
+      })
+    }
     if (key === 'retry_failed') void handleRetryFailedDocuments()
     if (key === 'select_all') selectAll()
     if (String(key).startsWith('export:')) {
-      void handleBatchExport(String(key).replace('export:', '') as DocumentExportFormat)
+      openBatchExportModal(String(key).replace('export:', '') as DocumentExportFormat)
     }
     if (key === 'delete_selected') {
       Modal.confirm({
@@ -5992,6 +6769,28 @@ export default function LibraryView({
     setBatchMode(false)
   }, [batchMode, clearSelection, selectedIds.length])
 
+  const hasActiveOcrQueue = useMemo(() => {
+    if (Object.values(ocrProgressByDoc).some((info) => isActiveOcrProgress(info))) return true
+    return documents.some((doc) => isDocumentOcrJobActive(doc))
+  }, [documents, ocrProgressByDoc])
+
+  const hasActiveEmbeddingQueue = useMemo(() => {
+    const queueQueued = Number(embeddingQueueSnapshot?.queueQueued || 0)
+    const queueProcessing = Number(embeddingQueueSnapshot?.queueProcessing || 0)
+    if (queueQueued > 0 || queueProcessing > 0) return true
+    if (Number(smartViewCounts.embeddingQueued || 0) > 0) return true
+    if (Object.values(embeddingProgressByDoc).some((info) => (
+      info
+      && !info.canceled
+      && info.status !== 'canceled'
+      && (info.status === 'queued' || info.status === 'processing')
+    ))) return true
+    return documents.some((doc) => {
+      const status = String(doc.embedding_status || '').trim()
+      return status === 'queued' || status === 'processing'
+    })
+  }, [documents, embeddingProgressByDoc, embeddingQueueSnapshot, smartViewCounts.embeddingQueued])
+
   const listCardContext = useMemo<DocumentCardContext>(() => ({
     viewMode,
     batchMode,
@@ -6020,6 +6819,7 @@ export default function LibraryView({
     handleTaggingChange,
     handleForceRerunDocument,
     handleCancelOcr,
+    handleCancelEmbedding,
     handleQuickAddTagToDocument,
     openDocumentTagModal,
     handleAddToFolder,
@@ -6042,6 +6842,7 @@ export default function LibraryView({
     folders,
     handleAddToFolder,
     handleBatchMenu,
+    handleCancelEmbedding,
     handleCancelOcr,
     handleDocumentContextMenu,
     getDocumentContextMenuItems,
@@ -6087,17 +6888,69 @@ export default function LibraryView({
               style={{ ...getSectionWrapperStyle('smart'), display: 'flex', flexDirection: 'column', minHeight: 0, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 10, padding: 10 }}
             >
               <div
-                onClick={() => toggleSectionCollapsed('smart')}
-                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer', marginBottom: collapsedSections.smart ? 0 : 8 }}
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, marginBottom: collapsedSections.smart ? 0 : 8 }}
               >
-                <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12, fontWeight: 600 }}>智能视图</span>
-                <DownOutlined style={{ fontSize: 12, transform: collapsedSections.smart ? 'rotate(-90deg)' : 'rotate(0deg)', transition: 'transform 0.2s ease' }} />
+                <div
+                  onClick={() => toggleSectionCollapsed('smart')}
+                  style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', flex: 1, minWidth: 0 }}
+                >
+                  <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12, fontWeight: 600 }}>智能视图</span>
+                  <DownOutlined style={{ fontSize: 12, transform: collapsedSections.smart ? 'rotate(-90deg)' : 'rotate(0deg)', transition: 'transform 0.2s ease' }} />
+                </div>
+                <Popover
+                  trigger="click"
+                  open={smartViewCustomizeOpen}
+                  onOpenChange={setSmartViewCustomizeOpen}
+                  placement="bottomLeft"
+                  title="自定义智能视图"
+                  content={(
+                    <div style={{ width: 240, maxHeight: 360, overflowY: 'auto' }}>
+                      <div style={{ color: 'var(--gs-text-secondary)', fontSize: 12, marginBottom: 8 }}>
+                        勾选要显示的分类。可与文件夹/标签组合筛选（如「某文件夹 ∩ 已向量化」）。
+                      </div>
+                      <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                        {SMART_VIEW_CATALOG.map((item) => (
+                          <Checkbox
+                            key={item.key}
+                            checked={item.locked || smartViewVisibleKeys.includes(item.key)}
+                            disabled={item.locked}
+                            onChange={(event) => handleSmartViewVisibleChange(item.key, event.target.checked)}
+                          >
+                            {item.label}
+                          </Checkbox>
+                        ))}
+                      </Space>
+                      <Button
+                        size="small"
+                        type="link"
+                        style={{ paddingInline: 0, marginTop: 8 }}
+                        onClick={() => {
+                          const keys = [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+                          setSmartViewVisibleKeys(keys)
+                          saveSmartViewVisibleKeys(keys)
+                        }}
+                      >
+                        恢复默认
+                      </Button>
+                    </div>
+                  )}
+                >
+                  <Tooltip title="自定义显示分类">
+                    <Button
+                      size="small"
+                      type="text"
+                      icon={<SettingOutlined />}
+                      onClick={(event) => event.stopPropagation()}
+                      aria-label="自定义智能视图"
+                    />
+                  </Tooltip>
+                </Popover>
               </div>
               {!collapsedSections.smart ? (
                 <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 2 }}>
                   <Space direction="vertical" size={6} style={{ width: '100%' }}>
                     {smartFilters.map((item) => {
-                      const active = filter.type === item.filter.type && filter.value === item.filter.value
+                      const active = isSmartViewFilterActive(filter, item.filter)
                       return (
                         <Button
                           key={item.key}
@@ -6155,7 +7008,7 @@ export default function LibraryView({
                     <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 2 }}>
                       <Space direction="vertical" size={6} style={{ width: '100%', minHeight: '100%' }}>
                         {(() => {
-                          const active = filter.type === 'folder' && filter.value === UNFILED_FOLDER_ID
+                          const active = getFilterScopeFolderId(filter) === UNFILED_FOLDER_ID
                           return (
                             <div
                               role="button"
@@ -6239,7 +7092,7 @@ export default function LibraryView({
                           拖到这里移为顶层文件夹
                         </div>
                         {visibleFolders.map((item) => {
-                          const active = filter.type === 'folder' && filter.value === item.id
+                          const active = getFilterScopeFolderId(filter) === item.id
                           const collapsed = folderCollapsedIds.includes(item.id)
                           const hasChildren = item.children.length > 0
                           const dropActive = folderDropTarget?.id === item.id
@@ -6556,18 +7409,34 @@ export default function LibraryView({
                 <Button size="small" icon={<CheckSquareOutlined />} onClick={() => setBatchMode(true)}>
                   批量处理
                 </Button>
-                <Popconfirm
-                  title="停止全部 OCR 队列？"
-                  description="会取消排队中和正在处理的 OCR（已完成页面保留）。重启后也不会再自动续跑这些任务。"
-                  okText="全部停止"
-                  cancelText="返回"
-                  okButtonProps={{ danger: true }}
-                  onConfirm={() => void handleCancelAllPendingOcr()}
-                >
-                  <Button size="small" danger icon={<CloseCircleOutlined />}>
-                    停止全部 OCR
-                  </Button>
-                </Popconfirm>
+                {hasActiveOcrQueue ? (
+                  <Popconfirm
+                    title="停止全部 OCR 队列？"
+                    description="会取消排队中和正在处理的 OCR（已完成页面保留）。重启后也不会再自动续跑这些任务。"
+                    okText="全部停止"
+                    cancelText="返回"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => void handleCancelAllPendingOcr()}
+                  >
+                    <Button size="small" danger icon={<CloseCircleOutlined />}>
+                      停止全部 OCR
+                    </Button>
+                  </Popconfirm>
+                ) : null}
+                {hasActiveEmbeddingQueue ? (
+                  <Popconfirm
+                    title="停止全部向量化队列？"
+                    description="会取消排队中和正在处理的向量化（已有完整向量索引会保留并恢复为「已向量化」）。重启后也不会再自动续跑这些任务。"
+                    okText="全部停止"
+                    cancelText="返回"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => void handleCancelAllPendingEmbeddings()}
+                  >
+                    <Button size="small" danger icon={<CloseCircleOutlined />}>
+                      停止全部向量化
+                    </Button>
+                  </Popconfirm>
+                ) : null}
                 <Button
                   size="small"
                   icon={<FileSearchOutlined />}
@@ -6918,7 +7787,7 @@ export default function LibraryView({
                 if (key === 'cleanup_pdf_assets') {
                   Modal.confirm({
                     title: '删除原文件/页图缓存',
-                    content: '只会删除软件数据目录里的 PDF 副本和页图缓存，不会删除 OCR 文本、检索结果，也不会修改 PDF 原件仓库。以后可从原件仓库补回。',
+                    content: '只会删除软件数据目录（storage）内的 PDF 副本和页图缓存。绝不删除 OCR 文本、检索结果，也绝不删除 PDF 原件仓库 / NAS /「仅登记路径」指向的外部源文件。以后可从原件仓库或外盘补回。',
                     okText: '删除原文件',
                     cancelText: '取消',
                     okButtonProps: { danger: true },
@@ -7297,13 +8166,13 @@ export default function LibraryView({
                           lineHeight: 1.5,
                         }}
                       >
-                        页面待复核：{doc.error_message}
+                        {doc.error_message}
                       </div>
                     ) : null}
 
                     {progressInfo ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
                     {renderBookTranslationProgress(bookTranslationProgressInfo)}
-                    {renderEmbeddingProgress(embeddingProgressByDoc[doc.id])}
+                    {renderEmbeddingProgress(embeddingProgressByDoc[doc.id], handleCancelEmbedding)}
                   </div>
                 </Dropdown>
               )
@@ -7491,6 +8360,53 @@ export default function LibraryView({
               },
               tags.length === 0 ? '还没有标签' : '没有匹配的标签',
             )}
+          </div>
+        </Space>
+      </Modal>
+
+      <Modal
+        title="批量导出文献"
+        open={batchExportModalOpen}
+        onCancel={() => {
+          setBatchExportModalOpen(false)
+          setPendingBatchExportFormat(null)
+        }}
+        onOk={() => void handleBatchExport()}
+        okText="导出"
+        cancelText="取消"
+        confirmLoading={batchExporting}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <div style={{ color: 'var(--gs-text-secondary)', fontSize: 13 }}>
+            已选 {selectedIds.length} 篇 · 格式：{{
+              markdown: 'Markdown',
+              'tei-xml': 'TEI-XML',
+              'page-xml': 'PAGE XML',
+              'paddle-json': 'Paddle JSON',
+              txt: 'TXT',
+              'reading-pdf': '阅读模式 PDF',
+              'layout-pdf': '排版模式 PDF',
+              'layout-searchable-pdf': '原图可搜索 PDF',
+            }[pendingBatchExportFormat || 'txt'] || pendingBatchExportFormat}
+          </div>
+          <div>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>页码类型</div>
+            <Radio.Group
+              value={batchExportPageNumberMode}
+              onChange={(event) => setBatchExportPageNumberMode(event.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+              options={[
+                { value: 'literature', label: '文献页码' },
+                { value: 'natural', label: '自然页码' },
+              ]}
+            />
+            <div style={{ color: 'var(--gs-text-secondary)', fontSize: 12, marginTop: 8 }}>
+              {batchExportPageNumberMode === 'natural'
+                ? '自然页码：PDF/扫描影像的物理页序（第 1…N 页）。'
+                : '文献页码：书上印刷/校准后的连续页码（默认，与阅读模式「文献页码」一致）。'}
+            </div>
           </div>
         </Space>
       </Modal>

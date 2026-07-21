@@ -234,15 +234,20 @@ async function run() {
     assert(reviewListed.ocr_status === 'completed', `Expected review document to normalize to completed, saw ${JSON.stringify(reviewListed)}`)
     assert(reviewListed.import_status === 'processed', `Expected review document to normalize to processed, saw ${JSON.stringify(reviewListed)}`)
     assert(
-      String(reviewListed.error_message || '').includes('部分页面 OCR 需要复核')
-        && String(reviewListed.error_message || '').includes('simulated page quality issue'),
-      `Expected review warning to preserve page issue, saw ${JSON.stringify(reviewListed)}`,
+      String(reviewListed.error_message || '').includes('OCR完成')
+        && String(reviewListed.error_message || '').includes('OCR 未成功')
+        && String(reviewListed.error_message || '').includes('3'),
+      `Expected short review warning listing failed page nums, saw ${JSON.stringify(reviewListed)}`,
     )
 
     const reviewPersistedDetail = await win.evaluate(async (id) => window.api.getDocument(id), reviewDocId)
     assert(reviewPersistedDetail?.ocr_status === 'completed', `Expected review normalized status persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
     assert(reviewPersistedDetail?.import_status === 'processed', `Expected review normalized import status persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
-    assert(String(reviewPersistedDetail?.error_message || '').includes('部分页面 OCR 需要复核'), `Expected review warning persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
+    assert(
+      String(reviewPersistedDetail?.error_message || '').includes('OCR完成')
+        && String(reviewPersistedDetail?.error_message || '').includes('OCR 未成功'),
+      `Expected short review warning persisted, saw ${JSON.stringify(reviewPersistedDetail)}`,
+    )
 
     console.log('Library OCR status reconcile regression passed.')
   } finally {

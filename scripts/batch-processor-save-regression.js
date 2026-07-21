@@ -85,12 +85,14 @@ assert(
     && asyncPdfBranchBody.includes('failedPageIds.delete(pageResult.pageId)')
     && asyncPdfBranchBody.includes('failedPageIds.add(pageResult.pageId)')
     && asyncPdfBranchBody.includes('streamedPageSummary = {')
-    && processBatchBody.includes('const hasPendingPageFailure = pageResultsPersistedInChunks')
-    && processBatchBody.includes('streamedPageSummary.pending > 0')
-    && processBatchBody.includes('const hasReviewPageFailure = pageResultsPersistedInChunks')
-    && processBatchBody.includes('streamedPageSummary.pending === 0 && streamedPageSummary.failed > 0')
-    && processBatchBody.includes('const hasPageFailure = hasPendingPageFailure'),
-  'Legacy batch PDF OCR should keep streamed counts and distinguish pending hard failures from settled review pages.',
+    && batchSource.includes('function buildIncompleteBatchOcrReviewResults')
+    && processBatchBody.includes('buildIncompleteBatchOcrReviewResults(docId)')
+    && processBatchBody.includes('const hasReviewPageFailure = countBatchOcrErrorPages(docId) > 0')
+    && processBatchBody.includes("'completed'")
+    && processBatchBody.includes("'processed'")
+    && !processBatchBody.includes('const hasPageFailure = hasPendingPageFailure')
+    && !processBatchBody.includes('const hasPendingPageFailure = pageResultsPersistedInChunks'),
+  'Legacy batch PDF OCR should settle incomplete pages as review warnings and complete/入库 the document without whole-book failure.',
 )
 assert(
   !processBatchBody.includes("SELECT COUNT(*) as count FROM pages WHERE doc_id = ? AND ocr_status != 'completed'"),
@@ -158,13 +160,16 @@ assert(
 )
 assert(
   batchSource.includes('function getBatchDocumentOcrReviewMessage')
+    && batchSource.includes('function buildIncompleteBatchOcrReviewResults')
     && processBatchBody.includes('const reviewMessage = hasReviewPageFailure ? getBatchDocumentOcrReviewMessage(docId) : null')
-    && processBatchBody.includes("hasPageFailure ? 'error' : 'completed'")
-    && processBatchBody.includes("hasPageFailure ? 'error' : 'processed'")
-    && processBatchBody.includes("hasPageFailure ? 'OCR page processing failed' : reviewMessage")
-    && processBatchBody.includes('if (!hasPageFailure && !hasReviewPageFailure)')
-    && processBatchBody.includes("this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)"),
-  'Legacy batch OCR should save settled page-level OCR failures as completed documents with review warnings.',
+    && processBatchBody.includes("run('UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?', [")
+    && processBatchBody.includes("'completed'")
+    && processBatchBody.includes("'processed'")
+    && processBatchBody.includes('if (!hasReviewPageFailure)')
+    && processBatchBody.includes("this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)")
+    && !processBatchBody.includes("hasPageFailure ? 'error' : 'completed'")
+    && !processBatchBody.includes("hasPageFailure ? 'OCR page processing failed' : reviewMessage"),
+  'Legacy batch OCR should settle page-level failures, complete/入库 the document, and only show review warnings.',
 )
 assert(
   batchSource.includes("AND p.ocr_status = 'completed'\n               AND ${pageContentAvailableCondition('p')}")

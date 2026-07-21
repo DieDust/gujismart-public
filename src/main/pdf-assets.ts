@@ -11,7 +11,9 @@ import type {
   CompletedPdfAssetCleanupResult,
   DocumentMetadataResult,
   PdfAssetCleanupResult,
+  PdfAssetRestoreOptions,
   PdfAssetRestoreResult,
+  PdfAssetRestoreStorageMode,
   PdfRepositoryIndexResult,
   PdfRepositoryStatus,
 } from '../shared/types'
@@ -905,6 +907,33 @@ export function annotatePdfMetadata(docId: string, filePath: string, pageCount?:
   scheduleDatabaseSave()
 }
 
+/**
+ * Hard gate: only files under dataDir/storage/{docId}/ may be deleted.
+ * Linked external PDFs (pdf_asset_storage=linked / outside managed tree) are never candidates.
+ */
+function authorizeManagedPdfAssetDeletion(docId: string, targetPath: string | null | undefined): string | null {
+  const raw = String(targetPath || '').trim()
+  if (!raw) return null
+  const normalizedPath = normalize(raw)
+  const decision = inspectManagedDeleteTarget({
+    dataDir: getDataDir(),
+    docId,
+    targetPath: normalizedPath,
+    kind: 'document-asset',
+  })
+  if (!decision.allowed || !decision.canonicalTarget) return null
+  return decision.canonicalTarget
+}
+
+function isLinkedExternalPdfAsset(metadata: DocumentMetadataResult, filePath?: string | null): boolean {
+  const storage = String(metadata.pdf_asset_storage || metadata.restored_storage_mode || '').trim().toLowerCase()
+  if (storage === 'linked' || storage === 'link') return true
+  const linkedPath = String(metadata.pdf_linked_path || '').trim()
+  const current = normalize(String(filePath || '').trim())
+  if (linkedPath && current && normalize(linkedPath) === current) return true
+  return false
+}
+
 export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
   const doc = queryOne<DocumentRow>('SELECT id, title, file_path, thumb_path, page_count, metadata FROM documents WHERE id = ?', [docId])
   if (!doc) throw new Error('文献不存在')
@@ -913,7 +942,17 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
   const preservedImageCount = materializeContentImageAssets(docId)
   const metadata = parseMetadata(doc.metadata)
   const filePath = String(doc.file_path || '').trim()
-  if (filePath && extname(filePath).toLowerCase() === '.pdf' && existsSync(filePath) && !metadata.pdf_sha256) {
+  const linkedExternal = isLinkedExternalPdfAsset(metadata, filePath)
+
+  // Fingerprint managed copies only — never treat external linked originals as cleanup I/O targets beyond a safe read.
+  if (
+    !linkedExternal
+    && filePath
+    && extname(filePath).toLowerCase() === '.pdf'
+    && existsSync(filePath)
+    && !metadata.pdf_sha256
+    && authorizeManagedPdfAssetDeletion(docId, filePath)
+  ) {
     const fingerprint = getPdfFingerprint(filePath)
     updateMetadata(docId, {
       pdf_sha256: fingerprint.sha256,
@@ -922,38 +961,29 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
       original_file_name: basename(filePath),
     })
   }
+
   const pathsToDelete = new Set<string>()
   const addPath = (value?: string | null) => {
-    if (!value) return
-    const normalizedPath = normalize(value)
-    const decision = inspectManagedDeleteTarget({
-      dataDir: getDataDir(),
-      docId,
-      targetPath: normalizedPath,
-      kind: 'document-asset',
-    })
-    if (decision.allowed && decision.canonicalTarget) {
-      pathsToDelete.add(decision.canonicalTarget)
-    }
+    const authorized = authorizeManagedPdfAssetDeletion(docId, value)
+    if (authorized) pathsToDelete.add(authorized)
   }
 
-  addPath(doc.file_path)
+  // Linked external originals: never add file_path / pdf_linked_path to the delete set.
+  if (!linkedExternal) {
+    addPath(doc.file_path)
+  }
   addPath(doc.thumb_path)
   queryAll<{ image_path: string | null }>('SELECT image_path FROM pages WHERE doc_id = ?', [docId]).forEach((page) => addPath(page.image_path))
 
-  for (const filePath of pathsToDelete) {
+  for (const candidate of pathsToDelete) {
     try {
-      const decision = inspectManagedDeleteTarget({
-        dataDir: getDataDir(),
-        docId,
-        targetPath: filePath,
-        kind: 'document-asset',
-      })
-      if (!decision.allowed || !decision.canonicalTarget) continue
-      const stats = statSync(decision.canonicalTarget)
+      // Re-validate immediately before rm — defense in depth.
+      const authorized = authorizeManagedPdfAssetDeletion(docId, candidate)
+      if (!authorized) continue
+      const stats = statSync(authorized)
       if (stats.isFile()) {
         bytesFreed += stats.size
-        rmSync(decision.canonicalTarget, { force: true })
+        rmSync(authorized, { force: true })
       }
     } catch {
       // Ignore files that disappeared while cleanup was running.
@@ -965,6 +995,9 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
   updateMetadata(docId, {
     pdf_asset_state: 'text_only' as PdfAssetState,
     pdf_asset_deleted_at: new Date().toISOString(),
+    pdf_asset_storage: null,
+    pdf_linked_path: null,
+    restored_storage_mode: null,
     preserved_content_image_count: preservedImageCount,
   })
   scheduleDatabaseSave()
@@ -979,7 +1012,16 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
   const preservedImageCount = await materializeContentImageAssetsAsync(docId)
   const metadata = parseMetadata(doc.metadata)
   const filePath = String(doc.file_path || '').trim()
-  if (filePath && extname(filePath).toLowerCase() === '.pdf' && await pathExists(filePath) && !metadata.pdf_sha256) {
+  const linkedExternal = isLinkedExternalPdfAsset(metadata, filePath)
+
+  if (
+    !linkedExternal
+    && filePath
+    && extname(filePath).toLowerCase() === '.pdf'
+    && await pathExists(filePath)
+    && !metadata.pdf_sha256
+    && authorizeManagedPdfAssetDeletion(docId, filePath)
+  ) {
     const fingerprint = await getPdfFingerprintAsync(filePath)
     updateMetadata(docId, {
       pdf_sha256: fingerprint.sha256,
@@ -988,40 +1030,29 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
       original_file_name: basename(filePath),
     })
   }
+
   const pathsToDelete = new Set<string>()
   const addPath = async (value?: string | null) => {
-    if (!value) return
-    const normalizedPath = normalize(value)
-    const decision = inspectManagedDeleteTarget({
-      dataDir: getDataDir(),
-      docId,
-      targetPath: normalizedPath,
-      kind: 'document-asset',
-    })
-    if (decision.allowed && decision.canonicalTarget) {
-      pathsToDelete.add(decision.canonicalTarget)
-    }
+    const authorized = authorizeManagedPdfAssetDeletion(docId, value)
+    if (authorized) pathsToDelete.add(authorized)
   }
 
-  await addPath(doc.file_path)
+  if (!linkedExternal) {
+    await addPath(doc.file_path)
+  }
   await addPath(doc.thumb_path)
   for (const page of queryAll<{ image_path: string | null }>('SELECT image_path FROM pages WHERE doc_id = ?', [docId])) {
     await addPath(page.image_path)
   }
 
-  for (const filePath of pathsToDelete) {
+  for (const candidate of pathsToDelete) {
     try {
-      const decision = inspectManagedDeleteTarget({
-        dataDir: getDataDir(),
-        docId,
-        targetPath: filePath,
-        kind: 'document-asset',
-      })
-      if (!decision.allowed || !decision.canonicalTarget) continue
-      const stats = await stat(decision.canonicalTarget)
+      const authorized = authorizeManagedPdfAssetDeletion(docId, candidate)
+      if (!authorized) continue
+      const stats = await stat(authorized)
       if (stats.isFile()) {
         bytesFreed += stats.size
-        await rm(decision.canonicalTarget, { force: true })
+        await rm(authorized, { force: true })
       }
     } catch {
       // Ignore files that disappeared while cleanup was running.
@@ -1034,6 +1065,9 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
   updateMetadata(docId, {
     pdf_asset_state: 'text_only' as PdfAssetState,
     pdf_asset_deleted_at: new Date().toISOString(),
+    pdf_asset_storage: null,
+    pdf_linked_path: null,
+    restored_storage_mode: null,
     preserved_content_image_count: preservedImageCount,
   })
   scheduleDatabaseSave()
@@ -1110,7 +1144,78 @@ export async function shutdownPdfAssetRuntime(timeoutMs = 3000): Promise<void> {
   ])
 }
 
-export function restorePdfAssetForDocument(docId: string, manualPath?: string): PdfAssetRestoreResult {
+function isPdfRestoreLinkOnlyEnabled(options?: PdfAssetRestoreOptions): boolean {
+  if (typeof options?.linkOnly === 'boolean') return options.linkOnly
+  const row = queryOne<{ value: string | null }>("SELECT value FROM settings WHERE key = 'pdf_restore_link_only'")
+  return String(row?.value || '').trim() === 'true'
+}
+
+function lookupPdfRepositoryPathByHash(targetHash: string): string | null {
+  const hash = String(targetHash || '').trim()
+  if (!hash) return null
+  const match = queryOne<{ path: string }>(
+    'SELECT path FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1',
+    [hash],
+  )
+  const filePath = normalize(String(match?.path || '').trim())
+  if (!filePath || !existsSync(filePath)) return null
+  return filePath
+}
+
+async function lookupPdfRepositoryPathByHashAsync(targetHash: string): Promise<string | null> {
+  const hash = String(targetHash || '').trim()
+  if (!hash) return null
+  const match = queryOne<{ path: string }>(
+    'SELECT path FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1',
+    [hash],
+  )
+  const filePath = normalize(String(match?.path || '').trim())
+  if (!filePath || !(await pathExists(filePath))) return null
+  return filePath
+}
+
+function persistLinkedPdfRestore(
+  docId: string,
+  sourcePath: string,
+  metadata: DocumentMetadataResult,
+  options?: { trustedFromIndex?: boolean; sourceFingerprint?: PdfFingerprint | null },
+): PdfAssetRestoreResult {
+  const absolutePath = normalize(sourcePath)
+  const fingerprint = options?.sourceFingerprint
+  const nextMetadata: DocumentMetadataResult = {
+    ...metadata,
+    pdf_asset_state: 'available' as PdfAssetState,
+    pdf_asset_storage: 'linked',
+    pdf_asset_deleted_at: null,
+    pdf_linked_path: absolutePath,
+    restored_from_repository_at: new Date().toISOString(),
+    restored_source_name: basename(absolutePath),
+    restored_storage_mode: 'link',
+  }
+  if (fingerprint) {
+    if (!nextMetadata.pdf_sha256) nextMetadata.pdf_sha256 = fingerprint.sha256
+    if (!nextMetadata.pdf_size_bytes) nextMetadata.pdf_size_bytes = fingerprint.sizeBytes
+    if (!nextMetadata.pdf_mtime_ms) nextMetadata.pdf_mtime_ms = fingerprint.mtimeMs
+  }
+  if (options?.trustedFromIndex) {
+    nextMetadata.pdf_restore_trusted_index = true
+  }
+
+  run('UPDATE documents SET file_path = ?, metadata = ?, updated_at = ? WHERE id = ?', [
+    absolutePath,
+    JSON.stringify(nextMetadata),
+    new Date().toISOString(),
+    docId,
+  ])
+  scheduleDatabaseSave()
+  return { restored: true, path: absolutePath, storageMode: 'link' }
+}
+
+export function restorePdfAssetForDocument(
+  docId: string,
+  manualPath?: string,
+  options?: PdfAssetRestoreOptions,
+): PdfAssetRestoreResult {
   const doc = queryOne<DocumentRow>('SELECT id, title, file_path, thumb_path, page_count, metadata FROM documents WHERE id = ?', [docId])
   if (!doc) return { restored: false, error: '文献不存在' }
   const existingPdfPath = resolveManagedStoragePath(doc.file_path, docId)
@@ -1120,53 +1225,74 @@ export function restorePdfAssetForDocument(docId: string, manualPath?: string): 
     }
     updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState })
     scheduleDatabaseSave()
-    return { restored: true, path: existingPdfPath }
+    const existingMode = String(parseMetadata(doc.metadata).pdf_asset_storage || '').trim() === 'linked' ? 'link' : 'copy'
+    return { restored: true, path: existingPdfPath, storageMode: existingMode }
   }
 
   const metadata = parseMetadata(doc.metadata)
   const targetHash = String(metadata.pdf_sha256 || '')
   let sourcePath = manualPath || ''
+  let trustedFromIndex = false
+  let sourceFingerprint: PdfFingerprint | null = null
+  const linkOnly = isPdfRestoreLinkOnlyEnabled(options)
 
   if (sourcePath) {
     if (!existsSync(sourcePath) || extname(sourcePath).toLowerCase() !== '.pdf') {
       return { restored: false, error: '请选择有效的 PDF 文件' }
     }
-    const fingerprint = getPdfFingerprint(sourcePath)
-    if (targetHash && fingerprint.sha256 !== targetHash) {
+    sourcePath = normalize(sourcePath)
+    // Manual pick: still verify content when we have a stored fingerprint.
+    sourceFingerprint = getPdfFingerprint(sourcePath)
+    if (targetHash && sourceFingerprint.sha256 !== targetHash) {
       return { restored: false, error: '选择的 PDF 与该文献原始文件内容不一致' }
     }
     if (!targetHash) {
-      metadata.pdf_sha256 = fingerprint.sha256
-      metadata.pdf_size_bytes = fingerprint.sizeBytes
+      metadata.pdf_sha256 = sourceFingerprint.sha256
+      metadata.pdf_size_bytes = sourceFingerprint.sizeBytes
     }
   } else {
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
     }
-    indexPdfRepositories(readRepositoryPaths())
-    const match = queryOne<{ path: string }>('SELECT path FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1', [targetHash])
-    if (!match?.path || !existsSync(match.path)) {
+    // Prefer existing index hit before a full repository rescan.
+    let matchPath = lookupPdfRepositoryPathByHash(targetHash)
+    if (!matchPath) {
+      indexPdfRepositories(readRepositoryPaths())
+      matchPath = lookupPdfRepositoryPathByHash(targetHash)
+    }
+    if (!matchPath) {
       return { restored: false, error: '未在 PDF 原件仓库找到同内容 PDF' }
     }
-    sourcePath = match.path
+    sourcePath = matchPath
+    trustedFromIndex = true
+  }
+
+  if (linkOnly) {
+    return persistLinkedPdfRestore(docId, sourcePath, metadata, {
+      trustedFromIndex,
+      sourceFingerprint,
+    })
   }
 
   const storageDir = join(getDataDir(), 'storage', docId)
   mkdirSync(storageDir, { recursive: true })
-  const sourceFingerprint = getPdfFingerprint(sourcePath)
+  const finalSourceFingerprint = sourceFingerprint || getPdfFingerprint(sourcePath)
   const originalFingerprint = {
-    sha256: targetHash || sourceFingerprint.sha256,
-    sizeBytes: Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || sourceFingerprint.sizeBytes),
-    mtimeMs: Number(metadata.pdf_mtime_ms || sourceFingerprint.mtimeMs),
+    sha256: targetHash || finalSourceFingerprint.sha256,
+    sizeBytes: Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || finalSourceFingerprint.sizeBytes),
+    mtimeMs: Number(metadata.pdf_mtime_ms || finalSourceFingerprint.mtimeMs),
   }
   const stored = storePdfWithCompressionSync(sourcePath, storageDir, originalFingerprint)
   const nextMetadata: DocumentMetadataResult = {
     ...metadata,
     ...buildPdfCompressionMetadata(basename(sourcePath), originalFingerprint, stored.storedFingerprint, stored.compression),
     pdf_asset_state: 'available' as PdfAssetState,
+    pdf_asset_storage: 'copy',
     pdf_asset_deleted_at: null,
+    pdf_linked_path: null,
     restored_from_repository_at: new Date().toISOString(),
     restored_source_name: basename(sourcePath),
+    restored_storage_mode: 'copy',
   }
   if (!nextMetadata.pdf_sha256) {
     nextMetadata.pdf_sha256 = originalFingerprint.sha256
@@ -1179,10 +1305,15 @@ export function restorePdfAssetForDocument(docId: string, manualPath?: string): 
     docId,
   ])
   scheduleDatabaseSave()
-  return { restored: true, path: stored.storedPath, pdfCompression: stored.compression }
+  return { restored: true, path: stored.storedPath, pdfCompression: stored.compression, storageMode: 'copy' }
 }
 
-export async function restorePdfAssetForDocumentAsync(docId: string, manualPath?: string, knownSourceFingerprint?: PdfFingerprint): Promise<PdfAssetRestoreResult> {
+export async function restorePdfAssetForDocumentAsync(
+  docId: string,
+  manualPath?: string,
+  knownSourceFingerprint?: PdfFingerprint,
+  options?: PdfAssetRestoreOptions,
+): Promise<PdfAssetRestoreResult> {
   const doc = queryOne<DocumentRow>('SELECT id, title, file_path, thumb_path, page_count, metadata FROM documents WHERE id = ?', [docId])
   if (!doc) return { restored: false, error: '文献不存在' }
   const existingPdfPath = resolveManagedStoragePath(doc.file_path, docId)
@@ -1192,18 +1323,22 @@ export async function restorePdfAssetForDocumentAsync(docId: string, manualPath?
     }
     updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState })
     scheduleDatabaseSave()
-    return { restored: true, path: existingPdfPath }
+    const existingMode = String(parseMetadata(doc.metadata).pdf_asset_storage || '').trim() === 'linked' ? 'link' : 'copy'
+    return { restored: true, path: existingPdfPath, storageMode: existingMode }
   }
 
   const metadata = parseMetadata(doc.metadata)
   const targetHash = String(metadata.pdf_sha256 || '')
   let sourcePath = manualPath || ''
   let sourceFingerprint: PdfFingerprint | null = null
+  let trustedFromIndex = false
+  const linkOnly = isPdfRestoreLinkOnlyEnabled(options)
 
   if (sourcePath) {
     if (!(await pathExists(sourcePath)) || extname(sourcePath).toLowerCase() !== '.pdf') {
       return { restored: false, error: '请选择有效的 PDF 文件' }
     }
+    sourcePath = normalize(sourcePath)
     sourceFingerprint = knownSourceFingerprint || await getPdfFingerprintAsync(sourcePath)
     if (targetHash && sourceFingerprint.sha256 !== targetHash) {
       return { restored: false, error: '选择的 PDF 与该文献原始文件内容不一致' }
@@ -1216,17 +1351,38 @@ export async function restorePdfAssetForDocumentAsync(docId: string, manualPath?
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
     }
-    await indexPdfRepositoriesAsync(readRepositoryPaths())
-    const match = queryOne<{ path: string }>('SELECT path FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1', [targetHash])
-    if (!match?.path || !(await pathExists(match.path))) {
+    // Prefer index hit; only rescan repositories when missing.
+    let matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+    if (!matchPath) {
+      await indexPdfRepositoriesAsync(readRepositoryPaths())
+      matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+    }
+    if (!matchPath) {
       return { restored: false, error: '未在 PDF 原件仓库找到同内容 PDF' }
     }
-    sourcePath = match.path
+    sourcePath = matchPath
+    trustedFromIndex = true
+  }
+
+  if (linkOnly) {
+    // Index match already encodes sha256; skip re-hash for speed.
+    return persistLinkedPdfRestore(docId, sourcePath, metadata, {
+      trustedFromIndex,
+      sourceFingerprint,
+    })
   }
 
   const storageDir = join(getDataDir(), 'storage', docId)
   await mkdir(storageDir, { recursive: true })
-  const finalSourceFingerprint = sourceFingerprint || await getPdfFingerprintAsync(sourcePath)
+  // When matching via repository index, reuse stored size/mtime and avoid a full re-hash of the source.
+  const finalSourceFingerprint = sourceFingerprint
+    || (trustedFromIndex
+      ? {
+          sha256: targetHash,
+          sizeBytes: Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || 0),
+          mtimeMs: Number(metadata.pdf_mtime_ms || 0),
+        }
+      : await getPdfFingerprintAsync(sourcePath))
   const originalFingerprint = {
     sha256: targetHash || finalSourceFingerprint.sha256,
     sizeBytes: Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || finalSourceFingerprint.sizeBytes),
@@ -1237,9 +1393,12 @@ export async function restorePdfAssetForDocumentAsync(docId: string, manualPath?
     ...metadata,
     ...buildPdfCompressionMetadata(basename(sourcePath), originalFingerprint, stored.storedFingerprint, stored.compression),
     pdf_asset_state: 'available' as PdfAssetState,
+    pdf_asset_storage: 'copy',
     pdf_asset_deleted_at: null,
+    pdf_linked_path: null,
     restored_from_repository_at: new Date().toISOString(),
     restored_source_name: basename(sourcePath),
+    restored_storage_mode: 'copy',
   }
   if (!nextMetadata.pdf_sha256) {
     nextMetadata.pdf_sha256 = originalFingerprint.sha256
@@ -1252,5 +1411,5 @@ export async function restorePdfAssetForDocumentAsync(docId: string, manualPath?
     docId,
   ])
   scheduleDatabaseSave()
-  return { restored: true, path: stored.storedPath, pdfCompression: stored.compression }
+  return { restored: true, path: stored.storedPath, pdfCompression: stored.compression, storageMode: 'copy' }
 }

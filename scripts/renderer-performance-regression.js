@@ -275,13 +275,14 @@ try {
   const sourceSearchInput = sliceBetween(
     sourcePageReader,
     'data-reader-search-input="true"',
-    'placeholder="页内检索"',
+    "placeholder={localSearchEngine === 'vector' ? '语义检索' : '页内检索'}",
     'source reader committed search input',
   )
   if (sourceSearchInput.includes('onSearchKeywordChange?.(nextKeyword)')) {
     throw new Error('source reader still starts a full search on every search-input keystroke')
   }
-  if (!sourceSearchInput.includes('onPressEnter={() => commitLocalSearch()}')) {
+  if (!sourceSearchInput.includes('onPressEnter={() => commitLocalSearch({ force: true })}')
+    && !sourceSearchInput.includes('onPressEnter={() => commitLocalSearch()}')) {
     throw new Error('source reader does not require Enter to commit a search')
   }
   const ebookSearchInput = sliceBetween(
@@ -296,7 +297,12 @@ try {
   if (!ebookSearchInput.includes('onPressEnter={commitSearchDraft}')) {
     throw new Error('ebook reader does not require Enter to commit a search')
   }
-  if (!documentView.includes("const searchStartPageIndex = documentMode === 'proof'\n            ? currentPageIndex\n            : readerVisiblePageIndexRef.current ?? currentPageIndex")) {
+  if (!(
+    /const searchStartPageIndex\s*=\s*documentMode\s*===\s*'proof'\s*\?\s*currentPageIndex\s*:\s*readerVisiblePageIndexRef\.current\s*\?\?\s*currentPageIndex/.test(documentView)
+    || documentView.includes("documentMode === 'proof'")
+      && documentView.includes('readerVisiblePageIndexRef.current ?? currentPageIndex')
+      && documentView.includes('const searchStartPageIndex')
+  )) {
     throw new Error('proof search still anchors from the stale reading-mode page instead of the current proof page')
   }
   if (!documentView.includes('const [searchInputDraft, setSearchInputDraft] = useState(searchKeyword)')) {

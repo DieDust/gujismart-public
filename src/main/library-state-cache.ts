@@ -3,7 +3,7 @@ import { queryAll, queryOne, run, scheduleDatabaseSave } from './database'
 import { buildCumulativeFolderDocumentCounts } from './folder-scope'
 
 const CACHE_KEY = 'library-sidebar-v1'
-const CACHE_VERSION = 'library-sidebar-v4-vectorized-smart-view'
+const CACHE_VERSION = 'library-sidebar-v5-embedding-smart-views'
 // Keep first paint free: dirty-cache rebuild is expensive COUNT work on large libraries.
 const LIBRARY_STATE_CACHE_REFRESH_DELAY_MS = 12_000
 const LIBRARY_STATE_CACHE_COLD_START_DELAY_MS = 18_000
@@ -24,6 +24,24 @@ const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   metadataPending: 0,
   unstored: 0,
   vectorized: 0,
+  notVectorized: 0,
+  embeddingQueued: 0,
+  embeddingProcessing: 0,
+  embeddingError: 0,
+}
+
+function embeddingStatusExistsSql(status: string): string {
+  return `EXISTS (
+    SELECT 1 FROM embedding_index_status eis
+    WHERE eis.doc_id = d.id AND eis.status = '${status}'
+  )`
+}
+
+function embeddingNotReadySql(): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM embedding_index_status eis
+    WHERE eis.doc_id = d.id AND eis.status = 'ready'
+  )`
 }
 
 interface CacheRow {
@@ -69,6 +87,10 @@ function parseCounts(value: unknown): LibrarySmartViewCounts {
     metadataPending: numberValue(source.metadataPending),
     unstored: numberValue(source.unstored),
     vectorized: numberValue(source.vectorized),
+    notVectorized: numberValue(source.notVectorized),
+    embeddingQueued: numberValue(source.embeddingQueued),
+    embeddingProcessing: numberValue(source.embeddingProcessing),
+    embeddingError: numberValue(source.embeddingError),
   }
 }
 
@@ -242,10 +264,23 @@ function buildCache(): LibraryStateCache {
     unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE d.import_status = 'unstored'`),
     vectorized: count(
       `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(`EXISTS (
-         SELECT 1 FROM embedding_index_status eis
-         WHERE eis.doc_id = d.id AND eis.status = 'ready'
-       )`)}`,
+       ${activeDocumentWhere(embeddingStatusExistsSql('ready'))}`,
+    ),
+    notVectorized: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingNotReadySql())}`,
+    ),
+    embeddingQueued: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingStatusExistsSql('queued'))}`,
+    ),
+    embeddingProcessing: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingStatusExistsSql('processing'))}`,
+    ),
+    embeddingError: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingStatusExistsSql('error'))}`,
     ),
   }
   return {
@@ -281,10 +316,23 @@ function buildLightweightCache(dirty: boolean): LibraryStateCache {
     unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE d.import_status = 'unstored'`),
     vectorized: count(
       `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(`EXISTS (
-         SELECT 1 FROM embedding_index_status eis
-         WHERE eis.doc_id = d.id AND eis.status = 'ready'
-       )`)}`,
+       ${activeDocumentWhere(embeddingStatusExistsSql('ready'))}`,
+    ),
+    notVectorized: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingNotReadySql())}`,
+    ),
+    embeddingQueued: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingStatusExistsSql('queued'))}`,
+    ),
+    embeddingProcessing: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingStatusExistsSql('processing'))}`,
+    ),
+    embeddingError: count(
+      `SELECT COUNT(*) AS count FROM documents d
+       ${activeDocumentWhere(embeddingStatusExistsSql('error'))}`,
     ),
   }
   return {

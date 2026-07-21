@@ -187,6 +187,8 @@ export interface VectorSearchError {
 let queueRunning = false
 let queuePaused = false
 let queueTimer: ReturnType<typeof setTimeout> | null = null
+/** Docs the user canceled while queued/processing — checked between embed batches. */
+const canceledEmbeddingDocIds = new Set<string>()
 /** Counts for the latest manual/auto enqueue burst — drives 处理队列 + toast progress. */
 let sessionTotal = 0
 let sessionCompleted = 0
@@ -874,6 +876,181 @@ export function setEmbeddingQueuePaused(paused: boolean): EmbeddingIndexStats {
   return getEmbeddingIndexStats()
 }
 
+function countDocumentEmbeddingChunks(docId: string): number {
+  const modelId = getActiveEmbeddingModelIdPrefix()
+  const modelName = getEmbeddingModel()
+  return Number(
+    queryOne<{ c: number }>(
+      `SELECT COUNT(*) as c FROM embedding_chunks
+       WHERE doc_id = ? AND (model_id = ? OR model_id LIKE ?)`,
+      [docId, modelId, `${modelName}@%`],
+    )?.c || 0,
+  )
+}
+
+function countDocumentSearchSegments(docId: string): number {
+  return Number(
+    queryOne<{ c: number }>('SELECT COUNT(*) as c FROM search_index_segments WHERE doc_id = ?', [docId])?.c || 0,
+  )
+}
+
+/**
+ * Text-only embedding: need OCR/proofed body text on pages (not images alone).
+ */
+function documentHasIndexableOcrText(docId: string): boolean {
+  const row = queryOne<{ c: number }>(
+    `SELECT COUNT(*) as c FROM pages
+     WHERE doc_id = ?
+       AND (
+         TRIM(COALESCE(proofed_text, '')) <> ''
+         OR TRIM(COALESCE(ocr_text, '')) <> ''
+         OR (TRIM(COALESCE(ocr_text_ref, '')) <> '' AND TRIM(COALESCE(ocr_text_ref, '')) <> 'null')
+         OR (TRIM(COALESCE(proofed_text_ref, '')) <> '' AND TRIM(COALESCE(proofed_text_ref, '')) <> 'null')
+       )`,
+    [docId],
+  )
+  return Number(row?.c || 0) > 0
+}
+
+/**
+ * If search segments are missing (e.g. just finished OCR), rebuild once so embedding can proceed.
+ * Uses require() to avoid circular init with semantic-search.
+ * Vectorization is text-only — without OCR/proof body text, rebuild cannot create segments.
+ */
+function ensureSearchSegmentsForEmbedding(docId: string): number {
+  let segments = countDocumentSearchSegments(docId)
+  if (segments > 0) return segments
+  if (!documentHasIndexableOcrText(docId)) return 0
+  try {
+    const search = require('./semantic-search') as {
+      reindexDocument?: (id: string) => { status?: string; segmentCount?: number }
+    }
+    if (typeof search.reindexDocument === 'function') {
+      const result = search.reindexDocument(docId)
+      segments = Number(result?.segmentCount || 0) || countDocumentSearchSegments(docId)
+    }
+  } catch (error) {
+    console.warn('[embedding] ensure search segments failed', docId, error)
+    segments = countDocumentSearchSegments(docId)
+  }
+  return segments
+}
+
+/**
+ * After cancel: if the document still has a full (or near-full) vector index, restore ready.
+ * Accidental re-queue of already-vectorized books (old bug) keeps chunks → back to ready.
+ * Force rebuild that cleared chunks / partial rewrite → pending.
+ */
+function restoreEmbeddingStatusAfterCancel(docId: string): 'ready' | 'pending' {
+  const chunks = countDocumentEmbeddingChunks(docId)
+  const segments = countDocumentSearchSegments(docId)
+  const fullEnough = chunks > 0 && (
+    segments <= 0
+    || chunks >= segments
+    || chunks >= Math.ceil(segments * 0.95)
+  )
+  if (fullEnough) {
+    upsertDocStatus(docId, 'ready', {
+      segmentCount: segments || chunks,
+      embeddedCount: chunks,
+      error: '',
+    })
+    return 'ready'
+  }
+  upsertDocStatus(docId, 'pending', {
+    segmentCount: segments,
+    embeddedCount: chunks,
+    error: '向量化已取消',
+  })
+  return 'pending'
+}
+
+export function cancelDocumentsForEmbedding(docIds: string[]): {
+  canceled: number
+  restoredReady: number
+  restoredPending: number
+  skipped: number
+} {
+  const unique = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
+  let canceled = 0
+  let restoredReady = 0
+  let restoredPending = 0
+  let skipped = 0
+
+  for (const docId of unique) {
+    const row = queryOne<{ status?: string }>(
+      'SELECT status FROM embedding_index_status WHERE doc_id = ?',
+      [docId],
+    )
+    const status = String(row?.status || '').trim()
+    if (status !== 'queued' && status !== 'processing') {
+      skipped += 1
+      continue
+    }
+    canceledEmbeddingDocIds.add(docId)
+    const restored = restoreEmbeddingStatusAfterCancel(docId)
+    if (restored === 'ready') restoredReady += 1
+    else restoredPending += 1
+    canceled += 1
+    // Session counter: canceled items no longer count as remaining work.
+    sessionTotal = Math.max(0, sessionTotal - 1)
+    sendEmbeddingProgress({
+      docId,
+      status: restored === 'ready' ? 'ready' : 'pending',
+      progress: restored === 'ready' ? 100 : 0,
+      segmentCount: countDocumentSearchSegments(docId),
+      embeddedCount: countDocumentEmbeddingChunks(docId),
+      message: restored === 'ready'
+        ? '向量化已取消，已恢复为已向量化（原有索引保留）'
+        : '向量化已取消，可稍后继续',
+    })
+  }
+
+  if (canceled > 0) {
+    try {
+      markLibraryStateCacheDirty()
+    } catch {
+      // ignore
+    }
+    const remaining = countEmbeddingStatus('queued') + countEmbeddingStatus('processing')
+    setMeta(
+      'last_message',
+      `已停止向量化 ${canceled} 篇（恢复已向量化 ${restoredReady}，待继续 ${restoredPending}）`,
+    )
+    scheduleDatabaseSave({ minDelayMs: 300 })
+    sendEmbeddingProgress({
+      status: remaining > 0 ? (countEmbeddingStatus('processing') > 0 ? 'processing' : 'queued') : 'idle',
+      progress: remaining > 0 ? 0 : 100,
+      message: remaining > 0
+        ? `已停止 ${canceled} 篇向量化；队列剩余 ${remaining} 篇`
+        : `已停止向量化 ${canceled} 篇，队列已空`,
+    })
+    emitQueueBackgroundProgress(
+      remaining > 0 ? 'processing' : 'completed',
+      remaining > 0
+        ? `已停止 ${canceled} 篇向量化；队列剩余 ${remaining}`
+        : `已停止向量化 ${canceled} 篇`,
+    )
+    if (remaining > 0 && !queuePaused) scheduleEmbeddingQueue()
+  }
+
+  return { canceled, restoredReady, restoredPending, skipped }
+}
+
+export function cancelAllPendingEmbeddings(): {
+  canceled: number
+  restoredReady: number
+  restoredPending: number
+  skipped: number
+} {
+  const rows = queryAll<{ doc_id: string }>(
+    `SELECT doc_id FROM embedding_index_status
+     WHERE status IN ('queued', 'processing')`,
+  )
+  const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
+  return cancelDocumentsForEmbedding(ids)
+}
+
 function upsertDocStatus(
   docId: string,
   status: EmbeddingDocStatus,
@@ -978,31 +1155,55 @@ export function enqueueDocumentsForEmbedding(
       skipped += 1
       continue
     }
-    const segments = Number(
-      queryOne<{ c: number }>('SELECT COUNT(*) as c FROM search_index_segments WHERE doc_id = ?', [docId])?.c || 0,
-    )
-    if (segments <= 0) {
+    // Text-only vectors: require OCR body text, then search segments (rebuild after OCR if needed).
+    if (!documentHasIndexableOcrText(docId) && countDocumentSearchSegments(docId) <= 0) {
       upsertDocStatus(docId, 'pending', {
         segmentCount: 0,
-        error: '检索分段尚未就绪，请等待搜索索引完成后再向量化',
+        error: '尚无 OCR 正文，无法文本向量化。请先 OCR 完成后再向量化。',
       })
       sendEmbeddingProgress({
         docId,
         status: 'pending',
         progress: 0,
         segmentCount: 0,
-        message: '检索分段尚未就绪，请等待搜索索引完成后再向量化',
+        message: '尚无 OCR 正文，无法文本向量化。请先 OCR 完成后再向量化。',
+        errorMessage: '缺少 OCR 正文',
+      })
+      skipped += 1
+      continue
+    }
+    const segments = ensureSearchSegmentsForEmbedding(docId)
+    if (segments <= 0) {
+      upsertDocStatus(docId, 'pending', {
+        segmentCount: 0,
+        error: 'OCR 正文尚未入库为检索分段，请稍候再试或重新 OCR',
+      })
+      sendEmbeddingProgress({
+        docId,
+        status: 'pending',
+        progress: 0,
+        segmentCount: 0,
+        message: 'OCR 正文尚未入库为检索分段，请稍候再试或重新 OCR',
         errorMessage: '检索分段尚未就绪',
       })
       skipped += 1
       continue
     }
     const previous = queryOne<{ status?: string }>('SELECT status FROM embedding_index_status WHERE doc_id = ?', [docId])
-    const wasReady = String(previous?.status || '') === 'ready'
+    const previousStatus = String(previous?.status || '').trim()
+    const wasReady = previousStatus === 'ready'
+    // Same policy as batch OCR: "向量化" skips completed/in-flight docs; only "重新向量化" (force) may re-run ready ones.
+    if (!force) {
+      if (wasReady || previousStatus === 'queued' || previousStatus === 'processing') {
+        skipped += 1
+        continue
+      }
+    }
     if (force) {
       clearedChunks += clearDocumentEmbeddingChunks(docId, { onlyCurrentModel: options?.onlyCurrentModel })
       if (wasReady) reindexed += 1
     }
+    canceledEmbeddingDocIds.delete(docId)
     upsertDocStatus(docId, 'queued', { segmentCount: segments, embeddedCount: 0, error: '' })
     queuedIds.push(docId)
     queued += 1
@@ -1300,6 +1501,9 @@ async function embedDocument(docId: string): Promise<void> {
   let offset = 0
 
   while (offset < totalSegments) {
+    if (canceledEmbeddingDocIds.has(docId)) {
+      throw new Error('queue_canceled')
+    }
     if (queuePaused) {
       upsertDocStatus(docId, 'queued', { segmentCount: totalSegments, embeddedCount: embedded })
       sendEmbeddingProgress({
@@ -1334,6 +1538,9 @@ async function embedDocument(docId: string): Promise<void> {
     if (segments.length === 0) break
 
     for (let i = 0; i < segments.length; i += batchSize) {
+      if (canceledEmbeddingDocIds.has(docId)) {
+        throw new Error('queue_canceled')
+      }
       if (queuePaused) {
         upsertDocStatus(docId, 'queued', { segmentCount: totalSegments, embeddedCount: embedded })
         throw new Error('queue_paused')
@@ -1436,7 +1643,12 @@ async function processEmbeddingQueue(): Promise<void> {
       )
       if (!next?.doc_id) break
       try {
+        if (canceledEmbeddingDocIds.has(next.doc_id)) {
+          canceledEmbeddingDocIds.delete(next.doc_id)
+          continue
+        }
         await embedDocument(next.doc_id)
+        canceledEmbeddingDocIds.delete(next.doc_id)
         setMeta('last_message', `已完成向量化：${next.doc_id}`)
         // Prefer deferred checkpoint — forcing WAL checkpoint after every book can freeze/kill the app.
         scheduleDatabaseSave({ minDelayMs: 800 })
@@ -1444,6 +1656,12 @@ async function processEmbeddingQueue(): Promise<void> {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         if (message === 'queue_paused') break
+        if (message === 'queue_canceled') {
+          // cancelDocumentsForEmbedding already restored status (ready if chunks remain).
+          canceledEmbeddingDocIds.delete(next.doc_id)
+          await sleep(DOC_YIELD_MS)
+          continue
+        }
         sessionFailed += 1
         try {
           upsertDocStatus(next.doc_id, 'error', { error: message.slice(0, 500) })
@@ -1503,7 +1721,7 @@ async function processEmbeddingQueue(): Promise<void> {
 
 export async function vectorSearch(
   query: string,
-  options?: { limit?: number; folderId?: string; tagId?: string },
+  options?: { limit?: number; folderId?: string; tagId?: string; docId?: string },
 ): Promise<VectorSearchResult | VectorSearchError> {
   const q = String(query || '').trim()
   if (!q) return { ok: false, code: 'invalid_args', message: 'query is required' }
@@ -1535,18 +1753,23 @@ export async function vectorSearch(
   }
 
   let allowedDocs: Set<string> | null = null
+  const scopedDocId = String(options?.docId || '').trim()
+  if (scopedDocId) {
+    allowedDocs = new Set([scopedDocId])
+  }
   if (options?.folderId) {
     const folderIds = resolveFolderAndDescendantIds([String(options.folderId)])
-    if (folderIds.length > 0) {
-      const placeholders = folderIds.map(() => '?').join(',')
-      const rows = queryAll<{ doc_id: string }>(
-        `SELECT DISTINCT doc_id FROM document_folders WHERE folder_id IN (${placeholders})`,
-        folderIds,
+    const folderSet = folderIds.length > 0
+      ? new Set(
+        queryAll<{ doc_id: string }>(
+          `SELECT DISTINCT doc_id FROM document_folders WHERE folder_id IN (${folderIds.map(() => '?').join(',')})`,
+          folderIds,
+        ).map((r) => r.doc_id),
       )
-      allowedDocs = new Set(rows.map((r) => r.doc_id))
-    } else {
-      allowedDocs = new Set()
-    }
+      : new Set<string>()
+    allowedDocs = allowedDocs
+      ? new Set([...allowedDocs].filter((id) => folderSet.has(id)))
+      : folderSet
   }
   if (options?.tagId) {
     const rows = queryAll<{ doc_id: string }>('SELECT doc_id FROM document_tags WHERE tag_id = ?', [String(options.tagId)])
@@ -1560,71 +1783,110 @@ export async function vectorSearch(
   type Cand = { segmentId: string; docId: string; pageId: string | null; pageNum: number | null; score: number }
   const best: Cand[] = []
 
-  let offset = 0
-  for (;;) {
-    const rows = queryAll<{
-      segment_id: string
-      doc_id: string
-      page_id: string | null
-      page_num: number | null
-      embedding: Buffer
-    }>(
-      `SELECT segment_id, doc_id, page_id, page_num, embedding
-       FROM embedding_chunks
-       WHERE model_id = ?
-       LIMIT ? OFFSET ?`,
-      [modelId, SCAN_CHUNK_ROWS, offset],
-    )
-    if (rows.length === 0) break
-    for (const row of rows) {
-      if (allowedDocs && !allowedDocs.has(row.doc_id)) continue
-      const emb = bufferToFloat32(Buffer.isBuffer(row.embedding) ? row.embedding : Buffer.from(row.embedding as ArrayBuffer))
-      if (emb.length !== queryVec.length) continue
-      const score = cosine(queryVec, emb)
-      if (best.length < limit) {
-        best.push({
-          segmentId: row.segment_id,
-          docId: row.doc_id,
-          pageId: row.page_id,
-          pageNum: row.page_num,
-          score,
-        })
-        best.sort((a, b) => b.score - a.score)
-      } else if (score > best[best.length - 1].score) {
-        best[best.length - 1] = {
-          segmentId: row.segment_id,
-          docId: row.doc_id,
-          pageId: row.page_id,
-          pageNum: row.page_num,
-          score,
-        }
-        best.sort((a, b) => b.score - a.score)
-      }
+  const considerRow = (row: {
+    segment_id: string
+    doc_id: string
+    page_id: string | null
+    page_num: number | null
+    embedding: Buffer
+  }) => {
+    if (allowedDocs && !allowedDocs.has(row.doc_id)) return
+    const emb = bufferToFloat32(Buffer.isBuffer(row.embedding) ? row.embedding : Buffer.from(row.embedding as ArrayBuffer))
+    if (emb.length !== queryVec.length) return
+    const score = cosine(queryVec, emb)
+    if (best.length < limit) {
+      best.push({
+        segmentId: row.segment_id,
+        docId: row.doc_id,
+        pageId: row.page_id,
+        pageNum: row.page_num,
+        score,
+      })
+      best.sort((a, b) => b.score - a.score)
+      return
     }
-    offset += rows.length
-    if (rows.length < SCAN_CHUNK_ROWS) break
+    if (score > best[best.length - 1].score) {
+      best[best.length - 1] = {
+        segmentId: row.segment_id,
+        docId: row.doc_id,
+        pageId: row.page_id,
+        pageNum: row.page_num,
+        score,
+      }
+      best.sort((a, b) => b.score - a.score)
+    }
   }
 
-  const hits: VectorSearchHit[] = best.map((item) => {
-    const doc = queryOne<{ title?: string | null; author?: string | null }>(
-      'SELECT title, author FROM documents WHERE id = ?',
-      [item.docId],
-    )
-    const seg = queryOne<{ text?: string | null; normalized_text?: string | null }>(
-      'SELECT text, normalized_text FROM search_index_segments WHERE segment_id = ?',
-      [item.segmentId],
-    )
-    const excerpt = String(seg?.normalized_text || seg?.text || '').replace(/\s+/g, ' ').trim().slice(0, 240)
-    return {
-      documentId: item.docId,
-      title: doc?.title ?? null,
-      author: doc?.author ?? null,
-      pageNum: item.pageNum,
-      excerpt,
-      score: Math.round(item.score * 10000) / 10000,
-      ref: { docId: item.docId, pageNum: item.pageNum, segmentId: item.segmentId },
+  // In-document search: query only this doc's chunks (SQL-level), never leak other docs.
+  if (scopedDocId) {
+    let offset = 0
+    for (;;) {
+      const rows = queryAll<{
+        segment_id: string
+        doc_id: string
+        page_id: string | null
+        page_num: number | null
+        embedding: Buffer
+      }>(
+        `SELECT segment_id, doc_id, page_id, page_num, embedding
+         FROM embedding_chunks
+         WHERE model_id = ? AND doc_id = ?
+         LIMIT ? OFFSET ?`,
+        [modelId, scopedDocId, SCAN_CHUNK_ROWS, offset],
+      )
+      if (rows.length === 0) break
+      rows.forEach(considerRow)
+      offset += rows.length
+      if (rows.length < SCAN_CHUNK_ROWS) break
     }
-  })
+  } else {
+    let offset = 0
+    for (;;) {
+      const rows = queryAll<{
+        segment_id: string
+        doc_id: string
+        page_id: string | null
+        page_num: number | null
+        embedding: Buffer
+      }>(
+        `SELECT segment_id, doc_id, page_id, page_num, embedding
+         FROM embedding_chunks
+         WHERE model_id = ?
+         LIMIT ? OFFSET ?`,
+        [modelId, SCAN_CHUNK_ROWS, offset],
+      )
+      if (rows.length === 0) break
+      rows.forEach(considerRow)
+      offset += rows.length
+      if (rows.length < SCAN_CHUNK_ROWS) break
+    }
+  }
+
+  const hits: VectorSearchHit[] = best
+    .filter((item) => !scopedDocId || item.docId === scopedDocId)
+    .map((item) => {
+      const doc = queryOne<{ title?: string | null; author?: string | null }>(
+        'SELECT title, author FROM documents WHERE id = ?',
+        [item.docId],
+      )
+      const seg = queryOne<{ text?: string | null; normalized_text?: string | null }>(
+        'SELECT text, normalized_text FROM search_index_segments WHERE segment_id = ? AND doc_id = ?',
+        [item.segmentId, item.docId],
+      ) || queryOne<{ text?: string | null; normalized_text?: string | null }>(
+        'SELECT text, normalized_text FROM search_index_segments WHERE segment_id = ?',
+        [item.segmentId],
+      )
+      const excerpt = String(seg?.normalized_text || seg?.text || '').replace(/\s+/g, ' ').trim().slice(0, 240)
+      return {
+        documentId: item.docId,
+        title: doc?.title ?? null,
+        author: doc?.author ?? null,
+        pageNum: item.pageNum,
+        excerpt,
+        score: Math.round(item.score * 10000) / 10000,
+        ref: { docId: item.docId, pageNum: item.pageNum, segmentId: item.segmentId },
+      }
+    })
 
   return {
     ok: true,
@@ -1632,7 +1894,9 @@ export async function vectorSearch(
     modelId,
     totalHits: hits.length,
     hits,
-    hint: '语义召回结果；请用 get_page_text(ref.docId, ref.pageNum) 精读正文。专名精确匹配可用 library_search。',
+    hint: scopedDocId
+      ? '本文文献内向量命中。'
+      : '语义召回结果；请用 get_page_text(ref.docId, ref.pageNum) 精读正文。专名精确匹配可用 library_search。',
   }
 }
 

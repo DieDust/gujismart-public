@@ -163,6 +163,36 @@ export default function DashboardView() {
     }
   }
 
+  const handleEmbeddingCancelAll = async () => {
+    setEmbeddingBusy(true)
+    try {
+      const result = await window.api.cancelAllPendingEmbeddings()
+      setEmbeddingProgress((current) => current ? {
+        ...current,
+        status: 'idle',
+        queueQueued: result.stats.docsQueued,
+        queueProcessing: result.stats.docsProcessing,
+        queueReady: result.stats.docsReady,
+        queueError: result.stats.docsError,
+        queuePaused: result.stats.queuePaused,
+        message: result.stats.message || (
+          result.canceled > 0
+            ? `已停止 ${result.canceled} 篇向量化（恢复已向量化 ${result.restoredReady}）`
+            : '队列已空'
+        ),
+      } : current)
+      message.success(
+        result.canceled > 0
+          ? `已停止向量化队列：取消 ${result.canceled} 篇（恢复已向量化 ${result.restoredReady} 篇，待继续 ${result.restoredPending} 篇）。已有索引会保留。`
+          : '当前没有排队中的向量化任务',
+      )
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '停止向量化失败')
+    } finally {
+      setEmbeddingBusy(false)
+    }
+  }
+
   const embeddingActive = isEmbeddingQueueActive(embeddingProgress)
   const sessionTotal = Math.max(
     1,
@@ -370,6 +400,16 @@ export default function DashboardView() {
                   onClick={() => void handleEmbeddingPause()}
                 >
                   暂停向量化
+                </Button>
+              ) : null}
+              {embeddingActive || Number(embeddingProgress?.queueQueued || 0) > 0 || Number(embeddingProgress?.queueProcessing || 0) > 0 ? (
+                <Button
+                  danger
+                  loading={embeddingBusy}
+                  icon={<CloseCircleOutlined />}
+                  onClick={() => void handleEmbeddingCancelAll()}
+                >
+                  停止全部向量化
                 </Button>
               ) : null}
             </Space>

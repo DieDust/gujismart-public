@@ -1,6 +1,6 @@
 ﻿import { Children, cloneElement, isValidElement, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
 import { lazy, Suspense } from 'react'
-import { Button, Dropdown, Empty, Input, Modal, Pagination, Popover, Select, Segmented, Slider, Space, Spin, Tag, Typography, message } from 'antd'
+import { Button, Dropdown, Empty, Input, Modal, Pagination, Popover, Radio, Select, Segmented, Slider, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import { useLayoutEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -17,6 +17,7 @@ import {
   ExportOutlined,
   FileImageOutlined,
   FolderOpenOutlined,
+  FontSizeOutlined,
   LeftOutlined,
   PlusOutlined,
   RightOutlined,
@@ -24,6 +25,7 @@ import {
   ScanOutlined,
   SearchOutlined,
   SettingOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
 import type { ViewerViewport } from '../components/ImageViewer'
 import GujiFacsimileProofreader, { getFacsimileTranslationSourceText, isFacsimileProofCandidate } from '../components/GujiFacsimileProofreader'
@@ -53,7 +55,7 @@ import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { toLocalResourceUrl } from '../utils/localResource'
 import { isDocumentPagePayloadHydrated, retainDocumentPagePayloadWindow } from '../utils/documentPageRetention'
 import { findFirstSearchHitAtOrAfterPage, findSearchOccurrenceContainer, findSearchOccurrenceIndexNearChar } from '../utils/readerSearchNavigation'
-import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHitLocator, SearchSessionState, StableReaderLocator, TranslationGlossaryScope, TranslationMode, TranslationUnitV1 } from '@shared/types'
+import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, ExportPageNumberMode, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHit, SearchHitLocator, SearchSessionState, StableReaderLocator, TranslationGlossaryScope, TranslationMode, TranslationUnitV1, VectorSearchHit } from '@shared/types'
 
 const { Title, Text } = Typography
 const AiPanel = lazy(() => import('../components/AiPanel'))
@@ -883,20 +885,31 @@ function findBoxForLocator(page: DocumentViewPage | undefined, locator: SearchHi
   if (!Array.isArray(textFlowBoxes) || textFlowBoxes.length === 0) {
     return { boxIndex: -1, boxTop: Number.MAX_SAFE_INTEGER, boxLeft: Number.MAX_SAFE_INTEGER, boxOccurrenceIndex: -1 }
   }
-  const terms = uniqueSearchTerms(locator.matchText || locator.queryTerm || query)
-  const needle = terms[0] || ''
+  const matchText = String(locator.matchText || '').replace(/\s+/g, ' ').trim()
+  const queryTerm = String(locator.queryTerm || query || '').trim()
+  // Vector excerpts: prefer head/tail anchors so long semantic text still lands on a block.
+  const needleCandidates: string[] = []
+  if (matchText.length >= 6) {
+    needleCandidates.push(matchText.slice(0, 3), matchText.slice(-3), matchText.slice(0, Math.min(16, matchText.length)))
+  }
+  if (matchText) needleCandidates.push(matchText)
+  needleCandidates.push(...uniqueSearchTerms(matchText || queryTerm || query))
   const pageText = String(page?.proofed_text || page?.ocr_text || '')
   const targetCharStart = Number(locator.charStart || 0)
-  const nearestPageOccurrence = findSearchOccurrenceIndexNearChar(pageText, needle, targetCharStart)
-  const targetOccurrence = nearestPageOccurrence >= 0 ? nearestPageOccurrence : Number(locator.occurrenceIndex || 0)
-  const container = findSearchOccurrenceContainer(textFlowBoxes.map(getBoxText), needle, targetOccurrence)
-  if (!container) {
-    return { boxIndex: -1, boxTop: Number.MAX_SAFE_INTEGER, boxLeft: Number.MAX_SAFE_INTEGER, boxOccurrenceIndex: -1 }
-  }
   const textFlowToLayoutIndex = buildBoxIndexMap(textFlowBoxes, orderedBoxes)
-  const boxIndex = getMappedBoxIndex(textFlowToLayoutIndex, container.containerIndex)
-  const point = getBoxSortPoint(textFlowBoxes[container.containerIndex])
-  return { boxIndex, boxTop: point.top, boxLeft: point.left, boxOccurrenceIndex: container.occurrenceIndex }
+  const boxTexts = textFlowBoxes.map(getBoxText)
+
+  for (const needle of needleCandidates) {
+    if (!needle) continue
+    const nearestPageOccurrence = findSearchOccurrenceIndexNearChar(pageText, needle, targetCharStart)
+    const targetOccurrence = nearestPageOccurrence >= 0 ? nearestPageOccurrence : Number(locator.occurrenceIndex || 0)
+    const container = findSearchOccurrenceContainer(boxTexts, needle, targetOccurrence)
+    if (!container) continue
+    const boxIndex = getMappedBoxIndex(textFlowToLayoutIndex, container.containerIndex)
+    const point = getBoxSortPoint(textFlowBoxes[container.containerIndex])
+    return { boxIndex, boxTop: point.top, boxLeft: point.left, boxOccurrenceIndex: container.occurrenceIndex }
+  }
+  return { boxIndex: -1, boxTop: Number.MAX_SAFE_INTEGER, boxLeft: Number.MAX_SAFE_INTEGER, boxOccurrenceIndex: -1 }
 }
 
 function putLimitedPageImageCache(cache: Map<string, string>, key: string, value: string, maxEntries = 18, maxTotalChars = 96 * 1024 * 1024) {
@@ -1368,6 +1381,9 @@ export default function DocumentView({
   const [extracting, setExtracting] = useState(false)
   const [restoringPdf, setRestoringPdf] = useState(false)
   const [exportingDocument, setExportingDocument] = useState(false)
+  const [exportModalOpen, setExportModalOpen] = useState(false)
+  const [pendingExportFormat, setPendingExportFormat] = useState<DocumentExportFormat | null>(null)
+  const [exportPageNumberMode, setExportPageNumberMode] = useState<ExportPageNumberMode>('literature')
   const [editorVisible, setEditorVisible] = useState(false)
   const [activeBoxIndex, setActiveBoxIndex] = useState(-1)
   const [switchToRegion, setSwitchToRegion] = useState(false)
@@ -1380,6 +1396,11 @@ export default function DocumentView({
   const [floatPanelOpen, setFloatPanelOpen] = useState(false)
   const [localSearchKeyword, setLocalSearchKeyword] = useState(searchKeyword)
   const [searchInputDraft, setSearchInputDraft] = useState(searchKeyword)
+  const [readerSearchEngine, setReaderSearchEngine] = useState<'fulltext' | 'vector'>(
+    searchSession?.engine === 'vector' || sourceId === 'vector-search' ? 'vector' : 'fulltext',
+  )
+  /** Bumped on every in-reader search commit so same keyword can re-run after engine switch / Enter. */
+  const [readerSearchRevision, setReaderSearchRevision] = useState(0)
   const [readerSearchPages, setReaderSearchPages] = useState<DocumentPage[]>([])
   const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
   const [documentSearchSession, setDocumentSearchSession] = useState<SearchSessionState | undefined>(searchSession)
@@ -1477,6 +1498,10 @@ export default function DocumentView({
   const searchRequestIdRef = useRef(0)
   const searchPagesRequestIdRef = useRef(0)
   const incomingSearchSessionKeyRef = useRef('')
+  /** Prevents re-fetch loops when a focused open expands to 0–1 fulltext hits. */
+  const documentSearchFetchedKeyRef = useRef('')
+  /** Doc-scoped vector expand (in-document semantic hits). */
+  const documentVectorExpandKeyRef = useRef('')
   const searchAutoNavigationKeyRef = useRef('')
   const appliedInitialSearchLocatorKeyRef = useRef('')
   const temporaryNavigationRef = useRef(false)
@@ -1756,6 +1781,41 @@ export default function DocumentView({
   const pageCount = sortedPages.length
   const currentPage = sortedPages[currentPageIndex]
   const nextSpreadPage = sortedPages[currentPageIndex + 1]
+  const ocrFailedPageEntries = useMemo(
+    () => sortedPages
+      .map((page, pageIndex) => ({ page, pageIndex }))
+      .filter(({ page }) => String(page.ocr_status || '').trim() === 'error'),
+    [sortedPages],
+  )
+  const ocrFailedPageLabel = useMemo(() => {
+    const nums = [...new Set(
+      ocrFailedPageEntries
+        .map(({ page }) => Math.floor(Number(page.page_num || 0)))
+        .filter((value) => Number.isFinite(value) && value > 0),
+    )].sort((left, right) => left - right)
+    if (nums.length === 0) return ''
+    const parts: string[] = []
+    let start = nums[0]
+    let end = nums[0]
+    for (let index = 1; index <= nums.length; index += 1) {
+      const current = nums[index]
+      if (current === end + 1) {
+        end = current
+        continue
+      }
+      parts.push(start === end ? `${start}` : `${start}-${end}`)
+      start = current
+      end = current
+    }
+    return parts.join('、')
+  }, [ocrFailedPageEntries])
+  const jumpToOcrFailedBirdseye = useCallback(() => {
+    setDocumentMode('proof')
+    setPageViewMode('bird')
+    if (ocrFailedPageEntries[0]) {
+      setCurrentPageIndex(clampPageIndex(ocrFailedPageEntries[0].pageIndex, pageCount))
+    }
+  }, [ocrFailedPageEntries, pageCount])
   const ocrResultObj = useMemo(() => parseMaybeJson(currentPage?.ocr_result), [currentPage])
   const proofingOcrResultObj = useMemo(() => getProofingOcrResult(currentPage), [currentPage])
   const facsimileOcrResultObj = useMemo(
@@ -1991,21 +2051,39 @@ export default function DocumentView({
       }))
   }, [documentMode, shouldPreferSourcePageReader, sortedPages])
 
+  const isVectorReaderSearch = readerSearchEngine === 'vector' || documentSearchSession?.engine === 'vector'
+
   const searchMatches = useMemo<SearchMatch[]>(() => {
     if (shouldPreferSourcePageReader) return []
-    if (locatorHits.length > 0) {
-      return locatorHits
+
+    // Vector session hits (proof mode): never fall back to keyword FTS for the match list.
+    const vectorHits = (
+      isVectorReaderSearch
+      && documentSearchSession?.query === effectiveSearchKeyword
+      && (documentSearchSession.hits?.length || 0) > 0
+    )
+      ? documentSearchSession.hits
+      : null
+
+    const sessionHits = vectorHits || (locatorHits.length > 0 ? locatorHits : null)
+    if (sessionHits && sessionHits.length > 0) {
+      return sessionHits
         .map((hit, hitIndex) => {
           const locator = hit.locator
           const pageIndex = resolveLocatorPageIndex(sortedPages, locator)
           const box = findBoxForLocator(sortedPages[pageIndex], locator, effectiveSearchKeyword)
+          const matchText = String(locator.matchText || hit.snippet || '').replace(/\s+/g, ' ').trim()
+          // Facsimile highlighter matches short substrings; head-3 works for whole-block yellow tint.
+          const highlightKeyword = isVectorReaderSearch && matchText.length >= 3
+            ? matchText.slice(0, 3)
+            : (locator.queryTerm || effectiveSearchKeyword || matchText)
           return {
             pageIndex,
             boxIndex: box.boxIndex,
-            charIndex: locator.charStart,
+            charIndex: Number(locator.charStart || 0),
             boxTop: box.boxTop,
             boxLeft: box.boxLeft,
-            keyword: locator.queryTerm || effectiveSearchKeyword || locator.matchText,
+            keyword: highlightKeyword,
             hitIndex,
             boxOccurrenceIndex: box.boxOccurrenceIndex,
             locator,
@@ -2019,6 +2097,10 @@ export default function DocumentView({
           || left.charIndex - right.charIndex
         ))
     }
+
+    // Vector mode with no hits yet (searching/empty): do not invent keyword matches.
+    if (isVectorReaderSearch) return []
+
     if (!effectiveSearchKeyword.trim()) return []
     const matches: SearchMatch[] = []
     const pagesToSearch: Array<{ page: DocumentViewPage; pageIndex: number }> = documentMode === 'proof'
@@ -2085,7 +2167,7 @@ export default function DocumentView({
       || left.boxIndex - right.boxIndex
       || left.charIndex - right.charIndex
     ))
-  }, [documentMode, effectiveSearchKeyword, locatorHits, pageCount, proofSearchFallbackPage, readerSearchPages, shouldPreferSourcePageReader, sortedPages])
+  }, [documentMode, documentSearchSession?.engine, documentSearchSession?.hits, documentSearchSession?.query, effectiveSearchKeyword, isVectorReaderSearch, locatorHits, pageCount, proofSearchFallbackPage, readerSearchPages, shouldPreferSourcePageReader, sortedPages])
   const activeProofSearchHitOrdinal = useMemo(() => {
     if (documentMode !== 'proof') return -1
     if (currentMatchIndex < 0 || currentMatchIndex >= searchMatches.length) return -1
@@ -2597,6 +2679,7 @@ export default function DocumentView({
     setFacsimileTranslationOpen(false)
     setLocalSearchKeyword(highlightExcerpt || searchKeyword)
     setSearchInputDraft(highlightExcerpt || searchKeyword)
+    setReaderSearchEngine(searchSession?.engine === 'vector' || sourceId === 'vector-search' ? 'vector' : 'fulltext')
     setInitialReaderLocationKey('')
     setReaderStateReady(false)
     latestReaderStateRef.current = {}
@@ -2606,6 +2689,8 @@ export default function DocumentView({
     }
     searchRequestIdRef.current += 1
     incomingSearchSessionKeyRef.current = ''
+    documentSearchFetchedKeyRef.current = ''
+    documentVectorExpandKeyRef.current = ''
     appliedInitialSearchLocatorKeyRef.current = ''
     temporaryNavigationRef.current = !!(sourceId || locator || stableLocator || searchSession?.hits?.length || searchKeyword || highlightExcerpt)
     setDocumentSearchSession(searchSession)
@@ -2669,84 +2754,192 @@ export default function DocumentView({
     })
   }, [doc, initialPageIndex, locator, sortedPages, stableLocator])
 
-  useEffect(() => {
-    const query = effectiveSearchKeyword.trim()
+  /**
+   * Imperative in-document search. Always runs when called (engine switch / Enter / commit).
+   * Does not rely on React effect dependency equality for the same keyword.
+   */
+  const runInDocumentSearch = useCallback((queryRaw: string, engineRaw: 'fulltext' | 'vector') => {
+    const query = String(queryRaw || '').trim()
+    const engine: 'fulltext' | 'vector' = engineRaw === 'vector' ? 'vector' : 'fulltext'
+    const docId = activeDocumentIdRef.current || documentId
+
     searchRequestIdRef.current += 1
     const requestId = searchRequestIdRef.current
-    if (!documentId || !query) {
-      setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle' })
+    documentVectorExpandKeyRef.current = ''
+
+    if (!docId || !query) {
+      documentSearchFetchedKeyRef.current = ''
+      setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle', engine })
       setCurrentMatchIndex(-1)
       setActiveBoxIndex(-1)
       return
     }
-    const shouldRefreshFocusedIncomingSession = shouldUseSourcePageReader
-      && Boolean(sourceId || locator)
-      && (searchSession?.hits?.length || 0) <= 1
-    if (searchSession?.query === query && !shouldRefreshFocusedIncomingSession) {
-      const incomingKey = `${documentId}:${query}:${searchSession.hits?.length || 0}:${searchSession.hits?.[0]?.id || ''}`
+
+    const fetchKey = `${docId}\0${engine}\0${query}`
+    // Claim immediately so the auto-effect does not start a duplicate request.
+    documentSearchFetchedKeyRef.current = fetchKey
+
+    if (engine === 'vector') {
+      // Keep existing vector hits (e.g. from search-page open) while expanding, so the left
+      // list never flashes keyword-FTS fallback content.
+      setDocumentSearchSession((previous) => {
+        const keepSeed = previous?.engine === 'vector'
+          && previous.query === query
+          && (previous.hits?.length || 0) > 0
+        return {
+          query,
+          hits: keepSeed ? previous.hits : [],
+          activeHitIndex: keepSeed ? Math.max(0, previous.activeHitIndex ?? 0) : -1,
+          status: 'searching',
+          engine: 'vector',
+        }
+      })
+      void window.api.vectorSearch(query, { docId, limit: 40 })
+        .then((response) => {
+          if (searchRequestIdRef.current !== requestId) return
+          documentSearchFetchedKeyRef.current = fetchKey
+          if (!response || !('ok' in response) || !response.ok) {
+            setDocumentSearchSession((previous) => ({
+              query,
+              hits: previous?.engine === 'vector' && previous.query === query ? previous.hits : [],
+              activeHitIndex: previous?.engine === 'vector' && previous.query === query
+                ? Math.max(0, previous.activeHitIndex ?? 0)
+                : -1,
+              status: (previous?.hits?.length || 0) > 0 ? 'ready' : 'error',
+              engine: 'vector',
+            }))
+            if (!response || !('ok' in response) || !response.ok) {
+              message.warning(response && 'message' in response ? String(response.message) : '向量检索失败')
+            }
+            return
+          }
+          const hits = (response.hits || [])
+            .filter((hit: VectorSearchHit) => {
+              const hitDocId = String(hit.documentId || hit.ref?.docId || '').trim()
+              return hitDocId === docId
+            })
+            .map((hit: VectorSearchHit, index: number): SearchHit => {
+              const pageNum = Number(hit.pageNum || hit.ref?.pageNum || 1) || 1
+              const segmentId = String(hit.ref?.segmentId || `${docId}:${pageNum}:${index}`)
+              const excerpt = String(hit.excerpt || '').replace(/\s+/g, ' ').trim()
+              const matchText = excerpt
+                ? (excerpt.length <= 160 ? excerpt : excerpt.slice(0, 160))
+                : query
+              return {
+                id: `${segmentId}:${index}`,
+                locator: {
+                  docId,
+                  segmentId,
+                  pageId: null,
+                  pageNum,
+                  pageIndex: Math.max(0, pageNum - 1),
+                  href: null,
+                  segmentOrdinal: 0,
+                  charStart: 0,
+                  charEnd: matchText.length,
+                  matchText,
+                  queryTerm: query,
+                  occurrenceIndex: index,
+                },
+                snippet: excerpt,
+                score: Number(hit.score) || 0,
+              }
+            })
+          setDocumentSearchSession({
+            query,
+            hits,
+            activeHitIndex: hits.length ? 0 : -1,
+            status: hits.length ? 'ready' : 'empty',
+            engine: 'vector',
+          })
+          setCurrentMatchIndex(hits.length ? 0 : -1)
+        })
+        .catch((error: unknown) => {
+          if (searchRequestIdRef.current !== requestId) return
+          documentSearchFetchedKeyRef.current = fetchKey
+          console.error('Failed to load in-document vector hits', error)
+          setDocumentSearchSession((previous) => ({
+            query,
+            hits: previous?.engine === 'vector' && previous.query === query ? previous.hits : [],
+            activeHitIndex: previous?.engine === 'vector' && previous.query === query
+              ? Math.max(0, previous.activeHitIndex ?? 0)
+              : -1,
+            status: (previous?.hits?.length || 0) > 0 ? 'ready' : 'error',
+            engine: 'vector',
+          }))
+        })
+      return
+    }
+
+    // fulltext
+    setDocumentSearchSession({
+      query,
+      hits: [],
+      activeHitIndex: -1,
+      status: 'searching',
+      engine: 'fulltext',
+    })
+    setCurrentMatchIndex(-1)
+    void window.api.getDocumentSearchHits(docId, query, { limit: 20000, resultMode: 'all' })
+      .then((session: SearchSessionState) => {
+        if (searchRequestIdRef.current !== requestId) return
+        documentSearchFetchedKeyRef.current = fetchKey
+        const searchStartPageIndex = documentMode === 'proof'
+          ? currentPageIndex
+          : readerVisiblePageIndexRef.current ?? currentPageIndex
+        const pageAnchoredIndex = findFirstSearchHitAtOrAfterPage(
+          session.hits.map((hit) => ({ pageIndex: resolveLocatorPageIndex(sortedPagesRef.current, hit.locator) })),
+          searchStartPageIndex,
+        )
+        const nextActiveIndex = pageAnchoredIndex >= 0 ? pageAnchoredIndex : (session.hits.length ? 0 : -1)
+        setDocumentSearchSession({ ...session, engine: 'fulltext', activeHitIndex: nextActiveIndex })
+        setCurrentMatchIndex(nextActiveIndex)
+      })
+      .catch((error: unknown) => {
+        if (searchRequestIdRef.current !== requestId) return
+        documentSearchFetchedKeyRef.current = fetchKey
+        console.error('Failed to load document search hits', error)
+        setDocumentSearchSession({ query, hits: [], activeHitIndex: -1, status: 'error', engine: 'fulltext' })
+        setCurrentMatchIndex(-1)
+      })
+  }, [currentPageIndex, documentId, documentMode])
+
+  // Open / prop keyword: seed multi-hit FTS once, otherwise kick off search if not already claimed.
+  useEffect(() => {
+    const query = effectiveSearchKeyword.trim()
+    const engine = readerSearchEngine === 'vector' ? 'vector' : 'fulltext'
+    if (!documentId || !query) {
+      if (!query) {
+        documentSearchFetchedKeyRef.current = ''
+        setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle', engine })
+        setCurrentMatchIndex(-1)
+      }
+      return
+    }
+    const fetchKey = `${documentId}\0${engine}\0${query}`
+    // Already in-flight or finished for this engine+query (UI commits claim the key first).
+    if (documentSearchFetchedKeyRef.current === fetchKey) return
+    // Prefer incoming multi-hit fulltext session from search page (one-shot).
+    if (
+      engine === 'fulltext'
+      && searchSession?.query === query
+      && searchSession.engine !== 'vector'
+      && (searchSession.hits?.length || 0) > 1
+      && searchSession.status !== 'searching'
+    ) {
+      const incomingKey = `${documentId}:fts:${query}:${searchSession.hits.length}`
       if (incomingSearchSessionKeyRef.current !== incomingKey) {
         incomingSearchSessionKeyRef.current = incomingKey
-        const nextActiveIndex = searchSession.activeHitIndex >= 0 ? searchSession.activeHitIndex : searchSession.hits.length > 0 ? 0 : -1
-        setDocumentSearchSession({ ...searchSession, activeHitIndex: nextActiveIndex })
+        documentSearchFetchedKeyRef.current = fetchKey
+        const nextActiveIndex = searchSession.activeHitIndex >= 0 ? searchSession.activeHitIndex : 0
+        setDocumentSearchSession({ ...searchSession, engine: 'fulltext', activeHitIndex: nextActiveIndex })
         setCurrentMatchIndex(nextActiveIndex)
       }
       return
     }
-    const shouldRefreshCurrentFocusedSession = shouldUseSourcePageReader
-      && Boolean(sourceId || locator)
-      && documentSearchSession?.query === query
-      && (documentSearchSession.hits?.length || 0) <= 1
-    if (documentSearchSession?.query === query && documentSearchSession.status !== 'searching' && !shouldRefreshCurrentFocusedSession) return
-    if (shouldPreferLocalSearchMatches && locator && !shouldUseSourcePageReader) {
-      setDocumentSearchSession({
-        query,
-        hits: [],
-        activeHitIndex: -1,
-        status: 'ready',
-      })
-      return
-    }
-
-    setDocumentSearchSession((previous) => ({
-      query,
-      hits: previous?.query === query ? previous.hits : [],
-      activeHitIndex: previous?.query === query ? previous.activeHitIndex : -1,
-      status: 'searching',
-    }))
-
-    const timer = window.setTimeout(() => {
-      window.api.getDocumentSearchHits(documentId, query, { limit: 20000, resultMode: 'all' })
-        .then((session: SearchSessionState) => {
-          if (searchRequestIdRef.current !== requestId) return
-          const targetIndex = locator
-            ? session.hits.findIndex((hit) => (
-              hit.locator.segmentId === locator.segmentId
-              && Math.abs(hit.locator.charStart - locator.charStart) <= 2
-            ))
-            : -1
-          const searchStartPageIndex = documentMode === 'proof'
-            ? currentPageIndex
-            : readerVisiblePageIndexRef.current ?? currentPageIndex
-          const pageAnchoredIndex = findFirstSearchHitAtOrAfterPage(
-            session.hits.map((hit) => ({ pageIndex: resolveLocatorPageIndex(sortedPagesRef.current, hit.locator) })),
-            searchStartPageIndex,
-          )
-          const nextActiveIndex = targetIndex >= 0 ? targetIndex : pageAnchoredIndex
-          setDocumentSearchSession({ ...session, activeHitIndex: nextActiveIndex })
-          setCurrentMatchIndex(nextActiveIndex)
-        })
-        .catch((error: unknown) => {
-          if (searchRequestIdRef.current !== requestId) return
-          console.error('Failed to load document search hits', error)
-          setDocumentSearchSession({ query, hits: [], activeHitIndex: -1, status: 'error' })
-          setCurrentMatchIndex(-1)
-        })
-    }, 220)
-
-    return () => {
-      window.clearTimeout(timer)
-    }
-  }, [currentPageIndex, documentId, documentMode, documentSearchSession?.query, documentSearchSession?.status, effectiveSearchKeyword, locator, searchSession, shouldPreferLocalSearchMatches, shouldUseSourcePageReader, sourceId])
+    runInDocumentSearch(query, engine)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [documentId, effectiveSearchKeyword, readerSearchEngine, runInDocumentSearch, searchSession])
 
   useEffect(() => {
     if (effectiveSearchKeyword.trim()) {
@@ -3674,12 +3867,20 @@ export default function DocumentView({
 
   const commitSearchInputDraft = () => {
     const nextKeyword = searchInputDraft.trim()
-    if (nextKeyword === effectiveSearchKeyword.trim()) return
+    // Same keyword still re-runs when engine differs or user hits Enter after 向量→文本.
     setLocalSearchKeyword(nextKeyword)
     setCurrentMatchIndex(-1)
     setActiveBoxIndex(-1)
-    setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle' })
+    runInDocumentSearch(nextKeyword, readerSearchEngine)
   }
+
+  const proofSearchHighlightKeyword = useMemo(() => {
+    if (!isVectorReaderSearch) return effectiveSearchKeyword
+    const hit = documentSearchSession?.hits?.[Math.max(0, documentSearchSession.activeHitIndex ?? 0)]
+    const matchText = String(hit?.locator?.matchText || hit?.snippet || '').replace(/\s+/g, ' ').trim()
+    if (matchText.length >= 3) return matchText.slice(0, 3)
+    return effectiveSearchKeyword
+  }, [documentSearchSession?.activeHitIndex, documentSearchSession?.hits, effectiveSearchKeyword, isVectorReaderSearch])
 
   const handleStartOcr = async () => {
     if (!doc?.pages?.length) return
@@ -3932,7 +4133,13 @@ export default function DocumentView({
         ))
         const pageReady = await cacheRestoredPdfCurrentPage(result.path, refreshedPage || targetPage)
         window.dispatchEvent(new Event(LIBRARY_RELATIONS_CHANGED_EVENT))
-        message.success(pageReady ? 'PDF 原图已补回，当前页预览已恢复' : 'PDF 原图已补回；当前页预览生成失败，可手动重新选择 PDF 或重新打开文献')
+        const linked = result.storageMode === 'link'
+        const base = linked
+          ? 'PDF 已链接补回（未复制到软件目录）'
+          : 'PDF 原图已补回'
+        message.success(pageReady
+          ? `${base}，当前页预览已恢复`
+          : `${base}；当前页预览生成失败，可手动重新选择 PDF 或重新打开文献`)
         return true
       }
       message.warning(result?.error || '未能补回 PDF 原图')
@@ -4338,13 +4545,21 @@ export default function DocumentView({
     }
   }
 
-  const handleExport: MenuProps['onClick'] = async (event) => {
-    const format = event.key as DocumentExportFormat
+  const handleExport: MenuProps['onClick'] = (event) => {
     if (exportingDocument || !doc?.id) return
+    setPendingExportFormat(event.key as DocumentExportFormat)
+    setExportPageNumberMode('literature')
+    setExportModalOpen(true)
+  }
+
+  const confirmDocumentExport = async () => {
+    const format = pendingExportFormat
+    if (!format || exportingDocument || !doc?.id) return
     setExportingDocument(true)
+    setExportModalOpen(false)
     message.loading({ content: '正在导出中，请稍候…', key: 'document-export', duration: 0 })
     try {
-      const exportOptions: DocumentExportOptions | undefined = format === 'reading-pdf'
+      const baseOptions: DocumentExportOptions = format === 'reading-pdf'
         ? {
             readingFontFamily: readerFontFamily,
             readingFontSize: readerFontSize,
@@ -4352,9 +4567,13 @@ export default function DocumentView({
             readingPageWidth: readerPageWidth,
             readingTheme: readerTheme,
             readingDisplayScript: readerDisplayScript,
+            pageNumberMode: exportPageNumberMode,
           }
-        : getFacsimileExportOptions(format)
-      const success = await window.api.exportDocument(doc.id, format, exportOptions)
+        : {
+            ...(getFacsimileExportOptions(format) || {}),
+            pageNumberMode: exportPageNumberMode,
+          }
+      const success = await window.api.exportDocument(doc.id, format, baseOptions)
       if (success) {
         const names: Record<string, string> = {
           markdown: 'Markdown',
@@ -4375,6 +4594,7 @@ export default function DocumentView({
       message.error({ content: (error as Error)?.message || '导出失败', key: 'document-export', duration: 6 })
     } finally {
       setExportingDocument(false)
+      setPendingExportFormat(null)
     }
   }
 
@@ -4952,6 +5172,9 @@ export default function DocumentView({
 
   const getReaderSearchResultSnippet = (match: SearchMatch): string => {
     const sessionHit = Number.isFinite(Number(match.hitIndex)) ? documentSearchSession?.hits?.[Number(match.hitIndex)] : null
+    if (isVectorReaderSearch) {
+      return String(sessionHit?.snippet || match.locator?.matchText || '').replace(/\s+/g, ' ').trim()
+    }
     if (sessionHit?.snippet) return sessionHit.snippet
     if (shouldUseTextReaderMode) {
       const page = readerVirtualPages[match.pageIndex]
@@ -5049,7 +5272,11 @@ export default function DocumentView({
                   <span style={{ color: active ? '#ffd8a8' : 'var(--gs-text-primary)', fontWeight: 600 }}>#{matchIndex + 1}</span>
                   <span style={{ opacity: 0.72 }}>第 {getReaderSearchResultPageNum(match)} 页</span>
                 </div>
-                <span>{renderMarkedSnippet(snippet, match.keyword || effectiveSearchKeyword, readerDisplayScript)}</span>
+                <span>
+                  {isVectorReaderSearch
+                    ? snippet
+                    : renderMarkedSnippet(snippet, match.keyword || effectiveSearchKeyword, readerDisplayScript)}
+                </span>
               </button>
             )
           })}
@@ -5102,7 +5329,12 @@ export default function DocumentView({
           onChange={(value) => setReaderSidebarTab(value as ReaderSidebarTab)}
           options={[
             { value: 'toc', label: '目录' },
-            { value: 'search', label: `检索结果${readerSearchMatches.length ? ` ${readerSearchMatches.length}` : ''}` },
+            {
+              value: 'search',
+              label: isVectorReaderSearch
+                ? `向量命中${readerSearchMatches.length ? ` ${readerSearchMatches.length}` : ''}`
+                : `检索结果${readerSearchMatches.length ? ` ${readerSearchMatches.length}` : ''}`,
+            },
           ]}
         />
       </div>
@@ -5264,8 +5496,8 @@ export default function DocumentView({
         {readerPages.map((page, index) => {
           const pageIndex = readerPageIndex + index
           const pageHitStartIndex = readerSearchMatches.filter((match) => match.pageIndex < pageIndex).length
-          const imageLabel = `影像 第 ${page.sourcePageNum} / ${pageCount} 页`
-          const literatureLabel = `文献 第 ${page.literaturePageNum || page.sourcePageNum} 页`
+          const imageLabel = `自然页码 第 ${page.sourcePageNum} / ${pageCount} 页`
+          const literatureLabel = `文献页码 第 ${page.literaturePageNum || page.sourcePageNum} 页`
           return (
             <div
               key={page.id}
@@ -5289,7 +5521,7 @@ export default function DocumentView({
               }}
             >
               <div
-                title="PDF/扫描影像页序"
+                title="自然页码：PDF/扫描物理页序，用于翻页定位"
                 style={{
                   color: readerThemeStyle.muted,
                   fontSize: 12,
@@ -5304,7 +5536,7 @@ export default function DocumentView({
               {renderBookText(page.text, effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex)}
               <div
                 aria-label={literatureLabel}
-                title="书上印刷页码，与引用、TXT 导出一致"
+                title="文献页码：书上印刷/校准页码，与引用、TXT 导出默认一致"
                 style={{
                   position: 'sticky',
                   bottom: 0,
@@ -5363,8 +5595,8 @@ export default function DocumentView({
             .map((item, index) => {
               const physical = Number(item.page.page_num || 0)
               const literature = getCitationPageNumber(item.page, physical) || physical
-              const imageLabel = physical > 0 ? `影像 第 ${physical} / ${pageCount} 页` : ''
-              const literatureLabel = literature > 0 ? `文献 第 ${literature} 页` : ''
+              const imageLabel = physical > 0 ? `自然页码 第 ${physical} / ${pageCount} 页` : ''
+              const literatureLabel = literature > 0 ? `文献页码 第 ${literature} 页` : ''
               return (
             <button
               key={item.page.id}
@@ -5393,7 +5625,7 @@ export default function DocumentView({
               )}
               {imageLabel ? (
                 <span
-                  title="PDF/扫描影像页序"
+                  title="自然页码：PDF/扫描物理页序"
                   style={{
                     position: 'absolute',
                     right: 14,
@@ -5411,7 +5643,7 @@ export default function DocumentView({
               ) : null}
               {literatureLabel ? (
                 <span
-                  title="书上印刷页码，与引用、TXT 导出一致"
+                  title="文献页码：书上印刷/校准页码"
                   style={{
                     position: 'absolute',
                     left: 14,
@@ -5485,6 +5717,22 @@ export default function DocumentView({
               <Tag color={doc.ocr_status === 'completed' ? 'success' : doc.ocr_status === 'processing' ? 'processing' : 'default'}>
                 {`OCR: ${doc.ocr_status === 'completed' ? '已完成' : doc.ocr_status === 'processing' ? '处理中' : '待处理'}`}
               </Tag>
+              {ocrFailedPageEntries.length > 0 ? (
+                <Tooltip title="点击打开鸟瞰页，可筛选并跳转全部 OCR 失败页">
+                  <Tag
+                    color="error"
+                    style={{ cursor: 'pointer', maxWidth: 420, overflow: 'hidden', textOverflow: 'ellipsis' }}
+                    onClick={jumpToOcrFailedBirdseye}
+                  >
+                    {ocrFailedPageLabel
+                      ? `OCR完成，第 ${ocrFailedPageLabel} 页 OCR 未成功`
+                      : `OCR完成，${ocrFailedPageEntries.length} 页 OCR 未成功`}
+                  </Tag>
+                </Tooltip>
+              ) : null}
+              {String(currentPage?.ocr_status || '') === 'error' ? (
+                <Tag color="error">当前页 OCR 未成功</Tag>
+              ) : null}
               <Tag color={currentPageProofStatus === 'completed' ? 'gold' : 'default'}>
                 {`校对：${currentPageProofStatus === 'completed' ? '已完成' : '待处理'}`}
               </Tag>
@@ -5674,6 +5922,7 @@ export default function DocumentView({
             searchPages={readerSearchPages}
             currentPageIndex={currentPageIndex}
             searchKeyword={localSearchKeyword}
+            searchEngine={readerSearchEngine}
             highlightColor={highlightColor}
             sourceLabel={sourceLabel}
             searchSession={readerDocumentSearchSession}
@@ -5698,10 +5947,28 @@ export default function DocumentView({
                 void loadPagesAround(nextIndex, 5)
               }
             }}
-            onSearchKeywordChange={(keyword) => {
+            onSearchEngineChange={(engine) => {
+              setReaderSearchEngine(engine)
+              const keyword = localSearchKeyword.trim()
+              if (!keyword) {
+                documentSearchFetchedKeyRef.current = ''
+                setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle', engine })
+                setCurrentMatchIndex(-1)
+                return
+              }
+              // Direct re-search under the new engine (vector ↔ 文本).
+              runInDocumentSearch(keyword, engine)
+            }}
+            onSearchKeywordChange={(keyword, meta) => {
+              const engine = meta?.engine === 'vector' || meta?.engine === 'fulltext'
+                ? meta.engine
+                : readerSearchEngine
+              if (meta?.engine === 'vector' || meta?.engine === 'fulltext') {
+                setReaderSearchEngine(meta.engine)
+              }
               setLocalSearchKeyword(keyword)
-              setCurrentMatchIndex(-1)
-              setDocumentSearchSession({ query: '', hits: [], activeHitIndex: -1, status: 'idle' })
+              // Imperative: same keyword Enter / engine switch always hits the API.
+              runInDocumentSearch(keyword, engine)
             }}
             onSelectedTextChange={setSelectedTextForAi}
             onContextTextChange={(text) => setReaderContextTextForAi(text.slice(0, 2200))}
@@ -5837,30 +6104,74 @@ export default function DocumentView({
             }}
           >
             <Space size={6} wrap>
-              <Input
-                data-reader-search-input="true"
-                size="small"
-                placeholder="搜索正文"
-                prefix={<SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />}
-                value={searchInputDraft}
-                onChange={(event) => {
-                  const nextValue = event.target.value
-                  setSearchInputDraft(nextValue)
-                  if (!nextValue) setLocalSearchKeyword('')
-                }}
-                onFocus={() => setSearchFocused(true)}
-                onBlur={() => setSearchFocused(false)}
-                onPressEnter={commitSearchInputDraft}
-                allowClear
-                style={{
-                  width: 220,
-                  background: searchFocused && effectiveSearchKeyword ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
-                  borderColor: searchFocused && effectiveSearchKeyword ? '#ffc069' : 'rgba(255,255,255,0.12)',
-                }}
-              />
+              <Space.Compact size="small">
+                <Select
+                  size="small"
+                  value={readerSearchEngine}
+                  onChange={(engine) => {
+                    setReaderSearchEngine(engine)
+                    const keyword = searchInputDraft.trim() || effectiveSearchKeyword.trim()
+                    if (keyword) {
+                      setLocalSearchKeyword(keyword)
+                      runInDocumentSearch(keyword, engine)
+                    }
+                  }}
+                  style={{ width: 92 }}
+                  options={[
+                    {
+                      value: 'fulltext',
+                      label: (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <FontSizeOutlined />
+                          文本
+                        </span>
+                      ),
+                    },
+                    {
+                      value: 'vector',
+                      label: (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <ThunderboltOutlined />
+                          向量
+                        </span>
+                      ),
+                    },
+                  ]}
+                />
+                <Input
+                  data-reader-search-input="true"
+                  size="small"
+                  placeholder={readerSearchEngine === 'vector' ? '语义检索' : '搜索正文'}
+                  prefix={
+                    readerSearchEngine === 'vector'
+                      ? <ThunderboltOutlined style={{ color: 'var(--gs-gold)' }} />
+                      : <SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />
+                  }
+                  value={searchInputDraft}
+                  onChange={(event) => {
+                    const nextValue = event.target.value
+                    setSearchInputDraft(nextValue)
+                    if (!nextValue) {
+                      setLocalSearchKeyword('')
+                      runInDocumentSearch('', readerSearchEngine)
+                    }
+                  }}
+                  onFocus={() => setSearchFocused(true)}
+                  onBlur={() => setSearchFocused(false)}
+                  onPressEnter={commitSearchInputDraft}
+                  allowClear
+                  style={{
+                    width: 180,
+                    background: searchFocused && effectiveSearchKeyword ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
+                    borderColor: searchFocused && effectiveSearchKeyword ? '#ffc069' : 'rgba(255,255,255,0.12)',
+                  }}
+                />
+              </Space.Compact>
               <Button size="small" icon={<LeftOutlined />} onClick={handleSearchPrev} disabled={readerSearchMatches.length === 0} />
               <span data-reader-search-counter="true" style={{ fontSize: 12, color: 'var(--gs-text-secondary)', minWidth: 56, textAlign: 'center' }}>
-                {effectiveSearchKeyword ? `${readerSearchMatches.length ? Math.max(1, currentMatchIndex + 1) : 0}/${readerSearchMatches.length}` : '0/0'}
+                {effectiveSearchKeyword
+                  ? `${isVectorReaderSearch ? '向量 ' : ''}${readerSearchMatches.length ? Math.max(1, currentMatchIndex + 1) : 0}/${readerSearchMatches.length}`
+                  : '0/0'}
               </span>
               <Button size="small" icon={<RightOutlined />} data-reader-search-next="true" onClick={handleSearchNext} disabled={readerSearchMatches.length === 0} />
             </Space>
@@ -6171,37 +6482,82 @@ export default function DocumentView({
                   {getOcrEngineLabel(String(currentOcrEngineForUi))}
                 </Tag>
               )}
-              <Input
-                data-reader-search-input="true"
-                size="small"
-                placeholder="搜索本页文本"
-                prefix={<SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />}
-                value={searchInputDraft}
-                onChange={(event) => {
-                  const nextValue = event.target.value
-                  setSearchInputDraft(nextValue)
-                  if (!nextValue) setLocalSearchKeyword('')
-                }}
-                onPressEnter={commitSearchInputDraft}
-                onFocus={() => setSearchFocused(true)}
-                onBlur={() => setSearchFocused(false)}
-                allowClear
-                style={{
-                  width: 180,
-                  background: searchFocused && effectiveSearchKeyword ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
-                  borderColor: searchFocused && effectiveSearchKeyword ? '#ffc069' : 'rgba(255,255,255,0.12)',
-                }}
-              />
+              <Space.Compact size="small">
+                <Select
+                  size="small"
+                  value={readerSearchEngine}
+                  onChange={(engine) => {
+                    setReaderSearchEngine(engine)
+                    const keyword = searchInputDraft.trim() || effectiveSearchKeyword.trim()
+                    if (keyword) {
+                      setLocalSearchKeyword(keyword)
+                      runInDocumentSearch(keyword, engine)
+                    }
+                  }}
+                  style={{ width: 92 }}
+                  options={[
+                    {
+                      value: 'fulltext',
+                      label: (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <FontSizeOutlined />
+                          文本
+                        </span>
+                      ),
+                    },
+                    {
+                      value: 'vector',
+                      label: (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                          <ThunderboltOutlined />
+                          向量
+                        </span>
+                      ),
+                    },
+                  ]}
+                />
+                <Input
+                  data-reader-search-input="true"
+                  size="small"
+                  placeholder={readerSearchEngine === 'vector' ? '语义检索' : '搜索本页文本'}
+                  prefix={
+                    readerSearchEngine === 'vector'
+                      ? <ThunderboltOutlined style={{ color: 'var(--gs-gold)' }} />
+                      : <SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />
+                  }
+                  value={searchInputDraft}
+                  onChange={(event) => {
+                    const nextValue = event.target.value
+                    setSearchInputDraft(nextValue)
+                    if (!nextValue) {
+                      setLocalSearchKeyword('')
+                      runInDocumentSearch('', readerSearchEngine)
+                    }
+                  }}
+                  onPressEnter={commitSearchInputDraft}
+                  onFocus={() => setSearchFocused(true)}
+                  onBlur={() => setSearchFocused(false)}
+                  allowClear
+                  style={{
+                    width: 160,
+                    background: searchFocused && effectiveSearchKeyword ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
+                    borderColor: searchFocused && effectiveSearchKeyword ? '#ffc069' : 'rgba(255,255,255,0.12)',
+                  }}
+                />
+              </Space.Compact>
               {effectiveSearchKeyword && searchMatches.length > 0 ? (
                 <>
                   <Button size="small" icon={<LeftOutlined />} onClick={handleSearchPrev} type="text" style={{ color: 'var(--gs-text-secondary)' }} />
-                  <span data-reader-search-counter="true" style={{ fontSize: 12, color: 'var(--gs-text-secondary)', minWidth: 44, textAlign: 'center' }}>
-                    {currentMatchIndex >= 0 ? currentMatchIndex + 1 : 1}/{searchMatches.length}
+                  <span data-reader-search-counter="true" style={{ fontSize: 12, color: 'var(--gs-text-secondary)', minWidth: 56, textAlign: 'center' }}>
+                    {isVectorReaderSearch ? '向量 ' : ''}{currentMatchIndex >= 0 ? currentMatchIndex + 1 : 1}/{searchMatches.length}
                   </span>
                   <Button size="small" icon={<RightOutlined />} data-reader-search-next="true" onClick={handleSearchNext} type="text" style={{ color: 'var(--gs-text-secondary)' }} />
                 </>
               ) : null}
-              {effectiveSearchKeyword && searchMatches.length === 0 ? (
+              {effectiveSearchKeyword && documentSearchSession?.status === 'searching' && searchMatches.length === 0 ? (
+                <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>检索中</span>
+              ) : null}
+              {effectiveSearchKeyword && documentSearchSession?.status !== 'searching' && searchMatches.length === 0 ? (
                 <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>无命中</span>
               ) : null}
             </Space>
@@ -6220,7 +6576,7 @@ export default function DocumentView({
                 pageProofStatus={currentPageProofStatus}
                 activeBoxIndex={activeBoxIndex}
                 activeSearchHitOrdinal={activeProofSearchHitOrdinal}
-                searchKeyword={effectiveSearchKeyword}
+                searchKeyword={proofSearchHighlightKeyword}
                 coordinateSourceSize={facsimileCoordinateSourceSize}
                 preferVerticalLayout={shouldUseVerticalOcr}
                 translationText={currentFacsimileTranslationText}
@@ -6274,7 +6630,7 @@ export default function DocumentView({
                 onLineFocus={handleTextEditorLineFocus}
                 switchToRegion={switchToRegion}
                 onSwitchToRegionConsumed={() => setSwitchToRegion(false)}
-                searchKeyword={effectiveSearchKeyword}
+                searchKeyword={proofSearchHighlightKeyword}
               />
             ) : (
               <Empty image={<FileImageOutlined style={{ fontSize: 48, opacity: 0.2 }} />} description="暂无可校对文本" />
@@ -6366,6 +6722,52 @@ export default function DocumentView({
           />
         </Suspense>
       ) : null}
+      <Modal
+        title="导出文献"
+        open={exportModalOpen}
+        onCancel={() => {
+          setExportModalOpen(false)
+          setPendingExportFormat(null)
+        }}
+        onOk={() => void confirmDocumentExport()}
+        okText="导出"
+        cancelText="取消"
+        confirmLoading={exportingDocument}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Text type="secondary">
+            格式：{{
+              markdown: 'Markdown',
+              'tei-xml': 'TEI-XML',
+              'page-xml': 'PAGE XML',
+              'paddle-json': 'Paddle JSON',
+              txt: 'TXT',
+              'reading-pdf': '阅读模式 PDF',
+              'layout-pdf': '排版模式 PDF',
+              'layout-searchable-pdf': '原图可搜索 PDF',
+            }[pendingExportFormat || 'txt'] || pendingExportFormat}
+          </Text>
+          <div>
+            <Text strong style={{ display: 'block', marginBottom: 6 }}>页码类型</Text>
+            <Radio.Group
+              value={exportPageNumberMode}
+              onChange={(event) => setExportPageNumberMode(event.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+              options={[
+                { value: 'literature', label: '文献页码' },
+                { value: 'natural', label: '自然页码' },
+              ]}
+            />
+            <Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+              {exportPageNumberMode === 'natural'
+                ? '自然页码：PDF/扫描影像的物理页序（第 1…N 页）。'
+                : '文献页码：书上印刷/校准后的连续页码（默认，与阅读模式「文献页码」一致）。'}
+            </Text>
+          </div>
+        </Space>
+      </Modal>
       <Modal
         title="加入翻译术语表"
         open={quickGlossaryModalOpen}

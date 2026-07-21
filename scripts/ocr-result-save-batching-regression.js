@@ -82,7 +82,7 @@ const retryIncompletePagesWithSinglePageOcrBody = sliceBetween(
 const singlePageRetryCatchBody = sliceBetween(
   retryIncompletePagesWithSinglePageOcrBody,
   '    } catch (error) {',
-  '    }\n  }\n  }',
+  '    }\n  }\n  return [...resultsByPageId.values()]',
   'single-page incomplete OCR retry catch body',
 )
 const resetPagesForFullOcrRerunBody = sliceBetween(
@@ -251,7 +251,7 @@ assert(
     && ocrIpcSource.includes('hasOldBookRouteHints(doc)')
     && processDocumentOcrBody.includes('await retryIncompletePagesWithSinglePageOcr(')
     && processDocumentOcrBody.includes('await savePageOcrResultsBatchedDeferred(retryResults')
-    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('const hasPendingPageFailure = persistedPageSummary.pending > 0'),
+    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('settleIncompleteOcrPagesAsReviewFailures(docId)'),
   'Document OCR should automatically retry failed or incomplete PDF pages with original-PDF pageRanges, then continue to single-page image OCR for pages that still failed.',
 )
 assert(
@@ -260,16 +260,21 @@ assert(
     && ocrIpcSource.includes('function isOcrPageSummarySettled')
     && ocrIpcSource.includes('function hasOcrReviewPages')
     && ocrIpcSource.includes('function getDocumentOcrReviewMessage')
+    && ocrIpcSource.includes('function formatOcrFailedPageNumberList')
+    && ocrIpcSource.includes('function listDocumentOcrFailedPageNums')
+    && ocrIpcSource.includes('OCR完成，第 ${pageList} 页 OCR 未成功')
+    && ocrIpcSource.includes('function settleIncompleteOcrPagesAsReviewFailures')
     && ocrIpcSource.includes('return isOcrPageSummaryComplete(stats)')
     && ocrIpcSource.includes('const settledWithReviewPages = hasOcrReviewPages(stats)')
     && ocrIpcSource.includes('const nextStatus = completed || settledWithReviewPages')
     && ocrIpcSource.includes('const reviewMessage = settledWithReviewPages ? (errorMessage || getDocumentOcrReviewMessage(docId)) : null')
-    && processDocumentOcrBody.includes('const hasPendingPageFailure = persistedPageSummary.pending > 0')
-    && processDocumentOcrBody.includes('const hasFinalPendingPageFailure = persistedPageSummary.pending > 0')
-    && processDocumentOcrBody.includes('const hasFinalReviewPageFailure = !hasFinalPendingPageFailure && persistedPageSummary.failed > 0')
-    && processDocumentOcrBody.includes('updateDocumentStatusFromPages(docId, hasFinalReviewPageFailure ? getDocumentOcrReviewMessage(docId) : null)')
+    && processDocumentOcrBody.includes('settleIncompleteOcrPagesAsReviewFailures(docId)')
+    && processDocumentOcrBody.includes('const hasFinalReviewPageFailure = hasOcrReviewPages(persistedPageSummary) || persistedPageSummary.failed > 0')
+    && processDocumentOcrBody.includes('updateDocumentStatusFromPages(docId, reviewMessage)')
+    && !processDocumentOcrBody.includes('const hasPendingPageFailure = persistedPageSummary.pending > 0')
+    && !processDocumentOcrBody.includes('const hasFinalPendingPageFailure = persistedPageSummary.pending > 0')
     && !processDocumentOcrBody.includes('const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0'),
-  'Document OCR should treat pending pages as blocking failures while saving settled failed pages as completed review warnings.',
+  'Document OCR should settle incomplete pages as short review warnings listing failed page nums and complete/入库 without whole-book failure.',
 )
 assert(
   ocrIpcSource.includes('function getPreferredGujiServiceText')
@@ -508,10 +513,11 @@ assert(
     && processDocumentOcrBody.includes('if (isAsyncPdfRecoverableStallError(error))')
     && processDocumentOcrBody.includes('异步 PDF OCR 进度停住，正在自动补跑未完成页')
     && processDocumentOcrBody.includes('pageResults = await retryIncompletePagesWithSinglePageOcr(')
-    && processDocumentOcrBody.includes('正在自动补跑未完成页')
+    && (processDocumentOcrBody.includes('正在自动补跑未完成页') || processDocumentOcrBody.includes('开始自动补跑'))
+    && processDocumentOcrBody.includes('skipOriginalPdfRetry: pageResultsPersistedInChunks')
     && ocrIpcSource.includes('const OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE = 10')
     && ocrIpcSource.includes('pageRangeChunkSize: pageRangeChunkSize || OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE'),
-  'Document OCR should recover from async PDF jobs stuck at a partial page count by auto-rerunning incomplete pages with original-PDF pageRanges, not full-document retries.',
+  'Document OCR should recover stalled async PDF by retrying incomplete pages; skip second full-PDF async when bulk already streamed results.',
 )
 assert(
   ocrIpcSource.includes('function getLikelyGujiPdfTableMisclassification')

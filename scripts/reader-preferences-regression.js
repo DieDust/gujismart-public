@@ -74,8 +74,18 @@ assertIncludes(
 )
 assertIncludes(
   documentView,
-  "if (canRestoreDocumentMode && state.document_mode === 'read') setDocumentMode('read')",
+  "state.document_mode === 'read'",
   '已有用户阅读模式选择仍应优先于新的默认模式。',
+)
+assertIncludes(
+  documentView,
+  "tryRestoreDocumentMode('read')",
+  '恢复阅读状态时应调用 tryRestoreDocumentMode(read)。',
+)
+assertIncludes(
+  documentView,
+  'if (documentModeTouchedRef.current) return false',
+  '用户手动切换阅读/校对后，不应再被异步恢复覆盖。',
 )
 assertIncludes(
   documentView,

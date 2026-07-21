@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type MouseEvent, type UIEvent, type WheelEvent } from 'react'
-import { Button, Dropdown, Empty, Input, Layout, Modal, Segmented, Select, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
+import { Button, Dropdown, Empty, Input, Layout, Modal, Radio, Segmented, Select, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   BookOutlined,
@@ -26,7 +26,7 @@ import {
   ZoomInOutlined,
   ZoomOutOutlined,
 } from '@ant-design/icons'
-import type { DocumentExportFormat, FolderContentOptions, FolderContentResult, FolderOverviewDocument, FolderOverviewItem, FolderOverviewResult, ImportDocumentResult, LibraryDocumentSortDirection, LibraryDocumentSortKey, OcrEngine } from '@shared/types'
+import type { DocumentExportFormat, DocumentExportOptions, ExportPageNumberMode, FolderContentOptions, FolderContentResult, FolderOverviewDocument, FolderOverviewItem, FolderOverviewResult, ImportDocumentResult, LibraryDocumentSortDirection, LibraryDocumentSortKey, OcrEngine } from '@shared/types'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
 import { buildFolderTree, flattenVisibleFolders, isFolderDescendant, sortFolders, type FolderTreeNode } from '../utils/folders'
@@ -198,11 +198,6 @@ function getFolderOcrConfigWarning(engine: OcrEngine): string {
   return '请先在设置页配置 PaddleOCR API Token。'
 }
 
-function getFolderOcrBatchProgressMessage(engineLabel: string, batchIndex: number, totalBatches: number, batchSize: number, documentConcurrency: number): string {
-  const concurrencyText = documentConcurrency > 1 ? `，并行 ${documentConcurrency} 篇` : ''
-  return `正在用${engineLabel}处理第 ${batchIndex}/${totalBatches} 批（每批 ${batchSize} 篇${concurrencyText}）…`
-}
-
 async function getConfiguredFolderBatchSize(): Promise<number> {
   try {
     const rawValue = await window.api.getSetting('batch_size')
@@ -327,6 +322,11 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
   const [tagModalOpen, setTagModalOpen] = useState(false)
   const [tagModalDocIds, setTagModalDocIds] = useState<string[]>([])
   const [tagInput, setTagInput] = useState('')
+  const [exportModalOpen, setExportModalOpen] = useState(false)
+  const [exportModalDocIds, setExportModalDocIds] = useState<string[]>([])
+  const [pendingExportFormat, setPendingExportFormat] = useState<DocumentExportFormat | null>(null)
+  const [exportPageNumberMode, setExportPageNumberMode] = useState<ExportPageNumberMode>('literature')
+  const [exportingFolderDocs, setExportingFolderDocs] = useState(false)
   const [importing, setImporting] = useState(false)
   const [importProgressText, setImportProgressText] = useState('')
 
@@ -753,60 +753,56 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     const uniqueDocIds = Array.from(new Set(docIds.filter(Boolean)))
     if (uniqueDocIds.length === 0) return 0
 
-    const ocrBatchSize = await getConfiguredFolderBatchSize()
-    const documentConcurrency = ocrBatchSize
-    const batches = chunkArray(uniqueDocIds, ocrBatchSize)
+    // Setting value = max concurrent docs; whole selection is enqueued once.
+    const documentConcurrency = await getConfiguredFolderBatchSize()
     let successCount = 0
     let shouldRefreshAfterBatches = false
     const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'
 
-    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-      const batch = batches[batchIndex]
-      let ocrBatch = batch
-      if (requiresPageImagesBeforeOcr) {
-        ocrBatch = []
-        for (let docIndex = 0; docIndex < batch.length; docIndex += 1) {
-          const docId = batch[docIndex]
-          try {
-            const result = await ensureOcrPageImages(docId, {
-              fileIndex: batchIndex * ocrBatchSize + docIndex,
-              totalFiles: uniqueDocIds.length,
-              engine,
-              messageKey,
-              getEngineLabel: getFolderOcrEngineLabel,
-              onProgress: (content, key) => {
-                setImportProgressText(content)
-                if (key) message.loading({ content, key, duration: 0 })
-              },
-            })
-            if (result.ready) ocrBatch.push(docId)
-          } catch (error) {
-            const reason = getErrorMessage(error, '未知错误')
-            console.warn('[FoldersView] OCR 前补齐 PDF 页图失败', docId, error)
-            await window.api.updateDocument(docId, {
-              ocr_status: 'error',
-              import_status: 'error',
-              error_message: `OCR 页图补齐失败：${reason}。请确认该文献所属数据库包含 PDF/页图资源，或把原 PDF 加入“PDF 原件仓库”后重试。`,
-            })
-            shouldRefreshAfterBatches = true
-          }
-          await delay(0)
+    let ocrBatch = uniqueDocIds
+    if (requiresPageImagesBeforeOcr) {
+      ocrBatch = []
+      for (let docIndex = 0; docIndex < uniqueDocIds.length; docIndex += 1) {
+        const docId = uniqueDocIds[docIndex]
+        try {
+          const result = await ensureOcrPageImages(docId, {
+            fileIndex: docIndex,
+            totalFiles: uniqueDocIds.length,
+            engine,
+            messageKey,
+            getEngineLabel: getFolderOcrEngineLabel,
+            onProgress: (content, key) => {
+              setImportProgressText(content)
+              if (key) message.loading({ content, key, duration: 0 })
+            },
+          })
+          if (result.ready) ocrBatch.push(docId)
+        } catch (error) {
+          const reason = getErrorMessage(error, '未知错误')
+          console.warn('[FoldersView] OCR 前补齐 PDF 页图失败', docId, error)
+          await window.api.updateDocument(docId, {
+            ocr_status: 'error',
+            import_status: 'error',
+            error_message: `OCR 页图补齐失败：${reason}。请确认该文献所属数据库包含 PDF/页图资源，或把原 PDF 加入“PDF 原件仓库”后重试。`,
+          })
+          shouldRefreshAfterBatches = true
         }
+        await delay(0)
       }
-      if (ocrBatch.length === 0) continue
+    }
 
+    if (ocrBatch.length > 0) {
       message.loading({
-        content: getFolderOcrBatchProgressMessage(getFolderOcrEngineLabel(engine), batchIndex + 1, batches.length, ocrBatchSize, documentConcurrency),
+        content: `正在用${getFolderOcrEngineLabel(engine)}识别 ${ocrBatch.length} 篇文献…`,
         key: messageKey,
         duration: 0,
       })
-      successCount += await window.api.batchOcr(ocrBatch, {
+      successCount = await window.api.batchOcr(ocrBatch, {
         engine,
         forceFullRerun: options?.forceFullRerun,
         concurrency: documentConcurrency,
       })
       shouldRefreshAfterBatches = true
-      await delay(0)
     }
 
     if (shouldRefreshAfterBatches) {
@@ -909,15 +905,31 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     }
   }, [loadFolderContent, loadOverview, selectedFolderId, tagInput, tagModalDocIds])
 
-  const handleFolderBatchExport = useCallback(async (docIds: string[], format: DocumentExportFormat) => {
+  const openFolderBatchExportModal = useCallback((docIds: string[], format: DocumentExportFormat) => {
     const uniqueDocIds = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
     if (uniqueDocIds.length === 0) {
       message.info('请先选择文献')
       return
     }
+    setExportModalDocIds(uniqueDocIds)
+    setPendingExportFormat(format)
+    setExportPageNumberMode('literature')
+    setExportModalOpen(true)
+  }, [])
+
+  const handleFolderBatchExport = useCallback(async () => {
+    const format = pendingExportFormat
+    const uniqueDocIds = exportModalDocIds
+    if (!format || uniqueDocIds.length === 0) {
+      message.info('请先选择文献')
+      return
+    }
+    setExportingFolderDocs(true)
+    setExportModalOpen(false)
     message.loading({ content: `正在导出 ${uniqueDocIds.length} 篇文献…`, key: FOLDERS_BATCH_EXPORT_MESSAGE_KEY, duration: 0 })
     try {
-      const result = await window.api.exportDocumentsBatch(uniqueDocIds, format)
+      const exportOptions: DocumentExportOptions = { pageNumberMode: exportPageNumberMode }
+      const result = await window.api.exportDocumentsBatch(uniqueDocIds, format, exportOptions)
       if (result?.canceled) {
         message.destroy(FOLDERS_BATCH_EXPORT_MESSAGE_KEY)
         return
@@ -937,8 +949,12 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       }
     } catch (error) {
       message.error({ content: getErrorMessage(error, '批量导出失败'), key: FOLDERS_BATCH_EXPORT_MESSAGE_KEY })
+    } finally {
+      setExportingFolderDocs(false)
+      setPendingExportFormat(null)
+      setExportModalDocIds([])
     }
-  }, [])
+  }, [exportModalDocIds, exportPageNumberMode, pendingExportFormat])
 
   const handleFolderBatchCleanupPdfAssets = useCallback((docIds: string[]) => {
     const uniqueDocIds = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
@@ -948,7 +964,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     }
     Modal.confirm({
       title: `删除 ${uniqueDocIds.length} 篇文献的本地原文件？`,
-      content: '只会删除软件数据目录里的 PDF 副本和页图缓存，不会删除 OCR 文本，也不会修改 PDF 原件仓库。',
+      content: '只会删除软件数据目录（storage）内的 PDF 副本和页图缓存。绝不删除 OCR 文本，也绝不删除 PDF 原件仓库 / NAS / 链接的外部源文件。',
       okText: '删除原文件',
       cancelText: '取消',
       okButtonProps: { danger: true },
@@ -984,7 +1000,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       }
     }
     if (restoredCount > 0) {
-      message.success({ content: `已补回 ${restoredCount} 篇原文${failedCount ? `，${failedCount} 篇未找到` : ''}`, key: 'folders-batch-restore-pdf', duration: 5 })
+      message.success({ content: `已补回 ${restoredCount} 篇原文${failedCount ? `，${failedCount} 篇未找到` : ''}（模式见设置 → PDF 原件仓库）`, key: 'folders-batch-restore-pdf', duration: 5 })
     } else {
       message.warning({ content: '未能补回原文，请检查 PDF 原件仓库索引', key: 'folders-batch-restore-pdf', duration: 6 })
     }
@@ -1697,7 +1713,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
             if (key === 'add_tags') openTagDocumentsModal(actionDocIds)
             if (key === 'move') openMoveDocumentsModal(actionDocIds)
             if (key === 'remove_current') void handleRemoveDocumentsFromCurrentFolder(actionDocIds)
-            if (String(key).startsWith('export:')) void handleFolderBatchExport(actionDocIds, String(key).replace('export:', '') as DocumentExportFormat)
+            if (String(key).startsWith('export:')) openFolderBatchExportModal(actionDocIds, String(key).replace('export:', '') as DocumentExportFormat)
             if (key === 'cleanup_pdf_assets') handleFolderBatchCleanupPdfAssets(actionDocIds)
             if (key === 'restore_pdf_assets') void handleFolderBatchRestorePdfAssets(actionDocIds)
             if (key === 'delete') handleDeleteDocuments(actionDocIds)
@@ -1813,7 +1829,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
                 if (key === 'add_tags') openTagDocumentsModal(selectedDocumentIds)
                 if (key === 'move') openMoveDocumentsModal(selectedDocumentIds)
                 if (key === 'remove_current') void handleRemoveDocumentsFromCurrentFolder(selectedDocumentIds)
-                if (String(key).startsWith('export:')) void handleFolderBatchExport(selectedDocumentIds, String(key).replace('export:', '') as DocumentExportFormat)
+                if (String(key).startsWith('export:')) openFolderBatchExportModal(selectedDocumentIds, String(key).replace('export:', '') as DocumentExportFormat)
                 if (key === 'cleanup_pdf_assets') handleFolderBatchCleanupPdfAssets(selectedDocumentIds)
                 if (key === 'restore_pdf_assets') void handleFolderBatchRestorePdfAssets(selectedDocumentIds)
                 if (key === 'delete') handleDeleteDocuments(selectedDocumentIds)
@@ -2122,6 +2138,45 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
             placeholder="标签名称"
             autoFocus
           />
+        </Space>
+      </Modal>
+
+      <Modal
+        title="批量导出文献"
+        open={exportModalOpen}
+        onCancel={() => {
+          setExportModalOpen(false)
+          setPendingExportFormat(null)
+          setExportModalDocIds([])
+        }}
+        onOk={() => void handleFolderBatchExport()}
+        okText="导出"
+        cancelText="取消"
+        confirmLoading={exportingFolderDocs}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Text type="secondary">
+            已选 {exportModalDocIds.length} 篇 · 格式：{pendingExportFormat ? DOCUMENT_EXPORT_FORMAT_NAMES[pendingExportFormat] : ''}
+          </Text>
+          <div>
+            <Text strong style={{ display: 'block', marginBottom: 6 }}>页码类型</Text>
+            <Radio.Group
+              value={exportPageNumberMode}
+              onChange={(event) => setExportPageNumberMode(event.target.value)}
+              optionType="button"
+              buttonStyle="solid"
+              options={[
+                { value: 'literature', label: '文献页码' },
+                { value: 'natural', label: '自然页码' },
+              ]}
+            />
+            <Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+              {exportPageNumberMode === 'natural'
+                ? '自然页码：PDF/扫描影像的物理页序（第 1…N 页）。'
+                : '文献页码：书上印刷/校准后的连续页码（默认，与阅读模式「文献页码」一致）。'}
+            </Text>
+          </div>
         </Space>
       </Modal>
 

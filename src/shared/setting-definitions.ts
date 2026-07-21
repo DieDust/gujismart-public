@@ -6,10 +6,20 @@ const definitions: Record<string, SettingDefinition> = {
   vision_ocr_api_key: { key: 'vision_ocr_api_key', type: 'secret', sensitivity: 'protected', rendererVisible: false },
   theme: { key: 'theme', type: 'string', sensitivity: 'public', rendererVisible: true, defaultValue: 'light' },
   batch_size: { key: 'batch_size', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '5', min: 1, max: 100 },
+  /**
+   * Wall-clock minutes for a single document OCR run. When exceeded, that book is
+   * aborted and the queue continues with other books. 0 = no per-document limit.
+   */
+  ocr_document_timeout_minutes: { key: 'ocr_document_timeout_minutes', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '45', min: 0, max: 720 },
   retry_count: { key: 'retry_count', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '3', min: 0, max: 20 },
   auto_ocr_after_import: { key: 'auto_ocr_after_import', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
   auto_ai_after_ocr: { key: 'auto_ai_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
   auto_delete_pdf_assets_after_ocr: { key: 'auto_delete_pdf_assets_after_ocr', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
+  /**
+   * When restoring a PDF original: only register the external path (no copy into
+   * app storage). Fast for large books; fails later if the external file is moved.
+   */
+  pdf_restore_link_only: { key: 'pdf_restore_link_only', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'false' },
   prefer_facsimile_proof_layout: { key: 'prefer_facsimile_proof_layout', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },
   /** First open of a document: read vs proof. Per-document manual switches still win via reader_state. */
   prefer_read_mode_on_open: { key: 'prefer_read_mode_on_open', type: 'boolean', sensitivity: 'public', rendererVisible: true, defaultValue: 'true' },

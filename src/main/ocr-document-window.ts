@@ -12,6 +12,8 @@ type QueuedTask<T> = PendingTask<T> & { limit: number }
 
 export class SlidingWindowScheduler {
   private activeCount = 0
+  /** Per-running-task slot limits; capacity is min(active limits ∪ next limit). */
+  private readonly activeSlotLimits: number[] = []
   private readonly queue: Array<QueuedTask<unknown>> = []
 
   run<T>(limit: number, task: () => Promise<T>): Promise<T> {
@@ -22,19 +24,34 @@ export class SlidingWindowScheduler {
     })
   }
 
+  private currentCapacity(nextLimit: number): number {
+    // If any running task asked for serial (1), keep the whole window serial
+    // until it finishes — otherwise a heavy book + light books would pile up.
+    if (this.activeSlotLimits.some((limit) => limit <= 1)) return 1
+    if (nextLimit <= 1) return this.activeCount === 0 ? 1 : 0
+    const activeMin = this.activeSlotLimits.length > 0
+      ? Math.min(...this.activeSlotLimits)
+      : nextLimit
+    return Math.max(1, Math.min(activeMin, nextLimit))
+  }
+
   private drain(): void {
     while (this.queue.length > 0) {
       // Use the next task's requested concurrency so concurrent batch/import OCR
       // callers do not permanently shrink/expand a shared mutable limit mid-flight.
       const nextLimit = this.queue[0]?.limit || 1
-      if (this.activeCount >= nextLimit) break
+      const capacity = this.currentCapacity(nextLimit)
+      if (this.activeCount >= capacity) break
       const pending = this.queue.shift()
       if (!pending) return
       this.activeCount += 1
+      this.activeSlotLimits.push(pending.limit)
       void pending.run()
         .then(pending.resolve, pending.reject)
         .finally(() => {
           this.activeCount -= 1
+          const idx = this.activeSlotLimits.indexOf(pending.limit)
+          if (idx >= 0) this.activeSlotLimits.splice(idx, 1)
           this.drain()
         })
     }

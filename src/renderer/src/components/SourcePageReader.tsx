@@ -8,6 +8,7 @@ import {
   DeleteOutlined,
   EditOutlined,
   FileTextOutlined,
+  FontSizeOutlined,
   LeftOutlined,
   LinkOutlined,
   PushpinOutlined,
@@ -17,6 +18,7 @@ import {
   RobotOutlined,
   SearchOutlined,
   SettingOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
 import OpenCC from 'opencc-js'
 import type { AiLayoutCacheItem, Document, DocumentPage, ReaderTranslationOptions, ReaderTranslationPayload, ResearchNote, ResearchProject, SearchHitLocator, SearchSessionState, TocItemSource, TocItemV2, TranslationMode, TranslationUnitV1 } from '@shared/types'
@@ -62,9 +64,27 @@ type ReaderSearchMatch = {
   pageOccurrenceIndex?: number
   globalIndex?: number
   sessionIndex?: number
+  /** Semantic / vector excerpt used for paragraph highlight (may differ from query). */
+  highlightText?: string
+  /** When true, paint the whole OCR block if substring match fails. */
+  blockHighlight?: boolean
+  /**
+   * Inclusive end element index for multi-block spans (vector head…tail).
+   * When set with blockHighlight, paint every block from elementIndex..blockSpanEnd.
+   */
+  blockSpanEnd?: number
 }
 type PendingSearchTarget = { anchorId: string; active?: boolean; text?: string; hitIndex?: number; token?: number }
-type SearchDirectoryItem = { index: number; key: string; pageLabel: string; snippet: string; active: boolean; session: boolean }
+type SearchDirectoryItem = {
+  index: number
+  key: string
+  pageLabel: string
+  snippet: string
+  active: boolean
+  session: boolean
+  /** When true, snippet is a semantic excerpt — do not keyword-paint the query. */
+  vector?: boolean
+}
 type PageLocatorIndex = { byId: Map<string, number>; byNum: Map<number, number> }
 type ReaderNoteItem = Pick<ResearchNote, 'id' | 'doc_id' | 'page_num' | 'excerpt' | 'note' | 'kind' | 'color' | 'locator_json' | 'source_id' | 'created_at' | 'updated_at'>
 type ReaderNoteHighlight = {
@@ -177,6 +197,8 @@ interface SourcePageReaderProps {
   searchPages?: ReaderSourcePage[]
   currentPageIndex: number
   searchKeyword?: string
+  /** In-document search engine: fulltext (default) or vector. */
+  searchEngine?: 'fulltext' | 'vector'
   highlightColor?: string
   sourceLabel?: string
   searchSession?: SearchSessionState
@@ -192,7 +214,8 @@ interface SourcePageReaderProps {
   translationMode?: TranslationMode
   onDisplayScriptChange?: (script: ReaderDisplayScript) => void
   onPageIndexChange: (pageIndex: number) => void
-  onSearchKeywordChange?: (keyword: string) => void
+  onSearchKeywordChange?: (keyword: string, meta?: { engine?: 'fulltext' | 'vector' }) => void
+  onSearchEngineChange?: (engine: 'fulltext' | 'vector') => void
   onSelectedTextChange?: (text: string) => void
   onContextTextChange?: (text: string) => void
   onDocumentMetadataChange?: (metadata: JsonRecord) => void
@@ -1459,39 +1482,212 @@ function locateNthSearchMatchInPage(page: ReaderSourcePage, pageIndex: number, k
   return sorted[targetIndex] || locateSearchMatchInPage(page, pageIndex, keyword, fallbackCharIndex)
 }
 
-function locateSearchMatchByLocator(page: ReaderSourcePage, pageIndex: number, locator: SearchHitLocator, fallbackKeyword: string): ReaderSearchMatch {
-  const keyword = locator.matchText || locator.queryTerm || fallbackKeyword
+/** Vector / semantic: anchor by first & last N characters of the excerpt, then paint whole block(s). */
+const SEMANTIC_HEAD_TAIL_LEN = 3
+/** Treat matchText this long or longer as a semantic excerpt (not a fulltext keyword). */
+const SEMANTIC_EXCERPT_MIN_LEN = 12
+
+function cleanExcerptForAnchor(needle: string): string {
+  return String(needle || '').replace(/\s+/g, ' ').trim()
+}
+
+/** First / last 3 chars of the vector segment (user-requested head–tail anchor). */
+function excerptHeadAndTail(needle: string): { head: string; tail: string; clean: string } | null {
+  const clean = cleanExcerptForAnchor(needle)
+  if (!clean) return null
+  if (clean.length <= SEMANTIC_HEAD_TAIL_LEN) {
+    return { head: clean, tail: clean, clean }
+  }
+  if (clean.length < SEMANTIC_HEAD_TAIL_LEN * 2) {
+    const half = Math.max(1, Math.floor(clean.length / 2))
+    return { head: clean.slice(0, half), tail: clean.slice(-half), clean }
+  }
+  return {
+    head: clean.slice(0, SEMANTIC_HEAD_TAIL_LEN),
+    tail: clean.slice(-SEMANTIC_HEAD_TAIL_LEN),
+    clean,
+  }
+}
+
+function elementContainsAnchor(text: string, anchor: string): boolean {
+  if (!text || !anchor) return false
+  return findSearchOccurrenceRanges(text, anchor).length > 0
+}
+
+/**
+ * Locate a semantic segment by first-3 + last-3 characters, then highlight the whole
+ * paragraph block(s) from the head block through the tail block (no partial misses).
+ */
+function locateByHeadTail(
+  page: ReaderSourcePage,
+  pageIndex: number,
+  needle: string,
+): ReaderSearchMatch | null {
+  const ht = excerptHeadAndTail(needle)
+  if (!ht) return null
   const elements = getPageElements(page)
-  const locatorCharStart = Number(locator.charStart || 0)
-  const segmentOrdinal = Number(locator.segmentOrdinal)
-  const segmentOrdinalIndex = Number.isFinite(segmentOrdinal) && segmentOrdinal >= 0 ? Math.floor(segmentOrdinal) : -1
-  const segmentIdIndex = getElementIndexFromSearchHitSegment(locator.segmentId)
-  const elementIndex = [segmentOrdinalIndex, segmentIdIndex]
-    .find((candidate) => {
-      const element = elements[candidate]
-      return !!element
-        && locatorCharStart >= Number(element.charStart || 0)
-        && locatorCharStart <= Number(element.charEnd || 0)
-    }) ?? -1
-  const element = elements[elementIndex]
-  if (element && keyword) {
-    const offsets = findSearchOccurrences(getElementSearchText(element), keyword)
-    if (offsets.length > 0) {
-      const occurrenceIndex = Math.max(0, Math.min(offsets.length - 1, Number(locator.occurrenceIndex || 0)))
-      const localCharStart = Math.max(0, locatorCharStart - Number(element.charStart || 0))
-      const nearestOffset = offsets
-        .map((offset, index) => ({ offset, index, distance: Math.abs(offset - localCharStart) }))
-        .sort((left, right) => left.distance - right.distance)[0]
-      const chosen = offsets[occurrenceIndex] != null ? { offset: offsets[occurrenceIndex], index: occurrenceIndex } : nearestOffset
-      if (chosen) {
-        return {
-          pageIndex,
-          charIndex: Number(element.charStart || 0) + chosen.offset,
-          elementIndex,
-          occurrenceIndex: chosen.index,
-        }
-      }
+  if (!elements.length) return null
+
+  // Prefer a single OCR block that contains both head and tail (order: head then tail).
+  for (let i = 0; i < elements.length; i += 1) {
+    const text = getElementSearchText(elements[i])
+    if (!elementContainsAnchor(text, ht.head)) continue
+    if (!elementContainsAnchor(text, ht.tail) && ht.head !== ht.tail) continue
+    // When head === tail (very short), still require one hit.
+    const headRanges = findSearchOccurrenceRanges(text, ht.head)
+    if (!headRanges.length) continue
+    if (ht.head !== ht.tail) {
+      const afterHead = text.slice(headRanges[0].start)
+      if (!elementContainsAnchor(afterHead, ht.tail)) continue
     }
+    return {
+      pageIndex,
+      charIndex: Number(elements[i].charStart || 0) + headRanges[0].start,
+      elementIndex: i,
+      occurrenceIndex: 0,
+      highlightText: ht.clean,
+      blockHighlight: true,
+      blockSpanEnd: i,
+    }
+  }
+
+  // Head in block A, tail in block B (A <= B): paint the whole span of blocks.
+  let headEl = -1
+  for (let i = 0; i < elements.length; i += 1) {
+    if (elementContainsAnchor(getElementSearchText(elements[i]), ht.head)) {
+      headEl = i
+      break
+    }
+  }
+  if (headEl < 0) return null
+
+  let tailEl = -1
+  for (let j = headEl; j < elements.length; j += 1) {
+    if (elementContainsAnchor(getElementSearchText(elements[j]), ht.tail)) {
+      tailEl = j
+      // Keep scanning for a later tail only if same as head block with wrong order —
+      // first tail at/after head is correct for “first…last” segment.
+      break
+    }
+  }
+  // Head found but tail missing: still highlight the head block as the segment start.
+  if (tailEl < 0) tailEl = headEl
+
+  const headText = getElementSearchText(elements[headEl])
+  const headRanges = findSearchOccurrenceRanges(headText, ht.head)
+  const localStart = headRanges[0]?.start ?? 0
+  return {
+    pageIndex,
+    charIndex: Number(elements[headEl].charStart || 0) + localStart,
+    elementIndex: headEl,
+    occurrenceIndex: 0,
+    highlightText: ht.clean,
+    blockHighlight: true,
+    blockSpanEnd: Math.max(headEl, tailEl),
+  }
+}
+
+/** Fulltext keyword probes (short query strings only). */
+function buildSnippetProbes(needle: string): string[] {
+  const clean = cleanExcerptForAnchor(needle)
+  if (!clean) return []
+  if (clean.length <= 24) return [clean]
+  const probes = [clean]
+  for (const len of [24, 16, 12]) {
+    if (clean.length >= len) probes.push(clean.slice(0, len))
+  }
+  return [...new Set(probes.filter((item) => item.length >= 2))]
+}
+
+function pickMatchingProbe(source: string, needle: string): string | null {
+  const text = String(source || '')
+  if (!text || !needle) return null
+  const probes = buildSnippetProbes(needle).slice().sort((left, right) => right.length - left.length)
+  for (const probe of probes) {
+    if (findSearchOccurrenceRanges(text, probe).length > 0) return probe
+  }
+  return null
+}
+
+function locateSnippetInPage(
+  page: ReaderSourcePage,
+  pageIndex: number,
+  needle: string,
+  preferredCharStart = 0,
+): ReaderSearchMatch | null {
+  const elements = getPageElements(page)
+  type SnippetCandidate = {
+    pageIndex: number
+    charIndex: number
+    elementIndex: number
+    occurrenceIndex: number
+    distance: number
+    probeLen: number
+  }
+  const probes = buildSnippetProbes(needle).slice().sort((left, right) => right.length - left.length)
+  let best: SnippetCandidate | undefined
+  for (const probe of probes) {
+    elements.forEach((element, elementIndex) => {
+      const offsets = findSearchOccurrences(getElementSearchText(element), probe)
+      if (offsets.length === 0) return
+      const localPreferred = Math.max(0, preferredCharStart - Number(element.charStart || 0))
+      offsets.forEach((offset, occurrenceIndex) => {
+        const distance = Math.abs(offset - localPreferred)
+        const candidate: SnippetCandidate = {
+          pageIndex,
+          charIndex: Number(element.charStart || 0) + offset,
+          elementIndex,
+          occurrenceIndex,
+          distance,
+          probeLen: probe.length,
+        }
+        if (
+          !best
+          || candidate.probeLen > best.probeLen
+          || (candidate.probeLen === best.probeLen && distance < best.distance)
+        ) {
+          best = candidate
+        }
+      })
+    })
+    if (best) break
+  }
+  if (!best) return null
+  return {
+    pageIndex: best.pageIndex,
+    charIndex: best.charIndex,
+    elementIndex: best.elementIndex,
+    occurrenceIndex: best.occurrenceIndex,
+  }
+}
+
+function locateSearchMatchByLocator(page: ReaderSourcePage, pageIndex: number, locator: SearchHitLocator, fallbackKeyword: string): ReaderSearchMatch {
+  const matchText = cleanExcerptForAnchor(locator.matchText || '')
+  const queryTerm = cleanExcerptForAnchor(locator.queryTerm || fallbackKeyword || '')
+  const isSemanticExcerpt = matchText.length >= SEMANTIC_EXCERPT_MIN_LEN
+  const keyword = matchText || queryTerm
+  const locatorCharStart = Number(locator.charStart || 0)
+
+  // Vector / semantic: head–tail → whole paragraph block(s).
+  if (isSemanticExcerpt) {
+    const headTail = locateByHeadTail(page, pageIndex, matchText)
+    if (headTail) return headTail
+    return {
+      pageIndex,
+      charIndex: 0,
+      elementIndex: 0,
+      occurrenceIndex: 0,
+      highlightText: matchText,
+      blockHighlight: false,
+    }
+  }
+
+  // Fulltext: exact / short keyword match.
+  const snippetHit = locateSnippetInPage(page, pageIndex, keyword, locatorCharStart)
+  if (snippetHit) return { ...snippetHit, highlightText: keyword || undefined }
+  if (queryTerm && queryTerm !== matchText) {
+    const queryHit = locateSnippetInPage(page, pageIndex, queryTerm, locatorCharStart)
+    if (queryHit) return { ...queryHit, highlightText: queryTerm }
   }
   if (Number.isFinite(Number(locator.occurrenceIndex))) {
     return locateNthSearchMatchInPage(page, pageIndex, keyword, Number(locator.occurrenceIndex), locatorCharStart)
@@ -1570,7 +1766,7 @@ function formatReaderImagePageLabel(page: ReaderSourcePage | null | undefined, p
   const isEbookVirtual = String(parseMaybeRecord(page?.ocr_result).source_type || '') === 'ebook_virtual_page'
   if (isEbookVirtual) return `阅读页 ${pageIndex + 1}/${pageCount}`
   const physical = getReaderPhysicalPageNum(page, pageIndex)
-  return `影像 第 ${physical} / ${pageCount} 页`
+  return `自然页码 第 ${physical} / ${pageCount} 页`
 }
 
 /** Bottom-left: printed literature page (same as citation / TXT export). */
@@ -1578,7 +1774,7 @@ function formatReaderLiteraturePageLabel(page: ReaderSourcePage | null | undefin
   const isEbookVirtual = String(parseMaybeRecord(page?.ocr_result).source_type || '') === 'ebook_virtual_page'
   if (isEbookVirtual) return `阅读页 ${pageIndex + 1}`
   const literature = getReaderLiteraturePageNum(page, pageIndex)
-  return `文献 第 ${literature} 页`
+  return `文献页码 第 ${literature} 页`
 }
 
 function buildReaderCitationText(title: string | null | undefined, pageNum: number | null): string {
@@ -1971,6 +2167,121 @@ function highlightPlainText(
   return parts
 }
 
+/** Highlight multiple distinct phrases (vector semantic paragraphs on one page). */
+function highlightSearchPhrases(
+  text: string,
+  phrases: Array<{ text: string; globalIndex: number; blockFallback?: boolean }>,
+  activeGlobalHitIndex?: number | null,
+  displayScript: ReaderDisplayScript = 'original',
+  highlightColor = DEFAULT_HIGHLIGHT_COLOR,
+) {
+  const source = transformReaderDisplayText(String(text || ''), displayScript)
+  if (!source || phrases.length === 0) return renderInlineAnnotations(source, 'plain', displayScript)
+
+  type Range = { start: number; end: number; globalIndex: number; blockFallback?: boolean }
+  const ranges: Range[] = []
+  phrases.forEach((phrase) => {
+    const needle = String(phrase.text || '').trim()
+    if (!needle && !phrase.blockFallback) return
+    // Whole-block vector paint: always cover the full element (no partial substring split).
+    if (phrase.blockFallback && source.trim()) {
+      ranges.push({
+        start: 0,
+        end: source.length,
+        globalIndex: phrase.globalIndex,
+        blockFallback: true,
+      })
+      return
+    }
+    let found = needle ? findSearchOccurrenceRanges(source, needle) : []
+    if (found.length === 0 && needle) {
+      const anchor = pickMatchingProbe(source, needle)
+      if (anchor) found = findSearchOccurrenceRanges(source, anchor)
+    }
+    found.forEach((range) => {
+      ranges.push({
+        start: range.start,
+        end: range.end,
+        globalIndex: phrase.globalIndex,
+        blockFallback: false,
+      })
+    })
+  })
+  if (ranges.length === 0) return renderInlineAnnotations(source, 'plain', displayScript)
+
+  ranges.sort((left, right) => left.start - right.start || right.end - left.end || left.globalIndex - right.globalIndex)
+  const picked: Range[] = []
+  ranges.forEach((range) => {
+    const overlaps = picked.some((item) => range.start < item.end && range.end > item.start)
+    if (overlaps) {
+      const index = picked.findIndex((item) => range.start < item.end && range.end > item.start)
+      if (index < 0) return
+      const existing = picked[index]
+      const preferNew = (
+        (range.blockFallback && !existing.blockFallback)
+        || (
+          Number(range.globalIndex) === Number(activeGlobalHitIndex)
+          && Number(existing.globalIndex) !== Number(activeGlobalHitIndex)
+        )
+        || (
+          Number(range.globalIndex) === Number(existing.globalIndex)
+          && (range.end - range.start) > (existing.end - existing.start)
+        )
+      )
+      if (preferNew) picked[index] = range
+      return
+    }
+    picked.push(range)
+  })
+  picked.sort((left, right) => left.start - right.start)
+
+  const markColor = normalizeHighlightColor(highlightColor)
+  // Single solid color for the selected segment (no orange/yellow mix inside one hit).
+  const solidColor = markColor.toLowerCase() === DEFAULT_HIGHLIGHT_COLOR ? '#ffb020' : markColor
+  const parts: ReactNode[] = []
+  let cursor = 0
+  picked.forEach((range, index) => {
+    if (range.start > cursor) {
+      parts.push(...renderInlineAnnotations(source.slice(cursor, range.start), `plain-${cursor}`))
+    }
+    // Vector head–tail only paints the active hit; treat every block of that hit as selected.
+    const isActiveHit = !Number.isFinite(Number(activeGlobalHitIndex))
+      || !Number.isFinite(Number(range.globalIndex))
+      || Number(activeGlobalHitIndex) === Number(range.globalIndex)
+    const active = range.blockFallback || isActiveHit
+    parts.push(
+      <mark
+        key={`phrase-${range.start}-${range.globalIndex}-${index}`}
+        data-reader-search-hit={active ? 'active' : 'true'}
+        data-reader-search-hit-index={range.globalIndex}
+        data-search-active={active ? 'true' : undefined}
+        data-search-hit-index={range.globalIndex}
+        data-search-active-color={solidColor}
+        data-search-idle-color={solidColor}
+        data-vector-hit="true"
+        style={{
+          background: solidColor,
+          color: getHighlightTextColor(markColor),
+          padding: '0 2px',
+          borderRadius: 3,
+          fontWeight: 700,
+          position: 'relative',
+          zIndex: 3,
+          border: '1px solid rgba(120, 53, 15, 0.55)',
+          outline: 'none',
+          boxShadow: `0 0 0 1px ${hexToRgba(solidColor, 0.2)}`,
+          textDecoration: 'none',
+        }}
+      >
+        {source.slice(range.start, range.end)}
+      </mark>,
+    )
+    cursor = Math.max(cursor, range.end)
+  })
+  if (cursor < source.length) parts.push(...renderInlineAnnotations(source.slice(cursor), `plain-${cursor}`))
+  return parts
+}
+
 function renderTocAnchoredText(text: string, pendingTarget?: PendingSearchTarget | null, displayScript: ReaderDisplayScript = 'original') {
   const targetText = transformReaderDisplayText(String(pendingTarget?.text || '').trim(), displayScript)
   if (!targetText) return highlightPlainText(text, '', null, null, null, displayScript)
@@ -2235,7 +2546,9 @@ function renderReaderElementGroup(
   noteHighlights: ReaderNoteHighlight[] = [],
   displayScript: ReaderDisplayScript = 'original',
   searchActiveOnly = false,
+  searchPhrases: Array<{ text: string; globalIndex: number; blockFallback?: boolean }> = [],
 ) {
+  const usePhraseHighlight = searchPhrases.length > 0
   const { element, anchorId, activeHit } = group
   if (element.type === 'image') {
     return (
@@ -2299,14 +2612,16 @@ function renderReaderElementGroup(
     )
   }
   if (element.type === 'toc') {
-    if (searchActiveOnly && searchKeyword.trim()) {
+    if (searchActiveOnly && (usePhraseHighlight || searchKeyword.trim())) {
       return (
         <div id={anchorId} key={anchorId} data-source-anchor="true" data-reader-page-index={pageIndex} data-reader-element-index={group.index} onMouseUp={(event) => pageIndex != null && onReaderSelection?.(pageIndex, group.index, event)} style={{ margin: '0.15em 0 1.2em', textAlign: 'left', whiteSpace: 'pre-wrap' }}>
-          {highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchHitIndexes ?? group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, true)}
+          {usePhraseHighlight
+            ? highlightSearchPhrases(element.text, searchPhrases, group.activeGlobalHitIndex, displayScript, highlightColor)
+            : highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchHitIndexes ?? group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, true)}
         </div>
       )
     }
-    if (!searchKeyword.trim() && noteHighlights.length) {
+    if (!searchKeyword.trim() && !usePhraseHighlight && noteHighlights.length) {
       return (
         <div id={anchorId} key={anchorId} data-source-anchor="true" data-reader-page-index={pageIndex} data-reader-element-index={group.index} onMouseUp={(event) => pageIndex != null && onReaderSelection?.(pageIndex, group.index, event)} style={{ margin: '0.15em 0 1.2em', textAlign: 'left', whiteSpace: 'pre-wrap' }}>
           {renderReaderNoteHighlightedText(element.text, noteHighlights, displayScript, `reader-toc-note-${anchorId}`)}
@@ -2352,11 +2667,13 @@ function renderReaderElementGroup(
     <TagName id={anchorId} key={anchorId} data-source-anchor="true" data-reader-page-index={pageIndex} data-reader-element-index={group.index} onMouseUp={(event) => pageIndex != null && onReaderSelection?.(pageIndex, group.index, event)} style={{ margin: element.type === 'heading' ? '0.15em 0 0.85em' : '0 0 1em', fontSize: element.type === 'heading' ? '1.08em' : undefined, fontWeight: element.type === 'heading' ? 700 : undefined, textAlign: element.type === 'heading' ? 'left' : 'justify' }}>
       {pendingTocTarget?.anchorId === anchorId
         ? renderTocAnchoredText(displayText, pendingTocTarget, displayScript)
-        : searchKeyword.trim()
-          ? highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchHitIndexes ?? group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
-          : noteHighlights.length
-            ? renderReaderNoteHighlightedText(element.text, noteHighlights, displayScript, `reader-note-${anchorId}`)
-            : renderInlineAnnotations(displayText, `reader-${anchorId}`, displayScript)}
+        : usePhraseHighlight
+          ? highlightSearchPhrases(element.text, searchPhrases, group.activeGlobalHitIndex, displayScript, highlightColor)
+          : searchKeyword.trim()
+            ? highlightPlainText(element.text, searchKeyword, activeHit, group.globalSearchHitIndexes ?? group.globalSearchStartIndex, group.activeGlobalHitIndex, displayScript, highlightColor, searchActiveOnly)
+            : noteHighlights.length
+              ? renderReaderNoteHighlightedText(element.text, noteHighlights, displayScript, `reader-note-${anchorId}`)
+              : renderInlineAnnotations(displayText, `reader-${anchorId}`, displayScript)}
     </TagName>
   )
 }
@@ -2416,6 +2733,7 @@ function SourcePageSpread({
   onCalibrateLiteraturePage,
   displayScript = 'original',
   searchActiveOnly = false,
+  activeSearchGlobalIndex = null,
 }: {
   rowPages: ReaderSourcePage[]
   pageIndices: number[]
@@ -2439,6 +2757,7 @@ function SourcePageSpread({
   onCalibrateLiteraturePage?: (page: ReaderSourcePage, pageIndex: number) => void
   displayScript?: ReaderDisplayScript
   searchActiveOnly?: boolean
+  activeSearchGlobalIndex?: number | null
 }) {
   const themeStyle = themeStyles[theme]
   const effectiveHighlightColor = normalizeHighlightColor(highlightColor)
@@ -2459,6 +2778,7 @@ function SourcePageSpread({
     })
     return map
   }, [searchMatches])
+  const usePhraseHighlight = searchMatches.some((match) => Boolean(String(match.highlightText || '').trim()))
   return (
     <div style={shellStyle}>
       <div style={gridStyle}>
@@ -2483,7 +2803,7 @@ function SourcePageSpread({
               index,
               anchorId: getElementAnchorId(page, pageIndex, index),
               activeHit: null,
-              activeGlobalHitIndex: null,
+              activeGlobalHitIndex: Number.isFinite(Number(activeSearchGlobalIndex)) ? Number(activeSearchGlobalIndex) : null,
               globalSearchStartIndex,
               globalSearchHitIndexes: globalMatchIndexes.length ? globalMatchIndexes : null,
             }
@@ -2517,7 +2837,7 @@ function SourcePageSpread({
             >
               {/* Top-right only: physical / image sheet index. No page numbers on top-left. */}
               <div
-                title="PDF/扫描影像页序，用于翻页定位"
+                title="自然页码：PDF/扫描物理页序，用于翻页定位"
                 style={{
                   position: 'absolute',
                   top: 14,
@@ -2552,7 +2872,71 @@ function SourcePageSpread({
                 ? { height: pageMetrics.textHeight, margin: '48px 42px 36px', fontFamily: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif", fontSize, lineHeight, whiteSpace: 'normal', overflowWrap: 'break-word', textAlign: 'justify', overflow: 'hidden' }
                 : { margin: '58px 48px 48px', fontFamily: "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif", fontSize, lineHeight, whiteSpace: 'normal', overflowWrap: 'break-word', textAlign: 'justify', overflow: 'visible' }}>
                 {bodyElementGroups.length
-                  ? bodyElementGroups.map((group) => renderReaderElementGroup(group, theme, themeStyle, searchKeyword, effectiveHighlightColor, pendingTocTarget, page, pageIndex, onReaderSelection, searchKeyword.trim() || aiText ? [] : noteHighlightsByElement.get(`${pageIndex}:${group.index}`) || [], displayScript, searchActiveOnly))
+                  ? bodyElementGroups.map((group) => {
+                    // Vector: only the *active* hit; paint whole block(s) between head…tail anchors.
+                    const pagePhraseHits = usePhraseHighlight
+                      ? searchMatches.filter((match) => {
+                        if (match.pageIndex !== pageIndex) return false
+                        if (!String(match.highlightText || '').trim()) return false
+                        if (!Number.isFinite(Number(match.globalIndex))) return false
+                        if (Number.isFinite(Number(activeSearchGlobalIndex))) {
+                          return Number(match.globalIndex) === Number(activeSearchGlobalIndex)
+                        }
+                        return true
+                      })
+                      : []
+                    const elementText = group.element?.text || getElementSearchText(group.element)
+                    const phrases = pagePhraseHits
+                      .map((match) => {
+                        const raw = String(match.highlightText || '').trim()
+                        if (!raw || !String(elementText || '').trim()) return null
+                        const spanStart = Number(match.elementIndex)
+                        const spanEnd = Number.isFinite(Number(match.blockSpanEnd))
+                          ? Number(match.blockSpanEnd)
+                          : spanStart
+                        // Head–tail strategy: paint every OCR block from first to last of the span.
+                        if (
+                          match.blockHighlight
+                          && Number.isFinite(spanStart)
+                          && group.index >= Math.min(spanStart, spanEnd)
+                          && group.index <= Math.max(spanStart, spanEnd)
+                        ) {
+                          return {
+                            text: elementText,
+                            globalIndex: Number(match.globalIndex),
+                            blockFallback: true,
+                          }
+                        }
+                        // Fulltext-style short keyword still uses substring highlight.
+                        if (!match.blockHighlight) {
+                          const anchor = pickMatchingProbe(elementText, raw)
+                          if (anchor) {
+                            return {
+                              text: anchor,
+                              globalIndex: Number(match.globalIndex),
+                              blockFallback: false,
+                            }
+                          }
+                        }
+                        return null
+                      })
+                      .filter(Boolean) as Array<{ text: string; globalIndex: number; blockFallback?: boolean }>
+                    return renderReaderElementGroup(
+                      group,
+                      theme,
+                      themeStyle,
+                      searchKeyword,
+                      effectiveHighlightColor,
+                      pendingTocTarget,
+                      page,
+                      pageIndex,
+                      onReaderSelection,
+                      searchKeyword.trim() || phrases.length > 0 || aiText ? [] : noteHighlightsByElement.get(`${pageIndex}:${group.index}`) || [],
+                      displayScript,
+                      searchActiveOnly,
+                      phrases,
+                    )
+                  })
                   : <Text style={{ color: themeStyle.muted }}>本页暂无可阅读文本</Text>}
                 {renderFootnoteGroup(footnoteElementGroups, theme, pendingTocTarget, searchKeyword, effectiveHighlightColor, displayScript, searchActiveOnly, noteHighlightsByElement, pageIndex)}
               </div>
@@ -2616,6 +3000,7 @@ function areSourcePageSpreadPropsEqual(
     || previous.noteHighlightsByElement !== next.noteHighlightsByElement
     || previous.displayScript !== next.displayScript
     || previous.searchActiveOnly !== next.searchActiveOnly
+    || previous.activeSearchGlobalIndex !== next.activeSearchGlobalIndex
     || previous.onCalibrateLiteraturePage !== next.onCalibrateLiteraturePage
     || previous.pageIndices.length !== next.pageIndices.length
     || previous.searchMatches.length !== next.searchMatches.length) return false
@@ -2628,6 +3013,9 @@ function areSourcePageSpreadPropsEqual(
       && match.charIndex === candidate.charIndex
       && match.occurrenceIndex === candidate.occurrenceIndex
       && match.globalIndex === candidate.globalIndex
+      && match.highlightText === candidate.highlightText
+      && match.blockHighlight === candidate.blockHighlight
+      && match.blockSpanEnd === candidate.blockSpanEnd
   })
 }
 
@@ -2639,6 +3027,7 @@ export default function SourcePageReader({
   searchPages,
   currentPageIndex,
   searchKeyword = '',
+  searchEngine = 'fulltext',
   highlightColor = '',
   sourceLabel = '',
   searchSession,
@@ -2655,6 +3044,7 @@ export default function SourcePageReader({
   onDisplayScriptChange,
   onPageIndexChange,
   onSearchKeywordChange,
+  onSearchEngineChange,
   onSelectedTextChange,
   onContextTextChange,
   onDocumentMetadataChange,
@@ -2680,6 +3070,9 @@ export default function SourcePageReader({
   const [translationOpen, setTranslationOpen] = useState(false)
   const [activeParallelSegmentId, setActiveParallelSegmentId] = useState('')
   const [localSearchInput, setLocalSearchInput] = useState(searchKeyword)
+  const [localSearchEngine, setLocalSearchEngine] = useState<'fulltext' | 'vector'>(
+    searchEngine === 'vector' || searchSession?.engine === 'vector' ? 'vector' : 'fulltext',
+  )
   const [searchCursor, setSearchCursor] = useState(-1)
   const [sessionSearchCursor, setSessionSearchCursor] = useState(-1)
   const [toc, setToc] = useState<TocItemV2[]>([])
@@ -2946,6 +3339,20 @@ export default function SourcePageReader({
     emittedLocalSearchKeywordRef.current = ''
     if (searchKeyword.trim()) setDismissedSearchSessionKey('')
   }, [searchKeyword])
+
+  useEffect(() => {
+    // Prefer explicit toolbar prop; only fall back to session engine when prop is fulltext default
+    // and session is still carrying a vector open (do not override a user switch to 文本).
+    if (searchEngine === 'vector') {
+      setLocalSearchEngine('vector')
+      return
+    }
+    if (searchEngine === 'fulltext') {
+      setLocalSearchEngine('fulltext')
+      return
+    }
+    setLocalSearchEngine(searchSession?.engine === 'vector' ? 'vector' : 'fulltext')
+  }, [searchEngine, searchSession?.engine])
 
   useEffect(() => {
     if (committedSearchInput) {
@@ -3255,8 +3662,17 @@ export default function SourcePageReader({
   }, [aiLayoutByPageId, aiLayoutCandidatePages, aiLayoutEnabled, aiLayoutErrors, document?.id])
 
   const effectiveSessionHits = effectiveSearchSession?.hits || []
+  const sessionEngineIsVector = effectiveSearchSession?.engine === 'vector'
+    || localSearchEngine === 'vector'
+    || String(searchEngine || '') === 'vector'
   const hasIncomingLocatorSession = !localSearchEdited && effectiveSessionHits.length > 0
-  const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === committedSearchInput && effectiveSessionHits.length > 0
+  // Vector mode: stay on session navigation even while re-fetching (empty hits + searching),
+  // so the left panel never falls back to local keyword FTS and looks like 全文检索.
+  const hasMatchingSearchSession = effectiveSearchSession?.query?.trim() === committedSearchInput
+    && (
+      effectiveSessionHits.length > 0
+      || (sessionEngineIsVector && (effectiveSearchSession?.status === 'searching' || effectiveSearchSession?.status === 'ready' || effectiveSearchSession?.status === 'empty'))
+    )
   const hasFullLocalSearchPages = !isEbook && Array.isArray(searchPages) && searchPages.length >= sortedPages.length
   const searchSourcePages = useMemo(() => {
     if (!isEbook && Array.isArray(searchPages) && searchPages.length >= sortedPages.length) {
@@ -3268,9 +3684,11 @@ export default function SourcePageReader({
   const allSearchMatches = useMemo(() => {
     const keyword = committedSearchInput
     if (!keyword) return []
+    // Never run local keyword scan while in vector mode (would flood the sidebar with FTS hits).
+    if (sessionEngineIsVector) return []
     if (localSearchEdited || hasMatchingSearchSession || !hasFullLocalSearchPages) return []
     return readerSearchHitsToMatches(searchSourcePages, keyword, document?.id)
-  }, [committedSearchInput, document?.id, hasFullLocalSearchPages, hasMatchingSearchSession, localSearchEdited, searchSourcePages])
+  }, [committedSearchInput, document?.id, hasFullLocalSearchPages, hasMatchingSearchSession, localSearchEdited, searchSourcePages, sessionEngineIsVector])
 
   const hasReaderNavigation = allSearchMatches.length > 0 && !hasIncomingLocatorSession
   const hasSessionNavigation = hasMatchingSearchSession
@@ -3302,15 +3720,40 @@ export default function SourcePageReader({
         : 0
     : -1
 
+  const isVectorSearchSession = effectiveSearchSession?.engine === 'vector' && hasMatchingSearchSession
   const sessionActiveHit = useMemo(() => {
     if (!effectiveSearchSession?.hits?.length || effectiveSessionHitIndex < 0) return null
     const hit = effectiveSearchSession.hits[effectiveSessionHitIndex]
     if (!hit?.locator) return null
     const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
     if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
-    const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
-    return { ...match, globalIndex: effectiveSessionHitIndex, sessionIndex: effectiveSessionHitIndex }
-  }, [committedSearchInput, effectiveSearchSession, effectiveSessionHitIndex, sortedPages])
+    const page = sortedPages[pageIndex]
+    // Empty page text (not hydrated yet) — keep page jump but skip false highlights.
+    if (!getPageText(page)) {
+      return {
+        pageIndex,
+        charIndex: 0,
+        elementIndex: 0,
+        occurrenceIndex: 0,
+        globalIndex: effectiveSessionHitIndex,
+        sessionIndex: effectiveSessionHitIndex,
+        highlightText: String(hit.locator.matchText || hit.snippet || '').replace(/\s+/g, ' ').trim() || undefined,
+        blockHighlight: true,
+      }
+    }
+    const match = locateSearchMatchByLocator(page, pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
+    const highlightText = String(
+      match.highlightText || hit.locator.matchText || hit.snippet || '',
+    ).replace(/\s+/g, ' ').trim()
+    return {
+      ...match,
+      globalIndex: effectiveSessionHitIndex,
+      sessionIndex: effectiveSessionHitIndex,
+      highlightText: highlightText || undefined,
+      blockHighlight: match.blockHighlight || false,
+      blockSpanEnd: match.blockSpanEnd ?? match.elementIndex,
+    }
+  }, [committedSearchInput, effectiveSearchSession, effectiveSessionHitIndex, pageLocatorIndex, sortedPages])
   const sessionLocalSearchIndex = useMemo(() => {
     if (!sessionActiveHit || !allSearchMatches.length) return -1
     return allSearchMatches
@@ -3344,8 +3787,31 @@ export default function SourcePageReader({
           if (!hit?.locator) return null
           const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
           if (pageIndex < 0 || pageIndex >= sortedPages.length) return null
-          const match = locateSearchMatchByLocator(sortedPages[pageIndex], pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
-          return { ...match, globalIndex: index, sessionIndex: index }
+          const page = sortedPages[pageIndex]
+          if (!getPageText(page)) {
+            return {
+              pageIndex,
+              charIndex: 0,
+              elementIndex: 0,
+              occurrenceIndex: 0,
+              globalIndex: index,
+              sessionIndex: index,
+              highlightText: String(hit.locator.matchText || hit.snippet || '').replace(/\s+/g, ' ').trim() || undefined,
+              blockHighlight: true,
+            } as ReaderSearchMatch
+          }
+          const match = locateSearchMatchByLocator(page, pageIndex, hit.locator, hit.locator.queryTerm || committedSearchInput)
+          const highlightText = String(
+            match.highlightText || hit.locator.matchText || hit.snippet || '',
+          ).replace(/\s+/g, ' ').trim()
+          return {
+            ...match,
+            globalIndex: index,
+            sessionIndex: index,
+            highlightText: highlightText || undefined,
+            blockHighlight: match.blockHighlight || false,
+            blockSpanEnd: match.blockSpanEnd ?? match.elementIndex,
+          }
         })
         .filter(Boolean) as ReaderSearchMatch[]
       if (!sessionActiveHit) return visibleSessionMatches
@@ -3374,9 +3840,14 @@ export default function SourcePageReader({
   const renderedActiveSearchHit = Number.isFinite(Number(activeSearchHit?.globalIndex))
     ? searchMatches.find((hit) => hit.globalIndex === activeSearchHit?.globalIndex) || activeSearchHit
     : activeSearchHit
-  const renderedSearchKeyword = hasSessionNavigation && effectiveSessionHitIndex >= 0
-    ? effectiveSessionHits[effectiveSessionHitIndex]?.locator?.queryTerm || effectiveSessionHits[effectiveSessionHitIndex]?.locator?.matchText || committedSearchInput
-    : committedSearchInput
+  // Vector sessions: keep query in the box for navigation; paragraph highlights use highlightText.
+  const renderedSearchKeyword = isVectorSearchSession
+    ? committedSearchInput
+    : hasSessionNavigation && effectiveSessionHitIndex >= 0
+      ? effectiveSessionHits[effectiveSessionHitIndex]?.locator?.queryTerm
+        || effectiveSessionHits[effectiveSessionHitIndex]?.locator?.matchText
+        || committedSearchInput
+      : committedSearchInput
   const totalSearchHitCount = hasSessionNavigation ? effectiveSessionHits.length : allSearchMatches.length || effectiveSessionHits.length || 0
   const visibleSearchHitIndex = hasSessionNavigation
     ? effectiveSessionHitIndex
@@ -3390,7 +3861,7 @@ export default function SourcePageReader({
   const searchCounterText = searchIndexLoading
     ? '检索中'
     : totalSearchHitCount
-      ? `${Math.max(0, visibleSearchHitIndex) + 1}/${totalSearchHitCount}`
+      ? `${isVectorSearchSession ? '向量 ' : ''}${Math.max(0, visibleSearchHitIndex) + 1}/${totalSearchHitCount}`
       : '0/0'
   const canNavigateSearchHits = totalSearchHitCount > 0 && !searchIndexLoading
 
@@ -3431,23 +3902,47 @@ export default function SourcePageReader({
         }
       })
     }
-    const hits = effectiveSearchSession?.hits || []
-    return hits.slice(start, end).map((hit, offset) => {
-      const index = start + offset
+    const currentDocId = String(document?.id || '').trim()
+    const hits = (effectiveSearchSession?.hits || [])
+      .map((hit, index) => ({ hit, index }))
+      .filter(({ hit }) => {
+        const hitDocId = String(hit.locator?.docId || '').trim()
+        // Never list another document's snippet in this reader's search panel.
+        return !currentDocId || !hitDocId || hitDocId === currentDocId
+      })
+    const vectorList = sessionEngineIsVector || effectiveSearchSession?.engine === 'vector'
+    return hits.slice(start, end).map(({ hit, index }) => {
       const pageIndex = findPageIndexForLocatorFast(pageLocatorIndex, hit.locator)
       const page = pageIndex >= 0 ? sortedPages[pageIndex] : null
       const pageNum = hit.locator.pageNum || page?.page_num || (hit.locator.pageIndex ?? -1) + 1
-      const pageText = getPageText(page)
+      // Vector: show semantic excerpt as-is (do NOT re-paint the query as FTS keyword marks).
+      // Fulltext: keep keyword marks in the snippet for scanability.
+      let snippetSource = String(hit.snippet || '').trim()
+      if (!vectorList) {
+        const pageText = getPageText(page)
+        snippetSource = pageText
+          ? makeMarkedSnippet(pageText, hit.locator.matchText || hit.locator.queryTerm || committedSearchInput, hit.locator.charStart || 0)
+          : snippetSource
+      } else if (!snippetSource) {
+        snippetSource = String(hit.locator.matchText || '').trim()
+      }
+      const score = Number(hit.score)
+      const scoreLabel = vectorList && Number.isFinite(score) && score > 0 && score <= 1
+        ? ` · 相似度 ${score.toFixed(3)}`
+        : vectorList && Number.isFinite(score) && score > 1
+          ? ` · 分 ${score.toFixed(2)}`
+          : ''
       return {
         index,
         key: `session-${hit.id}-${index}`,
-        pageLabel: pageNum > 0 ? `第 ${pageNum} 页` : '正文',
-        snippet: hit.snippet || makeMarkedSnippet(pageText, hit.locator.queryTerm || committedSearchInput, hit.locator.charStart || 0),
+        pageLabel: `${pageNum > 0 ? `第 ${pageNum} 页` : '正文'}${scoreLabel}`,
+        snippet: snippetSource,
         active: index === effectiveSessionHitIndex,
         session: true,
+        vector: vectorList,
       }
     })
-  }, [allSearchMatches, committedSearchInput, effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, pageLocatorIndex, searchDirectoryItemCount, searchResultPageSafe, searchSourcePages, sortedPages, visibleSearchHitIndex])
+  }, [allSearchMatches, committedSearchInput, document?.id, effectiveSearchSession, effectiveSessionHitIndex, hasSessionNavigation, pageLocatorIndex, searchDirectoryItemCount, searchResultPageSafe, searchSourcePages, sessionEngineIsVector, sortedPages, visibleSearchHitIndex])
   const [readerScrollVersion, setReaderScrollVersion] = useState(0)
   const readerScrollVersionRef = useRef(0)
   const refreshReaderPosition = () => {
@@ -3978,9 +4473,14 @@ export default function SourcePageReader({
     }
   }
 
-  const commitLocalSearch = () => {
+  const commitLocalSearch = (options?: { force?: boolean; engine?: 'fulltext' | 'vector' }) => {
     const nextKeyword = localSearchInput.trim()
-    if (nextKeyword === committedSearchInput) return
+    const nextEngine = options?.engine || localSearchEngine
+    const propEngine = searchEngine === 'vector' ? 'vector' : 'fulltext'
+    // Same keyword + same engine + not forced → nothing to do (typing echo).
+    if (!options?.force && nextKeyword === committedSearchInput && nextEngine === propEngine) {
+      return
+    }
     emittedLocalSearchKeywordRef.current = nextKeyword
     localSearchEditedRef.current = true
     setLocalSearchEdited(true)
@@ -3989,7 +4489,19 @@ export default function SourcePageReader({
     setSearchCursor(-1)
     setSessionSearchCursor(-1)
     setReaderHighlightColor('')
-    onSearchKeywordChange?.(nextKeyword)
+    // Single parent entry: always re-search with explicit engine (Enter / switch / commit).
+    onSearchKeywordChange?.(nextKeyword, { engine: nextEngine })
+  }
+
+  const handleReaderSearchEngineChange = (nextEngine: 'fulltext' | 'vector') => {
+    if (nextEngine === localSearchEngine) return
+    setLocalSearchEngine(nextEngine)
+    // Switching text ↔ vector must re-run even when the keyword is unchanged.
+    if (localSearchInput.trim()) {
+      commitLocalSearch({ force: true, engine: nextEngine })
+    } else {
+      onSearchEngineChange?.(nextEngine)
+    }
   }
 
   const jumpToSearchDirectoryItem = (item: SearchDirectoryItem) => {
@@ -4528,7 +5040,11 @@ export default function SourcePageReader({
                 <span style={{ fontWeight: 700 }}>#{item.index + 1}</span>
                 <span style={{ color: item.active ? 'rgba(255,245,220,0.82)' : tocStyle.muted }}>{item.pageLabel}</span>
               </div>
-              <span>{renderMarkedSnippet(item.snippet, localSearchInput, displayScript)}</span>
+              <span>
+                {item.vector
+                  ? stripSnippetMarkers(item.snippet)
+                  : renderMarkedSnippet(item.snippet, localSearchInput, displayScript)}
+              </span>
             </button>
           ))}
         </Space>
@@ -4576,7 +5092,11 @@ export default function SourcePageReader({
             {
               value: 'search',
               label: localSearchInput.trim()
-                ? `检索结果${searchDirectoryItemCount ? ` ${searchDirectoryItemCount}` : ''}`
+                ? (
+                  sessionEngineIsVector
+                    ? `向量命中${searchDirectoryItemCount ? ` ${searchDirectoryItemCount}` : ''}`
+                    : `检索结果${searchDirectoryItemCount ? ` ${searchDirectoryItemCount}` : ''}`
+                )
                 : `摘录${readerNotes.length ? ` ${readerNotes.length}` : ''}`,
             },
           ]}
@@ -4817,7 +5337,7 @@ export default function SourcePageReader({
                   setLiteratureCalibrateOpen(false)
                   const forwardCount = Math.max(0, (result.pages || []).filter((page) => page.page_num > result.anchorPhysical).length)
                   message.success(
-                    `已将影像第 ${result.anchorPhysical} 页标为文献第 ${result.anchorLiterature} 页`
+                    `已将自然页码第 ${result.anchorPhysical} 页标为文献页码第 ${result.anchorLiterature} 页`
                     + (forwardCount > 0 ? `，并向后自动顺延 ${forwardCount} 页` : ''),
                   )
                 } catch (error: unknown) {
@@ -4840,9 +5360,9 @@ export default function SourcePageReader({
             若改错了，可点「重置全文」清除手动标记并重新自动识别。
           </Text>
           <div>
-            <Text strong>当前影像页（只读）</Text>
+            <Text strong>当前自然页码（只读）</Text>
             <div style={{ marginTop: 6 }}>
-              影像 第 {literatureCalibratePhysical} / {literatureCalibrateImageTotal} 页
+              自然页码 第 {literatureCalibratePhysical} / {literatureCalibrateImageTotal} 页
             </div>
           </div>
           <div>
@@ -4863,7 +5383,7 @@ export default function SourcePageReader({
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, padding: '8px 16px', borderBottom: '1px solid rgba(255,255,255,0.06)', flexWrap: 'wrap' }}>
         <Space size={8} wrap>
           <Button size="small" icon={<BarsOutlined />} type={tocOpen ? 'primary' : 'default'} onClick={() => setTocOpen((value) => !value)}>目录</Button>
-          {/* Page numbers live on the paper only: top-right = 影像, bottom-left = 文献. */}
+          {/* Page numbers live on the paper only: top-right = 自然页码, bottom-left = 文献页码. */}
           {sourceLabel ? (
             <span
               title={
@@ -4991,31 +5511,61 @@ export default function SourcePageReader({
               </Button>
             </>
           ) : null}
-          <Input
-            data-reader-search-input="true"
-            size="small"
-            prefix={<SearchOutlined />}
-            allowClear
-            value={localSearchInput}
-            onChange={(event) => {
-              const nextKeyword = event.target.value
-              setLocalSearchInput(nextKeyword)
-              if (!nextKeyword) {
-                emittedLocalSearchKeywordRef.current = ''
-                localSearchEditedRef.current = true
-                setLocalSearchEdited(true)
-                localSearchCursorRef.current = -1
-                sessionSearchCursorRef.current = -1
-                setSearchCursor(-1)
-                setSessionSearchCursor(-1)
-                setReaderHighlightColor('')
-                onSearchKeywordChange?.('')
-              }
-            }}
-            onPressEnter={() => commitLocalSearch()}
-            placeholder="页内检索"
-            style={{ width: 170 }}
-          />
+          <Space.Compact size="small">
+            <Select
+              data-reader-search-engine="true"
+              value={localSearchEngine}
+              onChange={(value) => handleReaderSearchEngineChange(value as 'fulltext' | 'vector')}
+              style={{ width: 92 }}
+              popupMatchSelectWidth={120}
+              options={[
+                {
+                  value: 'fulltext',
+                  label: (
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      <FontSizeOutlined />
+                      文本
+                    </span>
+                  ),
+                },
+                {
+                  value: 'vector',
+                  label: (
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      <ThunderboltOutlined />
+                      向量
+                    </span>
+                  ),
+                },
+              ]}
+            />
+            <Input
+              data-reader-search-input="true"
+              size="small"
+              prefix={localSearchEngine === 'vector' ? <ThunderboltOutlined style={{ color: 'var(--gs-gold)' }} /> : <SearchOutlined />}
+              allowClear
+              value={localSearchInput}
+              onChange={(event) => {
+                const nextKeyword = event.target.value
+                setLocalSearchInput(nextKeyword)
+                if (!nextKeyword) {
+                  emittedLocalSearchKeywordRef.current = ''
+                  localSearchEditedRef.current = true
+                  setLocalSearchEdited(true)
+                  localSearchCursorRef.current = -1
+                  sessionSearchCursorRef.current = -1
+                  setSearchCursor(-1)
+                  setSessionSearchCursor(-1)
+                  setReaderHighlightColor('')
+                  onSearchKeywordChange?.('')
+                }
+              }}
+              onPressEnter={() => commitLocalSearch({ force: true })}
+              placeholder={localSearchEngine === 'vector' ? '语义检索' : '页内检索'}
+              style={{ width: 168 }}
+              title={localSearchEngine === 'vector' ? '本文献向量语义检索' : '本文献关键词检索'}
+            />
+          </Space.Compact>
           <Button size="small" title="上一处页内命中" icon={<LeftOutlined />} disabled={!canNavigateSearchHits} onClick={() => jumpToSearchHit(-1)} />
           <Text ref={searchCounterRef} data-reader-search-counter="true" style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{searchCounterText}</Text>
           <Button size="small" title="下一处页内命中" icon={<RightOutlined />} data-reader-search-next="true" disabled={!canNavigateSearchHits} onClick={() => jumpToSearchHit(1)} />
@@ -5115,6 +5665,7 @@ export default function SourcePageReader({
                   }}
                   displayScript={displayScript}
                   searchActiveOnly={false}
+                  activeSearchGlobalIndex={visibleSearchHitIndex}
                 />
               )}
             </div>

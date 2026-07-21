@@ -90,7 +90,7 @@ try {
   const ocrIpc = readFileSync(path.join(root, 'src/main/ipc/ocr.ts'), 'utf8')
   assert.ok(settingsView.includes('const [autoAi, setAutoAi] = useState(false)'))
   assert.ok(settingsView.includes("setAutoAi(settings.auto_ai_after_ocr === 'true')"))
-  assert.ok(ocrIpc.includes("if (autoAi?.value === 'true' && !hasFinalPendingPageFailure"))
+  assert.ok(ocrIpc.includes("if (autoAi?.value === 'true' && !hasFinalReviewPageFailure && hybridReadyForAutoAi)"))
 
   console.log('Shared task, error, and setting contract regression checks passed.')
 } finally {

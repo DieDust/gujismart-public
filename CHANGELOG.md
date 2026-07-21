@@ -2,6 +2,83 @@
 
 ## Unreleased
 
+## 1.1.10 - 2026-07-22
+
+### 中文
+
+#### 新增
+
+- **PDF 补回「仅登记路径」**：设置 → PDF 原件仓库可开启；补回时不整本复制进软件目录，大书更快；清理原图仍绝不删除外部源文件。
+- **OCR 错页短提示 + 鸟瞰定位**：文案形如「OCR完成，第 3、7-9 页 OCR 未成功」；鸟瞰页可筛选/跳转失败页。
+
+#### 修复
+
+- **OCR 单页失败不再拖垮整本**：未完成/失败页 settle 为页级复核，文献仍 `completed` 入库。
+- **「先 OCR 再向量」不重跑已 OCR 书**：仅缺正文时才自动飞桨。
+- **批量 OCR 连续性**：取消后槽位释放、按 `batch_size` 并发、单本墙钟超时跳过、排队与自动续跑更稳。
+- **导出页码模式**：支持「文献页码 / 自然页码」，默认文献页码。
+- **Toast 堆叠**：限制并发提示条数，避免刷屏。
+- **豆包视觉 OCR 连接测试**：探测图改为 32×32，避免「最短边 ≥ 14 像素」导致 HTTP 400。
+- **清理 OCR 原图**：仅删 `storage/{docId}/` 托管副本；链接原文/原件仓库永不删除。
+
+#### 下载
+
+- `GujiSmart-1.1.10-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.10-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- **Link-only PDF restore** option (register external path, no copy); cleanup still never deletes external originals.
+- **Short OCR failed-page notices** and birdseye jump/filter for failed pages.
+
+#### Fixed
+
+- **Page-level OCR failures no longer fail the whole document**.
+- **Vectorize-after-OCR skips books that already have OCR body**.
+- **Bulk OCR continuity**: cancel slot release, concurrency, per-doc wall timeout, resume.
+- **Export page-number mode**: literature vs natural; literature default.
+- **Toast stacking** capped.
+- **Doubao vision connection test** uses a 32×32 probe image (min 14px).
+- **Cleanup OCR assets** only removes managed `storage/{docId}/` files.
+
+#### Downloads
+
+- `GujiSmart-1.1.10-Setup-x64.exe`
+- `GujiSmart-1.1.10-Portable-x64.exe`
+
+## 1.1.8 - 2026-07-21
+
+### 中文
+
+#### 新增
+
+- **智能视图增强**：可自定义显示/隐藏分类；新增未向量化、向量排队、向量化中、向量失败；可与文件夹/标签组合筛选。
+- **文本向量化（当前仅正文）**：基于 OCR/校对正文建向量；「批量向量化 · 先 OCR(飞桨) 再向量」；停止队列/单本/所选；跳过已完成。
+- **文内向量检索与高亮**：从向量结果进入阅读后按语义命中导航；前 3 / 后 3 字锚定整段高亮；右上角可切换「文本 / 向量」并自动重搜。
+- **向量侧栏**：显示「向量命中」与相似度，不再误用关键词高亮/全文回落。
+- **向量证据导出**：导出含相似度分数与中文定位标签，不误走全文检索。
+
+#### 下载
+
+- `GujiSmart-1.1.8-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.8-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Added
+
+- **Smarter library smart views** with embedding status chips and compose filters.
+- **Text embeddings + OCR→embed pipeline**, queue cancel, skip-ready.
+- **In-document vector search** with paragraph highlight; reader toolbar text/vector mode switch.
+- **Vector evidence export** with similarity scores and Chinese locators.
+
+#### Downloads
+
+- `GujiSmart-1.1.8-Setup-x64.exe`
+- `GujiSmart-1.1.8-Portable-x64.exe`
+
 ## 1.1.7 - 2026-07-20
 
 ### 中文

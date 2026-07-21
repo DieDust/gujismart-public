@@ -1,9 +1,17 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { ConfigProvider, theme } from 'antd'
+import { ConfigProvider, message, theme } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import App from './App'
 import './styles/global.css'
+
+// Cap concurrent toasts so OCR/import/index progress never stacks into a wall of bubbles.
+// Same-key updates still replace in place; this only limits distinct keys.
+message.config({
+  maxCount: 3,
+  duration: 3,
+  top: 48,
+})
 
 type RendererErrorBoundaryState = {
   error: Error | null

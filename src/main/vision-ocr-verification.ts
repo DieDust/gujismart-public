@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import { nativeImage } from 'electron'
 import { queryOne, run, saveDatabase } from './database'
 import { readProtectedSetting } from './settings-security'
 import type { VisionOcrConnectionTestState } from '../shared/types'
@@ -11,7 +12,32 @@ interface VerificationRecord {
 type VerificationMap = Record<string, VerificationRecord>
 
 const VERIFICATION_SETTING_KEY = 'vision_ocr_connection_verifications_v1'
-const TEST_IMAGE_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n1AAAAAASUVORK5CYII='
+/**
+ * Doubao / Volcengine vision rejects tiny probe images:
+ * "Minimum allowed dimension: 14 pixels".
+ * Build a solid 32×32 PNG so connection tests pass provider size gates.
+ */
+function getVisionOcrTestImageDataUrl(): string {
+  const width = 32
+  const height = 32
+  const buffer = Buffer.alloc(width * height * 4)
+  for (let index = 0; index < width * height; index += 1) {
+    // BGRA: light blue block (visible, non-transparent).
+    buffer[index * 4] = 210
+    buffer[index * 4 + 1] = 160
+    buffer[index * 4 + 2] = 70
+    buffer[index * 4 + 3] = 255
+  }
+  const image = nativeImage.createFromBitmap(buffer, { width, height })
+  if (image.isEmpty()) {
+    throw new Error('无法生成视觉 OCR 连接测试图')
+  }
+  const size = image.getSize()
+  if (size.width < 14 || size.height < 14) {
+    throw new Error(`视觉 OCR 连接测试图尺寸无效：${size.width}×${size.height}`)
+  }
+  return image.toDataURL()
+}
 
 function readSetting(key: string): string {
   return String(queryOne<{ value?: string | null }>('SELECT value FROM settings WHERE key = ?', [key])?.value || '')
@@ -113,6 +139,7 @@ export async function testVisionOcrConnection(baseUrl: string, model: string, ap
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 45_000)
   try {
+    const testImageDataUrl = getVisionOcrTestImageDataUrl()
     const response = await fetch(`${normalizedBaseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -125,7 +152,7 @@ export async function testVisionOcrConnection(baseUrl: string, model: string, ap
           role: 'user',
           content: [
             { type: 'text', text: 'This is a connection test. Briefly describe the image.' },
-            { type: 'image_url', image_url: { url: TEST_IMAGE_DATA_URL } },
+            { type: 'image_url', image_url: { url: testImageDataUrl } },
           ],
         }],
         max_tokens: 16,

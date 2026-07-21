@@ -1,6 +1,8 @@
 import { ipcMain } from 'electron'
 import { writeProtectedSetting, revokeProtectedSetting } from '../settings-security'
 import {
+  cancelAllPendingEmbeddings,
+  cancelDocumentsForEmbedding,
   enqueueDocumentsForEmbedding,
   getEmbeddingApiKey,
   getEmbeddingBaseUrl,
@@ -81,12 +83,22 @@ export function registerEmbeddingIpc(): void {
     setEmbeddingQueuePaused(Boolean(paused)),
   )
 
+  ipcMain.handle('embedding:cancelDocuments', async (_event, docIds: string[]) => {
+    const result = cancelDocumentsForEmbedding(Array.isArray(docIds) ? docIds.map(String) : [])
+    return { ...result, stats: getEmbeddingIndexStats() }
+  })
+
+  ipcMain.handle('embedding:cancelAllPending', async () => {
+    const result = cancelAllPendingEmbeddings()
+    return { ...result, stats: getEmbeddingIndexStats() }
+  })
+
   ipcMain.handle(
     'embedding:search',
     async (
       _event,
       query: string,
-      options?: { limit?: number; folderId?: string; tagId?: string },
+      options?: { limit?: number; folderId?: string; tagId?: string; docId?: string },
     ) => vectorSearch(String(query || ''), options),
   )
 

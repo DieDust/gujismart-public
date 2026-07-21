@@ -74,12 +74,14 @@ assert(
   documentsSource.includes('function getDocumentListOcrPageSummaries')
     && documentsSource.includes('function isDocumentListOcrSettledWithReviewPages')
     && documentsSource.includes('function getDocumentListOcrReviewMessage')
+    && documentsSource.includes('function listDocumentListOcrFailedPageNums')
+    && documentsSource.includes('OCR完成，第 ${pageList} 页 OCR 未成功')
     && documentsSource.includes("return doc.ocr_status === 'error' || doc.import_status === 'error'")
     && documentsSource.includes('summary.pending === 0')
     && documentsSource.includes('summary.failed > 0')
     && documentsSource.includes("ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?")
     && documentsSource.includes('reviewMessage.slice(0, 1000)'),
-  'document list normalization should migrate old document-level OCR failures with only settled page errors into completed review warnings.',
+  'document list normalization should migrate old document-level OCR failures with only settled page errors into short completed review warnings.',
 )
 
 assert(
@@ -87,9 +89,10 @@ assert(
     && libraryViewSource.includes("return doc.ocr_status === 'completed' && doc.import_status === 'processed'")
     && libraryViewSource.includes('if (shouldShowDocumentReviewMessage(doc, info)) return false')
     && libraryViewSource.includes('patch.error_message = data.errorMessage || null')
-    && libraryViewSource.includes('页面待复核：{doc.error_message}')
+    && libraryViewSource.includes('{doc.error_message}')
+    && libraryViewSource.includes('shouldShowDocumentReviewMessage')
     && libraryViewSource.includes('OCR 已保存：${data.errorMessage}'),
-  'Library cards should show completed OCR page-level issues as review warnings instead of clearing them or rendering failure banners.',
+  'Library cards should show completed OCR page-level issues as short review warnings instead of clearing them or rendering failure banners.',
 )
 
 console.log('Library OCR incomplete filter regression passed.')

@@ -15,7 +15,7 @@ import { attachCanonicalPageContent } from './canonical-content'
 import { writeAtomicExport } from './atomic-export-writer'
 import { persistExportArtifact, persistExportSnapshot } from './export-snapshots'
 import { recomputeLiteraturePageMap } from './literature-page-map'
-import type { Document, DocumentExportFormat, DocumentExportOptions, DocumentPage } from '../shared/types'
+import type { Document, DocumentExportFormat, DocumentExportOptions, DocumentPage, ExportPageNumberMode } from '../shared/types'
 
 marked.setOptions({
   gfm: true,
@@ -26,12 +26,25 @@ const MAX_VISUAL_PDF_PAGES = 160
 
 interface ExportPage extends DocumentPage {}
 
-/** Prefer continuity-resolved literature page for human-facing export labels. */
-function exportDisplayPageNum(page: Pick<ExportPage, 'page_num' | 'literature_page_num'>): number {
+/**
+ * Page labels for export files.
+ * - literature (default): 文献页码 — printed/calibrated continuous page; falls back to natural if missing
+ * - natural: 自然页码 — physical PDF/scan sheet index
+ */
+function exportDisplayPageNum(
+  page: Pick<ExportPage, 'page_num' | 'literature_page_num'>,
+  mode: ExportPageNumberMode = 'literature',
+): number {
+  const physical = Number(page.page_num || 0)
+  const natural = Number.isFinite(physical) && physical > 0 ? Math.floor(physical) : 0
+  if (mode === 'natural') return natural
   const literature = Number(page.literature_page_num || 0)
   if (Number.isFinite(literature) && literature > 0) return Math.floor(literature)
-  const physical = Number(page.page_num || 0)
-  return Number.isFinite(physical) && physical > 0 ? Math.floor(physical) : 0
+  return natural
+}
+
+function resolveExportPageNumberMode(options?: DocumentExportOptions | null): ExportPageNumberMode {
+  return options?.pageNumberMode === 'natural' ? 'natural' : 'literature'
 }
 
 interface ExportPageOcrVersion {
@@ -1020,11 +1033,11 @@ function imagePathToDataUrl(filePath?: string | null): string {
   return `data:${getMimeType(resolvedPath)};base64,${buffer.toString('base64')}`
 }
 
-function buildFullText(pages: ExportPage[]): string {
+function buildFullText(pages: ExportPage[], mode: ExportPageNumberMode = 'literature'): string {
   return pages
     .map((page) => {
       const text = getPageText(page)
-      return text ? `\n\n=== 第 ${exportDisplayPageNum(page)} 页 ===\n\n${text}` : ''
+      return text ? `\n\n=== 第 ${exportDisplayPageNum(page, mode)} 页 ===\n\n${text}` : ''
     })
     .join('')
     .trim()
@@ -1138,10 +1151,11 @@ function getReadingExportHtml(title: string, pages: ExportPage[], metadata: Json
   const fontSize = clampNumber(options.readingFontSize, 17, 13, 26)
   const lineHeight = clampNumber(options.readingLineHeight, 1.9, 1.3, 2.4)
   const pageWidth = clampNumber(options.readingPageWidth, 520, 380, 680)
+  const pageNumberMode = resolveExportPageNumberMode(options)
   const pageHtml = pages.map((page) => {
     const content = getReadingPageContentHtml(page, options)
     return `<section class="reader-page">
-      <div class="reader-page-marker">第 ${exportDisplayPageNum(page)} 页</div>
+      <div class="reader-page-marker">第 ${exportDisplayPageNum(page, pageNumberMode)} 页</div>
       ${content}
     </section>`
   }).join('\n')
@@ -1230,7 +1244,13 @@ function getReadingExportHtml(title: string, pages: ExportPage[], metadata: Json
 </html>`
 }
 
-function getGujiExportHtml(title: string, pages: ExportPage[], metadata: JsonRecord): string {
+function getGujiExportHtml(
+  title: string,
+  pages: ExportPage[],
+  metadata: JsonRecord,
+  options: ExportOptions = {},
+): string {
+  const pageNumberMode = resolveExportPageNumberMode(options)
   const pageHtml = pages.map((page) => {
     const blocks = getSortedLayoutBlocks(page)
     const bounds = getPageBounds(blocks, page)
@@ -1248,7 +1268,7 @@ function getGujiExportHtml(title: string, pages: ExportPage[], metadata: JsonRec
     }).join('\n')
 
     return `<section class="guji-page">
-      <div class="guji-page-header"><span>第 ${exportDisplayPageNum(page)} 页</span><span class="status">${proofStatus}</span></div>
+      <div class="guji-page-header"><span>第 ${exportDisplayPageNum(page, pageNumberMode)} 页</span><span class="status">${proofStatus}</span></div>
       <div class="guji-canvas" style="aspect-ratio:${bounds.width} / ${bounds.height};">
         ${imageUrl ? `<img class="guji-image" src="${imageUrl}" alt="page-${page.page_num}" />` : ''}
         <div class="guji-overlay">${blocksHtml}</div>
@@ -2559,7 +2579,8 @@ async function renderExportDocument(
   const metadataObj = parseMaybeJson<JsonRecord>(doc.metadata, {})
   const metadataSource = metadataText(metadataObj, 'source')
   const metadataVersion = metadataText(metadataObj, 'version')
-  const fullText = buildFullText(pages)
+  const pageNumberMode = resolveExportPageNumberMode(options)
+  const fullText = buildFullText(pages, pageNumberMode)
   const docTitle = String(doc.title || '文献内容')
   const isGuji = doc.doc_type === '古籍' || doc.doc_type === '\u53e4\u7c4d'
 
@@ -2618,7 +2639,7 @@ async function renderExportDocument(
 
   if (format === 'html') {
     const htmlContent = isGuji
-      ? getGujiExportHtml(docTitle, pages, { ...metadataObj, author: doc.author, dynasty: doc.dynasty, version: metadataVersion, source: metadataSource })
+      ? getGujiExportHtml(docTitle, pages, { ...metadataObj, author: doc.author, dynasty: doc.dynasty, version: metadataVersion, source: metadataSource }, options)
       : getStandardExportHtml(docTitle, fullText, { ...metadataObj, author: doc.author, dynasty: doc.dynasty, source: metadataSource })
     writeFileSync(exportPath, htmlContent, 'utf-8')
     return true

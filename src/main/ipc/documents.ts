@@ -114,6 +114,7 @@ import type {
   PageTranslationCacheItem,
   PageTranslationCachePayload,
   PdfAssetCleanupResult,
+  PdfAssetRestoreOptions,
   PdfAssetRestoreResult,
   PdfRepositoryIndexResult,
   PdfRepositoryStatus,
@@ -2931,12 +2932,42 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
   if (options?.favoritesOnly) {
     conditions.push('d.is_favorite = 1')
   }
-  if (options?.embeddingReady) {
-    // Only documents that finished embedding successfully (vector library ready).
+  const embeddingFilter = options?.embeddingFilter
+    || (options?.embeddingReady ? 'ready' as const : undefined)
+  if (embeddingFilter === 'ready') {
     conditions.push(
       `EXISTS (
         SELECT 1 FROM embedding_index_status eis
         WHERE eis.doc_id = d.id AND eis.status = 'ready'
+      )`,
+    )
+  } else if (embeddingFilter === 'not_ready') {
+    // No successful vector index (never embedded, pending, queued, processing, or error).
+    conditions.push(
+      `NOT EXISTS (
+        SELECT 1 FROM embedding_index_status eis
+        WHERE eis.doc_id = d.id AND eis.status = 'ready'
+      )`,
+    )
+  } else if (embeddingFilter === 'queued') {
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM embedding_index_status eis
+        WHERE eis.doc_id = d.id AND eis.status = 'queued'
+      )`,
+    )
+  } else if (embeddingFilter === 'processing') {
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM embedding_index_status eis
+        WHERE eis.doc_id = d.id AND eis.status = 'processing'
+      )`,
+    )
+  } else if (embeddingFilter === 'error') {
+    conditions.push(
+      `EXISTS (
+        SELECT 1 FROM embedding_index_status eis
+        WHERE eis.doc_id = d.id AND eis.status = 'error'
       )`,
     )
   }
@@ -3823,12 +3854,55 @@ function isDocumentListOcrSettledWithReviewPages(doc: DocumentListItem, summary?
     && summary.completed + summary.failed >= expectedPages
 }
 
+/** Compact page list for short review notices: 3、7-9、12 */
+function formatDocumentListFailedPageNumberList(pageNums: Array<number | null | undefined>): string {
+  const nums = [...new Set(
+    pageNums
+      .map((value) => Number(value || 0))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Math.floor(value)),
+  )].sort((left, right) => left - right)
+  if (nums.length === 0) return ''
+  const parts: string[] = []
+  let rangeStart = nums[0]
+  let rangeEnd = nums[0]
+  for (let index = 1; index <= nums.length; index += 1) {
+    const current = nums[index]
+    if (current === rangeEnd + 1) {
+      rangeEnd = current
+      continue
+    }
+    parts.push(rangeStart === rangeEnd ? `${rangeStart}` : `${rangeStart}-${rangeEnd}`)
+    rangeStart = current
+    rangeEnd = current
+  }
+  return parts.join('、')
+}
+
+function listDocumentListOcrFailedPageNums(docId: string): number[] {
+  const rows = queryAll<{ page_num: number | null }>(
+    `SELECT page_num
+     FROM pages
+     WHERE doc_id = ? AND ocr_status = 'error'
+     ORDER BY page_num`,
+    [docId],
+  )
+  return rows
+    .map((row) => Math.floor(Number(row.page_num || 0)))
+    .filter((value) => Number.isFinite(value) && value > 0)
+}
+
 function getDocumentListOcrReviewMessage(doc: DocumentListItem): string {
   const existingMessage = String(doc.error_message || '').trim()
-  if (existingMessage.includes('部分页面 OCR 需要复核')) return existingMessage
+  // Keep already-short notices written by OCR completion path.
+  if (/^OCR完成[，,]/.test(existingMessage) && /OCR 未成功/.test(existingMessage)) {
+    return existingMessage
+  }
+  const pageList = formatDocumentListFailedPageNumberList(listDocumentListOcrFailedPageNums(doc.id))
+  if (pageList) return `OCR完成，第 ${pageList} 页 OCR 未成功`
   return existingMessage
-    ? `部分页面 OCR 需要复核，文献已按识别完成保存：${existingMessage}`
-    : '部分页面 OCR 需要复核，文献已按识别完成保存。'
+    ? `OCR完成，部分页面 OCR 未成功`
+    : 'OCR完成，部分页面 OCR 未成功'
 }
 
 function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): DocumentListItem[] {
@@ -5508,27 +5582,33 @@ export function registerDocumentIpc(): void {
     return indexPdfRepositoriesAsync()
   })
 
-  ipcMain.handle('pdfRepository:restoreForDocument', async (_event, docId: string): Promise<PdfAssetRestoreResult> => {
-    return restorePdfAssetForDocumentAsync(docId)
-  })
+  ipcMain.handle(
+    'pdfRepository:restoreForDocument',
+    async (_event, docId: string, options?: PdfAssetRestoreOptions): Promise<PdfAssetRestoreResult> => {
+      return restorePdfAssetForDocumentAsync(docId, undefined, undefined, options)
+    },
+  )
 
-  ipcMain.handle('pdfRepository:selectAndRestoreForDocument', async (event, docId: string): Promise<PdfAssetRestoreResult> => {
-    const result = await dialog.showOpenDialog({
-      title: '选择要补回的 PDF 原件',
-      filters: [{ name: 'PDF 文档', extensions: ['pdf'] }],
-      properties: ['openFile'],
-    })
-    if (result.canceled || result.filePaths.length === 0) return { restored: false, error: '未选择 PDF 文件' }
-    const grants = await fileCapabilityService.issueTrustedPaths({
-      ownerId: event.sender.id,
-      purpose: 'pdf-restore',
-      paths: [result.filePaths[0]],
-      kind: 'file',
-      consumeMode: 'once',
-    })
-    const manualPath = await fileCapabilityService.consumeFile(event.sender.id, grants[0].grantId, 'pdf-restore')
-    return restorePdfAssetForDocumentAsync(docId, manualPath)
-  })
+  ipcMain.handle(
+    'pdfRepository:selectAndRestoreForDocument',
+    async (event, docId: string, options?: PdfAssetRestoreOptions): Promise<PdfAssetRestoreResult> => {
+      const result = await dialog.showOpenDialog({
+        title: '选择要补回的 PDF 原件',
+        filters: [{ name: 'PDF 文档', extensions: ['pdf'] }],
+        properties: ['openFile'],
+      })
+      if (result.canceled || result.filePaths.length === 0) return { restored: false, error: '未选择 PDF 文件' }
+      const grants = await fileCapabilityService.issueTrustedPaths({
+        ownerId: event.sender.id,
+        purpose: 'pdf-restore',
+        paths: [result.filePaths[0]],
+        kind: 'file',
+        consumeMode: 'once',
+      })
+      const manualPath = await fileCapabilityService.consumeFile(event.sender.id, grants[0].grantId, 'pdf-restore')
+      return restorePdfAssetForDocumentAsync(docId, manualPath, undefined, options)
+    },
+  )
 
   ipcMain.handle('pages:update', async (_event, pageId: string, data: PageUpdatePayload) => {
     rejectProtectedPathFields(data, ['image_path'])

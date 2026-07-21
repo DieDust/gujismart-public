@@ -1,6 +1,6 @@
 {
   "name": "gujismart",
-  "version": "1.1.7",
+  "version": "1.1.10",
   "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
   "main": "./out/main/index.js",
   "author": "DieDust",
@@ -151,7 +151,7 @@
     "antd": "^5.24.0",
     "archiver": "^8.0.0",
     "better-sqlite3": "^12.10.0",
-    "brace-expansion": "^5.0.6",
+    "brace-expansion": "^5.0.7",
     "epubjs": "^0.3.93",
     "extract-zip": "^2.0.1",
     "fast-xml-parser": "^5.8.0",
@@ -256,6 +256,7 @@
   },
   "overrides": {
     "@xmldom/xmldom": "^0.9.10",
-    "esbuild": "^0.28.1"
+    "esbuild": "^0.28.1",
+    "brace-expansion": "^5.0.7"
   }
 }

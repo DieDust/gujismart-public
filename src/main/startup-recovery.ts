@@ -841,8 +841,9 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     message: '正在接续未完成的删除任务',
   })
   deletingDocuments = resumeInterruptedDocumentDeletes()
-  // Count interrupted batch items, but do not start OCR/batch workers during recovery.
-  // Immediate resume competes with the first library paint and freezes large installs.
+  // Count interrupted batch items only. Actual worker start is deferred in main
+  // (BATCH_OCR_RESUME_DELAY_MS) so first paint stays responsive; bulk OCR then
+  // continues automatically without requiring a manual click.
   const pendingBatchRows = queryAll<{ id: string; batch_id: string | null }>(
     `SELECT b.id, b.batch_id
      FROM batch_queue b
@@ -857,10 +858,8 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     skippedItems: 0,
   }
   if (pendingBatchRows.length > 0) {
-    // Leave batch OCR queued after open. Auto-resume of 100+ items still causes
-    // perceived freezes while the library list is loading. Manual continue only.
     console.log(
-      `[Startup Recovery] ${pendingBatchRows.length} batch OCR item(s) left queued (not auto-started on open)`,
+      `[Startup Recovery] ${pendingBatchRows.length} batch OCR item(s) queued for deferred auto-resume after interactive grace`,
     )
   }
 

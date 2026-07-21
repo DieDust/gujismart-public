@@ -524,6 +524,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [autoOcr, setAutoOcr] = useState(true)
   const [autoAi, setAutoAi] = useState(false)
   const [autoDeletePdfAssets, setAutoDeletePdfAssets] = useState(false)
+  const [pdfRestoreLinkOnly, setPdfRestoreLinkOnly] = useState(false)
   const [preferFacsimileProofLayout, setPreferFacsimileProofLayout] = useState(true)
   const [preferReadModeOnOpen, setPreferReadModeOnOpen] = useState(true)
   const [metadataTagBindingEnabled, setMetadataTagBindingEnabled] = useState(false)
@@ -704,6 +705,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
           paddleocr_api_key: '',
           ocr_async_model: settings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : settings.ocr_async_model || 'PaddleOCR-VL-1.6',
           ocr_upload_timeout_seconds: settings.ocr_upload_timeout_seconds || '3600',
+          ocr_document_timeout_minutes: settings.ocr_document_timeout_minutes || '45',
           ocr_max_image_side: settings.ocr_max_image_side || '2200',
           ocr_jpeg_quality: settings.ocr_jpeg_quality || '82',
           local_paddle_ocr_size: settings.local_paddle_ocr_size || DEFAULT_LOCAL_PADDLE_OCR_SIZE,
@@ -749,6 +751,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         setAutoOcr(settings.auto_ocr_after_import !== 'false')
         setAutoAi(settings.auto_ai_after_ocr === 'true')
         setAutoDeletePdfAssets(settings.auto_delete_pdf_assets_after_ocr === 'true')
+        setPdfRestoreLinkOnly(settings.pdf_restore_link_only === 'true')
         setPreferFacsimileProofLayout(settings.prefer_facsimile_proof_layout !== 'false')
         setPreferReadModeOnOpen(settings.prefer_read_mode_on_open !== 'false')
         const nextMetadataTagBindingEnabled = settings.metadata_tag_binding_enabled === 'true'
@@ -1359,6 +1362,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
       await window.api.setSetting('auto_ocr_after_import', autoOcr ? 'true' : 'false')
       await window.api.setSetting('auto_ai_after_ocr', autoAi ? 'true' : 'false')
       await window.api.setSetting('auto_delete_pdf_assets_after_ocr', autoDeletePdfAssets ? 'true' : 'false')
+      await window.api.setSetting('pdf_restore_link_only', pdfRestoreLinkOnly ? 'true' : 'false')
       await window.api.setSetting('prefer_facsimile_proof_layout', preferFacsimileProofLayout ? 'true' : 'false')
       await window.api.setSetting('prefer_read_mode_on_open', preferReadModeOnOpen ? 'true' : 'false')
       const nextMetadataTagBindingEnabled = metadataTagBindingEnabledRef.current
@@ -1444,6 +1448,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     batchSize,
     form,
     paddleOcrTokenPool.configuredCount,
+    pdfRestoreLinkOnly,
     preferFacsimileProofLayout,
     preferReadModeOnOpen,
     retryCount,
@@ -2496,6 +2501,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         <Form.Item label="上传超时（秒）" name="ocr_upload_timeout_seconds" extra="填 0 表示不限制客户端上传时长。">
           <InputNumber min={0} max={86400} step={60} style={{ width: '100%' }} />
         </Form.Item>
+        <Form.Item label="单本 OCR 超时（分钟）" name="ocr_document_timeout_minutes" extra="单本超时则跳过并继续其他书；0=不限制。默认 45。">
+          <InputNumber min={0} max={720} step={5} style={{ width: '100%' }} />
+        </Form.Item>
         <Form.Item label="图片上传最长边" name="ocr_max_image_side" extra="越大越清晰，但上传更慢。">
           <InputNumber min={800} max={4096} step={100} style={{ width: '100%' }} />
         </Form.Item>
@@ -2771,7 +2779,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               <div>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>OCR 完成后自动删除 PDF 原图</Text>
                 <br />
-                <Text type="secondary" style={{ fontSize: 13 }}>只清理软件数据目录里的 PDF 副本和页图缓存；PDF 原件仓库中的文件只读不动。</Text>
+                <Text type="secondary" style={{ fontSize: 13 }}>
+                  只删除软件数据目录（storage）内的 PDF 副本和页图；绝不删除 PDF 原件仓库、NAS 或「仅登记路径」指向的外部源文件。
+                </Text>
               </div>
               <Switch checked={autoDeletePdfAssets} onChange={(checked) => { setAutoDeletePdfAssets(checked); markSettingsDirty() }} />
             </div>
@@ -2858,9 +2868,25 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               type="info"
               showIcon
               style={{ marginBottom: 16 }}
-              message="PDF 原件仓库只会被读取和复制"
-              description="可以添加 NAS、移动硬盘或资料库目录，软件会只读扫描并匹配已导入文献的 PDF 原件。"
+              message="PDF 原件仓库只会被读取；补回时默认复制进软件目录"
+              description="可以添加 NAS、移动硬盘或资料库目录，软件会只读扫描并匹配已导入文献的 PDF 原件。开启下方「仅登记路径」后，补回不再复制大文件，速度会快很多，但依赖外盘/NAS 保持可访问。"
             />
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, paddingBottom: 16, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+              <div style={{ minWidth: 0, paddingRight: 12 }}>
+                <Text strong style={{ color: 'var(--gs-text-primary)' }}>补回原文时仅登记路径（不复制）</Text>
+                <br />
+                <Text type="secondary" style={{ fontSize: 13 }}>
+                  开启后：从仓库或手动选择 PDF 补回时，只把外部路径登记到文献，不再整本拷贝进软件目录。大书可秒开；外盘拔掉或文件移动后需重新补回。关闭则为稳妥复制模式。
+                </Text>
+              </div>
+              <Switch
+                checked={pdfRestoreLinkOnly}
+                onChange={(checked) => {
+                  setPdfRestoreLinkOnly(checked)
+                  markSettingsDirty()
+                }}
+              />
+            </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 12 }}>
               <div>
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>
@@ -2879,7 +2905,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                   立即扫描
                 </Button>
                 <Popconfirm
-                  title="只会删除软件目录内的 PDF 副本和页图缓存，不会修改 PDF 原件仓库。确定清理已完成 OCR 的 PDF 原图吗？"
+                  title="只会删除软件数据目录内的 PDF 副本和页图缓存。绝不删除 PDF 原件仓库、NAS 或链接的外部源文件。确定清理已完成 OCR 的 PDF 原图吗？"
                   okText="清理"
                   cancelText="取消"
                   onConfirm={() => void handleCleanupCompletedPdfAssets()}
@@ -3397,6 +3423,13 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             </Form.Item>
             <Form.Item label="上传超时（秒）" name="ocr_upload_timeout_seconds" extra="用于飞桨 OCR 图片和 PDF 分片上传；填 0 表示不限制客户端上传时长，适合批量大文件。">
               <InputNumber min={0} max={86400} step={60} style={{ width: 140 }} />
+            </Form.Item>
+            <Form.Item
+              label="单本 OCR 超时（分钟）"
+              name="ocr_document_timeout_minutes"
+              extra="单本书超过该时间仍未完成时会跳过并继续下一批，避免一本卡死堵住队列。默认 45 分钟；填 0 表示不限制；超过 300 页会自动略微加时，最长 12 小时。"
+            >
+              <InputNumber min={0} max={720} step={5} style={{ width: 140 }} />
             </Form.Item>
             <Form.Item label="图片上传最长边" name="ocr_max_image_side" extra="飞桨 OCR 单页图片上传前会按最长边压缩；越大越清晰，但上传更慢。">
               <InputNumber min={800} max={4096} step={100} style={{ width: 140 }} />

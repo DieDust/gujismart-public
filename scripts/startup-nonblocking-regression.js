@@ -103,26 +103,30 @@ assert(
 assert(
   mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 45_000')
     && mainIndex.includes('const IMPORT_AUTO_OCR_RESUME_DELAY_MS = 15_000')
+    && mainIndex.includes('const BATCH_OCR_RESUME_DELAY_MS = 25_000')
     && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowManagedFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex)
     && mainIndex.includes('resumePendingImportAutoOcrTasks(sender)')
-    && !/did-finish-load[\s\S]{0,220}resumePendingImportAutoOcrTasks\(mainWindow\.webContents\)/.test(mainIndex),
-  'Startup resource allow-list preloading and import auto-OCR resume should be delayed so large libraries do not block the first window.',
+    && mainIndex.includes('batchProcessor.resumePendingQueueFromDatabase()')
+    && !/did-finish-load[\s\S]{0,220}resumePendingImportAutoOcrTasks\(mainWindow\.webContents\)/.test(mainIndex)
+    && !/did-finish-load[\s\S]{0,220}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(mainIndex),
+  'Startup resource allow-list preloading and bulk OCR resume should be delayed so large libraries do not block the first window.',
 )
 assert(
   ocrIpc.includes('export function resumePendingImportAutoOcrTasks')
-    && ocrIpc.includes('left queued (not auto-started on open)')
+    && ocrIpc.includes('startAllResumableImportAutoOcrTasks')
+    && ocrIpc.includes('auto-started')
     && ocrIpc.includes('runBoundedDocumentWorkers')
     && ocrIpc.includes('limit: concurrency')
     && !ocrIpc.includes('Math.min(200, Math.max(1, config.batchSize))')
-    && /export function resumePendingImportAutoOcrTasks[\s\S]{0,900}return 0/.test(ocrIpc),
-  'Import-auto OCR open path may only repair leases and must not auto-start the full queue; workers stay bounded.',
+    && /export function resumePendingImportAutoOcrTasks[\s\S]{0,1200}startAllResumableImportAutoOcrTasks/.test(ocrIpc),
+  'Import-auto OCR should auto-start after interactive grace with bounded workers so large batches continue after restart.',
 )
 assert(
   startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 8_000')
-    && startupRecovery.includes('left queued (not auto-started on open)')
+    && startupRecovery.includes('deferred auto-resume after interactive grace')
     && !/setTimeout\(\(\) => \{[\s\S]{0,260}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery)
     && !/runStartupRecovery[\s\S]{0,4000}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery),
-  'Batch OCR must stay queued after open recovery; auto-start of large queues freezes the first paint.',
+  'Batch OCR must not start inside open recovery; deferred main-process resume continues bulk OCR without freezing first paint.',
 )
 assert(
   database.includes('export function runDeferredStartupDatabaseMaintenance')
@@ -209,9 +213,9 @@ assert(
 assert(
   finalPreResumeCheckpoint > runStartupRecoveryStart
     && resumeDeletes > finalPreResumeCheckpoint
-    && startupRecovery.includes('left queued (not auto-started on open)')
+    && startupRecovery.includes('deferred auto-resume after interactive grace')
     && !startupRecovery.includes('batchProcessor.resumePendingQueueFromDatabase()'),
-  'Startup recovery must not auto-start batch OCR on the open path; leave items queued for manual continue.',
+  'Startup recovery must not auto-start batch OCR on the open path; deferred main resume continues bulk OCR later.',
 )
 assert(
   startupRecovery.includes('function findRecoveredOcrDocumentsNeedingSearchIndex(candidateDocIds: string[])')
@@ -301,19 +305,21 @@ assert(
 )
 assert(
   ocrIpc.includes('export async function shutdownOcrRuntime')
-    && ocrIpc.includes('activeOcrTasks.forEach((task) => task.controller.abort())')
+    && ocrIpc.includes('forceReleaseAllActiveOcrTasks()')
     && ocrIpc.includes('await waitForOcrShutdown(activeDoneTasks, timeoutMs)'),
-  'OCR runtime shutdown should abort active OCR tasks and wait briefly for their cleanup.',
+  'OCR runtime shutdown should force-release active OCR tasks and wait briefly for their cleanup.',
 )
 assert(
   ocrIpc.includes('done: Promise<void>')
-    && ocrIpc.includes('activeOcrTasks.set(docId, { controller, done })')
-    && ocrIpc.includes('resolveDone()'),
-  'Active OCR tasks should expose a completion promise for clean shutdown.',
+    && ocrIpc.includes('finish: () => void')
+    && ocrIpc.includes('createActiveOcrTask')
+    && ocrIpc.includes('activeOcrTasks.set(docId, activeTask)')
+    && ocrIpc.includes('activeTask.finish()'),
+  'Active OCR tasks should expose a completion promise and finish() for clean cancel/shutdown.',
 )
 assert(
   ocrIpc.includes('function shouldPersistBatchOcrForRecovery')
-    && ocrIpc.includes("engine === 'paddle' && options?.forceFullRerun !== true")
+    && ocrIpc.includes('function shouldPersistBatchOcrForRecovery(_options?: BatchOcrOptions): boolean {\n  return true\n}')
     && ocrIpc.includes('function createRecoverableBatchOcrItems')
     && recoverableBatchOcrItemsBody.includes('createLegacyBatchTask(uniqueDocIds, batchSize')
     && !recoverableBatchOcrItemsBody.includes('INSERT INTO batch_queue')
@@ -325,7 +331,7 @@ assert(
     && ocrIpc.includes("updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
     && ocrIpc.includes('!ocrRuntimeShuttingDown')
     && ocrIpc.includes("result.success ? 'completed' : 'failed'"),
-  'Paddle batch OCR should persist through the shared scheduler in chunks, run a bounded worker pool, and release leases on shutdown.',
+  'All batch OCR should persist for recovery, run a bounded worker pool, and release leases on shutdown so large uploads survive restarts.',
 )
 assert(
   batchProcessor.includes('async shutdownRuntime')

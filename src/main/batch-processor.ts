@@ -92,27 +92,83 @@ function getTextFromUnknown(value: unknown): string {
   return ''
 }
 
+/** Compact page list: 3、7-9、12 */
+function formatBatchOcrFailedPageNumberList(pageNums: Array<number | null | undefined>): string {
+  const nums = [...new Set(
+    pageNums
+      .map((value) => Number(value || 0))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .map((value) => Math.floor(value)),
+  )].sort((left, right) => left - right)
+  if (nums.length === 0) return ''
+  const parts: string[] = []
+  let rangeStart = nums[0]
+  let rangeEnd = nums[0]
+  for (let index = 1; index <= nums.length; index += 1) {
+    const current = nums[index]
+    if (current === rangeEnd + 1) {
+      rangeEnd = current
+      continue
+    }
+    parts.push(rangeStart === rangeEnd ? `${rangeStart}` : `${rangeStart}-${rangeEnd}`)
+    rangeStart = current
+    rangeEnd = current
+  }
+  return parts.join('、')
+}
+
 function getBatchDocumentOcrReviewMessage(docId: string): string {
-  const rows = queryAll<{ page_num: number | null; ocr_result: string | null }>(
-    `SELECT page_num, ocr_result
+  const rows = queryAll<{ page_num: number | null }>(
+    `SELECT page_num
      FROM pages
      WHERE doc_id = ? AND ocr_status = 'error'
-     ORDER BY page_num
-     LIMIT 3`,
+     ORDER BY page_num`,
     [docId],
   )
-  const messages = rows
-    .map((row) => {
-      const parsed = parseJsonRecord(row.ocr_result)
-      const errorMessage = String(parsed?.error || parsed?.message || '').trim()
-      return errorMessage
-        ? `第 ${row.page_num || '?'} 页：${errorMessage}`
-        : `第 ${row.page_num || '?'} 页 OCR 需要复核`
-    })
-    .filter(Boolean)
-  return messages.length > 0
-    ? `部分页面 OCR 需要复核，文献已按识别完成保存：${messages.join('；')}`
-    : '部分页面 OCR 需要复核，文献已按识别完成保存。'
+  const pageList = formatBatchOcrFailedPageNumberList(rows.map((row) => row.page_num))
+  return pageList
+    ? `OCR完成，第 ${pageList} 页 OCR 未成功`
+    : 'OCR完成，部分页面 OCR 未成功'
+}
+
+/**
+ * Turn leftover incomplete pages into settled `error` pages so the document can
+ * still complete/入库. Page-level failures must not fail the whole book.
+ */
+function buildIncompleteBatchOcrReviewResults(docId: string): OcrPageResult[] {
+  const needsWrite = queryAll<{ id: string; page_num: number | null }>(
+    `SELECT id, page_num
+     FROM pages
+     WHERE doc_id = ?
+       AND (
+         ocr_status IS NULL
+         OR ocr_status IN ('pending', 'queued', 'processing')
+       )
+     ORDER BY page_num`,
+    [docId],
+  )
+  return needsWrite.map((row) => {
+    const error = `第 ${row.page_num || '?'} 页 OCR 未成功`
+    return {
+      pageId: row.id,
+      result: {
+        source_type: 'ocr_error',
+        error,
+        failed_at: new Date().toISOString(),
+      },
+      text: '',
+      status: 'error' as const,
+      error,
+    }
+  })
+}
+
+function countBatchOcrErrorPages(docId: string): number {
+  const row = queryOne<{ count: number }>(
+    `SELECT COUNT(*) as count FROM pages WHERE doc_id = ? AND ocr_status = 'error'`,
+    [docId],
+  )
+  return Number(row?.count || 0)
 }
 
 function getMarkdownTextFromUnknown(value: unknown): string {
@@ -734,13 +790,6 @@ class BatchProcessor {
         if (!pageResultsPersistedInChunks && pageResults.length === 0) {
           throw new Error(ZERO_PAGE_OCR_ERROR)
         }
-        const hasPendingPageFailure = pageResultsPersistedInChunks
-          ? streamedPageSummary.pending > 0
-          : false
-        const hasReviewPageFailure = pageResultsPersistedInChunks
-          ? streamedPageSummary.pending === 0 && streamedPageSummary.failed > 0
-          : pageResults.some((item) => item.status === 'error')
-        const hasPageFailure = hasPendingPageFailure
         if (!pageResultsPersistedInChunks) {
           await this.savePageResults(pageResults)
         } else if (deferredChangedPageIds.size > 0) {
@@ -749,17 +798,28 @@ class BatchProcessor {
           if (deferredDatabaseSaveNeeded) scheduleDatabaseSave()
         }
 
+        // Partial page failures must not fail the whole document. Settle leftovers
+        // as review errors so the book can 入库 with a notice below.
+        const incompleteReviewResults = buildIncompleteBatchOcrReviewResults(docId)
+        if (incompleteReviewResults.length > 0) {
+          await this.savePageResults(incompleteReviewResults, {
+            deferSearchRefresh: true,
+            deferDatabaseSave: true,
+          })
+        }
+        const hasReviewPageFailure = countBatchOcrErrorPages(docId) > 0
+          || (!pageResultsPersistedInChunks && pageResults.some((item) => item.status === 'error'))
         const reviewMessage = hasReviewPageFailure ? getBatchDocumentOcrReviewMessage(docId) : null
         run('UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?', [
-          hasPageFailure ? 'error' : 'completed',
-          hasPageFailure ? 'error' : 'processed',
-          hasPageFailure ? 'OCR page processing failed' : reviewMessage,
+          'completed',
+          'processed',
+          reviewMessage,
           new Date().toISOString(),
           docId,
         ])
         scheduleDatabaseSave()
 
-        if (!hasPageFailure && !hasReviewPageFailure) {
+        if (!hasReviewPageFailure) {
           void autoExtractAndApply(docId)
             .then(() => {
               scheduleDatabaseSave()
@@ -769,13 +829,8 @@ class BatchProcessor {
             })
         }
 
-        if (hasPageFailure) {
-          job.failedCount += 1
-          this.updateQueueItemStatus(job, docId, 'failed', 'OCR page processing failed')
-        } else {
-          job.processedCount += 1
-          this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)
-        }
+        job.processedCount += 1
+        this.updateQueueItemStatus(job, docId, 'completed', reviewMessage || undefined)
       } catch (error) {
         if (job.status === 'canceled') return
         if (this.shuttingDown || isOcrAbortError(error)) {
