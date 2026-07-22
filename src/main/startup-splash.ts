@@ -1,4 +1,4 @@
-import { BrowserWindow, screen } from 'electron'
+import { app, BrowserWindow, screen } from 'electron'
 import type { StartupTimingUiSnapshot } from './startup-timing'
 import {
   getStartupTimingUiSnapshot,
@@ -12,6 +12,13 @@ let closed = false
 let diagnosticsReady = false
 
 function buildSplashHtml(): string {
+  const appVersion = (() => {
+    try {
+      return String(app.getVersion() || '').trim() || 'unknown'
+    } catch {
+      return 'unknown'
+    }
+  })()
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -205,7 +212,7 @@ function buildSplashHtml(): string {
     <div class="list" id="list"></div>
     <div class="footer">
       墙钟总用时 ≠ 各步毫秒简单相加：中间有等待（如首屏后延迟恢复）、界面加载、以及嵌套子步骤（缩进行不重复计入「已计量工作」）。
-      日志前缀 <code>[StartupTiming]</code> · 窗口保留到手动关闭。
+      日志前缀 <code>[StartupTiming]</code> · 窗口保留到手动关闭 · 版本 <code id="appVersion">${appVersion}</code>
     </div>
   </div>
   <script>

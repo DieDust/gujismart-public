@@ -2,7 +2,7 @@ import { existsSync } from 'fs'
 import { readdir, rename, rm, stat } from 'fs/promises'
 import { tmpdir } from 'os'
 import { dirname, extname, join } from 'path'
-import { getDataDir, queryAll, run, scheduleDatabaseSave, transaction } from './database'
+import { getDataDir, isLargeLibraryForAutomaticMaintenance, queryAll, queryOne, run, scheduleDatabaseSave, transaction } from './database'
 import { recoverInterruptedOcrJobs, type OcrRecoverySummary } from './ocr-recovery'
 import { resumeInterruptedDocumentDeletes, type InterruptedDocumentDeleteRecoverySummary } from './ipc/documents'
 import type { BatchQueueResumeSummary } from './batch-processor'
@@ -58,6 +58,10 @@ const STARTUP_PDF_PAGE_RECORD_INIT_LIMIT = 1000
 const STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT = 80
 /** Recent docs to probe for missing page rows without correlated full-table COUNT. */
 const STARTUP_INCOMPLETE_PAGE_PROBE_LIMIT = 120
+/** Document count threshold for open-path light repair (no existsSync / PDF parse / bulk page insert). */
+const STARTUP_IMPORT_REPAIR_LIGHT_DOC_LIMIT = 500
+/** Max filesystem probes on the full (small-library) open path. */
+const STARTUP_IMPORT_REPAIR_MAX_FS_PROBES = 12
 const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
@@ -337,48 +341,71 @@ function isPdfPageRecordsDeferred(metadata: Record<string, unknown>): boolean {
     || metadata.pdf_page_records_deferred === '1'
 }
 
+function documentCountApprox(): number {
+  return Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM documents')?.count || 0)
+}
+
+function shouldUseLightInterruptedImportRepair(): boolean {
+  if (isLargeLibraryForAutomaticMaintenance()) return true
+  return documentCountApprox() >= STARTUP_IMPORT_REPAIR_LIGHT_DOC_LIMIT
+}
+
 /**
- * Collect interrupted-import candidates without full-library correlated
- * `(SELECT COUNT(*) FROM pages WHERE doc_id = documents.id)` filters.
- * Those force a pages probe per document and dominate cold open on large corpora.
+ * Large-library open path: only true mid-import rows (`processing`).
+ * Index-friendly single predicate — no OR / lower(file_path) full scans.
+ */
+function collectCriticalInterruptedImportCandidates(limit = 20): InterruptedImportDocumentRow[] {
+  return queryAll<InterruptedImportDocumentRow>(
+    `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
+     FROM documents
+     WHERE import_status = 'processing'
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+    [limit],
+  ).filter((row) => row.id)
+}
+
+/**
+ * Small-library path: status queries are separate (index-friendly), then a capped
+ * recent incomplete-page probe. Never use correlated COUNT in a full-table WHERE.
  */
 function collectInterruptedImportCandidates(): InterruptedImportDocumentRow[] {
   const byId = new Map<string, InterruptedImportDocumentRow>()
-
-  // 1) Status-driven: clearly mid-import / in-flight OCR. Index-friendly, hard-capped.
-  const statusCandidates = queryAll<InterruptedImportDocumentRow>(
-    `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
-     FROM documents
-     WHERE COALESCE(import_status, '') <> 'deleting'
-       AND (
-         COALESCE(import_status, '') IN ('processing', 'unstored', '')
-         OR (
-           lower(COALESCE(file_path, '')) LIKE '%.pdf'
-           AND COALESCE(ocr_status, '') IN ('queued', 'processing')
-         )
-         OR (
-           lower(COALESCE(file_path, '')) LIKE '%.pdf'
-           AND COALESCE(page_count, 0) <= 0
-           AND COALESCE(import_status, '') NOT IN ('processed')
-         )
-       )
-     ORDER BY
-       CASE
-         WHEN COALESCE(import_status, '') = 'processing' THEN 0
-         WHEN COALESCE(ocr_status, '') IN ('queued', 'processing') THEN 1
-         WHEN COALESCE(import_status, '') IN ('unstored', '') THEN 2
-         ELSE 3
-       END,
-       updated_at DESC
-     LIMIT ?`,
-    [STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT],
-  )
-  for (const row of statusCandidates) {
-    if (row.id) byId.set(row.id, row)
+  const take = (rows: InterruptedImportDocumentRow[]) => {
+    for (const row of rows) {
+      if (!row.id || byId.has(row.id)) continue
+      byId.set(row.id, row)
+      if (byId.size >= STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT) return
+    }
   }
 
-  // 2) Missing page rows: only probe a recent window, then cheap per-doc COUNT.
-  // Never put correlated COUNT(*) in a full-table WHERE — that was the ~70s stall.
+  // Prefer true interruptions first.
+  take(collectCriticalInterruptedImportCandidates(STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT))
+
+  if (byId.size < STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT) {
+    take(queryAll<InterruptedImportDocumentRow>(
+      `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
+       FROM documents
+       WHERE import_status = 'unstored'
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+      [STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT],
+    ))
+  }
+
+  if (byId.size < STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT) {
+    take(queryAll<InterruptedImportDocumentRow>(
+      `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
+       FROM documents
+       WHERE COALESCE(import_status, '') <> 'deleting'
+         AND ocr_status IN ('queued', 'processing')
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+      [STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT],
+    ))
+  }
+
+  // Missing page rows: recent window only + cheap per-doc COUNT.
   if (byId.size < STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT) {
     const recent = queryAll<InterruptedImportDocumentRow>(
       `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
@@ -396,12 +423,67 @@ function collectInterruptedImportCandidates(): InterruptedImportDocumentRow[] {
       if (isPdfPageRecordsDeferred(metadata)) continue
       const expected = Math.max(Number(row.page_count || 0), metadataPageCount(metadata))
       if (expected <= 0) continue
-      const actual = countDocumentPageRows(row.id)
-      if (actual < expected) byId.set(row.id, row)
+      if (countDocumentPageRows(row.id) < expected) byId.set(row.id, row)
     }
   }
 
   return [...byId.values()]
+}
+
+/**
+ * DB-only status repair for large libraries.
+ * No existsSync (AV/disk can make each probe cost seconds), no PDF parse, no bulk page inserts.
+ */
+function repairInterruptedImportsLight(
+  candidates: InterruptedImportDocumentRow[],
+): { repairedDocuments: number; initializedPageRecords: number } {
+  let repairedDocuments = 0
+  const repairedDocIds: string[] = []
+  const now = new Date().toISOString()
+
+  for (const doc of candidates) {
+    if (startupRecoveryCancelRequested) break
+    const metadata = parseMetadata(doc.metadata)
+    const pageStats = summarizeDocumentPages(doc.id)
+    const expectedPageCount = Math.max(Number(doc.page_count || 0), metadataPageCount(metadata))
+    const pagesComplete = expectedPageCount > 0
+      && pageStats.total >= expectedPageCount
+      && pageStats.completed >= expectedPageCount
+
+    if (pagesComplete || (pageStats.total > 0 && pageStats.completed === pageStats.total && String(doc.ocr_status || '') === 'completed')) {
+      run(
+        `UPDATE documents
+         SET ocr_status = 'completed',
+             import_status = 'processed',
+             error_message = NULL,
+             metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
+             updated_at = ?
+         WHERE id = ?
+           AND COALESCE(import_status, '') <> 'deleting'`,
+        [now, doc.id],
+      )
+      repairedDocuments += 1
+      repairedDocIds.push(doc.id)
+      continue
+    }
+
+    // Clear stuck "processing" so the library is interactive; deep repair is deferred.
+    run(
+      `UPDATE documents
+       SET ocr_status = CASE WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
+           import_status = CASE WHEN ocr_status = 'completed' THEN 'processed' ELSE 'stored' END,
+           error_message = NULL,
+           metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
+           updated_at = ?
+       WHERE id = ?
+         AND COALESCE(import_status, '') <> 'deleting'`,
+      [now, doc.id],
+    )
+    repairedDocuments += 1
+  }
+
+  markSearchIndexPendingForRecoveredDocuments(repairedDocIds)
+  return { repairedDocuments, initializedPageRecords: 0 }
 }
 
 function markInterruptedImportForCleanup(docId: string, message: string): void {
@@ -484,151 +566,198 @@ async function insertMissingPdfPageRecords(docId: string, pageCount: number): Pr
 }
 
 async function repairInterruptedImports(): Promise<{ repairedDocuments: number; initializedPageRecords: number }> {
-  const candidates = collectInterruptedImportCandidates()
-  if (candidates.length > 0) {
-    console.log(`[Startup Recovery] Interrupted import candidates=${candidates.length} (capped)`)
+  const light = shouldUseLightInterruptedImportRepair()
+  const endCollect = beginStartupPhase('startup-recovery.interrupted-imports.collect')
+  let candidates: InterruptedImportDocumentRow[]
+  try {
+    candidates = light
+      ? collectCriticalInterruptedImportCandidates(20)
+      : collectInterruptedImportCandidates()
+  } finally {
+    endCollect()
   }
 
-  let repairedDocuments = 0
-  let initializedPageRecords = 0
-  const repairedDocIds: string[] = []
-  for (const doc of candidates) {
-    if (startupRecoveryCancelRequested) break
-    const filePath = String(doc.file_path || '').trim()
-    const metadata = parseMetadata(doc.metadata)
-    const ext = extname(filePath).toLowerCase()
-    const isPdf = ext === '.pdf'
-    const isImage = RECOVERABLE_IMAGE_EXTENSIONS.has(ext)
-    const pageStats = summarizeDocumentPages(doc.id)
-    const expectedPageCount = Math.max(Number(doc.page_count || 0), metadataPageCount(metadata))
-    const hasIncompletePageRows = expectedPageCount > 0 && pageStats.total < expectedPageCount
-    if (!filePath || !existsSync(filePath)) {
-      const hasExpectedCompletedPages = expectedPageCount > 0
-        && pageStats.total >= expectedPageCount
-        && pageStats.completed >= expectedPageCount
-      if (hasExpectedCompletedPages) {
+  console.log(
+    `[Startup Recovery] Interrupted import repair mode=${light ? 'light' : 'full'} ` +
+    `candidates=${candidates.length}`,
+  )
+
+  if (light) {
+    const endLight = beginStartupPhase('startup-recovery.interrupted-imports.light')
+    try {
+      return repairInterruptedImportsLight(candidates)
+    } finally {
+      endLight()
+    }
+  }
+
+  const endFull = beginStartupPhase('startup-recovery.interrupted-imports.full')
+  try {
+    let repairedDocuments = 0
+    let initializedPageRecords = 0
+    let fsProbes = 0
+    const repairedDocIds: string[] = []
+    for (const doc of candidates) {
+      if (startupRecoveryCancelRequested) break
+      const filePath = String(doc.file_path || '').trim()
+      const metadata = parseMetadata(doc.metadata)
+      const ext = extname(filePath).toLowerCase()
+      const isPdf = ext === '.pdf'
+      const isImage = RECOVERABLE_IMAGE_EXTENSIONS.has(ext)
+      const pageStats = summarizeDocumentPages(doc.id)
+      const expectedPageCount = Math.max(Number(doc.page_count || 0), metadataPageCount(metadata))
+      const hasIncompletePageRows = expectedPageCount > 0 && pageStats.total < expectedPageCount
+
+      // Cap filesystem probes: AV scanners often make existsSync cost 0.5–2s each on large trees.
+      let fileExists = false
+      if (filePath) {
+        if (fsProbes < STARTUP_IMPORT_REPAIR_MAX_FS_PROBES) {
+          fsProbes += 1
+          fileExists = existsSync(filePath)
+        } else {
+          // Assume present when probe budget exhausted; status-only repair below.
+          fileExists = true
+        }
+      }
+
+      if (!filePath || !fileExists) {
+        const hasExpectedCompletedPages = expectedPageCount > 0
+          && pageStats.total >= expectedPageCount
+          && pageStats.completed >= expectedPageCount
+        if (hasExpectedCompletedPages) {
+          run(
+            `UPDATE documents
+             SET ocr_status = 'completed',
+                 import_status = 'processed',
+                 error_message = NULL,
+                 metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
+                 updated_at = ?
+             WHERE id = ?
+               AND COALESCE(import_status, '') <> 'deleting'`,
+            [new Date().toISOString(), doc.id],
+          )
+          repairedDocuments += 1
+          repairedDocIds.push(doc.id)
+          continue
+        }
+
+        if (hasIncompletePageRows || String(doc.import_status || '') === 'processing') {
+          // Only mark cleanup when we actually confirmed the file is missing.
+          if (!filePath || fsProbes <= STARTUP_IMPORT_REPAIR_MAX_FS_PROBES) {
+            markInterruptedImportForCleanup(
+              doc.id,
+              '上次导入在写入文件或页面记录时中断，库内记录不完整；请重新导入原文件。',
+            )
+            repairedDocuments += 1
+          }
+        }
+        continue
+      }
+
+      const wasCompleted = String(doc.ocr_status || '') === 'completed'
+      if (!isPdf) {
+        if (isImage && pageStats.total === 0) {
+          run(
+            'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [nanoid(), doc.id, 1, filePath, null, null, null, 'pending', 'pending', new Date().toISOString()],
+          )
+          initializedPageRecords += 1
+          run(
+            `UPDATE documents
+             SET page_count = 1,
+                 thumb_path = COALESCE(NULLIF(thumb_path, ''), ?),
+                 ocr_status = CASE WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
+                 import_status = CASE WHEN ocr_status = 'completed' THEN 'processed' ELSE 'stored' END,
+                 error_message = NULL,
+                 metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
+                 updated_at = ?
+             WHERE id = ?
+               AND COALESCE(import_status, '') <> 'deleting'`,
+            [filePath, new Date().toISOString(), doc.id],
+          )
+          repairedDocuments += 1
+          repairedDocIds.push(doc.id)
+          continue
+        }
+
+        if (hasIncompletePageRows) {
+          markInterruptedImportForCleanup(
+            doc.id,
+            '上次导入在写入页面/章节记录时中断，已保存内容不完整；请重新导入原文件。',
+          )
+          repairedDocuments += 1
+          continue
+        }
+
+        const completedFromPages = pageStats.total > 0 && pageStats.completed === pageStats.total
+        const nextOcrStatus = wasCompleted || completedFromPages ? 'completed' : 'pending'
+        const nextImportStatus = nextOcrStatus === 'completed' ? 'processed' : 'stored'
         run(
           `UPDATE documents
-           SET ocr_status = 'completed',
-               import_status = 'processed',
+           SET ocr_status = ?,
+               import_status = ?,
                error_message = NULL,
                metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
                updated_at = ?
            WHERE id = ?
              AND COALESCE(import_status, '') <> 'deleting'`,
-          [new Date().toISOString(), doc.id],
+          [nextOcrStatus, nextImportStatus, new Date().toISOString(), doc.id],
         )
         repairedDocuments += 1
-        repairedDocIds.push(doc.id)
+        if (nextOcrStatus === 'completed') repairedDocIds.push(doc.id)
         continue
       }
 
-      if (hasIncompletePageRows || String(doc.import_status || '') === 'processing') {
-        markInterruptedImportForCleanup(
-          doc.id,
-          '上次导入在写入文件或页面记录时中断，库内记录不完整；请重新导入原文件。',
-        )
-        repairedDocuments += 1
+      // Never open/parse PDF on cold start when page_count is already known.
+      // getPdfPageCountFast spawns qpdf and can stall for seconds per file under AV.
+      const knownPageCount = Math.max(Number(doc.page_count || 0), metadataPageCount(metadata))
+      let pageCount = knownPageCount
+      if (pageCount <= 0 && fsProbes < STARTUP_IMPORT_REPAIR_MAX_FS_PROBES) {
+        fsProbes += 1
+        pageCount = Number(await getPdfPageCountFast(filePath) || 0)
       }
-      continue
-    }
+      pageCount = Number.isFinite(pageCount) && pageCount > 0 ? Math.floor(pageCount) : 0
+      const now = new Date().toISOString()
 
-    const wasCompleted = String(doc.ocr_status || '') === 'completed'
-    if (!isPdf) {
-      if (isImage && pageStats.total === 0) {
-        run(
-          'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [nanoid(), doc.id, 1, filePath, null, null, null, 'pending', 'pending', new Date().toISOString()],
-        )
-        initializedPageRecords += 1
+      if (pageCount > 0) {
+        const deferPageRecords = shouldDeferStartupPdfPageRecordInit(pageCount, pageStats)
+        const insertedPageRecords = deferPageRecords ? 0 : await insertMissingPdfPageRecords(doc.id, pageCount)
+        initializedPageRecords += insertedPageRecords
         run(
           `UPDATE documents
-           SET page_count = 1,
-               thumb_path = COALESCE(NULLIF(thumb_path, ''), ?),
-               ocr_status = CASE WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
+           SET page_count = ?,
+               ocr_status = CASE WHEN ? > 0 OR ? > 0 THEN 'pending' WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
+               import_status = CASE WHEN ? > 0 OR ? > 0 THEN 'stored' WHEN ocr_status = 'completed' THEN 'processed' ELSE 'stored' END,
+               error_message = NULL,
+               metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
+               updated_at = ?
+           WHERE id = ?
+             AND COALESCE(import_status, '') <> 'deleting'`,
+          [pageCount, insertedPageRecords, deferPageRecords ? 1 : 0, insertedPageRecords, deferPageRecords ? 1 : 0, now, doc.id],
+        )
+        updateRecoveredPdfMetadataPageCount(doc.id, metadata, pageCount, deferPageRecords)
+      } else {
+        run(
+          `UPDATE documents
+           SET ocr_status = CASE WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
                import_status = CASE WHEN ocr_status = 'completed' THEN 'processed' ELSE 'stored' END,
                error_message = NULL,
-               metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
                updated_at = ?
            WHERE id = ?
              AND COALESCE(import_status, '') <> 'deleting'`,
-          [filePath, new Date().toISOString(), doc.id],
+          [now, doc.id],
         )
-        repairedDocuments += 1
-        repairedDocIds.push(doc.id)
-        continue
       }
-
-      if (hasIncompletePageRows) {
-        markInterruptedImportForCleanup(
-          doc.id,
-          '上次导入在写入页面/章节记录时中断，已保存内容不完整；请重新导入原文件。',
-        )
-        repairedDocuments += 1
-        continue
-      }
-
-      const completedFromPages = pageStats.total > 0 && pageStats.completed === pageStats.total
-      const nextOcrStatus = wasCompleted || completedFromPages ? 'completed' : 'pending'
-      const nextImportStatus = nextOcrStatus === 'completed' ? 'processed' : 'stored'
-      run(
-        `UPDATE documents
-         SET ocr_status = ?,
-             import_status = ?,
-             error_message = NULL,
-             metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
-             updated_at = ?
-         WHERE id = ?
-           AND COALESCE(import_status, '') <> 'deleting'`,
-        [nextOcrStatus, nextImportStatus, new Date().toISOString(), doc.id],
-      )
       repairedDocuments += 1
-      if (nextOcrStatus === 'completed') repairedDocIds.push(doc.id)
-      continue
+      repairedDocIds.push(doc.id)
+      if (startupRecoveryCancelRequested) break
     }
 
-    const knownPageCount = Math.max(Number(doc.page_count || 0), metadataPageCount(metadata))
-    const fastPageCount = knownPageCount > 0 ? knownPageCount : Number(await getPdfPageCountFast(filePath) || 0)
-    const pageCount = Number.isFinite(fastPageCount) && fastPageCount > 0 ? Math.floor(fastPageCount) : 0
-    const now = new Date().toISOString()
-
-    if (pageCount > 0) {
-      const deferPageRecords = shouldDeferStartupPdfPageRecordInit(pageCount, pageStats)
-      const insertedPageRecords = deferPageRecords ? 0 : await insertMissingPdfPageRecords(doc.id, pageCount)
-      initializedPageRecords += insertedPageRecords
-      run(
-        `UPDATE documents
-         SET page_count = ?,
-             ocr_status = CASE WHEN ? > 0 OR ? > 0 THEN 'pending' WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
-             import_status = CASE WHEN ? > 0 OR ? > 0 THEN 'stored' WHEN ocr_status = 'completed' THEN 'processed' ELSE 'stored' END,
-             error_message = NULL,
-             metadata_status = COALESCE(NULLIF(metadata_status, ''), 'pending'),
-             updated_at = ?
-         WHERE id = ?
-           AND COALESCE(import_status, '') <> 'deleting'`,
-        [pageCount, insertedPageRecords, deferPageRecords ? 1 : 0, insertedPageRecords, deferPageRecords ? 1 : 0, now, doc.id],
-      )
-      updateRecoveredPdfMetadataPageCount(doc.id, metadata, pageCount, deferPageRecords)
-    } else {
-      run(
-        `UPDATE documents
-         SET ocr_status = CASE WHEN ocr_status = 'completed' THEN 'completed' ELSE 'pending' END,
-             import_status = CASE WHEN ocr_status = 'completed' THEN 'processed' ELSE 'stored' END,
-             error_message = NULL,
-             updated_at = ?
-         WHERE id = ?
-           AND COALESCE(import_status, '') <> 'deleting'`,
-        [now, doc.id],
-      )
-    }
-    repairedDocuments += 1
-    repairedDocIds.push(doc.id)
-    if (startupRecoveryCancelRequested) break
+    markSearchIndexPendingForRecoveredDocuments(repairedDocIds)
+    return { repairedDocuments, initializedPageRecords }
+  } finally {
+    endFull()
   }
-
-  markSearchIndexPendingForRecoveredDocuments(repairedDocIds)
-
-  return { repairedDocuments, initializedPageRecords }
 }
 
 async function removeOrphanStorageDirs(): Promise<number> {

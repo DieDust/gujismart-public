@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.1.20 - 2026-07-23
+
+### 中文
+
+#### 性能
+
+- **大库启动导入修复改轻量模式**：文献数 ≥500 或 pages 超阈值时，只清 `import_status=processing`，不做 `existsSync` / 读 PDF / 批量插页（杀毒下单次 `existsSync` 可达秒级）。
+- 小库完整修复也限制文件探测次数，避免连环磁盘探测。
+- 诊断窗口显示应用版本号；导入修复拆成 collect / light / full 子步骤便于截图定位。
+
+#### 下载
+
+- `GujiSmart-1.1.20-Setup-x64.exe`
+- `GujiSmart-1.1.20-Portable-x64.exe`
+
 ## 1.1.19 - 2026-07-23
 
 ### 中文
