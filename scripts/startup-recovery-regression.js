@@ -396,7 +396,14 @@ async function run() {
       completedItems: 0,
       skippedItems: 0,
     })
-    assert(summary.removedTempDirs >= 2, `expected at least 2 temp dirs to be removed, saw ${summary.removedTempDirs}`)
+    // Open path no longer deletes temp trees (that freeze cold start); cleanup is deferred.
+    assert.strictEqual(summary.removedTempDirs, 0, `open path must not remove temp dirs, saw ${summary.removedTempDirs}`)
+    const deferredTempRemoved = await startupRecovery.cleanupStartupTempDirsNow(Date.now() - 120_000, {
+      includeSystemTmp: true,
+      budgetMs: 10_000,
+      maxDirs: 20,
+    })
+    assert(deferredTempRemoved >= 2, `expected deferred temp cleanup to remove at least 2 dirs, saw ${deferredTempRemoved}`)
 
     // Interrupted search rows reset to pending (not immediately requeued).
     // Import/OCR repair may also mark additional recovered docs pending for later reindex.

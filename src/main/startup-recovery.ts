@@ -939,13 +939,32 @@ async function removeStartupTempDirs(
   return removed
 }
 
+/**
+ * Full temp cleanup (system %TEMP% + app temp). Used by deferred open path and tests.
+ * Never call this on the interactive open critical path — readdir/rm of huge OCR trees freezes cold start.
+ */
+export async function cleanupStartupTempDirsNow(
+  recoveryStartedAtMs = Date.now() - 120_000,
+  options?: {
+    includeSystemTmp?: boolean
+    budgetMs?: number
+    maxDirs?: number
+  },
+): Promise<number> {
+  return removeStartupTempDirs(recoveryStartedAtMs, {
+    includeSystemTmp: options?.includeSystemTmp !== false,
+    budgetMs: options?.budgetMs ?? 30_000,
+    maxDirs: options?.maxDirs ?? 40,
+  })
+}
+
 function scheduleDeferredStartupTempCleanup(recoveryStartedAtMs: number): void {
   // After interactive open: clean leftover OCR temp trees without blocking recovery.
   setTimeout(() => {
     void (async () => {
       const endPhase = beginStartupPhase('startup-recovery.temp-dirs-deferred')
       try {
-        const removed = await removeStartupTempDirs(recoveryStartedAtMs, {
+        const removed = await cleanupStartupTempDirsNow(recoveryStartedAtMs, {
           includeSystemTmp: true,
           budgetMs: 30_000,
           maxDirs: 40,
@@ -1143,24 +1162,13 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
   {
     const endPhase = beginStartupPhase('startup-recovery.temp-dirs')
     try {
-      // Large libraries / light open path: never walk system %TEMP% during recovery.
-      // Failed OCR often leaves multi-GB gujismart-ocr-* trees; rm under AV freezes open ~70s.
-      const lightOpen = shouldUseLightInterruptedImportRepair()
-      if (lightOpen) {
-        removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs, {
-          includeSystemTmp: false,
-          budgetMs: 400,
-          maxDirs: 4,
-        })
-        scheduleDeferredStartupTempCleanup(recoveryStartedAtMs)
-        console.log('[Startup Recovery] System TEMP OCR cleanup deferred (light open path)')
-      } else {
-        removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs, {
-          includeSystemTmp: true,
-          budgetMs: 3_000,
-          maxDirs: 20,
-        })
-      }
+      // CRITICAL: do not readdir/rm temp trees during open recovery.
+      // Even with a time budget, a single recursive rm (or readdir of Windows %TEMP%)
+      // can run 60s+ under AV and cannot be cancelled mid-await — that is the ~70s
+      // "清理临时目录" stall. Always defer; open path records 0 work.
+      removedTempDirs = 0
+      scheduleDeferredStartupTempCleanup(recoveryStartedAtMs)
+      console.log('[Startup Recovery] Temp cleanup fully deferred off open path (no readdir/rm)')
     } finally {
       endPhase()
     }
