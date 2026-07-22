@@ -196,7 +196,7 @@ assert(
   'Import-auto OCR should auto-start after interactive grace with bounded workers so large batches continue after restart.',
 )
 assert(
-  startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 8_000')
+  startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 0')
     && startupRecovery.includes('deferred auto-resume after interactive grace')
     && !/setTimeout\(\(\) => \{[\s\S]{0,260}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery)
     && !/runStartupRecovery[\s\S]{0,4000}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery),

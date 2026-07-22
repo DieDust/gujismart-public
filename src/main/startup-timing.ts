@@ -85,7 +85,7 @@ const PHASE_LABELS: Record<string, string> = {
   'renderer-did-finish-load': '界面资源加载完成',
   'startup-recovery-scheduled': '已安排启动恢复任务',
   'startup-maintenance-scheduled': '已安排延迟维护任务',
-  'startup-recovery-delay': '等待首屏后再恢复（固定延迟）',
+  'startup-recovery-delay': '排队启动恢复（极短让出主线程）',
   'startup-recovery-begin': '开始启动恢复',
   'startup-recovery': '启动恢复（整体）',
   'startup-recovery.ocr-jobs': '恢复中断的 OCR 任务',

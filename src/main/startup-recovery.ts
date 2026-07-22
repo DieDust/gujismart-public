@@ -57,8 +57,9 @@ const STARTUP_PDF_PAGE_RECORD_INIT_LIMIT = 1000
 const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
-// Give the first library paint a short grace period, then recover queues so OCR is not stuck forever.
-const STARTUP_RECOVERY_DELAY_MS = 8_000
+// Defer only to the next macrotask so createWindow/ready-to-show can finish first.
+// A multi-second fixed wait made cold start feel ~8s slower without helping large-library UX.
+const STARTUP_RECOVERY_DELAY_MS = 0
 
 async function startupRecoveryCheckpoint(): Promise<boolean> {
   await yieldToEventLoop()
