@@ -1,13 +1,12 @@
 /**
  * Cold-start phase timing for diagnosing large-library open latency.
  *
- * - Always logs to console with prefix [StartupTiming]
- * - Optionally publishes UI snapshots to the startup splash window
+ * - Console: [StartupTiming]
+ * - UI splash: Chinese labels + wall-clock timeline (not just active work ms)
  *
- * Example console:
- *   [StartupTiming] +12ms BEGIN initDatabase
- *   [StartupTiming] +840ms END initDatabase duration=828ms
- *   [StartupTiming] SUMMARY total=4521ms phases=...
+ * Important: "总用时" is wall-clock from process boot. Phase durations are active
+ * work between begin/end; nested phases nest inside parents; idle gaps (e.g. 8s
+ * recovery delay, renderer load) appear as "未计量间隔".
  */
 
 export type StartupTimingPhaseRecord = {
@@ -15,19 +14,26 @@ export type StartupTimingPhaseRecord = {
   startedAtMs: number
   endedAtMs: number
   durationMs: number
-  /** Milliseconds since process boot epoch when the phase ended. */
-  sinceBootMs: number
+  /** Wall-clock offset when phase started (ms since boot). */
+  startedSinceBootMs: number
+  /** Wall-clock offset when phase ended (ms since boot). */
+  endedSinceBootMs: number
 }
 
 export type StartupTimingUiPhase = {
   name: string
   label: string
   durationMs: number
+  startedSinceBootMs: number
+  endedSinceBootMs: number
+  /** True when this phase is fully nested inside another measured phase. */
+  nested: boolean
 }
 
 export type StartupTimingUiOpenPhase = {
   name: string
   label: string
+  startedSinceBootMs: number
 }
 
 export type StartupTimingUiSnapshot = {
@@ -39,10 +45,13 @@ export type StartupTimingUiSnapshot = {
   phases: StartupTimingUiPhase[]
   openPhases: StartupTimingUiOpenPhase[]
   lastEvent?: string
-  /** Test builds keep the splash open; true when main window is up and recovery has finished (or timed out). */
   diagnosticsReady?: boolean
   diagnosticsReadyAtMs?: number
   diagnosticsReadyReason?: string
+  /** Sum of leaf (non-nested) phase durations — comparable to wall clock. */
+  measuredLeafWorkMs: number
+  /** Wall clock minus leaf work (idle waits, uninstrumented gaps). */
+  unaccountedGapMs: number
 }
 
 type StartupTimingUiPublisher = (snapshot: StartupTimingUiSnapshot) => void
@@ -59,7 +68,7 @@ let diagnosticsReady = false
 let diagnosticsReadyAtMs = 0
 let diagnosticsReadyReason = ''
 
-/** User-facing Chinese labels for known phase ids. Unknown ids fall back to the raw name. */
+/** User-facing Chinese labels for known phase ids. */
 const PHASE_LABELS: Record<string, string> = {
   'main-module-loaded': '主进程模块已加载',
   'app-when-ready': 'Electron 已就绪',
@@ -76,7 +85,7 @@ const PHASE_LABELS: Record<string, string> = {
   'renderer-did-finish-load': '界面资源加载完成',
   'startup-recovery-scheduled': '已安排启动恢复任务',
   'startup-maintenance-scheduled': '已安排延迟维护任务',
-  'startup-recovery-delay': '等待首屏后再恢复后台任务',
+  'startup-recovery-delay': '等待首屏后再恢复（固定延迟）',
   'startup-recovery-begin': '开始启动恢复',
   'startup-recovery': '启动恢复（整体）',
   'startup-recovery.ocr-jobs': '恢复中断的 OCR 任务',
@@ -112,13 +121,52 @@ function labelFor(name: string): string {
 function formatPhaseList(): string {
   if (completedPhases.length === 0) return '(none)'
   return completedPhases
-    .map((phase) => `${phase.name}=${phase.durationMs}ms`)
+    .map((phase) => `${phase.name}=${phase.durationMs}ms@+${phase.startedSinceBootMs}`)
     .join(', ')
 }
 
+function isNestedPhase(
+  phase: StartupTimingPhaseRecord,
+  all: StartupTimingPhaseRecord[],
+): boolean {
+  return all.some((other) => (
+    other !== phase
+    && other.startedAtMs <= phase.startedAtMs
+    && other.endedAtMs >= phase.endedAtMs
+    && (other.startedAtMs < phase.startedAtMs || other.endedAtMs > phase.endedAtMs)
+  ))
+}
+
+function buildUiPhases(): StartupTimingUiPhase[] {
+  return completedPhases
+    .slice()
+    .sort((a, b) => a.startedAtMs - b.startedAtMs || a.endedAtMs - b.endedAtMs)
+    .map((phase) => ({
+      name: phase.name,
+      label: labelFor(phase.name),
+      durationMs: phase.durationMs,
+      startedSinceBootMs: phase.startedSinceBootMs,
+      endedSinceBootMs: phase.endedSinceBootMs,
+      nested: isNestedPhase(phase, completedPhases),
+    }))
+}
+
+function sumLeafWorkMs(phases: StartupTimingUiPhase[]): number {
+  return phases
+    .filter((phase) => !phase.nested)
+    .reduce((sum, phase) => sum + Math.max(0, phase.durationMs), 0)
+}
+
 function buildUiSnapshot(now = Date.now()): StartupTimingUiSnapshot {
-  const open = [...openPhases.keys()]
-  const currentPhase = open.length > 0 ? open[open.length - 1] : null
+  const open = [...openPhases.entries()]
+    .map(([name, startedAtMs]) => ({
+      name,
+      label: labelFor(name),
+      startedSinceBootMs: Math.max(0, startedAtMs - bootAtMs),
+    }))
+    .sort((a, b) => a.startedSinceBootMs - b.startedSinceBootMs)
+
+  const currentPhase = open.length > 0 ? open[open.length - 1].name : null
   let currentLabel = currentPhase
     ? labelFor(currentPhase)
     : (lastEventLabel || '正在启动…')
@@ -126,33 +174,43 @@ function buildUiSnapshot(now = Date.now()): StartupTimingUiSnapshot {
     ? `技术名：${currentPhase}${lastEventDetail ? ` · ${lastEventDetail}` : ''}`
     : (lastEventDetail || '请稍候，大文献库首次打开可能需要更长时间')
 
+  const phases = buildUiPhases()
+  const wallMs = diagnosticsReady && diagnosticsReadyAtMs > 0 ? diagnosticsReadyAtMs : sinceBoot(now)
+  const measuredLeafWorkMs = sumLeafWorkMs(phases)
+  const unaccountedGapMs = Math.max(0, wallMs - measuredLeafWorkMs)
+
   if (diagnosticsReady) {
     currentLabel = '启动诊断完成 · 请截图本窗口'
-    currentDetail = diagnosticsReadyReason
-      ? `测试版：主程序已可用，请截图整窗发给开发者（含总用时与阶段毫秒）。原因：${diagnosticsReadyReason}`
-      : '测试版：主程序已可用，请截图整窗发给开发者（含总用时与阶段毫秒）'
+    currentDetail = [
+      `墙钟总用时 ${formatDurationZh(wallMs)}`,
+      `已计量工作（不含嵌套重复） ${formatDurationZh(measuredLeafWorkMs)}`,
+      `未计量间隔（等待/加载空档） ${formatDurationZh(unaccountedGapMs)}`,
+      diagnosticsReadyReason ? `原因：${diagnosticsReadyReason}` : '',
+    ].filter(Boolean).join(' · ')
   }
 
   return {
     bootAtMs,
-    sinceBootMs: diagnosticsReady && diagnosticsReadyAtMs > 0 ? diagnosticsReadyAtMs : sinceBoot(now),
+    sinceBootMs: wallMs,
     currentPhase,
     currentLabel,
     currentDetail,
-    phases: completedPhases.map((phase) => ({
-      name: phase.name,
-      label: labelFor(phase.name),
-      durationMs: phase.durationMs,
-    })),
-    openPhases: open.map((name) => ({
-      name,
-      label: labelFor(name),
-    })),
+    phases,
+    openPhases: open,
     lastEvent: lastEventLabel || undefined,
     diagnosticsReady,
     diagnosticsReadyAtMs: diagnosticsReady ? diagnosticsReadyAtMs : undefined,
     diagnosticsReadyReason: diagnosticsReady ? diagnosticsReadyReason : undefined,
+    measuredLeafWorkMs,
+    unaccountedGapMs,
   }
+}
+
+/** Format for UI: short work in ms, longer spans in seconds. */
+export function formatDurationZh(ms: number): string {
+  const value = Math.max(0, Math.round(Number(ms) || 0))
+  if (value < 1000) return `${value} ms`
+  return `${(value / 1000).toFixed(2)} 秒（${value} ms）`
 }
 
 /** Test-build only: freeze splash as a screenshot-friendly report without closing it. */
@@ -174,7 +232,6 @@ export function markStartupDiagnosticsSession(options: {
 function schedulePublishUi(): void {
   if (!uiPublisher) return
   if (publishTimer) return
-  // Coalesce rapid nested phase marks so the splash does not thrash.
   publishTimer = setTimeout(() => {
     publishTimer = null
     try {
@@ -218,11 +275,12 @@ export function beginStartupPhase(name: string): () => void {
       startedAtMs: markedStart,
       endedAtMs,
       durationMs,
-      sinceBootMs: sinceBoot(endedAtMs),
+      startedSinceBootMs: Math.max(0, markedStart - bootAtMs),
+      endedSinceBootMs: Math.max(0, endedAtMs - bootAtMs),
     }
     completedPhases.push(record)
     console.log(
-      `[StartupTiming] +${record.sinceBootMs}ms END ${phaseName} duration=${durationMs}ms`,
+      `[StartupTiming] +${record.endedSinceBootMs}ms END ${phaseName} duration=${durationMs}ms start=+${record.startedSinceBootMs}ms`,
     )
     schedulePublishUi()
   }
@@ -269,8 +327,9 @@ export function logStartupTimingSummary(reason = 'checkpoint', force = false): v
   const now = Date.now()
   const openNames = [...openPhases.keys()]
   const openNote = openNames.length > 0 ? ` open=[${openNames.join(', ')}]` : ''
+  const snap = buildUiSnapshot(now)
   console.log(
-    `[StartupTiming] SUMMARY reason=${reason} total=${sinceBoot(now)}ms phases=[${formatPhaseList()}]${openNote}`,
+    `[StartupTiming] SUMMARY reason=${reason} wall=${snap.sinceBootMs}ms leafWork=${snap.measuredLeafWorkMs}ms gap=${snap.unaccountedGapMs}ms phases=[${formatPhaseList()}]${openNote}`,
   )
   schedulePublishUi()
 }

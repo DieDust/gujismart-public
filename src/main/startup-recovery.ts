@@ -1059,9 +1059,12 @@ export function scheduleStartupRecovery(): void {
     progress: 0,
     message: '准备检查上次未完成的任务',
   })
+  // Explicit timed wait so the diagnostic UI accounts for the 8s grace (otherwise wall clock ≫ sum of work ms).
+  const endRecoveryDelay = beginStartupPhase('startup-recovery-delay')
   markStartupEvent('startup-recovery-delay', `delayMs=${STARTUP_RECOVERY_DELAY_MS}`)
   startupRecoveryPromise = new Promise((resolve) => {
     setTimeout(() => {
+      endRecoveryDelay()
       markStartupEvent('startup-recovery-begin')
       void runStartupRecovery()
       .catch((error) => {

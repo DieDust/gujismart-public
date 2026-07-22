@@ -115,6 +115,19 @@ function buildSplashHtml(): string {
       0% { transform: translateX(-120%); }
       100% { transform: translateX(320%); }
     }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+    .stat {
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.03);
+    }
+    .stat-k { font-size: 11px; color: #8a8176; margin-bottom: 4px; }
+    .stat-v { font-size: 13px; color: #e8c9a0; font-variant-numeric: tabular-nums; font-weight: 600; }
     .list-title {
       font-size: 12px;
       color: #8a8176;
@@ -136,14 +149,17 @@ function buildSplashHtml(): string {
     }
     .row {
       display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 10px;
+      grid-template-columns: 72px 1fr auto;
+      gap: 8px;
       padding: 6px 12px;
       color: #cfc6ba;
+      align-items: baseline;
     }
     .row.is-open { color: #e8c9a0; }
     .row.is-slow { color: #ffcc80; background: rgba(255, 171, 64, 0.08); }
-    .row .ms { color: #9a9186; }
+    .row.is-nested { opacity: 0.72; }
+    .row .at { color: #8a8176; }
+    .row .ms { color: #9a9186; white-space: nowrap; }
     .row.is-open .ms { color: #d4ad84; }
     .row.is-slow .ms { color: #ffb74d; font-weight: 600; }
     .footer {
@@ -172,18 +188,24 @@ function buildSplashHtml(): string {
       这是<strong>内部测试版</strong>诊断窗口，不会自动关闭。
       启动过程中请<strong>不要强关</strong>；全部结束后请<strong>截图本窗口</strong>反馈最慢的步骤。
     </p>
+    <div class="stats">
+      <div class="stat"><div class="stat-k">墙钟总用时</div><div class="stat-v" id="statWall">—</div></div>
+      <div class="stat"><div class="stat-k">已计量工作</div><div class="stat-v" id="statWork">—</div></div>
+      <div class="stat"><div class="stat-k">未计量间隔</div><div class="stat-v" id="statGap">—</div></div>
+    </div>
     <div class="current">
       <div class="current-label" id="current">准备启动…</div>
       <div class="current-detail" id="detail">初始化中</div>
     </div>
     <div class="bar" id="bar"><i></i></div>
     <div class="list-title">
-      <span>启动阶段明细（越靠后越新；偏黄=较慢）</span>
+      <span>时间轴（起点相对启动；耗时=该步工作时间）</span>
       <span id="slowHint"></span>
     </div>
     <div class="list" id="list"></div>
     <div class="footer">
-      测试版诊断 · 日志前缀 <code>[StartupTiming]</code> · 本窗口会保留到你手动关闭，方便截图。
+      墙钟总用时 ≠ 各步毫秒简单相加：中间有等待（如首屏后延迟恢复）、界面加载、以及嵌套子步骤（缩进行不重复计入「已计量工作」）。
+      日志前缀 <code>[StartupTiming]</code> · 窗口保留到手动关闭。
     </div>
   </div>
   <script>
@@ -195,11 +217,22 @@ function buildSplashHtml(): string {
     const bannerEl = document.getElementById('banner');
     const titleEl = document.getElementById('title');
     const slowHintEl = document.getElementById('slowHint');
+    const statWallEl = document.getElementById('statWall');
+    const statWorkEl = document.getElementById('statWork');
+    const statGapEl = document.getElementById('statGap');
     let bootAt = Date.now();
     let frozenElapsedMs = null;
 
-    function formatSec(ms) {
-      return (Math.max(0, ms) / 1000).toFixed(1);
+    function formatDuration(ms) {
+      const value = Math.max(0, Math.round(Number(ms) || 0));
+      if (value < 1000) return value + ' ms';
+      return (value / 1000).toFixed(2) + ' 秒（' + value + ' ms）';
+    }
+
+    function formatOffset(ms) {
+      const value = Math.max(0, Number(ms) || 0);
+      if (value < 1000) return '+' + Math.round(value) + 'ms';
+      return '+' + (value / 1000).toFixed(2) + 's';
     }
 
     function render(snap) {
@@ -207,6 +240,9 @@ function buildSplashHtml(): string {
       if (typeof snap.bootAtMs === 'number' && snap.bootAtMs > 0) bootAt = snap.bootAtMs;
       const ready = !!snap.diagnosticsReady;
       const since = typeof snap.sinceBootMs === 'number' ? snap.sinceBootMs : (Date.now() - bootAt);
+      const workMs = Number(snap.measuredLeafWorkMs || 0);
+      const gapMs = Number(snap.unaccountedGapMs || Math.max(0, since - workMs));
+
       if (ready) {
         frozenElapsedMs = typeof snap.diagnosticsReadyAtMs === 'number'
           ? snap.diagnosticsReadyAtMs
@@ -215,41 +251,58 @@ function buildSplashHtml(): string {
         bannerEl.classList.add('is-visible');
         titleEl.textContent = '文献管理 · 启动诊断完成（请截图）';
         document.title = '文献管理 · 启动诊断完成（请截图）';
-        elapsedEl.textContent = '总用时 ' + formatSec(frozenElapsedMs) + ' 秒';
+        elapsedEl.textContent = '墙钟 ' + formatDuration(frozenElapsedMs);
         currentEl.textContent = snap.currentLabel || '启动与后台恢复已结束';
-        detailEl.textContent = snap.currentDetail || '请截图本窗口（含总用时与阶段列表）发给开发者';
+        detailEl.textContent = snap.currentDetail || '请截图本窗口发给开发者';
       } else {
         document.body.classList.remove('is-ready');
         bannerEl.classList.remove('is-visible');
         titleEl.textContent = '文献管理 · 启动诊断（测试版）';
-        elapsedEl.textContent = '已用时 ' + formatSec(since) + ' 秒';
+        elapsedEl.textContent = '墙钟 ' + formatDuration(since);
         currentEl.textContent = snap.currentLabel || '正在启动…';
         detailEl.textContent = snap.currentDetail || snap.currentPhase || '';
       }
 
+      const wallForStats = ready && frozenElapsedMs != null ? frozenElapsedMs : since;
+      statWallEl.textContent = formatDuration(wallForStats);
+      statWorkEl.textContent = formatDuration(workMs);
+      statGapEl.textContent = formatDuration(ready ? Math.max(0, wallForStats - workMs) : gapMs);
+
       const phases = snap.phases || [];
-      const maxMs = phases.reduce(function (m, p) { return Math.max(m, Number(p.durationMs) || 0); }, 0);
+      const leafPhases = phases.filter(function (p) { return !p.nested; });
+      const maxMs = leafPhases.reduce(function (m, p) { return Math.max(m, Number(p.durationMs) || 0); }, 0);
       const slowThreshold = Math.max(500, maxMs * 0.35);
-      if (ready && maxMs > 0) {
-        slowHintEl.textContent = '最慢一步 ' + maxMs + ' ms';
+      if (maxMs > 0) {
+        slowHintEl.textContent = '最慢工作步 ' + formatDuration(maxMs);
       } else {
         slowHintEl.textContent = '';
       }
 
       const rows = [];
       phases.forEach(function (p) {
-        const slow = Number(p.durationMs) >= slowThreshold && Number(p.durationMs) >= 500;
+        const slow = !p.nested && Number(p.durationMs) >= slowThreshold && Number(p.durationMs) >= 500;
+        const nested = !!p.nested;
+        const cls = 'row' + (slow ? ' is-slow' : '') + (nested ? ' is-nested' : '');
+        const label = (nested ? '↳ ' : '') + (p.label || p.name);
         rows.push(
-          '<div class="row' + (slow ? ' is-slow' : '') + '"><span>' + escapeHtml(p.label || p.name) + '</span><span class="ms">' + p.durationMs + ' ms</span></div>'
+          '<div class="' + cls + '">'
+          + '<span class="at">' + formatOffset(p.startedSinceBootMs) + '</span>'
+          + '<span>' + escapeHtml(label) + '</span>'
+          + '<span class="ms">' + formatDuration(p.durationMs) + '</span>'
+          + '</div>'
         );
       });
       (snap.openPhases || []).forEach(function (p) {
         rows.push(
-          '<div class="row is-open"><span>进行中 · ' + escapeHtml(p.label || p.name) + '</span><span class="ms">…</span></div>'
+          '<div class="row is-open">'
+          + '<span class="at">' + formatOffset(p.startedSinceBootMs) + '</span>'
+          + '<span>进行中 · ' + escapeHtml(p.label || p.name) + '</span>'
+          + '<span class="ms">…</span>'
+          + '</div>'
         );
       });
       if (rows.length === 0) {
-        rows.push('<div class="row"><span>等待阶段数据…</span><span class="ms">—</span></div>');
+        rows.push('<div class="row"><span class="at">+0</span><span>等待阶段数据…</span><span class="ms">—</span></div>');
       }
       listEl.innerHTML = rows.join('');
       if (!ready) listEl.scrollTop = listEl.scrollHeight;
@@ -265,11 +318,11 @@ function buildSplashHtml(): string {
 
     setInterval(function () {
       if (frozenElapsedMs != null) {
-        elapsedEl.textContent = '总用时 ' + formatSec(frozenElapsedMs) + ' 秒';
+        elapsedEl.textContent = '墙钟 ' + formatDuration(frozenElapsedMs);
         return;
       }
       const ms = Date.now() - bootAt;
-      elapsedEl.textContent = '已用时 ' + formatSec(ms) + ' 秒';
+      elapsedEl.textContent = '墙钟 ' + formatDuration(ms);
     }, 200);
 
     ipcRenderer.on('startup:timing', function (_event, snap) {

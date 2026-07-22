@@ -90,8 +90,23 @@ assert(
 assert(
   startupTiming.includes('export function setStartupTimingUiPublisher')
     && startupTiming.includes('export function getStartupTimingUiSnapshot')
-    && startupTiming.includes('PHASE_LABELS'),
-  'Startup timing should publish Chinese-labeled UI snapshots for the splash window.',
+    && startupTiming.includes('PHASE_LABELS')
+    && startupTiming.includes('measuredLeafWorkMs')
+    && startupTiming.includes('unaccountedGapMs')
+    && startupTiming.includes('startedSinceBootMs')
+    && startupTiming.includes('export function formatDurationZh'),
+  'Startup timing UI should expose wall-clock, leaf work, gap, and timeline offsets so totals are reconcilable.',
+)
+assert(
+  startupRecovery.includes("beginStartupPhase('startup-recovery-delay')"),
+  'The fixed post-paint recovery delay must be a timed phase so wall clock is not unexplained idle.',
+)
+assert(
+  startupSplash.includes('墙钟总用时')
+    && startupSplash.includes('已计量工作')
+    && startupSplash.includes('未计量间隔')
+    && startupSplash.includes('formatOffset'),
+  'Diagnostic splash must show wall/work/gap and timeline offsets, not only raw work ms.',
 )
 assert(
   database.includes("from './startup-timing'")
