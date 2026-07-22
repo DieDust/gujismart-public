@@ -760,6 +760,10 @@ export function addPdfRepositoryPath(dirPath: string): PdfRepositoryStatus {
   const nextPaths = [...paths, dirPath]
   writeRepositoryPaths(nextPaths)
   scheduleDatabaseSave()
+  // Cloud/NAS folders change often — kick off a background scan so newly added dirs are usable soon.
+  void ensurePdfRepositoryIndexAsync({ force: true }).catch((error) => {
+    console.warn('[PDF repository] background index after add failed', error)
+  })
   return getPdfRepositoryStatus()
 }
 
@@ -1199,6 +1203,103 @@ async function lookupPdfRepositoryPathByHashAsync(targetHash: string): Promise<s
   return filePath
 }
 
+/** Soft freshness window: batch restore reuses one scan; cloud uploads within this window still get a rescan if miss. */
+const PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS = 20_000
+let pdfRepositoryIndexInFlight: Promise<PdfRepositoryIndexResult> | null = null
+
+function getPdfRepositoryLastIndexedAtMs(): number {
+  const fromSetting = queryOne<{ value: string | null }>(
+    "SELECT value FROM settings WHERE key = 'pdf_repository_last_indexed_at'",
+  )
+  const settingMs = Date.parse(String(fromSetting?.value || ''))
+  if (Number.isFinite(settingMs) && settingMs > 0) return settingMs
+  const fromTable = queryOne<{ lastIndexedAt: string | null }>(
+    'SELECT MAX(indexed_at) as lastIndexedAt FROM pdf_repository_index',
+  )
+  const tableMs = Date.parse(String(fromTable?.lastIndexedAt || ''))
+  return Number.isFinite(tableMs) && tableMs > 0 ? tableMs : 0
+}
+
+type PdfRepositoryIndexEnsureResult = PdfRepositoryIndexResult & { refreshed: boolean }
+
+/**
+ * Ensure warehouse index is reasonably fresh.
+ * Cloud/NAS users often drop new PDFs without clicking「立即扫描」—restore and add-folder paths call this.
+ */
+export function ensurePdfRepositoryIndex(options?: { force?: boolean; maxAgeMs?: number }): PdfRepositoryIndexEnsureResult {
+  const force = options?.force === true
+  const maxAgeMs = force ? 0 : Math.max(0, Number(options?.maxAgeMs ?? PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS))
+  const lastMs = getPdfRepositoryLastIndexedAtMs()
+  if (!force && lastMs > 0 && Date.now() - lastMs < maxAgeMs) {
+    const status = getPdfRepositoryStatus()
+    return {
+      fileCount: status.stats.fileCount,
+      totalBytes: status.stats.totalBytes,
+      matchedCount: 0,
+      refreshed: false,
+    }
+  }
+  const result = indexPdfRepositories(readRepositoryPaths())
+  return { ...result, refreshed: true }
+}
+
+export async function ensurePdfRepositoryIndexAsync(options?: {
+  force?: boolean
+  maxAgeMs?: number
+}): Promise<PdfRepositoryIndexEnsureResult> {
+  const force = options?.force === true
+  const maxAgeMs = force ? 0 : Math.max(0, Number(options?.maxAgeMs ?? PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS))
+  const lastMs = getPdfRepositoryLastIndexedAtMs()
+  if (!force && lastMs > 0 && Date.now() - lastMs < maxAgeMs) {
+    const status = getPdfRepositoryStatus()
+    return {
+      fileCount: status.stats.fileCount,
+      totalBytes: status.stats.totalBytes,
+      matchedCount: 0,
+      refreshed: false,
+    }
+  }
+  if (pdfRepositoryIndexInFlight) {
+    const result = await pdfRepositoryIndexInFlight
+    return { ...result, refreshed: true }
+  }
+  pdfRepositoryIndexInFlight = indexPdfRepositoriesAsync(readRepositoryPaths())
+    .finally(() => {
+      pdfRepositoryIndexInFlight = null
+    })
+  const result = await pdfRepositoryIndexInFlight
+  return { ...result, refreshed: true }
+}
+
+/**
+ * Resolve a library PDF from the warehouse index, refreshing the scan when:
+ * - index is stale (new cloud uploads since last scan), or
+ * - hash miss / indexed path no longer exists.
+ */
+function resolveWarehousePdfPathByHash(targetHash: string): string | null {
+  // Soft refresh so recently uploaded cloud files are visible without a manual「立即扫描」.
+  const soft = ensurePdfRepositoryIndex({ maxAgeMs: PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS })
+  let matchPath = lookupPdfRepositoryPathByHash(targetHash)
+  if (matchPath) return matchPath
+  // Only force another full scan when the soft path reused a stale cache (did not just scan).
+  if (!soft.refreshed) {
+    ensurePdfRepositoryIndex({ force: true })
+    matchPath = lookupPdfRepositoryPathByHash(targetHash)
+  }
+  return matchPath
+}
+
+async function resolveWarehousePdfPathByHashAsync(targetHash: string): Promise<string | null> {
+  const soft = await ensurePdfRepositoryIndexAsync({ maxAgeMs: PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS })
+  let matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+  if (matchPath) return matchPath
+  if (!soft.refreshed) {
+    await ensurePdfRepositoryIndexAsync({ force: true })
+    matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+  }
+  return matchPath
+}
+
 function persistLinkedPdfRestore(
   docId: string,
   sourcePath: string,
@@ -1284,14 +1385,10 @@ export function restorePdfAssetForDocument(
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
     }
-    // Prefer existing index hit before a full repository rescan.
-    let matchPath = lookupPdfRepositoryPathByHash(targetHash)
+    // Soft + forced warehouse rescan so newly uploaded cloud/NAS files are found without manual「立即扫描」.
+    const matchPath = resolveWarehousePdfPathByHash(targetHash)
     if (!matchPath) {
-      indexPdfRepositories(readRepositoryPaths())
-      matchPath = lookupPdfRepositoryPathByHash(targetHash)
-    }
-    if (!matchPath) {
-      return { restored: false, error: '未在 PDF 原件仓库找到同内容 PDF' }
+      return { restored: false, error: '未在 PDF 原件仓库找到同内容 PDF。若刚上传到云盘/NAS，请稍候同步完成后再试，或点设置里「立即扫描」' }
     }
     sourcePath = matchPath
     trustedFromIndex = true
@@ -1383,14 +1480,13 @@ export async function restorePdfAssetForDocumentAsync(
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
     }
-    // Prefer index hit; only rescan repositories when missing.
-    let matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+    // Soft + forced warehouse rescan so newly uploaded cloud/NAS files are found without manual「立即扫描」.
+    const matchPath = await resolveWarehousePdfPathByHashAsync(targetHash)
     if (!matchPath) {
-      await indexPdfRepositoriesAsync(readRepositoryPaths())
-      matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
-    }
-    if (!matchPath) {
-      return { restored: false, error: '未在 PDF 原件仓库找到同内容 PDF' }
+      return {
+        restored: false,
+        error: '未在 PDF 原件仓库找到同内容 PDF。若刚上传到云盘/NAS，请稍候同步完成后再试，或点设置里「立即扫描」',
+      }
     }
     sourcePath = matchPath
     trustedFromIndex = true

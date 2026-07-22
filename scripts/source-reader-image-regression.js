@@ -181,6 +181,10 @@ assertIncludes(documentView, 'const needsPdfAssetRestore = isTextOnlyPdf || pdfA
 assertIncludes(documentView, 'canAttemptPageImageRecovery = isPdfSource || needsPdfAssetRestore', 'proof empty-state should allow PDF recovery for unknown assets')
 assertIncludes(pdfAssets, 'function stampPdfFingerprintMetadata(', 'PDF restore should stamp fingerprints so one-click warehouse restore works after a manual pick')
 assertIncludes(pdfAssets, 'Object.assign(metadata, stampPdfFingerprintMetadata(metadata, sourceFingerprint, doc.page_count))', 'manual PDF restore should write full fingerprint metadata for unknown documents')
+assertIncludes(pdfAssets, 'function resolveWarehousePdfPathByHash', 'one-click restore should resolve warehouse paths with automatic re-scan for newly uploaded files')
+assertIncludes(pdfAssets, 'async function resolveWarehousePdfPathByHashAsync', 'async one-click restore should re-scan the warehouse when the index is stale or misses')
+assertIncludes(pdfAssets, 'export async function ensurePdfRepositoryIndexAsync', 'warehouse index should expose a shared ensure helper with soft freshness and force rescan')
+assertIncludes(pdfAssets, 'void ensurePdfRepositoryIndexAsync({ force: true })', 'adding a repository folder should kick off a background index scan')
 assertIncludes(sharedTypes, 'pdf_asset_state?:', 'document list item should expose verified source state')
 
 assertIncludes(localResource, 'export function toLocalResourceUrl', 'renderer should share local-resource URL construction')

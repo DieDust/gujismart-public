@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 1.1.13 - 2026-07-22
+
+### 中文
+
+#### 修复
+
+- **PDF 原件仓库自动刷新**：一键补回前会软刷新/按需强制重扫索引，云盘/NAS 新上传的 PDF 不必次次手点「立即扫描」。
+- **批量补回合并扫描**：多篇补回共用一次索引，避免重复全盘扫描。
+- **添加仓库目录后后台建索引**：添加路径后自动启动扫描。
+- **设置页说明**：补充「新文件补回时自动刷新索引」的说明。
+
+#### 下载
+
+- `GujiSmart-1.1.13-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.13-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Fixed
+
+- **Auto-refresh PDF warehouse index** on one-click restore so newly uploaded cloud/NAS files are found without always clicking “Scan now”.
+- **Shared index scan for batch restore** to avoid repeated full rescans.
+- **Background index after adding a repository folder**.
+- **Settings copy** clarifies automatic refresh behavior.
+
+#### Downloads
+
+- `GujiSmart-1.1.13-Setup-x64.exe`
+- `GujiSmart-1.1.13-Portable-x64.exe`
+
 ## 1.1.12 - 2026-07-22
 
 ### 中文
