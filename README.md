@@ -2,7 +2,7 @@
 
 文献管理（GujiSmart）是一个面向古籍与通用文献的本地研究工作台，围绕“导入资料、OCR 校对、检索证据、摘录到写作”的闭环整理个人文献库。
 
-最新安装包见 [GitHub Releases](https://github.com/DieDust/gujismart-public/releases)（当前 **v1.1.20+**）。完整图文教程见 [docs/文献管理-图文使用教程.md](docs/文献管理-图文使用教程.md)。
+最新安装包见 [GitHub Releases](https://github.com/DieDust/gujismart-public/releases)（当前 **v1.1.21+**）。完整图文教程见 [docs/文献管理-图文使用教程.md](docs/文献管理-图文使用教程.md)。
 
 ## 界面预览
 

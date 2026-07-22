@@ -98,6 +98,7 @@ const PHASE_LABELS: Record<string, string> = {
   'startup-recovery.reconcile-completed-ocr': '核对已完成 OCR 状态',
   'startup-recovery.search-status': '整理搜索索引状态',
   'startup-recovery.temp-dirs': '清理临时目录',
+  'startup-recovery.temp-dirs-deferred': '延迟清理系统临时目录',
   'startup-recovery.orphan-storage': '清理孤立存储目录',
   'startup-recovery.resume-deletes': '接续未完成的删除任务',
   'startup-recovery.event-loop-wait': '等待主线程（被其他任务占用）',

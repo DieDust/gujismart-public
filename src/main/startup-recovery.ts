@@ -873,22 +873,54 @@ async function recoverInterruptedPdfCompressionSources(): Promise<number> {
   return recovered
 }
 
-async function removeStartupTempDirs(recoveryStartedAtMs: number): Promise<number> {
+/**
+ * Temp cleanup can dominate cold open: Windows %TEMP% may hold many large
+ * `gujismart-ocr-*` trees from failed OCR; recursive rm under AV easily costs
+ * tens of seconds. Open path uses a tight budget; deep system-tmp cleanup is deferred.
+ */
+async function removeStartupTempDirs(
+  recoveryStartedAtMs: number,
+  options?: {
+    includeSystemTmp?: boolean
+    budgetMs?: number
+    maxDirs?: number
+  },
+): Promise<number> {
+  const includeSystemTmp = options?.includeSystemTmp !== false
+  const budgetMs = Math.max(50, Number(options?.budgetMs || 2_000))
+  const maxDirs = Math.max(1, Number(options?.maxDirs || 20))
+  const deadline = Date.now() + budgetMs
   let removed = 0
-  const roots = [
-    { path: tmpdir(), pattern: /^gujismart-ocr-/ },
-    { path: join(getDataDir(), 'temp'), pattern: /^pdf-compression$/ },
-  ]
+  let budgetExceeded = false
+
+  const roots: Array<{ path: string; pattern: RegExp }> = []
+  if (includeSystemTmp) {
+    roots.push({ path: tmpdir(), pattern: /^gujismart-ocr-/ })
+  }
+  roots.push({ path: join(getDataDir(), 'temp'), pattern: /^pdf-compression$/ })
 
   for (const root of roots) {
+    if (Date.now() >= deadline || removed >= maxDirs) {
+      budgetExceeded = true
+      break
+    }
     if (!existsSync(root.path)) continue
+    // readdir on a huge system TEMP can itself stall; bail if already over budget.
     const entries = await readdir(root.path, { withFileTypes: true }).catch(() => [])
+    if (Date.now() >= deadline) {
+      budgetExceeded = true
+      break
+    }
     for (const entry of entries) {
+      if (Date.now() >= deadline || removed >= maxDirs) {
+        budgetExceeded = true
+        break
+      }
       if (!entry.isDirectory() || !root.pattern.test(entry.name)) continue
       const tempPath = join(root.path, entry.name)
       const info = await stat(tempPath).catch(() => null)
       if (info && info.mtimeMs >= recoveryStartedAtMs) continue
-      await rm(tempPath, { recursive: true, force: true })
+      await rm(tempPath, { recursive: true, force: true }).catch(() => undefined)
       removed += 1
       if (removed % ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL === 0) {
         await yieldToEventLoop()
@@ -898,7 +930,36 @@ async function removeStartupTempDirs(recoveryStartedAtMs: number): Promise<numbe
     if (startupRecoveryCancelRequested) break
   }
 
+  if (budgetExceeded) {
+    console.log(
+      `[Startup Recovery] Temp cleanup stopped early removed=${removed} ` +
+      `budgetMs=${budgetMs} maxDirs=${maxDirs} (remaining dirs deferred)`,
+    )
+  }
   return removed
+}
+
+function scheduleDeferredStartupTempCleanup(recoveryStartedAtMs: number): void {
+  // After interactive open: clean leftover OCR temp trees without blocking recovery.
+  setTimeout(() => {
+    void (async () => {
+      const endPhase = beginStartupPhase('startup-recovery.temp-dirs-deferred')
+      try {
+        const removed = await removeStartupTempDirs(recoveryStartedAtMs, {
+          includeSystemTmp: true,
+          budgetMs: 30_000,
+          maxDirs: 40,
+        })
+        if (removed > 0) {
+          console.log(`[Startup Recovery] Deferred temp cleanup removed ${removed} dir(s)`)
+        }
+      } catch (error) {
+        console.warn('[Startup Recovery] Deferred temp cleanup failed', error)
+      } finally {
+        endPhase()
+      }
+    })()
+  }, 90_000).unref?.()
 }
 
 export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
@@ -1082,7 +1143,24 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
   {
     const endPhase = beginStartupPhase('startup-recovery.temp-dirs')
     try {
-      removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs)
+      // Large libraries / light open path: never walk system %TEMP% during recovery.
+      // Failed OCR often leaves multi-GB gujismart-ocr-* trees; rm under AV freezes open ~70s.
+      const lightOpen = shouldUseLightInterruptedImportRepair()
+      if (lightOpen) {
+        removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs, {
+          includeSystemTmp: false,
+          budgetMs: 400,
+          maxDirs: 4,
+        })
+        scheduleDeferredStartupTempCleanup(recoveryStartedAtMs)
+        console.log('[Startup Recovery] System TEMP OCR cleanup deferred (light open path)')
+      } else {
+        removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs, {
+          includeSystemTmp: true,
+          budgetMs: 3_000,
+          maxDirs: 20,
+        })
+      }
     } finally {
       endPhase()
     }
