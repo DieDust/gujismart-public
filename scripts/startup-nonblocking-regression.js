@@ -13,6 +13,7 @@ const pdfAssets = readSource('src', 'main', 'pdf-assets.ts')
 const batchProcessor = readSource('src', 'main', 'batch-processor.ts')
 const libraryView = readSource('src', 'renderer', 'src', 'views', 'LibraryView.tsx')
 const startupRecovery = readSource('src', 'main', 'startup-recovery.ts')
+const startupTiming = readSource('src', 'main', 'startup-timing.ts')
 const metadataReclassifier = readSource('src', 'main', 'metadata-reclassifier.ts')
 function sliceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker)
@@ -49,6 +50,64 @@ const orphanStorageCleanupBody = sliceBetween(
   'async function recoverInterruptedPdfCompressionSources',
 )
 
+assert(
+  startupTiming.includes('export function beginStartupPhase')
+    && startupTiming.includes('export async function withStartupPhase')
+    && startupTiming.includes('export function logStartupTimingSummary')
+    && startupTiming.includes('[StartupTiming]'),
+  'Startup timing helper should expose begin/with/summary APIs and a stable log prefix for cold-start diagnosis.',
+)
+assert(
+  mainIndex.includes("from './startup-timing'")
+    && mainIndex.includes("withStartupPhase('initDatabase'")
+    && mainIndex.includes("withStartupPhaseSync('createWindow'")
+    && mainIndex.includes("logStartupTimingSummary('window-ready-to-show')")
+    && mainIndex.includes("logStartupTimingSummary('after-createWindow')"),
+  'Main open path should time initDatabase, createWindow, and window-ready checkpoints without blocking recovery.',
+)
+assert(
+  mainIndex.includes("from './startup-splash'")
+    && mainIndex.includes('openStartupSplash()')
+    && mainIndex.includes('keepStartupSplashForDiagnostics')
+    && mainIndex.indexOf('openStartupSplash()') < mainIndex.indexOf("withStartupPhase('initDatabase'")
+    && !/ready-to-show[\s\S]{0,400}closeStartupSplash\(/.test(mainIndex),
+  'Test diagnostic splash should open before initDatabase and must not auto-close when the main window shows.',
+)
+const startupSplash = readSource('src', 'main', 'startup-splash.ts')
+assert(
+  startupSplash.includes('export function openStartupSplash')
+    && startupSplash.includes('export function keepStartupSplashForDiagnostics')
+    && startupSplash.includes('启动诊断完成（请截图）')
+    && startupSplash.includes('截图')
+    && startupSplash.includes("ipcRenderer.on('startup:timing'"),
+  'Startup splash should stay open as a Chinese diagnostic report for remote screenshot feedback.',
+)
+assert(
+  startupRecovery.includes('keepStartupSplashForDiagnostics')
+    && startupRecovery.includes('recovery-complete'),
+  'Startup recovery completion should finalize the diagnostic splash for screenshots.',
+)
+assert(
+  startupTiming.includes('export function setStartupTimingUiPublisher')
+    && startupTiming.includes('export function getStartupTimingUiSnapshot')
+    && startupTiming.includes('PHASE_LABELS'),
+  'Startup timing should publish Chinese-labeled UI snapshots for the splash window.',
+)
+assert(
+  database.includes("from './startup-timing'")
+    && database.includes("withStartupPhaseSync('initDatabase.open-sqlite'")
+    && database.includes("withStartupPhaseSync('initDatabase.schema-migrate'")
+    && database.includes("withStartupPhaseSync('initDatabase.ensure-fts'"),
+  'Database init should split open/schema/FTS into timed sub-phases for large-library diagnosis.',
+)
+assert(
+  startupRecovery.includes("from './startup-timing'")
+    && startupRecovery.includes("beginStartupPhase('startup-recovery')")
+    && startupRecovery.includes("beginStartupPhase('startup-recovery.ocr-jobs')")
+    && startupRecovery.includes("beginStartupPhase('startup-recovery.orphan-storage')")
+    && startupRecovery.includes("logStartupTimingSummary('startup-recovery-complete'"),
+  'Startup recovery should time major sub-phases and emit a completion summary.',
+)
 assert(
   mainIndex.includes("import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'"),
   'Main process should use scheduled startup recovery, not await recovery before opening the window.',

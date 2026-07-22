@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 1.1.15 - 2026-07-22
+
+### 中文
+
+#### 测试诊断（不公开）
+
+- **启动诊断窗口**：冷启动时显示中文阶段进度与耗时；主窗口就绪后**不自动关闭**，便于大库用户截图反馈。
+- **启动分段计时**：主进程 `initDatabase` / 窗口 / 启动恢复各子步骤写入诊断列表。
+- 完成后提示「请截图本窗口」；可手动关闭。120 秒兜底解锁关闭。
+
+#### 下载
+
+- `GujiSmart-1.1.15-Setup-x64.exe`
+- `GujiSmart-1.1.15-Portable-x64.exe`
+
+### English
+
+#### Diagnostics (internal test)
+
+- Persistent startup diagnostics window with phase timings for remote large-library feedback.
+- Does not auto-close after main window is ready.
+
+#### Downloads
+
+- `GujiSmart-1.1.15-Setup-x64.exe`
+- `GujiSmart-1.1.15-Portable-x64.exe`
+
 ## 1.1.14 - 2026-07-22
 
 ### 中文

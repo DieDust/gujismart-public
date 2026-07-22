@@ -15,6 +15,14 @@ import { shutdownHealthReportWorkers } from './health-report-worker-client'
 import { shutdownSearchIndexWorkers } from './search-index-worker-client'
 import { ensureDisabledMetadataTagBindingsCleared, ensureEnabledMetadataTagBindingsRebuilt } from './metadata-tags'
 import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'
+import {
+  beginStartupPhase,
+  logStartupTimingSummary,
+  markStartupEvent,
+  withStartupPhase,
+  withStartupPhaseSync,
+} from './startup-timing'
+import { closeStartupSplash, keepStartupSplashForDiagnostics, openStartupSplash } from './startup-splash'
 import { resumePendingImportAutoOcrTasks, shutdownOcrRuntime } from './ipc/ocr'
 import { shutdownBookTranslationRuntime, shutdownDocumentDeleteRuntime, shutdownDocumentImportRuntime } from './ipc/documents'
 import { batchProcessor } from './batch-processor'
@@ -230,10 +238,19 @@ function createWindow(): void {
       windowShowFallbackTimer = null
     }
     console.log(`[Main] Showing main window via ${reason}`)
+    markStartupEvent('window-shown', `via=${reason}`)
     showWindowIfNeeded(win)
     batchProcessor.setMainWindow(win)
+    // Test build: do NOT auto-close the diagnostic window — keep it for remote users to screenshot.
     scheduleStartupRecovery()
     scheduleStartupMaintenance()
+    markStartupEvent('startup-recovery-scheduled')
+    markStartupEvent('startup-maintenance-scheduled')
+    logStartupTimingSummary('window-shown')
+    // Fallback only: if recovery hangs, still unlock the diagnostic window for screenshots.
+    setTimeout(() => {
+      keepStartupSplashForDiagnostics({ reason: `fallback-after-window-shown:${reason}` })
+    }, 120_000).unref?.()
   }
 
   mainWindow.on('ready-to-show', () => {
@@ -246,13 +263,22 @@ function createWindow(): void {
       windowShowFallbackTimer = null
     }
     console.log('[Main] Showing main window via ready-to-show')
+    markStartupEvent('window-shown', 'via=ready-to-show')
     const win = mainWindow
     showWindowIfNeeded(win)
     batchProcessor.setMainWindow(win)
+    markStartupEvent('startup-recovery-scheduled')
+    markStartupEvent('startup-maintenance-scheduled')
+    logStartupTimingSummary('window-ready-to-show')
+    // Prefer keepStartupSplashForDiagnostics from recovery completion; this is a safety net only.
+    setTimeout(() => {
+      keepStartupSplashForDiagnostics({ reason: 'fallback-after-ready-to-show' })
+    }, 120_000).unref?.()
   })
 
   mainWindow.webContents.on('did-finish-load', () => {
     console.log(`[Main] Renderer finished loading: ${mainWindow?.webContents.getURL() || ''}`)
+    markStartupEvent('renderer-did-finish-load')
     showMainWindowFallback('did-finish-load')
     // Never resume bulk OCR on the first paint path. After a short grace period,
     // auto-continue interrupted import-auto OCR and recoverable batch queues so
@@ -472,34 +498,46 @@ function scheduleStartupMaintenance(): void {
   startupMaintenanceScheduled = true
   setTimeout(() => {
     void (async () => {
+      const endMaintenance = beginStartupPhase('startup-maintenance')
       try {
-        runDeferredStartupDatabaseMaintenance()
-      } catch (error) {
-        console.warn('[Main] Failed to run deferred database maintenance', error)
-      }
-
-      try {
-        if (isLargeLibraryForAutomaticMaintenance()) {
-          console.log('[Main] Skipping automatic metadata tag reconciliation during startup because the library is large.')
-        } else {
-          const cleanup = ensureDisabledMetadataTagBindingsCleared()
-          if (cleanup && (cleanup.removedRelations > 0 || cleanup.keptManualRelations > 0 || cleanup.removedTags > 0)) {
-            console.log(
-              `[Main] Cleared stale metadata tag bindings: removed=${cleanup.removedRelations}, keptManual=${cleanup.keptManualRelations}, removedTags=${cleanup.removedTags}`,
-            )
-          }
-          const rebuild = await ensureEnabledMetadataTagBindingsRebuilt()
-          if (rebuild && (rebuild.syncedDocuments > 0 || rebuild.createdOrUpdatedRelations > 0)) {
-            console.log(
-              `[Main] Rebuilt metadata tag bindings: processed=${rebuild.processedDocuments}, synced=${rebuild.syncedDocuments}, skipped=${rebuild.skippedDocuments}, relations=${rebuild.createdOrUpdatedRelations}`,
-            )
-          }
+        try {
+          withStartupPhaseSync('startup-maintenance.database', () => {
+            runDeferredStartupDatabaseMaintenance()
+          })
+        } catch (error) {
+          console.warn('[Main] Failed to run deferred database maintenance', error)
         }
-      } catch (error) {
-        console.warn('[Main] Failed to reconcile metadata tag bindings', error)
-      }
 
-      scheduleStartupMetadataReclassification()
+        try {
+          if (isLargeLibraryForAutomaticMaintenance()) {
+            console.log('[Main] Skipping automatic metadata tag reconciliation during startup because the library is large.')
+            markStartupEvent('startup-maintenance.metadata-tags-skipped-large-library')
+          } else {
+            await withStartupPhase('startup-maintenance.metadata-tags', async () => {
+              const cleanup = ensureDisabledMetadataTagBindingsCleared()
+              if (cleanup && (cleanup.removedRelations > 0 || cleanup.keptManualRelations > 0 || cleanup.removedTags > 0)) {
+                console.log(
+                  `[Main] Cleared stale metadata tag bindings: removed=${cleanup.removedRelations}, keptManual=${cleanup.keptManualRelations}, removedTags=${cleanup.removedTags}`,
+                )
+              }
+              const rebuild = await ensureEnabledMetadataTagBindingsRebuilt()
+              if (rebuild && (rebuild.syncedDocuments > 0 || rebuild.createdOrUpdatedRelations > 0)) {
+                console.log(
+                  `[Main] Rebuilt metadata tag bindings: processed=${rebuild.processedDocuments}, synced=${rebuild.syncedDocuments}, skipped=${rebuild.skippedDocuments}, relations=${rebuild.createdOrUpdatedRelations}`,
+                )
+              }
+            })
+          }
+        } catch (error) {
+          console.warn('[Main] Failed to reconcile metadata tag bindings', error)
+        }
+
+        scheduleStartupMetadataReclassification()
+        markStartupEvent('startup-maintenance.metadata-reclassification-scheduled')
+      } finally {
+        endMaintenance()
+        logStartupTimingSummary('startup-maintenance-done', true)
+      }
     })()
   }, STARTUP_MAINTENANCE_DELAY_MS).unref?.()
 }
@@ -540,32 +578,52 @@ if (mcpLaunch.isMcp) {
       app.exit(1)
     })
 } else {
+  markStartupEvent('main-module-loaded')
   app.whenReady()
     .then(async () => {
+      markStartupEvent('app-when-ready')
+      // Visible progress for large libraries: show splash before heavy DB open so remote users can screenshot stalls.
+      try {
+        openStartupSplash()
+        markStartupEvent('startup-splash-open')
+      } catch (error) {
+        console.warn('[Main] Failed to open startup splash', error)
+      }
       protocol.handle('local-resource', (request) => {
         const filePath = assertAllowedLocalResourceUrl(request.url)
         return streamFileResponse(filePath, request)
       })
 
-      await initDatabase()
-      initializeSettingsSecurity()
-      registerAllIpcHandlers()
+      await withStartupPhase('initDatabase', () => initDatabase())
+      withStartupPhaseSync('initializeSettingsSecurity', () => {
+        initializeSettingsSecurity()
+      })
+      withStartupPhaseSync('registerAllIpcHandlers', () => {
+        registerAllIpcHandlers()
+      })
       fileCapabilitySweepTimer = setInterval(() => {
         fileCapabilityService.sweepExpired()
         importSelectionService.sweepExpired()
       }, FILE_CAPABILITY_SWEEP_INTERVAL_MS)
       fileCapabilitySweepTimer.unref?.()
-      createWindow()
+      withStartupPhaseSync('createWindow', () => {
+        createWindow()
+      })
+      logStartupTimingSummary('after-createWindow')
       // Delay allow-list preload further: reading every document file_path from SQLite
       // then statting/canonicalizing them causes open-path disk pressure on large libraries.
       setTimeout(() => {
         try {
+          const endPreload = beginStartupPhase('preload-local-resource-paths')
           allowManagedFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
+          endPreload()
         } catch (error) {
           console.warn('[Main] Failed to preload stored local resource paths', error)
         }
       }, Math.max(STARTUP_MAINTENANCE_DELAY_MS, 60_000)).unref?.()
-      startAutoBackupScheduler()
+      withStartupPhaseSync('startAutoBackupScheduler', () => {
+        startAutoBackupScheduler()
+      })
 
       app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
@@ -575,6 +633,12 @@ if (mcpLaunch.isMcp) {
     })
     .catch((error) => {
       console.error('[Main] Failed to initialize application', error)
+      logStartupTimingSummary('startup-failed', true)
+      try {
+        closeStartupSplash({ delayMs: 0 })
+      } catch {
+        // ignore
+      }
       app.quit()
     })
 

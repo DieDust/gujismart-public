@@ -10,6 +10,8 @@ import { getPdfPageCountFast } from './pdf-info'
 import { isSearchIndexReindexQueuedInMemory, isSearchIndexUsableForDocument, markSearchIndexStaleForDocuments } from './semantic-search'
 import { emitBackgroundTaskStatus } from './background-tasks'
 import { inspectManagedDeleteTarget } from './managed-path-boundary'
+import { beginStartupPhase, logStartupTimingSummary, markStartupEvent } from './startup-timing'
+import { keepStartupSplashForDiagnostics } from './startup-splash'
 import { nanoid } from 'nanoid'
 
 export interface StartupRecoverySummary {
@@ -715,6 +717,7 @@ async function removeStartupTempDirs(recoveryStartedAtMs: number): Promise<numbe
 
 export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
   const recoveryStartedAtMs = Date.now()
+  const endRecovery = beginStartupPhase('startup-recovery')
   emitStartupRecoveryStatus({
     status: 'processing',
     progress: 0.05,
@@ -775,19 +778,42 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       progress: 1,
       message: '启动恢复已暂停，下次打开会继续检查未完成任务',
     })
+    markStartupEvent('startup-recovery-canceled')
+    logStartupTimingSummary('startup-recovery-canceled', true)
+    try {
+      keepStartupSplashForDiagnostics({ reason: 'recovery-canceled' })
+    } catch {
+      // ignore
+    }
     return summary
   }
 
+  try {
+
   if (await startupRecoveryCheckpoint()) return finishCanceled()
-  ocr = recoverInterruptedOcrJobs()
+  {
+    const endPhase = beginStartupPhase('startup-recovery.ocr-jobs')
+    try {
+      ocr = recoverInterruptedOcrJobs()
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
 
-  transaction(() => {
-    resetSearchIndexDocIds = resetInterruptedSearchIndexJobs()
-    resetSearchIndexJobs = resetSearchIndexDocIds.length
-    resetAiLayoutCacheRows = resetInterruptedAiLayoutCacheRows()
-    resetTranslationCacheRows = resetInterruptedTranslationCacheRows()
-  })
+  {
+    const endPhase = beginStartupPhase('startup-recovery.reset-interrupted-jobs')
+    try {
+      transaction(() => {
+        resetSearchIndexDocIds = resetInterruptedSearchIndexJobs()
+        resetSearchIndexJobs = resetSearchIndexDocIds.length
+        resetAiLayoutCacheRows = resetInterruptedAiLayoutCacheRows()
+        resetTranslationCacheRows = resetInterruptedTranslationCacheRows()
+      })
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   emitStartupRecoveryStatus({
@@ -795,14 +821,35 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     progress: 0.45,
     message: '正在修复中断的导入记录',
   })
-  recoveredPdfCompressionSources = await recoverInterruptedPdfCompressionSources()
+  {
+    const endPhase = beginStartupPhase('startup-recovery.pdf-compression-sources')
+    try {
+      recoveredPdfCompressionSources = await recoverInterruptedPdfCompressionSources()
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
-  interruptedImports = await repairInterruptedImports()
+  {
+    const endPhase = beginStartupPhase('startup-recovery.interrupted-imports')
+    try {
+      interruptedImports = await repairInterruptedImports()
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
 
-  transaction(() => {
-    completedOcrDocuments = reconcileCompletedOcrDocuments()
-  })
+  {
+    const endPhase = beginStartupPhase('startup-recovery.reconcile-completed-ocr')
+    try {
+      transaction(() => {
+        completedOcrDocuments = reconcileCompletedOcrDocuments()
+      })
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   emitStartupRecoveryStatus({
@@ -814,25 +861,46 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
   // reindex workers rewrite large segment tables and dominate disk right after open.
   // Never full-scan pages content for "documents needing index" — only the IDs we
   // already touched in this recovery pass.
-  markSearchIndexPendingForRecoveredDocuments(resetSearchIndexDocIds)
-  const recoveredOcrSearchDocIds = findRecoveredOcrDocumentsNeedingSearchIndex(resetSearchIndexDocIds)
-  reindexedRecoveredOcrDocuments = recoveredOcrSearchDocIds.length
-  markSearchIndexPendingForRecoveredDocuments(recoveredOcrSearchDocIds)
-  const deferredReindexDocIds = [...new Set([...resetSearchIndexDocIds, ...recoveredOcrSearchDocIds].filter(Boolean))]
-  if (deferredReindexDocIds.length > 0) {
-    setTimeout(() => {
-      try {
-        markSearchIndexStaleForDocuments(deferredReindexDocIds)
-        console.log(`[Startup Recovery] Deferred search reindex queued for ${deferredReindexDocIds.length} document(s)`)
-      } catch (error) {
-        console.warn('[Startup Recovery] Deferred search reindex failed', error)
+  {
+    const endPhase = beginStartupPhase('startup-recovery.search-status')
+    try {
+      markSearchIndexPendingForRecoveredDocuments(resetSearchIndexDocIds)
+      const recoveredOcrSearchDocIds = findRecoveredOcrDocumentsNeedingSearchIndex(resetSearchIndexDocIds)
+      reindexedRecoveredOcrDocuments = recoveredOcrSearchDocIds.length
+      markSearchIndexPendingForRecoveredDocuments(recoveredOcrSearchDocIds)
+      const deferredReindexDocIds = [...new Set([...resetSearchIndexDocIds, ...recoveredOcrSearchDocIds].filter(Boolean))]
+      if (deferredReindexDocIds.length > 0) {
+        setTimeout(() => {
+          try {
+            markSearchIndexStaleForDocuments(deferredReindexDocIds)
+            console.log(`[Startup Recovery] Deferred search reindex queued for ${deferredReindexDocIds.length} document(s)`)
+          } catch (error) {
+            console.warn('[Startup Recovery] Deferred search reindex failed', error)
+          }
+        }, 90_000).unref?.()
       }
-    }, 90_000).unref?.()
+    } finally {
+      endPhase()
+    }
   }
 
-  removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs)
+  {
+    const endPhase = beginStartupPhase('startup-recovery.temp-dirs')
+    try {
+      removedTempDirs = await removeStartupTempDirs(recoveryStartedAtMs)
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
-  orphanStorageDirs = await removeOrphanStorageDirs()
+  {
+    const endPhase = beginStartupPhase('startup-recovery.orphan-storage')
+    try {
+      orphanStorageDirs = await removeOrphanStorageDirs()
+    } finally {
+      endPhase()
+    }
+  }
   if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   emitStartupRecoveryStatus({
@@ -840,7 +908,14 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     progress: 0.9,
     message: '正在接续未完成的删除任务',
   })
-  deletingDocuments = resumeInterruptedDocumentDeletes()
+  {
+    const endPhase = beginStartupPhase('startup-recovery.resume-deletes')
+    try {
+      deletingDocuments = resumeInterruptedDocumentDeletes()
+    } finally {
+      endPhase()
+    }
+  }
   // Count interrupted batch items only. Actual worker start is deferred in main
   // (BATCH_OCR_RESUME_DELAY_MS) so first paint stays responsive; bulk OCR then
   // continues automatically without requiring a manual click.
@@ -956,7 +1031,23 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       + orphanStorageDirs,
   })
 
+  markStartupEvent(
+    'startup-recovery-complete',
+    `batchPending=${resumedBatchQueue.resumedItems} ocrDocs=${ocr.recoveredDocuments} orphanStorage=${orphanStorageDirs}`,
+  )
+  logStartupTimingSummary('startup-recovery-complete', true)
+  // Test build: leave diagnostic splash open with full phase table for remote screenshot feedback.
+  try {
+    keepStartupSplashForDiagnostics({
+      reason: `recovery-complete batchPending=${resumedBatchQueue.resumedItems} ocrDocs=${ocr.recoveredDocuments}`,
+    })
+  } catch (error) {
+    console.warn('[Startup Recovery] Failed to finalize diagnostic splash', error)
+  }
   return summary
+  } finally {
+    endRecovery()
+  }
 }
 
 export function scheduleStartupRecovery(): void {
@@ -968,8 +1059,10 @@ export function scheduleStartupRecovery(): void {
     progress: 0,
     message: '准备检查上次未完成的任务',
   })
+  markStartupEvent('startup-recovery-delay', `delayMs=${STARTUP_RECOVERY_DELAY_MS}`)
   startupRecoveryPromise = new Promise((resolve) => {
     setTimeout(() => {
+      markStartupEvent('startup-recovery-begin')
       void runStartupRecovery()
       .catch((error) => {
         console.warn('[Main] Startup recovery failed', error)
@@ -979,6 +1072,7 @@ export function scheduleStartupRecovery(): void {
           message: '启动恢复失败，可重启后再试',
           errorMessage: (error as Error)?.message || String(error || '启动恢复失败'),
         })
+        logStartupTimingSummary('startup-recovery-error', true)
       })
       .finally(() => {
         startupRecoveryRunning = false
