@@ -1036,6 +1036,12 @@ function getPdfAssetState(doc: DocumentItem): 'available' | 'text_only' | 'unkno
   return 'unknown'
 }
 
+/** text_only and unknown both need a restore path (auto or manual pick). */
+function needsPdfAssetRestore(doc: DocumentItem): boolean {
+  const state = getPdfAssetState(doc)
+  return state === 'text_only' || state === 'unknown'
+}
+
 function getMetadataValue(metadata: DocumentMetadata, keys: string[]): unknown {
   for (const key of keys) {
     const value = metadata[key]
@@ -1136,9 +1142,13 @@ function getPdfAssetTagMeta(doc: DocumentItem): { text: string; color: string; t
     return { text: '有原文', color: 'green', title: '软件目录中保留了 PDF 原文件或可用原图' }
   }
   if (state === 'text_only') {
-    return { text: '仅文本', color: 'orange', title: '本地 PDF 原文件或页图不可读，可从原件仓库或手动选择 PDF 补回' }
+    return { text: '仅文本', color: 'orange', title: '本地 PDF 原文件或页图不可读，可从原件仓库一键补回，或右键手动选择 PDF' }
   }
-  return { text: '原文未知', color: 'default', title: '未记录 PDF 原文件状态' }
+  return {
+    text: '原文未知',
+    color: 'default',
+    title: '未记录可用 PDF/页图。可右键「补回原文」尝试原件仓库；若无指纹请手动选择 PDF，补回后会写入指纹以便下次一键补回',
+  }
 }
 
 function getPdfRestoreSuccessMessage(result: { storageMode?: string } | null | undefined): string {
@@ -1822,7 +1832,7 @@ function buildDocumentMoreMenuItems(input: {
           : []),
       ],
     },
-    ...(pdfAssetState === 'available' || pdfAssetState === 'text_only'
+    ...(pdfAssetState === 'available' || pdfAssetState === 'text_only' || pdfAssetState === 'unknown'
       ? [
           { type: 'divider' as const },
           {
@@ -1833,7 +1843,8 @@ function buildDocumentMoreMenuItems(input: {
               ...(pdfAssetState === 'available'
                 ? [{ key: 'cleanup_pdf_assets', label: '删除原文件/页图缓存', icon: <PictureOutlined /> }]
                 : []),
-              ...(pdfAssetState === 'text_only'
+              // text_only + unknown: allow restore (unknown often needs manual PDF pick when no fingerprint).
+              ...(pdfAssetState === 'text_only' || pdfAssetState === 'unknown'
                 ? [{ key: 'restore_pdf_assets', label: '补回原文', icon: <ImportOutlined /> }]
                 : []),
             ],
@@ -4316,18 +4327,30 @@ export default function LibraryView({
   }
 
   const handleRestorePdfAssets = async (doc: DocumentItem) => {
+    const toastKey = `restore-pdf-${doc.id}`
     try {
-      message.loading({ content: `正在补回“${doc.title || '未命名文献'}”的原文…`, key: `restore-pdf-${doc.id}`, duration: 0 })
-      const result = await window.api.restorePdfForDocument(doc.id)
+      message.loading({ content: `正在补回“${doc.title || '未命名文献'}”的原文…`, key: toastKey, duration: 0 })
+      let result = await window.api.restorePdfForDocument(doc.id)
+      // No fingerprint / warehouse miss: fall back to manual PDF pick, then stamp fingerprints for future one-click restore.
+      if (!result?.restored) {
+        message.loading({
+          content: result?.error
+            ? `${result.error}。请手动选择 PDF…`
+            : '未自动找到原件，请手动选择 PDF…',
+          key: toastKey,
+          duration: 0,
+        })
+        result = await window.api.selectAndRestorePdfForDocument(doc.id)
+      }
       if (result?.restored) {
-        message.success({ content: `${getPdfRestoreSuccessMessage(result)}，可以进入校对模式`, key: `restore-pdf-${doc.id}` })
+        message.success({ content: `${getPdfRestoreSuccessMessage(result)}，可以进入校对模式`, key: toastKey })
         await loadDocuments(filter, { silent: true })
       } else {
-        message.warning({ content: result?.error || '未在 PDF 原件仓库找到同内容文件', key: `restore-pdf-${doc.id}`, duration: 6 })
+        message.warning({ content: result?.error || '未能补回原文', key: toastKey, duration: 6 })
       }
     } catch (error) {
       console.error(error)
-      message.error({ content: (error as Error)?.message || '补回原文失败', key: `restore-pdf-${doc.id}` })
+      message.error({ content: (error as Error)?.message || '补回原文失败', key: toastKey })
     }
   }
 
@@ -4546,7 +4569,7 @@ export default function LibraryView({
   }
 
   const handleBatchRestorePdfAssets = async () => {
-    const targets = documents.filter((doc) => selectedIdSet.has(doc.id) && getPdfAssetState(doc) === 'text_only')
+    const targets = documents.filter((doc) => selectedIdSet.has(doc.id) && needsPdfAssetRestore(doc))
     if (targets.length === 0) {
       message.info('已选文献中没有需要补回的原文')
       return
@@ -4576,7 +4599,11 @@ export default function LibraryView({
         duration: 5,
       })
     } else {
-      message.warning({ content: '未能补回原文，请检查 PDF 原件仓库索引', key: 'batch-restore-pdf', duration: 6 })
+      message.warning({
+        content: '未能补回原文。若标签为「原文未知」（缺指纹），请右键单篇「补回原文」并手动选择 PDF；补回后会写入指纹，之后可一键自动补回。',
+        key: 'batch-restore-pdf',
+        duration: 8,
+      })
     }
     await loadDocuments(filter, { silent: true })
   }

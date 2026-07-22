@@ -1888,7 +1888,10 @@ export default function DocumentView({
   const currentOcrEngineForUi = activeOcrVersion?.engine || currentOcrEngine
   const ocrSwitchableVersions = pageOcrVersions.filter((version) => version.status === 'completed')
   const isPdfSource = !!doc?.file_path && String(doc.file_path).toLowerCase().endsWith('.pdf')
-  const isTextOnlyPdf = readRecordValue(docMetadataObj, 'pdf_asset_state') === 'text_only'
+  const pdfAssetState = String(readRecordValue(docMetadataObj, 'pdf_asset_state') || '').trim()
+  const isTextOnlyPdf = pdfAssetState === 'text_only'
+  /** text_only + unknown: both need restore / manual PDF pick (unknown often lacks fingerprint until first manual restore). */
+  const needsPdfAssetRestore = isTextOnlyPdf || pdfAssetState === 'unknown'
   const hasCurrentPageImage = !!currentPage?.image_path || !!imageDataUrl
   const isTextDocumentType = readRecordValue(docMetadataObj, 'file_kind') === 'ebook' || readRecordValue(docMetadataObj, 'file_kind') === 'text'
   const readerPageTranslations = useMemo(() => {
@@ -1965,7 +1968,7 @@ export default function DocumentView({
     && !hasCurrentPageImage
     && !pageImageLoading
     && !!getPageDisplayText(currentPage)
-  const canAttemptPageImageRecovery = isPdfSource || isTextOnlyPdf || !!String(doc?.file_path || '').trim()
+  const canAttemptPageImageRecovery = isPdfSource || needsPdfAssetRestore || !!String(doc?.file_path || '').trim()
   const readerVirtualPages = useMemo(
     () => documentMode !== 'read' || shouldPreferSourcePageReader
       ? []
@@ -4118,7 +4121,11 @@ export default function DocumentView({
     }
   }
 
-  const handleRestorePdfAsset = async (targetPage: DocumentViewPage | undefined = currentPage, manual = false) => {
+  const handleRestorePdfAsset = async (
+    targetPage: DocumentViewPage | undefined = currentPage,
+    manual = false,
+    options?: { quietFailure?: boolean },
+  ) => {
     if (!doc?.id) return false
     setRestoringPdf(true)
     try {
@@ -4142,11 +4149,15 @@ export default function DocumentView({
           : `${base}；当前页预览生成失败，可手动重新选择 PDF 或重新打开文献`)
         return true
       }
-      message.warning(result?.error || '未能补回 PDF 原图')
+      if (!options?.quietFailure) {
+        message.warning(result?.error || '未能补回 PDF 原图')
+      }
       return false
     } catch (error: unknown) {
       console.error(error)
-      message.error(getErrorMessage(error, '补回 PDF 原图失败'))
+      if (!options?.quietFailure) {
+        message.error(getErrorMessage(error, '补回 PDF 原图失败'))
+      }
       return false
     } finally {
       setRestoringPdf(false)
@@ -4198,14 +4209,19 @@ export default function DocumentView({
     const syncedPageIndex = resolveViewingSourcePageIndex()
     readerVisiblePageIndexRef.current = syncedPageIndex
 
-    if (nextMode === 'proof' && isTextOnlyPdf) {
-      const restored = await handleRestorePdfAsset(sortedPages[syncedPageIndex] || currentPage)
+    if (nextMode === 'proof' && needsPdfAssetRestore) {
+      // Prefer auto warehouse restore; fall back to manual pick when fingerprint is missing (unknown).
+      let restored = await handleRestorePdfAsset(sortedPages[syncedPageIndex] || currentPage, false, { quietFailure: true })
+      if (documentModeSwitchSerialRef.current !== switchSerial || intendedDocumentModeRef.current !== nextMode) return
+      if (!restored) {
+        restored = await handleRestorePdfAsset(sortedPages[syncedPageIndex] || currentPage, true)
+      }
       if (documentModeSwitchSerialRef.current !== switchSerial || intendedDocumentModeRef.current !== nextMode) return
       if (!restored) {
         // Revert optimistic mode if PDF cannot be restored for proof.
         intendedDocumentModeRef.current = previousMode
         setDocumentMode(previousMode)
-        message.warning('无法自动补回原始 PDF，请手动选择 PDF')
+        message.warning('无法补回原始 PDF，请手动选择 PDF 后再进入校对模式')
         return
       }
     }
@@ -5829,8 +5845,11 @@ export default function DocumentView({
               开始 OCR 识别
             </Button>
           )}
-          {isTextOnlyPdf ? (
+          {needsPdfAssetRestore ? (
             <Space.Compact size="small">
+              <Button loading={restoringPdf} onClick={() => void handleRestorePdfAsset(currentPage, false)}>
+                补回原文
+              </Button>
               <Button loading={restoringPdf} onClick={() => void handleRestorePdfManually()}>
                 手动选择 PDF
               </Button>
@@ -6621,8 +6640,10 @@ export default function DocumentView({
                 onSave={handleSavePage}
                 onReset={handleResetPage}
                 onModeChange={(mode) => {
-                  if (mode === 'region' && isTextOnlyPdf) {
-                    void handleRestorePdfAsset()
+                  if (mode === 'region' && needsPdfAssetRestore) {
+                    void handleRestorePdfAsset(currentPage, false, { quietFailure: true }).then((ok) => {
+                      if (!ok) void handleRestorePdfAsset(currentPage, true)
+                    })
                   }
                 }}
                 onTextSelectionChange={setSelectedTextForAi}

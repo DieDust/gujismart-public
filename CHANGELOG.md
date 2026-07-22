@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 1.1.12 - 2026-07-22
+
+### 中文
+
+#### 修复
+
+- **「原文未知」可补回**：文献库右键/批量补回、文档内「补回原文 / 手动选择 PDF」均覆盖 `unknown` 状态。
+- **自动补回失败后手选**：无指纹或仓库未命中时，会引导手动选择 PDF。
+- **补回后写入指纹**：手动补回会写入 `pdf_sha256` 等元数据并标为有原文，之后可一键自动补回，不再长期显示「原文未知」。
+- **校对模式恢复原图**：`unknown` 文献进入校对/区域模式时也可尝试补回 PDF。
+
+#### 下载
+
+- `GujiSmart-1.1.12-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.12-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Fixed
+
+- **Restore for “unknown” PDF assets**: library context/batch restore and document toolbar cover unknown state.
+- **Manual pick fallback** when warehouse auto-restore lacks fingerprint or miss.
+- **Stamp fingerprints on restore** so later one-click restore works and the badge is no longer stuck on unknown.
+- **Proof mode recovery** for unknown documents when entering proof/region views.
+
+#### Downloads
+
+- `GujiSmart-1.1.12-Setup-x64.exe`
+- `GujiSmart-1.1.12-Portable-x64.exe`
+
 ## 1.1.11 - 2026-07-22
 
 ### 中文

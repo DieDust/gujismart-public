@@ -599,6 +599,31 @@ function buildFileFingerprintPatch(filePath: string, fingerprint = getFileFinger
   return patch
 }
 
+/** After restore (esp. first manual pick for unknown docs), stamp fingerprints so one-click warehouse restore works later. */
+function stampPdfFingerprintMetadata(
+  metadata: DocumentMetadataResult,
+  fingerprint: PdfFingerprint,
+  pageCount?: number | null,
+  extras?: DocumentMetadataResult,
+): DocumentMetadataResult {
+  const pageNum = Number(pageCount || metadata.pdf_page_count || 0)
+  return {
+    ...metadata,
+    ...extras,
+    pdf_sha256: fingerprint.sha256,
+    pdf_size_bytes: fingerprint.sizeBytes,
+    pdf_mtime_ms: fingerprint.mtimeMs,
+    file_sha256: fingerprint.sha256,
+    file_size_bytes: fingerprint.sizeBytes,
+    file_mtime_ms: fingerprint.mtimeMs,
+    file_ext: '.pdf',
+    file_kind: 'pdf',
+    ...(pageNum > 0 ? { pdf_page_count: pageNum } : {}),
+    pdf_asset_state: 'available' as PdfAssetState,
+    pdf_asset_deleted_at: null,
+  }
+}
+
 function getLibraryPdfTargets(): Array<{ docId: string; sha256: string; sizeBytes: number }> {
   return queryAll<{ docId: string; sha256: string; sizeBytes: number }>(`
     SELECT id as docId,
@@ -1178,24 +1203,25 @@ function persistLinkedPdfRestore(
   docId: string,
   sourcePath: string,
   metadata: DocumentMetadataResult,
-  options?: { trustedFromIndex?: boolean; sourceFingerprint?: PdfFingerprint | null },
+  options?: { trustedFromIndex?: boolean; sourceFingerprint?: PdfFingerprint | null; pageCount?: number | null },
 ): PdfAssetRestoreResult {
   const absolutePath = normalize(sourcePath)
-  const fingerprint = options?.sourceFingerprint
-  const nextMetadata: DocumentMetadataResult = {
+  const fingerprint = options?.sourceFingerprint || (
+    existsSync(absolutePath) ? getPdfFingerprint(absolutePath) : null
+  )
+  let nextMetadata: DocumentMetadataResult = {
     ...metadata,
-    pdf_asset_state: 'available' as PdfAssetState,
     pdf_asset_storage: 'linked',
-    pdf_asset_deleted_at: null,
     pdf_linked_path: absolutePath,
     restored_from_repository_at: new Date().toISOString(),
     restored_source_name: basename(absolutePath),
     restored_storage_mode: 'link',
   }
   if (fingerprint) {
-    if (!nextMetadata.pdf_sha256) nextMetadata.pdf_sha256 = fingerprint.sha256
-    if (!nextMetadata.pdf_size_bytes) nextMetadata.pdf_size_bytes = fingerprint.sizeBytes
-    if (!nextMetadata.pdf_mtime_ms) nextMetadata.pdf_mtime_ms = fingerprint.mtimeMs
+    nextMetadata = stampPdfFingerprintMetadata(nextMetadata, fingerprint, options?.pageCount)
+  } else {
+    nextMetadata.pdf_asset_state = 'available' as PdfAssetState
+    nextMetadata.pdf_asset_deleted_at = null
   }
   if (options?.trustedFromIndex) {
     nextMetadata.pdf_restore_trusted_index = true
@@ -1223,7 +1249,13 @@ export function restorePdfAssetForDocument(
     if (existingPdfPath !== doc.file_path) {
       run('UPDATE documents SET file_path = ?, updated_at = ? WHERE id = ?', [existingPdfPath, new Date().toISOString(), docId])
     }
-    updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState })
+    // Re-stamp fingerprints when an existing PDF is still readable so later cleanup → one-click restore works.
+    try {
+      const fingerprint = getPdfFingerprint(existingPdfPath)
+      updateMetadata(docId, stampPdfFingerprintMetadata(parseMetadata(doc.metadata), fingerprint, doc.page_count))
+    } catch {
+      updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState, pdf_asset_deleted_at: null })
+    }
     scheduleDatabaseSave()
     const existingMode = String(parseMetadata(doc.metadata).pdf_asset_storage || '').trim() === 'linked' ? 'link' : 'copy'
     return { restored: true, path: existingPdfPath, storageMode: existingMode }
@@ -1246,10 +1278,8 @@ export function restorePdfAssetForDocument(
     if (targetHash && sourceFingerprint.sha256 !== targetHash) {
       return { restored: false, error: '选择的 PDF 与该文献原始文件内容不一致' }
     }
-    if (!targetHash) {
-      metadata.pdf_sha256 = sourceFingerprint.sha256
-      metadata.pdf_size_bytes = sourceFingerprint.sizeBytes
-    }
+    // Always stamp full fingerprint on manual pick (unknown docs get one-click restore afterwards).
+    Object.assign(metadata, stampPdfFingerprintMetadata(metadata, sourceFingerprint, doc.page_count))
   } else {
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
@@ -1271,6 +1301,7 @@ export function restorePdfAssetForDocument(
     return persistLinkedPdfRestore(docId, sourcePath, metadata, {
       trustedFromIndex,
       sourceFingerprint,
+      pageCount: doc.page_count,
     })
   }
 
@@ -1283,20 +1314,19 @@ export function restorePdfAssetForDocument(
     mtimeMs: Number(metadata.pdf_mtime_ms || finalSourceFingerprint.mtimeMs),
   }
   const stored = storePdfWithCompressionSync(sourcePath, storageDir, originalFingerprint)
-  const nextMetadata: DocumentMetadataResult = {
-    ...metadata,
-    ...buildPdfCompressionMetadata(basename(sourcePath), originalFingerprint, stored.storedFingerprint, stored.compression),
-    pdf_asset_state: 'available' as PdfAssetState,
-    pdf_asset_storage: 'copy',
-    pdf_asset_deleted_at: null,
-    pdf_linked_path: null,
-    restored_from_repository_at: new Date().toISOString(),
-    restored_source_name: basename(sourcePath),
-    restored_storage_mode: 'copy',
-  }
-  if (!nextMetadata.pdf_sha256) {
-    nextMetadata.pdf_sha256 = originalFingerprint.sha256
-  }
+  const nextMetadata = stampPdfFingerprintMetadata(
+    {
+      ...metadata,
+      ...buildPdfCompressionMetadata(basename(sourcePath), originalFingerprint, stored.storedFingerprint, stored.compression),
+      pdf_asset_storage: 'copy',
+      pdf_linked_path: null,
+      restored_from_repository_at: new Date().toISOString(),
+      restored_source_name: basename(sourcePath),
+      restored_storage_mode: 'copy',
+    },
+    originalFingerprint,
+    doc.page_count,
+  )
 
   run('UPDATE documents SET file_path = ?, metadata = ?, updated_at = ? WHERE id = ?', [
     stored.storedPath,
@@ -1321,7 +1351,12 @@ export async function restorePdfAssetForDocumentAsync(
     if (existingPdfPath !== doc.file_path) {
       run('UPDATE documents SET file_path = ?, updated_at = ? WHERE id = ?', [existingPdfPath, new Date().toISOString(), docId])
     }
-    updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState })
+    try {
+      const fingerprint = knownSourceFingerprint || await getPdfFingerprintAsync(existingPdfPath)
+      updateMetadata(docId, stampPdfFingerprintMetadata(parseMetadata(doc.metadata), fingerprint, doc.page_count))
+    } catch {
+      updateMetadata(docId, { pdf_asset_state: 'available' as PdfAssetState, pdf_asset_deleted_at: null })
+    }
     scheduleDatabaseSave()
     const existingMode = String(parseMetadata(doc.metadata).pdf_asset_storage || '').trim() === 'linked' ? 'link' : 'copy'
     return { restored: true, path: existingPdfPath, storageMode: existingMode }
@@ -1343,10 +1378,7 @@ export async function restorePdfAssetForDocumentAsync(
     if (targetHash && sourceFingerprint.sha256 !== targetHash) {
       return { restored: false, error: '选择的 PDF 与该文献原始文件内容不一致' }
     }
-    if (!targetHash) {
-      metadata.pdf_sha256 = sourceFingerprint.sha256
-      metadata.pdf_size_bytes = sourceFingerprint.sizeBytes
-    }
+    Object.assign(metadata, stampPdfFingerprintMetadata(metadata, sourceFingerprint, doc.page_count))
   } else {
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
@@ -1365,10 +1397,17 @@ export async function restorePdfAssetForDocumentAsync(
   }
 
   if (linkOnly) {
-    // Index match already encodes sha256; skip re-hash for speed.
+    // Index match already encodes sha256; skip re-hash for speed when fingerprint already on metadata.
     return persistLinkedPdfRestore(docId, sourcePath, metadata, {
       trustedFromIndex,
-      sourceFingerprint,
+      sourceFingerprint: sourceFingerprint || (targetHash
+        ? {
+            sha256: targetHash,
+            sizeBytes: Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || 0),
+            mtimeMs: Number(metadata.pdf_mtime_ms || 0),
+          }
+        : null),
+      pageCount: doc.page_count,
     })
   }
 
@@ -1389,20 +1428,19 @@ export async function restorePdfAssetForDocumentAsync(
     mtimeMs: Number(metadata.pdf_mtime_ms || finalSourceFingerprint.mtimeMs),
   }
   const stored = await storePdfWithCompression(sourcePath, storageDir, originalFingerprint)
-  const nextMetadata: DocumentMetadataResult = {
-    ...metadata,
-    ...buildPdfCompressionMetadata(basename(sourcePath), originalFingerprint, stored.storedFingerprint, stored.compression),
-    pdf_asset_state: 'available' as PdfAssetState,
-    pdf_asset_storage: 'copy',
-    pdf_asset_deleted_at: null,
-    pdf_linked_path: null,
-    restored_from_repository_at: new Date().toISOString(),
-    restored_source_name: basename(sourcePath),
-    restored_storage_mode: 'copy',
-  }
-  if (!nextMetadata.pdf_sha256) {
-    nextMetadata.pdf_sha256 = originalFingerprint.sha256
-  }
+  const nextMetadata = stampPdfFingerprintMetadata(
+    {
+      ...metadata,
+      ...buildPdfCompressionMetadata(basename(sourcePath), originalFingerprint, stored.storedFingerprint, stored.compression),
+      pdf_asset_storage: 'copy',
+      pdf_linked_path: null,
+      restored_from_repository_at: new Date().toISOString(),
+      restored_source_name: basename(sourcePath),
+      restored_storage_mode: 'copy',
+    },
+    originalFingerprint,
+    doc.page_count,
+  )
 
   run('UPDATE documents SET file_path = ?, metadata = ?, updated_at = ? WHERE id = ?', [
     stored.storedPath,
