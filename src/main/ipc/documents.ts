@@ -3093,7 +3093,12 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
   }
   sql += ` ORDER BY ${buildDocumentListOrderBy(options)}`
   sql += ' LIMIT ? OFFSET ?'
-  params.push(options?.limit || 1000, options?.offset || 0)
+  // Cap unbounded listDocuments callers (e.g. legacy dashboard) so large libraries
+  // cannot pull tens of thousands of rows + page-stat joins on the main thread.
+  const requestedLimit = Math.round(Number(options?.limit || 1000))
+  const safeListLimit = Math.max(1, Math.min(Number.isFinite(requestedLimit) ? requestedLimit : 1000, 2000))
+  const safeListOffset = Math.max(0, Math.round(Number(options?.offset || 0)) || 0)
+  params.push(safeListLimit, safeListOffset)
 
   return { sql, params }
 }

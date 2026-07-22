@@ -19,6 +19,19 @@ function countRows(sql: string, params?: unknown[]): number {
   return Number(queryOne<{ count: number }>(sql, params)?.count || 0)
 }
 
+function hasInFlightPages(): boolean {
+  // Existence probe only — avoid DISTINCT/COUNT full scans on large pages tables
+  // when nothing is in flight. Prefer documents/batch indexes first.
+  return Boolean(queryOne<{ ok: number }>(
+    `SELECT 1 as ok
+     FROM pages p
+     INNER JOIN documents d ON d.id = p.doc_id
+     WHERE p.ocr_status IN ('queued', 'processing')
+       AND COALESCE(d.import_status, '') <> 'deleting'
+     LIMIT 1`,
+  )?.ok)
+}
+
 /**
  * Startup recovery must stay index-friendly.
  *
@@ -28,6 +41,8 @@ function countRows(sql: string, params?: unknown[]): number {
  *
  * Cold-start only resets clearly interrupted statuses (queued/processing).
  * Deeper content validation belongs in deferred maintenance, not open path.
+ *
+ * Fast path: documents + batch_queue first; pages probes only when needed.
  */
 export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
   // Prefer document-status index probes first. Avoid EXISTS-over-pages unless needed.
@@ -40,6 +55,31 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
          OR d.import_status = 'processing'
        )`,
   ).filter((row) => row.id)
+
+  const inFlightBatchItems = countRows(
+    "SELECT COUNT(*) as count FROM batch_queue WHERE status IN ('queued', 'processing')",
+  )
+  const removedOrphanedBatchItems = countRows(
+    `SELECT COUNT(*) as count
+     FROM batch_queue b
+     WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = b.doc_id)`,
+  )
+
+  // Nothing interrupted at document/batch level — only check pages if necessary.
+  // A LIMIT 1 probe is far cheaper than DISTINCT + COUNT on 100k+ page rows.
+  if (interruptedDocs.length === 0 && inFlightBatchItems === 0 && removedOrphanedBatchItems === 0) {
+    if (!hasInFlightPages()) {
+      return {
+        recoveredDocuments: 0,
+        recoveredPages: 0,
+        recoveredCompletedPages: 0,
+        recoveredBatchItems: 0,
+        removedOrphanedBatchItems: 0,
+        completedDocuments: 0,
+        pendingDocuments: 0,
+      }
+    }
+  }
 
   // Pages still marked in-flight even when document status already drifted.
   const orphanInFlightPageDocIds = queryAll<{ doc_id: string }>(
@@ -65,14 +105,6 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
      INNER JOIN documents d ON d.id = p.doc_id
      WHERE p.ocr_status IN ('queued', 'processing')
        AND COALESCE(d.import_status, '') <> 'deleting'`,
-  )
-  const inFlightBatchItems = countRows(
-    "SELECT COUNT(*) as count FROM batch_queue WHERE status IN ('queued', 'processing')",
-  )
-  const removedOrphanedBatchItems = countRows(
-    `SELECT COUNT(*) as count
-     FROM batch_queue b
-     WHERE NOT EXISTS (SELECT 1 FROM documents d WHERE d.id = b.doc_id)`,
   )
 
   const summary: OcrRecoverySummary = {

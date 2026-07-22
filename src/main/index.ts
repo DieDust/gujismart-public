@@ -583,11 +583,14 @@ if (mcpLaunch.isMcp) {
     .then(async () => {
       markStartupEvent('app-when-ready')
       // Visible progress for large libraries: show splash before heavy DB open so remote users can screenshot stalls.
-      try {
-        openStartupSplash()
-        markStartupEvent('startup-splash-open')
-      } catch (error) {
-        console.warn('[Main] Failed to open startup splash', error)
+      // Smoke tests must not open splash — Playwright firstWindow would grab it instead of the main UI.
+      if (process.env.GUJISMART_SMOKE !== '1') {
+        try {
+          openStartupSplash()
+          markStartupEvent('startup-splash-open')
+        } catch (error) {
+          console.warn('[Main] Failed to open startup splash', error)
+        }
       }
       protocol.handle('local-resource', (request) => {
         const filePath = assertAllowedLocalResourceUrl(request.url)

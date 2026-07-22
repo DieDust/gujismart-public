@@ -51,13 +51,21 @@ export default function DashboardView() {
 
   const loadStats = useCallback(async () => {
     try {
-      const docs = await window.api.listDocuments({})
-      const total = docs.length
-      const unstored = docs.filter((item) => item.import_status === 'unstored').length
-      const processed = docs.filter((item) => item.import_status === 'processed').length
-      const error = docs.filter((item) => item.import_status === 'error').length
-      const processing = docs.filter((item) => item.import_status === 'processing').length
-      setStats({ total, unstored, processed, error, processing })
+      // Count-only page queries — never pull the full document list on large libraries.
+      const [all, unstored, processed, error, processing] = await Promise.all([
+        window.api.listDocumentsPage({ limit: 1, offset: 0 }),
+        window.api.listDocumentsPage({ limit: 1, offset: 0, importStatus: 'unstored' }),
+        window.api.listDocumentsPage({ limit: 1, offset: 0, importStatus: 'processed' }),
+        window.api.listDocumentsPage({ limit: 1, offset: 0, importStatus: 'error' }),
+        window.api.listDocumentsPage({ limit: 1, offset: 0, importStatus: 'processing' }),
+      ])
+      setStats({
+        total: Number(all.total || 0),
+        unstored: Number(unstored.total || 0),
+        processed: Number(processed.total || 0),
+        error: Number(error.total || 0),
+        processing: Number(processing.total || 0),
+      })
     } catch (error) {
       console.error(error)
     } finally {

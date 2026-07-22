@@ -97,6 +97,7 @@ const PHASE_LABELS: Record<string, string> = {
   'startup-recovery.temp-dirs': '清理临时目录',
   'startup-recovery.orphan-storage': '清理孤立存储目录',
   'startup-recovery.resume-deletes': '接续未完成的删除任务',
+  'startup-recovery.event-loop-wait': '等待主线程（被其他任务占用）',
   'startup-recovery-complete': '启动恢复完成',
   'startup-recovery-canceled': '启动恢复已取消',
   'startup-maintenance': '延迟启动维护（整体）',
@@ -125,16 +126,29 @@ function formatPhaseList(): string {
     .join(', ')
 }
 
+/**
+ * Hierarchy nesting by phase name: `startup-recovery.ocr-jobs` is nested under
+ * `startup-recovery`. Do NOT use pure time-window nesting — concurrent timers
+ * (maintenance at 45s, preload at 60s) would otherwise look like children of a
+ * long recovery parent and inflate "leaf work" with the parent wall span.
+ */
+function isNamedChildOf(parentName: string, childName: string): boolean {
+  return childName.startsWith(`${parentName}.`)
+}
+
 function isNestedPhase(
   phase: StartupTimingPhaseRecord,
   all: StartupTimingPhaseRecord[],
 ): boolean {
-  return all.some((other) => (
-    other !== phase
-    && other.startedAtMs <= phase.startedAtMs
-    && other.endedAtMs >= phase.endedAtMs
-    && (other.startedAtMs < phase.startedAtMs || other.endedAtMs > phase.endedAtMs)
-  ))
+  return all.some((other) => other !== phase && isNamedChildOf(other.name, phase.name))
+}
+
+/** True when this phase has named sub-phases (parent shell, not pure leaf work). */
+function hasNamedChildPhases(
+  phase: StartupTimingPhaseRecord,
+  all: StartupTimingPhaseRecord[],
+): boolean {
+  return all.some((other) => other !== phase && isNamedChildOf(phase.name, other.name))
 }
 
 function buildUiPhases(): StartupTimingUiPhase[] {
@@ -151,9 +165,26 @@ function buildUiPhases(): StartupTimingUiPhase[] {
     }))
 }
 
+/**
+ * Leaf work = phases that are not hierarchy parents and not pure event-loop waits.
+ * Parent shells (e.g. startup-recovery) may span waits between children; counting
+ * the shell as work double-counts and hides the real gap. Concurrent non-child
+ * phases (maintenance, preload) count on their own. Event-loop waits still appear
+ * on the timeline but contribute to "未计量间隔" instead of "已计量工作".
+ */
 function sumLeafWorkMs(phases: StartupTimingUiPhase[]): number {
+  const records = completedPhases
   return phases
-    .filter((phase) => !phase.nested)
+    .filter((phase) => {
+      if (phase.name.includes('event-loop-wait')) return false
+      const record = records.find((item) => (
+        item.name === phase.name
+        && item.startedSinceBootMs === phase.startedSinceBootMs
+        && item.endedSinceBootMs === phase.endedSinceBootMs
+      ))
+      if (!record) return !phase.nested
+      return !hasNamedChildPhases(record, records)
+    })
     .reduce((sum, phase) => sum + Math.max(0, phase.durationMs), 0)
 }
 
@@ -314,6 +345,34 @@ export function markStartupEvent(name: string, detail?: string): void {
   lastEventLabel = labelFor(phaseName)
   lastEventDetail = detail ? String(detail) : ''
   console.log(`[StartupTiming] +${sinceBoot(now)}ms EVENT ${phaseName}${suffix}`)
+  schedulePublishUi()
+}
+
+/**
+ * Record a completed phase that already finished (e.g. measured event-loop wait).
+ * Use when work was timed with Date.now() rather than begin/end around a block.
+ */
+export function recordStartupPhaseSpan(
+  name: string,
+  startedAtMs: number,
+  endedAtMs = Date.now(),
+): void {
+  const phaseName = String(name || 'unnamed').trim() || 'unnamed'
+  const safeStart = Number.isFinite(startedAtMs) ? startedAtMs : Date.now()
+  const safeEnd = Number.isFinite(endedAtMs) ? Math.max(safeStart, endedAtMs) : Date.now()
+  const durationMs = Math.max(0, safeEnd - safeStart)
+  const record: StartupTimingPhaseRecord = {
+    name: phaseName,
+    startedAtMs: safeStart,
+    endedAtMs: safeEnd,
+    durationMs,
+    startedSinceBootMs: Math.max(0, safeStart - bootAtMs),
+    endedSinceBootMs: Math.max(0, safeEnd - bootAtMs),
+  }
+  completedPhases.push(record)
+  console.log(
+    `[StartupTiming] +${record.endedSinceBootMs}ms SPAN ${phaseName} duration=${durationMs}ms start=+${record.startedSinceBootMs}ms`,
+  )
   schedulePublishUi()
 }
 

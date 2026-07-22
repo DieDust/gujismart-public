@@ -404,8 +404,13 @@ export function openStartupSplash(): void {
 /**
  * Test-build diagnostic: keep the splash open after startup so remote users can screenshot
  * the full phase timing table. Main window can be used normally.
+ * Smoke tests must not keep this window — Playwright firstWindow would grab it.
  */
 export function keepStartupSplashForDiagnostics(options?: { reason?: string }): void {
+  if (process.env.GUJISMART_SMOKE === '1') {
+    closeStartupSplash({ delayMs: 0 })
+    return
+  }
   if (!splashWindow || splashWindow.isDestroyed()) return
   const reason = String(options?.reason || 'main-window-ready').trim()
   const alreadyReady = diagnosticsReady
