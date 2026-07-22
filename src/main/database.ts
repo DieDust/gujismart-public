@@ -9,6 +9,7 @@ import {
   HISTORY_CITATION_STYLE,
 } from '../shared/history-citation'
 import { setPayloadDataDir } from './page-payload-files'
+import { withStartupPhaseSync } from './startup-timing'
 
 type NativeDatabase = Database.Database
 
@@ -2725,26 +2726,39 @@ export async function initDatabase(): Promise<void> {
   const jsonDbPath = join(dbDir, 'gujismart.json')
 
   const existed = existsSync(dbFilePath)
-  db = new Database(dbFilePath)
-  db.pragma('foreign_keys = ON')
-  db.pragma('journal_mode = WAL')
-  db.pragma('synchronous = NORMAL')
-  db.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
+  withStartupPhaseSync('initDatabase.open-sqlite', () => {
+    const database = new Database(dbFilePath)
+    database.pragma('foreign_keys = ON')
+    database.pragma('journal_mode = WAL')
+    database.pragma('synchronous = NORMAL')
+    database.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
+    db = database
+  })
+  const database = db
+  if (!database) {
+    throw new Error('Failed to open SQLite database during startup')
+  }
   console.log(existed ? '[Database] Loaded native SQLite database' : '[Database] Created native SQLite database')
 
-  db.pragma('foreign_keys = ON')
-  db.exec(TABLE_SCHEMA_SQL)
-  migrateExistingSchema(db)
+  withStartupPhaseSync('initDatabase.schema-migrate', () => {
+    database.pragma('foreign_keys = ON')
+    database.exec(TABLE_SCHEMA_SQL)
+    migrateExistingSchema(database)
 
-  if (!existed) {
-    migrateFromJson(jsonDbPath, db)
-    migrateExistingSchema(db)
-    ensureIndexes(db)
-  }
+    if (!existed) {
+      migrateFromJson(jsonDbPath, database)
+      migrateExistingSchema(database)
+      ensureIndexes(database)
+    }
+  })
 
-  ensureFts(db)
+  withStartupPhaseSync('initDatabase.ensure-fts', () => {
+    ensureFts(database)
+  })
 
-  seedDefaultData(db)
+  withStartupPhaseSync('initDatabase.seed-defaults', () => {
+    seedDefaultData(database)
+  })
   // Do not checkpoint at all during open. Even a deferred 45s checkpoint can still
   // freeze the UI with high disk and ~0% CPU while SQLite rewrites a huge WAL.
   // Checkpoints happen on clean exit or later write-driven saves after the user is interactive.
