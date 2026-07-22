@@ -54,6 +54,10 @@ const RECOVERABLE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.tiff', 
 const ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL = 4
 const ORPHAN_STORAGE_CLEANUP_MAX_PER_STARTUP = 40
 const STARTUP_PDF_PAGE_RECORD_INIT_LIMIT = 1000
+/** Cap open-path import repair — full-library page completeness scans freeze multi-GB installs. */
+const STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT = 80
+/** Recent docs to probe for missing page rows without correlated full-table COUNT. */
+const STARTUP_INCOMPLETE_PAGE_PROBE_LIMIT = 120
 const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
@@ -301,30 +305,15 @@ function metadataPageCount(metadata: Record<string, unknown>): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
 }
 
-function completedPageContentPredicate(alias = 'p'): string {
-  return `(
-    TRIM(COALESCE(NULLIF(${alias}.proofed_text, ''), NULLIF(${alias}.ocr_text, ''), '')) <> ''
-    OR TRIM(COALESCE(${alias}.proofed_text_ref, ${alias}.ocr_text_ref, '')) <> ''
-    OR (
-      COALESCE(${alias}.ocr_status, '') = 'completed'
-      AND TRIM(COALESCE(${alias}.ocr_result_ref, '')) <> ''
-    )
-    OR (
-      TRIM(COALESCE(${alias}.ocr_result, '')) <> ''
-      AND TRIM(COALESCE(${alias}.ocr_result, '')) <> '{"externalized":true}'
-      AND NOT (
-        COALESCE(${alias}.ocr_result, '') LIKE '%"error"%'
-        AND COALESCE(${alias}.ocr_result, '') LIKE '%"failed_at"%'
-      )
-    )
-  )`
-}
-
+/**
+ * Open-path page summary must stay status-only.
+ * Scanning proofed_text/ocr_text/ocr_result bodies for every candidate freezes large libraries.
+ */
 function summarizeDocumentPages(docId: string): { total: number; completed: number } {
   const row = queryAll<{ total: number; completed: number }>(
     `SELECT
        COUNT(*) as total,
-       SUM(CASE WHEN ocr_status = 'completed' AND ${completedPageContentPredicate('pages')} THEN 1 ELSE 0 END) as completed
+       SUM(CASE WHEN COALESCE(ocr_status, '') = 'completed' THEN 1 ELSE 0 END) as completed
      FROM pages
      WHERE doc_id = ?`,
     [docId],
@@ -333,6 +322,86 @@ function summarizeDocumentPages(docId: string): { total: number; completed: numb
     total: Number(row?.total || 0),
     completed: Number(row?.completed || 0),
   }
+}
+
+function countDocumentPageRows(docId: string): number {
+  return Number(queryAll<{ count: number }>(
+    'SELECT COUNT(*) as count FROM pages WHERE doc_id = ?',
+    [docId],
+  )[0]?.count || 0)
+}
+
+function isPdfPageRecordsDeferred(metadata: Record<string, unknown>): boolean {
+  return metadata.pdf_page_records_deferred === true
+    || metadata.pdf_page_records_deferred === 1
+    || metadata.pdf_page_records_deferred === '1'
+}
+
+/**
+ * Collect interrupted-import candidates without full-library correlated
+ * `(SELECT COUNT(*) FROM pages WHERE doc_id = documents.id)` filters.
+ * Those force a pages probe per document and dominate cold open on large corpora.
+ */
+function collectInterruptedImportCandidates(): InterruptedImportDocumentRow[] {
+  const byId = new Map<string, InterruptedImportDocumentRow>()
+
+  // 1) Status-driven: clearly mid-import / in-flight OCR. Index-friendly, hard-capped.
+  const statusCandidates = queryAll<InterruptedImportDocumentRow>(
+    `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
+     FROM documents
+     WHERE COALESCE(import_status, '') <> 'deleting'
+       AND (
+         COALESCE(import_status, '') IN ('processing', 'unstored', '')
+         OR (
+           lower(COALESCE(file_path, '')) LIKE '%.pdf'
+           AND COALESCE(ocr_status, '') IN ('queued', 'processing')
+         )
+         OR (
+           lower(COALESCE(file_path, '')) LIKE '%.pdf'
+           AND COALESCE(page_count, 0) <= 0
+           AND COALESCE(import_status, '') NOT IN ('processed')
+         )
+       )
+     ORDER BY
+       CASE
+         WHEN COALESCE(import_status, '') = 'processing' THEN 0
+         WHEN COALESCE(ocr_status, '') IN ('queued', 'processing') THEN 1
+         WHEN COALESCE(import_status, '') IN ('unstored', '') THEN 2
+         ELSE 3
+       END,
+       updated_at DESC
+     LIMIT ?`,
+    [STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT],
+  )
+  for (const row of statusCandidates) {
+    if (row.id) byId.set(row.id, row)
+  }
+
+  // 2) Missing page rows: only probe a recent window, then cheap per-doc COUNT.
+  // Never put correlated COUNT(*) in a full-table WHERE — that was the ~70s stall.
+  if (byId.size < STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT) {
+    const recent = queryAll<InterruptedImportDocumentRow>(
+      `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
+       FROM documents
+       WHERE COALESCE(import_status, '') <> 'deleting'
+         AND COALESCE(page_count, 0) > 0
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+      [STARTUP_INCOMPLETE_PAGE_PROBE_LIMIT],
+    )
+    for (const row of recent) {
+      if (!row.id || byId.has(row.id)) continue
+      if (byId.size >= STARTUP_INTERRUPTED_IMPORT_REPAIR_LIMIT) break
+      const metadata = parseMetadata(row.metadata)
+      if (isPdfPageRecordsDeferred(metadata)) continue
+      const expected = Math.max(Number(row.page_count || 0), metadataPageCount(metadata))
+      if (expected <= 0) continue
+      const actual = countDocumentPageRows(row.id)
+      if (actual < expected) byId.set(row.id, row)
+    }
+  }
+
+  return [...byId.values()]
 }
 
 function markInterruptedImportForCleanup(docId: string, message: string): void {
@@ -415,35 +484,10 @@ async function insertMissingPdfPageRecords(docId: string, pageCount: number): Pr
 }
 
 async function repairInterruptedImports(): Promise<{ repairedDocuments: number; initializedPageRecords: number }> {
-  const candidates = queryAll<InterruptedImportDocumentRow>(
-    `SELECT id, file_path, page_count, ocr_status, import_status, doc_type, metadata
-     FROM documents
-     WHERE COALESCE(import_status, '') <> 'deleting'
-       AND (
-         COALESCE(import_status, '') IN ('processing', 'unstored', '')
-         OR (
-           lower(file_path) LIKE '%.pdf'
-           AND COALESCE(ocr_status, '') IN ('queued', 'processing')
-         )
-         OR (
-           lower(file_path) LIKE '%.pdf'
-           AND COALESCE(page_count, 0) <= 0
-         )
-         OR (
-           lower(file_path) LIKE '%.pdf'
-           AND
-           COALESCE(page_count, 0) > 0
-           AND (SELECT COUNT(*) FROM pages p WHERE p.doc_id = documents.id) < COALESCE(page_count, 0)
-           AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.pdf_page_records_deferred') ELSE 0 END, 0) <> 1
-         )
-         OR (
-           lower(file_path) NOT LIKE '%.pdf'
-           AND
-           COALESCE(page_count, 0) > 0
-           AND (SELECT COUNT(*) FROM pages p WHERE p.doc_id = documents.id) < COALESCE(page_count, 0)
-         )
-       )`,
-  )
+  const candidates = collectInterruptedImportCandidates()
+  if (candidates.length > 0) {
+    console.log(`[Startup Recovery] Interrupted import candidates=${candidates.length} (capped)`)
+  }
 
   let repairedDocuments = 0
   let initializedPageRecords = 0
@@ -898,16 +942,8 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     }
   }
 
-  {
-    const endPhase = beginStartupPhase('startup-recovery.resume-deletes')
-    try {
-      deletingDocuments = resumeInterruptedDocumentDeletes()
-    } finally {
-      endPhase()
-    }
-  }
-
-  // FS cleanup can take longer; yield once so UI stays responsive, then finish.
+  // FS cleanup before delete resume: resume may drop document rows, which would
+  // otherwise make their storage dirs look like orphans in the same open pass.
   if (await startupRecoveryCheckpoint()) return finishCanceled()
   emitStartupRecoveryStatus({
     status: 'processing',
@@ -927,6 +963,20 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     const endPhase = beginStartupPhase('startup-recovery.orphan-storage')
     try {
       orphanStorageDirs = await removeOrphanStorageDirs()
+    } finally {
+      endPhase()
+    }
+  }
+
+  emitStartupRecoveryStatus({
+    status: 'processing',
+    progress: 0.9,
+    message: '正在接续未完成的删除任务',
+  })
+  {
+    const endPhase = beginStartupPhase('startup-recovery.resume-deletes')
+    try {
+      deletingDocuments = resumeInterruptedDocumentDeletes()
     } finally {
       endPhase()
     }
