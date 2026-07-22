@@ -1203,8 +1203,11 @@ async function lookupPdfRepositoryPathByHashAsync(targetHash: string): Promise<s
   return filePath
 }
 
-/** Soft freshness window: batch restore reuses one scan; cloud uploads within this window still get a rescan if miss. */
-const PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS = 20_000
+/**
+ * Soft window for full warehouse reindex (manual scan / add-folder only).
+ * Restore must NOT run full-index on every click — that freezes Electron when antivirus scans each PDF.
+ */
+const PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS = 5 * 60_000
 let pdfRepositoryIndexInFlight: Promise<PdfRepositoryIndexResult> | null = null
 
 function getPdfRepositoryLastIndexedAtMs(): number {
@@ -1223,8 +1226,8 @@ function getPdfRepositoryLastIndexedAtMs(): number {
 type PdfRepositoryIndexEnsureResult = PdfRepositoryIndexResult & { refreshed: boolean }
 
 /**
- * Ensure warehouse index is reasonably fresh.
- * Cloud/NAS users often drop new PDFs without clicking「立即扫描」—restore and add-folder paths call this.
+ * Full warehouse reindex helper (settings「立即扫描」/ add-folder background).
+ * Prefer targeted hash lookup for one-click restore — full reindex is expensive under antivirus.
  */
 export function ensurePdfRepositoryIndex(options?: { force?: boolean; maxAgeMs?: number }): PdfRepositoryIndexEnsureResult {
   const force = options?.force === true
@@ -1271,33 +1274,111 @@ export async function ensurePdfRepositoryIndexAsync(options?: {
   return { ...result, refreshed: true }
 }
 
-/**
- * Resolve a library PDF from the warehouse index, refreshing the scan when:
- * - index is stale (new cloud uploads since last scan), or
- * - hash miss / indexed path no longer exists.
- */
-function resolveWarehousePdfPathByHash(targetHash: string): string | null {
-  // Soft refresh so recently uploaded cloud files are visible without a manual「立即扫描」.
-  const soft = ensurePdfRepositoryIndex({ maxAgeMs: PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS })
-  let matchPath = lookupPdfRepositoryPathByHash(targetHash)
-  if (matchPath) return matchPath
-  // Only force another full scan when the soft path reused a stale cache (did not just scan).
-  if (!soft.refreshed) {
-    ensurePdfRepositoryIndex({ force: true })
-    matchPath = lookupPdfRepositoryPathByHash(targetHash)
-  }
-  return matchPath
+function rememberPdfRepositoryIndexHit(filePath: string, sha256: string, sizeBytes: number, mtimeMs: number): void {
+  run(
+    'INSERT OR REPLACE INTO pdf_repository_index (path, sha256, size_bytes, mtime_ms, indexed_at) VALUES (?, ?, ?, ?, ?)',
+    [filePath, sha256, sizeBytes, mtimeMs, new Date().toISOString()],
+  )
+  scheduleDatabaseSave()
 }
 
-async function resolveWarehousePdfPathByHashAsync(targetHash: string): Promise<string | null> {
-  const soft = await ensurePdfRepositoryIndexAsync({ maxAgeMs: PDF_REPOSITORY_INDEX_SOFT_MAX_AGE_MS })
-  let matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
-  if (matchPath) return matchPath
-  if (!soft.refreshed) {
-    await ensurePdfRepositoryIndexAsync({ force: true })
-    matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+/**
+ * Targeted warehouse search for one document hash.
+ * Avoids full-index rehash of every PDF (which freezes the UI when antivirus scans each open).
+ */
+function findPdfInRepositoriesByHash(targetHash: string, expectedSizeBytes?: number): string | null {
+  const hash = String(targetHash || '').trim()
+  if (!hash) return null
+  const dirs = readRepositoryPaths()
+  if (dirs.length === 0) return null
+  const sizeHint = Number(expectedSizeBytes || 0)
+  const files = dirs.flatMap((dirPath) => collectPdfFiles(dirPath))
+  const existingRows = queryAll<RepositoryIndexRow>('SELECT * FROM pdf_repository_index')
+  const existingByPath = new Map(existingRows.map((row) => [normalize(row.path), row]))
+
+  for (const rawPath of files) {
+    const filePath = normalize(rawPath)
+    let stats
+    try {
+      stats = statSync(filePath)
+    } catch {
+      continue
+    }
+    if (sizeHint > 0 && stats.size !== sizeHint) continue
+    const existing = existingByPath.get(filePath)
+    let sha256 = String(existing?.sha256 || '')
+    const sameMeta = !!existing
+      && Number(existing.size_bytes) === stats.size
+      && Math.abs(Number(existing.mtime_ms) - stats.mtimeMs) < 1
+    if (!sameMeta || !sha256) {
+      try {
+        sha256 = hashFile(filePath)
+      } catch {
+        continue
+      }
+    }
+    if (sha256 !== hash) continue
+    rememberPdfRepositoryIndexHit(filePath, sha256, stats.size, stats.mtimeMs)
+    return filePath
   }
-  return matchPath
+  return null
+}
+
+async function findPdfInRepositoriesByHashAsync(targetHash: string, expectedSizeBytes?: number): Promise<string | null> {
+  const hash = String(targetHash || '').trim()
+  if (!hash) return null
+  const dirs = readRepositoryPaths()
+  if (dirs.length === 0) return null
+  const sizeHint = Number(expectedSizeBytes || 0)
+  const files = await collectPdfFilesAsync(dirs)
+  const existingRows = queryAll<RepositoryIndexRow>('SELECT * FROM pdf_repository_index')
+  const existingByPath = new Map(existingRows.map((row) => [normalize(row.path), row]))
+
+  for (const rawPath of files) {
+    const filePath = normalize(rawPath)
+    let stats
+    try {
+      stats = await stat(filePath)
+    } catch {
+      continue
+    }
+    if (sizeHint > 0 && stats.size !== sizeHint) continue
+    const existing = existingByPath.get(filePath)
+    let sha256 = String(existing?.sha256 || '')
+    const sameMeta = !!existing
+      && Number(existing.size_bytes) === stats.size
+      && Math.abs(Number(existing.mtime_ms) - stats.mtimeMs) < 1
+    if (!sameMeta || !sha256) {
+      try {
+        sha256 = await hashFileAsync(filePath)
+      } catch {
+        continue
+      }
+    }
+    await yieldToEventLoop()
+    if (sha256 !== hash) continue
+    rememberPdfRepositoryIndexHit(filePath, sha256, stats.size, stats.mtimeMs)
+    return filePath
+  }
+  return null
+}
+
+/**
+ * Resolve a library PDF from the warehouse:
+ * 1) hot index lookup
+ * 2) targeted scan for this hash only (optionally filtered by stored size)
+ * Never runs a full warehouse reindex here — that path freezes the app under AV.
+ */
+function resolveWarehousePdfPathByHash(targetHash: string, expectedSizeBytes?: number): string | null {
+  const matchPath = lookupPdfRepositoryPathByHash(targetHash)
+  if (matchPath) return matchPath
+  return findPdfInRepositoriesByHash(targetHash, expectedSizeBytes)
+}
+
+async function resolveWarehousePdfPathByHashAsync(targetHash: string, expectedSizeBytes?: number): Promise<string | null> {
+  const matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+  if (matchPath) return matchPath
+  return findPdfInRepositoriesByHashAsync(targetHash, expectedSizeBytes)
 }
 
 function persistLinkedPdfRestore(
@@ -1385,8 +1466,9 @@ export function restorePdfAssetForDocument(
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
     }
-    // Soft + forced warehouse rescan so newly uploaded cloud/NAS files are found without manual「立即扫描」.
-    const matchPath = resolveWarehousePdfPathByHash(targetHash)
+    // Index hit first; on miss do a targeted size-filtered hash search (never full warehouse rehash here).
+    const expectedSize = Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || metadata.pdf_stored_size_bytes || 0)
+    const matchPath = resolveWarehousePdfPathByHash(targetHash, expectedSize > 0 ? expectedSize : undefined)
     if (!matchPath) {
       return { restored: false, error: '未在 PDF 原件仓库找到同内容 PDF。若刚上传到云盘/NAS，请稍候同步完成后再试，或点设置里「立即扫描」' }
     }
@@ -1480,8 +1562,9 @@ export async function restorePdfAssetForDocumentAsync(
     if (!targetHash) {
       return { restored: false, error: '该文献缺少 PDF 指纹，请手动选择 PDF 补回' }
     }
-    // Soft + forced warehouse rescan so newly uploaded cloud/NAS files are found without manual「立即扫描」.
-    const matchPath = await resolveWarehousePdfPathByHashAsync(targetHash)
+    // Index hit first; on miss do a targeted size-filtered hash search (never full warehouse rehash here).
+    const expectedSize = Number(metadata.pdf_size_bytes || metadata.pdf_original_size_bytes || metadata.pdf_stored_size_bytes || 0)
+    const matchPath = await resolveWarehousePdfPathByHashAsync(targetHash, expectedSize > 0 ? expectedSize : undefined)
     if (!matchPath) {
       return {
         restored: false,

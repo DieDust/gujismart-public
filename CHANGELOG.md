@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 1.1.14 - 2026-07-22
+
+### 中文
+
+#### 修复
+
+- **补回原文不再全盘重哈希**：一键补回先查索引，未命中时按该文献指纹/大小做定向匹配，避免主进程卡死（尤其在杀软实时扫描时）。
+- **全量扫描仅手动/添加目录触发**：设置「立即扫描」与添加仓库后台扫仍可用；日常补回不强制整库重扫。
+- **设置说明**：补充杀软白名单与扫描策略提示。
+
+#### 下载
+
+- `GujiSmart-1.1.14-Setup-x64.exe`：适合普通 Windows 安装。
+- `GujiSmart-1.1.14-Portable-x64.exe`：适合免安装便携使用。
+
+### English
+
+#### Fixed
+
+- **No full warehouse rehash on restore**: index lookup first, then targeted size/hash search for the document only — avoids UI freezes under antivirus.
+- **Full scans only for manual “Scan now” / add-folder background jobs**.
+- **Settings copy** about AV exclusions and scan policy.
+
+#### Downloads
+
+- `GujiSmart-1.1.14-Setup-x64.exe`
+- `GujiSmart-1.1.14-Portable-x64.exe`
+
 ## 1.1.13 - 2026-07-22
 
 ### 中文

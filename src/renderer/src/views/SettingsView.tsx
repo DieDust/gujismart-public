@@ -2869,7 +2869,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               showIcon
               style={{ marginBottom: 16 }}
               message="PDF 原件仓库只会被读取；补回时默认复制进软件目录"
-              description="可以添加 NAS、移动硬盘、网盘同步目录等，软件会只读扫描并匹配已导入文献的 PDF。一键补回前会自动重扫仓库（刚上传的云文件也能对上）；也可点「立即扫描」提前建好索引。开启下方「仅登记路径」后，补回不再复制大文件，速度更快，但依赖外盘/NAS 保持可访问。"
+              description="可以添加 NAS、移动硬盘、网盘同步目录等。一键补回会先查索引，找不到时只按该文献指纹做定向匹配（不会每次全盘重算哈希，避免卡死）。大批量新文件可点「立即扫描」提前建索引。若安装了杀软，请把软件数据目录与原件仓库加入白名单。开启「仅登记路径」后补回不复制大文件，但依赖外盘/NAS 可访问。"
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, paddingBottom: 16, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
               <div style={{ minWidth: 0, paddingRight: 12 }}>
@@ -2895,7 +2895,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 <br />
                 <Text type="secondary" style={{ fontSize: 13 }}>
                   总大小 {formatBytes(pdfRepositoryStatus?.stats.totalBytes)}；上次扫描 {formatDateTime(pdfRepositoryStatus?.lastIndexedAt)}
-                  。向仓库新增 PDF 后无需每次手点扫描——补回时会自动刷新索引；批量补回会合并为一次扫描。
+                  。日常补回会走索引/定向匹配；仓库新增很多文件后，可点「立即扫描」一次。
                 </Text>
               </div>
               <Space wrap>
