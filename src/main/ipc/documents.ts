@@ -3393,23 +3393,25 @@ function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentLis
   if (docIds.length === 0) return documents
   const placeholders = docIds.map(() => '?').join(', ')
 
-  // Lightweight page stats only for the current result page.
-  // Avoid scanning ocr_result JSON blobs; status/ref columns are enough for list UI.
-  // Use NULLIF so empty proofed_text does not hide a non-empty ocr_text (COALESCE alone would).
+  // List/first-paint must stay index/status-only.
+  // Never TRIM/read proofed_text/ocr_text/ocr_result bodies here: on large libraries that
+  // forces multi-ten-second (or multi-minute under AV) main-thread freezes right after open,
+  // after startup recovery already finished quickly.
   const pageRows = queryAll<DocumentListPageStatsRow>(
     `SELECT
        p.doc_id,
        COUNT(*) as actual_page_count,
        SUM(
          CASE
-           WHEN COALESCE(p.ocr_status, '') = 'completed'
-             OR TRIM(COALESCE(NULLIF(p.proofed_text, ''), NULLIF(p.ocr_text, ''), '')) <> ''
-             OR TRIM(COALESCE(NULLIF(p.proofed_text_ref, ''), NULLIF(p.ocr_text_ref, ''), NULLIF(p.ocr_result_ref, ''), '')) <> ''
-           THEN 1 ELSE 0
+           WHEN COALESCE(p.ocr_status, '') = 'completed' THEN 1
+           WHEN COALESCE(p.proofed_text_ref, '') <> '' THEN 1
+           WHEN COALESCE(p.ocr_text_ref, '') <> '' THEN 1
+           WHEN COALESCE(p.ocr_result_ref, '') <> '' THEN 1
+           ELSE 0
          END
        ) as text_page_count,
        SUM(CASE WHEN COALESCE(p.ocr_status, '') = 'completed' THEN 1 ELSE 0 END) as ocr_completed_page_count,
-       SUM(CASE WHEN p.image_path IS NOT NULL AND TRIM(p.image_path) <> '' THEN 1 ELSE 0 END) as image_page_count
+       SUM(CASE WHEN p.image_path IS NOT NULL AND p.image_path <> '' THEN 1 ELSE 0 END) as image_page_count
      FROM pages p
      WHERE p.doc_id IN (${placeholders})
      GROUP BY p.doc_id`,

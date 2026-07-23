@@ -3579,13 +3579,16 @@ export default function LibraryView({
 
         if (event.status === 'completed') {
           message.destroy(BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY)
-          void Promise.all([
-            loadBaseData(),
-            loadDocuments(filter, { silent: true }),
-          ])
-          scheduleHealthReportRefresh(200)
           const recoveredCount = Number(event.totalCount || 0)
+          // Empty recovery is common on large libraries. Reloading folders+list immediately
+          // doubles first-paint main-thread work and can freeze the UI right after the
+          // diagnostic window says "完成". Only refresh when something was actually fixed.
           if (recoveredCount > 0) {
+            void Promise.all([
+              loadBaseData(),
+              loadDocuments(filter, { silent: true }),
+            ])
+            scheduleHealthReportRefresh(2_000)
             message.success({
               content: event.message || '已恢复上次未完成的任务',
               key: BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY,

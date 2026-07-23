@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.1.23 - 2026-07-23
+
+### 中文
+
+#### 性能
+
+- **修复「诊断完成立刻卡死」**：文献列表首屏 `attachPageStats` 不再 TRIM/读取 `ocr_text`/`proofed_text` 正文（大库 + 杀毒下可堵主线程数分钟）；仅用 status/ref 统计。
+- 启动恢复无实际修复项时，不再立刻二次刷新文件夹+列表。
+- 大库跳过启动后本地资源路径全量预加载（避免对数万路径 `existsSync`）。
+
+#### 下载
+
+- `GujiSmart-1.1.23-Setup-x64.exe`
+- `GujiSmart-1.1.23-Portable-x64.exe`
+
 ## 1.1.22 - 2026-07-23
 
 ### 中文

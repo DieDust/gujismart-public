@@ -617,6 +617,13 @@ if (mcpLaunch.isMcp) {
       // then statting/canonicalizing them causes open-path disk pressure on large libraries.
       setTimeout(() => {
         try {
+          // Large libraries: listing every file_path then existsSync/stat each path freezes the
+          // main process for minutes. Paths are allowed on demand when opening a document.
+          if (isLargeLibraryForAutomaticMaintenance()) {
+            console.log('[Main] Skipping local-resource path preload because the library is large')
+            markStartupEvent('preload-local-resource-paths-skipped-large-library')
+            return
+          }
           const endPreload = beginStartupPhase('preload-local-resource-paths')
           allowManagedFileAccessPaths(listStoredLocalResourcePaths({ includePageImages: false }))
           endPreload()
