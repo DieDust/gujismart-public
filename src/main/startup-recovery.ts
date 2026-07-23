@@ -959,18 +959,20 @@ export async function cleanupStartupTempDirsNow(
 }
 
 function scheduleDeferredStartupTempCleanup(recoveryStartedAtMs: number): void {
-  // After interactive open: clean leftover OCR temp trees without blocking recovery.
+  // After interactive open: only touch the small app-local temp folder.
+  // Never readdir/rm Windows %TEMP%/gujismart-ocr-* while the user is in the app —
+  // that is a common cause of "idle then Not Responding" under antivirus.
   setTimeout(() => {
     void (async () => {
       const endPhase = beginStartupPhase('startup-recovery.temp-dirs-deferred')
       try {
         const removed = await cleanupStartupTempDirsNow(recoveryStartedAtMs, {
-          includeSystemTmp: true,
-          budgetMs: 30_000,
-          maxDirs: 40,
+          includeSystemTmp: false,
+          budgetMs: 2_000,
+          maxDirs: 4,
         })
         if (removed > 0) {
-          console.log(`[Startup Recovery] Deferred temp cleanup removed ${removed} dir(s)`)
+          console.log(`[Startup Recovery] Deferred app-temp cleanup removed ${removed} dir(s)`)
         }
       } catch (error) {
         console.warn('[Startup Recovery] Deferred temp cleanup failed', error)
@@ -978,7 +980,7 @@ function scheduleDeferredStartupTempCleanup(recoveryStartedAtMs: number): void {
         endPhase()
       }
     })()
-  }, 90_000).unref?.()
+  }, 120_000).unref?.()
 }
 
 export async function runStartupRecovery(): Promise<StartupRecoverySummary> {

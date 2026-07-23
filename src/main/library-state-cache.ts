@@ -1,5 +1,5 @@
 import type { LibrarySmartViewCounts, LibraryStateCache } from '../shared/types'
-import { queryAll, queryOne, run, scheduleDatabaseSave } from './database'
+import { isLargeLibraryForAutomaticMaintenance, queryAll, queryOne, run, scheduleDatabaseSave } from './database'
 import { buildCumulativeFolderDocumentCounts } from './folder-scope'
 
 const CACHE_KEY = 'library-sidebar-v1'
@@ -183,15 +183,29 @@ function readCacheRow(): CacheRow | null {
 export function getLibraryStateCache(): LibraryStateCache {
   const row = readCacheRow()
   if (!row?.cache_json) {
-    scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_COLD_START_DELAY_MS)
+    // Large libraries: full COUNT/json_extract rebuild freezes the UI for minutes if started
+    // automatically a few seconds after open. Prefer empty/dirty snapshot until manual refresh.
+    if (!isLargeLibraryForAutomaticMaintenance()) {
+      scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_COLD_START_DELAY_MS)
+    } else {
+      console.log('[LibraryStateCache] Skipping automatic cold rebuild on large library')
+    }
     return emptyCache(true)
   }
   try {
     const cache = normalizeCache(JSON.parse(row.cache_json), row, row.dirty === 0 ? 'cache' : 'snapshot')
-    if (cache.dirty) scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_REFRESH_DELAY_MS)
+    if (cache.dirty) {
+      if (!isLargeLibraryForAutomaticMaintenance()) {
+        scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_REFRESH_DELAY_MS)
+      } else {
+        console.log('[LibraryStateCache] Keeping dirty snapshot on large library (no auto rebuild)')
+      }
+    }
     return cache
   } catch {
-    scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_COLD_START_DELAY_MS)
+    if (!isLargeLibraryForAutomaticMaintenance()) {
+      scheduleLibraryStateCacheRefresh(LIBRARY_STATE_CACHE_COLD_START_DELAY_MS)
+    }
     return emptyCache(true)
   }
 }
