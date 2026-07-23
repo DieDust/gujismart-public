@@ -103,6 +103,7 @@ import type {
   DocumentHealthReport,
   DocumentHealthReportOptions,
   DocumentListItem,
+  DocumentFilterOption,
   DocumentListPage,
   DocumentMetadataResult,
   DocumentPage,
@@ -328,6 +329,10 @@ const api = {
 
   listDocumentsPage: (options?: ListDocumentOptions): Promise<DocumentListPage> =>
     ipcRenderer.invoke('documents:listPage', options),
+
+  /** Filter dropdown metadata only (documents table; no pages scan). */
+  listDocumentFilterOptions: (): Promise<DocumentFilterOption[]> =>
+    ipcRenderer.invoke('documents:listFilterOptions'),
 
   getDocumentHealthReport: (options?: DocumentHealthReportOptions): Promise<DocumentHealthReport> =>
     ipcRenderer.invoke('documents:getHealthReport', options),

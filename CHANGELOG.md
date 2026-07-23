@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.1.29 - 2026-07-24
+
+### 中文
+
+#### 设计对齐
+
+- **列表按「导入/OCR 写死的字段」展示**：`page_count` / `ocr_status` 只在导入、识别完成、删除等路径维护；列表/筛选项只读这些字段，**不再每次打开重算 pages 表**。
+- 新增 `documents:listFilterOptions`：检索筛选项拉**全库轻量元数据**（id/title/author/doc_type/page_count/ocr_status），不扫 pages、不探盘，也**不人为砍成 100 本**。
+- 检索**结果**仍是独立分页搜索接口，与筛选项名单无关。
+
+#### 下载
+
+- `GujiSmart-1.1.29-Setup-x64.exe`
+- `GujiSmart-1.1.29-Portable-x64.exe`
+
 ## 1.1.28 - 2026-07-24
 
 ### 中文

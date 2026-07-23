@@ -1063,16 +1063,15 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
 
   const loadFilterOptions = async () => {
     try {
-      // Never pull 1000 full list rows on mount — that freezes large libraries after
-      // startup diagnostics already report "complete". Filter dropdowns only need a
-      // recent slice of light document fields.
-      const [docsPage, tags, folders] = await Promise.all([
-        window.api.listDocumentsPage({ limit: 100, offset: 0, sortKey: 'updatedAt', sortDirection: 'desc' }),
+      // Design: filter options read fixed documents-table fields only (no pages scan,
+      // no artificial "recent 100" cut). Search results remain a separate paginated API.
+      const [docs, tags, folders] = await Promise.all([
+        window.api.listDocumentFilterOptions(),
         window.api.listTags(),
         window.api.listFolders(),
       ])
       setFilterDocuments(
-        (docsPage.items || []).map((doc) => ({
+        (docs || []).map((doc) => ({
           id: doc.id,
           title: doc.title,
           author: doc.author,

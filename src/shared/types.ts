@@ -1310,6 +1310,20 @@ export interface ListDocumentOptions {
   offset?: number
 }
 
+/**
+ * Lightweight document rows for filter dropdowns (search filters, etc.).
+ * Uses only documents-table fields — never scans pages or probes the filesystem.
+ * page_count / ocr_status are whatever was written at import/OCR completion.
+ */
+export interface DocumentFilterOption {
+  id: string
+  title: string | null
+  author: string | null
+  doc_type: string | null
+  page_count: number | null
+  ocr_status: string | null
+}
+
 export type LibraryHealthFilterType =
   | 'healthMissingMetadata'
   | 'healthSuspiciousTitle'

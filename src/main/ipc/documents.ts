@@ -3404,10 +3404,9 @@ function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentLis
   if (docIds.length === 0) return documents
   const placeholders = docIds.map(() => '?').join(', ')
 
-  // List/filter/open-first-paint: never query the pages table.
-  // Any SELECT on pages materializes full rows (including multi-MB ocr_text). Under AV that
-  // freezes the UI for minutes after diagnostics already say "complete" — whether the
-  // active tab is 检索, 文献库, or anything else that loads a document list.
+  // Product design: page_count and ocr_status are written at import/OCR completion
+  // (and adjusted on delete/reprocess). List views only READ those document fields —
+  // they must not re-aggregate the pages table on every open/list refresh.
   const embeddingStatusRows = queryAll<{ doc_id: string; status?: string | null }>(
     `SELECT doc_id, status FROM embedding_index_status WHERE doc_id IN (${placeholders})`,
     docIds,
@@ -4532,6 +4531,24 @@ export function registerDocumentIpc(): void {
 
   ipcMain.handle('documents:listPage', async (_event, options?: ListDocumentOptions): Promise<DocumentListPage> => {
     return listDocumentPage(options)
+  })
+
+  // Design: page_count / ocr_status live on documents after import/OCR.
+  // Filter UIs only need metadata — never scan pages or probe the filesystem.
+  ipcMain.handle('documents:listFilterOptions', async () => {
+    return queryAll<{
+      id: string
+      title: string | null
+      author: string | null
+      doc_type: string | null
+      page_count: number | null
+      ocr_status: string | null
+    }>(
+      `SELECT id, title, author, doc_type, page_count, ocr_status
+       FROM documents
+       WHERE COALESCE(import_status, '') <> 'deleting'
+       ORDER BY updated_at DESC, created_at DESC`,
+    )
   })
 
   ipcMain.handle('documents:getHealthReport', async (_event, options?: DocumentHealthReportOptions): Promise<DocumentHealthReport> => {

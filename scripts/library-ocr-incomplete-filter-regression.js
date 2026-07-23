@@ -51,10 +51,12 @@ const attachPageStatsBlock = sliceBetween(
 )
 
 assert(
-  attachPageStatsBlock.includes('never query the pages table')
-    || attachPageStatsBlock.includes('Never touch the pages table')
-    || !attachPageStatsBlock.includes('FROM pages p'),
-  'document list attachPageStats must not query the pages table on first paint (full row loads freeze large libraries).',
+  !attachPageStatsBlock.includes('FROM pages p')
+    && (
+      attachPageStatsBlock.includes('must not re-aggregate the pages table')
+      || attachPageStatsBlock.includes('page_count and ocr_status are written at import')
+    ),
+  'document list attachPageStats must read fixed document fields only and never re-aggregate the pages table.',
 )
 
 assert(
