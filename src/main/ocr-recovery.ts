@@ -1,4 +1,4 @@
-import { queryAll, queryOne, run, scheduleDatabaseSave, transaction } from './database'
+import { isLargeLibraryForAutomaticMaintenance, queryAll, queryOne, run, scheduleDatabaseSave, transaction } from './database'
 
 export interface OcrRecoverySummary {
   recoveredDocuments: number
@@ -67,8 +67,10 @@ export function recoverInterruptedOcrJobs(): OcrRecoverySummary {
 
   // Nothing interrupted at document/batch level — only check pages if necessary.
   // A LIMIT 1 probe is far cheaper than DISTINCT + COUNT on 100k+ page rows.
+  // Large libraries: skip pages-table existence probes entirely (ocr_status alone is not indexed
+  // and can force multi-second full scans of multi-GB pages tables under AV).
   if (interruptedDocs.length === 0 && inFlightBatchItems === 0 && removedOrphanedBatchItems === 0) {
-    if (!hasInFlightPages()) {
+    if (isLargeLibraryForAutomaticMaintenance() || !hasInFlightPages()) {
       return {
         recoveredDocuments: 0,
         recoveredPages: 0,

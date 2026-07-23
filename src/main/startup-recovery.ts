@@ -180,6 +180,8 @@ function resetInterruptedAiLayoutCacheRows(): number {
 
 function reconcileCompletedOcrDocuments(): number {
   // Open path: status-only promotion. Never scan page body text on startup.
+  // Large libraries: skip correlated pages probes entirely (can dominate cold open).
+  if (shouldUseLightInterruptedImportRepair()) return 0
   // Only look at documents already marked incomplete to keep the probe bounded.
   const rows = queryAll<{ id: string }>(
     `SELECT d.id
@@ -1156,9 +1158,9 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     }
   }
 
-  // FS cleanup before delete resume: resume may drop document rows, which would
-  // otherwise make their storage dirs look like orphans in the same open pass.
-  if (await startupRecoveryCheckpoint()) return finishCanceled()
+  // No more checkpoints until recovery is done: yielding here lets first-paint
+  // listDocumentsPage monopolize the main thread for minutes on large libraries,
+  // while "启动恢复（整体）" stays open and looks like recovery is slow.
   emitStartupRecoveryStatus({
     status: 'processing',
     progress: 0.85,
@@ -1168,9 +1170,6 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     const endPhase = beginStartupPhase('startup-recovery.temp-dirs')
     try {
       // CRITICAL: do not readdir/rm temp trees during open recovery.
-      // Even with a time budget, a single recursive rm (or readdir of Windows %TEMP%)
-      // can run 60s+ under AV and cannot be cancelled mid-await — that is the ~70s
-      // "清理临时目录" stall. Always defer; open path records 0 work.
       removedTempDirs = 0
       scheduleDeferredStartupTempCleanup(recoveryStartedAtMs)
       console.log('[Startup Recovery] Temp cleanup fully deferred off open path (no readdir/rm)')
@@ -1178,7 +1177,6 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
-  if (await startupRecoveryCheckpoint()) return finishCanceled()
   {
     const endPhase = beginStartupPhase('startup-recovery.orphan-storage')
     try {

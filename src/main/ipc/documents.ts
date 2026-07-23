@@ -12,7 +12,8 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { beginStartupPhase } from '../startup-timing'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { normalizePageResult, normalizeStoredGujiOcrResultForRead } from '../ocr'
@@ -2793,6 +2794,16 @@ function buildPageContentAvailableCondition(alias = 'p'): string {
   )`
 }
 
+/** List/open-path only: never touch ocr_text/proofed_text/ocr_result bodies (full row loads freeze large libraries). */
+function buildPageContentAvailableConditionStatusOnly(alias = 'p'): string {
+  return `(
+    COALESCE(${alias}.ocr_status, '') = 'completed'
+    OR COALESCE(${alias}.proofed_text_ref, '') <> ''
+    OR COALESCE(${alias}.ocr_text_ref, '') <> ''
+    OR COALESCE(${alias}.ocr_result_ref, '') <> ''
+  )`
+}
+
 function buildDocumentOcrCompleteCondition(alias = 'd'): string {
   const pageCount = `COALESCE(${alias}.page_count, 0)`
   return `(
@@ -3393,10 +3404,35 @@ function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentLis
   if (docIds.length === 0) return documents
   const placeholders = docIds.map(() => '?').join(', ')
 
-  // List/first-paint must stay index/status-only.
-  // Never TRIM/read proofed_text/ocr_text/ocr_result bodies here: on large libraries that
-  // forces multi-ten-second (or multi-minute under AV) main-thread freezes right after open,
-  // after startup recovery already finished quickly.
+  // Large libraries: never touch the pages table on list/first-paint.
+  // Even "status-only" SELECT still materializes full rows (including multi-MB ocr_text),
+  // which freezes the main process for minutes under antivirus right after open.
+  if (isLargeLibraryForAutomaticMaintenance()) {
+    const embeddingStatusRows = queryAll<{ doc_id: string; status?: string | null }>(
+      `SELECT doc_id, status FROM embedding_index_status WHERE doc_id IN (${placeholders})`,
+      docIds,
+    )
+    const embeddingStatusByDoc = new Map(
+      embeddingStatusRows.map((row) => [row.doc_id, String(row.status || '').trim() || 'none']),
+    )
+    return documents.map((doc) => {
+      const pageCount = Math.max(0, Number(doc.page_count || 0))
+      const completed = String(doc.ocr_status || '') === 'completed'
+      return {
+        ...doc,
+        actual_page_count: pageCount,
+        text_page_count: completed ? pageCount : 0,
+        ocr_completed_page_count: completed ? pageCount : 0,
+        image_page_count: 0,
+        research_note_count: 0,
+        search_segment_count: 0,
+        embedding_status: embeddingStatusByDoc.get(doc.id) || 'none',
+        embedding_chunk_count: 0,
+      }
+    })
+  }
+
+  // Small libraries: page stats only, never TRIM body text columns.
   const pageRows = queryAll<DocumentListPageStatsRow>(
     `SELECT
        p.doc_id,
@@ -3569,12 +3605,17 @@ function listDocumentPage(options?: ListDocumentOptions): DocumentListPage {
   const safeOffset = Math.max(0, Math.round(Number(options?.offset || 0)))
   const normalizedOptions = { ...options, limit: safeLimit, offset: safeOffset }
   const startedAt = Date.now()
+  const endPhase = beginStartupPhase('ipc.documents.listPage')
   try {
     const { sql, params } = buildDocumentListQuery(normalizedOptions)
     const countQuery = buildDocumentListQuery(normalizedOptions, true)
     const rawItems = queryAll<DocumentListItem>(sql, params)
     const items = attachDocumentRelations(rawItems)
     const totalRow = queryOne<{ total: number }>(countQuery.sql, countQuery.params)
+    const elapsedMs = Date.now() - startedAt
+    if (elapsedMs >= 200) {
+      console.log(`[Documents] listPage slow elapsedMs=${elapsedMs} limit=${safeLimit} offset=${safeOffset} items=${items.length}`)
+    }
     return {
       items,
       total: Number(totalRow?.total || 0),
@@ -3588,6 +3629,8 @@ function listDocumentPage(options?: ListDocumentOptions): DocumentListPage {
       error: getErrorMessage(error, String(error)),
     })
     throw error
+  } finally {
+    endPhase()
   }
 }
 
@@ -3826,14 +3869,16 @@ interface DocumentListOcrPageSummary {
 
 function getDocumentListOcrPageSummaries(docIds: string[]): Map<string, DocumentListOcrPageSummary> {
   const summaries = new Map<string, DocumentListOcrPageSummary>()
+  // Never use buildPageContentAvailableCondition here — it TRIMs ocr_text bodies and freezes large libs.
+  const contentOk = buildPageContentAvailableConditionStatusOnly('pages')
   runForIdChunks(uniqueDocumentIds(docIds), (chunkIds, placeholders) => {
     const rows = queryAll<DocumentListOcrPageSummary>(
       `SELECT
          doc_id,
          COUNT(*) as total,
-         SUM(CASE WHEN ocr_status = 'completed' AND ${buildPageContentAvailableCondition('pages')} THEN 1 ELSE 0 END) as completed,
+         SUM(CASE WHEN ocr_status = 'completed' AND ${contentOk} THEN 1 ELSE 0 END) as completed,
          SUM(CASE WHEN ocr_status = 'error' THEN 1 ELSE 0 END) as failed,
-         SUM(CASE WHEN ocr_status IS NULL OR ocr_status IN ('pending', 'queued', 'processing') OR (ocr_status = 'completed' AND NOT (${buildPageContentAvailableCondition('pages')})) THEN 1 ELSE 0 END) as pending
+         SUM(CASE WHEN ocr_status IS NULL OR ocr_status IN ('pending', 'queued', 'processing') OR (ocr_status = 'completed' AND NOT (${contentOk})) THEN 1 ELSE 0 END) as pending
        FROM pages
        WHERE doc_id IN (${placeholders})
        GROUP BY doc_id`,
@@ -3913,6 +3958,9 @@ function getDocumentListOcrReviewMessage(doc: DocumentListItem): string {
 }
 
 function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): DocumentListItem[] {
+  // Large libraries: never scan pages or rewrite document status during list/first-paint.
+  if (isLargeLibraryForAutomaticMaintenance()) return documents
+
   const changedDocIds: string[] = []
   const reviewCandidateDocs = documents.filter((doc) => {
     if (isDocumentListOcrTextComplete(doc)) return false

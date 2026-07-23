@@ -110,6 +110,8 @@ const PHASE_LABELS: Record<string, string> = {
   'startup-maintenance.metadata-tags-skipped-large-library': '大库跳过元数据标签自动重建',
   'startup-maintenance.metadata-reclassification-scheduled': '已安排元数据重分类',
   'preload-local-resource-paths': '预加载本地资源路径白名单',
+  'preload-local-resource-paths-skipped-large-library': '大库跳过本地资源路径预加载',
+  'ipc.documents.listPage': '文献列表分页查询（首屏）',
   startAutoBackupScheduler: '启动自动备份调度',
   'startup-failed': '启动失败',
 }
