@@ -874,9 +874,10 @@ async function recoverInterruptedPdfCompressionSources(): Promise<number> {
 }
 
 /**
- * Temp cleanup can dominate cold open: Windows %TEMP% may hold many large
- * `gujismart-ocr-*` trees from failed OCR; recursive rm under AV easily costs
- * tens of seconds. Open path uses a tight budget; deep system-tmp cleanup is deferred.
+ * Temp cleanup targets app-managed folders under getDataDir()/temp.
+ * OCR sessions write to temp/ocr/gujismart-ocr-*; PDF compression uses temp/pdf-compression.
+ * Optionally also scavenge legacy leftovers still sitting in Windows %TEMP%.
+ * Open path must not call this with large trees synchronously — use deferred cleanup.
  */
 async function removeStartupTempDirs(
   recoveryStartedAtMs: number,
@@ -886,18 +887,21 @@ async function removeStartupTempDirs(
     maxDirs?: number
   },
 ): Promise<number> {
-  const includeSystemTmp = options?.includeSystemTmp !== false
+  const includeSystemTmp = options?.includeSystemTmp === true
   const budgetMs = Math.max(50, Number(options?.budgetMs || 2_000))
   const maxDirs = Math.max(1, Number(options?.maxDirs || 20))
   const deadline = Date.now() + budgetMs
   let removed = 0
   let budgetExceeded = false
 
-  const roots: Array<{ path: string; pattern: RegExp }> = []
+  const roots: Array<{ path: string; pattern: RegExp }> = [
+    { path: join(getDataDir(), 'temp', 'ocr'), pattern: /^gujismart-ocr-/ },
+    { path: join(getDataDir(), 'temp'), pattern: /^pdf-compression$/ },
+  ]
+  // Legacy path only: older builds wrote OCR temps into the OS temp directory.
   if (includeSystemTmp) {
     roots.push({ path: tmpdir(), pattern: /^gujismart-ocr-/ })
   }
-  roots.push({ path: join(getDataDir(), 'temp'), pattern: /^pdf-compression$/ })
 
   for (const root of roots) {
     if (Date.now() >= deadline || removed >= maxDirs) {
@@ -940,8 +944,8 @@ async function removeStartupTempDirs(
 }
 
 /**
- * Full temp cleanup (system %TEMP% + app temp). Used by deferred open path and tests.
- * Never call this on the interactive open critical path — readdir/rm of huge OCR trees freezes cold start.
+ * App-local temp cleanup (dataDir/temp/ocr + pdf-compression). Used by deferred open path and tests.
+ * Never call this on the interactive open critical path when trees may be huge.
  */
 export async function cleanupStartupTempDirsNow(
   recoveryStartedAtMs = Date.now() - 120_000,
@@ -952,24 +956,23 @@ export async function cleanupStartupTempDirsNow(
   },
 ): Promise<number> {
   return removeStartupTempDirs(recoveryStartedAtMs, {
-    includeSystemTmp: options?.includeSystemTmp !== false,
-    budgetMs: options?.budgetMs ?? 30_000,
+    includeSystemTmp: options?.includeSystemTmp === true,
+    budgetMs: options?.budgetMs ?? 10_000,
     maxDirs: options?.maxDirs ?? 40,
   })
 }
 
 function scheduleDeferredStartupTempCleanup(recoveryStartedAtMs: number): void {
-  // After interactive open: only touch the small app-local temp folder.
-  // Never readdir/rm Windows %TEMP%/gujismart-ocr-* while the user is in the app —
-  // that is a common cause of "idle then Not Responding" under antivirus.
+  // After interactive open: clean app-managed OCR/compression temps only.
+  // Paths live under getDataDir()/temp so cleanup is scoped and does not walk Windows %TEMP%.
   setTimeout(() => {
     void (async () => {
       const endPhase = beginStartupPhase('startup-recovery.temp-dirs-deferred')
       try {
         const removed = await cleanupStartupTempDirsNow(recoveryStartedAtMs, {
           includeSystemTmp: false,
-          budgetMs: 2_000,
-          maxDirs: 4,
+          budgetMs: 8_000,
+          maxDirs: 20,
         })
         if (removed > 0) {
           console.log(`[Startup Recovery] Deferred app-temp cleanup removed ${removed} dir(s)`)

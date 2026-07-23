@@ -2,10 +2,9 @@ import { spawn } from 'child_process'
 import { basename, dirname, extname, join } from 'path'
 import { existsSync, mkdirSync, openAsBlob, statSync } from 'fs'
 import { readFile, rm, stat, writeFile } from 'fs/promises'
-import { tmpdir } from 'os'
 import { app, nativeImage } from 'electron'
 import { PDFDocument } from 'pdf-lib'
-import { queryOne } from './database'
+import { getDataDir, queryOne } from './database'
 import { isAbortError } from '../shared/errors'
 import { ensureOcrResultIr } from '../shared/ocr-ir'
 import {
@@ -4573,7 +4572,11 @@ async function createPdfChunkPlan(
     throw new Error('古籍竖排 OCR 需要整本 PDF 原文件上传；当前 PDF 必须分片或选择页码上传，已停止以避免单页 PDF 坐标偏移。')
   }
 
-  const tempRoot = join(tmpdir(), `gujismart-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+  // Keep OCR session temps under the managed data dir (not Windows %TEMP%).
+  // That makes cleanup scoped to the app and avoids open/idle freezes from scanning system TEMP.
+  const ocrTempRoot = join(getDataDir(), 'temp', 'ocr')
+  mkdirSync(ocrTempRoot, { recursive: true })
+  const tempRoot = join(ocrTempRoot, `gujismart-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
   mkdirSync(tempRoot, { recursive: true })
   const targetChunkSize = getPdfTargetChunkSize(stats.size, totalPages)
   let estimatedPagesPerChunk = Math.max(1, Math.floor((totalPages * targetChunkSize) / Math.max(stats.size, 1)))

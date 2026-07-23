@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 1.1.25 - 2026-07-23
+
+### 中文
+
+#### 存储
+
+- **OCR 会话临时目录改到软件数据目录**：`{数据目录}/temp/ocr/gujismart-ocr-*`，不再写 Windows `%TEMP%`。
+- 延迟清理只扫应用自己的 `temp/ocr` 与 `temp/pdf-compression`，范围可控；旧版残留在系统 TEMP 的可手动删，不再自动全盘扫。
+
+#### 下载
+
+- `GujiSmart-1.1.25-Setup-x64.exe`
+- `GujiSmart-1.1.25-Portable-x64.exe`
+
 ## 1.1.24 - 2026-07-23
 
 ### 中文

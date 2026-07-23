@@ -228,8 +228,9 @@ async function run() {
     const interruptedCompressionStorageDir = join(storageRoot, 'doc_interrupted_compression')
     const interruptedCompressionPdfPath = join(interruptedCompressionStorageDir, 'stored.pdf')
     const interruptedCompressionOriginalPath = join(interruptedCompressionStorageDir, '.original-123456-abcdef.pdf')
-    const ocrTempDir = join(tmpdir(), `gujismart-ocr-startup-recovery-${Date.now()}`)
-    const activeOcrTempDir = join(tmpdir(), `gujismart-ocr-active-${Date.now()}`)
+    // OCR session temps live under the managed data dir (temp/ocr), not OS tmpdir.
+    const ocrTempDir = join(tempDataDir, 'temp', 'ocr', `gujismart-ocr-startup-recovery-${Date.now()}`)
+    const activeOcrTempDir = join(tempDataDir, 'temp', 'ocr', `gujismart-ocr-active-${Date.now()}`)
     const compressionTempDir = join(tempDataDir, 'temp', 'pdf-compression')
     mkdirSync(knownStorageDir, { recursive: true })
     mkdirSync(orphanStorageDir, { recursive: true })
@@ -398,12 +399,13 @@ async function run() {
     })
     // Open path no longer deletes temp trees (that freeze cold start); cleanup is deferred.
     assert.strictEqual(summary.removedTempDirs, 0, `open path must not remove temp dirs, saw ${summary.removedTempDirs}`)
+    // App-local temps: stale OCR session under temp/ocr + pdf-compression (active OCR dir has future mtime).
     const deferredTempRemoved = await startupRecovery.cleanupStartupTempDirsNow(Date.now() - 120_000, {
-      includeSystemTmp: true,
+      includeSystemTmp: false,
       budgetMs: 10_000,
       maxDirs: 20,
     })
-    assert(deferredTempRemoved >= 2, `expected deferred temp cleanup to remove at least 2 dirs, saw ${deferredTempRemoved}`)
+    assert(deferredTempRemoved >= 2, `expected deferred app-temp cleanup to remove at least 2 dirs, saw ${deferredTempRemoved}`)
 
     // Interrupted search rows reset to pending (not immediately requeued).
     // Import/OCR repair may also mark additional recovered docs pending for later reindex.
