@@ -3404,94 +3404,30 @@ function attachPageStatsForDocuments(documents: DocumentListItem[]): DocumentLis
   if (docIds.length === 0) return documents
   const placeholders = docIds.map(() => '?').join(', ')
 
-  // Large libraries: never touch the pages table on list/first-paint.
-  // Even "status-only" SELECT still materializes full rows (including multi-MB ocr_text),
-  // which freezes the main process for minutes under antivirus right after open.
-  if (isLargeLibraryForAutomaticMaintenance()) {
-    const embeddingStatusRows = queryAll<{ doc_id: string; status?: string | null }>(
-      `SELECT doc_id, status FROM embedding_index_status WHERE doc_id IN (${placeholders})`,
-      docIds,
-    )
-    const embeddingStatusByDoc = new Map(
-      embeddingStatusRows.map((row) => [row.doc_id, String(row.status || '').trim() || 'none']),
-    )
-    return documents.map((doc) => {
-      const pageCount = Math.max(0, Number(doc.page_count || 0))
-      const completed = String(doc.ocr_status || '') === 'completed'
-      return {
-        ...doc,
-        actual_page_count: pageCount,
-        text_page_count: completed ? pageCount : 0,
-        ocr_completed_page_count: completed ? pageCount : 0,
-        image_page_count: 0,
-        research_note_count: 0,
-        search_segment_count: 0,
-        embedding_status: embeddingStatusByDoc.get(doc.id) || 'none',
-        embedding_chunk_count: 0,
-      }
-    })
-  }
-
-  // Small libraries: page stats only, never TRIM body text columns.
-  const pageRows = queryAll<DocumentListPageStatsRow>(
-    `SELECT
-       p.doc_id,
-       COUNT(*) as actual_page_count,
-       SUM(
-         CASE
-           WHEN COALESCE(p.ocr_status, '') = 'completed' THEN 1
-           WHEN COALESCE(p.proofed_text_ref, '') <> '' THEN 1
-           WHEN COALESCE(p.ocr_text_ref, '') <> '' THEN 1
-           WHEN COALESCE(p.ocr_result_ref, '') <> '' THEN 1
-           ELSE 0
-         END
-       ) as text_page_count,
-       SUM(CASE WHEN COALESCE(p.ocr_status, '') = 'completed' THEN 1 ELSE 0 END) as ocr_completed_page_count,
-       SUM(CASE WHEN p.image_path IS NOT NULL AND p.image_path <> '' THEN 1 ELSE 0 END) as image_page_count
-     FROM pages p
-     WHERE p.doc_id IN (${placeholders})
-     GROUP BY p.doc_id`,
-    docIds,
-  )
-  const noteRows = queryAll<DocumentListPageStatsRow>(
-    `SELECT rn.doc_id, COUNT(*) as research_note_count
-     FROM research_notes rn
-     WHERE rn.doc_id IN (${placeholders})
-     GROUP BY rn.doc_id`,
-    docIds,
-  )
+  // List/filter/open-first-paint: never query the pages table.
+  // Any SELECT on pages materializes full rows (including multi-MB ocr_text). Under AV that
+  // freezes the UI for minutes after diagnostics already say "complete" — whether the
+  // active tab is 检索, 文献库, or anything else that loads a document list.
   const embeddingStatusRows = queryAll<{ doc_id: string; status?: string | null }>(
     `SELECT doc_id, status FROM embedding_index_status WHERE doc_id IN (${placeholders})`,
     docIds,
   )
-  const embeddingChunkRows = queryAll<{ doc_id: string; c?: number | null }>(
-    `SELECT doc_id, COUNT(*) as c FROM embedding_chunks WHERE doc_id IN (${placeholders}) GROUP BY doc_id`,
-    docIds,
-  )
-
-  const pageStatsByDoc = new Map(pageRows.map((row) => [row.doc_id, row]))
-  const noteStatsByDoc = new Map(noteRows.map((row) => [row.doc_id, Number(row.research_note_count || 0)]))
   const embeddingStatusByDoc = new Map(
     embeddingStatusRows.map((row) => [row.doc_id, String(row.status || '').trim() || 'none']),
   )
-  const embeddingChunkByDoc = new Map(
-    embeddingChunkRows.map((row) => [row.doc_id, Number(row.c || 0)]),
-  )
-
   return documents.map((doc) => {
-    const stats = pageStatsByDoc.get(doc.id)
-    const embeddingStatus = embeddingStatusByDoc.get(doc.id) || 'none'
-    const embeddingChunks = embeddingChunkByDoc.get(doc.id) || 0
+    const pageCount = Math.max(0, Number(doc.page_count || 0))
+    const completed = String(doc.ocr_status || '') === 'completed'
     return {
       ...doc,
-      actual_page_count: Number(stats?.actual_page_count || 0),
-      text_page_count: Number(stats?.text_page_count || 0),
-      ocr_completed_page_count: Number(stats?.ocr_completed_page_count || 0),
-      image_page_count: Number(stats?.image_page_count || 0),
-      research_note_count: noteStatsByDoc.get(doc.id) || 0,
+      actual_page_count: pageCount,
+      text_page_count: completed ? pageCount : 0,
+      ocr_completed_page_count: completed ? pageCount : 0,
+      image_page_count: 0,
+      research_note_count: 0,
       search_segment_count: 0,
-      embedding_status: embeddingStatus,
-      embedding_chunk_count: embeddingChunks,
+      embedding_status: embeddingStatusByDoc.get(doc.id) || 'none',
+      embedding_chunk_count: 0,
     }
   })
 }
@@ -3963,70 +3899,10 @@ function getDocumentListOcrReviewMessage(doc: DocumentListItem): string {
 }
 
 function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): DocumentListItem[] {
-  // Large libraries: never scan pages or rewrite document status during list/first-paint.
-  if (isLargeLibraryForAutomaticMaintenance()) return documents
-
-  const changedDocIds: string[] = []
-  const reviewCandidateDocs = documents.filter((doc) => {
-    if (isDocumentListOcrTextComplete(doc)) return false
-    if (doc.ocr_status === 'completed' && doc.import_status === 'processed') return false
-    return doc.ocr_status === 'error' || doc.import_status === 'error'
-  })
-  const reviewSummaries = getDocumentListOcrPageSummaries(reviewCandidateDocs.map((doc) => doc.id))
-  const reviewMessagesByDocId = new Map<string, string>()
-  const normalized = documents.map((doc) => {
-    if (isDocumentListOcrTextComplete(doc)) {
-      if (doc.ocr_status === 'completed' && doc.import_status === 'processed' && !doc.error_message) return doc
-      changedDocIds.push(doc.id)
-      return {
-        ...doc,
-        ocr_status: 'completed',
-        import_status: 'processed',
-        error_message: null,
-      }
-    }
-
-    if (isDocumentListOcrSettledWithReviewPages(doc, reviewSummaries.get(doc.id))) {
-      const reviewMessage = getDocumentListOcrReviewMessage(doc)
-      reviewMessagesByDocId.set(doc.id, reviewMessage)
-      return {
-        ...doc,
-        ocr_status: 'completed',
-        import_status: 'processed',
-        error_message: reviewMessage,
-      }
-    }
-
-    return doc
-  })
-
-  if (changedDocIds.length > 0 || reviewMessagesByDocId.size > 0) {
-    const now = new Date().toISOString()
-    try {
-      runForIdChunks(changedDocIds, (chunkIds, placeholders) => {
-        run(
-          `UPDATE documents
-           SET ocr_status = ?, import_status = ?, error_message = NULL, updated_at = ?
-           WHERE id IN (${placeholders})`,
-          ['completed', 'processed', now, ...chunkIds],
-        )
-      })
-      transaction(() => {
-        reviewMessagesByDocId.forEach((reviewMessage, docId) => {
-          run(
-            'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?',
-            ['completed', 'processed', reviewMessage.slice(0, 1000), now, docId],
-          )
-        })
-      })
-      markLibraryStateCacheDirty()
-      scheduleDatabaseSave()
-    } catch (error) {
-      console.warn('[Documents] Failed to persist normalized OCR status; using page-derived status for this list response', error)
-    }
-  }
-
-  return normalized
+  // List path: never scan pages or rewrite statuses here.
+  // First-paint freezes came from pages-table scans / body text during list attach.
+  // Status promotion belongs to OCR completion and dedicated maintenance paths.
+  return documents
 }
 
 function scheduleDocumentHealthReportRefresh(): void {

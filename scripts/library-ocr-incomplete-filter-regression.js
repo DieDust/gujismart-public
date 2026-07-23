@@ -43,11 +43,24 @@ assert(
   'ocrIncomplete filter should not count completed/text pages per candidate document; it becomes too expensive at page size 100.',
 )
 
+const attachPageStatsBlock = sliceBetween(
+  documentsSource,
+  'function attachPageStatsForDocuments',
+  'function resolveListPdfAssetInfo',
+  'attachPageStatsForDocuments',
+)
+
 assert(
-  documentsSource.includes('function attachPageStatsForDocuments')
-    && documentsSource.includes('WHERE p.doc_id IN (${placeholders})')
-    && !/LEFT JOIN \(\s*SELECT[\s\S]{0,400}FROM pages p[\s\S]{0,200}GROUP BY p\.doc_id/.test(documentsSource),
-  'document list should attach page stats only for the current result page, not full-table page aggregation.',
+  attachPageStatsBlock.includes('never query the pages table')
+    || attachPageStatsBlock.includes('Never touch the pages table')
+    || !attachPageStatsBlock.includes('FROM pages p'),
+  'document list attachPageStats must not query the pages table on first paint (full row loads freeze large libraries).',
+)
+
+assert(
+  attachPageStatsBlock.includes('actual_page_count: pageCount')
+    && attachPageStatsBlock.includes("String(doc.ocr_status || '') === 'completed'"),
+  'list page stats should trust document.page_count / ocr_status instead of scanning page rows.',
 )
 
 const lightweightCacheBlock = sliceBetween(
@@ -64,24 +77,16 @@ assert(
 )
 
 assert(
-  documentsSource.includes('actual_page_count: Number(stats?.actual_page_count || 0)')
-    && documentsSource.includes('page_count: Math.max(storedPageCount, actualPageCount)')
+  documentsSource.includes('page_count: Math.max(storedPageCount, actualPageCount)')
     && documentsSource.includes('const pageCount = Math.max(Number(doc.page_count || 0), actualPageCount)'),
   'document list and health rows should use actual page rows as a fallback when legacy document page_count is zero.',
 )
 
 assert(
-  documentsSource.includes('function getDocumentListOcrPageSummaries')
-    && documentsSource.includes('function isDocumentListOcrSettledWithReviewPages')
-    && documentsSource.includes('function getDocumentListOcrReviewMessage')
-    && documentsSource.includes('function listDocumentListOcrFailedPageNums')
-    && documentsSource.includes('OCR完成，第 ${pageList} 页 OCR 未成功')
-    && documentsSource.includes("return doc.ocr_status === 'error' || doc.import_status === 'error'")
-    && documentsSource.includes('summary.pending === 0')
-    && documentsSource.includes('summary.failed > 0')
-    && documentsSource.includes("ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?")
-    && documentsSource.includes('reviewMessage.slice(0, 1000)'),
-  'document list normalization should migrate old document-level OCR failures with only settled page errors into short completed review warnings.',
+  documentsSource.includes('function normalizeCompletedOcrDocuments')
+    && /function normalizeCompletedOcrDocuments[\s\S]{0,400}return documents/.test(documentsSource)
+    && !/function normalizeCompletedOcrDocuments[\s\S]{0,800}getDocumentListOcrPageSummaries/.test(documentsSource),
+  'document list must not run pages-based OCR review promotion during list attach (open/OCR paths own that work).',
 )
 
 assert(
