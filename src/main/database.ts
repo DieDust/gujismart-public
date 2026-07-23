@@ -246,7 +246,11 @@ export function getDataDir(): string {
   return cachedDataDir
 }
 
-export function resolveManagedStoragePath(filePath: string | null | undefined, docId?: string | null): string {
+export function resolveManagedStoragePath(
+  filePath: string | null | undefined,
+  docId?: string | null,
+  options?: { verifyExists?: boolean },
+): string {
   const rawPath = String(filePath || '').trim()
   if (!rawPath) return rawPath
 
@@ -276,6 +280,8 @@ export function resolveManagedStoragePath(filePath: string | null | undefined, d
 
   if (relativeParts.length === 0) return rawPath
   const relocatedPath = join(getDataDir(), 'storage', ...relativeParts)
+  // List/first-paint must not existsSync every path — AV turns 1000 list rows into multi-minute freezes.
+  if (options?.verifyExists === false) return relocatedPath
   return existsSync(relocatedPath) ? relocatedPath : rawPath
 }
 

@@ -3573,8 +3573,13 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
     const folders = foldersByDoc.get(doc.id) || []
     const actualPageCount = Number(doc.actual_page_count || 0)
     const storedPageCount = Number(doc.page_count || 0)
-    const relocatedFilePath = doc.file_path ? resolveManagedStoragePath(doc.file_path, doc.id) : doc.file_path
-    const relocatedThumbPath = doc.thumb_path ? resolveManagedStoragePath(doc.thumb_path, doc.id) : doc.thumb_path
+    // List paths: logical relocate only. existsSync belongs on open/read, not every list row.
+    const relocatedFilePath = doc.file_path
+      ? resolveManagedStoragePath(doc.file_path, doc.id, { verifyExists: false })
+      : doc.file_path
+    const relocatedThumbPath = doc.thumb_path
+      ? resolveManagedStoragePath(doc.thumb_path, doc.id, { verifyExists: false })
+      : doc.thumb_path
     const pdfAssetInfo = resolveListPdfAssetInfo(doc)
     return {
       ...doc,
