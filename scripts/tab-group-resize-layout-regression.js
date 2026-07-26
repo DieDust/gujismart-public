@@ -96,8 +96,10 @@ async function run() {
       (async () => {
         const strip = document.getElementById('fixture-strip')
         const rail = document.getElementById('fixture-rail')
-        const visibleTabCount = 7
-        const groupCount = 4
+        const visibleTabCount = strip.querySelectorAll(
+          ':scope > .app-tab, :scope > [data-layout-group]:not(.is-collapsed) > .app-tab',
+        ).length
+        const groupCount = strip.querySelectorAll(':scope > [data-layout-group]').length
         const visualItemCount = visibleTabCount + groupCount
 
         const getMetrics = (density) => {
@@ -146,8 +148,11 @@ async function run() {
             group.style.setProperty('--app-tab-group-segment-width', groupWidth + 'px')
           })
         }
-        const inspect = (width) => {
+        let layoutCount = 0
+        const layoutHistory = []
+        const inspect = (width, zoomFactor = 1) => {
           const overlaps = []
+          const stripRect = strip.getBoundingClientRect()
           const groups = Array.from(strip.querySelectorAll('[data-layout-group]'))
           groups.forEach((group) => {
             const groupRect = group.getBoundingClientRect()
@@ -168,27 +173,103 @@ async function run() {
               }
             })
           })
+          Array.from(strip.querySelectorAll(':scope > [data-layout-group], :scope > .app-tab'))
+            .filter((element) => element.getClientRects().length > 0)
+            .forEach((element) => {
+              const rect = element.getBoundingClientRect()
+              if (rect.left < stripRect.left - 0.5 || rect.right > stripRect.right + 0.5) {
+                overlaps.push({
+                  type: 'strip-overflow',
+                  item: element.dataset.layoutGroup || element.dataset.layoutItem,
+                  stripLeft: stripRect.left,
+                  stripRight: stripRect.right,
+                  itemLeft: rect.left,
+                  itemRight: rect.right,
+                })
+              }
+            })
           return {
             width,
+            zoomFactor,
             density: strip.dataset.appTabDensity,
             stripWidth: strip.clientWidth,
+            stripRectWidth: stripRect.width,
+            viewportWidth: window.visualViewport?.width || window.innerWidth,
+            documentWidth: document.documentElement.clientWidth,
+            devicePixelRatio: window.devicePixelRatio,
+            layoutCount,
+            layoutHistory: layoutHistory.slice(-12),
             overlaps,
           }
         }
 
-        const checks = []
-        for (const width of [2100, 1520, 1180, 860, 1320, 1900, 1040, 2100]) {
+        const measure = () => {
+          layoutCount += 1
+          applyLayout()
+          layoutHistory.push({
+            at: Math.round(performance.now()),
+            stripWidth: strip.clientWidth,
+            density: strip.dataset.appTabDensity,
+            slotWidth: strip.style.getPropertyValue('--app-tab-slot-width'),
+            devicePixelRatio: window.devicePixelRatio,
+          })
+        }
+        let settleMeasureTimers = []
+        const scheduleMeasure = () => {
+          measure()
+          settleMeasureTimers.forEach((timer) => window.clearTimeout(timer))
+          settleMeasureTimers = [30, 90, 180].map((delay) => window.setTimeout(measure, delay))
+        }
+        const resizeObserver = new ResizeObserver(measure)
+        resizeObserver.observe(strip)
+        resizeObserver.observe(rail)
+        window.addEventListener('resize', scheduleMeasure)
+        window.visualViewport?.addEventListener('resize', scheduleMeasure)
+        let resolutionMedia = window.matchMedia('(resolution: ' + window.devicePixelRatio + 'dppx)')
+        const handleResolutionChange = () => {
+          scheduleMeasure()
+          resolutionMedia.removeEventListener('change', handleResolutionChange)
+          resolutionMedia = window.matchMedia('(resolution: ' + window.devicePixelRatio + 'dppx)')
+          resolutionMedia.addEventListener('change', handleResolutionChange)
+        }
+        resolutionMedia.addEventListener('change', handleResolutionChange)
+        let observedDevicePixelRatio = window.devicePixelRatio
+        window.setInterval(() => {
+          if (Math.abs(window.devicePixelRatio - observedDevicePixelRatio) < 0.001) return
+          observedDevicePixelRatio = window.devicePixelRatio
+          scheduleMeasure()
+        }, 25)
+        measure()
+
+        window.__runTabLayoutWidths = (widths) => widths.map((width) => {
           rail.style.width = width + 'px'
           strip.getBoundingClientRect()
-          applyLayout()
+          measure()
           strip.getBoundingClientRect()
-          checks.push(inspect(width))
+          return inspect(width)
+        })
+        window.__prepareFluidTabLayout = () => {
+          rail.style.width = '100%'
+          strip.getBoundingClientRect()
+          measure()
+          strip.getBoundingClientRect()
         }
-        return checks
+        window.__inspectTabLayout = (zoomFactor) => inspect(rail.clientWidth, zoomFactor)
+
+        return window.__runTabLayoutWidths([2100, 1520, 1180, 860, 1320, 1900, 1040, 2100])
       })()
     `)
 
-    const failures = result.filter((check) => check.overlaps.length > 0)
+    await window.webContents.executeJavaScript('window.__prepareFluidTabLayout()')
+    const zoomChecks = []
+    for (const zoomFactor of [1, 1.25, 1.5, 1.75, 1.25, 1]) {
+      window.webContents.setZoomFactor(zoomFactor)
+      await new Promise((resolve) => setTimeout(resolve, 260))
+      zoomChecks.push(await window.webContents.executeJavaScript(`window.__inspectTabLayout(${zoomFactor})`))
+    }
+
+    const checks = [...result, ...zoomChecks]
+    const failures = checks.filter((check) => check.overlaps.length > 0)
     if (failures.length > 0) {
       throw new Error(`Tab/group items overflow after resize: ${JSON.stringify(failures, null, 2)}`)
     }

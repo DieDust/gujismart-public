@@ -884,21 +884,52 @@ export default function App() {
     const rail = strip.parentElement
     if (rail) resizeObserver.observe(rail)
     let resizeFrame: number | null = null
-    const handleWindowResize = () => {
-      // A viewport change invalidates FLIP coordinates captured before the resize.
-      pendingTabLayoutRef.current = null
-      tabReorderAnimationsRef.current.forEach((animation) => animation.cancel())
-      tabReorderAnimationsRef.current.clear()
+    let settledMeasureTimers: number[] = []
+    const scheduleSettledMeasure = () => {
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame)
       resizeFrame = window.requestAnimationFrame(() => {
         resizeFrame = null
         measure()
       })
+      settledMeasureTimers.forEach((timer) => window.clearTimeout(timer))
+      settledMeasureTimers = [60, 180, 360].map((delay) => window.setTimeout(measure, delay))
+    }
+    const handleWindowResize = () => {
+      // A viewport change invalidates FLIP coordinates captured before the resize.
+      pendingTabLayoutRef.current = null
+      tabReorderAnimationsRef.current.forEach((animation) => animation.cancel())
+      tabReorderAnimationsRef.current.clear()
+      scheduleSettledMeasure()
     }
     window.addEventListener('resize', handleWindowResize)
+    window.visualViewport?.addEventListener('resize', handleWindowResize)
+
+    let resolutionMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+    const handleResolutionChange = () => {
+      handleWindowResize()
+      resolutionMedia.removeEventListener('change', handleResolutionChange)
+      resolutionMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+      resolutionMedia.addEventListener('change', handleResolutionChange)
+    }
+    resolutionMedia.addEventListener('change', handleResolutionChange)
+
+    // Chromium can update display scale without emitting resize/ResizeObserver.
+    // Comparing the scalar is cheap; layout work only runs when the DPI really changes.
+    let observedDevicePixelRatio = window.devicePixelRatio
+    const displayScaleMonitor = window.setInterval(() => {
+      const nextDevicePixelRatio = window.devicePixelRatio
+      if (Math.abs(nextDevicePixelRatio - observedDevicePixelRatio) < 0.001) return
+      observedDevicePixelRatio = nextDevicePixelRatio
+      handleWindowResize()
+    }, 250)
+
     return () => {
       resizeObserver.disconnect()
       window.removeEventListener('resize', handleWindowResize)
+      window.visualViewport?.removeEventListener('resize', handleWindowResize)
+      resolutionMedia.removeEventListener('change', handleResolutionChange)
+      window.clearInterval(displayScaleMonitor)
+      settledMeasureTimers.forEach((timer) => window.clearTimeout(timer))
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame)
     }
   }, [collapsedTabGroupCount, siderCollapsed, tabStripGroupCount, visibleTabCount, visibleTabUnitCount])
