@@ -1,6 +1,6 @@
 {
   "name": "gujismart",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
   "main": "./out/main/index.js",
   "author": "DieDust",
@@ -103,7 +103,7 @@
     "prepare:release-metadata": "node scripts/generate-release-evidence.js",
     "check:release-evidence": "node scripts/release-evidence-regression.js",
     "smoke:packaged": "node scripts/packaged-smoke.js",
-    "check:tabbed-browsing": "node scripts/tabbed-browsing-regression.js",
+    "check:tabbed-browsing": "node scripts/tabbed-browsing-regression.js && electron scripts/tab-group-resize-layout-regression.js",
     "check:tab-group-numbering": "node scripts/tab-group-numbering-regression.js",
     "check:workspace-restore": "node scripts/workspace-restore-regression.js && npm run check:interaction-kernel",
     "check:renderer-performance": "node scripts/renderer-performance-regression.js",

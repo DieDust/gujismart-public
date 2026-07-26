@@ -107,6 +107,13 @@ type AppTab = WorkspaceAppTab
 type AppTabStripItem =
   | { type: 'group'; group: WorkspaceTabGroup; tabs: AppTab[]; tabCount: number; active: boolean }
   | { type: 'tab'; tab: AppTab }
+type AppTabDensityMetrics = {
+  gap: number
+  groupChipWidth: number
+  groupHorizontalPadding: number
+  stripHorizontalPadding: number
+  tabMaxWidth: number
+}
 type ClosedAppTabItem =
   | { type: 'tab'; tab: AppTab; group?: WorkspaceTabGroup; closedAt: number }
   | { type: 'group'; group: WorkspaceTabGroup; tabs: AppTab[]; activeTabId?: string; closedAt: number }
@@ -155,6 +162,7 @@ const TAB_TIGHT_SLOT_WIDTH = 74
 const TAB_ICON_SLOT_WIDTH = 46
 const TAB_STRIP_GAP = 6
 const TAB_STRIP_HORIZONTAL_PADDING = 16
+const TAB_GROUP_HORIZONTAL_PADDING = 8
 const MAX_CLOSED_TAB_HISTORY = 20
 const SINGLETON_VIEW_KEYS = new Set<AppViewKey>(['library', 'excerpts', 'citation', 'tags', 'dashboard', 'settings'])
 const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research'])
@@ -353,6 +361,80 @@ function getTabDensityForSlot(slotWidth: number): AppTabDensity {
   if (slotWidth <= TAB_TIGHT_SLOT_WIDTH) return 'tight'
   if (slotWidth <= TAB_COMPACT_SLOT_WIDTH) return 'compact'
   return 'normal'
+}
+
+function getTabDensityMetrics(density: AppTabDensity): AppTabDensityMetrics {
+  if (density === 'icon') {
+    return {
+      gap: 2,
+      groupChipWidth: 34,
+      groupHorizontalPadding: 6,
+      stripHorizontalPadding: 8,
+      tabMaxWidth: 42,
+    }
+  }
+  if (density === 'tight') {
+    return {
+      gap: 3,
+      groupChipWidth: 58,
+      groupHorizontalPadding: 6,
+      stripHorizontalPadding: TAB_STRIP_HORIZONTAL_PADDING,
+      tabMaxWidth: TAB_TIGHT_SLOT_WIDTH,
+    }
+  }
+  if (density === 'compact') {
+    return {
+      gap: 4,
+      groupChipWidth: 78,
+      groupHorizontalPadding: TAB_GROUP_HORIZONTAL_PADDING,
+      stripHorizontalPadding: TAB_STRIP_HORIZONTAL_PADDING,
+      tabMaxWidth: TAB_COMPACT_SLOT_WIDTH,
+    }
+  }
+  return {
+    gap: TAB_STRIP_GAP,
+    groupChipWidth: TAB_GROUP_CHIP_WIDTH,
+    groupHorizontalPadding: TAB_GROUP_HORIZONTAL_PADDING,
+    stripHorizontalPadding: TAB_STRIP_HORIZONTAL_PADDING,
+    tabMaxWidth: TAB_PREFERRED_WIDTH,
+  }
+}
+
+function calculateTabSlotWidth(
+  stripWidth: number,
+  density: AppTabDensity,
+  visibleTabCount: number,
+  tabStripGroupCount: number,
+  visibleTabUnitCount: number,
+): number {
+  const metrics = getTabDensityMetrics(density)
+  if (visibleTabCount <= 0) return metrics.tabMaxWidth
+  const gapTotal = Math.max(0, visibleTabUnitCount - 1) * metrics.gap
+  const groupReserve = tabStripGroupCount * (
+    metrics.groupChipWidth + metrics.groupHorizontalPadding
+  )
+  const usableForTabs = Math.max(
+    0,
+    stripWidth
+      - metrics.stripHorizontalPadding
+      - gapTotal
+      - groupReserve,
+  )
+  return Math.max(0, Math.min(metrics.tabMaxWidth, usableForTabs / visibleTabCount))
+}
+
+function getExpandedTabGroupWidth(
+  tabCount: number,
+  tabSlotWidth: number,
+  density: AppTabDensity,
+): number {
+  const metrics = getTabDensityMetrics(density)
+  return (
+    metrics.groupChipWidth
+    + metrics.groupHorizontalPadding
+    + tabCount * tabSlotWidth
+    + tabCount * metrics.gap
+  )
 }
 
 function reorderAppTabs(current: AppTab[], sourceId: string, targetId: string, position: TabDropPosition): AppTab[] {
@@ -554,6 +636,7 @@ export default function App() {
   const [databaseUpgradePhase, setDatabaseUpgradePhase] = useState<DatabaseUpgradePhase>('idle')
   const [databaseUpgradeProgress, setDatabaseUpgradeProgress] = useState<BackgroundTaskProgressEvent | null>(null)
   const [tabDensity, setTabDensity] = useState<AppTabDensity>('normal')
+  const [tabSlotWidth, setTabSlotWidth] = useState(TAB_PREFERRED_WIDTH)
   const onboardingVisible = useOnboardingStore((state) => state.visible)
   const activeTab = useMemo(() => tabs.find((tab) => tab.id === activeTabId) || tabs[0] || createHomeTab(), [activeTabId, tabs])
   const tabGroupsById = useMemo(() => new Map(tabGroups.map((group) => [group.id, group])), [tabGroups])
@@ -614,6 +697,7 @@ export default function App() {
     + tabStripGroupCount * TAB_GROUP_CHIP_WIDTH
     + Math.max(0, visibleTabUnitCount - 1) * TAB_STRIP_GAP
     + TAB_STRIP_HORIZONTAL_PADDING
+    + tabStripGroupCount * TAB_GROUP_HORIZONTAL_PADDING
   )
   const filteredTabs = useMemo(() => {
     const keyword = tabSearchKey.trim().toLocaleLowerCase()
@@ -766,24 +850,32 @@ export default function App() {
     if (!strip) return
 
     const measure = () => {
-      // Density follows the post-collapse layout: only visible tabs compress.
-      // Collapsed (and expanded) group chips reserve a fixed preferred chip width
-      // so folding a group immediately frees slot budget for the remaining tabs.
-      const visualItemCount = Math.max(1, visibleTabUnitCount)
-      const gapTotal = Math.max(0, visualItemCount - 1) * TAB_STRIP_GAP
-      const chipReserve = tabStripGroupCount * TAB_GROUP_CHIP_WIDTH
       if (visibleTabCount <= 0) {
         setTabDensity('normal')
+        setTabSlotWidth(TAB_PREFERRED_WIDTH)
         return
       }
-      const usableForTabs = Math.max(
-        1,
-        strip.clientWidth
-          - TAB_STRIP_HORIZONTAL_PADDING
-          - gapTotal
-          - chipReserve,
+      // Choose density against the full-size chip budget to avoid oscillating
+      // between normal and compact when compact chips release a little space.
+      const normalSlotWidth = calculateTabSlotWidth(
+        strip.clientWidth,
+        'normal',
+        visibleTabCount,
+        tabStripGroupCount,
+        visibleTabUnitCount,
       )
-      setTabDensity(getTabDensityForSlot(usableForTabs / visibleTabCount))
+      const nextDensity = getTabDensityForSlot(normalSlotWidth)
+      const nextSlotWidth = calculateTabSlotWidth(
+        strip.clientWidth,
+        nextDensity,
+        visibleTabCount,
+        tabStripGroupCount,
+        visibleTabUnitCount,
+      )
+      setTabDensity((current) => current === nextDensity ? current : nextDensity)
+      setTabSlotWidth((current) => (
+        Math.abs(current - nextSlotWidth) < 0.25 ? current : nextSlotWidth
+      ))
     }
 
     measure()
@@ -791,10 +883,23 @@ export default function App() {
     resizeObserver.observe(strip)
     const rail = strip.parentElement
     if (rail) resizeObserver.observe(rail)
-    window.addEventListener('resize', measure)
+    let resizeFrame: number | null = null
+    const handleWindowResize = () => {
+      // A viewport change invalidates FLIP coordinates captured before the resize.
+      pendingTabLayoutRef.current = null
+      tabReorderAnimationsRef.current.forEach((animation) => animation.cancel())
+      tabReorderAnimationsRef.current.clear()
+      if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame)
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = null
+        measure()
+      })
+    }
+    window.addEventListener('resize', handleWindowResize)
     return () => {
       resizeObserver.disconnect()
-      window.removeEventListener('resize', measure)
+      window.removeEventListener('resize', handleWindowResize)
+      if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame)
     }
   }, [collapsedTabGroupCount, siderCollapsed, tabStripGroupCount, visibleTabCount, visibleTabUnitCount])
 
@@ -3183,7 +3288,10 @@ export default function App() {
               data-app-tab-density={tabDensity}
               data-app-tab-count={tabs.length}
               data-app-tab-visible-count={visibleTabCount}
-              style={{ '--app-tab-strip-ideal-width': `${tabStripIdealWidth}px` } as React.CSSProperties}
+              style={{
+                '--app-tab-strip-ideal-width': `${tabStripIdealWidth}px`,
+                '--app-tab-slot-width': `${tabSlotWidth}px`,
+              } as React.CSSProperties}
             >
               <div
                 ref={tabDropIndicatorRef}
@@ -3202,7 +3310,10 @@ export default function App() {
                       data-app-tab-group-id={item.group.id}
                       data-app-tab-group-collapsed={item.group.collapsed ? 'true' : undefined}
                       data-app-tab-group-just-created={justCreatedTabGroupId === item.group.id ? 'true' : undefined}
-                      style={{ '--app-tab-group-color': item.group.color } as React.CSSProperties}
+                      style={{
+                        '--app-tab-group-color': item.group.color,
+                        '--app-tab-group-segment-width': `${getExpandedTabGroupWidth(item.tabs.length, tabSlotWidth, tabDensity)}px`,
+                      } as React.CSSProperties}
                     >
                       <Popover
                         trigger="contextMenu"
