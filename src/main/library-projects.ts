@@ -124,6 +124,29 @@ function normalizeProject(row: ProjectRow): LibraryProject {
   }
 }
 
+function getLibraryProjectById(projectId: string): LibraryProject | null {
+  const row = getDatabase().prepare(
+    `SELECT
+       lp.id,
+       lp.name,
+       lp.description,
+       lp.color,
+       lp.is_default,
+       lp.created_at,
+       lp.updated_at,
+       (
+         SELECT COUNT(*)
+         FROM library_project_documents lpd
+         INNER JOIN documents d ON d.id = lpd.document_id
+         WHERE lpd.project_id = lp.id
+           AND d.import_status != 'deleting'
+       ) AS document_count
+     FROM library_projects lp
+     WHERE lp.id = ?`,
+  ).get(projectId) as ProjectRow | undefined
+  return row ? normalizeProject(row) : null
+}
+
 export function listLibraryProjects(): LibraryProject[] {
   const rows = getDatabase().prepare(
     `SELECT
@@ -170,7 +193,7 @@ export function getActiveLibraryProjectId(): string {
 
 export function getActiveLibraryProject(): LibraryProject {
   const activeId = getActiveLibraryProjectId()
-  const project = listLibraryProjects().find((item) => item.id === activeId)
+  const project = getLibraryProjectById(activeId)
   if (!project) throw new Error('当前文献项目不存在')
   return project
 }
@@ -205,14 +228,21 @@ export function createLibraryProject(payload: CreateLibraryProjectPayload): Libr
     }
   })()
   scheduleDatabaseSave()
-  const project = listLibraryProjects().find((item) => item.id === id)
-  if (!project) throw new Error('文献项目创建失败')
-  return project
+  return {
+    id,
+    name,
+    description,
+    color,
+    is_default: 0,
+    document_count: 0,
+    created_at: now,
+    updated_at: now,
+  }
 }
 
 export function setActiveLibraryProject(projectId: string): LibraryProject {
   const normalizedId = String(projectId || '').trim()
-  const project = listLibraryProjects().find((item) => item.id === normalizedId)
+  const project = getLibraryProjectById(normalizedId)
   if (!project) throw new Error('目标文献项目不存在')
   getDatabase().prepare(
     "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_library_project_id', ?)",

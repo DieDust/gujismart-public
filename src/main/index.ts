@@ -14,7 +14,7 @@ import { importSelectionService } from './import-selections'
 import { shutdownHealthReportWorkers } from './health-report-worker-client'
 import { shutdownSearchIndexWorkers } from './search-index-worker-client'
 import { ensureDisabledMetadataTagBindingsCleared, ensureEnabledMetadataTagBindingsRebuilt } from './metadata-tags'
-import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'
+import { shutdownStartupRecovery } from './startup-recovery'
 import {
   beginStartupPhase,
   logStartupTimingSummary,
@@ -236,16 +236,13 @@ function createWindow(): void {
     markStartupEvent('window-shown', `via=${reason}`)
     showWindowIfNeeded(win)
     batchProcessor.setMainWindow(win)
-    scheduleStartupRecovery()
     scheduleStartupMaintenance()
-    markStartupEvent('startup-recovery-scheduled')
     markStartupEvent('startup-maintenance-scheduled')
     logStartupTimingSummary('window-shown')
   }
 
   mainWindow.on('ready-to-show', () => {
     if (!mainWindow || mainWindow.isDestroyed() || windowShownInitialized) return
-    scheduleStartupRecovery()
     scheduleStartupMaintenance()
     windowShownInitialized = true
     if (windowShowFallbackTimer) {
@@ -257,7 +254,6 @@ function createWindow(): void {
     const win = mainWindow
     showWindowIfNeeded(win)
     batchProcessor.setMainWindow(win)
-    markStartupEvent('startup-recovery-scheduled')
     markStartupEvent('startup-maintenance-scheduled')
     logStartupTimingSummary('window-ready-to-show')
   })

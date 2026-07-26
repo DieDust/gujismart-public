@@ -17,6 +17,7 @@ const startupTiming = readSource('src', 'main', 'startup-timing.ts')
 const metadataReclassifier = readSource('src', 'main', 'metadata-reclassifier.ts')
 const libraryProjectsIpc = readSource('src', 'main', 'ipc', 'library-projects.ts')
 const libraryProjects = readSource('src', 'main', 'library-projects.ts')
+const libraryStateCache = readSource('src', 'main', 'library-state-cache.ts')
 const embeddingIndex = readSource('src', 'main', 'embedding-index.ts')
 const embeddingIpc = readSource('src', 'main', 'ipc', 'embedding.ts')
 function sliceBetween(source, startMarker, endMarker) {
@@ -72,6 +73,16 @@ const setActiveLibraryProjectBody = sliceBetween(
   libraryProjects,
   'export function setActiveLibraryProject(projectId: string)',
   'interface ProjectTagRow',
+)
+const createLibraryProjectBody = sliceBetween(
+  libraryProjects,
+  'export function createLibraryProject(payload: CreateLibraryProjectPayload)',
+  'export function setActiveLibraryProject(projectId: string)',
+)
+const markLibraryStateCacheDirtyBody = sliceBetween(
+  libraryStateCache,
+  'export function markLibraryStateCacheDirty',
+  'return getLibraryStateCache()',
 )
 
 assert(
@@ -135,16 +146,17 @@ assert(
   'Startup recovery should time major sub-phases and emit a completion summary.',
 )
 assert(
-  mainIndex.includes("import { scheduleStartupRecovery, shutdownStartupRecovery } from './startup-recovery'"),
-  'Main process should use scheduled startup recovery, not await recovery before opening the window.',
+  mainIndex.includes("import { shutdownStartupRecovery } from './startup-recovery'")
+    && libraryProjectsIpc.includes("import { scheduleStartupRecovery } from '../startup-recovery'"),
+  'Startup recovery should be owned by the post-project-selection IPC path while shutdown remains coordinated by main.',
 )
 assert(
   !mainIndex.includes('await runStartupRecovery()'),
   'Startup recovery must not be awaited on the app startup path.',
 )
 assert(
-  /ready-to-show[\s\S]{0,160}scheduleStartupRecovery\(\)/.test(mainIndex),
-  'Startup recovery should be scheduled after the window is ready to show.',
+  !/ready-to-show[\s\S]{0,240}scheduleStartupRecovery\(\)/.test(mainIndex),
+  'Startup recovery must not begin while the project-selection gate is still interactive.',
 )
 assert(
   /ready-to-show[\s\S]{0,200}scheduleStartupMaintenance\(\)/.test(mainIndex),
@@ -193,14 +205,22 @@ assert(
   'Startup resource allow-list preloading should be delayed, while project queues must not start before the user selects a project.',
 )
 assert(
-  libraryProjectsIpc.includes('const PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS')
+  libraryProjectsIpc.includes('const PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS = 30_000')
     && setActiveLibraryProjectHandler.includes('scheduleProjectBackgroundResume(event.sender)')
+    && setActiveLibraryProjectHandler.includes('scheduleStartupRecovery()')
+    && !setActiveLibraryProjectHandler.includes('markLibraryStateCacheDirty')
     && !setActiveLibraryProjectHandler.includes('resumeEmbeddingQueueForActiveProject()')
     && !setActiveLibraryProjectHandler.includes('resumePendingImportAutoOcrTasks(event.sender)')
     && projectBackgroundResumeBody.includes('resumeEmbeddingQueueForActiveProject()')
     && projectBackgroundResumeBody.includes('resumePendingImportAutoOcrTasks(sender)')
     && projectBackgroundResumeBody.includes('batchProcessor.resumePendingQueueFromDatabase()'),
   'Project selection must return before vector/OCR/batch queue recovery, then resume only the selected project after an interactive grace.',
+)
+assert(
+  !mainIndex.includes('scheduleStartupRecovery()')
+    && startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 15_000')
+    && (startupRecovery.match(/if \(await startupRecoveryCheckpoint\(\)\) return finishCanceled\(\)/g) || []).length >= 6,
+  'Startup recovery must wait for project selection, then yield between bounded phases after the selected workspace has rendered.',
 )
 assert(
   !embeddingIpc.includes('resumeEmbeddingQueueOnStartup')
@@ -219,6 +239,18 @@ assert(
   'Changing the active project is already durable in WAL and must not schedule an interactive-path checkpoint.',
 )
 assert(
+  !setActiveLibraryProjectBody.includes('listLibraryProjects()')
+    && !createLibraryProjectBody.includes('listLibraryProjects()')
+    && libraryProjects.includes('function getLibraryProjectById(projectId: string)'),
+  'Project selection and creation must not aggregate every project before returning to the selection gate.',
+)
+assert(
+  markLibraryStateCacheDirtyBody.includes('isLargeLibraryForAutomaticMaintenance()')
+    && markLibraryStateCacheDirtyBody.includes('Keeping dirty snapshot on large library')
+    && markLibraryStateCacheDirtyBody.includes('scheduleLibraryStateCacheRefresh()'),
+  'Dirty sidebar snapshots may refresh automatically for small libraries, but large libraries must not start a full count rebuild after project changes.',
+)
+assert(
   ocrIpc.includes('export function resumePendingImportAutoOcrTasks')
     && ocrIpc.includes('startAllResumableImportAutoOcrTasks')
     && ocrIpc.includes('auto-started')
@@ -229,7 +261,7 @@ assert(
   'Import-auto OCR should auto-start after interactive grace with bounded workers so large batches continue after restart.',
 )
 assert(
-  startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 0')
+  startupRecovery.includes('const STARTUP_RECOVERY_DELAY_MS = 15_000')
     && startupRecovery.includes('deferred auto-resume after interactive grace')
     && !/setTimeout\(\(\) => \{[\s\S]{0,260}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery)
     && !/runStartupRecovery[\s\S]{0,4000}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(startupRecovery),
@@ -333,7 +365,9 @@ assert(
 assert(
   /export function scheduleStartupRecovery\(\)[\s\S]{0,160}startupRecoveryCancelRequested = false/.test(startupRecovery)
     && startupRecovery.includes('canceled?: boolean')
-    && startupRecovery.includes('canceled: true'),
+    && startupRecovery.includes('canceled: true')
+    && startupRecovery.includes('startupRecoveryFinishedForSession')
+    && startupRecovery.includes('startupRecoveryRunning || startupRecoveryFinishedForSession'),
   'A fresh scheduled startup recovery should clear stale cancel state and report canceled summaries explicitly.',
 )
 assert(

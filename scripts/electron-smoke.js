@@ -99,6 +99,29 @@ async function clickMenu(window, label) {
   await window.waitForTimeout(700)
 }
 
+async function verifyProjectCreateAndSwitch(window, originalProjectName) {
+  await dismissBlockingModal(window)
+  const switcher = window.locator('.sidebar-project-switcher')
+  await switcher.click()
+  const createProjectItem = window.getByText('\u65b0\u5efa\u6587\u732e\u9879\u76ee', { exact: true })
+  await createProjectItem.last().click()
+
+  const createModal = window.locator('.ant-modal-content').filter({ hasText: '\u65b0\u5efa\u6587\u732e\u9879\u76ee' })
+  const projectName = `Smoke Project ${Date.now()}`
+  await createModal.locator('input').fill(projectName)
+  await createModal.getByText('\u521b\u5efa\u5e76\u8fdb\u5165', { exact: true }).click()
+  await window.waitForFunction((name) => {
+    return (document.querySelector('.sidebar-project-current')?.textContent || '').trim() === name
+  }, projectName, { timeout: 8000 })
+  await createModal.waitFor({ state: 'detached', timeout: 5000 })
+
+  await switcher.click()
+  await window.getByText(originalProjectName, { exact: true }).last().click()
+  await window.waitForFunction((name) => {
+    return (document.querySelector('.sidebar-project-current')?.textContent || '').trim() === name
+  }, originalProjectName, { timeout: 8000 })
+}
+
 async function dismissBlockingModal(window) {
   let attempts = 0
   while (await dismissOneBlockingModal(window)) {
@@ -1697,8 +1720,10 @@ async function run() {
     expectContains(title, '\u6587\u732e\u7ba1\u7406', 'window title')
     const projectChoices = window.locator('[data-library-project-choice="true"]')
     if (await projectChoices.count() > 0) {
+      const originalProjectName = (await projectChoices.first().locator('strong').innerText()).trim()
       await projectChoices.first().click()
       await window.waitForFunction(() => Boolean(document.querySelector('main')), null, { timeout: 8000 })
+      await verifyProjectCreateAndSwitch(window, originalProjectName)
     }
     await verifyMainText(window, LABELS.welcomeTitle)
 

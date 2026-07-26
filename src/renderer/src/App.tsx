@@ -779,8 +779,9 @@ export default function App() {
       setActiveResearchProjectId(null)
       setActiveLibraryProject(activated)
       setWorkspaceProjectId(activated.id)
-      const refreshedProjects = await window.api.listLibraryProjects()
-      setLibraryProjects(refreshedProjects)
+      void window.api.listLibraryProjects()
+        .then((refreshedProjects) => setLibraryProjects(refreshedProjects))
+        .catch((error) => console.warn('[LibraryProjects] Failed to refresh project list after switch', error))
     } catch (error) {
       message.error(`切换文献项目失败：${error instanceof Error ? error.message : String(error)}`)
     } finally {

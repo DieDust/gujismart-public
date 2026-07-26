@@ -49,6 +49,7 @@ interface DocumentFilePathRow {
 let startupRecoveryRunning = false
 let startupRecoveryPromise: Promise<void> | null = null
 let startupRecoveryCancelRequested = false
+let startupRecoveryFinishedForSession = false
 
 const RECOVERABLE_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp'])
 const ORPHAN_STORAGE_CLEANUP_YIELD_INTERVAL = 4
@@ -65,9 +66,9 @@ const STARTUP_IMPORT_REPAIR_MAX_FS_PROBES = 12
 const RESERVED_STORAGE_DIR_NAMES = new Set(['page-payloads'])
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
-// Defer only to the next macrotask so createWindow/ready-to-show can finish first.
-// A multi-second fixed wait made cold start feel ~8s slower without helping large-library UX.
-const STARTUP_RECOVERY_DELAY_MS = 0
+// Project selection is the interactive startup gate. Recovery begins only after
+// selection has completed and the chosen workspace has had time to render.
+const STARTUP_RECOVERY_DELAY_MS = 15_000
 /** Only record event-loop waits that are long enough to matter in diagnostics. */
 const EVENT_LOOP_WAIT_PHASE_THRESHOLD_MS = 50
 
@@ -1058,13 +1059,10 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
 
   try {
 
-  // One short yield so ready-to-show / first paint can land, then run the critical
-  // DB recovery path without intermediate setImmediate yields. Frequent yields were
-  // letting large-library renderer IPC monopolize the main thread for minutes while
-  // "启动恢复（整体）" stayed open and looked like recovery SQL was slow.
+  // Recovery starts after project selection. Yield between bounded phases so
+  // project navigation and renderer IPC remain responsive during repair work.
   if (await startupRecoveryCheckpoint()) return finishCanceled()
 
-  // Critical path: no intermediate setImmediate. Keep sub-phases for diagnostics only.
   {
     const endPhase = beginStartupPhase('startup-recovery.ocr-jobs')
     try {
@@ -1073,6 +1071,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   {
     const endPhase = beginStartupPhase('startup-recovery.reset-interrupted-jobs')
@@ -1087,6 +1086,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   emitStartupRecoveryStatus({
     status: 'processing',
@@ -1101,6 +1101,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
   {
     const endPhase = beginStartupPhase('startup-recovery.interrupted-imports')
     try {
@@ -1109,6 +1110,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   {
     const endPhase = beginStartupPhase('startup-recovery.reconcile-completed-ocr')
@@ -1120,6 +1122,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   emitStartupRecoveryStatus({
     status: 'processing',
@@ -1152,10 +1155,8 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
 
-  // No more checkpoints until recovery is done: yielding here lets first-paint
-  // listDocumentsPage monopolize the main thread for minutes on large libraries,
-  // while "启动恢复（整体）" stays open and looks like recovery is slow.
   emitStartupRecoveryStatus({
     status: 'processing',
     progress: 0.85,
@@ -1172,6 +1173,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
   {
     const endPhase = beginStartupPhase('startup-recovery.orphan-storage')
     try {
@@ -1180,6 +1182,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
 
   emitStartupRecoveryStatus({
     status: 'processing',
@@ -1194,6 +1197,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
       endPhase()
     }
   }
+  if (await startupRecoveryCheckpoint()) return finishCanceled()
   // Count interrupted batch items only. Actual worker start is deferred in main
   // (BATCH_OCR_RESUME_DELAY_MS) so first paint stays responsive; bulk OCR then
   // continues automatically without requiring a manual click.
@@ -1321,7 +1325,7 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
 }
 
 export function scheduleStartupRecovery(): void {
-  if (startupRecoveryRunning) return
+  if (startupRecoveryRunning || startupRecoveryFinishedForSession) return
   startupRecoveryRunning = true
   startupRecoveryCancelRequested = false
   emitStartupRecoveryStatus({
@@ -1349,6 +1353,7 @@ export function scheduleStartupRecovery(): void {
       })
       .finally(() => {
         startupRecoveryRunning = false
+        startupRecoveryFinishedForSession = true
         startupRecoveryPromise = null
         resolve()
       })

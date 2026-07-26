@@ -19,9 +19,10 @@ import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { resumeEmbeddingQueueForActiveProject } from '../embedding-index'
 import { notifySearchContentChanged } from '../semantic-search'
 import { batchProcessor } from '../batch-processor'
+import { scheduleStartupRecovery } from '../startup-recovery'
 import { resumePendingImportAutoOcrTasks } from './ocr'
 
-const PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS = 10_000
+const PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS = 30_000
 let projectBackgroundResumeTimer: ReturnType<typeof setTimeout> | null = null
 
 function scheduleProjectBackgroundResume(sender: WebContents): void {
@@ -70,7 +71,7 @@ export function registerLibraryProjectIpc(): void {
     'libraryProjects:setActive',
     async (event, projectId: string): Promise<LibraryProject> => {
       const project = setActiveLibraryProject(projectId)
-      markLibraryStateCacheDirty([project.id])
+      scheduleStartupRecovery()
       scheduleProjectBackgroundResume(event.sender)
       return project
     },

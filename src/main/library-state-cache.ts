@@ -387,6 +387,12 @@ export function markLibraryStateCacheDirty(projectIds?: string[]): LibraryStateC
     }
   }
   scheduleDatabaseSave()
-  if (scopedProjectIds.includes(activeProjectId)) scheduleLibraryStateCacheRefresh()
+  if (scopedProjectIds.includes(activeProjectId)) {
+    if (isLargeLibraryForAutomaticMaintenance()) {
+      console.log('[LibraryStateCache] Keeping dirty snapshot on large library (no automatic rebuild)')
+    } else {
+      scheduleLibraryStateCacheRefresh()
+    }
+  }
   return getLibraryStateCache()
 }

@@ -37,6 +37,11 @@ assert.ok(
 )
 assert.ok(appSource.includes('选择本次要加载的文献项目'), 'startup must wait for project selection')
 assert.ok(appSource.includes('migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID'), 'legacy workspace must migrate only to the default project')
+assert.ok(
+  appSource.includes('void window.api.listLibraryProjects()')
+    && !appSource.includes('const refreshedProjects = await window.api.listLibraryProjects()'),
+  'project selection should enter the selected workspace before refreshing project counts in the background',
+)
 assert.ok(libraryViewSource.includes("key: 'move_project'"), 'library batch menu must expose project transfer')
 assert.ok(libraryViewSource.includes("key: 'context_move_project'"), 'document context menu must expose project transfer directly')
 assert.ok(libraryViewSource.includes("key: 'link_project'"), 'library batch menu must expose synchronized project linking')
@@ -433,6 +438,39 @@ async function run() {
       )
     })
     assert.strictEqual(modules.projects.getActiveLibraryProjectId(), secondProject.id)
+
+    const largeProject = modules.projects.createLibraryProject({ name: 'Large selection project', activate: false })
+    const sqlite = database.getDatabase()
+    const insertLargeDocument = sqlite.prepare(
+      `INSERT INTO documents
+       (id, library_project_id, title, import_status, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, 'processed', '{}', ?, ?)`,
+    )
+    sqlite.transaction(() => {
+      for (let index = 0; index < 20_000; index += 1) {
+        const id = `large_project_doc_${index}`
+        insertLargeDocument.run(id, largeProject.id, `Large project document ${index}`, timestamp, timestamp)
+      }
+    })()
+    const selectionStartedAt = Date.now()
+    const selectedLargeProject = modules.projects.setActiveLibraryProject(largeProject.id)
+    const selectionDurationMs = Date.now() - selectionStartedAt
+    assert.strictEqual(selectedLargeProject.document_count, 20_000)
+    assert.ok(
+      selectionDurationMs < 1_500,
+      `large project selection should stay bounded, took ${selectionDurationMs}ms`,
+    )
+    const creationStartedAt = Date.now()
+    const emptyProject = modules.projects.createLibraryProject({ name: 'Fast empty project', activate: true })
+    const creationDurationMs = Date.now() - creationStartedAt
+    assert.strictEqual(emptyProject.document_count, 0)
+    assert.ok(
+      creationDurationMs < 1_500,
+      `empty project creation should not aggregate the large library, took ${creationDurationMs}ms`,
+    )
+    console.log(
+      `Large project responsiveness: select=${selectionDurationMs}ms create=${creationDurationMs}ms documents=20000`,
+    )
     assert.deepStrictEqual(database.queryAll('PRAGMA foreign_key_check'), [], 'project migration must preserve foreign keys')
 
     console.log('Library project migration, isolation, workspace, transfer, and copy regression passed.')
