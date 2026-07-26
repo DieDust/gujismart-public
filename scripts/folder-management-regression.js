@@ -66,7 +66,7 @@ assertIncludes(foldersIpc, 'function reorderFolderSiblings', 'folder move should
 assertIncludes(foldersIpc, 'markLibraryStateCacheDirty()', 'folder move should invalidate cached library state')
 assertIncludes(foldersIpc, 'function buildFolderOverview', 'main process should build folder overview in one backend path')
 assertIncludes(foldersIpc, 'COUNT(DISTINCT df.doc_id)', 'folder overview should use SQL aggregation for document counts')
-assertIncludes(foldersIpc, 'buildCumulativeFolderDocumentCounts()', 'folder overview should use cumulative document counts')
+assertIncludes(foldersIpc, 'buildCumulativeFolderDocumentCounts(activeProjectId)', 'folder overview should use project-scoped cumulative document counts')
 assertIncludes(foldersIpc, 'recent_documents: collectRecentDocuments(folder.id)', 'folder overview should include recent document previews')
 assertIncludes(foldersIpc, 'function getFolderContent', 'main process should expose current-level folder content')
 assertIncludes(foldersIpc, 'if (!normalizedFolderId && !unfiledOnly)', 'root folder content should not load unfiled documents implicitly')

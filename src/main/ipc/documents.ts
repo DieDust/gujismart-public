@@ -46,6 +46,12 @@ import { FileCapabilityError, fileCapabilityService } from '../file-capabilities
 import { cancelLegacyImportQueueTasks, registerLegacyImportQueueState } from '../task-import-compat'
 import { attachCanonicalPageContent } from '../canonical-content'
 import { importSelectionService } from '../import-selections'
+import {
+  assertDocumentInLibraryProject,
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
 import { normalizeHistoryDocType } from '../../shared/history-citation'
 import { getErrorMessage } from '../../shared/errors'
@@ -127,6 +133,7 @@ import type {
   TranslationStyle,
   TranslationMode,
 } from '../../shared/types'
+import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
 
 type JsonRecord = Record<string, unknown>
 const LIBRARY_IMPORT_QUEUE_STATE_ID = 'default'
@@ -945,8 +952,16 @@ function normalizeLibraryImportQueueState(value: unknown): LibraryImportQueueSta
         : filePaths.map((filePath) => basename(filePath))
       const pendingCount = Math.max(0, Math.floor(Number(job.pendingCount ?? filePaths.length) || 0))
       if (pendingCount === 0 && sourceLabels.length === 0) return null
+      const requestedProjectId = String(job.libraryProjectId || '').trim()
+      const libraryProjectId = requestedProjectId && queryOne(
+        'SELECT 1 FROM library_projects WHERE id = ?',
+        [requestedProjectId],
+      )
+        ? requestedProjectId
+        : DEFAULT_LIBRARY_PROJECT_ID
       return {
         id: Number(job.id || 0) || Date.now(),
+        libraryProjectId,
         selectionId: null,
         sourceLabels,
         pendingCount,
@@ -2794,10 +2809,16 @@ function buildPageContentAvailableCondition(alias = 'p'): string {
   )`
 }
 
-/** List/open-path only: never touch ocr_text/proofed_text/ocr_result bodies (full row loads freeze large libraries). */
+/**
+ * List/open-path only: avoid TRIM/JSON parsing over OCR payload bodies.
+ * Direct non-empty checks preserve legacy inline text without scanning every
+ * character, while ref/status columns cover externalized payloads.
+ */
 function buildPageContentAvailableConditionStatusOnly(alias = 'p'): string {
   return `(
     COALESCE(${alias}.ocr_status, '') = 'completed'
+    OR COALESCE(${alias}.proofed_text, '') <> ''
+    OR COALESCE(${alias}.ocr_text, '') <> ''
     OR COALESCE(${alias}.proofed_text_ref, '') <> ''
     OR COALESCE(${alias}.ocr_text_ref, '') <> ''
     OR COALESCE(${alias}.ocr_result_ref, '') <> ''
@@ -2876,8 +2897,8 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
         0 as search_segment_count
       FROM documents d`
 
-  const params: unknown[] = []
-  const conditions: string[] = []
+  const params: unknown[] = [getActiveLibraryProjectId()]
+  const conditions: string[] = ['d.library_project_id = ?']
 
   if (requestedFolderIds.length > 0 && scopedFolderIds.length === 0) {
     conditions.push('1 = 0')
@@ -3698,7 +3719,7 @@ function buildDocumentHealthRow(doc: DocumentHealthSourceRow): DocumentHealthRow
   }
 }
 
-function getDocumentHealthReport(): DocumentHealthReport {
+function getDocumentHealthReport(libraryProjectId = getActiveLibraryProjectId()): DocumentHealthReport {
   const docs = queryAll<DocumentHealthSourceRow>(
     `SELECT
       d.*,
@@ -3708,7 +3729,9 @@ function getDocumentHealthReport(): DocumentHealthReport {
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
       (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
       (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count
-    FROM documents d`,
+    FROM documents d
+    WHERE d.library_project_id = ?`,
+    [libraryProjectId],
   )
   const rows = docs
     .map(buildDocumentHealthRow)
@@ -3718,7 +3741,10 @@ function getDocumentHealthReport(): DocumentHealthReport {
     `SELECT
       COUNT(*) as total_pages,
       SUM(CASE WHEN ${buildPageContentAvailableCondition('pages')} THEN 1 ELSE 0 END) as text_pages
-    FROM pages`,
+    FROM pages
+    INNER JOIN documents d ON d.id = pages.doc_id
+    WHERE d.library_project_id = ?`,
+    [libraryProjectId],
   )
 
   return {
@@ -3728,11 +3754,23 @@ function getDocumentHealthReport(): DocumentHealthReport {
       totalPages: rows.reduce((sum, row) => sum + row.page_count, 0),
       pageRows: Number(pageStats?.total_pages || 0),
       textPages: Number(pageStats?.text_pages || 0),
-      segments: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM search_index_segments')?.count || 0),
+      segments: Number(queryOne<{ count: number }>(
+        `SELECT COUNT(*) as count
+         FROM search_index_segments sis
+         INNER JOIN documents d ON d.id = sis.doc_id
+         WHERE d.library_project_id = ?`,
+        [libraryProjectId],
+      )?.count || 0),
       tags: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM tags')?.count || 0),
       folders: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM folders')?.count || 0),
       researchProjects: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM research_projects')?.count || 0),
-      researchNotes: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM research_notes')?.count || 0),
+      researchNotes: Number(queryOne<{ count: number }>(
+        `SELECT COUNT(*) as count
+         FROM research_notes rn
+         INNER JOIN documents d ON d.id = rn.doc_id
+         WHERE d.library_project_id = ?`,
+        [libraryProjectId],
+      )?.count || 0),
       missingAuthor: countIssue('missing_author'),
       missingYear: countIssue('missing_year'),
       missingIdentifier: countIssue('missing_identifier'),
@@ -3774,7 +3812,7 @@ function createEmptyDocumentHealthReport(): DocumentHealthReport {
   }
 }
 
-let cachedDocumentHealthReport: DocumentHealthReport | null = null
+const cachedDocumentHealthReports = new Map<string, DocumentHealthReport>()
 let healthReportRefreshRunning = false
 let healthReportRefreshPending = false
 
@@ -3816,9 +3854,9 @@ function getDocumentListOcrPageSummaries(docIds: string[]): Map<string, Document
       `SELECT
          doc_id,
          COUNT(*) as total,
-         SUM(CASE WHEN ocr_status = 'completed' AND ${contentOk} THEN 1 ELSE 0 END) as completed,
+         SUM(CASE WHEN COALESCE(ocr_status, '') <> 'error' AND ${contentOk} THEN 1 ELSE 0 END) as completed,
          SUM(CASE WHEN ocr_status = 'error' THEN 1 ELSE 0 END) as failed,
-         SUM(CASE WHEN ocr_status IS NULL OR ocr_status IN ('pending', 'queued', 'processing') OR (ocr_status = 'completed' AND NOT (${contentOk})) THEN 1 ELSE 0 END) as pending
+         SUM(CASE WHEN COALESCE(ocr_status, '') <> 'error' AND NOT (${contentOk}) THEN 1 ELSE 0 END) as pending
        FROM pages
        WHERE doc_id IN (${placeholders})
        GROUP BY doc_id`,
@@ -3898,13 +3936,94 @@ function getDocumentListOcrReviewMessage(doc: DocumentListItem): string {
 }
 
 function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): DocumentListItem[] {
-  // List path: never scan pages or rewrite statuses here.
-  // First-paint freezes came from pages-table scans / body text during list attach.
-  // Status promotion belongs to OCR completion and dedicated maintenance paths.
-  return documents
+  // Keep the common completed path free of page-table work. Only inconsistent
+  // rows on the current (bounded) list page need a compact status/ref summary;
+  // OCR payloads are not trimmed/parsed and filesystem paths are never probed.
+  const candidates = documents.filter((doc) => (
+    doc.ocr_status !== 'completed'
+    || doc.import_status !== 'processed'
+    || !!doc.error_message
+  ))
+  if (candidates.length === 0) return documents
+
+  const summaries = getDocumentListOcrPageSummaries(candidates.map((doc) => doc.id))
+  const changedDocIds: string[] = []
+  const reviewMessagesByDocId = new Map<string, string>()
+  const normalized = documents.map((doc) => {
+    const summary = summaries.get(doc.id)
+    if (!summary) return doc
+
+    const actualPageCount = Math.max(Number(doc.actual_page_count || 0), summary.total)
+    const pageCount = Math.max(Number(doc.page_count || 0), actualPageCount)
+    const withPageStats: DocumentListItem = {
+      ...doc,
+      actual_page_count: actualPageCount,
+      page_count: pageCount,
+      text_page_count: summary.completed,
+      ocr_completed_page_count: summary.completed,
+    }
+    const allPagesHaveText = pageCount > 0
+      && summary.failed === 0
+      && summary.pending === 0
+      && summary.completed >= pageCount
+
+    if (allPagesHaveText) {
+      if (doc.ocr_status === 'completed' && doc.import_status === 'processed' && !doc.error_message) {
+        return withPageStats
+      }
+      changedDocIds.push(doc.id)
+      return {
+        ...withPageStats,
+        ocr_status: 'completed',
+        import_status: 'processed',
+        error_message: null,
+      }
+    }
+
+    if (isDocumentListOcrSettledWithReviewPages(withPageStats, summary)) {
+      const reviewMessage = getDocumentListOcrReviewMessage(withPageStats)
+      reviewMessagesByDocId.set(doc.id, reviewMessage)
+      return {
+        ...withPageStats,
+        ocr_status: 'completed',
+        import_status: 'processed',
+        error_message: reviewMessage,
+      }
+    }
+
+    return withPageStats
+  })
+
+  if (changedDocIds.length > 0 || reviewMessagesByDocId.size > 0) {
+    const now = new Date().toISOString()
+    try {
+      runForIdChunks(changedDocIds, (chunkIds, placeholders) => {
+        run(
+          `UPDATE documents
+           SET ocr_status = ?, import_status = ?, error_message = NULL, updated_at = ?
+           WHERE id IN (${placeholders})`,
+          ['completed', 'processed', now, ...chunkIds],
+        )
+      })
+      transaction(() => {
+        reviewMessagesByDocId.forEach((reviewMessage, docId) => {
+          run(
+            'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = ?, updated_at = ? WHERE id = ?',
+            ['completed', 'processed', reviewMessage.slice(0, 1000), now, docId],
+          )
+        })
+      })
+      markLibraryStateCacheDirty()
+      scheduleDatabaseSave()
+    } catch (error) {
+      console.warn('[Documents] Failed to persist normalized OCR status; using page-derived status for this list response', error)
+    }
+  }
+
+  return normalized
 }
 
-function scheduleDocumentHealthReportRefresh(): void {
+function scheduleDocumentHealthReportRefresh(projectId = getActiveLibraryProjectId()): void {
   if (healthReportRefreshRunning) {
     healthReportRefreshPending = true
     emitHealthReportTaskStatus({
@@ -3928,9 +4047,10 @@ function scheduleDocumentHealthReportRefresh(): void {
         progress: 0.1,
         message: '正在后台刷新健康统计，不影响阅读和浏览',
       })
-      cachedDocumentHealthReport = isHealthReportWorkerAvailable()
-        ? await runHealthReportWorkerTask({ dbFilePath: getDatabaseFilePath() })
-        : getDocumentHealthReport()
+      const report = isHealthReportWorkerAvailable()
+        ? await runHealthReportWorkerTask({ dbFilePath: getDatabaseFilePath(), libraryProjectId: projectId })
+        : getDocumentHealthReport(projectId)
+      cachedDocumentHealthReports.set(projectId, report)
       emitHealthReportTaskStatus({
         status: 'completed',
         progress: 1,
@@ -3958,18 +4078,21 @@ function scheduleDocumentHealthReportRefresh(): void {
 }
 
 async function getCachedDocumentHealthReport(options?: DocumentHealthReportOptions): Promise<DocumentHealthReport> {
+  const projectId = getActiveLibraryProjectId()
+  let cachedDocumentHealthReport = cachedDocumentHealthReports.get(projectId)
   if (!cachedDocumentHealthReport) {
     cachedDocumentHealthReport = isHealthReportWorkerAvailable()
-      ? await runHealthReportWorkerTask({ dbFilePath: getDatabaseFilePath() })
-      : getDocumentHealthReport()
+      ? await runHealthReportWorkerTask({ dbFilePath: getDatabaseFilePath(), libraryProjectId: projectId })
+      : getDocumentHealthReport(projectId)
+    cachedDocumentHealthReports.set(projectId, cachedDocumentHealthReport)
     if (options?.refresh === true) {
-      scheduleDocumentHealthReportRefresh()
+      scheduleDocumentHealthReportRefresh(projectId)
     }
     return cachedDocumentHealthReport
   }
 
   if (options?.refresh !== false) {
-    scheduleDocumentHealthReportRefresh()
+    scheduleDocumentHealthReportRefresh(projectId)
   }
   return cachedDocumentHealthReport
 }
@@ -4039,7 +4162,9 @@ export function registerDocumentIpc(): void {
     return getPdfInfo(safePath)
   })
 
-  ipcMain.handle('documents:import', (event, grantIds: string[], options?: ImportDocumentOptions) => trackDocumentImportJob(async () => {
+  ipcMain.handle('documents:import', (event, grantIds: string[], options?: ImportDocumentOptions) => trackDocumentImportJob(
+    () => withLibraryProjectContext(captureActiveLibraryProjectId(options?.libraryProjectId), async () => {
+    const libraryProjectId = getActiveLibraryProjectId()
     const lease = await fileCapabilityService.beginFileBatch(
       event.sender.id,
       grantIds,
@@ -4081,15 +4206,16 @@ export function registerDocumentIpc(): void {
         if (isPdfFile) {
           const sourceStats = await stat(filePath)
           const possibleDuplicate = queryOne<{ id: string }>(
-            `SELECT id
-             FROM documents
-             WHERE COALESCE(import_status, '') <> 'deleting'
+             `SELECT id
+              FROM documents
+              WHERE library_project_id = ?
+                AND COALESCE(import_status, '') <> 'deleting'
                AND (
                  json_extract(metadata, '$.pdf_size_bytes') = ?
                  OR json_extract(metadata, '$.pdf_original_size_bytes') = ?
                )
              LIMIT 1`,
-            [sourceStats.size, sourceStats.size],
+            [libraryProjectId, sourceStats.size, sourceStats.size],
           )
           if (possibleDuplicate?.id) {
             pdfFingerprint = await getPdfFingerprintAsync(filePath, ({ bytesDone, totalBytes }) => {
@@ -4111,13 +4237,14 @@ export function registerDocumentIpc(): void {
         if (pdfFingerprint) {
           pdfDuplicateChecked = true
           const existing = queryOne<ExistingPdfImportRow>(
-            `SELECT id, title, file_path, metadata
-             FROM documents
-             WHERE json_extract(metadata, '$.pdf_sha256') = ?
+             `SELECT id, title, file_path, metadata
+              FROM documents
+              WHERE library_project_id = ?
+                AND json_extract(metadata, '$.pdf_sha256') = ?
                AND COALESCE(import_status, '') <> 'deleting'
              ORDER BY updated_at DESC
              LIMIT 1`,
-            [pdfFingerprint.sha256],
+            [libraryProjectId, pdfFingerprint.sha256],
           )
           if (existing?.id) {
             const existingPdfPath = resolveManagedStoragePath(existing.file_path, existing.id)
@@ -4169,11 +4296,11 @@ export function registerDocumentIpc(): void {
 
           run(
             `INSERT INTO documents (
-              id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
+              id, library_project_id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
               ocr_status, proof_status, import_status, is_favorite, favorite_at, read_status,
               rating, last_opened_at, metadata_status, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [id, docTitle, rawRecord.author || null, rawRecord.dynasty || null, rawRecord.source || 'Paddle OCR JSON', rawRecord.doc_type || 'unknown', null, null, pages.length, 'processing', 'pending', 'processing', 0, null, 'unread', null, null, 'pending', JSON.stringify(metadata), now, now]
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [id, libraryProjectId, docTitle, rawRecord.author || null, rawRecord.dynasty || null, rawRecord.source || 'Paddle OCR JSON', rawRecord.doc_type || 'unknown', null, null, pages.length, 'processing', 'pending', 'processing', 0, null, 'unread', null, null, 'pending', JSON.stringify(metadata), now, now]
           )
 
           for (let index = 0; index < pages.length; index += DOCUMENT_DB_INSERT_CHUNK_SIZE) {
@@ -4252,12 +4379,13 @@ export function registerDocumentIpc(): void {
 
           run(
             `INSERT INTO documents (
-              id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
+              id, library_project_id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
               ocr_status, proof_status, import_status, is_favorite, favorite_at, read_status,
               rating, last_opened_at, metadata_status, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               id,
+              libraryProjectId,
               parsedEbook.title || title,
               parsedEbook.author,
               null,
@@ -4319,11 +4447,12 @@ export function registerDocumentIpc(): void {
             const existing = queryOne<ExistingPdfImportRow>(
               `SELECT id, title, file_path, metadata
                FROM documents
-               WHERE json_extract(metadata, '$.pdf_sha256') = ?
+               WHERE library_project_id = ?
+                 AND json_extract(metadata, '$.pdf_sha256') = ?
                  AND COALESCE(import_status, '') <> 'deleting'
                ORDER BY updated_at DESC
                LIMIT 1`,
-              [pdfFingerprint.sha256],
+              [libraryProjectId, pdfFingerprint.sha256],
             )
             if (existing?.id) {
               const existingPdfPath = resolveManagedStoragePath(existing.file_path, existing.id)
@@ -4412,12 +4541,13 @@ export function registerDocumentIpc(): void {
 
         run(
           `INSERT INTO documents (
-            id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
+            id, library_project_id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
             ocr_status, proof_status, import_status, is_favorite, favorite_at, read_status,
             rating, last_opened_at, metadata_status, metadata, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
+            libraryProjectId,
             title,
             null,
             null,
@@ -4522,7 +4652,7 @@ export function registerDocumentIpc(): void {
         }
       }
     }
-  }))
+  })))
 
   ipcMain.handle('documents:list', async (_event, options?: ListDocumentOptions): Promise<DocumentListItem[]> => {
     const { sql, params } = buildDocumentListQuery(options)
@@ -4536,6 +4666,7 @@ export function registerDocumentIpc(): void {
   // Design: page_count / ocr_status live on documents after import/OCR.
   // Filter UIs only need metadata — never scan pages or probe the filesystem.
   ipcMain.handle('documents:listFilterOptions', async () => {
+    const activeProjectId = getActiveLibraryProjectId()
     return queryAll<{
       id: string
       title: string | null
@@ -4546,8 +4677,10 @@ export function registerDocumentIpc(): void {
     }>(
       `SELECT id, title, author, doc_type, page_count, ocr_status
        FROM documents
-       WHERE COALESCE(import_status, '') <> 'deleting'
+       WHERE library_project_id = ?
+         AND COALESCE(import_status, '') <> 'deleting'
        ORDER BY updated_at DESC, created_at DESC`,
+      [activeProjectId],
     )
   })
 
@@ -4556,7 +4689,10 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:get', async (_event, id: string): Promise<DocumentDetail | null> => {
-    const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [id])
+    const doc = queryOne<Document>(
+      'SELECT * FROM documents WHERE id = ? AND library_project_id = ?',
+      [id, getActiveLibraryProjectId()],
+    )
     if (!doc) return null
 
     run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?', [new Date().toISOString(), id])
@@ -4592,7 +4728,10 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:getLight', async (_event, id: string): Promise<DocumentLightDetail | null> => {
-    const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [id])
+    const doc = queryOne<Document>(
+      'SELECT * FROM documents WHERE id = ? AND library_project_id = ?',
+      [id, getActiveLibraryProjectId()],
+    )
     if (!doc) return null
 
     run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?', [new Date().toISOString(), id])
@@ -4817,7 +4956,11 @@ export function registerDocumentIpc(): void {
 
   ipcMain.handle('documents:update', async (_event, id: string, data: DocumentUpdatePayload) => {
     rejectProtectedPathFields(data, ['file_path', 'thumb_path'])
-    const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [id])
+    const libraryProjectId = getActiveLibraryProjectId()
+    const doc = queryOne<Document>(
+      'SELECT * FROM documents WHERE id = ? AND library_project_id = ?',
+      [id, libraryProjectId],
+    )
     if (!doc) return false
 
     const allowedFields: Array<keyof DocumentUpdatePayload> = [
@@ -4861,8 +5004,8 @@ export function registerDocumentIpc(): void {
     if (sets.length === 0) return false
 
     sets.push('updated_at = ?')
-    params.push(new Date().toISOString(), id)
-    run(`UPDATE documents SET ${sets.join(', ')} WHERE id = ?`, params)
+    params.push(new Date().toISOString(), id, libraryProjectId)
+    run(`UPDATE documents SET ${sets.join(', ')} WHERE id = ? AND library_project_id = ?`, params)
     if (
       'metadata' in data
       || 'doc_type' in data
@@ -4884,12 +5027,16 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:toggleFavorite', async (_event, id: string, nextValue?: boolean) => {
-    const doc = queryOne<{ is_favorite: number }>('SELECT is_favorite FROM documents WHERE id = ?', [id])
+    const libraryProjectId = getActiveLibraryProjectId()
+    const doc = queryOne<{ is_favorite: number }>(
+      'SELECT is_favorite FROM documents WHERE id = ? AND library_project_id = ?',
+      [id, libraryProjectId],
+    )
     if (!doc) return false
     const isFavorite = typeof nextValue === 'boolean' ? nextValue : doc.is_favorite !== 1
     run(
-      'UPDATE documents SET is_favorite = ?, favorite_at = ?, updated_at = ? WHERE id = ?',
-      [isFavorite ? 1 : 0, isFavorite ? new Date().toISOString() : null, new Date().toISOString(), id]
+      'UPDATE documents SET is_favorite = ?, favorite_at = ?, updated_at = ? WHERE id = ? AND library_project_id = ?',
+      [isFavorite ? 1 : 0, isFavorite ? new Date().toISOString() : null, new Date().toISOString(), id, libraryProjectId]
     )
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()
@@ -4897,14 +5044,24 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:setReadStatus', async (_event, id: string, readStatus: ReadStatus): Promise<boolean> => {
-    run('UPDATE documents SET read_status = ?, updated_at = ? WHERE id = ?', [readStatus, new Date().toISOString(), id])
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentInLibraryProject(id, libraryProjectId)
+    run(
+      'UPDATE documents SET read_status = ?, updated_at = ? WHERE id = ? AND library_project_id = ?',
+      [readStatus, new Date().toISOString(), id, libraryProjectId],
+    )
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()
     return true
   })
 
   ipcMain.handle('documents:setRating', async (_event, id: string, rating: number | null) => {
-    run('UPDATE documents SET rating = ?, updated_at = ? WHERE id = ?', [rating, new Date().toISOString(), id])
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentInLibraryProject(id, libraryProjectId)
+    run(
+      'UPDATE documents SET rating = ?, updated_at = ? WHERE id = ? AND library_project_id = ?',
+      [rating, new Date().toISOString(), id, libraryProjectId],
+    )
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()
     return true
@@ -5255,8 +5412,10 @@ export function registerDocumentIpc(): void {
   ipcMain.handle('documents:deleteZeroPage', async (): Promise<DeleteDocumentsResult> => {
     const rows = queryAll<{ id: string }>(
       `SELECT id FROM documents
-       WHERE COALESCE(page_count, 0) <= 0
+       WHERE library_project_id = ?
+         AND COALESCE(page_count, 0) <= 0
          AND COALESCE(import_status, '') <> 'deleting'`,
+      [getActiveLibraryProjectId()],
     )
     return deleteDocumentsByIds(rows.map((row) => row.id))
   })

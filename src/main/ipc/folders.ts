@@ -23,6 +23,12 @@ import { getLibraryStateCache, markLibraryStateCacheDirty } from '../library-sta
 import { buildCumulativeFolderDocumentCounts, resolveFolderAndDescendantIds } from '../folder-scope'
 import { allowManagedFileAccessPaths } from '../file-access'
 import { importSelectionService } from '../import-selections'
+import {
+  assertDocumentIdsInLibraryProject,
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 import { scanCanonicalExternalFolder } from '../external-folder-boundary'
 
 const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
@@ -73,7 +79,10 @@ function listFoldersWithCounts(): Folder[] {
   // are refreshed in the background after open.
   const cache = getLibraryStateCache()
   const counts = cache.folderDocumentCounts || {}
-  return queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order, created_at')
+  return queryAll<Folder>(
+    'SELECT * FROM folders WHERE library_project_id = ? ORDER BY sort_order, created_at',
+    [getActiveLibraryProjectId()],
+  )
     .map((folder) => ({ ...folder, document_count: counts[folder.id] || 0 }))
 }
 
@@ -86,12 +95,13 @@ function findFolderByNameInParent(name: string, parentId: string | null, exclude
     : [normalizedName, ...(excludeId ? [excludeId] : [])]
   return queryOne<Folder>(
     `SELECT * FROM folders
-     WHERE name = ?
+     WHERE library_project_id = ?
+       AND name = ?
        AND parent_id ${parentId ? '= ?' : 'IS NULL'}
        ${excludeSql}
      ORDER BY updated_at DESC, created_at DESC
      LIMIT 1`,
-    params,
+    [getActiveLibraryProjectId(), ...params],
   )
 }
 
@@ -119,8 +129,15 @@ function updateExistingFolderMetadata(folder: Folder, data: FolderCreatePayload 
 function mergeFolderContentsInto(sourceId: string, targetId: string, data: FolderUpdatePayload, now: string, visited = new Set<string>()): void {
   if (!sourceId || !targetId || sourceId === targetId || visited.has(sourceId)) return
   visited.add(sourceId)
-  const source = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [sourceId])
-  const target = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [targetId])
+  const libraryProjectId = getActiveLibraryProjectId()
+  const source = queryOne<Folder>(
+    'SELECT * FROM folders WHERE id = ? AND library_project_id = ?',
+    [sourceId, libraryProjectId],
+  )
+  const target = queryOne<Folder>(
+    'SELECT * FROM folders WHERE id = ? AND library_project_id = ?',
+    [targetId, libraryProjectId],
+  )
   if (!source || !target) return
 
   run(
@@ -130,7 +147,10 @@ function mergeFolderContentsInto(sourceId: string, targetId: string, data: Folde
   )
   run('DELETE FROM document_folders WHERE folder_id = ?', [sourceId])
 
-  const children = queryAll<Folder>('SELECT * FROM folders WHERE parent_id = ? ORDER BY sort_order, created_at', [sourceId])
+  const children = queryAll<Folder>(
+    'SELECT * FROM folders WHERE parent_id = ? AND library_project_id = ? ORDER BY sort_order, created_at',
+    [sourceId, libraryProjectId],
+  )
   for (const child of children) {
     const existingChild = findFolderByNameInParent(child.name, targetId, child.id)
     if (existingChild) {
@@ -181,7 +201,10 @@ function getFolderChildrenMap(folders: Array<Pick<Folder, 'id' | 'parent_id'>>):
 function assertFolderParentAllowed(folderId: string | null, nextParentId: string | null): void {
   if (!nextParentId) return
   if (folderId && nextParentId === folderId) throw new Error('不能把文件夹移动到自己里面')
-  const parent = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [nextParentId])
+  const parent = queryOne<Pick<Folder, 'id'>>(
+    'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+    [nextParentId, getActiveLibraryProjectId()],
+  )
   if (!parent) throw new Error('目标文件夹不存在')
   if (folderId) {
     const descendants = new Set(resolveFolderAndDescendantIds([folderId]))
@@ -190,7 +213,10 @@ function assertFolderParentAllowed(folderId: string | null, nextParentId: string
 }
 
 function assertFolderMoveAllowed(folderId: string, nextParentId: string | null): Folder {
-  const current = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
+  const current = queryOne<Folder>(
+    'SELECT * FROM folders WHERE id = ? AND library_project_id = ?',
+    [folderId, getActiveLibraryProjectId()],
+  )
   if (!current) throw new Error('文件夹不存在')
   assertFolderParentAllowed(folderId, nextParentId)
 
@@ -202,8 +228,10 @@ function assertFolderMoveAllowed(folderId: string, nextParentId: string | null):
 function reorderFolderSiblings(folderId: string, nextParentId: string | null, beforeId?: string | null, afterId?: string | null): void {
   const parentWhere = folderParentWhere(nextParentId)
   const siblings = queryAll<Folder>(
-    `SELECT * FROM folders WHERE ${parentWhere.sql} ORDER BY sort_order ASC, created_at ASC`,
-    parentWhere.params,
+    `SELECT * FROM folders
+     WHERE library_project_id = ? AND ${parentWhere.sql}
+     ORDER BY sort_order ASC, created_at ASC`,
+    [getActiveLibraryProjectId(), ...parentWhere.params],
   ).filter((folder) => folder.id !== folderId)
 
   let insertIndex = siblings.length
@@ -324,16 +352,22 @@ function buildFolderContentOrderBy(options: Pick<NormalizedFolderContentOptions,
 }
 
 function buildFolderOverview(): FolderOverviewResult {
-  const folders = queryAll<Folder>('SELECT * FROM folders ORDER BY sort_order ASC, created_at ASC')
-  const cumulativeCounts = buildCumulativeFolderDocumentCounts()
+  const activeProjectId = getActiveLibraryProjectId()
+  const folders = queryAll<Folder>(
+    'SELECT * FROM folders WHERE library_project_id = ? ORDER BY sort_order ASC, created_at ASC',
+    [activeProjectId],
+  )
+  const cumulativeCounts = buildCumulativeFolderDocumentCounts(activeProjectId)
   const childrenByParent = getFolderChildrenMap(folders)
   const directCounts = new Map<string, number>()
   queryAll<FolderDirectCountRow>(
     `SELECT df.folder_id, COUNT(DISTINCT df.doc_id) as count
      FROM document_folders df
      INNER JOIN documents d ON d.id = df.doc_id
-     WHERE COALESCE(d.import_status, '') <> 'deleting'
+     WHERE d.library_project_id = ?
+       AND COALESCE(d.import_status, '') <> 'deleting'
      GROUP BY df.folder_id`,
+    [activeProjectId],
   ).forEach((row) => {
     directCounts.set(row.folder_id, Number(row.count || 0))
   })
@@ -362,8 +396,10 @@ function buildFolderOverview(): FolderOverviewResult {
        ) as first_page_image_path
      FROM document_folders df
      INNER JOIN documents d ON d.id = df.doc_id
-     WHERE COALESCE(d.import_status, '') <> 'deleting'
+     WHERE d.library_project_id = ?
+       AND COALESCE(d.import_status, '') <> 'deleting'
      ORDER BY COALESCE(d.updated_at, d.created_at, '') DESC, d.title ASC`,
+    [activeProjectId],
   ).forEach((row) => {
     const current = directDocsByFolder.get(row.folder_id) || []
     current.push({
@@ -411,13 +447,16 @@ function buildFolderOverview(): FolderOverviewResult {
   }))
 
   const totalDocumentCount = Number(queryOne<{ count: number }>(
-    "SELECT COUNT(*) as count FROM documents WHERE COALESCE(import_status, '') <> 'deleting'",
+    "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND COALESCE(import_status, '') <> 'deleting'",
+    [activeProjectId],
   )?.count || 0)
   const unfiledDocumentCount = Number(queryOne<{ count: number }>(
     `SELECT COUNT(*) as count
      FROM documents d
-     WHERE COALESCE(d.import_status, '') <> 'deleting'
+     WHERE d.library_project_id = ?
+       AND COALESCE(d.import_status, '') <> 'deleting'
        AND NOT EXISTS (SELECT 1 FROM document_folders df WHERE df.doc_id = d.id)`,
+    [activeProjectId],
   )?.count || 0)
 
   return {
@@ -476,7 +515,10 @@ function getFolderContent(options?: FolderContentOptions | string | null): Folde
     }
   }
   if (normalizedFolderId) {
-    const folder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [normalizedFolderId])
+    const folder = queryOne<Pick<Folder, 'id'>>(
+      'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+      [normalizedFolderId, getActiveLibraryProjectId()],
+    )
     if (!folder) {
       return {
         folder_id: normalizedFolderId,
@@ -513,8 +555,8 @@ function getFolderContent(options?: FolderContentOptions | string | null): Folde
     FROM documents d
     ${normalizedFolderId ? 'INNER JOIN document_folders df ON d.id = df.doc_id' : ''}
   `
-  const conditions = ["COALESCE(d.import_status, '') <> 'deleting'"]
-  const params: unknown[] = []
+  const conditions = ["d.library_project_id = ?", "COALESCE(d.import_status, '') <> 'deleting'"]
+  const params: unknown[] = [getActiveLibraryProjectId()]
   if (normalizedFolderId) {
     conditions.push('df.folder_id = ?')
     params.push(normalizedFolderId)
@@ -555,10 +597,18 @@ function moveDocumentsToFolder(payload: FolderDocumentMovePayload): BulkAssociat
   const uniqueDocIds = [...new Set((payload?.docIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
   if (!targetFolderId || uniqueDocIds.length === 0) return { count: 0 }
 
-  const targetFolder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [targetFolderId])
+  const libraryProjectId = getActiveLibraryProjectId()
+  assertDocumentIdsInLibraryProject(uniqueDocIds, libraryProjectId)
+  const targetFolder = queryOne<Pick<Folder, 'id'>>(
+    'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+    [targetFolderId, libraryProjectId],
+  )
   if (!targetFolder) throw new Error('目标文件夹不存在')
   if (sourceFolderId) {
-    const sourceFolder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [sourceFolderId])
+    const sourceFolder = queryOne<Pick<Folder, 'id'>>(
+      'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+      [sourceFolderId, libraryProjectId],
+    )
     if (!sourceFolder) throw new Error('来源文件夹不存在')
     if (sourceFolderId === targetFolderId) return { count: uniqueDocIds.length }
   }
@@ -615,7 +665,10 @@ export function registerFolderIpc(): void {
   })
 
   ipcMain.handle('folders:get', async (_event, id: string): Promise<Folder | null> => {
-    return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [id])
+    return queryOne<Folder>(
+      'SELECT * FROM folders WHERE id = ? AND library_project_id = ?',
+      [id, getActiveLibraryProjectId()],
+    )
   })
 
   ipcMain.handle('folders:create', async (_event, data: FolderCreatePayload): Promise<Folder | null> => {
@@ -631,12 +684,18 @@ export function registerFolderIpc(): void {
     }
 
     const id = nanoid()
-    const maxOrder = queryOne<{ max_order: number | null }>('SELECT MAX(sort_order) as max_order FROM folders WHERE parent_id ' + (parentId ? '= ?' : 'IS NULL'), parentId ? [parentId] : undefined)
+    const libraryProjectId = getActiveLibraryProjectId()
+    const maxOrder = queryOne<{ max_order: number | null }>(
+      `SELECT MAX(sort_order) as max_order
+       FROM folders
+       WHERE library_project_id = ? AND parent_id ${parentId ? '= ?' : 'IS NULL'}`,
+      parentId ? [libraryProjectId, parentId] : [libraryProjectId],
+    )
     const sortOrder = (maxOrder?.max_order as number || 0) + 1
 
     run(
-      'INSERT INTO folders (id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, name, parentId, null, data.icon || 'folder', data.color || null, sortOrder, now, now]
+      'INSERT INTO folders (id, library_project_id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, libraryProjectId, name, parentId, null, data.icon || 'folder', data.color || null, sortOrder, now, now]
     )
     saveDatabase()
     markLibraryStateCacheDirty()
@@ -648,7 +707,10 @@ export function registerFolderIpc(): void {
     rejectProtectedExternalPathFields(data)
     const folderId = String(id || '').trim()
     if (!folderId) return false
-    const current = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
+    const current = queryOne<Folder>(
+      'SELECT * FROM folders WHERE id = ? AND library_project_id = ?',
+      [folderId, getActiveLibraryProjectId()],
+    )
     if (!current) return false
 
     const nextName = 'name' in data ? normalizeFolderName(data.name) : current.name
@@ -701,7 +763,10 @@ export function registerFolderIpc(): void {
   ipcMain.handle('folders:delete', async (_event, id: string): Promise<boolean> => {
     const folderId = String(id || '').trim()
     if (!folderId) return false
-    const folder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [folderId])
+    const folder = queryOne<Pick<Folder, 'id'>>(
+      'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+      [folderId, getActiveLibraryProjectId()],
+    )
     if (!folder) return false
 
     transaction(() => {
@@ -715,18 +780,37 @@ export function registerFolderIpc(): void {
   })
 
   ipcMain.handle('folders:addDocument', async (_event, docId: string, folderId: string): Promise<boolean> => {
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentIdsInLibraryProject([docId], libraryProjectId)
+    const folder = queryOne(
+      'SELECT 1 FROM folders WHERE id = ? AND library_project_id = ?',
+      [folderId, libraryProjectId],
+    )
+    if (!folder) throw new Error('文件夹不属于当前项目')
     run('INSERT OR IGNORE INTO document_folders (doc_id, folder_id) VALUES (?, ?)', [docId, folderId])
     saveDatabase()
     markLibraryStateCacheDirty()
     return true
   })
 
-  ipcMain.handle('folders:addDocuments', async (_event, docIds: string[], folderId: string): Promise<BulkAssociationResult> => {
+  ipcMain.handle('folders:addDocuments', async (
+    _event,
+    docIds: string[],
+    folderId: string,
+    requestedProjectId?: string,
+  ): Promise<BulkAssociationResult> => withLibraryProjectContext(
+    captureActiveLibraryProjectId(requestedProjectId),
+    () => {
     const targetFolderId = String(folderId || '').trim()
     const uniqueDocIds = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
     if (!targetFolderId || uniqueDocIds.length === 0) return { count: 0 }
 
-    const folder = queryOne<Pick<Folder, 'id'>>('SELECT id FROM folders WHERE id = ?', [targetFolderId])
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentIdsInLibraryProject(uniqueDocIds, libraryProjectId)
+    const folder = queryOne<Pick<Folder, 'id'>>(
+      'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+      [targetFolderId, libraryProjectId],
+    )
     if (!folder) throw new Error('文件夹不存在')
 
     transaction(() => {
@@ -737,9 +821,11 @@ export function registerFolderIpc(): void {
     saveDatabase()
     markLibraryStateCacheDirty()
     return { count: uniqueDocIds.length }
-  })
+  }))
 
   ipcMain.handle('folders:removeDocument', async (_event, docId: string, folderId: string): Promise<boolean> => {
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentIdsInLibraryProject([docId], libraryProjectId)
     run('DELETE FROM document_folders WHERE doc_id = ? AND folder_id = ?', [docId, folderId])
     saveDatabase()
     markLibraryStateCacheDirty()
@@ -747,15 +833,17 @@ export function registerFolderIpc(): void {
   })
 
   ipcMain.handle('folders:getDocuments', async (_event, folderId: string): Promise<Document[]> => {
-    const folderIds = resolveFolderAndDescendantIds([folderId])
+    const libraryProjectId = getActiveLibraryProjectId()
+    const folderIds = resolveFolderAndDescendantIds([folderId], libraryProjectId)
     if (folderIds.length === 0) return []
     return queryAll<Document>(
       `SELECT DISTINCT d.*
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
-       WHERE df.folder_id IN (${folderIds.map(() => '?').join(', ')})
+       WHERE d.library_project_id = ?
+         AND df.folder_id IN (${folderIds.map(() => '?').join(', ')})
        ORDER BY d.updated_at DESC`,
-      folderIds
+      [libraryProjectId, ...folderIds]
     )
   })
 
@@ -764,7 +852,10 @@ export function registerFolderIpc(): void {
     selectionId: string,
     sourceId: string,
     parentId?: string | null,
-  ): Promise<Folder | null> => {
+    requestedProjectId?: string,
+  ): Promise<Folder | null> => withLibraryProjectContext(
+    captureActiveLibraryProjectId(requestedProjectId),
+    async () => {
     const externalPath = await importSelectionService.getDirectorySourcePath(event.sender.id, selectionId, sourceId)
     const name = normalizeFolderName(externalPath.split(/[/\\]/).pop())
     if (!name) return null
@@ -780,18 +871,27 @@ export function registerFolderIpc(): void {
       return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [existing.id])
     }
     const id = nanoid()
-    const maxOrder = queryOne<{ max_order: number | null }>('SELECT MAX(sort_order) as max_order FROM folders WHERE parent_id ' + (normalizedParentId ? '= ?' : 'IS NULL'), normalizedParentId ? [normalizedParentId] : undefined)
+    const libraryProjectId = getActiveLibraryProjectId()
+    const maxOrder = queryOne<{ max_order: number | null }>(
+      `SELECT MAX(sort_order) as max_order
+       FROM folders
+       WHERE library_project_id = ? AND parent_id ${normalizedParentId ? '= ?' : 'IS NULL'}`,
+      normalizedParentId ? [libraryProjectId, normalizedParentId] : [libraryProjectId],
+    )
     run(
-      'INSERT INTO folders (id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, name, normalizedParentId, externalPath, 'folder', null, (Number(maxOrder?.max_order) || 0) + 1, now, now],
+      'INSERT INTO folders (id, library_project_id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, libraryProjectId, name, normalizedParentId, externalPath, 'folder', null, (Number(maxOrder?.max_order) || 0) + 1, now, now],
     )
     saveDatabase()
     markLibraryStateCacheDirty()
     return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [id])
-  })
+  }))
 
   ipcMain.handle('folders:scanExternal', async (_event, folderId: string): Promise<FolderImportFile[]> => {
-    const folder = queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [folderId])
+    const folder = queryOne<Folder>(
+      'SELECT * FROM folders WHERE id = ? AND library_project_id = ?',
+      [folderId, getActiveLibraryProjectId()],
+    )
     if (!folder || !folder.external_path) return []
 
     const extPath = folder.external_path

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Key } from 'react'
 import {
   AppstoreOutlined,
@@ -24,6 +24,7 @@ import {
   Segmented,
   Select,
   Space,
+  Spin,
   Table,
   Tag,
   Tooltip,
@@ -33,9 +34,11 @@ import {
 import type { MenuProps } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import type {
+  ListResearchNotesOptions,
   OpenDocumentTarget,
   ResearchKnowledgeKind,
   ResearchNote,
+  ResearchNoteListStats,
   ResearchNoteSourceType,
   ResearchNoteUpdatePayload,
   ResearchProject,
@@ -97,6 +100,14 @@ interface EditNoteValues {
 }
 
 const NO_PROJECT_VALUE = '__none__'
+const EXCERPTS_PAGE_SIZE = 200
+const EXCERPTS_COPY_PAGE_SIZE = 1000
+const EMPTY_NOTE_STATS: ResearchNoteListStats = {
+  total: 0,
+  documentCount: 0,
+  tags: [],
+  colorCount: 0,
+}
 
 const KIND_OPTIONS: Array<{ value: ResearchKnowledgeKind; label: string; color: string }> = [
   { value: 'quote', label: '摘录', color: 'blue' },
@@ -238,7 +249,13 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
   const [notes, setNotes] = useState<ResearchNote[]>([])
   const [projects, setProjects] = useState<ResearchProject[]>([])
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [listHasMore, setListHasMore] = useState(false)
+  const [noteTotal, setNoteTotal] = useState(0)
+  const [noteStats, setNoteStats] = useState<ResearchNoteListStats>(EMPTY_NOTE_STATS)
+  const [scopeDocIds, setScopeDocIds] = useState<string[]>([])
   const [query, setQuery] = useState('')
+  const [listSearch, setListSearch] = useState('')
   const [searchMode, setSearchMode] = useState<ExcerptSearchMode>('keyword')
   const [aiSearchLoading, setAiSearchLoading] = useState(false)
   const [aiSearchState, setAiSearchState] = useState<ExcerptAiSearchState | null>(null)
@@ -254,28 +271,95 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
   const [editingNote, setEditingNote] = useState<ResearchNote | null>(null)
   const [excerptContextMenu, setExcerptContextMenu] = useState<ExcerptContextMenuState | null>(null)
   const [citationByNoteId, setCitationByNoteId] = useState<Record<string, string>>({})
+  const [deleting, setDeleting] = useState(false)
+  const [copyingCurrentView, setCopyingCurrentView] = useState(false)
   const [editForm] = Form.useForm<EditNoteValues>()
+  const workbenchRef = useRef<HTMLDivElement | null>(null)
+  const notesRef = useRef<ResearchNote[]>([])
+  const listRequestSeqRef = useRef(0)
+  const loadingMoreRef = useRef(false)
+  const listHasMoreRef = useRef(false)
 
   const projectById = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects])
 
-  const loadData = useCallback(async () => {
-    setLoading(true)
+  useEffect(() => {
+    const nextSearch = searchMode === 'keyword' ? query.trim() : ''
+    const timer = window.setTimeout(() => setListSearch(nextSearch), 220)
+    return () => window.clearTimeout(timer)
+  }, [query, searchMode])
+
+  const buildListOptions = useCallback((
+    offset = 0,
+    limit = EXCERPTS_PAGE_SIZE,
+    includeOverview = true,
+  ): ListResearchNotesOptions => {
+    const options: ListResearchNotesOptions = {
+      limit,
+      offset,
+      includeOverview,
+      sort: sortKey,
+    }
+    if (listSearch) {
+      const normalizedSearch = listSearch.toLocaleLowerCase()
+      options.search = listSearch
+      options.searchColors = HIGHLIGHT_COLOR_OPTIONS
+        .filter((item) => item.label.toLocaleLowerCase().includes(normalizedSearch))
+        .map((item) => item.value)
+    }
+    if (projectFilter === 'none') options.unassignedOnly = true
+    else if (projectFilter !== 'all') options.projectId = projectFilter
+    if (kindFilter !== 'all') options.kind = kindFilter
+    if (sourceFilter !== 'all') options.source = sourceFilter
+    if (colorFilter !== 'all') options.color = colorFilter
+    if (tagFilter !== 'all') options.tag = tagFilter
+    return options
+  }, [colorFilter, kindFilter, listSearch, projectFilter, sortKey, sourceFilter, tagFilter])
+
+  const loadData = useCallback(async (options?: { append?: boolean; silent?: boolean }) => {
+    const append = !!options?.append
+    if (append && (loadingMoreRef.current || !listHasMoreRef.current)) return
+    const requestId = ++listRequestSeqRef.current
+    const offset = append ? notesRef.current.length : 0
+    if (append) {
+      loadingMoreRef.current = true
+      setLoadingMore(true)
+    } else if (!options?.silent) {
+      setLoading(true)
+    }
     try {
-      const [nextNotes, nextProjects] = await Promise.all([
-        window.api.listResearchNotes(null),
-        window.api.listResearchProjects(),
+      const [page, nextProjects] = await Promise.all([
+        window.api.listResearchNotesPage(buildListOptions(offset, EXCERPTS_PAGE_SIZE, !append)),
+        append ? Promise.resolve<ResearchProject[] | null>(null) : window.api.listResearchProjects(),
       ])
+      if (requestId !== listRequestSeqRef.current) return
+      const existingIds = append ? new Set(notesRef.current.map((note) => note.id)) : null
+      const nextNotes = existingIds
+        ? [...notesRef.current, ...page.items.filter((note) => !existingIds.has(note.id))]
+        : page.items
+      notesRef.current = nextNotes
       setNotes(nextNotes)
-      setProjects(nextProjects)
+      if (nextProjects) setProjects(nextProjects)
+      setNoteTotal(page.total)
+      if (page.stats) setNoteStats(page.stats)
+      if (page.scopeDocIds) setScopeDocIds(page.scopeDocIds)
+      listHasMoreRef.current = nextNotes.length < page.total
+      setListHasMore(listHasMoreRef.current)
     } catch (error: unknown) {
       console.error(error)
-      message.error(`加载摘录失败：${getErrorMessage(error, '未知错误')}`)
+      message.error(`${append ? '加载更多摘录' : '加载摘录'}失败：${getErrorMessage(error, '未知错误')}`)
     } finally {
-      setLoading(false)
+      if (append) {
+        loadingMoreRef.current = false
+        setLoadingMore(false)
+      } else if (requestId === listRequestSeqRef.current) {
+        setLoading(false)
+      }
     }
-  }, [])
+  }, [buildListOptions])
 
   useEffect(() => {
+    setSelectedRowKeys([])
+    workbenchRef.current?.scrollTo({ top: 0 })
     void loadData()
   }, [loadData])
 
@@ -299,11 +383,7 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
     }
   }, [notes])
 
-  const tagOptions = useMemo(() => {
-    const tags = new Set<string>()
-    notes.forEach((note) => splitTags(note.tags).forEach((tag) => tags.add(tag)))
-    return Array.from(tags).sort((a, b) => a.localeCompare(b, 'zh-CN'))
-  }, [notes])
+  const tagOptions = noteStats.tags
 
   const baseFilteredNotes = useMemo(() => {
     const nextNotes = notes.filter((note) => {
@@ -349,15 +429,13 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
     ].some((value) => String(value || '').toLocaleLowerCase().includes(keyword)))
   }, [baseFilteredNotes, projectById, query, searchMode])
 
-  const selectedNotes = useMemo(() => {
-    const selectedIds = new Set(selectedRowKeys.map(String))
-    return notes.filter((note) => selectedIds.has(note.id))
-  }, [notes, selectedRowKeys])
+  const selectedIdSet = useMemo(() => new Set(selectedRowKeys.map(String)), [selectedRowKeys])
 
-  const scopedExcerptDocIds = useMemo(
-    () => [...new Set(baseFilteredNotes.map((note) => note.doc_id).filter((docId): docId is string => !!docId))],
-    [baseFilteredNotes],
-  )
+  const selectedNotes = useMemo(() => {
+    return notes.filter((note) => selectedIdSet.has(note.id))
+  }, [notes, selectedIdSet])
+
+  const scopedExcerptDocIds = scopeDocIds
 
   const getDisplayCitation = useCallback((note: ResearchNote): string => {
     return citationByNoteId[note.id] || buildNoteCitation(note)
@@ -530,23 +608,102 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
     message.success(`已复制${label}：${items.length} 条`)
   }, [])
 
-  const deleteNote = useCallback((note: ResearchNote) => {
+  const copyCurrentView = useCallback(async () => {
+    if (noteTotal === 0 || copyingCurrentView) return
+    setCopyingCurrentView(true)
+    try {
+      const items: ResearchNote[] = []
+      const seenIds = new Set<string>()
+      let offset = 0
+      let total = noteTotal
+      do {
+        const page = await window.api.listResearchNotesPage(buildListOptions(offset, EXCERPTS_COPY_PAGE_SIZE, false))
+        total = page.total
+        for (const note of page.items) {
+          if (seenIds.has(note.id)) continue
+          seenIds.add(note.id)
+          items.push(note)
+        }
+        offset += page.items.length
+        if (page.items.length === 0) break
+      } while (offset < total)
+      await copyNotesMarkdown(items, '当前视图')
+    } catch (error: unknown) {
+      console.error(error)
+      message.error(`复制当前视图失败：${getErrorMessage(error, '未知错误')}`)
+    } finally {
+      setCopyingCurrentView(false)
+    }
+  }, [buildListOptions, copyNotesMarkdown, copyingCurrentView, noteTotal])
+
+  const confirmDeleteNotes = useCallback((items: ResearchNote[]) => {
+    const ids = [...new Set(items.map((note) => note.id).filter(Boolean))]
+    if (ids.length === 0) return
     setExcerptContextMenu(null)
+    const isBatch = ids.length > 1
     Modal.confirm({
-      title: '删除摘录',
-      content: '这条摘录会从摘录库和研究专题中移除，原文不会受影响。',
-      okText: '删除',
+      title: isBatch ? `批量删除 ${ids.length} 条摘录？` : '删除摘录',
+      content: isBatch
+        ? `选中的 ${ids.length} 条摘录会一次性从摘录库和研究专题中移除。该操作不会删除文献原文，但无法撤销。`
+        : '这条摘录会从摘录库和研究专题中移除，原文不会受影响。',
+      okText: isBatch ? `删除 ${ids.length} 条` : '删除',
       cancelText: '取消',
       okButtonProps: { danger: true },
       centered: true,
       onOk: async () => {
-        await window.api.deleteResearchNote(note.id)
-        setNotes((current) => current.filter((item) => item.id !== note.id))
-        setSelectedRowKeys((current) => current.filter((key) => String(key) !== note.id))
-        message.success('已删除摘录')
+        setDeleting(true)
+        try {
+          const result = await window.api.deleteResearchNotes(ids)
+          const deletedIds = new Set(ids)
+          setSelectedRowKeys((current) => current.filter((key) => !deletedIds.has(String(key))))
+          await loadData({ silent: true })
+          message.success(isBatch ? `已删除 ${result.deleted} 条摘录` : '已删除摘录')
+        } catch (error: unknown) {
+          console.error(error)
+          message.error(`删除摘录失败：${getErrorMessage(error, '未知错误')}`)
+          throw error
+        } finally {
+          setDeleting(false)
+        }
       },
     })
+  }, [loadData])
+
+  const deleteNote = useCallback((note: ResearchNote) => {
+    confirmDeleteNotes([note])
+  }, [confirmDeleteNotes])
+
+  const toggleNoteSelection = useCallback((noteId: string, checked: boolean) => {
+    setSelectedRowKeys((current) => {
+      const currentIds = new Set(current.map(String))
+      if (checked) currentIds.add(noteId)
+      else currentIds.delete(noteId)
+      return [...currentIds]
+    })
   }, [])
+
+  const allLoadedSelected = filteredNotes.length > 0 && filteredNotes.every((note) => selectedIdSet.has(note.id))
+  const someLoadedSelected = filteredNotes.some((note) => selectedIdSet.has(note.id))
+
+  const toggleAllLoaded = useCallback((checked: boolean) => {
+    const loadedIds = new Set(filteredNotes.map((note) => note.id))
+    setSelectedRowKeys((current) => {
+      const next = new Set(current.map(String))
+      if (checked) loadedIds.forEach((id) => next.add(id))
+      else loadedIds.forEach((id) => next.delete(id))
+      return [...next]
+    })
+  }, [filteredNotes])
+
+  const loadMoreNotes = useCallback(() => {
+    if (loading || loadingMoreRef.current || !listHasMoreRef.current) return
+    void loadData({ append: true, silent: true })
+  }, [loadData, loading])
+
+  const maybeLoadMoreNotes = useCallback((target: HTMLElement) => {
+    const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight
+    if (distanceToBottom <= 240) loadMoreNotes()
+  }, [loadMoreNotes])
 
   const openEditNote = useCallback((note: ResearchNote) => {
     setExcerptContextMenu(null)
@@ -754,6 +911,7 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
   const rowSelection = {
     selectedRowKeys,
     onChange: (keys: Key[]) => setSelectedRowKeys(keys),
+    preserveSelectedRowKeys: true,
   }
 
   const renderGroupHeader = (label: string, count: number) => (
@@ -778,7 +936,7 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
             onRow={(note) => ({
               onContextMenu: (event) => openExcerptContextMenu(note, event),
             })}
-            pagination={groupKey === 'none' ? { pageSize: 12, showSizeChanger: false } : false}
+            pagination={false}
             scroll={{ x: 980 }}
           />
         </section>
@@ -794,12 +952,8 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
           {group.notes.map((note) => (
             <article key={note.id} className="excerpt-list-item" onContextMenu={(event) => openExcerptContextMenu(note, event)}>
               <Checkbox
-                checked={selectedRowKeys.map(String).includes(note.id)}
-                onChange={(event) => {
-                  setSelectedRowKeys((current) => event.target.checked
-                    ? [...current, note.id]
-                    : current.filter((key) => String(key) !== note.id))
-                }}
+                checked={selectedIdSet.has(note.id)}
+                onChange={(event) => toggleNoteSelection(note.id, event.target.checked)}
               />
               <div className="excerpt-list-main">
                 <div className="excerpt-list-meta">
@@ -832,12 +986,8 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
               <article key={note.id} className="excerpt-card" onContextMenu={(event) => openExcerptContextMenu(note, event)}>
                 <div className="excerpt-card-header">
                   <Checkbox
-                    checked={selectedRowKeys.map(String).includes(note.id)}
-                    onChange={(event) => {
-                      setSelectedRowKeys((current) => event.target.checked
-                        ? [...current, note.id]
-                        : current.filter((key) => String(key) !== note.id))
-                    }}
+                    checked={selectedIdSet.has(note.id)}
+                    onChange={(event) => toggleNoteSelection(note.id, event.target.checked)}
                   />
                   <Space size={4} wrap>
                     {renderKindTag(note)}
@@ -914,7 +1064,14 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
     || tagFilter !== 'all'
 
   return (
-    <div className="excerpts-workbench">
+    <div
+      ref={workbenchRef}
+      className="excerpts-workbench"
+      onScroll={(event) => maybeLoadMoreNotes(event.currentTarget)}
+      onWheel={(event) => {
+        if (event.deltaY > 0) maybeLoadMoreNotes(event.currentTarget)
+      }}
+    >
       {excerptContextMenu ? (
         <Dropdown
           open
@@ -934,13 +1091,36 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
           <Text type="secondary">来自阅读器、检索和 AI 的全部摘录</Text>
         </div>
         <Space wrap>
+          <Checkbox
+            checked={allLoadedSelected}
+            indeterminate={!allLoadedSelected && someLoadedSelected}
+            disabled={filteredNotes.length === 0 || deleting}
+            onChange={(event) => toggleAllLoaded(event.target.checked)}
+          >
+            全选已加载
+          </Checkbox>
           <Button icon={<ReloadOutlined />} onClick={() => void loadData()} loading={loading}>
             刷新
           </Button>
           <Button icon={<CopyOutlined />} disabled={selectedNotes.length === 0} onClick={() => void copyNotesMarkdown(selectedNotes, '选中摘录')}>
-            复制选中
+            复制选中{selectedNotes.length > 0 ? `（${selectedNotes.length}）` : ''}
           </Button>
-          <Button type="primary" icon={<CopyOutlined />} disabled={filteredNotes.length === 0} onClick={() => void copyNotesMarkdown(filteredNotes, '当前视图')}>
+          <Button
+            danger
+            icon={<DeleteOutlined />}
+            disabled={selectedNotes.length === 0 || deleting}
+            loading={deleting}
+            onClick={() => confirmDeleteNotes(selectedNotes)}
+          >
+            批量删除{selectedNotes.length > 0 ? `（${selectedNotes.length}）` : ''}
+          </Button>
+          <Button
+            type="primary"
+            icon={<CopyOutlined />}
+            disabled={noteTotal === 0}
+            loading={copyingCurrentView}
+            onClick={() => void copyCurrentView()}
+          >
             复制当前视图
           </Button>
         </Space>
@@ -949,15 +1129,15 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
       <div className="excerpts-metrics">
         <div className="excerpts-metric">
           <Text type="secondary">全部摘录</Text>
-          <strong>{notes.length}</strong>
+          <strong>{noteStats.total}</strong>
         </div>
         <div className="excerpts-metric">
           <Text type="secondary">当前视图</Text>
-          <strong>{filteredNotes.length}</strong>
+          <strong>{noteTotal}</strong>
         </div>
         <div className="excerpts-metric">
           <Text type="secondary">相关文献</Text>
-          <strong>{new Set(notes.map((note) => note.doc_id)).size}</strong>
+          <strong>{noteStats.documentCount}</strong>
         </div>
         <div className="excerpts-metric">
           <Text type="secondary">标签</Text>
@@ -965,7 +1145,7 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
         </div>
         <div className="excerpts-metric">
           <Text type="secondary">荧光笔</Text>
-          <strong>{new Set(notes.map((note) => getNoteColor(note))).size}</strong>
+          <strong>{noteStats.colorCount}</strong>
         </div>
       </div>
 
@@ -1093,8 +1273,21 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
 
       <div className="excerpts-view-shell">
         {filteredNotes.length === 0 && !loading ? (
-          <Empty description={notes.length === 0 ? '暂无摘录' : '当前筛选下没有摘录'} />
+          <Empty description={noteStats.total === 0 ? '暂无摘录' : '当前筛选下没有摘录'} />
         ) : viewMode === 'table' ? renderTableView() : viewMode === 'list' ? renderListView() : renderCardView()}
+        {notes.length > 0 ? (
+          <div className="excerpts-load-more">
+            <Text type="secondary">
+              已加载 {notes.length}/{noteTotal} 条{listHasMore ? ' · 继续向下滚动加载更多' : ' · 已全部加载'}
+            </Text>
+            {loadingMore ? <Spin size="small" /> : null}
+            {listHasMore ? (
+              <Button size="small" onClick={loadMoreNotes} disabled={loadingMore}>
+                加载更多
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       <Modal

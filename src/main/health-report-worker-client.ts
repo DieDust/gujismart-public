@@ -6,6 +6,7 @@ import type { DocumentHealthReport } from '../shared/types'
 
 export interface HealthReportWorkerTask {
   dbFilePath: string
+  libraryProjectId: string
 }
 
 type WorkerMessage =

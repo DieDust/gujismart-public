@@ -77,9 +77,11 @@ assert(
   !fileBranch.includes('getPdfFingerprint(destPath)'),
   'PDF import should reuse the source hash after copying instead of hashing the stored copy again',
 )
+const projectScopedDuplicateHashLookup = importHandler.indexOf("json_extract(metadata, '$.pdf_sha256') = ?")
 assert(
-  importHandler.indexOf('pdfFingerprint = await getPdfFingerprintAsync(filePath') < importHandler.indexOf("WHERE json_extract(metadata, '$.pdf_sha256') = ?")
-    && importHandler.indexOf("WHERE json_extract(metadata, '$.pdf_sha256') = ?") < importHandler.indexOf('await copyFileWithFingerprintAsync(filePath, destPath, pdfFingerprint || undefined'),
+  importHandler.indexOf('pdfFingerprint = await getPdfFingerprintAsync(filePath') < projectScopedDuplicateHashLookup
+    && projectScopedDuplicateHashLookup < importHandler.indexOf('await copyFileWithFingerprintAsync(filePath, destPath, pdfFingerprint || undefined')
+    && importHandler.includes('WHERE library_project_id = ?'),
   'PDF duplicate lookup should happen before copying into the library when a same-size candidate exists',
 )
 assert(

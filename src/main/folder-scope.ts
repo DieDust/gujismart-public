@@ -1,4 +1,5 @@
 import { queryAll } from './database'
+import { getActiveLibraryProjectId } from './library-projects'
 
 interface FolderTreeRow {
   id: string
@@ -24,10 +25,14 @@ function buildChildrenByParent(folders: FolderTreeRow[]): Map<string, string[]> 
   return childrenByParent
 }
 
-export function resolveFolderAndDescendantIds(folderIds: string[]): string[] {
+export function resolveFolderAndDescendantIds(folderIds: string[], libraryProjectId?: string): string[] {
   const roots = uniqueIds(folderIds)
   if (roots.length === 0) return []
-  const folders = queryAll<FolderTreeRow>('SELECT id, parent_id FROM folders')
+  const projectId = libraryProjectId || getActiveLibraryProjectId()
+  const folders = queryAll<FolderTreeRow>(
+    'SELECT id, parent_id FROM folders WHERE library_project_id = ?',
+    [projectId],
+  )
   const knownIds = new Set(folders.map((folder) => folder.id))
   const childrenByParent = buildChildrenByParent(folders)
   const resolved: string[] = []
@@ -44,8 +49,12 @@ export function resolveFolderAndDescendantIds(folderIds: string[]): string[] {
   return resolved
 }
 
-export function buildCumulativeFolderDocumentCounts(): Record<string, number> {
-  const folders = queryAll<FolderTreeRow>('SELECT id, parent_id FROM folders')
+export function buildCumulativeFolderDocumentCounts(libraryProjectId?: string): Record<string, number> {
+  const projectId = libraryProjectId || getActiveLibraryProjectId()
+  const folders = queryAll<FolderTreeRow>(
+    'SELECT id, parent_id FROM folders WHERE library_project_id = ?',
+    [projectId],
+  )
   if (folders.length === 0) return {}
 
   const childrenByParent = buildChildrenByParent(folders)
@@ -54,7 +63,9 @@ export function buildCumulativeFolderDocumentCounts(): Record<string, number> {
     `SELECT df.folder_id, df.doc_id
      FROM document_folders df
      INNER JOIN documents d ON d.id = df.doc_id
-     WHERE COALESCE(d.import_status, '') <> 'deleting'`,
+     WHERE COALESCE(d.import_status, '') <> 'deleting'
+       AND d.library_project_id = ?`,
+    [projectId],
   ).forEach((row) => {
     if (!row.folder_id || !row.doc_id) return
     const docs = directDocIds.get(row.folder_id) || new Set<string>()

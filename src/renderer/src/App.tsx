@@ -25,6 +25,7 @@ import type { MenuProps } from 'antd'
 import type { SettingsViewHandle } from './views/SettingsView'
 import WelcomeView from './views/WelcomeView'
 import { useFolderStore } from './stores/useFolderStore'
+import { useDocumentStore } from './stores/useDocumentStore'
 import { useOnboardingStore } from './stores/useOnboardingStore'
 import { clampAiButtonPosition, clampFloatingPanelState, getDefaultFloatingPanelState } from './utils/floatingViewport'
 import {
@@ -36,8 +37,8 @@ import {
   type WorkspaceViewKey,
 } from './utils/appWorkspace'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from './utils/shortcuts'
-import type { AppUpdateInfo, BackgroundTaskProgressEvent, DatabaseStorageDiagnostics, ImportSelection, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, OpenDocumentTarget, SettingsMap } from '@shared/types'
-import { PRODUCT_NAME } from '@shared/types'
+import type { AppUpdateInfo, BackgroundTaskProgressEvent, DatabaseStorageDiagnostics, ImportSelection, LibraryAiOpenPayload, LibraryAiScope, LibraryAiTab, LibraryFilter, LibraryProject, OpenDocumentTarget, SettingsMap } from '@shared/types'
+import { DEFAULT_LIBRARY_PROJECT_ID, PRODUCT_NAME } from '@shared/types'
 import './styles/app.css'
 
 const { Sider, Content, Header } = Layout
@@ -537,6 +538,15 @@ export default function App() {
   const [libraryAiInitialTab, setLibraryAiInitialTab] = useState<LibraryAiTab>('qa')
   const [libraryAiResearchProjectId, setLibraryAiResearchProjectId] = useState<string | null>(null)
   const [activeResearchProjectId, setActiveResearchProjectId] = useState<string | null>(null)
+  const [libraryProjects, setLibraryProjects] = useState<LibraryProject[]>([])
+  const [activeLibraryProject, setActiveLibraryProject] = useState<LibraryProject | null>(null)
+  const [workspaceProjectId, setWorkspaceProjectId] = useState<string | null>(null)
+  const [libraryProjectLoading, setLibraryProjectLoading] = useState(true)
+  const [libraryProjectError, setLibraryProjectError] = useState('')
+  const [libraryProjectSwitching, setLibraryProjectSwitching] = useState(false)
+  const [libraryProjectCreateOpen, setLibraryProjectCreateOpen] = useState(false)
+  const [libraryProjectCreateName, setLibraryProjectCreateName] = useState('')
+  const [libraryProjectCreateBusy, setLibraryProjectCreateBusy] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [databaseUpgradeDiagnostics, setDatabaseUpgradeDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
   const [databaseUpgradeVisible, setDatabaseUpgradeVisible] = useState(false)
@@ -611,27 +621,114 @@ export default function App() {
     return tabs.filter((tab) => tab.title.toLocaleLowerCase().includes(keyword))
   }, [tabSearchKey, tabs])
 
+  const loadLibraryProjectChoices = async (): Promise<void> => {
+    setLibraryProjectLoading(true)
+    setLibraryProjectError('')
+    try {
+      const [projects, activeProject] = await Promise.all([
+        window.api.listLibraryProjects(),
+        window.api.getActiveLibraryProject(),
+      ])
+      setLibraryProjects(projects)
+      setActiveLibraryProject(activeProject)
+    } catch (error) {
+      setLibraryProjectError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setLibraryProjectLoading(false)
+    }
+  }
+
   useEffect(() => {
+    void loadLibraryProjectChoices()
+  }, [])
+
+  useEffect(() => {
+    if (!workspaceProjectId) return
     saveAppWorkspace(window.localStorage, {
       tabs,
       tabGroups,
       activeTabId,
       siderCollapsed,
-    })
-  }, [activeTabId, siderCollapsed, tabGroups, tabs])
+    }, workspaceProjectId)
+  }, [activeTabId, siderCollapsed, tabGroups, tabs, workspaceProjectId])
 
   useEffect(() => {
     const saveBeforeUnload = () => {
+      if (!workspaceProjectId) return
       saveAppWorkspace(window.localStorage, {
         tabs,
         tabGroups,
         activeTabId,
         siderCollapsed,
-      })
+      }, workspaceProjectId)
     }
     window.addEventListener('beforeunload', saveBeforeUnload)
     return () => window.removeEventListener('beforeunload', saveBeforeUnload)
-  }, [activeTabId, siderCollapsed, tabGroups, tabs])
+  }, [activeTabId, siderCollapsed, tabGroups, tabs, workspaceProjectId])
+
+  const activateLibraryProject = async (project: LibraryProject): Promise<void> => {
+    if (libraryProjectSwitching) return
+    setLibraryProjectSwitching(true)
+    try {
+      if (workspaceProjectId) {
+        saveAppWorkspace(window.localStorage, {
+          tabs,
+          tabGroups,
+          activeTabId,
+          siderCollapsed,
+        }, workspaceProjectId)
+      }
+      const activated = await window.api.setActiveLibraryProject(project.id)
+      useDocumentStore.getState().setDocuments([])
+      useDocumentStore.getState().clearSelection()
+      const workspace = loadAppWorkspace(window.localStorage, project.id, {
+        migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID,
+      })
+      setTabs(workspace.tabs)
+      setTabGroups(repairDefaultTabGroupTitlesByCreationOrder(workspace.tabGroups))
+      setActiveTabId(workspace.activeTabId)
+      setSiderCollapsed(workspace.siderCollapsed)
+      setClosedTabHistory([])
+      setLibraryFilter({ type: 'all' })
+      setLibraryFocusSection(undefined)
+      setLibraryAiOpen(false)
+      setActiveResearchProjectId(null)
+      setActiveLibraryProject(activated)
+      setWorkspaceProjectId(activated.id)
+      const refreshedProjects = await window.api.listLibraryProjects()
+      setLibraryProjects(refreshedProjects)
+    } catch (error) {
+      message.error(`切换文献项目失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setLibraryProjectSwitching(false)
+    }
+  }
+
+  const confirmCreateLibraryProject = async (): Promise<void> => {
+    const name = libraryProjectCreateName.trim()
+    if (!name || libraryProjectCreateBusy) return
+    setLibraryProjectCreateBusy(true)
+    try {
+      const project = await window.api.createLibraryProject({ name, activate: true })
+      setLibraryProjectCreateOpen(false)
+      setLibraryProjectCreateName('')
+      await activateLibraryProject(project)
+    } catch (error) {
+      message.error(`新建文献项目失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setLibraryProjectCreateBusy(false)
+    }
+  }
+
+  const handleLibraryDocumentsMoved = (documentIds: string[]): void => {
+    const movedIds = new Set(documentIds)
+    setTabs((currentTabs) => {
+      const nextTabs = currentTabs.filter((tab) => tab.kind !== 'document' || !movedIds.has(tab.document.docId))
+      const safeTabs = nextTabs.length > 0 ? nextTabs : [createHomeTab()]
+      if (!safeTabs.some((tab) => tab.id === activeTabId)) setActiveTabId(safeTabs[0].id)
+      return safeTabs
+    })
+  }
 
   const settingsViewRef = useRef<SettingsViewHandle>(null)
   const floatingPanelRef = useRef<HTMLDivElement>(null)
@@ -2667,6 +2764,10 @@ export default function App() {
             onDroppedImportHandled={(requestId) => {
               setLibraryDroppedImportRequest((current) => (current?.id === requestId ? null : current))
             }}
+            libraryProjects={libraryProjects}
+            activeLibraryProjectId={activeLibraryProject?.id}
+            onLibraryProjectsChanged={() => void loadLibraryProjectChoices()}
+            onLibraryDocumentsMoved={handleLibraryDocumentsMoved}
           />
         )
       case 'folders':
@@ -2713,7 +2814,16 @@ export default function App() {
           />
         )
       default:
-        return <LibraryView onSelectDoc={openDocumentTarget} onOpenLibraryAi={openLibraryAi} />
+        return (
+          <LibraryView
+            onSelectDoc={openDocumentTarget}
+            onOpenLibraryAi={openLibraryAi}
+            libraryProjects={libraryProjects}
+            activeLibraryProjectId={activeLibraryProject?.id}
+            onLibraryProjectsChanged={() => void loadLibraryProjectChoices()}
+            onLibraryDocumentsMoved={handleLibraryDocumentsMoved}
+          />
+        )
     }
   }
 
@@ -2852,6 +2962,117 @@ export default function App() {
     </div>
   )
 
+  const libraryProjectCreateModal = (
+    <Modal
+      open={libraryProjectCreateOpen}
+      title="新建文献项目"
+      okText="创建并进入"
+      cancelText="取消"
+      centered
+      destroyOnHidden
+      confirmLoading={libraryProjectCreateBusy}
+      okButtonProps={{ disabled: libraryProjectCreateName.trim().length === 0 }}
+      onOk={() => void confirmCreateLibraryProject()}
+      onCancel={() => {
+        if (libraryProjectCreateBusy) return
+        setLibraryProjectCreateOpen(false)
+        setLibraryProjectCreateName('')
+      }}
+    >
+      <p className="library-project-create-description">
+        文献、检索、向量结果和摘录列表会按当前项目隔离加载；以后可以在文献库中批量转移。
+      </p>
+      <Input
+        autoFocus
+        maxLength={80}
+        placeholder="例如：明清史料、论文资料、待整理"
+        value={libraryProjectCreateName}
+        onChange={(event) => setLibraryProjectCreateName(event.target.value)}
+        onPressEnter={() => void confirmCreateLibraryProject()}
+      />
+    </Modal>
+  )
+
+  if (!workspaceProjectId) {
+    return (
+      <div className="library-project-gate">
+        <div className="library-project-gate-card">
+          <div className="library-project-gate-brand">
+            <span className="brand-icon">智</span>
+            <div>
+              <strong>{PRODUCT_NAME}</strong>
+              <span>选择本次要加载的文献项目</span>
+            </div>
+          </div>
+          {libraryProjectLoading ? (
+            <div className="library-project-gate-loading">
+              <Spin size="large" />
+              <span>正在读取项目…</span>
+            </div>
+          ) : libraryProjectError ? (
+            <Alert
+              type="error"
+              showIcon
+              message="项目列表加载失败"
+              description={libraryProjectError}
+              action={<Button onClick={() => void loadLibraryProjectChoices()}>重试</Button>}
+            />
+          ) : (
+            <>
+              <div className="library-project-gate-list">
+                {libraryProjects.map((project) => (
+                  <button
+                    type="button"
+                    key={project.id}
+                    data-library-project-choice="true"
+                    className={`library-project-gate-item ${activeLibraryProject?.id === project.id ? 'is-last-active' : ''}`}
+                    onClick={() => void activateLibraryProject(project)}
+                    disabled={libraryProjectSwitching}
+                  >
+                    <span className="library-project-gate-item-color" style={{ background: project.color }} />
+                    <span className="library-project-gate-item-content">
+                      <strong>{project.name}</strong>
+                      <span>{project.document_count.toLocaleString()} 篇文献{project.is_default ? ' · 旧版文献默认归入' : ''}</span>
+                    </span>
+                    {activeLibraryProject?.id === project.id ? <span className="library-project-last-badge">上次使用</span> : null}
+                    <RightOutlined />
+                  </button>
+                ))}
+              </div>
+              <Button
+                className="library-project-gate-create"
+                type="dashed"
+                size="large"
+                block
+                icon={<PlusOutlined />}
+                onClick={() => setLibraryProjectCreateOpen(true)}
+              >
+                新建文献项目
+              </Button>
+            </>
+          )}
+        </div>
+        {libraryProjectCreateModal}
+      </div>
+    )
+  }
+
+  const libraryProjectMenuItems: MenuProps['items'] = [
+    ...libraryProjects.map((project) => ({
+      key: project.id,
+      label: (
+        <span className="sidebar-project-menu-item">
+          <span className="sidebar-project-dot" style={{ background: project.color }} />
+          <span>{project.name}</span>
+          <span className="sidebar-project-count">{project.document_count.toLocaleString()}</span>
+        </span>
+      ),
+      disabled: project.id === activeLibraryProject?.id,
+    })),
+    { type: 'divider' as const },
+    { key: '__create_project__', icon: <PlusOutlined />, label: '新建文献项目' },
+  ]
+
   return (
     <Layout className="app-layout">
       <Sider
@@ -2871,6 +3092,35 @@ export default function App() {
           <span className="brand-icon">智</span>
           {!siderCollapsed ? <span>{PRODUCT_NAME}</span> : null}
         </div>
+        <Dropdown
+          trigger={['click']}
+          menu={{
+            items: libraryProjectMenuItems,
+            onClick: ({ key }) => {
+              if (key === '__create_project__') {
+                setLibraryProjectCreateOpen(true)
+                return
+              }
+              const project = libraryProjects.find((item) => item.id === key)
+              if (project) void activateLibraryProject(project)
+            },
+          }}
+        >
+          <button
+            type="button"
+            className={`sidebar-project-switcher ${siderCollapsed ? 'is-collapsed' : ''}`}
+            title={activeLibraryProject?.name || '选择文献项目'}
+            disabled={libraryProjectSwitching}
+          >
+            <span className="sidebar-project-dot" style={{ background: activeLibraryProject?.color || '#1677ff' }} />
+            {!siderCollapsed ? (
+              <>
+                <span className="sidebar-project-current">{activeLibraryProject?.name || '选择项目'}</span>
+                <DownOutlined />
+              </>
+            ) : null}
+          </button>
+        </Dropdown>
 
         <div className="sider-import" style={{ display: 'none' }}>
           <Button
@@ -3010,7 +3260,7 @@ export default function App() {
         </Header>
 
         <Content className="app-content">
-          <Suspense fallback={<ViewLoadingFallback />}>
+          <Suspense key={workspaceProjectId} fallback={<ViewLoadingFallback />}>
             {renderView()}
           </Suspense>
         </Content>
@@ -3038,6 +3288,7 @@ export default function App() {
           onPressEnter={confirmRenameTabGroup}
         />
       </Modal>
+      {libraryProjectCreateModal}
 
       <Modal
         open={databaseUpgradeVisible}

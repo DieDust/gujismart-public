@@ -17,6 +17,9 @@ assert(source.includes('function assertTagParentAllowed'), 'tag parent mutations
 assert(source.includes('assertTagParentAllowed(null, parentId)'), 'tag creation must validate its parent')
 assert(source.includes('assertTagParentAllowed(tagId, nextParentId)'), 'tag update must reject self and descendant cycles')
 assert(source.includes("throw new Error('标签名称不能为空')"), 'tag create and update must reject empty names')
-assert(source.includes('SELECT * FROM tags WHERE normalized_name = ? AND id <> ?'), 'tag rename must detect conflicts without overwriting another tag')
+assert(
+  source.includes('SELECT * FROM tags WHERE library_project_id = ? AND normalized_name = ? AND id <> ?'),
+  'tag rename must detect conflicts inside the active project without overwriting another tag',
+)
 
 console.log('Tag management regression passed.')

@@ -1683,6 +1683,11 @@ async function run() {
 
     const title = await window.title()
     expectContains(title, '\u6587\u732e\u7ba1\u7406', 'window title')
+    const projectChoices = window.locator('[data-library-project-choice="true"]')
+    if (await projectChoices.count() > 0) {
+      await projectChoices.first().click()
+      await window.waitForFunction(() => Boolean(document.querySelector('main')), null, { timeout: 8000 })
+    }
     await verifyMainText(window, LABELS.welcomeTitle)
 
     await clickMenu(window, LABELS.research)

@@ -22,7 +22,7 @@ import {
   withStartupPhase,
   withStartupPhaseSync,
 } from './startup-timing'
-import { closeStartupSplash, keepStartupSplashForDiagnostics, openStartupSplash } from './startup-splash'
+import { closeStartupSplash } from './startup-splash'
 import { resumePendingImportAutoOcrTasks, shutdownOcrRuntime } from './ipc/ocr'
 import { shutdownBookTranslationRuntime, shutdownDocumentDeleteRuntime, shutdownDocumentImportRuntime } from './ipc/documents'
 import { batchProcessor } from './batch-processor'
@@ -241,16 +241,11 @@ function createWindow(): void {
     markStartupEvent('window-shown', `via=${reason}`)
     showWindowIfNeeded(win)
     batchProcessor.setMainWindow(win)
-    // Test build: do NOT auto-close the diagnostic window — keep it for remote users to screenshot.
     scheduleStartupRecovery()
     scheduleStartupMaintenance()
     markStartupEvent('startup-recovery-scheduled')
     markStartupEvent('startup-maintenance-scheduled')
     logStartupTimingSummary('window-shown')
-    // Fallback only: if recovery hangs, still unlock the diagnostic window for screenshots.
-    setTimeout(() => {
-      keepStartupSplashForDiagnostics({ reason: `fallback-after-window-shown:${reason}` })
-    }, 120_000).unref?.()
   }
 
   mainWindow.on('ready-to-show', () => {
@@ -270,10 +265,6 @@ function createWindow(): void {
     markStartupEvent('startup-recovery-scheduled')
     markStartupEvent('startup-maintenance-scheduled')
     logStartupTimingSummary('window-ready-to-show')
-    // Prefer keepStartupSplashForDiagnostics from recovery completion; this is a safety net only.
-    setTimeout(() => {
-      keepStartupSplashForDiagnostics({ reason: 'fallback-after-ready-to-show' })
-    }, 120_000).unref?.()
   })
 
   mainWindow.webContents.on('did-finish-load', () => {
@@ -582,16 +573,7 @@ if (mcpLaunch.isMcp) {
   app.whenReady()
     .then(async () => {
       markStartupEvent('app-when-ready')
-      // Visible progress for large libraries: show splash before heavy DB open so remote users can screenshot stalls.
-      // Smoke tests must not open splash — Playwright firstWindow would grab it instead of the main UI.
-      if (process.env.GUJISMART_SMOKE !== '1') {
-        try {
-          openStartupSplash()
-          markStartupEvent('startup-splash-open')
-        } catch (error) {
-          console.warn('[Main] Failed to open startup splash', error)
-        }
-      }
+      // Startup diagnostic splash was a temporary remote-debug tool; do not open it on normal launches.
       protocol.handle('local-resource', (request) => {
         const filePath = assertAllowedLocalResourceUrl(request.url)
         return streamFileResponse(filePath, request)

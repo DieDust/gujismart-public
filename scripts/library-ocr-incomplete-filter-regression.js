@@ -65,17 +65,18 @@ assert(
   'list page stats should trust document.page_count / ocr_status instead of scanning page rows.',
 )
 
-const lightweightCacheBlock = sliceBetween(
+const sidebarCacheBlock = sliceBetween(
   libraryCacheSource,
-  'function buildLightweightCache',
+  'function buildCache',
   'export function refreshLibraryStateCache',
-  'library sidebar lightweight cache',
+  'library sidebar project cache',
 )
 
 assert(
-  lightweightCacheBlock.includes('activeDocumentWhere(buildOcrIncompleteCondition())')
-    && !lightweightCacheBlock.includes("COALESCE(d.ocr_status, 'pending') <> 'completed' OR COALESCE(d.page_count, 0) = 0"),
-  'dirty sidebar cache should use the same OCR incomplete condition as the document list instead of over-counting legacy pending documents with OCR text.',
+  sidebarCacheBlock.includes('activeDocumentWhere(buildOcrIncompleteCondition())')
+    && sidebarCacheBlock.includes('const projectId = getActiveLibraryProjectId()')
+    && !sidebarCacheBlock.includes("COALESCE(d.ocr_status, 'pending') <> 'completed' OR COALESCE(d.page_count, 0) = 0"),
+  'project sidebar cache should use the same OCR incomplete condition as the document list instead of over-counting legacy pending documents with OCR text.',
 )
 
 assert(
@@ -84,11 +85,27 @@ assert(
   'document list and health rows should use actual page rows as a fallback when legacy document page_count is zero.',
 )
 
+const ocrNormalizationBlock = sliceBetween(
+  documentsSource,
+  'function normalizeCompletedOcrDocuments',
+  'function scheduleDocumentHealthReportRefresh',
+  'bounded OCR status normalization',
+)
+const statusOnlyContentBlock = sliceBetween(
+  documentsSource,
+  'function buildPageContentAvailableConditionStatusOnly',
+  'function buildDocumentOcrCompleteCondition',
+  'status-only OCR content predicate',
+)
+
 assert(
-  documentsSource.includes('function normalizeCompletedOcrDocuments')
-    && /function normalizeCompletedOcrDocuments[\s\S]{0,400}return documents/.test(documentsSource)
-    && !/function normalizeCompletedOcrDocuments[\s\S]{0,800}getDocumentListOcrPageSummaries/.test(documentsSource),
-  'document list must not run pages-based OCR review promotion during list attach (open/OCR paths own that work).',
+  ocrNormalizationBlock.includes('const candidates = documents.filter')
+    && ocrNormalizationBlock.includes('getDocumentListOcrPageSummaries(candidates.map')
+    && ocrNormalizationBlock.includes('if (candidates.length === 0) return documents')
+    && documentsSource.includes('WHERE doc_id IN (${placeholders})')
+    && documentsSource.includes('buildPageContentAvailableConditionStatusOnly')
+    && !statusOnlyContentBlock.includes('TRIM('),
+  'document list may repair inconsistent OCR status only for bounded current-page candidates, without full-library/body normalization.',
 )
 
 assert(

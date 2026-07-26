@@ -123,7 +123,7 @@ function isMissingError(error: unknown): boolean {
 
 function buildIdentity(
   kind: FileCapabilityKind,
-  value: Awaited<ReturnType<typeof stat>>,
+  value: NonNullable<Awaited<ReturnType<typeof stat>>>,
 ): FileIdentity {
   const identity: FileIdentity = {
     dev: String(value.dev),

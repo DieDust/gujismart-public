@@ -455,6 +455,7 @@ export interface ImportSelectionBatch {
 
 export interface LibraryImportQueueJobSnapshotV1 {
   id: number
+  libraryProjectId?: string
   filePaths: string[]
   folderId?: string | null
   folderAssignments?: Array<[string, string]>
@@ -463,6 +464,7 @@ export interface LibraryImportQueueJobSnapshotV1 {
 
 export interface LibraryImportQueueJobSnapshotV2 {
   id: number
+  libraryProjectId?: string
   selectionId: string | null
   sourceLabels: string[]
   pendingCount: number
@@ -721,6 +723,7 @@ export interface ImportProgressEvent {
 
 export interface ImportDocumentOptions {
   ocrEngine?: OcrEngine
+  libraryProjectId?: string
 }
 
 export interface BatchOcrOptions {
@@ -733,6 +736,7 @@ export interface ImportAutoOcrTaskCreateOptions {
   engine: OcrEngine
   batchSize: number
   sourceImportJobId?: string | null
+  libraryProjectId?: string
 }
 
 export interface ImportAutoOcrTaskItemInput {
@@ -1213,8 +1217,36 @@ export interface DocumentHealthReportOptions {
   refresh?: boolean
 }
 
+export const DEFAULT_LIBRARY_PROJECT_ID = 'library_project_default'
+
+export interface LibraryProject {
+  id: string
+  name: string
+  description: string
+  color: string
+  is_default: number
+  document_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateLibraryProjectPayload {
+  name: string
+  description?: string
+  color?: string
+  activate?: boolean
+}
+
+export interface MoveDocumentsToLibraryProjectResult {
+  requested: number
+  moved: number
+  from_project_ids: string[]
+  target_project_id: string
+}
+
 export interface Document {
   id: string
+  library_project_id: string
   title: string
   author: string | null
   dynasty: string | null
@@ -1981,6 +2013,7 @@ export interface OpenDocumentTarget {
 
 export interface Folder {
   id: string
+  library_project_id: string
   name: string
   parent_id: string | null
   external_path: string | null
@@ -2075,6 +2108,7 @@ export interface DocumentFolder {
 
 export interface Tag {
   id: string
+  library_project_id: string
   name: string
   color: string
   parent_id: string | null
@@ -2498,6 +2532,7 @@ export interface OnboardingStep {
 
 export interface ResearchProject {
   id: string
+  library_project_id: string
   name: string
   description: string
   status: ResearchProjectStatus
@@ -2568,6 +2603,44 @@ export interface ResearchNote {
 }
 
 export type ResearchNoteSourceType = 'manual' | 'search' | 'ai' | 'ai_research'
+
+export type ResearchNoteListSort = 'updated_desc' | 'created_desc' | 'document_asc' | 'page_asc' | 'kind_asc'
+
+export interface ListResearchNotesOptions {
+  limit?: number
+  offset?: number
+  includeOverview?: boolean
+  search?: string
+  searchColors?: string[]
+  projectId?: string
+  unassignedOnly?: boolean
+  kind?: ResearchKnowledgeKind
+  source?: ResearchNoteSourceType | 'reader'
+  color?: string
+  tag?: string
+  sort?: ResearchNoteListSort
+}
+
+export interface ResearchNoteListStats {
+  total: number
+  documentCount: number
+  tags: string[]
+  colorCount: number
+}
+
+export interface ResearchNoteListPage {
+  items: ResearchNote[]
+  total: number
+  limit: number
+  offset: number
+  scopeDocIds?: string[]
+  stats?: ResearchNoteListStats
+}
+
+export interface DeleteResearchNotesResult {
+  requested: number
+  deleted: number
+}
 
 export interface ResearchNotePayload {
   project_id?: string | null
@@ -3064,6 +3137,7 @@ export type AiChatMode = 'document' | 'library'
 
 export interface AiChatSession {
   id: string
+  library_project_id: string
   mode: AiChatMode
   doc_id?: string | null
   title: string
@@ -3123,6 +3197,7 @@ export interface AiResearchCreateTaskPayload extends AiResearchPlanPayload {
 
 export interface AiResearchTask {
   id: string
+  library_project_id: string
   project_id: string | null
   title: string
   goal: string
@@ -3288,6 +3363,7 @@ export interface AiResearchTaskStep {
 
 export interface AiResearchDataset {
   id: string
+  library_project_id: string
   task_id: string
   project_id: string | null
   name: string
@@ -3301,6 +3377,7 @@ export interface AiResearchDataset {
 
 export interface AiResearchRecord {
   id: string
+  library_project_id: string
   dataset_id: string
   task_id: string
   project_id: string | null
@@ -3635,6 +3712,23 @@ export interface SearchOptions {
   searchEngine?: 'fulltext' | 'vector'
   /** Default: literature (文献页码). */
   pageNumberMode?: ExportPageNumberMode
+  /**
+   * When set, export/preview/save builds from these on-screen groups instead of re-querying.
+   * Avoids a second full-corpus vector scan (main-process freeze on large indexes).
+   */
+  exportGroups?: SearchDocumentGroup[]
+  /** Optional warnings carried with exportGroups (e.g. vector model label). */
+  exportWarnings?: string[]
+  /**
+   * Vector export only: keep hits with cosine similarity ≥ this value (0–1).
+   * 0 or omitted = no score filter.
+   */
+  minVectorScore?: number
+  /**
+   * Max records to write on export/preview (vector evidence rows or fulltext paragraphs).
+   * Clamped server-side; omit for engine default.
+   */
+  maxExportRecords?: number
 }
 
 export interface SearchExportOptions {
@@ -3647,6 +3741,13 @@ export interface SearchExportOptions {
   searchEngine?: 'fulltext' | 'vector'
   /** Default: literature (文献页码). */
   pageNumberMode?: ExportPageNumberMode
+  /**
+   * Vector export only: keep hits with cosine similarity ≥ this value (0–1).
+   * 0 or omitted = no score filter.
+   */
+  minVectorScore?: number
+  /** Max exportable records after score filter (clamped). */
+  maxExportRecords?: number
 }
 
 export interface SearchExportPreviewItem {
@@ -3672,6 +3773,12 @@ export interface SearchExportPreviewResult {
   totalHits: number
   exportableParagraphs: number
   skippedHits: number
+  /** Hits dropped because score &lt; minVectorScore (vector export). */
+  filteredByMinScore?: number
+  /** Effective min similarity used for this preview (0 = none). */
+  minVectorScore?: number
+  /** Cap applied to exportable records. */
+  maxExportRecords?: number
   previewItems: SearchExportPreviewItem[]
 }
 
@@ -3683,6 +3790,10 @@ export interface SearchExportResult {
   content?: string
   exportableParagraphs?: number
   skippedHits?: number
+  /** Hits dropped because score &lt; minVectorScore (vector export). */
+  filteredByMinScore?: number
+  minVectorScore?: number
+  maxExportRecords?: number
 }
 
 export interface SaveSearchExcerptsOptions extends SearchOptions {

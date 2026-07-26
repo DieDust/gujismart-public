@@ -1,6 +1,11 @@
-import type { OcrEngine, TaskJobRecord } from '../shared/types'
+import { DEFAULT_LIBRARY_PROJECT_ID, type OcrEngine, type TaskJobRecord } from '../shared/types'
 import { queryAll, run, scheduleDatabaseSave, transaction } from './database'
 import { appendTaskItems, createTaskJob, getTaskJob } from './task-scheduler'
+import {
+  assertDocumentIdsInLibraryProject,
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+} from './library-projects'
 
 const IMPORT_AUTO_OCR_TASK_KIND = 'ocr.import-auto'
 const MAX_APPEND_ITEMS = 200
@@ -9,6 +14,7 @@ export interface CreateImportAutoOcrTaskInput {
   engine: OcrEngine
   batchSize: number
   sourceImportJobId?: string | null
+  libraryProjectId?: string | null
   nowMs?: number
 }
 
@@ -47,9 +53,10 @@ export function createImportAutoOcrTask(input: CreateImportAutoOcrTaskInput): Ta
   const engine = safeEngine(input.engine)
   const batchSize = safeBatchSize(input.batchSize)
   const sourceImportJobId = String(input.sourceImportJobId || '').trim() || null
+  const libraryProjectId = captureActiveLibraryProjectId(input.libraryProjectId)
   return createTaskJob({
     kind: IMPORT_AUTO_OCR_TASK_KIND,
-    settingsSnapshot: { engine, batchSize, sourceImportJobId },
+    settingsSnapshot: { engine, batchSize, sourceImportJobId, libraryProjectId },
     phase: 'staging',
     nowMs: input.nowMs,
   })
@@ -60,9 +67,11 @@ export function appendImportAutoOcrItems(
   items: ImportAutoOcrItemInput[],
   options?: { nowMs?: number },
 ): TaskJobRecord {
-  requireImportAutoOcrTask(jobId)
+  const job = requireImportAutoOcrTask(jobId)
   if (!Array.isArray(items)) throw new Error('import_auto_ocr_items_invalid')
   if (items.length > MAX_APPEND_ITEMS) throw new Error('import_auto_ocr_append_too_large')
+  const libraryProjectId = String(job.settingsSnapshot.libraryProjectId || DEFAULT_LIBRARY_PROJECT_ID)
+  assertDocumentIdsInLibraryProject(items.map((item) => item.docId), libraryProjectId)
   appendTaskItems(
     jobId,
     items.map((item) => {
@@ -121,23 +130,29 @@ export function listImportAutoOcrItems(jobId: string): ImportAutoOcrItem[] {
   })
 }
 
-export function listResumableImportAutoOcrTasks(): TaskJobRecord[] {
+export function listResumableImportAutoOcrTasks(libraryProjectId = getActiveLibraryProjectId()): TaskJobRecord[] {
   const rows = queryAll<{ id: string }>(
     `SELECT id FROM task_jobs
      WHERE kind = ? AND status IN ('queued', 'running')
      ORDER BY created_at, id`,
     [IMPORT_AUTO_OCR_TASK_KIND],
   )
-  return rows.map((row) => getTaskJob(row.id))
+  return rows
+    .map((row) => getTaskJob(row.id))
+    .filter((job) => String(job.settingsSnapshot.libraryProjectId || DEFAULT_LIBRARY_PROJECT_ID) === libraryProjectId)
 }
 
-export function recoverInterruptedImportAutoOcrTasks(nowMs = Date.now()): number {
+export function recoverInterruptedImportAutoOcrTasks(
+  nowMs = Date.now(),
+  libraryProjectId = getActiveLibraryProjectId(),
+): number {
   const interrupted = queryAll<{ item_id: string; attempt_id: string | null; job_id: string }>(
     `SELECT ti.id AS item_id, ti.active_attempt_id AS attempt_id, ti.job_id
      FROM task_items ti
      INNER JOIN task_jobs tj ON tj.id = ti.job_id
-     WHERE tj.kind = ? AND ti.status = 'running'`,
-    [IMPORT_AUTO_OCR_TASK_KIND],
+     WHERE tj.kind = ? AND ti.status = 'running'
+       AND COALESCE(json_extract(tj.settings_snapshot_json, '$.libraryProjectId'), ?) = ?`,
+    [IMPORT_AUTO_OCR_TASK_KIND, DEFAULT_LIBRARY_PROJECT_ID, libraryProjectId],
   )
   if (interrupted.length === 0) return 0
   transaction(() => {

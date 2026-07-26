@@ -2797,7 +2797,7 @@ export default function DocumentView({
           engine: 'vector',
         }
       })
-      void window.api.vectorSearch(query, { docId, limit: 40 })
+      void window.api.vectorSearch(query, { docId, limit: 200 })
         .then((response) => {
           if (searchRequestIdRef.current !== requestId) return
           documentSearchFetchedKeyRef.current = fetchKey

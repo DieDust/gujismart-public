@@ -7,6 +7,11 @@ import { fullTextSearch } from '../semantic-search'
 import { getErrorMessage } from '../../shared/errors'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
 import {
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
+import {
   buildResearchSeedQueries,
   evidenceItemToSearchResult,
   expandRelatedResearchQueries,
@@ -172,7 +177,18 @@ function makeSourceHash(parts: Array<string | number | null | undefined>): strin
 }
 
 function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
-  if (scope.type === 'documents') return uniqueStrings(scope.docIds || [])
+  const activeProjectId = getActiveLibraryProjectId()
+  if (scope.type === 'documents') {
+    const docIds = uniqueStrings(scope.docIds || [])
+    if (docIds.length === 0) return []
+    return queryAll<{ id: string }>(
+      `SELECT id
+       FROM documents
+       WHERE id IN (${docIds.map(() => '?').join(', ')})
+         AND library_project_id = ?`,
+      [...docIds, activeProjectId],
+    ).map((item) => item.id)
+  }
   if (scope.type === 'tags') {
     const tagIds = uniqueStrings(scope.tagIds || [])
     if (tagIds.length === 0) return []
@@ -183,7 +199,8 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
       sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
       params.push(tagId)
     })
-    sql += ' GROUP BY d.id ORDER BY d.updated_at DESC'
+    sql += ' WHERE d.library_project_id = ? GROUP BY d.id ORDER BY d.updated_at DESC'
+    params.push(activeProjectId)
     return queryAll<{ id: string }>(sql, params).map((item) => item.id)
   }
   if (scope.type === 'folders') {
@@ -194,8 +211,9 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
        WHERE df.folder_id IN (${folderIds.map(() => '?').join(', ')})
+         AND d.library_project_id = ?
        ORDER BY d.updated_at DESC`,
-      folderIds,
+      [...folderIds, activeProjectId],
     ).map((item) => item.id)
   }
   return undefined
@@ -226,6 +244,7 @@ async function planTask(payload: AiResearchPlanPayload): Promise<AiResearchPlan>
 }
 
 function createTask(payload: AiResearchCreateTaskPayload): AiResearchTask {
+  const libraryProjectId = getActiveLibraryProjectId()
   const goal = String(payload.goal || '').trim()
   if (!goal) throw new Error('请输入研究目标')
   const fields = normalizeFields(payload.fields)
@@ -236,12 +255,19 @@ function createTask(payload: AiResearchCreateTaskPayload): AiResearchTask {
   const kind = normalizeAiResearchTaskKind(payload.kind, goal)
   const id = nanoid()
   const now = new Date().toISOString()
+  if (payload.projectId && !queryOne(
+    'SELECT 1 FROM research_projects WHERE id = ? AND library_project_id = ?',
+    [payload.projectId, libraryProjectId],
+  )) {
+    throw new Error('Research project does not belong to the active library project')
+  }
   run(
     `INSERT INTO ai_research_tasks (
-      id, project_id, title, goal, kind, scope_json, field_schema_json, suggested_queries_json, status, error_message, dataset_id, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', NULL, ?, ?)`,
+      id, library_project_id, project_id, title, goal, kind, scope_json, field_schema_json, suggested_queries_json, status, error_message, dataset_id, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', NULL, ?, ?)`,
     [
       id,
+      libraryProjectId,
       payload.projectId || null,
       String(payload.title || goal).trim().slice(0, 80) || 'AI 研究任务',
       goal,
@@ -258,15 +284,26 @@ function createTask(payload: AiResearchCreateTaskPayload): AiResearchTask {
 }
 
 function getTask(taskId: string): AiResearchTask {
-  const task = rowToTask(queryOne<AiResearchTask>('SELECT * FROM ai_research_tasks WHERE id = ?', [taskId]))
+  const libraryProjectId = getActiveLibraryProjectId()
+  const task = rowToTask(queryOne<AiResearchTask>(
+    'SELECT * FROM ai_research_tasks WHERE id = ? AND library_project_id = ?',
+    [taskId, libraryProjectId],
+  ))
   task.record_count = Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM ai_research_records WHERE task_id = ?', [taskId])?.count || 0)
   return task
 }
 
 function listTasks(projectId?: string | null): AiResearchTask[] {
+  const libraryProjectId = getActiveLibraryProjectId()
   const rows = projectId
-    ? queryAll<AiResearchTask>('SELECT * FROM ai_research_tasks WHERE project_id = ? ORDER BY updated_at DESC', [projectId])
-    : queryAll<AiResearchTask>('SELECT * FROM ai_research_tasks ORDER BY updated_at DESC')
+    ? queryAll<AiResearchTask>(
+        'SELECT * FROM ai_research_tasks WHERE library_project_id = ? AND project_id = ? ORDER BY updated_at DESC',
+        [libraryProjectId, projectId],
+      )
+    : queryAll<AiResearchTask>(
+        'SELECT * FROM ai_research_tasks WHERE library_project_id = ? ORDER BY updated_at DESC',
+        [libraryProjectId],
+      )
   return rows.map((row) => {
     const task = rowToTask(row)
     task.record_count = Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM ai_research_records WHERE task_id = ?', [task.id])?.count || 0)
@@ -288,6 +325,7 @@ function upsertStep(taskId: string, stepKey: string, title: string, status: AiRe
 }
 
 function listSteps(taskId: string): AiResearchTaskStep[] {
+  getTask(taskId)
   return queryAll<AiResearchTaskStep>('SELECT * FROM ai_research_task_steps WHERE task_id = ? ORDER BY created_at', [taskId])
 }
 
@@ -503,10 +541,11 @@ function insertStatisticalRecords(
     const summary = `本地统计：${stat.query} 命中文献 ${stat.documentCount} 篇、页面 ${stat.pageCount} 页、出现 ${stat.hitCount} 次。`
     run(
       `INSERT INTO ai_research_records (
-        id, dataset_id, task_id, project_id, doc_id, page_num, excerpt, locator_json, source_hash, values_json, confidence, status, note, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+        id, library_project_id, dataset_id, task_id, project_id, doc_id, page_num, excerpt, locator_json, source_hash, values_json, confidence, status, note, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
       [
         nanoid(),
+        task.library_project_id,
         datasetId,
         task.id,
         task.project_id,
@@ -593,11 +632,14 @@ async function runTask(taskId: string): Promise<AiResearchRunResult> {
     }
 
     const datasetId = task.dataset_id || nanoid()
-    const datasetExists = queryOne<{ id: string }>('SELECT id FROM ai_research_datasets WHERE id = ?', [datasetId])
+    const datasetExists = queryOne<{ id: string }>(
+      'SELECT id FROM ai_research_datasets WHERE id = ? AND library_project_id = ?',
+      [datasetId, task.library_project_id],
+    )
     if (!datasetExists) {
       run(
-        'INSERT INTO ai_research_datasets (id, task_id, project_id, name, description, field_schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [datasetId, task.id, task.project_id, `${task.title} 数据集`, task.goal, task.field_schema_json, now, now],
+        'INSERT INTO ai_research_datasets (id, library_project_id, task_id, project_id, name, description, field_schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [datasetId, task.library_project_id, task.id, task.project_id, `${task.title} 数据集`, task.goal, task.field_schema_json, now, now],
       )
       run('UPDATE ai_research_tasks SET dataset_id = ? WHERE id = ?', [datasetId, task.id])
     }
@@ -634,10 +676,11 @@ async function runTask(taskId: string): Promise<AiResearchRunResult> {
         const extracted = await extractValuesFromHit(task, hit)
         run(
           `INSERT INTO ai_research_records (
-            id, dataset_id, task_id, project_id, doc_id, page_num, excerpt, locator_json, source_hash, values_json, confidence, status, note, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+            id, library_project_id, dataset_id, task_id, project_id, doc_id, page_num, excerpt, locator_json, source_hash, values_json, confidence, status, note, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
           [
             nanoid(),
+            task.library_project_id,
             datasetId,
             task.id,
             task.project_id,
@@ -679,15 +722,26 @@ async function runTask(taskId: string): Promise<AiResearchRunResult> {
 }
 
 function getDataset(datasetId: string): AiResearchDataset {
-  const dataset = rowToDataset(queryOne<AiResearchDataset>('SELECT * FROM ai_research_datasets WHERE id = ?', [datasetId]))
+  const libraryProjectId = getActiveLibraryProjectId()
+  const dataset = rowToDataset(queryOne<AiResearchDataset>(
+    'SELECT * FROM ai_research_datasets WHERE id = ? AND library_project_id = ?',
+    [datasetId, libraryProjectId],
+  ))
   dataset.record_count = Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM ai_research_records WHERE dataset_id = ?', [datasetId])?.count || 0)
   return dataset
 }
 
 function listDatasets(projectId?: string | null): AiResearchDataset[] {
+  const libraryProjectId = getActiveLibraryProjectId()
   const rows = projectId
-    ? queryAll<AiResearchDataset>('SELECT * FROM ai_research_datasets WHERE project_id = ? ORDER BY updated_at DESC', [projectId])
-    : queryAll<AiResearchDataset>('SELECT * FROM ai_research_datasets ORDER BY updated_at DESC')
+    ? queryAll<AiResearchDataset>(
+        'SELECT * FROM ai_research_datasets WHERE library_project_id = ? AND project_id = ? ORDER BY updated_at DESC',
+        [libraryProjectId, projectId],
+      )
+    : queryAll<AiResearchDataset>(
+        'SELECT * FROM ai_research_datasets WHERE library_project_id = ? ORDER BY updated_at DESC',
+        [libraryProjectId],
+      )
   return rows.map((row) => getDataset(row.id))
 }
 
@@ -703,20 +757,27 @@ function normalizeRecordListOptions(options?: AiResearchRecordListOptions): { li
 }
 
 function listRecords(datasetId: string, options?: AiResearchRecordListOptions): AiResearchRecord[] {
+  const dataset = getDataset(datasetId)
   const paging = normalizeRecordListOptions(options)
   return queryAll<AiResearchRecord & { doc_title?: string }>(
     `SELECT r.*, d.title as doc_title
      FROM ai_research_records r
      LEFT JOIN documents d ON d.id = r.doc_id
-     WHERE r.dataset_id = ?
+     WHERE r.dataset_id = ? AND r.library_project_id = ?
      ORDER BY r.created_at ASC
      ${paging ? 'LIMIT ? OFFSET ?' : ''}`,
-    paging ? [datasetId, paging.limit, paging.offset] : [datasetId],
+    paging
+      ? [datasetId, dataset.library_project_id, paging.limit, paging.offset]
+      : [datasetId, dataset.library_project_id],
   ).map(rowToRecord)
 }
 
 function updateRecord(recordId: string, payload: AiResearchRecordUpdatePayload): AiResearchRecord {
-  const existing = rowToRecord(queryOne<AiResearchRecord>('SELECT * FROM ai_research_records WHERE id = ?', [recordId]))
+  const libraryProjectId = getActiveLibraryProjectId()
+  const existing = rowToRecord(queryOne<AiResearchRecord>(
+    'SELECT * FROM ai_research_records WHERE id = ? AND library_project_id = ?',
+    [recordId, libraryProjectId],
+  ))
   const nextValues = payload.values ? payload.values : existing.values || {}
   const nextStatus = payload.status || existing.status
   let versionStatus: 'pending' | 'confirmed' | 'excluded' = 'pending'
@@ -730,7 +791,10 @@ function updateRecord(recordId: string, payload: AiResearchRecordUpdatePayload):
     note: nextNote,
   })
   saveDatabase()
-  return rowToRecord(queryOne<AiResearchRecord>('SELECT * FROM ai_research_records WHERE id = ?', [recordId]))
+  return rowToRecord(queryOne<AiResearchRecord>(
+    'SELECT * FROM ai_research_records WHERE id = ? AND library_project_id = ?',
+    [recordId, libraryProjectId],
+  ))
 }
 
 function excludeRecord(recordId: string): AiResearchRecord {
@@ -764,7 +828,10 @@ function recordsToMarkdown(dataset: AiResearchDataset, records: AiResearchRecord
 function getScopeDocumentSummary(scope: LibraryAiScope): { label: string; count: number; titles: string[] } {
   const docIds = getDocumentIdsForScope(scope)
   if (!docIds) {
-    const count = Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM documents')?.count || 0)
+    const count = Number(queryOne<{ count: number }>(
+      'SELECT COUNT(*) as count FROM documents WHERE library_project_id = ?',
+      [getActiveLibraryProjectId()],
+    )?.count || 0)
     return { label: '整个数据库', count, titles: [] }
   }
   if (docIds.length === 0) return { label: '空范围', count: 0, titles: [] }
@@ -931,20 +998,63 @@ function exportDataset(datasetId: string, format: 'csv' | 'markdown' | 'json' = 
 }
 
 export function registerAiResearchIpc(): void {
-  ipcMain.handle('aiResearch:planTask', async (_event, payload: AiResearchPlanPayload): Promise<AiResearchPlan> => planTask(payload))
-  ipcMain.handle('aiResearch:createTask', async (_event, payload: AiResearchCreateTaskPayload): Promise<AiResearchTask> => createTask(payload))
-  ipcMain.handle('aiResearch:runTask', async (_event, taskId: string): Promise<AiResearchRunResult> => runTask(taskId))
-  ipcMain.handle('aiResearch:previewRetrieval', async (_event, payload: AiResearchRetrievalPreviewPayload): Promise<AiResearchRetrievalStats> => previewResearchRetrieval(payload))
-  ipcMain.handle('aiResearch:runRetrieval', async (_event, taskId: string): Promise<AiResearchRetrievalRunResult> => runResearchRetrievalForTask(getTask(taskId)))
-  ipcMain.handle('aiResearch:getRetrievalStats', async (_event, taskId: string): Promise<AiResearchRetrievalStats | null> => getLatestResearchRetrievalStats(taskId))
-  ipcMain.handle('aiResearch:getEvidencePack', async (_event, taskId: string): Promise<AiResearchEvidencePack | null> => getLatestResearchEvidencePack(taskId))
-  ipcMain.handle('aiResearch:listTasks', async (_event, projectId?: string | null): Promise<AiResearchTask[]> => listTasks(projectId))
-  ipcMain.handle('aiResearch:getTask', async (_event, taskId: string): Promise<AiResearchTask> => getTask(taskId))
-  ipcMain.handle('aiResearch:listTaskSteps', async (_event, taskId: string): Promise<AiResearchTaskStep[]> => listSteps(taskId))
-  ipcMain.handle('aiResearch:listDatasets', async (_event, projectId?: string | null): Promise<AiResearchDataset[]> => listDatasets(projectId))
-  ipcMain.handle('aiResearch:listRecords', async (_event, datasetId: string, options?: AiResearchRecordListOptions): Promise<AiResearchRecord[]> => listRecords(datasetId, options))
-  ipcMain.handle('aiResearch:updateRecord', async (_event, recordId: string, payload: AiResearchRecordUpdatePayload): Promise<AiResearchRecord> => updateRecord(recordId, payload))
-  ipcMain.handle('aiResearch:excludeRecord', async (_event, recordId: string): Promise<AiResearchRecord> => excludeRecord(recordId))
-  ipcMain.handle('aiResearch:generateReport', async (_event, payload: AiResearchReportPayload): Promise<{ content: string; outputId: string | null }> => generateReport(payload))
-  ipcMain.handle('aiResearch:exportDataset', async (_event, datasetId: string, format?: 'csv' | 'markdown' | 'json'): Promise<AiResearchExportResult> => exportDataset(datasetId, format))
+  const inCapturedLibraryProject = <T>(operation: () => T): T => {
+    const projectId = captureActiveLibraryProjectId()
+    return withLibraryProjectContext(projectId, operation)
+  }
+
+  ipcMain.handle('aiResearch:planTask', async (_event, payload: AiResearchPlanPayload): Promise<AiResearchPlan> => (
+    inCapturedLibraryProject(() => planTask(payload))
+  ))
+  ipcMain.handle('aiResearch:createTask', async (_event, payload: AiResearchCreateTaskPayload): Promise<AiResearchTask> => (
+    inCapturedLibraryProject(() => createTask(payload))
+  ))
+  ipcMain.handle('aiResearch:runTask', async (_event, taskId: string): Promise<AiResearchRunResult> => (
+    inCapturedLibraryProject(() => runTask(taskId))
+  ))
+  ipcMain.handle('aiResearch:previewRetrieval', async (_event, payload: AiResearchRetrievalPreviewPayload): Promise<AiResearchRetrievalStats> => (
+    inCapturedLibraryProject(() => previewResearchRetrieval(payload))
+  ))
+  ipcMain.handle('aiResearch:runRetrieval', async (_event, taskId: string): Promise<AiResearchRetrievalRunResult> => (
+    inCapturedLibraryProject(() => runResearchRetrievalForTask(getTask(taskId)))
+  ))
+  ipcMain.handle('aiResearch:getRetrievalStats', async (_event, taskId: string): Promise<AiResearchRetrievalStats | null> => (
+    inCapturedLibraryProject(() => {
+      getTask(taskId)
+      return getLatestResearchRetrievalStats(taskId)
+    })
+  ))
+  ipcMain.handle('aiResearch:getEvidencePack', async (_event, taskId: string): Promise<AiResearchEvidencePack | null> => (
+    inCapturedLibraryProject(() => {
+      getTask(taskId)
+      return getLatestResearchEvidencePack(taskId)
+    })
+  ))
+  ipcMain.handle('aiResearch:listTasks', async (_event, projectId?: string | null): Promise<AiResearchTask[]> => (
+    inCapturedLibraryProject(() => listTasks(projectId))
+  ))
+  ipcMain.handle('aiResearch:getTask', async (_event, taskId: string): Promise<AiResearchTask> => (
+    inCapturedLibraryProject(() => getTask(taskId))
+  ))
+  ipcMain.handle('aiResearch:listTaskSteps', async (_event, taskId: string): Promise<AiResearchTaskStep[]> => (
+    inCapturedLibraryProject(() => listSteps(taskId))
+  ))
+  ipcMain.handle('aiResearch:listDatasets', async (_event, projectId?: string | null): Promise<AiResearchDataset[]> => (
+    inCapturedLibraryProject(() => listDatasets(projectId))
+  ))
+  ipcMain.handle('aiResearch:listRecords', async (_event, datasetId: string, options?: AiResearchRecordListOptions): Promise<AiResearchRecord[]> => (
+    inCapturedLibraryProject(() => listRecords(datasetId, options))
+  ))
+  ipcMain.handle('aiResearch:updateRecord', async (_event, recordId: string, payload: AiResearchRecordUpdatePayload): Promise<AiResearchRecord> => (
+    inCapturedLibraryProject(() => updateRecord(recordId, payload))
+  ))
+  ipcMain.handle('aiResearch:excludeRecord', async (_event, recordId: string): Promise<AiResearchRecord> => (
+    inCapturedLibraryProject(() => excludeRecord(recordId))
+  ))
+  ipcMain.handle('aiResearch:generateReport', async (_event, payload: AiResearchReportPayload): Promise<{ content: string; outputId: string | null }> => (
+    inCapturedLibraryProject(() => generateReport(payload))
+  ))
+  ipcMain.handle('aiResearch:exportDataset', async (_event, datasetId: string, format?: 'csv' | 'markdown' | 'json'): Promise<AiResearchExportResult> => (
+    inCapturedLibraryProject(() => exportDataset(datasetId, format))
+  ))
 }

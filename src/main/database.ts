@@ -1,4 +1,5 @@
 ﻿import { app } from 'electron'
+import { randomUUID } from 'crypto'
 import { basename, dirname, join, normalize, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { is } from '@electron-toolkit/utils'
@@ -295,6 +296,10 @@ export function getDatabaseFilePath(): string {
   return dbFilePath
 }
 
+export async function backupDatabaseTo(destinationPath: string): Promise<void> {
+  await getDatabase().backup(destinationPath)
+}
+
 export function isFtsAvailable(): boolean {
   return ftsAvailable
 }
@@ -319,8 +324,19 @@ function runOn(sqlite: NativeDatabase, sql: string, params?: unknown[]): void {
 }
 
 const TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS library_projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  color TEXT DEFAULT '#1677ff',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS documents (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   title TEXT NOT NULL,
   author TEXT,
   dynasty TEXT,
@@ -343,7 +359,8 @@ CREATE TABLE IF NOT EXISTS documents (
   metadata_status TEXT DEFAULT 'pending',
   metadata TEXT DEFAULT '{}',
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS pages (
@@ -387,6 +404,7 @@ CREATE TABLE IF NOT EXISTS page_ocr_versions (
 
 CREATE TABLE IF NOT EXISTS folders (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   name TEXT NOT NULL,
   parent_id TEXT,
   external_path TEXT,
@@ -395,7 +413,8 @@ CREATE TABLE IF NOT EXISTS folders (
   sort_order INTEGER DEFAULT 0,
   created_at TEXT,
   updated_at TEXT,
-  FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE SET NULL
+  FOREIGN KEY (parent_id) REFERENCES folders(id) ON DELETE SET NULL,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS document_folders (
@@ -408,7 +427,8 @@ CREATE TABLE IF NOT EXISTS document_folders (
 
 CREATE TABLE IF NOT EXISTS tags (
   id TEXT PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
+  library_project_id TEXT,
+  name TEXT NOT NULL,
   color TEXT DEFAULT '#1890ff',
   parent_id TEXT,
   source TEXT DEFAULT 'manual',
@@ -417,7 +437,8 @@ CREATE TABLE IF NOT EXISTS tags (
   normalized_name TEXT,
   created_at TEXT,
   updated_at TEXT,
-  FOREIGN KEY (parent_id) REFERENCES tags(id) ON DELETE SET NULL
+  FOREIGN KEY (parent_id) REFERENCES tags(id) ON DELETE SET NULL,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS document_tags (
@@ -472,13 +493,15 @@ CREATE TABLE IF NOT EXISTS ai_results (
 
 CREATE TABLE IF NOT EXISTS ai_chat_sessions (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   mode TEXT NOT NULL,
   doc_id TEXT,
   title TEXT NOT NULL,
   scope_json TEXT DEFAULT '',
   created_at TEXT,
   updated_at TEXT,
-  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS ai_chat_turns (
@@ -744,11 +767,13 @@ CREATE TABLE IF NOT EXISTS onboarding_progress (
 
 CREATE TABLE IF NOT EXISTS research_projects (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   name TEXT NOT NULL,
   description TEXT DEFAULT '',
   status TEXT DEFAULT 'active',
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS research_project_documents (
@@ -1004,6 +1029,7 @@ CREATE INDEX IF NOT EXISTS idx_research_claim_entries_manifest ON research_claim
 
 CREATE TABLE IF NOT EXISTS ai_research_tasks (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   project_id TEXT,
   title TEXT NOT NULL,
   goal TEXT NOT NULL,
@@ -1016,7 +1042,8 @@ CREATE TABLE IF NOT EXISTS ai_research_tasks (
   dataset_id TEXT,
   created_at TEXT,
   updated_at TEXT,
-  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS ai_research_task_steps (
@@ -1034,6 +1061,7 @@ CREATE TABLE IF NOT EXISTS ai_research_task_steps (
 
 CREATE TABLE IF NOT EXISTS ai_research_datasets (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   task_id TEXT NOT NULL,
   project_id TEXT,
   name TEXT NOT NULL,
@@ -1042,11 +1070,13 @@ CREATE TABLE IF NOT EXISTS ai_research_datasets (
   created_at TEXT,
   updated_at TEXT,
   FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
-  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL
+  FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS ai_research_records (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   dataset_id TEXT NOT NULL,
   task_id TEXT NOT NULL,
   project_id TEXT,
@@ -1064,7 +1094,8 @@ CREATE TABLE IF NOT EXISTS ai_research_records (
   FOREIGN KEY (dataset_id) REFERENCES ai_research_datasets(id) ON DELETE CASCADE,
   FOREIGN KEY (task_id) REFERENCES ai_research_tasks(id) ON DELETE CASCADE,
   FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL,
-  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+  FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS ai_research_retrieval_runs (
@@ -1214,6 +1245,7 @@ CREATE TABLE IF NOT EXISTS document_toc_items (
 
 CREATE TABLE IF NOT EXISTS search_index_segments (
   segment_id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   doc_id TEXT NOT NULL,
   page_id TEXT,
   page_num INTEGER,
@@ -1244,6 +1276,7 @@ CREATE TABLE IF NOT EXISTS search_ngram_index (
 CREATE TABLE IF NOT EXISTS search_index_segments_staging (
   job_id TEXT NOT NULL,
   segment_id TEXT NOT NULL,
+  library_project_id TEXT,
   doc_id TEXT NOT NULL,
   page_id TEXT,
   page_num INTEGER,
@@ -1283,6 +1316,7 @@ CREATE TABLE IF NOT EXISTS search_index_status (
 
 CREATE TABLE IF NOT EXISTS embedding_chunks (
   segment_id TEXT NOT NULL,
+  library_project_id TEXT,
   doc_id TEXT NOT NULL,
   page_id TEXT,
   page_num INTEGER,
@@ -1500,30 +1534,38 @@ CREATE INDEX IF NOT EXISTS idx_saved_searches_updated_at ON saved_searches(updat
 CREATE INDEX IF NOT EXISTS idx_ai_results_doc_id ON ai_results(doc_id);
 CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_doc_id ON ai_chat_sessions(doc_id);
 CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_mode_doc ON ai_chat_sessions(mode, doc_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_library_project ON ai_chat_sessions(library_project_id, mode, updated_at);
 CREATE INDEX IF NOT EXISTS idx_ai_chat_turns_session ON ai_chat_turns(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_batch_queue_batch_id ON batch_queue(batch_id);
 CREATE INDEX IF NOT EXISTS idx_batch_queue_doc_id ON batch_queue(doc_id);
 CREATE INDEX IF NOT EXISTS idx_citation_templates_style_id ON citation_templates(style_id);
 CREATE INDEX IF NOT EXISTS idx_citation_templates_style_type ON citation_templates(style_id, format_type);
 CREATE INDEX IF NOT EXISTS idx_documents_import_status ON documents(import_status);
+CREATE INDEX IF NOT EXISTS idx_documents_library_project ON documents(library_project_id, import_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_folders_library_project ON folders(library_project_id, parent_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_documents_ocr_status ON documents(ocr_status);
 CREATE INDEX IF NOT EXISTS idx_documents_doc_type ON documents(doc_type);
 CREATE INDEX IF NOT EXISTS idx_documents_is_favorite ON documents(is_favorite);
 CREATE INDEX IF NOT EXISTS idx_documents_read_status ON documents(read_status);
 CREATE INDEX IF NOT EXISTS idx_documents_metadata_status ON documents(metadata_status);
 CREATE INDEX IF NOT EXISTS idx_tags_normalized_name ON tags(normalized_name);
+CREATE INDEX IF NOT EXISTS idx_tags_library_project ON tags(library_project_id, normalized_name);
 CREATE INDEX IF NOT EXISTS idx_research_notes_project_id ON research_notes(project_id);
 CREATE INDEX IF NOT EXISTS idx_research_notes_doc_id ON research_notes(doc_id);
 CREATE INDEX IF NOT EXISTS idx_research_notes_outline_id ON research_notes(outline_id);
 CREATE INDEX IF NOT EXISTS idx_research_notes_source_hash ON research_notes(doc_id, source_hash);
 CREATE INDEX IF NOT EXISTS idx_research_project_documents_doc_id ON research_project_documents(doc_id);
+CREATE INDEX IF NOT EXISTS idx_research_projects_library_project ON research_projects(library_project_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_research_outline_project_order ON research_outline_items(project_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_research_outputs_project_id ON research_outputs(project_id);
 CREATE INDEX IF NOT EXISTS idx_ai_research_tasks_project ON ai_research_tasks(project_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_tasks_library_project ON ai_research_tasks(library_project_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_ai_research_steps_task ON ai_research_task_steps(task_id, step_key);
 CREATE INDEX IF NOT EXISTS idx_ai_research_datasets_project ON ai_research_datasets(project_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ai_research_datasets_library_project ON ai_research_datasets(library_project_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_ai_research_records_dataset ON ai_research_records(dataset_id, status);
 CREATE INDEX IF NOT EXISTS idx_ai_research_records_doc ON ai_research_records(doc_id, page_num);
+CREATE INDEX IF NOT EXISTS idx_ai_research_records_library_project ON ai_research_records(library_project_id, dataset_id, status);
 CREATE INDEX IF NOT EXISTS idx_ai_research_retrieval_runs_task ON ai_research_retrieval_runs(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ai_research_retrieval_stats_task ON ai_research_retrieval_stats(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ai_research_evidence_packs_task ON ai_research_evidence_packs(task_id, created_at);
@@ -1540,6 +1582,8 @@ CREATE INDEX IF NOT EXISTS idx_document_toc_doc_page ON document_toc_items(doc_i
 CREATE INDEX IF NOT EXISTS idx_document_toc_doc_source ON document_toc_items(doc_id, source);
 CREATE INDEX IF NOT EXISTS idx_search_segments_doc_id ON search_index_segments(doc_id);
 CREATE INDEX IF NOT EXISTS idx_search_segments_page_num ON search_index_segments(doc_id, page_num, ordinal);
+CREATE INDEX IF NOT EXISTS idx_search_segments_library_project ON search_index_segments(library_project_id, doc_id, page_num, ordinal);
+CREATE INDEX IF NOT EXISTS idx_embedding_chunks_library_project_model ON embedding_chunks(library_project_id, model_id, doc_id, page_num);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_doc_id ON search_ngram_index(doc_id);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_segment ON search_ngram_index(segment_id);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_hit_count ON search_ngram_index(gram, hit_count);
@@ -1623,6 +1667,256 @@ function addColumnIfMissing(sqlite: NativeDatabase, tableName: string, columnSql
   if (!hasColumn(sqlite, tableName, columnName)) {
     sqlite.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnSql}`)
   }
+}
+
+function migrateTagsToLibraryProjects(sqlite: NativeDatabase, defaultProjectId: string): void {
+  if (hasColumn(sqlite, 'tags', 'library_project_id')) return
+
+  type LegacyTagRow = {
+    id: string
+    name: string
+    color?: string | null
+    parent_id?: string | null
+    source?: string | null
+    confidence?: number | null
+    usage_count?: number | null
+    normalized_name?: string | null
+    created_at?: string | null
+    updated_at?: string | null
+  }
+  type LegacyDocumentTagRow = {
+    doc_id: string
+    tag_id: string
+    library_project_id?: string | null
+    is_manual?: number | null
+    is_metadata?: number | null
+    source_field?: string | null
+    confidence?: number | null
+    created_at?: string | null
+    updated_at?: string | null
+  }
+
+  const tags = sqlite.prepare('SELECT * FROM tags ORDER BY id').all() as LegacyTagRow[]
+  const bindings = sqlite.prepare(
+    `SELECT dt.*, d.library_project_id
+     FROM document_tags dt
+     INNER JOIN documents d ON d.id = dt.doc_id`,
+  ).all() as LegacyDocumentTagRow[]
+  const projectIdsByTag = new Map<string, Set<string>>()
+  bindings.forEach((binding) => {
+    const projectId = String(binding.library_project_id || defaultProjectId)
+    const projects = projectIdsByTag.get(binding.tag_id) || new Set<string>()
+    projects.add(projectId)
+    projectIdsByTag.set(binding.tag_id, projects)
+  })
+
+  const mapping = new Map<string, string>()
+  const mappingKey = (tagId: string, projectId: string) => `${tagId}\u001f${projectId}`
+  const migratedRows: Array<LegacyTagRow & { migratedId: string; projectId: string }> = []
+  tags.forEach((tag) => {
+    const usedProjects = [...(projectIdsByTag.get(tag.id) || new Set<string>([defaultProjectId]))]
+      .sort((left, right) => {
+        if (left === defaultProjectId) return -1
+        if (right === defaultProjectId) return 1
+        return left.localeCompare(right)
+      })
+    usedProjects.forEach((projectId, index) => {
+      const migratedId = index === 0 ? tag.id : `tag_${randomUUID()}`
+      mapping.set(mappingKey(tag.id, projectId), migratedId)
+      migratedRows.push({ ...tag, migratedId, projectId })
+    })
+  })
+
+  sqlite.pragma('foreign_keys = OFF')
+  try {
+    sqlite.transaction(() => {
+      sqlite.exec(`
+        CREATE TABLE tags_project_migration (
+          id TEXT PRIMARY KEY,
+          library_project_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          color TEXT DEFAULT '#1890ff',
+          parent_id TEXT,
+          source TEXT DEFAULT 'manual',
+          confidence REAL,
+          usage_count INTEGER DEFAULT 0,
+          normalized_name TEXT,
+          created_at TEXT,
+          updated_at TEXT,
+          FOREIGN KEY (parent_id) REFERENCES tags_project_migration(id) ON DELETE SET NULL,
+          FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
+        );
+        CREATE TABLE document_tags_project_migration (
+          doc_id TEXT NOT NULL,
+          tag_id TEXT NOT NULL,
+          is_manual INTEGER DEFAULT 1,
+          is_metadata INTEGER DEFAULT 0,
+          source_field TEXT,
+          confidence REAL,
+          created_at TEXT,
+          updated_at TEXT,
+          PRIMARY KEY (doc_id, tag_id),
+          FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+          FOREIGN KEY (tag_id) REFERENCES tags_project_migration(id) ON DELETE CASCADE
+        );
+      `)
+      const insertTag = sqlite.prepare(
+        `INSERT INTO tags_project_migration
+         (id, library_project_id, name, color, parent_id, source, confidence, usage_count, normalized_name, created_at, updated_at)
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+      )
+      migratedRows.forEach((row) => {
+        insertTag.run(
+          row.migratedId,
+          row.projectId,
+          row.name,
+          row.color || '#1890ff',
+          row.source || 'manual',
+          row.confidence ?? null,
+          Number(row.usage_count || 0),
+          row.normalized_name || normalizeTagName(row.name),
+          row.created_at || null,
+          row.updated_at || null,
+        )
+      })
+      const updateParent = sqlite.prepare('UPDATE tags_project_migration SET parent_id = ? WHERE id = ?')
+      migratedRows.forEach((row) => {
+        const parentId = row.parent_id ? mapping.get(mappingKey(row.parent_id, row.projectId)) || null : null
+        if (parentId) updateParent.run(parentId, row.migratedId)
+      })
+      const insertBinding = sqlite.prepare(
+        `INSERT OR IGNORE INTO document_tags_project_migration
+         (doc_id, tag_id, is_manual, is_metadata, source_field, confidence, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      bindings.forEach((binding) => {
+        const projectId = String(binding.library_project_id || defaultProjectId)
+        const migratedTagId = mapping.get(mappingKey(binding.tag_id, projectId))
+        if (!migratedTagId) return
+        insertBinding.run(
+          binding.doc_id,
+          migratedTagId,
+          Number(binding.is_manual ?? 1),
+          Number(binding.is_metadata ?? 0),
+          binding.source_field || null,
+          binding.confidence ?? null,
+          binding.created_at || null,
+          binding.updated_at || null,
+        )
+      })
+      sqlite.exec(`
+        DROP TABLE document_tags;
+        DROP TABLE tags;
+        ALTER TABLE tags_project_migration RENAME TO tags;
+        ALTER TABLE document_tags_project_migration RENAME TO document_tags;
+      `)
+    })()
+  } finally {
+    sqlite.pragma('foreign_keys = ON')
+  }
+}
+
+function migrateFoldersToLibraryProjects(sqlite: NativeDatabase, defaultProjectId: string): void {
+  const completed = sqlite.prepare(
+    "SELECT value FROM settings WHERE key = 'library_project_folder_migration_v1'",
+  ).get() as { value?: string } | undefined
+  if (completed?.value === '1') return
+
+  type FolderMigrationRow = {
+    id: string
+    library_project_id?: string | null
+    name: string
+    parent_id?: string | null
+    external_path?: string | null
+    icon?: string | null
+    color?: string | null
+    sort_order?: number | null
+    created_at?: string | null
+    updated_at?: string | null
+  }
+  const folders = sqlite.prepare('SELECT * FROM folders ORDER BY id').all() as FolderMigrationRow[]
+  if (folders.length === 0) return
+  const foldersById = new Map(folders.map((folder) => [folder.id, folder]))
+  const projectsByFolder = new Map<string, Set<string>>()
+  const directRelations = sqlite.prepare(
+    `SELECT df.doc_id, df.folder_id, d.library_project_id
+     FROM document_folders df
+     INNER JOIN documents d ON d.id = df.doc_id`,
+  ).all() as Array<{ doc_id: string; folder_id: string; library_project_id?: string | null }>
+  directRelations.forEach((relation) => {
+    const projectId = String(relation.library_project_id || defaultProjectId)
+    let folderId: string | null = relation.folder_id
+    const visited = new Set<string>()
+    while (folderId && !visited.has(folderId)) {
+      visited.add(folderId)
+      const projects = projectsByFolder.get(folderId) || new Set<string>()
+      projects.add(projectId)
+      projectsByFolder.set(folderId, projects)
+      folderId = String(foldersById.get(folderId)?.parent_id || '') || null
+    }
+  })
+
+  const mapping = new Map<string, string>()
+  const mappingKey = (folderId: string, projectId: string) => `${folderId}\u001f${projectId}`
+  const copies: Array<{ source: FolderMigrationRow; id: string; projectId: string }> = []
+  folders.forEach((folder) => {
+    const ownerProjectId = String(folder.library_project_id || defaultProjectId)
+    const projects = [...(projectsByFolder.get(folder.id) || new Set<string>([ownerProjectId]))]
+    if (!projects.includes(ownerProjectId)) projects.unshift(ownerProjectId)
+    projects.forEach((projectId) => {
+      const id = projectId === ownerProjectId ? folder.id : `folder_${randomUUID()}`
+      mapping.set(mappingKey(folder.id, projectId), id)
+      copies.push({ source: folder, id, projectId })
+    })
+  })
+
+  sqlite.transaction(() => {
+    const insertFolder = sqlite.prepare(
+      `INSERT INTO folders
+       (id, library_project_id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+    )
+    copies.forEach(({ source, id, projectId }) => {
+      if (id === source.id) {
+        sqlite.prepare('UPDATE folders SET library_project_id = ? WHERE id = ?').run(projectId, id)
+        return
+      }
+      insertFolder.run(
+        id,
+        projectId,
+        source.name,
+        source.external_path || null,
+        source.icon || 'folder',
+        source.color || null,
+        Number(source.sort_order || 0),
+        source.created_at || null,
+        source.updated_at || null,
+      )
+    })
+    const updateParent = sqlite.prepare('UPDATE folders SET parent_id = ? WHERE id = ?')
+    copies.forEach(({ source, id, projectId }) => {
+      const targetParentId = source.parent_id
+        ? mapping.get(mappingKey(source.parent_id, projectId)) || null
+        : null
+      updateParent.run(targetParentId, id)
+    })
+    const insertRelation = sqlite.prepare(
+      'INSERT OR IGNORE INTO document_folders (doc_id, folder_id) VALUES (?, ?)',
+    )
+    const deleteRelation = sqlite.prepare(
+      'DELETE FROM document_folders WHERE doc_id = ? AND folder_id = ?',
+    )
+    directRelations.forEach((relation) => {
+      const projectId = String(relation.library_project_id || defaultProjectId)
+      const targetFolderId = mapping.get(mappingKey(relation.folder_id, projectId))
+      if (!targetFolderId || targetFolderId === relation.folder_id) return
+      insertRelation.run(relation.doc_id, targetFolderId)
+      deleteRelation.run(relation.doc_id, relation.folder_id)
+    })
+    sqlite.prepare(
+      "INSERT OR REPLACE INTO settings (key, value) VALUES ('library_project_folder_migration_v1', '1')",
+    ).run()
+  })()
 }
 
 function getTableCreateSql(sqlite: NativeDatabase, tableName: string): string {
@@ -1884,14 +2178,14 @@ export function mergeTagInto(sqlite: NativeDatabase, fromTagId: string, intoTagI
 
 function autoMergeDuplicateTags(sqlite: NativeDatabase): void {
   const tags = sqlite.prepare(`
-    SELECT id, name, source, usage_count, COALESCE(created_at, id) as created_at
+    SELECT id, library_project_id, name, source, usage_count, COALESCE(created_at, id) as created_at
     FROM tags
     ORDER BY usage_count DESC, name ASC
-  `).all() as Array<{ id: string; name: string; source?: string | null; usage_count?: number | null; created_at?: string | null }>
+  `).all() as Array<{ id: string; library_project_id?: string | null; name: string; source?: string | null; usage_count?: number | null; created_at?: string | null }>
   const groups = new Map<string, typeof tags>()
 
   for (const tag of tags) {
-    const key = getLooseDuplicateTagKey(tag.name || '')
+    const key = `${String(tag.library_project_id || '')}\u001f${getLooseDuplicateTagKey(tag.name || '')}`
     if (!key) continue
     groups.set(key, [...(groups.get(key) || []), tag])
   }
@@ -2105,6 +2399,57 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'documents', 'error_message TEXT', 'error_message')
   addColumnIfMissing(sqlite, 'documents', 'retry_count INTEGER DEFAULT 0', 'retry_count')
   addColumnIfMissing(sqlite, 'documents', 'last_retry_at TEXT', 'last_retry_at')
+  addColumnIfMissing(sqlite, 'documents', 'library_project_id TEXT', 'library_project_id')
+  const defaultLibraryProjectId = 'library_project_default'
+  const libraryProjectMigrationNow = new Date().toISOString()
+  sqlite.transaction(() => {
+    sqlite.prepare(
+      `INSERT OR IGNORE INTO library_projects
+       (id, name, description, color, is_default, created_at, updated_at)
+       VALUES (?, '默认项目', '由旧版本文献自动迁移生成', '#1677ff', 1, ?, ?)`,
+    ).run(defaultLibraryProjectId, libraryProjectMigrationNow, libraryProjectMigrationNow)
+    sqlite.prepare(
+      `UPDATE documents
+       SET library_project_id = ?
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM library_projects lp WHERE lp.id = documents.library_project_id
+          )`,
+    ).run(defaultLibraryProjectId)
+    const activeProject = sqlite.prepare(
+      "SELECT value FROM settings WHERE key = 'active_library_project_id'",
+    ).get() as { value?: string } | undefined
+    const activeProjectExists = activeProject?.value
+      ? sqlite.prepare('SELECT 1 FROM library_projects WHERE id = ?').get(activeProject.value)
+      : null
+    if (!activeProjectExists) {
+      sqlite.prepare(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_library_project_id', ?)",
+      ).run(defaultLibraryProjectId)
+    }
+  })()
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_documents_library_project
+      ON documents(library_project_id, import_status, updated_at);
+    CREATE TRIGGER IF NOT EXISTS trg_documents_assign_library_project
+    AFTER INSERT ON documents
+    WHEN NEW.library_project_id IS NULL
+      OR NOT EXISTS (SELECT 1 FROM library_projects WHERE id = NEW.library_project_id)
+    BEGIN
+      UPDATE documents
+      SET library_project_id = COALESCE(
+        (
+          SELECT s.value
+          FROM settings s
+          INNER JOIN library_projects lp ON lp.id = s.value
+          WHERE s.key = 'active_library_project_id'
+          LIMIT 1
+        ),
+        '${defaultLibraryProjectId}'
+      )
+      WHERE id = NEW.id;
+    END;
+  `)
 
   addColumnIfMissing(sqlite, 'reader_state', "document_mode TEXT DEFAULT 'read'", 'document_mode')
   addColumnIfMissing(sqlite, 'reader_state', "proof_location_key TEXT DEFAULT ''", 'proof_location_key')
@@ -2124,6 +2469,131 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'document_tags', 'confidence REAL', 'confidence')
   addColumnIfMissing(sqlite, 'document_tags', 'created_at TEXT', 'created_at')
   addColumnIfMissing(sqlite, 'document_tags', 'updated_at TEXT', 'updated_at')
+  migrateTagsToLibraryProjects(sqlite, defaultLibraryProjectId)
+  sqlite.prepare(
+    `UPDATE tags
+     SET library_project_id = ?
+     WHERE library_project_id IS NULL
+        OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = tags.library_project_id)`,
+  ).run(defaultLibraryProjectId)
+
+  addColumnIfMissing(sqlite, 'folders', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'research_projects', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'ai_research_tasks', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'ai_research_datasets', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'ai_research_records', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'search_index_segments', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'search_index_segments_staging', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'embedding_chunks', 'library_project_id TEXT', 'library_project_id')
+  sqlite.transaction(() => {
+    sqlite.prepare(
+      `UPDATE folders
+       SET library_project_id = COALESCE(
+         (
+           SELECT d.library_project_id
+           FROM document_folders df
+           INNER JOIN documents d ON d.id = df.doc_id
+           WHERE df.folder_id = folders.id
+           ORDER BY d.updated_at DESC
+           LIMIT 1
+         ),
+         ?
+       )
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = folders.library_project_id)`,
+    ).run(defaultLibraryProjectId)
+    sqlite.prepare(
+      `UPDATE research_projects
+       SET library_project_id = COALESCE(
+         (
+           SELECT d.library_project_id
+           FROM research_project_documents rpd
+           INNER JOIN documents d ON d.id = rpd.doc_id
+           WHERE rpd.project_id = research_projects.id
+           ORDER BY rpd.created_at DESC
+           LIMIT 1
+         ),
+         ?
+       )
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = research_projects.library_project_id)`,
+    ).run(defaultLibraryProjectId)
+    sqlite.prepare(
+      `UPDATE ai_research_tasks
+       SET library_project_id = COALESCE(
+         (SELECT rp.library_project_id FROM research_projects rp WHERE rp.id = ai_research_tasks.project_id),
+         ?
+       )
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = ai_research_tasks.library_project_id)`,
+    ).run(defaultLibraryProjectId)
+    sqlite.prepare(
+      `UPDATE ai_research_datasets
+       SET library_project_id = COALESCE(
+         (SELECT task.library_project_id FROM ai_research_tasks task WHERE task.id = ai_research_datasets.task_id),
+         ?
+       )
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = ai_research_datasets.library_project_id)`,
+    ).run(defaultLibraryProjectId)
+    sqlite.prepare(
+      `UPDATE ai_research_records
+       SET library_project_id = COALESCE(
+         (SELECT task.library_project_id FROM ai_research_tasks task WHERE task.id = ai_research_records.task_id),
+         (SELECT d.library_project_id FROM documents d WHERE d.id = ai_research_records.doc_id),
+         ?
+       )
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = ai_research_records.library_project_id)`,
+    ).run(defaultLibraryProjectId)
+    sqlite.exec(`
+      UPDATE search_index_segments
+      SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = search_index_segments.doc_id)
+      WHERE library_project_id IS NULL;
+      UPDATE embedding_chunks
+      SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = embedding_chunks.doc_id)
+      WHERE library_project_id IS NULL;
+    `)
+  })()
+  migrateFoldersToLibraryProjects(sqlite, defaultLibraryProjectId)
+  sqlite.exec(`
+    CREATE INDEX IF NOT EXISTS idx_folders_library_project
+      ON folders(library_project_id, parent_id, sort_order);
+    CREATE INDEX IF NOT EXISTS idx_tags_library_project
+      ON tags(library_project_id, normalized_name);
+    CREATE INDEX IF NOT EXISTS idx_research_projects_library_project
+      ON research_projects(library_project_id, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_ai_research_tasks_library_project
+      ON ai_research_tasks(library_project_id, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_ai_research_datasets_library_project
+      ON ai_research_datasets(library_project_id, updated_at);
+    DROP TRIGGER IF EXISTS trg_search_segments_assign_library_project;
+    CREATE TRIGGER trg_search_segments_assign_library_project
+    AFTER INSERT ON search_index_segments
+    WHEN NEW.library_project_id IS NULL
+    BEGIN
+      UPDATE search_index_segments
+      SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = NEW.doc_id)
+      WHERE segment_id = NEW.segment_id;
+    END;
+    DROP TRIGGER IF EXISTS trg_embedding_chunks_assign_library_project;
+    CREATE TRIGGER trg_embedding_chunks_assign_library_project
+    AFTER INSERT ON embedding_chunks
+    WHEN NEW.library_project_id IS NULL
+    BEGIN
+      UPDATE embedding_chunks
+      SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = NEW.doc_id)
+      WHERE segment_id = NEW.segment_id AND model_id = NEW.model_id;
+    END;
+    DROP TRIGGER IF EXISTS trg_documents_propagate_library_project;
+    CREATE TRIGGER trg_documents_propagate_library_project
+    AFTER UPDATE OF library_project_id ON documents
+    WHEN COALESCE(NEW.library_project_id, '') <> COALESCE(OLD.library_project_id, '')
+    BEGIN
+      UPDATE search_index_segments SET library_project_id = NEW.library_project_id WHERE doc_id = NEW.id;
+      UPDATE embedding_chunks SET library_project_id = NEW.library_project_id WHERE doc_id = NEW.id;
+    END;
+  `)
 
   addColumnIfMissing(sqlite, 'ai_results', "prompt_hash TEXT DEFAULT ''", 'prompt_hash')
 
@@ -2154,13 +2624,15 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS ai_chat_sessions (
       id TEXT PRIMARY KEY,
+      library_project_id TEXT,
       mode TEXT NOT NULL,
       doc_id TEXT,
       title TEXT NOT NULL,
       scope_json TEXT DEFAULT '',
       created_at TEXT,
       updated_at TEXT,
-      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+      FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS ai_chat_turns (
@@ -2174,8 +2646,21 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
       FOREIGN KEY (session_id) REFERENCES ai_chat_sessions(id) ON DELETE CASCADE
     );
   `)
+  addColumnIfMissing(sqlite, 'ai_chat_sessions', 'library_project_id TEXT', 'library_project_id')
   addColumnIfMissing(sqlite, 'ai_chat_sessions', "scope_json TEXT DEFAULT ''", 'scope_json')
   addColumnIfMissing(sqlite, 'ai_chat_turns', "metadata_json TEXT DEFAULT ''", 'metadata_json')
+  sqlite.prepare(
+    `UPDATE ai_chat_sessions
+     SET library_project_id = COALESCE(
+       (SELECT d.library_project_id FROM documents d WHERE d.id = ai_chat_sessions.doc_id),
+       ?
+     )
+     WHERE library_project_id IS NULL
+        OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = ai_chat_sessions.library_project_id)`,
+  ).run(defaultLibraryProjectId)
+  sqlite.exec(
+    'CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_library_project ON ai_chat_sessions(library_project_id, mode, updated_at)',
+  )
 
   sqlite.exec(`
     CREATE TABLE IF NOT EXISTS citation_styles (
@@ -2397,6 +2882,7 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
 
     CREATE INDEX IF NOT EXISTS idx_embedding_chunks_doc ON embedding_chunks(doc_id);
     CREATE INDEX IF NOT EXISTS idx_embedding_chunks_model ON embedding_chunks(model_id);
+    CREATE INDEX IF NOT EXISTS idx_embedding_chunks_library_project_model ON embedding_chunks(library_project_id, model_id, doc_id, page_num);
     CREATE INDEX IF NOT EXISTS idx_embedding_status_updated ON embedding_index_status(updated_at);
   `)
 
@@ -2819,6 +3305,7 @@ export function resetRebuildableSearchTables(): void {
 
       CREATE TABLE IF NOT EXISTS search_index_segments (
         segment_id TEXT PRIMARY KEY,
+        library_project_id TEXT,
         doc_id TEXT NOT NULL,
         page_id TEXT,
         page_num INTEGER,
@@ -2849,6 +3336,7 @@ export function resetRebuildableSearchTables(): void {
       CREATE TABLE IF NOT EXISTS search_index_segments_staging (
         job_id TEXT NOT NULL,
         segment_id TEXT NOT NULL,
+        library_project_id TEXT,
         doc_id TEXT NOT NULL,
         page_id TEXT,
         page_num INTEGER,
@@ -2885,6 +3373,15 @@ export function resetRebuildableSearchTables(): void {
         updated_at TEXT,
         FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
       );
+
+      CREATE TRIGGER IF NOT EXISTS trg_search_segments_assign_library_project
+      AFTER INSERT ON search_index_segments
+      WHEN NEW.library_project_id IS NULL
+      BEGIN
+        UPDATE search_index_segments
+        SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = NEW.doc_id)
+        WHERE segment_id = NEW.segment_id;
+      END;
     `)
   })
   ensureIndexes(database)

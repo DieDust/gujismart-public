@@ -6,13 +6,16 @@ const root = join(__dirname, '..')
 const read = (...parts) => readFileSync(join(root, ...parts), 'utf8')
 
 const embedding = read('src', 'main', 'embedding-index.ts')
+const vectorSearchContract = read('src', 'shared', 'vector-search.ts')
 const database = read('src', 'main', 'database.ts')
 const ipc = read('src', 'main', 'ipc', 'embedding.ts')
+const searchIpc = read('src', 'main', 'ipc', 'search.ts')
 const preload = read('src', 'preload', 'index.ts')
 const tools = read('src', 'main', 'mcp', 'library-tools.ts')
 const protectedSettings = read('src', 'main', 'protected-settings.ts')
 const settingsView = read('src', 'renderer', 'src', 'views', 'SettingsView.tsx')
 const libraryView = read('src', 'renderer', 'src', 'views', 'LibraryView.tsx')
+const searchView = read('src', 'renderer', 'src', 'views', 'SearchView.tsx')
 
 assert.ok(database.includes('embedding_chunks'), 'schema must define embedding_chunks')
 assert.ok(database.includes('embedding_index_status'), 'schema must define embedding_index_status')
@@ -59,6 +62,41 @@ assert.ok(ipc.includes('embedding:requeueFailed'), 'embedding requeue IPC')
 assert.ok(ipc.includes('embedding:reindexDocuments') && ipc.includes('embedding:reindexStale'), 'embedding reindex IPC')
 assert.ok(!embedding.includes("DEFAULT_MODEL = 'text-embedding-3-small'"), 'must not default to OpenAI small without Tongyi')
 assert.ok(embedding.includes('vectorSearch'), 'vectorSearch service')
+assert.ok(
+  /VECTOR_SEARCH_DEFAULT_LIMIT\s*=\s*200/.test(vectorSearchContract),
+  'desktop vector search should default to 200 hits',
+)
+const vectorSearchMaxMatch = vectorSearchContract.match(/VECTOR_SEARCH_MAX_LIMIT\s*=\s*([\d_]+)/)
+assert.ok(
+  vectorSearchMaxMatch && Number(vectorSearchMaxMatch[1].replace(/_/g, '')) > 200,
+  '200 must be a default rather than the hard vector-search maximum',
+)
+assert.ok(
+  embedding.includes('bestHeap')
+    && embedding.includes('siftHeapDown')
+    && embedding.includes('rowid > ?')
+    && embedding.includes('segmentsByDocumentAndId'),
+  'large Top-K search should use a bounded heap, keyset scan, and batched metadata hydration',
+)
+assert.ok(
+  searchView.includes('检索前召回')
+    && searchView.includes('VECTOR_SEARCH_DEFAULT_LIMIT')
+    && searchView.includes('VECTOR_SEARCH_MAX_LIMIT')
+    && searchView.includes('exportPreviewExpanded'),
+  'renderer should choose vector hit count before search and keep export preview collapsed on demand',
+)
+assert.ok(
+  !searchView.includes('limit: VECTOR_SEARCH_UI_LIMIT')
+    && !searchView.includes('EXPORT_MAX_RECORDS_PRESETS')
+    && !searchView.includes('VECTOR_EXPORT_SCORE_PRESETS'),
+  'renderer must not retain the old fixed-200 request or the cluttered export preset rows',
+)
+assert.ok(
+  searchIpc.includes('recordBuildLimit')
+    && searchIpc.includes('buildLiteraturePageCache')
+    && searchIpc.includes('await writeFile(outputFilePath'),
+  'vector export preview should build only samples and bulk export should avoid page-number N+1/sync writes',
+)
 assert.ok(embedding.includes('/embeddings'), 'OpenAI-compatible embeddings endpoint')
 assert.ok(settingsView.includes('linkedProfiles') || settingsView.includes('handleSelectEmbeddingSourceProfile'), 'settings reuses AI provider list')
 assert.ok(settingsView.includes('fetchEmbeddingModelOptions') || settingsView.includes('listEmbeddingModels'), 'settings can fetch embedding models')

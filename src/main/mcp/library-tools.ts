@@ -19,8 +19,9 @@ import { listDocumentsPage } from '../ipc/documents'
 import { resolveSearchEvidence } from '../search-evidence-resolver'
 import { querySearchV2 } from '../semantic-search'
 import { getEmbeddingIndexStats, vectorSearch } from '../embedding-index'
+import { VECTOR_SEARCH_MAX_LIMIT } from '../../shared/vector-search'
 
-const MAX_SEARCH_LIMIT = 50
+const MAX_SEARCH_LIMIT = VECTOR_SEARCH_MAX_LIMIT
 const MAX_LIST_LIMIT = 50
 const MAX_PAGE_RANGE = 20
 const MAX_TEXT_CHARS = 12_000

@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid'
 import { queryAll, queryOne, run, saveDatabase } from './database'
 import { resolveFolderAndDescendantIds } from './folder-scope'
+import { getActiveLibraryProjectId } from './library-projects'
 import type {
   AiResearchEvidenceItem,
   AiResearchEvidencePack,
@@ -305,7 +306,18 @@ export function expandRelatedResearchQueries(values: string[], limit = MAX_QUERY
 }
 
 function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
-  if (scope.type === 'documents') return uniqueStrings(scope.docIds || [])
+  const activeProjectId = getActiveLibraryProjectId()
+  if (scope.type === 'documents') {
+    const docIds = uniqueStrings(scope.docIds || [])
+    if (docIds.length === 0) return []
+    return queryAll<{ id: string }>(
+      `SELECT id
+       FROM documents
+       WHERE id IN (${docIds.map(() => '?').join(', ')})
+         AND library_project_id = ?`,
+      [...docIds, activeProjectId],
+    ).map((item) => item.id)
+  }
   if (scope.type === 'tags') {
     const tagIds = uniqueStrings(scope.tagIds || [])
     if (tagIds.length === 0) return []
@@ -316,7 +328,8 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
       sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
       params.push(tagId)
     })
-    sql += ' GROUP BY d.id ORDER BY d.updated_at DESC'
+    sql += ' WHERE d.library_project_id = ? GROUP BY d.id ORDER BY d.updated_at DESC'
+    params.push(activeProjectId)
     return queryAll<{ id: string }>(sql, params).map((item) => item.id)
   }
   if (scope.type === 'folders') {
@@ -327,8 +340,9 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
        WHERE df.folder_id IN (${folderIds.map(() => '?').join(', ')})
+         AND d.library_project_id = ?
        ORDER BY d.updated_at DESC`,
-      folderIds,
+      [...folderIds, activeProjectId],
     ).map((item) => item.id)
   }
   return undefined
@@ -348,6 +362,14 @@ function buildQueryWhere(terms: string[], chunk?: string[]): { where: string; pa
   const clauses = terms.map(() => `${SEARCH_TEXT_EXPR} LIKE ? ESCAPE '\\'`)
   const params: unknown[] = terms.map((term) => `%${escapeLike(term)}%`)
   clauses.push(`TRIM(COALESCE(NULLIF(s.normalized_text, ''), s.text, '')) != ''`)
+  clauses.push(`EXISTS (
+    SELECT 1
+    FROM documents d_project
+    WHERE d_project.id = s.doc_id
+      AND d_project.library_project_id = ?
+      AND COALESCE(d_project.import_status, '') <> 'deleting'
+  )`)
+  params.push(getActiveLibraryProjectId())
   if (chunk) {
     clauses.push(`s.doc_id IN (${chunk.map(() => '?').join(', ')})`)
     params.push(...chunk)

@@ -3,6 +3,12 @@ import { basename, extname, join } from 'path'
 import { net } from 'electron'
 import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { exportDocument } from '../export'
+import {
+  assertDocumentIdsInLibraryProject,
+  assertDocumentInLibraryProject,
+  captureActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 import { checkLuaTeX, checkLuatexCn, generateTeX, compileTeX } from '../typeset'
 import { readFileSync, existsSync } from 'fs'
 import { open } from 'fs/promises'
@@ -1353,61 +1359,69 @@ export function registerExportIpc(): void {
     format: DocumentExportFormat,
     options?: DocumentExportOptions,
   ): Promise<boolean> => {
-    const { canceled, filePath } = await dialog.showSaveDialog({
-      title: '导出文献',
-      defaultPath: getExportDefaultName(docId, getExportExtension(format)),
-      filters: [
-        { name: format.toUpperCase(), extensions: [getExportExtension(format)] }
-      ]
+    const libraryProjectId = captureActiveLibraryProjectId()
+    return withLibraryProjectContext(libraryProjectId, async () => {
+      assertDocumentInLibraryProject(docId, libraryProjectId)
+      const { canceled, filePath } = await dialog.showSaveDialog({
+        title: '导出文献',
+        defaultPath: getExportDefaultName(docId, getExportExtension(format)),
+        filters: [
+          { name: format.toUpperCase(), extensions: [getExportExtension(format)] }
+        ]
+      })
+
+      if (canceled || !filePath) return false
+
+      try {
+        await exportDocument(docId, format, filePath, options)
+        return true
+      } catch (error) {
+        console.error('导出失败:', error)
+        throw new Error((error as Error).message)
+      }
     })
-
-    if (canceled || !filePath) return false
-
-    try {
-      await exportDocument(docId, format, filePath, options)
-      return true
-    } catch (error) {
-      console.error('导出失败:', error)
-      throw new Error((error as Error).message)
-    }
   })
 
   ipcMain.handle('documents:exportBatch', async (_event, docIds: string[], format: DocumentExportFormat, options?: DocumentExportOptions): Promise<DocumentExportBatchResult> => {
     const uniqueDocIds = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
     if (uniqueDocIds.length === 0) throw new Error('请先选择要导出的文献')
+    const libraryProjectId = captureActiveLibraryProjectId()
 
-    const { canceled, filePaths } = await dialog.showOpenDialog({
-      title: `批量导出 ${uniqueDocIds.length} 篇文献`,
-      properties: ['openDirectory', 'createDirectory'],
-    })
-    if (canceled || !filePaths?.[0]) {
-      return { canceled: true, successCount: 0, failedCount: 0, directoryPath: null, errors: [] }
-    }
-
-    const directoryPath = filePaths[0]
-    const extension = getExportExtension(format)
-    const usedPaths = new Set<string>()
-    const errors: DocumentExportBatchError[] = []
-    let successCount = 0
-
-    for (const docId of uniqueDocIds) {
-      try {
-        const fileName = getExportDefaultName(docId, extension)
-        await exportDocument(docId, format, ensureUniqueExportPath(directoryPath, fileName, usedPaths), options)
-        successCount += 1
-      } catch (error) {
-        console.error(`批量导出失败: ${docId}`, error)
-        errors.push({ docId, message: (error as Error)?.message || '导出失败' })
+    return withLibraryProjectContext(libraryProjectId, async () => {
+      assertDocumentIdsInLibraryProject(uniqueDocIds, libraryProjectId)
+      const { canceled, filePaths } = await dialog.showOpenDialog({
+        title: `批量导出 ${uniqueDocIds.length} 篇文献`,
+        properties: ['openDirectory', 'createDirectory'],
+      })
+      if (canceled || !filePaths?.[0]) {
+        return { canceled: true, successCount: 0, failedCount: 0, directoryPath: null, errors: [] }
       }
-    }
 
-    return {
-      canceled: false,
-      successCount,
-      failedCount: errors.length,
-      directoryPath,
-      errors,
-    }
+      const directoryPath = filePaths[0]
+      const extension = getExportExtension(format)
+      const usedPaths = new Set<string>()
+      const errors: DocumentExportBatchError[] = []
+      let successCount = 0
+
+      for (const docId of uniqueDocIds) {
+        try {
+          const fileName = getExportDefaultName(docId, extension)
+          await exportDocument(docId, format, ensureUniqueExportPath(directoryPath, fileName, usedPaths), options)
+          successCount += 1
+        } catch (error) {
+          console.error(`批量导出失败: ${docId}`, error)
+          errors.push({ docId, message: (error as Error)?.message || '导出失败' })
+        }
+      }
+
+      return {
+        canceled: false,
+        successCount,
+        failedCount: errors.length,
+        directoryPath,
+        errors,
+      }
+    })
   })
 }
 

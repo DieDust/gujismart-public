@@ -9,7 +9,9 @@ const TARGETS = [
   'out/renderer/assets',
   'dist',
   'dist/win-unpacked',
+  'dist/win-unpacked/locales',
   'dist/win-unpacked/resources/app.asar',
+  'dist/win-unpacked/resources/app.asar.unpacked',
 ]
 
 function formatBytes(bytes) {

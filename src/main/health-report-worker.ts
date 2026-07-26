@@ -223,7 +223,7 @@ function buildDocumentHealthRow(doc: DocumentHealthSourceRow): DocumentHealthRow
   }
 }
 
-function buildDocumentHealthReport(sqlite: NativeDatabase): DocumentHealthReport {
+function buildDocumentHealthReport(sqlite: NativeDatabase, libraryProjectId: string): DocumentHealthReport {
   const docs = queryAll<DocumentHealthSourceRow>(
     sqlite,
     `SELECT
@@ -233,7 +233,9 @@ function buildDocumentHealthReport(sqlite: NativeDatabase): DocumentHealthReport
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
       (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
       (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count
-    FROM documents d`,
+    FROM documents d
+    WHERE d.library_project_id = ?`,
+    [libraryProjectId],
   )
   const rows = docs
     .map((doc) => {
@@ -250,7 +252,10 @@ function buildDocumentHealthReport(sqlite: NativeDatabase): DocumentHealthReport
     `SELECT
       COUNT(*) as total_pages,
       SUM(CASE WHEN ${buildPageContentAvailableCondition('pages')} THEN 1 ELSE 0 END) as text_pages
-    FROM pages`,
+    FROM pages
+    INNER JOIN documents d ON d.id = pages.doc_id
+    WHERE d.library_project_id = ?`,
+    [libraryProjectId],
   )
 
   return {
@@ -260,11 +265,25 @@ function buildDocumentHealthReport(sqlite: NativeDatabase): DocumentHealthReport
       totalPages: rows.reduce((sum, row) => sum + row.page_count, 0),
       pageRows: Number(pageStats?.total_pages || 0),
       textPages: Number(pageStats?.text_pages || 0),
-      segments: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM search_index_segments')?.count || 0),
+      segments: Number(queryOne<{ count: number }>(
+        sqlite,
+        `SELECT COUNT(*) as count
+         FROM search_index_segments sis
+         INNER JOIN documents d ON d.id = sis.doc_id
+         WHERE d.library_project_id = ?`,
+        [libraryProjectId],
+      )?.count || 0),
       tags: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM tags')?.count || 0),
       folders: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM folders')?.count || 0),
       researchProjects: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM research_projects')?.count || 0),
-      researchNotes: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM research_notes')?.count || 0),
+      researchNotes: Number(queryOne<{ count: number }>(
+        sqlite,
+        `SELECT COUNT(*) as count
+         FROM research_notes rn
+         INNER JOIN documents d ON d.id = rn.doc_id
+         WHERE d.library_project_id = ?`,
+        [libraryProjectId],
+      )?.count || 0),
       missingAuthor: countIssue('missing_author'),
       missingYear: countIssue('missing_year'),
       missingIdentifier: countIssue('missing_identifier'),
@@ -283,7 +302,7 @@ function runTask(task: HealthReportWorkerTask): DocumentHealthReport {
   const sqlite = new Database(task.dbFilePath)
   sqlite.pragma('busy_timeout = 5000')
   try {
-    return buildDocumentHealthReport(sqlite)
+    return buildDocumentHealthReport(sqlite, task.libraryProjectId)
   } finally {
     sqlite.close()
   }

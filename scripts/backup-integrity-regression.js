@@ -80,7 +80,7 @@ try {
   assert.ok(typesSource.includes('integrityReport?: BackupIntegrityReport'), 'backup result and slots should expose optional integrity reports')
   assert.ok(typesSource.includes('restoredIntegrityReport?: BackupIntegrityReport'), 'backup import results should expose restored integrity reports')
   assert.ok(typesSource.includes("from './backup-integrity'"), 'shared types should re-export backup integrity contracts')
-  assert.ok(backupSource.includes('integrityReport: collectBackupIntegrityReport(backupDir, { includesStorage })'), 'backup manifest should include an integrity report')
+  assert.ok(backupSource.includes('integrityReport: await collectBackupIntegrityReportAsync(backupDir, { includesStorage })'), 'backup manifest should include an asynchronously collected integrity report')
   assert.ok(backupSource.includes('function validateBackupManifestIntegrity'), 'backup imports should validate manifest integrity')
   assert.ok(backupSource.includes('compareBackupIntegrityReports(integrityReport, collectBackupIntegrityReport(dataDir))'), 'backup imports should verify restored data integrity')
   assert.ok(backupSource.includes('restoredIntegrityReport'), 'backup import result should include restored integrity diagnostics')

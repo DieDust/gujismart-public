@@ -21,6 +21,7 @@ npm run build
 - `npm run check:mcp` verifies MCP tool definitions, stdio server contract, and launcher wiring.
 - `npm run check` runs TypeScript, mojibake detection, and open-source hygiene checks.
 - `npm run check:function-contract` verifies that critical `window.api` members for OCR, import, reading, search, AI, research, citation, settings, and backup remain exposed.
+- `npm run check:excerpts-library` verifies the excerpts page keeps its 200-item first page, append pagination, global filters, explicit multi-selection, and atomic batch deletion while retaining the legacy single/all-note APIs.
 - `npm run check:status-envelope` verifies the shared status/error envelope and its OCR progress integration.
 - `npm run check:config-validation` verifies shared configuration validation reports for provider, OCR, typeset, and backup settings.
 - `npm run check:ai-response-envelope` verifies shared AI response envelopes for sources, trace hashes, warnings, and AI IPC integration.
@@ -53,8 +54,9 @@ npm run build
 - `npm run check:export-snapshot` verifies same-directory atomic export publication, old-target preservation, concurrent staging uniqueness, snapshot identity, and artifact hashes.
 - `npm run check:interaction-kernel` verifies close participant aggregation, latest-request-wins tokens, and drag preview/commit/cancel semantics.
 - `npm run check:release-evidence` verifies synthetic dual-audience fixtures, SPDX generation, vendor hashes, and the non-public local RC manifest.
+- `npm run check:package-footprint` verifies build-only renderer dependencies stay out of packaged production dependencies, required main-process dependencies and vendor tools remain present, locale/file pruning stays enabled, and GitHub Actions uses the same local packaging path.
 - `npm run prepare:release-metadata` writes SBOM, vendor manifest, and local RC evidence under ignored `tmp/package-metadata` for packaging.
-- `npm run smoke:packaged` launches `dist/win-unpacked` with isolated user data and verifies package metadata plus a nonblank renderer.
+- `npm run smoke:packaged` uses the packaged Electron runtime to exercise SQLite, Canvas, PDF.js, PDF export fonts, OpenCC, archive/search dependencies, then launches `dist/win-unpacked` with isolated user data and verifies package metadata plus a nonblank renderer.
 - `npm run check:search-excerpt-source-hash` verifies that manual and batch search excerpt saves keep a compatible source-hash contract.
 - `npm run check:research-integrity` verifies the internal research project integrity report used by output snapshots.
 - `npm run test:research` verifies research notes, exports, and output input snapshots.
@@ -74,7 +76,7 @@ npm run size:build
 
 - `clean:build` removes only `out/`; `npm run build` runs it automatically so stale Vite hash bundles cannot accumulate across builds.
 - `clean:dist` removes only `dist/`; run it explicitly before packaging when you want to discard historical installers.
-- `size:build` is read-only and useful for checking whether renderer chunks or packaged assets have grown unexpectedly.
+- `size:build` is read-only and reports renderer chunks, installers, Electron locales, `app.asar`, and unpacked native modules for local/GitHub artifact comparisons.
 
 ## Focused Regression Tests
 

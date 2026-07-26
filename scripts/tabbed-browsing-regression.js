@@ -242,7 +242,8 @@ assertIncludes(workspace, 'function cleanTabGroupColor(', 'workspace restoration
 assertIncludes(workspace, 'const tabGroups = sanitizeTabGroups(parsed.tabGroups)', 'workspace restoration should validate saved tab groups')
 assertIncludes(workspace, 'const tabs = sanitizeTabs(parsed.tabs, tabGroups)', 'workspace restoration should validate saved tabs against tab groups')
 assertIncludes(workspace, 'tabGroups: safeTabGroups', 'workspace restoration should persist only referenced tab groups')
-assertIncludes(workspace, 'storage.removeItem(APP_WORKSPACE_STORAGE_KEY)', 'invalid workspace data should be discarded safely')
+assertIncludes(workspace, 'storage.removeItem(storageKey)', 'invalid project-scoped workspace data should be discarded safely')
+assertIncludes(workspace, 'scopedWorkspaceKey(APP_WORKSPACE_STORAGE_KEY, scopeId)', 'each library project should restore an independent workspace')
 assertIncludes(workspace, 'target: { ...target, docId }', 'document tabs should restore a normalized document target')
 assertNotIncludes(workspace, 'searchSession:', 'workspace storage should not persist full search-result sessions')
 

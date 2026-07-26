@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid'
 import { queryAll, queryOne, refreshTagUsage, run, saveDatabase, transaction } from './database'
+import { getActiveLibraryProjectId } from './library-projects'
 import { HISTORY_DOC_TYPE_OPTIONS, LEGACY_DOC_TYPE_MAP, normalizeHistoryDocType } from '../shared/history-citation'
 import {
   decideMetadataTagRelationCleanup,
@@ -199,10 +200,16 @@ function parseMetadata(value: unknown): DocumentMetadataResult {
 }
 
 export function clearMetadataTagBindings(docId?: string): MetadataTagBindingCleanupResult {
-  const relationFilter = docId ? 'doc_id = ? AND ' : ''
-  const relationFilterWithAlias = docId ? 'dt.doc_id = ? AND ' : ''
-  const params = docId ? [docId] : []
-  const countParams = docId ? [docId] : []
+  const libraryProjectId = docId
+    ? queryOne<{ library_project_id?: string | null }>(
+      'SELECT library_project_id FROM documents WHERE id = ?',
+      [docId],
+    )?.library_project_id || getActiveLibraryProjectId()
+    : getActiveLibraryProjectId()
+  const relationFilter = docId ? 'doc_id = ? AND ' : 'doc_id IN (SELECT id FROM documents WHERE library_project_id = ?) AND '
+  const relationFilterWithAlias = docId ? 'dt.doc_id = ? AND ' : 'dt.doc_id IN (SELECT id FROM documents WHERE library_project_id = ?) AND '
+  const params = [docId || libraryProjectId]
+  const countParams = [docId || libraryProjectId]
   const metadataBindingPredicate = `(
         COALESCE(dt.is_metadata, 0) = 1
         OR TRIM(COALESCE(dt.source_field, '')) != ''
@@ -350,12 +357,13 @@ export function upsertTag(
   color: string,
   source: string,
   confidence: number | null,
+  libraryProjectId = getActiveLibraryProjectId(),
 ): string | null {
   const normalizedName = name.trim()
   if (!normalizedName) return null
   const existing = queryOne<{ id: string; color?: string | null; source?: string | null; confidence?: number | null }>(
-    'SELECT id, color, source, confidence FROM tags WHERE normalized_name = ?',
-    [normalizeTagName(normalizedName)],
+    'SELECT id, color, source, confidence FROM tags WHERE library_project_id = ? AND normalized_name = ?',
+    [libraryProjectId, normalizeTagName(normalizedName)],
   )
   if (existing) {
     const existingSource = existing.source || 'manual'
@@ -379,8 +387,8 @@ export function upsertTag(
   const id = nanoid()
   const now = new Date().toISOString()
   run(
-    'INSERT INTO tags (id, name, color, parent_id, source, confidence, usage_count, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [id, normalizedName, color, null, source, confidence, 0, normalizeTagName(normalizedName), now, now],
+    'INSERT INTO tags (id, library_project_id, name, color, parent_id, source, confidence, usage_count, normalized_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [id, libraryProjectId, normalizedName, color, null, source, confidence, 0, normalizeTagName(normalizedName), now, now],
   )
   return id
 }
@@ -390,8 +398,13 @@ function linkMetadataTag(docId: string, tagId: string, sourceField: string, conf
   const relationTargets = queryOne<{ doc_exists: number; tag_exists: number }>(
     `SELECT
       EXISTS(SELECT 1 FROM documents WHERE id = ?) as doc_exists,
-      EXISTS(SELECT 1 FROM tags WHERE id = ?) as tag_exists`,
-    [docId, tagId],
+      EXISTS(
+        SELECT 1
+        FROM tags t
+        INNER JOIN documents d ON d.id = ?
+        WHERE t.id = ? AND t.library_project_id = d.library_project_id
+      ) as tag_exists`,
+    [docId, docId, tagId],
   )
   if (!relationTargets?.doc_exists || !relationTargets?.tag_exists) return false
   const existing = queryOne<{ is_manual?: number }>(
@@ -467,6 +480,10 @@ function syncMetadataTagsForDocument(
   docType: string,
   baseInfo?: MetadataTagBaseInfo,
 ): MetadataTagSyncStats {
+  const libraryProjectId = queryOne<{ library_project_id?: string | null }>(
+    'SELECT library_project_id FROM documents WHERE id = ?',
+    [docId],
+  )?.library_project_id || getActiveLibraryProjectId()
   const normalizedDocType = normalizeHistoryDocType(docType)
   const suggestions = collectMetadataTagValues(metadata, normalizedDocType, baseInfo)
   const existingMetadataRelations = queryOne<{ count: number }>(
@@ -503,6 +520,7 @@ function syncMetadataTagsForDocument(
         FIELD_TAG_COLORS[suggestion.sourceField] || '#52c41a',
         suggestion.sourceField,
         suggestion.confidence,
+        libraryProjectId,
       )
       if (!tagId) continue
       if (linkMetadataTag(docId, tagId, suggestion.sourceField, suggestion.confidence)) {

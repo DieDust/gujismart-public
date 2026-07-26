@@ -11,7 +11,7 @@ import { isSearchIndexReindexQueuedInMemory, isSearchIndexUsableForDocument, mar
 import { emitBackgroundTaskStatus } from './background-tasks'
 import { inspectManagedDeleteTarget } from './managed-path-boundary'
 import { beginStartupPhase, logStartupTimingSummary, markStartupEvent, recordStartupPhaseSpan } from './startup-timing'
-import { keepStartupSplashForDiagnostics } from './startup-splash'
+
 import { nanoid } from 'nanoid'
 
 export interface StartupRecoverySummary {
@@ -1053,11 +1053,6 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     })
     markStartupEvent('startup-recovery-canceled')
     logStartupTimingSummary('startup-recovery-canceled', true)
-    try {
-      keepStartupSplashForDiagnostics({ reason: 'recovery-canceled' })
-    } catch {
-      // ignore
-    }
     return summary
   }
 
@@ -1319,14 +1314,6 @@ export async function runStartupRecovery(): Promise<StartupRecoverySummary> {
     `batchPending=${resumedBatchQueue.resumedItems} ocrDocs=${ocr.recoveredDocuments} orphanStorage=${orphanStorageDirs}`,
   )
   logStartupTimingSummary('startup-recovery-complete', true)
-  // Test build: leave diagnostic splash open with full phase table for remote screenshot feedback.
-  try {
-    keepStartupSplashForDiagnostics({
-      reason: `recovery-complete batchPending=${resumedBatchQueue.resumedItems} ocrDocs=${ocr.recoveredDocuments}`,
-    })
-  } catch (error) {
-    console.warn('[Startup Recovery] Failed to finalize diagnostic splash', error)
-  }
   return summary
   } finally {
     endRecovery()

@@ -108,6 +108,9 @@ import type {
   DocumentMetadataResult,
   DocumentPage,
   DocumentReadingWindow,
+  CreateLibraryProjectPayload,
+  LibraryProject,
+  MoveDocumentsToLibraryProjectResult,
   DocumentUpdatePayload,
   ImportDocumentResult,
   ImportDocumentOptions,
@@ -122,6 +125,7 @@ import type {
   LibraryAiSearchResponse,
   LibraryStateCache,
   ListDocumentOptions,
+  ListResearchNotesOptions,
   ListModelsPayload,
   LocalPaddleOcrDownloadOptions,
   LocalPaddleOcrDownloadProgress,
@@ -166,8 +170,10 @@ import type {
   ResearchClaimManifestPage,
   ResearchClaimManifestValidationResult,
   ResearchNote,
+  ResearchNoteListPage,
   ResearchNotePayload,
   ResearchNoteUpdatePayload,
+  DeleteResearchNotesResult,
   ResearchOutlineItem,
   ResearchOutlinePayload,
   ResearchOutlineUpdatePayload,
@@ -329,6 +335,24 @@ const api = {
 
   listDocumentsPage: (options?: ListDocumentOptions): Promise<DocumentListPage> =>
     ipcRenderer.invoke('documents:listPage', options),
+
+  listLibraryProjects: (): Promise<LibraryProject[]> =>
+    ipcRenderer.invoke('libraryProjects:list'),
+
+  getActiveLibraryProject: (): Promise<LibraryProject> =>
+    ipcRenderer.invoke('libraryProjects:getActive'),
+
+  createLibraryProject: (payload: CreateLibraryProjectPayload): Promise<LibraryProject> =>
+    ipcRenderer.invoke('libraryProjects:create', payload),
+
+  setActiveLibraryProject: (projectId: string): Promise<LibraryProject> =>
+    ipcRenderer.invoke('libraryProjects:setActive', projectId),
+
+  moveDocumentsToLibraryProject: (
+    documentIds: string[],
+    targetProjectId: string,
+  ): Promise<MoveDocumentsToLibraryProjectResult> =>
+    ipcRenderer.invoke('libraryProjects:moveDocuments', documentIds, targetProjectId),
 
   /** Filter dropdown metadata only (documents table; no pages scan). */
   listDocumentFilterOptions: (): Promise<DocumentFilterOption[]> =>
@@ -549,8 +573,8 @@ const api = {
   getFolder: (id: string): Promise<Folder | null> => ipcRenderer.invoke('folders:get', id),
   createFolder: (data: FolderCreatePayload): Promise<Folder | null> =>
     ipcRenderer.invoke('folders:create', data),
-  createFolderFromImportSource: (selectionId: string, sourceId: string, parentId?: string | null): Promise<Folder | null> =>
-    ipcRenderer.invoke('folders:createFromImportSource', selectionId, sourceId, parentId),
+  createFolderFromImportSource: (selectionId: string, sourceId: string, parentId?: string | null, libraryProjectId?: string): Promise<Folder | null> =>
+    ipcRenderer.invoke('folders:createFromImportSource', selectionId, sourceId, parentId, libraryProjectId),
   updateFolder: (id: string, data: FolderUpdatePayload): Promise<boolean> =>
     ipcRenderer.invoke('folders:update', id, data),
   moveFolder: (data: FolderMovePayload): Promise<Folder[]> =>
@@ -560,8 +584,8 @@ const api = {
   deleteFolder: (id: string): Promise<boolean> => ipcRenderer.invoke('folders:delete', id),
   addDocumentToFolder: (docId: string, folderId: string): Promise<boolean> =>
     ipcRenderer.invoke('folders:addDocument', docId, folderId),
-  addDocumentsToFolder: (docIds: string[], folderId: string): Promise<BulkAssociationResult> =>
-    ipcRenderer.invoke('folders:addDocuments', docIds, folderId),
+  addDocumentsToFolder: (docIds: string[], folderId: string, libraryProjectId?: string): Promise<BulkAssociationResult> =>
+    ipcRenderer.invoke('folders:addDocuments', docIds, folderId, libraryProjectId),
   removeDocumentFromFolder: (docId: string, folderId: string): Promise<boolean> =>
     ipcRenderer.invoke('folders:removeDocument', docId, folderId),
   getFolderDocuments: (folderId: string): Promise<Document[]> =>
@@ -735,6 +759,8 @@ const api = {
     ipcRenderer.invoke('research:assignNotesToOutline', noteIds, outlineId),
   listResearchNotes: (projectId?: string | null): Promise<ResearchNote[]> =>
     ipcRenderer.invoke('research:listNotes', projectId),
+  listResearchNotesPage: (options?: ListResearchNotesOptions): Promise<ResearchNoteListPage> =>
+    ipcRenderer.invoke('research:listNotesPage', options),
   listResearchEvidenceRelations: (
     projectId: string,
     options?: { limit?: number; cursor?: string | null },
@@ -757,6 +783,8 @@ const api = {
   ): Promise<{ evidence: ResearchEvidence; relation: ResearchEvidenceRelation | null }> =>
     ipcRenderer.invoke('research:promoteNoteEvidence', noteId),
   deleteResearchNote: (id: string): Promise<boolean> => ipcRenderer.invoke('research:deleteNote', id),
+  deleteResearchNotes: (ids: string[]): Promise<DeleteResearchNotesResult> =>
+    ipcRenderer.invoke('research:deleteNotes', ids),
   synthesizeResearchProject: (projectId: string, templateType: AiSynthesisTemplate, customPrompt?: string, citationStyleId?: string): Promise<ResearchOutput> =>
     ipcRenderer.invoke('research:synthesizeProject', projectId, templateType, customPrompt, citationStyleId),
   createResearchOutput: (payload: ResearchOutputPayload): Promise<ResearchOutput> =>

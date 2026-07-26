@@ -25,6 +25,7 @@ import {
   StarOutlined,
   TagOutlined,
   SettingOutlined,
+  SwapOutlined,
   ThunderboltOutlined,
   UnorderedListOutlined
 } from '@ant-design/icons'
@@ -65,7 +66,7 @@ import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import { matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -466,6 +467,7 @@ function getStoredLibraryPageSize(): LibraryPageSize {
 }
 
 function buildLibraryListScopeKey(input: {
+  libraryProjectId: string
   filter: LibraryFilter
   searchKey: string
   searchFields: LibraryDocumentSearchField[]
@@ -473,6 +475,7 @@ function buildLibraryListScopeKey(input: {
   pageSize: LibraryPageSize
 }): string {
   return JSON.stringify({
+    libraryProjectId: input.libraryProjectId,
     filter: input.filter,
     searchKey: input.searchKey.trim(),
     searchFields: input.searchFields,
@@ -494,6 +497,7 @@ type DocumentItem = DocumentListItem
 type DocumentMetadata = Record<string, unknown>
 type ImportQueueJob = {
   id: number
+  libraryProjectId: string
   filePaths: string[]
   selectionId: string
   nextCursor: string | null
@@ -709,6 +713,10 @@ interface LibraryViewProps {
   droppedImportRequest?: { id: number; selection: ImportSelection; folderId?: string | null } | null
   onDroppedImportHandled?: (requestId: number) => void
   onOpenLibraryAi?: (payload?: LibraryAiOpenPayload) => void
+  libraryProjects?: LibraryProject[]
+  activeLibraryProjectId?: string
+  onLibraryProjectsChanged?: () => void
+  onLibraryDocumentsMoved?: (documentIds: string[]) => void
 }
 
 interface SidebarLayoutState {
@@ -1700,6 +1708,7 @@ function buildBatchMenuItems(): MenuProps['items'] {
         { key: 'metadata_extract', label: '批量抓取元数据' },
         { key: 'add_tags', label: '批量添加标签' },
         { key: 'add_folder', label: '批量加入文件夹' },
+        { key: 'move_project', label: '转移到文献项目', icon: <SwapOutlined /> },
         { key: 'synthesize', label: 'AI 文献综述' },
       ],
     },
@@ -2483,7 +2492,11 @@ export default function LibraryView({
   importRequest = 0,
   droppedImportRequest,
   onDroppedImportHandled,
-  onOpenLibraryAi
+  onOpenLibraryAi,
+  libraryProjects = [],
+  activeLibraryProjectId = '',
+  onLibraryProjectsChanged,
+  onLibraryDocumentsMoved,
 }: LibraryViewProps): JSX.Element {
   const layoutRef = useRef<HTMLDivElement | null>(null)
   const libraryContentRef = useRef<HTMLDivElement | null>(null)
@@ -2536,6 +2549,10 @@ export default function LibraryView({
   const [documentTagSearch, setDocumentTagSearch] = useState('')
   const [batchFolderModalOpen, setBatchFolderModalOpen] = useState(false)
   const [batchFolderTargetId, setBatchFolderTargetId] = useState<string | null>(null)
+  const [batchProjectModalOpen, setBatchProjectModalOpen] = useState(false)
+  const [batchProjectTargetId, setBatchProjectTargetId] = useState<string | null>(null)
+  const [batchProjectDocumentIds, setBatchProjectDocumentIds] = useState<string[]>([])
+  const [batchProjectMoving, setBatchProjectMoving] = useState(false)
   const [folderDropTarget, setFolderDropTarget] = useState<{ id: string; position: FolderDropPosition } | null>(null)
   const [sidebarWidth, setSidebarWidth] = useState(250)
   const [sectionHeights, setSectionHeights] = useState({ smart: 24, folder: 30, tag: 46 })
@@ -2629,12 +2646,13 @@ export default function LibraryView({
   })
 
   const currentLibraryScopeKey = useMemo(() => buildLibraryListScopeKey({
+    libraryProjectId: activeLibraryProjectId,
     filter,
     searchKey,
     searchFields: librarySearchFields,
     sort: librarySort,
     pageSize: libraryPageSize,
-  }), [filter, libraryPageSize, librarySearchFields, librarySort, searchKey])
+  }), [activeLibraryProjectId, filter, libraryPageSize, librarySearchFields, librarySort, searchKey])
 
   useEffect(() => {
     let active = true
@@ -3046,6 +3064,7 @@ export default function LibraryView({
       })
       setDocumentTotal(page.total)
       patchLibraryWarmCache(buildLibraryListScopeKey({
+          libraryProjectId: activeLibraryProjectId,
           filter: activeFilter,
           searchKey: options?.search ?? searchKey,
           searchFields: librarySearchFields,
@@ -3090,7 +3109,7 @@ export default function LibraryView({
         setLoading(false)
       }
     }
-  }, [buildListOptions, filter, libraryPageSize, librarySearchFields, librarySort, searchKey, setDocuments, setLoading])
+  }, [activeLibraryProjectId, buildListOptions, filter, libraryPageSize, librarySearchFields, librarySort, searchKey, setDocuments, setLoading])
 
   const submitLibrarySearch = useCallback((value = searchInput) => {
     const keyword = value.trim()
@@ -5182,6 +5201,7 @@ export default function LibraryView({
     if (pendingCount === 0) return null
     return {
       id: job.id,
+      libraryProjectId: job.libraryProjectId,
       selectionId: null,
       sourceLabels,
       pendingCount,
@@ -5249,6 +5269,9 @@ export default function LibraryView({
       if (parsed.version !== 1 || !Array.isArray(parsed.jobs)) return []
       return parsed.jobs.map((job, index) => ({
         id: Number(job.id || 0) || Date.now() + index,
+        libraryProjectId: typeof job.libraryProjectId === 'string' && job.libraryProjectId
+          ? job.libraryProjectId
+          : activeLibraryProjectId,
         selectionId: null,
         sourceLabels: [],
         pendingCount: Array.isArray(job.filePaths) ? job.filePaths.length : 1,
@@ -5275,7 +5298,7 @@ export default function LibraryView({
   }
 
   const processImportJob = async (job: ImportQueueJob) => {
-    const { folderId, folderAssignments, engine } = job
+    const { folderId, folderAssignments, engine, libraryProjectId } = job
     const totalFileCount = job.filePaths.length
     if (totalFileCount === 0) return
     setImportProgressText(`准备导入 ${totalFileCount} 个文件`)
@@ -5299,6 +5322,7 @@ export default function LibraryView({
             engine,
             batchSize: autoOcrBatchSize,
             sourceImportJobId: String(job.id),
+            libraryProjectId,
           })
           autoOcrTaskJobId = autoOcrTask.jobId
         }
@@ -5407,7 +5431,7 @@ export default function LibraryView({
           for (let batchIndex = 0; batchIndex < associationBatches.length; batchIndex += 1) {
             try {
               setImportProgressText(`正在写入文件夹归属 ${batchIndex + 1}/${associationBatches.length}`)
-              await window.api.addDocumentsToFolder(associationBatches[batchIndex], targetFolderId)
+              await window.api.addDocumentsToFolder(associationBatches[batchIndex], targetFolderId, libraryProjectId)
             } catch (error) {
               console.error('加入导入文件夹失败', error)
             }
@@ -5428,7 +5452,7 @@ export default function LibraryView({
         const batchQueuedResults: ImportBatchQueueResult[] = []
 
         try {
-          const batchResults = await window.api.importDocuments(batch, { ocrEngine: engine })
+          const batchResults = await window.api.importDocuments(batch, { ocrEngine: engine, libraryProjectId })
           batchResults.forEach((result, resultIndex) => {
             batchQueuedResults.push({
               result,
@@ -5606,6 +5630,7 @@ export default function LibraryView({
               ...authorizationRequiredJobsRef.current.filter((item) => item.id !== job.id),
               {
                 id: job.id,
+                libraryProjectId: job.libraryProjectId,
                 selectionId: null,
                 sourceLabels: job.remainingAuthorizationLabels || [],
                 pendingCount: job.remainingAuthorizationLabels?.length || 0,
@@ -5665,6 +5690,7 @@ export default function LibraryView({
       allowedReauthorizationSourceIds?: Set<string>
       directorySourceIds?: Set<string>
       jobId?: number
+      libraryProjectId?: string
     },
   ) => {
     const seen = new Set<string>()
@@ -5691,6 +5717,7 @@ export default function LibraryView({
     if (options?.jobId) importJobSeqRef.current = Math.max(importJobSeqRef.current, options.jobId)
     const job: ImportQueueJob = {
       id: options?.jobId || (importJobSeqRef.current += 1),
+      libraryProjectId: options?.libraryProjectId || activeLibraryProjectId,
       filePaths: nextFilePaths,
       selectionId: options?.selectionId || '',
       nextCursor: options?.nextCursor ?? null,
@@ -5784,7 +5811,12 @@ export default function LibraryView({
     const acceptedDirectorySourceIds = [...new Set(items.map((item) => item.sourceId))]
       .filter((sourceId) => directorySourceIds.has(sourceId))
     for (const sourceId of acceptedDirectorySourceIds) {
-      const folder = await window.api.createFolderFromImportSource(selection.selectionId, sourceId, targetFolderId || null)
+      const folder = await window.api.createFolderFromImportSource(
+        selection.selectionId,
+        sourceId,
+        targetFolderId || null,
+        reauthorizationJob?.libraryProjectId || activeLibraryProjectId,
+      )
       if (folder?.id) sourceFolderIds.set(sourceId, folder.id)
     }
     const grantIds = items.map((item) => item.grantId)
@@ -5808,6 +5840,7 @@ export default function LibraryView({
       allowedReauthorizationSourceIds: sourceMatch?.allowedSourceIds,
       directorySourceIds,
       jobId: reauthorizationJob?.id,
+      libraryProjectId: reauthorizationJob?.libraryProjectId || activeLibraryProjectId,
     })
     ownershipTransferred = replacementEstablished && !batchResult.value.done
     return replacementEstablished
@@ -6456,6 +6489,57 @@ export default function LibraryView({
   }
 
   const batchMenuItems: MenuProps['items'] = buildBatchMenuItems()
+  const targetLibraryProjects = libraryProjects.filter((project) => project.id !== activeLibraryProjectId)
+
+  const openProjectTransfer = (documentIds: string[]): void => {
+    const targetIds = [...new Set(documentIds.filter(Boolean))]
+    if (targetIds.length === 0) {
+      message.info('请先选择文献')
+      return
+    }
+    if (targetLibraryProjects.length === 0) {
+      message.info('请先在左侧项目切换器中新建另一个文献项目')
+      return
+    }
+    setBatchProjectDocumentIds(targetIds)
+    setBatchProjectTargetId(targetLibraryProjects[0]?.id || null)
+    setBatchProjectModalOpen(true)
+  }
+
+  const handleBatchMoveToProject = async (): Promise<void> => {
+    if (batchProjectDocumentIds.length === 0) {
+      message.info('请先选择文献')
+      return
+    }
+    if (!batchProjectTargetId) {
+      message.info('请选择目标文献项目')
+      return
+    }
+    const targetIds = [...batchProjectDocumentIds]
+    setBatchProjectMoving(true)
+    try {
+      const result = await window.api.moveDocumentsToLibraryProject(targetIds, batchProjectTargetId)
+      if (result.moved > 0) {
+        applySubmittedDocumentDeletion(targetIds, true)
+        setBatchProjectModalOpen(false)
+        setBatchProjectTargetId(null)
+        setBatchProjectDocumentIds([])
+        message.success(`已转移 ${result.moved} 篇文献`)
+        onLibraryDocumentsMoved?.(targetIds)
+        onLibraryProjectsChanged?.()
+        scheduleSmartViewCountsRefresh(200)
+        window.setTimeout(() => {
+          void loadDocuments(filter, { reset: true, silent: true })
+        }, 120)
+      } else {
+        message.info('所选文献已经位于目标项目，未发生变化')
+      }
+    } catch (error) {
+      message.error(getErrorMessage(error, '转移文献失败'))
+    } finally {
+      setBatchProjectMoving(false)
+    }
+  }
 
   const handleBatchMenu: MenuProps['onClick'] = ({ key }) => {
     if (key === 'import') void handleBatchImport()
@@ -6622,6 +6706,9 @@ export default function LibraryView({
       setBatchFolderTargetId(null)
       setBatchFolderModalOpen(true)
     }
+    if (key === 'move_project') {
+      openProjectTransfer(selectedIds)
+    }
     if (key === 'cancel_embedding') {
       if (selectedIds.length === 0) {
         message.info('请先选择要停止向量化的文献')
@@ -6690,14 +6777,24 @@ export default function LibraryView({
   }, [selectedIdSet, selectedIds.length, setSelectedIds])
 
   const getDocumentContextMenuItems = useCallback((docId: string, singleItems: MenuProps['items']) => {
+    const transferItem = {
+      key: 'context_move_project',
+      label: '转移到文献项目',
+      icon: <SwapOutlined />,
+    }
     if (selectedIdSet.has(docId) && selectedIds.length > 0) {
       return [
         { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
+        transferItem,
         { type: 'divider' as const },
         ...(batchMenuItems || []),
       ]
     }
-    return singleItems
+    return [
+      ...(singleItems || []),
+      { type: 'divider' as const },
+      transferItem,
+    ]
   }, [batchMenuItems, selectedIdSet, selectedIds.length])
 
   const handleDocumentContextMenuClick = useCallback((docId: string, singleHandler: MenuProps['onClick']): MenuProps['onClick'] => {
@@ -6706,13 +6803,20 @@ export default function LibraryView({
         handleDocumentOpen(docId)
         return
       }
+      if (info.key === 'context_move_project') {
+        const targetIds = selectedIdSet.has(docId) && selectedIds.length > 0
+          ? selectedIds
+          : [docId]
+        openProjectTransfer(targetIds)
+        return
+      }
       if (selectedIdSet.has(docId) && selectedIds.length > 0) {
         handleBatchMenu(info)
         return
       }
       singleHandler?.(info)
     }
-  }, [handleBatchMenu, handleDocumentOpen, selectedIdSet, selectedIds.length])
+  }, [handleBatchMenu, handleDocumentOpen, openProjectTransfer, selectedIdSet, selectedIds])
 
   const toggleSectionCollapsed = (section: 'smart' | 'folder' | 'tag') => {
     setCollapsedSections((current) => ({ ...current, [section]: !current[section] }))
@@ -8391,6 +8495,41 @@ export default function LibraryView({
               tags.length === 0 ? '还没有标签' : '没有匹配的标签',
             )}
           </div>
+        </Space>
+      </Modal>
+
+      <Modal
+        title="转移到文献项目"
+        open={batchProjectModalOpen}
+        okText={`转移 ${batchProjectDocumentIds.length} 篇`}
+        cancelText="取消"
+        confirmLoading={batchProjectMoving}
+        okButtonProps={{ disabled: !batchProjectTargetId }}
+        onOk={() => void handleBatchMoveToProject()}
+        onCancel={() => {
+          if (batchProjectMoving) return
+          setBatchProjectModalOpen(false)
+          setBatchProjectTargetId(null)
+          setBatchProjectDocumentIds([])
+        }}
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="只改变文献所属项目"
+            description="文献正文、OCR、向量、标签、文件夹、摘录和研究关联都会完整保留。转移后它将从当前项目列表消失，并出现在目标项目。"
+          />
+          <Select
+            style={{ width: '100%' }}
+            placeholder="选择目标项目"
+            value={batchProjectTargetId}
+            onChange={setBatchProjectTargetId}
+            options={targetLibraryProjects.map((project) => ({
+              value: project.id,
+              label: `${project.name}（${project.document_count.toLocaleString()} 篇）`,
+            }))}
+          />
         </Space>
       </Modal>
 

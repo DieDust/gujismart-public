@@ -1,7 +1,8 @@
 ﻿import { dialog, ipcMain } from 'electron'
 import { writeFileSync } from 'fs'
+import { writeFile } from 'fs/promises'
 import { nanoid } from 'nanoid'
-import { queryOne, run, saveDatabase } from '../database'
+import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { createHash } from 'crypto'
 import { resolveCanonicalPageContent } from '../canonical-content'
 import { validateSearchSnapshot } from '../search-snapshots'
@@ -28,6 +29,7 @@ import {
   semanticSearch
 } from '../semantic-search'
 import { vectorSearch } from '../embedding-index'
+import { VECTOR_SEARCH_DEFAULT_LIMIT, VECTOR_SEARCH_MAX_LIMIT } from '../../shared/vector-search'
 import type {
   AiPlannedSearchResponse,
   CursorPage,
@@ -61,6 +63,13 @@ import type {
 import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
 import { getLiteraturePageNumForPhysical } from '../literature-page-map'
 import { buildCitation, buildCitationByStyle, mapDocTypeToCitationFormat } from './citation'
+import {
+  assertDocumentIdsInLibraryProject,
+  assertDocumentInLibraryProject,
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 
 function resolveExportPageNumberMode(options?: { pageNumberMode?: ExportPageNumberMode } | null): ExportPageNumberMode {
   return options?.pageNumberMode === 'natural' ? 'natural' : 'literature'
@@ -71,13 +80,54 @@ function resolveExportHitPageNum(
   hit: SearchHit,
   group: SearchDocumentGroup,
   mode: ExportPageNumberMode,
+  literaturePageCache?: ReadonlyMap<string, number | null>,
 ): number | null {
   const physical = Number(hit.locator.pageNum || 0)
   if (!Number.isFinite(physical) || physical <= 0) return null
   if (mode === 'natural') return Math.floor(physical)
+  const cacheKey = `${group.docId}\u0000${Math.floor(physical)}`
+  if (literaturePageCache?.has(cacheKey)) {
+    return literaturePageCache.get(cacheKey) || Math.floor(physical)
+  }
   const literature = getLiteraturePageNumForPhysical(group.docId, physical)
   if (literature != null && literature > 0) return literature
   return Math.floor(physical)
+}
+
+function buildLiteraturePageCache(
+  items: Array<{ group: SearchDocumentGroup; hit: SearchHit }>,
+): Map<string, number | null> {
+  const physicalPagesByDocument = new Map<string, Set<number>>()
+  for (const { group, hit } of items) {
+    const physical = Math.floor(Number(hit.locator.pageNum || 0))
+    if (!group.docId || physical <= 0) continue
+    const pages = physicalPagesByDocument.get(group.docId) || new Set<number>()
+    pages.add(physical)
+    physicalPagesByDocument.set(group.docId, pages)
+  }
+
+  const cache = new Map<string, number | null>()
+  for (const [docId, pageSet] of physicalPagesByDocument) {
+    const pages = [...pageSet]
+    pages.forEach((pageNum) => cache.set(`${docId}\u0000${pageNum}`, null))
+    for (let index = 0; index < pages.length; index += 400) {
+      const batch = pages.slice(index, index + 400)
+      const rows = queryAll<{ page_num: number | null; literature_page_num: number | null }>(
+        `SELECT page_num, literature_page_num
+         FROM pages
+         WHERE doc_id = ? AND page_num IN (${batch.map(() => '?').join(', ')})`,
+        [docId, ...batch],
+      )
+      rows.forEach((row) => {
+        const physical = Math.floor(Number(row.page_num || 0))
+        const literature = Math.floor(Number(row.literature_page_num || 0))
+        if (physical > 0) {
+          cache.set(`${docId}\u0000${physical}`, literature > 0 ? literature : null)
+        }
+      })
+    }
+  }
+  return cache
 }
 
 interface SearchIndexSegmentRow {
@@ -449,12 +499,8 @@ function getHitParagraphFromSnippet(hit: SearchHit): HitParagraphResolution | nu
   }
 }
 
-function getHitParagraph(hit: SearchHit): HitParagraphResolution | null {
-  const source = getHitSourceText(hit)
-  if (!source?.text) {
-    // Vector hits often carry a usable excerpt even when locator expand fails.
-    return getHitParagraphFromSnippet(hit)
-  }
+function resolveParagraphFromSource(hit: SearchHit, source: HitSourceResolution): HitParagraphResolution | null {
+  if (!source.text) return null
   if (source.sourceType !== 'page' && isEllipsisSnippetText(source.text)) {
     return getHitParagraphFromSnippet(hit)
   }
@@ -488,6 +534,63 @@ function getHitParagraph(hit: SearchHit): HitParagraphResolution | null {
     hitIndex,
     hitIndexStrategy,
   }
+}
+
+function getHitParagraph(hit: SearchHit): HitParagraphResolution | null {
+  const source = getHitSourceText(hit)
+  if (!source?.text) {
+    // Vector hits often carry a usable excerpt even when locator expand fails.
+    return getHitParagraphFromSnippet(hit)
+  }
+  return resolveParagraphFromSource(hit, source)
+}
+
+/**
+ * Vector export path: prefer segment/snippet over full-page OCR so export does not
+ * block the main process loading large page payloads for every hit.
+ */
+function getHitParagraphForVectorExport(hit: SearchHit): HitParagraphResolution | null {
+  const segment = loadHitSegment(hit)
+  const rawSegmentText = segment?.text ? cleanExcerptText(segment.text) : ''
+  const normalizedSegmentText = segment?.normalized_text ? cleanExcerptText(segment.normalized_text) : ''
+  const sourceStart = Math.max(0, Number(segment?.source_start || 0))
+  const baseMeta = {
+    sourceStart,
+    pageTextLength: 0,
+    segmentTextLength: rawSegmentText.length,
+    normalizedTextLength: normalizedSegmentText.length,
+    pageHasText: false,
+    segmentHasText: rawSegmentText.length > 0,
+    normalizedHasText: normalizedSegmentText.length > 0,
+  }
+
+  if (rawSegmentText && !isEllipsisSnippetText(rawSegmentText)) {
+    const source: HitSourceResolution = {
+      ...baseMeta,
+      text: rawSegmentText,
+      sourceKey: segment?.segment_id || hit.locator.segmentId || `${hit.locator.docId}:segment:${hit.locator.segmentOrdinal}`,
+      sourceType: 'segment',
+    }
+    const resolved = resolveParagraphFromSource(hit, source)
+    if (resolved?.text) return resolved
+  }
+
+  if (normalizedSegmentText && !isEllipsisSnippetText(normalizedSegmentText)) {
+    const source: HitSourceResolution = {
+      ...baseMeta,
+      text: normalizedSegmentText,
+      sourceKey: segment?.segment_id || hit.locator.segmentId || `${hit.locator.docId}:normalized:${hit.locator.segmentOrdinal}`,
+      sourceType: 'normalized-segment',
+    }
+    const resolved = resolveParagraphFromSource(hit, source)
+    if (resolved?.text) return resolved
+  }
+
+  const fromSnippet = getHitParagraphFromSnippet(hit)
+  if (fromSnippet?.text) return fromSnippet
+
+  // Last resort: full page OCR (may be slow on large pages).
+  return getHitParagraph(hit)
 }
 
 function getExportParagraphHitKey(hit: SearchHit, paragraph: HitParagraphResolution): string {
@@ -719,31 +822,94 @@ function buildExportRecords(
 /**
  * Export one evidence item per vector hit (do not collapse by paragraph), for AI re-use.
  */
+/** Clamp vector export score floor to [0, 1]. Values ≤ 0 mean “no filter”. */
+function normalizeMinVectorScore(value: unknown): number {
+  const raw = Number(value)
+  if (!Number.isFinite(raw) || raw <= 0) return 0
+  return Math.min(1, Math.max(0, Math.round(raw * 1000) / 1000))
+}
+
+const DEFAULT_VECTOR_EXPORT_MAX = VECTOR_SEARCH_DEFAULT_LIMIT
+const HARD_VECTOR_EXPORT_MAX = VECTOR_SEARCH_MAX_LIMIT
+const HARD_FULLTEXT_EXPORT_MAX = 1000
+
+/** Clamp user-selected export size. */
+function normalizeMaxExportRecords(value: unknown, vectorMode: boolean): number {
+  const fallback = vectorMode ? DEFAULT_VECTOR_EXPORT_MAX : 200
+  const hardMax = vectorMode ? HARD_VECTOR_EXPORT_MAX : HARD_FULLTEXT_EXPORT_MAX
+  const raw = Math.round(Number(value))
+  if (!Number.isFinite(raw) || raw <= 0) return fallback
+  return Math.min(hardMax, Math.max(1, raw))
+}
+
+/**
+ * Vector export body: prefer the already-returned snippet first.
+ * Avoids synchronous page/segment DB work that freezes the main process on bulk export/preview.
+ */
+function getHitParagraphForVectorExportFast(hit: SearchHit): HitParagraphResolution | null {
+  const fromSnippet = getHitParagraphFromSnippet(hit)
+  if (fromSnippet?.text) return fromSnippet
+  return getHitParagraphForVectorExport(hit)
+}
+
 function buildVectorExportRecords(
   response: SearchGroupedResponse,
   keyword: string,
   options: SearchExportOptions = {},
   maxRecords = Number.POSITIVE_INFINITY,
-): { records: SearchExportRecord[]; missingHitCount: number } {
+  recordBuildLimit = maxRecords,
+): {
+  records: SearchExportRecord[]
+  missingHitCount: number
+  filteredByMinScore: number
+  selectedHitCount: number
+} {
   const records: SearchExportRecord[] = []
   let missingHitCount = 0
+  let filteredByMinScore = 0
+  const minScore = normalizeMinVectorScore(options.minVectorScore)
+  const cap = Number.isFinite(maxRecords) && maxRecords > 0
+    ? maxRecords
+    : normalizeMaxExportRecords(options.maxExportRecords, true)
   const exportedAt = new Date().toISOString()
   const pageNumberMode = resolveExportPageNumberMode(options)
+  // Bulk vector export uses lightweight citations (no per-hit template DB) to avoid freezes.
   const flatHits: Array<{ group: SearchDocumentGroup; hit: SearchHit }> = []
   response.groups.forEach((group) => {
     group.hits.forEach((hit) => flatHits.push({ group, hit }))
   })
   flatHits.sort((a, b) => (Number(b.hit.score) || 0) - (Number(a.hit.score) || 0))
 
-  for (const { group, hit } of flatHits) {
-    if (records.length >= maxRecords) break
-    const paragraph = getHitParagraph(hit)
+  const matchingHits = flatHits.filter(({ hit }) => {
+    const score = Number(hit.score)
+    if (minScore > 0 && !(Number.isFinite(score) && score >= minScore)) {
+      filteredByMinScore += 1
+      return false
+    }
+    return true
+  })
+  const selectedHits = matchingHits.slice(0, cap)
+  const buildLimit = Number.isFinite(recordBuildLimit)
+    ? Math.max(0, Math.floor(recordBuildLimit))
+    : selectedHits.length
+  const hitsToBuild = selectedHits.slice(0, buildLimit)
+  const literaturePageCache = pageNumberMode === 'literature'
+    ? buildLiteraturePageCache(hitsToBuild)
+    : undefined
+
+  for (const { group, hit } of hitsToBuild) {
+    const score = Number(hit.score)
+    const paragraph = getHitParagraphForVectorExportFast(hit)
     if (!paragraph?.text) {
       missingHitCount += 1
       continue
     }
-    const score = Number(hit.score)
-    const pageNum = resolveExportHitPageNum(hit, group, pageNumberMode)
+    const pageNum = resolveExportHitPageNum(hit, group, pageNumberMode, literaturePageCache)
+    const citation = [
+      group.author ? String(group.author) : '',
+      group.title || '未命名文献',
+      pageNum ? `第 ${pageNum} 页` : '',
+    ].filter(Boolean).join('，')
     records.push({
       title: group.title || 'Untitled',
       author: group.author || null,
@@ -753,7 +919,7 @@ function buildVectorExportRecords(
       paragraph: paragraph.text,
       hitTerms: hit.locator.queryTerm ? [hit.locator.queryTerm] : [],
       hitCount: 1,
-      citation: formatHitCitation(group, hit, options, pageNum),
+      citation,
       locator: hit.locator,
       stableLocator: hit.stableLocator,
       searchKeyword: keyword,
@@ -764,15 +930,79 @@ function buildVectorExportRecords(
       segmentId: hit.locator.segmentId || null,
     })
   }
-  return { records, missingHitCount }
+  return {
+    records,
+    missingHitCount,
+    filteredByMinScore,
+    selectedHitCount: selectedHits.length,
+  }
+}
+
+const EXPORT_PREVIEW_ITEM_LIMIT = 3
+
+function collectExportRecords(
+  response: SearchGroupedResponse,
+  keyword: string,
+  options: SearchExportOptions = {},
+  maxRecords?: number,
+  recordBuildLimit?: number,
+): {
+  records: SearchExportRecord[]
+  missingHitCount: number
+  filteredByMinScore: number
+  vectorMode: boolean
+  minVectorScore: number
+  maxExportRecords: number
+  selectedHitCount: number
+} {
+  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
+  const minVectorScore = normalizeMinVectorScore(options.minVectorScore)
+  const resolvedMax = normalizeMaxExportRecords(
+    maxRecords ?? options.maxExportRecords,
+    vectorMode,
+  )
+  if (vectorMode) {
+    const built = buildVectorExportRecords(
+      response,
+      keyword,
+      { ...options, minVectorScore, maxExportRecords: resolvedMax },
+      resolvedMax,
+      recordBuildLimit,
+    )
+    return { ...built, vectorMode, minVectorScore, maxExportRecords: resolvedMax }
+  }
+  const built = buildExportRecords(response, keyword, options, resolvedMax)
+  return {
+    ...built,
+    filteredByMinScore: 0,
+    vectorMode,
+    minVectorScore: 0,
+    maxExportRecords: resolvedMax,
+    selectedHitCount: built.records.length,
+  }
 }
 
 function buildSearchExportPreview(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): SearchExportPreviewResult {
-  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
-  const { records, missingHitCount } = vectorMode
-    ? buildVectorExportRecords(response, keyword, options, 3)
-    : buildExportRecords(response, keyword, options, 3)
-  const previewItems: SearchExportPreviewItem[] = records.slice(0, 3).map((record) => ({
+  // Cap + score filter applied; only first few items are expanded for the UI list.
+  const previewOptions: SearchExportOptions = { ...options, previewOnly: true, citationMode: 'simple' }
+  const {
+    records,
+    missingHitCount,
+    filteredByMinScore,
+    vectorMode,
+    minVectorScore,
+    maxExportRecords,
+    selectedHitCount,
+  } = collectExportRecords(
+    response,
+    keyword,
+    previewOptions,
+    undefined,
+    isVectorExportResponse(response) || options.searchEngine === 'vector'
+      ? EXPORT_PREVIEW_ITEM_LIMIT
+      : undefined,
+  )
+  const previewItems: SearchExportPreviewItem[] = records.slice(0, EXPORT_PREVIEW_ITEM_LIMIT).map((record) => ({
     title: record.title,
     author: record.author,
     docType: record.docType,
@@ -791,8 +1021,13 @@ function buildSearchExportPreview(response: SearchGroupedResponse, keyword: stri
     keyword,
     totalDocuments: response.totalDocuments,
     totalHits: response.totalHits,
-    exportableParagraphs: records.length,
+    exportableParagraphs: vectorMode
+      ? Math.max(0, selectedHitCount - missingHitCount)
+      : records.length,
     skippedHits: missingHitCount,
+    filteredByMinScore,
+    minVectorScore: vectorMode ? minVectorScore : 0,
+    maxExportRecords,
     previewItems,
   }
 }
@@ -820,10 +1055,18 @@ function buildSearchExcerptMarkdown(
   keyword: string,
   missingHitCount: number,
   options: SearchExportOptions = {},
+  filteredByMinScore = 0,
 ): string {
   const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
   if (vectorMode) {
-    return buildVectorSearchExcerptMarkdown(records, response, keyword, missingHitCount)
+    return buildVectorSearchExcerptMarkdown(
+      records,
+      response,
+      keyword,
+      missingHitCount,
+      options,
+      filteredByMinScore,
+    )
   }
   const lines = [
     '# Search Excerpts',
@@ -937,8 +1180,11 @@ function buildVectorSearchExcerptMarkdown(
   response: SearchGroupedResponse,
   keyword: string,
   missingHitCount: number,
+  options: SearchExportOptions = {},
+  filteredByMinScore = 0,
 ): string {
   const modelHint = (response.warnings || []).find((item) => /模型/.test(String(item || ''))) || ''
+  const minScore = normalizeMinVectorScore(options.minVectorScore)
   const lines = [
     '# 向量库语义证据导出',
     '',
@@ -949,7 +1195,9 @@ function buildVectorSearchExcerptMarkdown(
     `- 文献数：${response.totalDocuments}`,
     `- 证据条数：${records.length}`,
     `- 导出时间：${new Date().toLocaleString('zh-CN')}`,
+    ...(minScore > 0 ? [`- 最低相似度：≥ ${minScore}`] : []),
     ...(modelHint ? [`- ${modelHint}`] : []),
+    ...(filteredByMinScore > 0 ? [`- 因相似度不足跳过：${filteredByMinScore}`] : []),
     ...(missingHitCount > 0 ? [`- 跳过无法还原：${missingHitCount}`] : []),
     '',
     '---',
@@ -981,8 +1229,11 @@ function buildVectorSearchExcerptTxt(
   response: SearchGroupedResponse,
   keyword: string,
   missingHitCount: number,
+  options: SearchExportOptions = {},
+  filteredByMinScore = 0,
 ): string {
   const modelHint = (response.warnings || []).find((item) => /模型/.test(String(item || ''))) || ''
+  const minScore = normalizeMinVectorScore(options.minVectorScore)
   const lines: string[] = [
     `向量库语义证据导出（${VECTOR_EXCERPT_EXPORTER_VERSION}）`,
     '说明：当前仅导出文本语义命中，供复制给外部 AI 使用；按相似度从高到低排列。',
@@ -992,7 +1243,9 @@ function buildVectorSearchExcerptTxt(
     `证据条数：${records.length}`,
     `导出时间：${new Date().toLocaleString('zh-CN')}`,
   ]
+  if (minScore > 0) lines.push(`最低相似度：≥ ${minScore}（余弦相似度）`)
   if (modelHint) lines.push(modelHint)
+  if (filteredByMinScore > 0) lines.push(`因相似度不足跳过：${filteredByMinScore}`)
   if (missingHitCount > 0) lines.push(`跳过无法还原：${missingHitCount}`)
   lines.push('', '==============================', '')
 
@@ -1014,25 +1267,57 @@ function buildVectorSearchExcerptTxt(
   return `\ufeff${lines.join('\n')}`
 }
 
-function buildSearchExcerptContent(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): string {
+function buildSearchExcerptContentFromRecords(
+  records: SearchExportRecord[],
+  missingHitCount: number,
+  response: SearchGroupedResponse,
+  keyword: string,
+  options: SearchExportOptions = {},
+  vectorMode = false,
+  filteredByMinScore = 0,
+): string {
   const format = options.format || 'txt'
-  const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
-  const { records, missingHitCount } = vectorMode
-    ? buildVectorExportRecords(response, keyword, options)
-    : buildExportRecords(response, keyword, options)
+  const minScore = normalizeMinVectorScore(options.minVectorScore)
   if (records.length === 0) {
+    if (vectorMode && filteredByMinScore > 0) {
+      throw new Error(
+        `没有达到最低相似度（≥ ${minScore}）的向量证据。可调低阈值后重试。`,
+      )
+    }
     throw new Error(vectorMode
       ? '没有可导出的向量证据。请确认已建立向量索引且本次检索有命中。'
       : 'No complete paragraphs were available for export. Please rebuild the search index or confirm OCR/proofed text exists.')
   }
   if (format === 'txt') {
     return vectorMode
-      ? buildVectorSearchExcerptTxt(records, response, keyword, missingHitCount)
+      ? buildVectorSearchExcerptTxt(records, response, keyword, missingHitCount, options, filteredByMinScore)
       : buildSearchExcerptTxt(response, keyword, options)
   }
-  if (format === 'markdown') return buildSearchExcerptMarkdown(records, response, keyword, missingHitCount, options)
+  if (format === 'markdown') {
+    return buildSearchExcerptMarkdown(
+      records,
+      response,
+      keyword,
+      missingHitCount,
+      options,
+      filteredByMinScore,
+    )
+  }
   if (format === 'csv') return buildSearchExcerptCsv(records, vectorMode)
   return buildSearchExcerptJson(records, response, keyword, missingHitCount, options)
+}
+
+function buildSearchExcerptContent(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): string {
+  const { records, missingHitCount, vectorMode, filteredByMinScore } = collectExportRecords(response, keyword, options)
+  return buildSearchExcerptContentFromRecords(
+    records,
+    missingHitCount,
+    response,
+    keyword,
+    options,
+    vectorMode,
+    filteredByMinScore,
+  )
 }
 
 function buildSearchExcerptTxt(response: SearchGroupedResponse, keyword: string, options: SearchExportOptions = {}): string {
@@ -1152,6 +1437,29 @@ function buildSearchExportDiagnostics(response: SearchGroupedResponse, keyword: 
     documents,
   }, null, 2)
 }
+function normalizeExportGroups(groups: SearchDocumentGroup[] | undefined | null): SearchDocumentGroup[] {
+  if (!Array.isArray(groups) || groups.length === 0) return []
+  return groups
+    .map((group) => {
+      const docId = String(group?.docId || '').trim()
+      if (!docId) return null
+      const hits = Array.isArray(group.hits) ? group.hits.filter((hit) => hit && hit.locator) : []
+      if (hits.length === 0) return null
+      const sortedHits = [...hits].sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
+      return {
+        docId,
+        title: String(group.title || '未命名文献'),
+        author: group.author ?? null,
+        docType: String(group.docType || ''),
+        totalHits: Number(group.totalHits) || sortedHits.length,
+        hits: sortedHits,
+        topHits: sortedHits.slice(0, 3),
+        score: Math.max(0, ...sortedHits.map((hit) => Number(hit.score) || 0), Number(group.score) || 0),
+      } satisfies SearchDocumentGroup
+    })
+    .filter((group): group is SearchDocumentGroup => !!group)
+}
+
 async function resolveExportSearchResponse(keyword: string, options?: SearchOptions): Promise<SearchGroupedResponse> {
   const query = String(keyword || '').trim()
   const {
@@ -1161,16 +1469,45 @@ async function resolveExportSearchResponse(keyword: string, options?: SearchOpti
     previewOnly: _previewOnly,
     format: _format,
     searchEngine,
+    exportGroups,
+    exportWarnings,
+    minVectorScore: _minVectorScore,
+    maxExportRecords: _maxExportRecords,
     ...searchOptions
   } = options || {}
+
+  // Reuse on-screen results: no second full-corpus vector/FTS pass (avoids "Not Responding").
+  const reusedGroups = normalizeExportGroups(exportGroups)
+  if (reusedGroups.length > 0) {
+    assertDocumentIdsInLibraryProject(
+      reusedGroups.map((group) => group.docId),
+      getActiveLibraryProjectId(),
+    )
+    const totalHits = reusedGroups.reduce((sum, group) => sum + (group.hits?.length || group.totalHits || 0), 0)
+    const warnings = [
+      ...(Array.isArray(exportWarnings) ? exportWarnings.map((item) => String(item || '').trim()).filter(Boolean) : []),
+      searchEngine === 'vector'
+        ? '使用当前向量检索结果导出（未重新扫描向量库）'
+        : '使用当前检索结果导出（未重新执行全文检索）',
+    ]
+    return {
+      query,
+      totalDocuments: reusedGroups.length,
+      totalHits,
+      groups: reusedGroups,
+      warnings,
+      status: 'complete',
+    }
+  }
 
   if (searchEngine === 'vector') {
     const folderId = searchOptions.folderId
       || (Array.isArray(searchOptions.folderIds) ? searchOptions.folderIds[0] : undefined)
     const tagId = searchOptions.tagId
       || (Array.isArray(searchOptions.tagIds) ? searchOptions.tagIds[0] : undefined)
+    const requestedLimit = Math.max(1, Math.round(Number(searchOptions?.limit || 40)) || 40)
     const vectorRes = await vectorSearch(query, {
-      limit: Math.min(100, Math.max(Number(searchOptions?.limit || 40) || 40, 1)),
+      limit: Math.min(VECTOR_SEARCH_MAX_LIMIT, requestedLimit),
       folderId: folderId ? String(folderId) : undefined,
       tagId: tagId ? String(tagId) : undefined,
     })
@@ -1278,6 +1615,9 @@ async function exportSearchExcerpts(keyword: string, options?: SearchOptions): P
   const allowedFormats = new Set(['txt', 'markdown', 'csv', 'json'])
   const format = allowedFormats.has(String(options?.format)) ? String(options?.format) as SearchExportOptions['format'] : 'txt'
   const requestedCitationMode = options?.citationMode
+  const isVector = options?.searchEngine === 'vector'
+  const minVectorScore = normalizeMinVectorScore(options?.minVectorScore)
+  const maxExportRecords = normalizeMaxExportRecords(options?.maxExportRecords, !!isVector)
   const exportConfig: SearchExportOptions = {
     format,
     citationMode: ['auto', 'simple', 'template'].includes(String(requestedCitationMode))
@@ -1290,12 +1630,60 @@ async function exportSearchExcerpts(keyword: string, options?: SearchOptions): P
       ? options.citationTemplateId.trim()
       : undefined,
     previewOnly: !!options?.previewOnly,
-    searchEngine: options?.searchEngine === 'vector' ? 'vector' : 'fulltext',
+    searchEngine: isVector ? 'vector' : 'fulltext',
     pageNumberMode: resolveExportPageNumberMode(options),
+    minVectorScore,
+    maxExportRecords,
   }
+
+  let outputFilePath: string | null = null
+  if (!exportConfig.previewOnly) {
+    // Ask for the destination before any bulk paragraph work so the app responds
+    // immediately to the Export button even for a large evidence set.
+    const extension = format === 'markdown' ? 'md' : format || 'txt'
+    const filterName = format === 'markdown' ? 'Markdown' : String(format || 'txt').toUpperCase()
+    const selection = await dialog.showSaveDialog({
+      title: '导出检索摘录',
+      defaultPath: `${sanitizeFileName(`检索摘录-${query}`)}.${extension}`,
+      filters: [{ name: filterName, extensions: [extension] }],
+    })
+    if (selection.canceled || !selection.filePath) {
+      const currentGroups = Array.isArray(options?.exportGroups) ? options.exportGroups : []
+      return {
+        canceled: true,
+        filePath: null,
+        totalHits: currentGroups.reduce((sum, group) => sum + (group.hits?.length || 0), 0),
+        totalDocuments: currentGroups.length,
+        exportableParagraphs: 0,
+        skippedHits: 0,
+        filteredByMinScore: 0,
+        minVectorScore,
+        maxExportRecords,
+      }
+    }
+    outputFilePath = selection.filePath
+  }
+
   const response = await resolveExportSearchResponse(query, options)
   if (!response.totalHits) throw new Error('No search hits are available to export.')
-  const content = buildSearchExcerptContent(response, query, exportConfig)
+  // Build records once: content + stats share the same work (no second paragraph pass).
+  const {
+    records,
+    missingHitCount,
+    vectorMode,
+    filteredByMinScore,
+    minVectorScore: appliedMinScore,
+    maxExportRecords: appliedMax,
+  } = collectExportRecords(response, query, exportConfig)
+  const content = buildSearchExcerptContentFromRecords(
+    records,
+    missingHitCount,
+    response,
+    query,
+    exportConfig,
+    vectorMode,
+    filteredByMinScore,
+  )
 
   if (exportConfig.previewOnly) {
     return {
@@ -1304,27 +1692,26 @@ async function exportSearchExcerpts(keyword: string, options?: SearchOptions): P
       totalHits: response.totalHits,
       totalDocuments: response.totalDocuments,
       content,
+      exportableParagraphs: records.length,
+      skippedHits: missingHitCount,
+      filteredByMinScore,
+      minVectorScore: appliedMinScore,
+      maxExportRecords: appliedMax,
     }
   }
 
-  const extension = format === 'markdown' ? 'md' : format || 'txt'
-  const filterName = format === 'markdown' ? 'Markdown' : String(format || 'txt').toUpperCase()
-  const { canceled, filePath } = await dialog.showSaveDialog({
-    title: '导出检索摘录',
-    defaultPath: `${sanitizeFileName(`检索摘录-${query}`)}.${extension}`,
-    filters: [{ name: filterName, extensions: [extension] }],
-  })
-  if (canceled || !filePath) return { canceled: true, filePath: null, totalHits: response.totalHits, totalDocuments: response.totalDocuments }
-
-  writeFileSync(filePath, content, 'utf-8')
-  const exportStats = buildSearchExportPreview(response, query, exportConfig)
+  if (!outputFilePath) throw new Error('未选择导出文件路径')
+  await writeFile(outputFilePath, content, 'utf-8')
   return {
     canceled: false,
-    filePath,
+    filePath: outputFilePath,
     totalHits: response.totalHits,
     totalDocuments: response.totalDocuments,
-    exportableParagraphs: exportStats.exportableParagraphs,
-    skippedHits: exportStats.skippedHits,
+    exportableParagraphs: records.length,
+    skippedHits: missingHitCount,
+    filteredByMinScore,
+    minVectorScore: appliedMinScore,
+    maxExportRecords: appliedMax,
   }
 }
 
@@ -1332,6 +1719,7 @@ async function previewSearchExcerpts(keyword: string, options?: SearchOptions): 
   const query = String(keyword || '').trim()
   if (!query) throw new Error('请先输入检索词')
   const requestedCitationMode = options?.citationMode
+  const isVector = options?.searchEngine === 'vector'
   const exportConfig: SearchExportOptions = {
     citationMode: ['auto', 'simple', 'template'].includes(String(requestedCitationMode))
       ? requestedCitationMode
@@ -1342,8 +1730,10 @@ async function previewSearchExcerpts(keyword: string, options?: SearchOptions): 
     citationTemplateId: typeof options?.citationTemplateId === 'string' && options.citationTemplateId.trim()
       ? options.citationTemplateId.trim()
       : undefined,
-    searchEngine: options?.searchEngine === 'vector' ? 'vector' : 'fulltext',
+    searchEngine: isVector ? 'vector' : 'fulltext',
     pageNumberMode: resolveExportPageNumberMode(options),
+    minVectorScore: normalizeMinVectorScore(options?.minVectorScore),
+    maxExportRecords: normalizeMaxExportRecords(options?.maxExportRecords, !!isVector),
   }
   const response = await resolveExportSearchResponse(query, options)
   return buildSearchExportPreview(response, query, exportConfig)
@@ -1392,12 +1782,20 @@ async function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExc
     previewOnly: _previewOnly,
     format: _format,
     projectId,
-    searchEngine: _searchEngine,
+    searchEngine,
+    exportGroups: _exportGroups,
+    exportWarnings: _exportWarnings,
+    minVectorScore,
+    maxExportRecords,
     ..._rest
   } = options || {}
   const response = await resolveExportSearchResponse(query, options)
-  const { records } = buildExportRecords(response, query, {
+  const isVector = searchEngine === 'vector'
+  const { records } = collectExportRecords(response, query, {
     citationMode: 'simple',
+    searchEngine: isVector ? 'vector' : 'fulltext',
+    minVectorScore: normalizeMinVectorScore(minVectorScore),
+    maxExportRecords: normalizeMaxExportRecords(maxExportRecords, isVector),
   })
   const now = new Date().toISOString()
   let savedCount = 0
@@ -1472,12 +1870,17 @@ async function saveSearchExcerptRecords(keyword: string, options?: SaveSearchExc
 }
 
 export function registerSearchIpc(): void {
+  const inCapturedLibraryProject = <T>(operation: () => T): T => {
+    const projectId = captureActiveLibraryProjectId()
+    return withLibraryProjectContext(projectId, operation)
+  }
+
   ipcMain.handle('search:fulltext', async (_event, keyword: string, options?: SearchOptions): Promise<SearchResult[]> => {
-    return fullTextSearch(keyword, options)
+    return inCapturedLibraryProject(() => fullTextSearch(keyword, options))
   })
 
   ipcMain.handle('search:queryV2', async (_event, keyword: string, options?: SearchOptions): Promise<SearchGroupedResponse> => {
-    return querySearchV2(keyword, options)
+    return inCapturedLibraryProject(() => querySearchV2(keyword, options))
   })
 
   ipcMain.handle('search:validateSnapshot', async (_event, snapshotId: string, criteriaKey?: string): Promise<SearchSnapshotValidationResult> => {
@@ -1510,57 +1913,73 @@ export function registerSearchIpc(): void {
   ))
 
   ipcMain.handle('search:exportExcerpts', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportResult> => {
-    return exportSearchExcerpts(keyword, options)
+    return inCapturedLibraryProject(() => exportSearchExcerpts(keyword, options))
   })
 
   ipcMain.handle('search:previewExportExcerpts', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportPreviewResult> => {
-    return previewSearchExcerpts(keyword, options)
+    return inCapturedLibraryProject(() => previewSearchExcerpts(keyword, options))
   })
 
   ipcMain.handle('search:exportDiagnostics', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportResult> => {
-    return exportSearchDiagnostics(keyword, options)
+    return inCapturedLibraryProject(() => exportSearchDiagnostics(keyword, options))
   })
 
   ipcMain.handle('search:saveExcerpts', async (_event, keyword: string, options?: SaveSearchExcerptsOptions): Promise<SaveSearchExcerptsResult> => {
-    return saveSearchExcerptRecords(keyword, options)
+    return inCapturedLibraryProject(() => saveSearchExcerptRecords(keyword, options))
   })
 
   ipcMain.handle('search:getDocumentHits', async (_event, docId: string, keyword: string, options?: SearchOptions): Promise<SearchSessionState> => {
-    return getDocumentSearchHits(docId, keyword, options)
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return getDocumentSearchHits(docId, keyword, options)
+    })
   })
 
   ipcMain.handle('search:getDocumentHitPage', async (_event, docId: string, keyword: string, options?: SearchOptions): Promise<SearchDocumentHitPage> => {
-    return getDocumentSearchHitPage(docId, keyword, options)
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return getDocumentSearchHitPage(docId, keyword, options)
+    })
   })
 
   ipcMain.handle('search:reindexDocument', async (_event, docId: string): Promise<SearchReindexDocumentResult> => {
-    return queueDocumentReindex(docId)
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return queueDocumentReindex(docId)
+    })
   })
 
   ipcMain.handle('search:reindexAll', async (): Promise<SearchReindexAllResult> => {
-    return queueAllDocumentsReindex()
+    return inCapturedLibraryProject(() => queueAllDocumentsReindex())
   })
 
   ipcMain.handle('search:getIndexStatus', async (_event, docId?: string): Promise<SearchIndexStatus[]> => {
-    return getSearchIndexStatus(docId)
+    return inCapturedLibraryProject(() => {
+      if (docId) assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return getSearchIndexStatus(docId)
+    })
   })
 
   ipcMain.handle('search:semantic', async (_event, keyword: string, options?: SearchOptions): Promise<SearchResult[]> => {
-    try {
-      return await semanticSearch(keyword, options)
-    } catch (error) {
-      console.error('[Search] Semantic search failed:', error)
-      return []
-    }
+    return inCapturedLibraryProject(async () => {
+      try {
+        return await semanticSearch(keyword, options)
+      } catch (error) {
+        console.error('[Search] Semantic search failed:', error)
+        return []
+      }
+    })
   })
 
   ipcMain.handle('search:aiPlanned', async (_event, prompt: string, options?: SearchOptions): Promise<AiPlannedSearchResponse> => {
-    try {
-      return await aiPlannedSearch(prompt, options)
-    } catch (error) {
-      console.error('[Search] AI planned search failed:', error)
-      throw error
-    }
+    return inCapturedLibraryProject(async () => {
+      try {
+        return await aiPlannedSearch(prompt, options)
+      } catch (error) {
+        console.error('[Search] AI planned search failed:', error)
+        throw error
+      }
+    })
   })
 
   ipcMain.handle('search:save', async (_event, name: string, filters: SavedSearchPayload): Promise<SavedSearch | null> => {
@@ -1576,10 +1995,10 @@ export function registerSearchIpc(): void {
   })
 
   ipcMain.handle('search:runSaved', async (_event, id: string): Promise<SavedSearchRunResult> => {
-    return runSavedSearch(id)
+    return inCapturedLibraryProject(() => runSavedSearch(id))
   })
 
   ipcMain.handle('search:aiLibrary', async (_event, question: string, options?: SearchOptions): Promise<LibraryAiSearchResponse> => {
-    return runLibraryAiSearch(question, options)
+    return inCapturedLibraryProject(() => runLibraryAiSearch(question, options))
   })
 }

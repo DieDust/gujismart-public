@@ -127,6 +127,11 @@ const VIEW_TITLES: Record<WorkspaceViewKey, string> = {
   excerpts: '摘录',
 }
 
+function scopedWorkspaceKey(key: string, scopeId?: string): string {
+  const normalizedScopeId = String(scopeId || '').trim()
+  return normalizedScopeId ? `${key}.project.${normalizedScopeId}` : key
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
@@ -360,21 +365,31 @@ function sanitizeTabs(value: unknown, tabGroups: WorkspaceTabGroup[] = []): Work
   return tabs
 }
 
-export function loadAppWorkspace(storage: AppWorkspaceStorage): AppWorkspaceState {
+export function loadAppWorkspace(
+  storage: AppWorkspaceStorage,
+  scopeId?: string,
+  options?: { migrateGlobalWorkspace?: boolean },
+): AppWorkspaceState {
+  const storageKey = scopedWorkspaceKey(APP_WORKSPACE_STORAGE_KEY, scopeId)
+  const lastKnownGoodKey = scopedWorkspaceKey(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY, scopeId)
   try {
-    const raw = storage.getItem(APP_WORKSPACE_STORAGE_KEY)
-      || storage.getItem(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY)
-      || storage.getItem(APP_WORKSPACE_LEGACY_STORAGE_KEY)
+    const raw = storage.getItem(storageKey)
+      || storage.getItem(lastKnownGoodKey)
+      || (options?.migrateGlobalWorkspace
+        ? storage.getItem(APP_WORKSPACE_STORAGE_KEY)
+          || storage.getItem(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY)
+          || storage.getItem(APP_WORKSPACE_LEGACY_STORAGE_KEY)
+        : null)
     if (!raw) return createDefaultWorkspace()
     const parsed: unknown = JSON.parse(raw)
     if (!isRecord(parsed) || (parsed.version !== 1 && parsed.version !== 2)) {
-      storage.removeItem(APP_WORKSPACE_STORAGE_KEY)
+      storage.removeItem(storageKey)
       return createDefaultWorkspace()
     }
     const tabGroups = sanitizeTabGroups(parsed.tabGroups)
     const tabs = sanitizeTabs(parsed.tabs, tabGroups)
     if (tabs.length === 0) {
-      storage.removeItem(APP_WORKSPACE_STORAGE_KEY)
+      storage.removeItem(storageKey)
       return createDefaultWorkspace()
     }
     const safeTabGroups = pruneTabGroupsForTabs(tabGroups, tabs)
@@ -390,7 +405,7 @@ export function loadAppWorkspace(storage: AppWorkspaceStorage): AppWorkspaceStat
     }
   } catch {
     try {
-      storage.removeItem(APP_WORKSPACE_STORAGE_KEY)
+      storage.removeItem(storageKey)
     } catch {
       // Ignore inaccessible storage and start from a clean workspace.
     }
@@ -401,7 +416,10 @@ export function loadAppWorkspace(storage: AppWorkspaceStorage): AppWorkspaceStat
 export function saveAppWorkspace(
   storage: AppWorkspaceStorage,
   state: AppWorkspaceState,
+  scopeId?: string,
 ): boolean {
+  const storageKey = scopedWorkspaceKey(APP_WORKSPACE_STORAGE_KEY, scopeId)
+  const lastKnownGoodKey = scopedWorkspaceKey(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY, scopeId)
   try {
     const tabGroups = sanitizeTabGroups(state.tabGroups)
     const tabs = sanitizeTabs(state.tabs, tabGroups)
@@ -410,11 +428,11 @@ export function saveAppWorkspace(
     const activeTabId = safeTabs.some((tab) => tab.id === state.activeTabId)
       ? state.activeTabId
       : safeTabs[0].id
-    const current = storage.getItem(APP_WORKSPACE_STORAGE_KEY)
+    const current = storage.getItem(storageKey)
     if (current) {
       try {
         const parsed = JSON.parse(current)
-        if (isRecord(parsed) && parsed.version === 2) storage.setItem(APP_WORKSPACE_LAST_KNOWN_GOOD_KEY, current)
+        if (isRecord(parsed) && parsed.version === 2) storage.setItem(lastKnownGoodKey, current)
       } catch {
         // Do not promote a corrupt snapshot to last-known-good.
       }
@@ -428,7 +446,7 @@ export function saveAppWorkspace(
       tabs: safeTabs,
       tabGroups: safeTabGroups,
     }
-    storage.setItem(APP_WORKSPACE_STORAGE_KEY, JSON.stringify(payload))
+    storage.setItem(storageKey, JSON.stringify(payload))
     return true
   } catch {
     return false

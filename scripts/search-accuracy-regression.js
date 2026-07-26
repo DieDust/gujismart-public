@@ -17,7 +17,8 @@ process.env.GUJISMART_AUTO_REINDEX = '0'
 writeFileSync(entryPath, `
   const database = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'database.ts'))})
   const search = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'semantic-search.ts'))})
-  module.exports = { database, search }
+  const projects = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'library-projects.ts'))})
+  module.exports = { database, search, projects }
 `)
 
 buildSync({
@@ -249,6 +250,7 @@ async function run() {
     const modules = require(bundlePath)
     database = modules.database
     const search = modules.search
+    const projects = modules.projects
     await database.initDatabase()
 
     const now = new Date().toISOString()
@@ -275,6 +277,35 @@ async function run() {
       assert.strictEqual(result.status, 'ready', `Expected ${docId} to be indexed`)
       assert.ok(result.segmentCount > 0, `Expected ${docId} to create search segments`)
     }
+
+    const defaultProjectId = projects.getActiveLibraryProjectId()
+    const isolatedProject = projects.createLibraryProject({ name: 'Search isolation project', activate: true })
+    const isolatedToken = 'projectisolationuniquetoken'
+    insertDocument(database, {
+      id: 'accuracy_isolated_project_doc',
+      title: 'Isolated project document',
+      author: 'GujiSmart QA',
+      docType: 'test-fixture',
+      pages: [{
+        id: 'accuracy_isolated_project_page_1',
+        pageNum: 1,
+        text: `Only the second project contains ${isolatedToken}.`,
+      }],
+    }, now)
+    assert.strictEqual(search.reindexDocument('accuracy_isolated_project_doc').status, 'ready')
+    projects.setActiveLibraryProject(defaultProjectId)
+    assert.strictEqual(
+      search.querySearchV2(isolatedToken, { exhaustive: true, resultMode: 'all' }).totalDocuments,
+      0,
+      'default project search must not load results from another project',
+    )
+    projects.setActiveLibraryProject(isolatedProject.id)
+    assert.strictEqual(
+      search.querySearchV2(isolatedToken, { exhaustive: true, resultMode: 'all' }).totalDocuments,
+      1,
+      'active project search must return its own indexed document',
+    )
+    projects.setActiveLibraryProject(defaultProjectId)
 
     for (const testCase of fixture.cases) {
       assertCase(search, docIds, testCase)

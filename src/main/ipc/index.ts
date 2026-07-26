@@ -16,6 +16,7 @@ import { registerLibraryIpc } from './library'
 import { registerDatabaseMaintenanceIpc } from './database-maintenance'
 import { registerTranslationIpc } from './translation'
 import { registerEmbeddingIpc } from './embedding'
+import { registerLibraryProjectIpc } from './library-projects'
 
 export function registerAllIpcHandlers(): void {
   registerDocumentIpc()
@@ -41,6 +42,7 @@ export function registerAllIpcHandlers(): void {
   registerDatabaseMaintenanceIpc()
   registerTranslationIpc()
   registerEmbeddingIpc()
+  registerLibraryProjectIpc()
 
   console.log('[IPC] All handlers registered')
 }

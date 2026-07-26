@@ -33,6 +33,7 @@ import {
 import { isSearchIndexWorkerAvailable, runSearchIndexWorkerTask } from './search-index-worker-client'
 import { hydratePagePayloadRow, readPagePayload } from './page-payload-store'
 import { resolveFolderAndDescendantIds } from './folder-scope'
+import { getActiveLibraryProjectId } from './library-projects'
 import type {
   AiPlannedSearchResponse,
   AiSearchPlan,
@@ -511,7 +512,9 @@ function chunkValues<T>(values: T[], size = 800): T[][] {
 }
 
 function activeDocumentCondition(alias = 'd'): string {
-  return `COALESCE(${alias}.import_status, '') <> '${DELETING_IMPORT_STATUS}'`
+  const projectId = getActiveLibraryProjectId().replace(/'/g, "''")
+  return `${alias}.library_project_id = '${projectId}'
+    AND COALESCE(${alias}.import_status, '') <> '${DELETING_IMPORT_STATUS}'`
 }
 
 function isDeletingImportStatus(value: unknown): boolean {
@@ -567,10 +570,16 @@ function normalizeScope(scope?: LibraryAiScope): LibraryAiScope {
 
 function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
   const normalized = normalizeScope(scope)
+  const activeProjectId = getActiveLibraryProjectId()
 
   if (normalized.type === 'all') {
     return queryAll<{ id: string }>(
-      `SELECT id FROM documents WHERE ${activeDocumentCondition('documents')} ORDER BY is_favorite DESC, updated_at DESC`,
+      `SELECT id
+       FROM documents
+       WHERE library_project_id = ?
+         AND ${activeDocumentCondition('documents')}
+       ORDER BY is_favorite DESC, updated_at DESC`,
+      [activeProjectId],
     ).map((item) => item.id)
   }
 
@@ -581,9 +590,10 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
       `SELECT id
        FROM documents
        WHERE id IN (${placeholders})
+         AND library_project_id = ?
          AND ${activeDocumentCondition('documents')}
        ORDER BY is_favorite DESC, updated_at DESC`,
-      normalized.docIds
+      [...normalized.docIds, activeProjectId],
     ).map((item) => item.id)
   }
 
@@ -596,9 +606,10 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
        WHERE df.folder_id IN (${placeholders})
+         AND d.library_project_id = ?
          AND ${activeDocumentCondition('d')}
        ORDER BY d.is_favorite DESC, d.updated_at DESC`,
-      folderIds
+      [...folderIds, activeProjectId],
     ).map((item) => item.id)
   }
 
@@ -611,7 +622,8 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
     sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
     params.push(tagId)
   })
-  sql += ` WHERE ${activeDocumentCondition('d')} GROUP BY d.id ORDER BY d.is_favorite DESC, d.updated_at DESC`
+  sql += ` WHERE d.library_project_id = ? AND ${activeDocumentCondition('d')} GROUP BY d.id ORDER BY d.is_favorite DESC, d.updated_at DESC`
+  params.push(activeProjectId)
 
   return queryAll<{ id: string }>(sql, params).map((item) => item.id)
 }
@@ -2188,51 +2200,56 @@ function matchesDocumentFilters(doc: SearchDocumentRow, options?: SearchOptions)
 }
 
 function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefined {
-  if (!options) return undefined
+  const resolvedOptions: SearchOptions = options || {}
+  const activeProjectId = getActiveLibraryProjectId()
 
-  const explicitDocIds = uniqueIds(options.docIds || [])
+  const explicitDocIds = uniqueIds(resolvedOptions.docIds || [])
   const tagIds = uniqueIds([
-    ...(options.tagId ? [options.tagId] : []),
-    ...(options.tagIds || [])
+    ...(resolvedOptions.tagId ? [resolvedOptions.tagId] : []),
+    ...(resolvedOptions.tagIds || [])
   ])
   const requestedFolderIds = uniqueIds([
-    ...(options.folderId ? [options.folderId] : []),
-    ...(options.folderIds || [])
+    ...(resolvedOptions.folderId ? [resolvedOptions.folderId] : []),
+    ...(resolvedOptions.folderIds || [])
   ])
   const folderIds = resolveSearchFolderScopeIds(requestedFolderIds)
-
-  const needsResolution = explicitDocIds.length > 0
+  const hasNarrowingFilters = explicitDocIds.length > 0
     || tagIds.length > 0
     || requestedFolderIds.length > 0
-    || !!options.docType
-    || !!options.author
-    || !!options.dynasty
-    || !!options.importStatus
-    || !!options.ocrStatus
-    || !!options.readStatus
-    || !!options.metadataStatus
-    || !!options.favoritesOnly
-    || !!options.yearFrom
-    || !!options.yearTo
+    || Boolean(
+      resolvedOptions.docType
+      || resolvedOptions.author
+      || resolvedOptions.dynasty
+      || resolvedOptions.importStatus
+      || resolvedOptions.ocrStatus
+      || resolvedOptions.readStatus
+      || resolvedOptions.metadataStatus
+      || resolvedOptions.favoritesOnly
+      || resolvedOptions.yearFrom
+      || resolvedOptions.yearTo,
+    )
 
-  if (!needsResolution) return undefined
+  // The common "search this project" path stays SQL-scoped instead of expanding
+  // every document into a giant IN (...) list.
+  if (!hasNarrowingFilters) return undefined
 
   const cacheKey = stableStringify({
-    docType: options.docType || '',
-    author: options.author || '',
-    dynasty: options.dynasty || '',
-    folderId: options.folderId || '',
+    libraryProjectId: activeProjectId,
+    docType: resolvedOptions.docType || '',
+    author: resolvedOptions.author || '',
+    dynasty: resolvedOptions.dynasty || '',
+    folderId: resolvedOptions.folderId || '',
     folderIds,
-    tagId: options.tagId || '',
+    tagId: resolvedOptions.tagId || '',
     tagIds,
     docIds: explicitDocIds,
-    importStatus: options.importStatus || '',
-    ocrStatus: options.ocrStatus || '',
-    readStatus: options.readStatus || '',
-    metadataStatus: options.metadataStatus || '',
-    favoritesOnly: !!options.favoritesOnly,
-    yearFrom: options.yearFrom || null,
-    yearTo: options.yearTo || null,
+    importStatus: resolvedOptions.importStatus || '',
+    ocrStatus: resolvedOptions.ocrStatus || '',
+    readStatus: resolvedOptions.readStatus || '',
+    metadataStatus: resolvedOptions.metadataStatus || '',
+    favoritesOnly: !!resolvedOptions.favoritesOnly,
+    yearFrom: resolvedOptions.yearFrom || null,
+    yearTo: resolvedOptions.yearTo || null,
   })
   const cached = getFreshSearchCacheEntry(searchFilterDocIdsCache, cacheKey, SEARCH_FILTER_CACHE_TTL_MS)
   if (cached) {
@@ -2240,8 +2257,9 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
   }
 
   let sql = 'SELECT DISTINCT d.id FROM documents d'
-  const conditions: string[] = options.importStatus ? [] : [activeDocumentCondition('d')]
-  const params: Array<string | number> = []
+  const conditions: string[] = ['d.library_project_id = ?']
+  const params: Array<string | number> = [activeProjectId]
+  if (!resolvedOptions.importStatus) conditions.push(activeDocumentCondition('d'))
 
   if (tagIds.length > 0) {
     tagIds.forEach((tagId, index) => {
@@ -2266,48 +2284,48 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
     conditions.push(`d.id IN (${buildInClause(explicitDocIds)})`)
     params.push(...explicitDocIds)
   }
-  if (options.docType) {
+  if (resolvedOptions.docType) {
     conditions.push('d.doc_type = ?')
-    params.push(options.docType)
+    params.push(resolvedOptions.docType)
   }
-  if (options.author) {
+  if (resolvedOptions.author) {
     conditions.push('COALESCE(d.author, \'\') LIKE ?')
-    params.push(`%${options.author}%`)
+    params.push(`%${resolvedOptions.author}%`)
   }
-  if (options.dynasty) {
+  if (resolvedOptions.dynasty) {
     conditions.push(`(
       COALESCE(d.dynasty, '') LIKE ?
       OR COALESCE(CASE WHEN json_valid(d.metadata) THEN json_extract(d.metadata, '$.dynasty') ELSE '' END, '') LIKE ?
       OR COALESCE(CASE WHEN json_valid(d.metadata) THEN json_extract(d.metadata, '$.date') ELSE '' END, '') LIKE ?
     )`)
-    params.push(`%${options.dynasty}%`, `%${options.dynasty}%`, `%${options.dynasty}%`)
+    params.push(`%${resolvedOptions.dynasty}%`, `%${resolvedOptions.dynasty}%`, `%${resolvedOptions.dynasty}%`)
   }
-  if (options.importStatus) {
+  if (resolvedOptions.importStatus) {
     conditions.push('d.import_status = ?')
-    params.push(options.importStatus)
+    params.push(resolvedOptions.importStatus)
   }
-  if (options.ocrStatus) {
+  if (resolvedOptions.ocrStatus) {
     conditions.push('d.ocr_status = ?')
-    params.push(options.ocrStatus)
+    params.push(resolvedOptions.ocrStatus)
   }
-  if (options.readStatus) {
+  if (resolvedOptions.readStatus) {
     conditions.push('d.read_status = ?')
-    params.push(options.readStatus)
+    params.push(resolvedOptions.readStatus)
   }
-  if (options.metadataStatus) {
+  if (resolvedOptions.metadataStatus) {
     conditions.push('d.metadata_status = ?')
-    params.push(options.metadataStatus)
+    params.push(resolvedOptions.metadataStatus)
   }
-  if (options.favoritesOnly) {
+  if (resolvedOptions.favoritesOnly) {
     conditions.push('d.is_favorite = 1')
   }
-  if (options.yearFrom) {
+  if (resolvedOptions.yearFrom) {
     conditions.push("CAST(CASE WHEN json_valid(d.metadata) THEN json_extract(d.metadata, '$.publication_year') ELSE NULL END AS INTEGER) >= ?")
-    params.push(options.yearFrom)
+    params.push(resolvedOptions.yearFrom)
   }
-  if (options.yearTo) {
+  if (resolvedOptions.yearTo) {
     conditions.push("CAST(CASE WHEN json_valid(d.metadata) THEN json_extract(d.metadata, '$.publication_year') ELSE NULL END AS INTEGER) <= ?")
-    params.push(options.yearTo)
+    params.push(resolvedOptions.yearTo)
   }
 
   if (conditions.length > 0) {
@@ -3519,6 +3537,7 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
   }
 
   const criteriaKey = stableStringify({
+    libraryProjectId: getActiveLibraryProjectId(),
     query: normalizedQuery,
     limit,
     pageSize: options?.pageSize || null,
@@ -4447,9 +4466,23 @@ export function listSavedSearches(): SavedSearch[] {
 }
 
 function getSearchLibraryFingerprint(): string {
-  const documentStats = queryOne<SearchLibraryStatsRow>('SELECT COUNT(*) as count, MAX(updated_at) as updatedAt FROM documents') || {}
-  const pageStats = queryOne<SearchLibraryStatsRow>('SELECT COUNT(*) as count, MAX(created_at) as updatedAt FROM pages') || {}
-  const indexStats = queryOne<SearchLibraryStatsRow>('SELECT COUNT(*) as count, MAX(updated_at) as updatedAt FROM search_index_status') || {}
+  const documentStats = queryOne<SearchLibraryStatsRow>(
+    `SELECT COUNT(*) as count, MAX(d.updated_at) as updatedAt
+     FROM documents d
+     WHERE ${activeDocumentCondition('d')}`,
+  ) || {}
+  const pageStats = queryOne<SearchLibraryStatsRow>(
+    `SELECT COUNT(*) as count, MAX(p.created_at) as updatedAt
+     FROM pages p
+     INNER JOIN documents d ON d.id = p.doc_id
+     WHERE ${activeDocumentCondition('d')}`,
+  ) || {}
+  const indexStats = queryOne<SearchLibraryStatsRow>(
+    `SELECT COUNT(*) as count, MAX(sis.updated_at) as updatedAt
+     FROM search_index_status sis
+     INNER JOIN documents d ON d.id = sis.doc_id
+     WHERE ${activeDocumentCondition('d')}`,
+  ) || {}
   return JSON.stringify({
     documents: Number(documentStats.count || 0),
     documentUpdatedAt: documentStats.updatedAt || '',

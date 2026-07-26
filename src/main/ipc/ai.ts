@@ -23,6 +23,13 @@ import { getActiveTranslationGlossary } from '../glossary-service'
 import { previewLibraryAiScope } from '../semantic-search'
 import { getErrorMessage } from '../../shared/errors'
 import { buildAiResponseEnvelope } from '../../shared/ai-response-envelope'
+import {
+  assertDocumentIdsInLibraryProject,
+  assertDocumentInLibraryProject,
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 import type {
   AiChatMode,
   AiChatSession,
@@ -153,12 +160,14 @@ function ensureChatTables(): void {
   run(`
     CREATE TABLE IF NOT EXISTS ai_chat_sessions (
       id TEXT PRIMARY KEY,
+      library_project_id TEXT NOT NULL,
       mode TEXT NOT NULL,
       doc_id TEXT,
       title TEXT NOT NULL,
       scope_json TEXT DEFAULT '',
       created_at TEXT,
       updated_at TEXT,
+      FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE,
       FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
     );
   `)
@@ -175,6 +184,7 @@ function ensureChatTables(): void {
     );
   `)
   run('CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_mode_doc ON ai_chat_sessions(mode, doc_id, updated_at)')
+  run('CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_project_mode ON ai_chat_sessions(library_project_id, mode, updated_at)')
   run('CREATE INDEX IF NOT EXISTS idx_ai_chat_turns_session ON ai_chat_turns(session_id, created_at)')
 }
 
@@ -202,48 +212,59 @@ function rowToChatTurn(row: JsonRecord | null): AiChatTurn {
 
 function listChatSessions(mode: AiChatMode, docId?: string | null): AiChatSession[] {
   ensureChatTables()
+  const libraryProjectId = getActiveLibraryProjectId()
   if (mode === 'document') {
+    assertDocumentInLibraryProject(String(docId || ''), libraryProjectId)
     return queryAll<AiChatSession>(
       `SELECT s.*, COUNT(t.id) as message_count
        FROM ai_chat_sessions s
        LEFT JOIN ai_chat_turns t ON t.session_id = s.id
-       WHERE s.mode = 'document' AND s.doc_id = ?
+       WHERE s.library_project_id = ? AND s.mode = 'document' AND s.doc_id = ?
        GROUP BY s.id
        ORDER BY s.updated_at DESC`,
-      [docId || ''],
+      [libraryProjectId, docId || ''],
     )
   }
   return queryAll<AiChatSession>(
     `SELECT s.*, COUNT(t.id) as message_count
      FROM ai_chat_sessions s
      LEFT JOIN ai_chat_turns t ON t.session_id = s.id
-     WHERE s.mode = 'library'
+     WHERE s.library_project_id = ? AND s.mode = 'library'
      GROUP BY s.id
      ORDER BY s.updated_at DESC`,
+    [libraryProjectId],
   )
 }
 
 function createChatSession(payload: AiChatSessionCreatePayload): AiChatSession {
   ensureChatTables()
+  const libraryProjectId = getActiveLibraryProjectId()
   const id = nanoid()
   const now = new Date().toISOString()
   const mode = payload.mode === 'document' ? 'document' : 'library'
+  if (mode === 'document') {
+    assertDocumentInLibraryProject(String(payload.docId || ''), libraryProjectId)
+  }
   const title = String(payload.title || (mode === 'document' ? '文献对话' : '全库对话')).trim() || 'AI 对话'
   run(
-    'INSERT INTO ai_chat_sessions (id, mode, doc_id, title, scope_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [id, mode, payload.docId || null, title.slice(0, 80), payload.scope ? JSON.stringify(payload.scope) : '', now, now],
+    'INSERT INTO ai_chat_sessions (id, library_project_id, mode, doc_id, title, scope_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [id, libraryProjectId, mode, payload.docId || null, title.slice(0, 80), payload.scope ? JSON.stringify(payload.scope) : '', now, now],
   )
   saveDatabase()
   return requireQueryResult(
-    queryOne<AiChatSession>('SELECT *, 0 as message_count FROM ai_chat_sessions WHERE id = ?', [id]),
+    queryOne<AiChatSession>('SELECT *, 0 as message_count FROM ai_chat_sessions WHERE id = ? AND library_project_id = ?', [id, libraryProjectId]),
     'Created AI chat session was not found',
   )
 }
 
 function ensureChatSession(payload: EnsureChatSessionPayload): AiChatSession {
   ensureChatTables()
+  const libraryProjectId = getActiveLibraryProjectId()
   if (payload.sessionId) {
-    const existing = queryOne<AiChatSession>('SELECT * FROM ai_chat_sessions WHERE id = ?', [payload.sessionId])
+    const existing = queryOne<AiChatSession>(
+      'SELECT * FROM ai_chat_sessions WHERE id = ? AND library_project_id = ?',
+      [payload.sessionId, libraryProjectId],
+    )
     if (existing) return existing
   }
   const sessions = listChatSessions(payload.mode, payload.docId)
@@ -254,6 +275,12 @@ function ensureChatSession(payload: EnsureChatSessionPayload): AiChatSession {
 
 function appendChatTurn(sessionId: string, prompt: string, response: EvidenceQaResponse, taskType: AiTaskType): AiChatTurn {
   ensureChatTables()
+  const libraryProjectId = getActiveLibraryProjectId()
+  const session = queryOne<{ id: string }>(
+    'SELECT id FROM ai_chat_sessions WHERE id = ? AND library_project_id = ?',
+    [sessionId, libraryProjectId],
+  )
+  if (!session) throw new Error('AI chat session does not belong to the active library project')
   const id = nanoid()
   const now = new Date().toISOString()
   const metadata = {
@@ -269,12 +296,13 @@ function appendChatTurn(sessionId: string, prompt: string, response: EvidenceQaR
     [id, sessionId, prompt, response.answer, taskType, JSON.stringify(metadata), now],
   )
   const title = prompt.trim().replace(/\s+/g, ' ').slice(0, 36) || 'AI 对话'
-  run('UPDATE ai_chat_sessions SET title = CASE WHEN title IN (?, ?) THEN ? ELSE title END, updated_at = ? WHERE id = ?', [
+  run('UPDATE ai_chat_sessions SET title = CASE WHEN title IN (?, ?) THEN ? ELSE title END, updated_at = ? WHERE id = ? AND library_project_id = ?', [
     '文献对话',
     '全库对话',
     title,
     now,
     sessionId,
+    libraryProjectId,
   ])
   saveDatabase()
   return rowToChatTurn(queryOne<JsonRecord>('SELECT * FROM ai_chat_turns WHERE id = ?', [id]))
@@ -322,7 +350,15 @@ function buildSelectionSummaryPrompt(payload: {
 function getRecentChatTurns(sessionId?: string): AiChatTurn[] {
   if (!sessionId) return []
   ensureChatTables()
-  return queryAll<JsonRecord>('SELECT * FROM ai_chat_turns WHERE session_id = ? ORDER BY created_at DESC LIMIT ?', [sessionId, CHAT_CONTEXT_TURNS])
+  return queryAll<JsonRecord>(
+    `SELECT t.*
+     FROM ai_chat_turns t
+     JOIN ai_chat_sessions s ON s.id = t.session_id
+     WHERE t.session_id = ? AND s.library_project_id = ?
+     ORDER BY t.created_at DESC
+     LIMIT ?`,
+    [sessionId, getActiveLibraryProjectId(), CHAT_CONTEXT_TURNS],
+  )
     .reverse()
     .map(rowToChatTurn)
 }
@@ -350,7 +386,29 @@ function withConversationContext(question: string, sessionId?: string): string {
   ].join('\n')
 }
 
+function assertMetadataCandidateInActiveProject(candidateId: string): void {
+  const row = queryOne<{ doc_id: string }>(
+    'SELECT doc_id FROM metadata_candidates WHERE id = ?',
+    [candidateId],
+  )
+  if (!row) throw new Error('Metadata candidate was not found')
+  assertDocumentInLibraryProject(row.doc_id, getActiveLibraryProjectId())
+}
+
+function assertChatSessionInActiveProject(sessionId: string): void {
+  const row = queryOne<{ id: string }>(
+    'SELECT id FROM ai_chat_sessions WHERE id = ? AND library_project_id = ?',
+    [sessionId, getActiveLibraryProjectId()],
+  )
+  if (!row) throw new Error('AI chat session does not belong to the active library project')
+}
+
 export function registerAiIpc(): void {
+  const inCapturedLibraryProject = <T>(operation: () => T): T => {
+    const projectId = captureActiveLibraryProjectId()
+    return withLibraryProjectContext(projectId, operation)
+  }
+
   ipcMain.handle('ai:classify', async (_event, ocrText: string): Promise<string> => {
     try {
       return await classifyDocument(ocrText)
@@ -370,20 +428,29 @@ export function registerAiIpc(): void {
   })
 
   ipcMain.handle('ai:extractMetadataStaged', async (_event, docId: string): Promise<DocumentMetadataResult> => {
-    try {
-      return await extractMetadataStaged(docId)
-    } catch (error) {
-      console.error('Staged metadata extraction failed:', error)
-      return {}
-    }
+    return inCapturedLibraryProject(async () => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      try {
+        return await extractMetadataStaged(docId)
+      } catch (error) {
+        console.error('Staged metadata extraction failed:', error)
+        return {}
+      }
+    })
   })
 
   ipcMain.handle('ai:autoExtract', async (_event, docId: string): Promise<DocumentMetadataResult> => {
-    return autoExtractAndApply(docId)
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return autoExtractAndApply(docId)
+    })
   })
 
   ipcMain.handle('ai:batchAutoExtract', async (_event, docIds: string[]): Promise<BatchAutoExtractResult> => {
     const uniqueDocIds = [...new Set((docIds || []).filter(Boolean))]
+    const projectId = captureActiveLibraryProjectId()
+    assertDocumentIdsInLibraryProject(uniqueDocIds, projectId)
+    return withLibraryProjectContext(projectId, async () => {
     const errors: BatchAutoExtractError[] = []
     let successCount = 0
     let skippedCount = 0
@@ -438,26 +505,41 @@ export function registerAiIpc(): void {
       concurrency,
       errors,
     }
+    })
   })
 
   ipcMain.handle('ai:getMetadataCandidates', async (_event, docId: string): Promise<MetadataCandidate[]> => {
-    return getMetadataCandidates(docId)
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return getMetadataCandidates(docId)
+    })
   })
 
   ipcMain.handle('ai:acceptMetadataCandidate', async (_event, candidateId: string): Promise<boolean> => {
-    return acceptMetadataCandidate(candidateId)
+    return inCapturedLibraryProject(() => {
+      assertMetadataCandidateInActiveProject(candidateId)
+      return acceptMetadataCandidate(candidateId)
+    })
   })
 
   ipcMain.handle('ai:rejectMetadataCandidate', async (_event, candidateId: string): Promise<boolean> => {
-    return rejectMetadataCandidate(candidateId)
+    return inCapturedLibraryProject(() => {
+      assertMetadataCandidateInActiveProject(candidateId)
+      return rejectMetadataCandidate(candidateId)
+    })
   })
 
   ipcMain.handle('ai:suggestTags', async (_event, docId: string): Promise<AiTagSuggestion[]> => {
-    return suggestTags(docId)
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return suggestTags(docId)
+    })
   })
 
   ipcMain.handle('ai:runTask', async (_event, docId: string, taskType: AiTaskType, text: string, options?: AiTaskOptions): Promise<string> => {
-    try {
+    return inCapturedLibraryProject(async () => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      try {
       const normalizedTaskType = String(taskType || '').trim() as AiTaskType
       const sourceText = String(text || '')
       const question = options?.question || ''
@@ -492,35 +574,46 @@ export function registerAiIpc(): void {
       )
       saveDatabase()
       return result
-    } catch (error) {
-      console.error(`AI task failed: ${String(taskType || '').trim() || taskType}`, error)
-      throw new Error((error as Error).message)
-    }
+      } catch (error) {
+        console.error(`AI task failed: ${String(taskType || '').trim() || taskType}`, error)
+        throw new Error((error as Error).message)
+      }
+    })
   })
 
   ipcMain.handle('ai:getResults', async (_event, docId: string): Promise<AiResult[]> => {
-    return queryAll<AiResult>('SELECT * FROM ai_results WHERE doc_id = ? ORDER BY created_at DESC', [docId])
+    return inCapturedLibraryProject(() => {
+      assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
+      return queryAll<AiResult>('SELECT * FROM ai_results WHERE doc_id = ? ORDER BY created_at DESC', [docId])
+    })
   })
 
   ipcMain.handle('ai:chatSessions:list', async (_event, payload?: Partial<AiChatSessionListPayload>): Promise<AiChatSession[]> => {
-    const mode = payload?.mode === 'document' ? 'document' : 'library'
-    return listChatSessions(mode, payload?.docId || null)
+    return inCapturedLibraryProject(() => {
+      const mode = payload?.mode === 'document' ? 'document' : 'library'
+      return listChatSessions(mode, payload?.docId || null)
+    })
   })
 
   ipcMain.handle('ai:chatSessions:create', async (_event, payload?: Partial<AiChatSessionCreatePayload>): Promise<AiChatSession> => {
-    return createChatSession({
-      mode: payload?.mode === 'document' ? 'document' : 'library',
-      docId: payload?.docId || null,
-      title: payload?.title,
-      scope: payload?.scope,
+    return inCapturedLibraryProject(() => {
+      return createChatSession({
+        mode: payload?.mode === 'document' ? 'document' : 'library',
+        docId: payload?.docId || null,
+        title: payload?.title,
+        scope: payload?.scope,
+      })
     })
   })
 
   ipcMain.handle('ai:chatSessions:getTurns', async (_event, sessionId: string): Promise<AiChatTurn[]> => {
-    return queryAll<JsonRecord>(
-      'SELECT * FROM ai_chat_turns WHERE session_id = ? ORDER BY created_at DESC LIMIT 30',
-      [sessionId],
-    ).reverse().map(rowToChatTurn)
+    return inCapturedLibraryProject(() => {
+      assertChatSessionInActiveProject(sessionId)
+      return queryAll<JsonRecord>(
+        'SELECT * FROM ai_chat_turns WHERE session_id = ? ORDER BY created_at DESC LIMIT 30',
+        [sessionId],
+      ).reverse().map(rowToChatTurn)
+    })
   })
 
   ipcMain.handle('ai:chatSessions:getTurnsPage', async (
@@ -529,31 +622,39 @@ export function registerAiIpc(): void {
     beforeCreatedAt?: string,
     limit?: number,
   ): Promise<AiChatTurn[]> => {
-    const safeLimit = Math.max(1, Math.min(80, Number(limit || 30)))
-    const params: unknown[] = [sessionId]
-    let where = 'session_id = ?'
-    if (beforeCreatedAt) {
-      where += ' AND created_at < ?'
-      params.push(beforeCreatedAt)
-    }
-    params.push(safeLimit)
-    return queryAll<JsonRecord>(
-      `SELECT * FROM ai_chat_turns WHERE ${where} ORDER BY created_at DESC LIMIT ?`,
-      params,
-    ).reverse().map(rowToChatTurn)
+    return inCapturedLibraryProject(() => {
+      assertChatSessionInActiveProject(sessionId)
+      const safeLimit = Math.max(1, Math.min(80, Number(limit || 30)))
+      const params: unknown[] = [sessionId]
+      let where = 'session_id = ?'
+      if (beforeCreatedAt) {
+        where += ' AND created_at < ?'
+        params.push(beforeCreatedAt)
+      }
+      params.push(safeLimit)
+      return queryAll<JsonRecord>(
+        `SELECT * FROM ai_chat_turns WHERE ${where} ORDER BY created_at DESC LIMIT ?`,
+        params,
+      ).reverse().map(rowToChatTurn)
+    })
   })
 
   ipcMain.handle('ai:chatSessions:delete', async (_event, sessionId: string): Promise<boolean> => {
-    run('DELETE FROM ai_chat_sessions WHERE id = ?', [sessionId])
-    saveDatabase()
-    return true
+    return inCapturedLibraryProject(() => {
+      assertChatSessionInActiveProject(sessionId)
+      run('DELETE FROM ai_chat_sessions WHERE id = ? AND library_project_id = ?', [sessionId, getActiveLibraryProjectId()])
+      saveDatabase()
+      return true
+    })
   })
 
   ipcMain.handle('ai:previewScope', async (_event, scope: LibraryAiScope): Promise<LibraryAiScopePreview> => {
-    return previewLibraryAiScope(scope)
+    return inCapturedLibraryProject(() => previewLibraryAiScope(scope))
   })
 
   ipcMain.handle('ai:askDocument', async (_event, docId: string, question: string, options?: AiQuestionOptions): Promise<AiQuestionResponse> => {
+    return inCapturedLibraryProject(async () => {
+    assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
     const startedMs = Date.now()
     const startedAt = new Date(startedMs).toISOString()
     const session = ensureChatSession({
@@ -573,6 +674,7 @@ export function registerAiIpc(): void {
     })
     const turn = appendChatTurn(session.id, question, response, 'document_qa')
     return { ...response, session, turn }
+    })
   })
 
   ipcMain.handle('ai:askDocumentStream', async (
@@ -582,6 +684,8 @@ export function registerAiIpc(): void {
     question: string,
     options?: AiQuestionOptions,
   ): Promise<AiStreamStartResult> => {
+    return inCapturedLibraryProject(async () => {
+    assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
     try {
       const startedMs = Date.now()
       const startedAt = new Date(startedMs).toISOString()
@@ -643,9 +747,11 @@ export function registerAiIpc(): void {
       emitAiStream(event, requestId, 'error', message)
       throw new Error(message)
     }
+    })
   })
 
   ipcMain.handle('ai:libraryAsk', async (_event, question: string, scope: LibraryAiScope, options?: AiQuestionOptions): Promise<AiQuestionResponse> => {
+    return inCapturedLibraryProject(async () => {
     const startedMs = Date.now()
     const startedAt = new Date(startedMs).toISOString()
     const session = ensureChatSession({
@@ -665,6 +771,7 @@ export function registerAiIpc(): void {
     })
     const turn = appendChatTurn(session.id, question, response, 'library_qa')
     return { ...response, session, turn }
+    })
   })
 
   ipcMain.handle('ai:libraryAskStream', async (
@@ -674,6 +781,7 @@ export function registerAiIpc(): void {
     scope: LibraryAiScope,
     options?: AiQuestionOptions,
   ): Promise<AiStreamStartResult> => {
+    return inCapturedLibraryProject(async () => {
     try {
       const startedMs = Date.now()
       const startedAt = new Date(startedMs).toISOString()
@@ -735,9 +843,11 @@ export function registerAiIpc(): void {
       emitAiStream(event, requestId, 'error', message)
       throw new Error(message)
     }
+    })
   })
 
   ipcMain.handle('ai:summarizeSelection', async (_event, payload?: AiSummaryPayload): Promise<AiSummaryResult> => {
+    return inCapturedLibraryProject(async () => {
     const startedMs = Date.now()
     const startedAt = new Date(startedMs).toISOString()
     const text = String(payload?.text || '').trim()
@@ -745,6 +855,8 @@ export function registerAiIpc(): void {
     const scope = (payload?.scope || 'selection') as SummaryScope
     const markdown = await callLLMStream([{ role: 'user', content: buildSelectionSummaryPrompt({ ...payload, text, scope }) }], () => {})
     const source = payload?.source
+    const sourceDocId = String(source?.doc_id || source?.docId || '').trim()
+    if (sourceDocId) assertDocumentInLibraryProject(sourceDocId, getActiveLibraryProjectId())
     const sources = source?.doc_id || source?.docId
       ? [{
           doc_id: String(source.doc_id || source.docId),
@@ -775,12 +887,16 @@ export function registerAiIpc(): void {
         startedMs,
       }),
     }
+    })
   })
 
   ipcMain.handle('ai:synthesize', async (_event, docIds: string[], templateType: AiSynthesisTemplate, customPrompt?: string): Promise<AiSynthesisResult> => {
+    const libraryProjectId = captureActiveLibraryProjectId()
+    const uniqueDocIds = [...new Set((docIds || []).filter(Boolean))]
+    assertDocumentIdsInLibraryProject(uniqueDocIds, libraryProjectId)
+    return withLibraryProjectContext(libraryProjectId, async () => {
     const startedMs = Date.now()
     const startedAt = new Date(startedMs).toISOString()
-    const uniqueDocIds = [...new Set((docIds || []).filter(Boolean))]
     if (uniqueDocIds.length > 0) {
       const result = await synthesizeDocumentIdsWithSources(uniqueDocIds, templateType, customPrompt)
       return {
@@ -830,5 +946,6 @@ export function registerAiIpc(): void {
         startedMs,
       }),
     }
+    })
   })
 }

@@ -66,26 +66,20 @@ assert(
   'Main open path should time initDatabase, createWindow, and window-ready checkpoints without blocking recovery.',
 )
 assert(
-  mainIndex.includes("from './startup-splash'")
-    && mainIndex.includes('openStartupSplash()')
-    && mainIndex.includes('keepStartupSplashForDiagnostics')
-    && mainIndex.indexOf('openStartupSplash()') < mainIndex.indexOf("withStartupPhase('initDatabase'")
-    && !/ready-to-show[\s\S]{0,400}closeStartupSplash\(/.test(mainIndex),
-  'Test diagnostic splash should open before initDatabase and must not auto-close when the main window shows.',
+  !mainIndex.includes('openStartupSplash()')
+    && !mainIndex.includes('keepStartupSplashForDiagnostics'),
+  'Normal product startup must not open or keep the temporary diagnostic splash window.',
 )
 const startupSplash = readSource('src', 'main', 'startup-splash.ts')
 assert(
   startupSplash.includes('export function openStartupSplash')
     && startupSplash.includes('export function keepStartupSplashForDiagnostics')
-    && startupSplash.includes('启动诊断完成（请截图）')
-    && startupSplash.includes('截图')
-    && startupSplash.includes("ipcRenderer.on('startup:timing'"),
-  'Startup splash should stay open as a Chinese diagnostic report for remote screenshot feedback.',
+    && startupSplash.includes('Intentionally disabled'),
+  'Startup splash module should remain as no-op exports (diagnostic UI retired).',
 )
 assert(
-  startupRecovery.includes('keepStartupSplashForDiagnostics')
-    && startupRecovery.includes('recovery-complete'),
-  'Startup recovery completion should finalize the diagnostic splash for screenshots.',
+  !startupRecovery.includes('keepStartupSplashForDiagnostics'),
+  'Startup recovery must not depend on the retired diagnostic splash.',
 )
 assert(
   startupTiming.includes('export function setStartupTimingUiPublisher')
@@ -100,13 +94,6 @@ assert(
 assert(
   startupRecovery.includes("beginStartupPhase('startup-recovery-delay')"),
   'The fixed post-paint recovery delay must be a timed phase so wall clock is not unexplained idle.',
-)
-assert(
-  startupSplash.includes('墙钟总用时')
-    && startupSplash.includes('已计量工作')
-    && startupSplash.includes('未计量间隔')
-    && startupSplash.includes('formatOffset'),
-  'Diagnostic splash must show wall/work/gap and timeline offsets, not only raw work ms.',
 )
 assert(
   database.includes("from './startup-timing'")
@@ -354,7 +341,7 @@ assert(
 assert(
   documentsIpc.includes('activeDocumentImportJobs')
     && documentsIpc.includes('export async function shutdownDocumentImportRuntime')
-    && /ipcMain\.handle\('documents:import', \([^)]*grantIds: string\[\], options\?: ImportDocumentOptions\) => trackDocumentImportJob\(async \(\) => \{/.test(documentsIpc),
+    && /ipcMain\.handle\('documents:import', \([^)]*grantIds: string\[\], options\?: ImportDocumentOptions\) => trackDocumentImportJob\(\s*\(\) => withLibraryProjectContext\(/.test(documentsIpc),
   'Document import IPC jobs should be tracked so shutdown does not close the database while an import is writing.',
 )
 assert(

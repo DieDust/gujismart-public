@@ -2,12 +2,14 @@ import { createHash } from 'crypto'
 import { ipcMain } from 'electron'
 import { nanoid } from 'nanoid'
 import { callLLM, synthesizeDocumentIds } from '../ai'
-import { queryAll, queryOne, run, saveDatabase } from '../database'
+import { queryAll, queryOne, run, saveDatabase, transaction } from '../database'
 import { buildCitationByStyle } from './citation'
 import type {
   AiSynthesisTemplate,
   CursorPage,
+  DeleteResearchNotesResult,
   Document,
+  ListResearchNotesOptions,
   ResearchEvidence,
   ResearchEvidenceRelation,
   ResearchDashboardStats,
@@ -16,6 +18,7 @@ import type {
   ResearchClaimManifestValidationResult,
   ResearchKnowledgeKind,
   ResearchNote,
+  ResearchNoteListPage,
   ResearchNotePayload,
   ResearchNoteUpdatePayload,
   ResearchOutlineItem,
@@ -38,6 +41,13 @@ import {
 import { buildResearchProjectIntegrityReport } from '../../shared/research-integrity'
 import { stringifyResearchLocator } from '../../shared/research-locator'
 import { buildSearchExcerptSourceHashInput } from '../../shared/search-evidence'
+import {
+  assertDocumentIdsInLibraryProject,
+  assertDocumentInLibraryProject,
+  captureActiveLibraryProjectId,
+  getActiveLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 import {
   createResearchOutputVersion,
   finalizeResearchOutputVersion,
@@ -334,10 +344,70 @@ function buildNoteCitationMap(notes: NoteRow[], citationStyleId?: string | null)
   return citations
 }
 
+function requireResearchProjectInActiveLibrary(projectId: string): ProjectRow {
+  const project = queryOne<ProjectRow>(
+    'SELECT id, name, description FROM research_projects WHERE id = ? AND library_project_id = ?',
+    [projectId, getActiveLibraryProjectId()],
+  )
+  if (!project) throw new Error('Research project does not belong to the active library project')
+  return project
+}
+
+function requireOutlineInActiveLibrary(outlineId: string): OutlineRow {
+  const outline = queryOne<OutlineRow>(
+    `SELECT roi.*
+     FROM research_outline_items roi
+     INNER JOIN research_projects rp ON rp.id = roi.project_id
+     WHERE roi.id = ? AND rp.library_project_id = ?`,
+    [outlineId, getActiveLibraryProjectId()],
+  )
+  if (!outline) throw new Error('Research outline does not belong to the active library project')
+  return outline
+}
+
+function requireNoteInActiveLibrary(noteId: string): NoteRow {
+  const note = queryOne<NoteRow>(
+    `SELECT rn.*
+     FROM research_notes rn
+     INNER JOIN documents d ON d.id = rn.doc_id
+     WHERE rn.id = ? AND d.library_project_id = ?`,
+    [noteId, getActiveLibraryProjectId()],
+  )
+  if (!note) throw new Error('Research note does not belong to the active library project')
+  return note
+}
+
+function requireOutputInActiveLibrary(outputId: string): void {
+  const output = queryOne(
+    `SELECT 1
+     FROM research_outputs ro
+     INNER JOIN research_projects rp ON rp.id = ro.project_id
+     WHERE ro.id = ? AND rp.library_project_id = ?`,
+    [outputId, getActiveLibraryProjectId()],
+  )
+  if (!output) throw new Error('Research output does not belong to the active library project')
+}
+
+function requireOutputVersionInActiveLibrary(outputVersionId: string): void {
+  const output = queryOne(
+    `SELECT 1
+     FROM research_output_versions rov
+     INNER JOIN research_projects rp ON rp.id = rov.project_id
+     WHERE rov.id = ? AND rp.library_project_id = ?`,
+    [outputVersionId, getActiveLibraryProjectId()],
+  )
+  if (!output) throw new Error('Research output version does not belong to the active library project')
+}
+
 function getProjectDocIds(projectId: string): string[] {
+  requireResearchProjectInActiveLibrary(projectId)
   return queryAll<{ doc_id: string }>(
-    'SELECT doc_id FROM research_project_documents WHERE project_id = ? ORDER BY created_at DESC',
-    [projectId],
+    `SELECT rpd.doc_id
+     FROM research_project_documents rpd
+     INNER JOIN documents d ON d.id = rpd.doc_id
+     WHERE rpd.project_id = ? AND d.library_project_id = ?
+     ORDER BY rpd.created_at DESC`,
+    [projectId, getActiveLibraryProjectId()],
   ).map((item) => item.doc_id)
 }
 
@@ -349,6 +419,7 @@ function getProjectDocs(projectId: string): DocumentRow[] {
 }
 
 function listOutline(projectId: string): OutlineRow[] {
+  requireResearchProjectInActiveLibrary(projectId)
   return queryAll<OutlineRow>(
     `SELECT roi.*,
        (SELECT COUNT(*) FROM research_notes rn WHERE rn.outline_id = roi.id) as note_count
@@ -360,7 +431,9 @@ function listOutline(projectId: string): OutlineRow[] {
 }
 
 function listNotes(projectId?: string | null): NoteRow[] {
-  const params = projectId ? [projectId] : []
+  if (projectId) requireResearchProjectInActiveLibrary(projectId)
+  const params: unknown[] = [getActiveLibraryProjectId()]
+  if (projectId) params.push(projectId)
   return queryAll<NoteRow>(
     `SELECT rn.*,
        d.title as doc_title,
@@ -372,10 +445,204 @@ function listNotes(projectId?: string | null): NoteRow[] {
        END as source_available
      FROM research_notes rn
      INNER JOIN documents d ON rn.doc_id = d.id
-     ${projectId ? 'WHERE rn.project_id = ?' : ''}
+     WHERE d.library_project_id = ?
+     ${projectId ? 'AND rn.project_id = ?' : ''}
      ORDER BY COALESCE(rn.sort_order, 0) ASC, rn.updated_at DESC`,
     params,
   )
+}
+
+const RESEARCH_NOTE_PAGE_SIZE = 200
+const RESEARCH_NOTE_PAGE_MAX = 1000
+const RESEARCH_NOTE_DELETE_MAX = 50_000
+const DEFAULT_RESEARCH_NOTE_COLOR = '#ffe066'
+const NORMALIZED_NOTE_SOURCE_SQL = `CASE
+  WHEN json_valid(COALESCE(rn.source_id, '')) THEN COALESCE(json_extract(rn.source_id, '$.sourceType'), rn.source_type)
+  ELSE rn.source_type
+END`
+const NORMALIZED_NOTE_TAGS_SQL = `(
+  ' ' || TRIM(
+    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+      COALESCE(rn.tags, ''),
+      '，', ' '
+    ), ',', ' '), '；', ' '), ';', ' '), char(9), ' '), char(10), ' ')
+  ) || ' '
+)`
+
+function splitResearchNoteTags(value: unknown): string[] {
+  return String(value || '')
+    .split(/[,，;；\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function buildResearchNoteListWhere(options: ListResearchNotesOptions = {}): { sql: string; params: unknown[] } {
+  const clauses: string[] = ['d.library_project_id = ?']
+  const params: unknown[] = [getActiveLibraryProjectId()]
+  const projectId = String(options.projectId || '').trim()
+  if (projectId) requireResearchProjectInActiveLibrary(projectId)
+  const kind = normalizeKind(options.kind)
+  const source = String(options.source || '').trim()
+  const color = String(options.color || '').trim().toLowerCase()
+  const tag = String(options.tag || '').trim()
+  const search = String(options.search || '').trim().toLocaleLowerCase()
+
+  if (options.unassignedOnly) {
+    clauses.push('rn.project_id IS NULL')
+  } else if (projectId) {
+    clauses.push('rn.project_id = ?')
+    params.push(projectId)
+  }
+  if (options.kind) {
+    clauses.push('rn.kind = ?')
+    params.push(kind)
+  }
+  if (source) {
+    clauses.push(`${NORMALIZED_NOTE_SOURCE_SQL} = ?`)
+    params.push(source)
+  }
+  if (color) {
+    clauses.push("LOWER(COALESCE(NULLIF(TRIM(rn.color), ''), ?)) = ?")
+    params.push(DEFAULT_RESEARCH_NOTE_COLOR, color)
+  }
+  if (tag) {
+    clauses.push(`INSTR(${NORMALIZED_NOTE_TAGS_SQL}, ?) > 0`)
+    params.push(` ${tag} `)
+  }
+  if (search) {
+    const searchClauses = [
+      "INSTR(LOWER(COALESCE(rn.excerpt, '')), ?) > 0",
+      "INSTR(LOWER(COALESCE(rn.note, '')), ?) > 0",
+      "INSTR(LOWER(COALESCE(rn.tags, '')), ?) > 0",
+      "INSTR(LOWER(COALESCE(d.title, '')), ?) > 0",
+      "INSTR(LOWER(COALESCE(d.author, '')), ?) > 0",
+      "INSTR(LOWER(COALESCE(rn.citation_text, '')), ?) > 0",
+      "INSTR(LOWER(COALESCE(rp.name, '')), ?) > 0",
+    ]
+    params.push(search, search, search, search, search, search, search)
+    const searchColors = [...new Set((options.searchColors || [])
+      .map((item) => String(item || '').trim().toLowerCase())
+      .filter(Boolean))]
+    if (searchColors.length > 0) {
+      searchClauses.push(`LOWER(COALESCE(NULLIF(TRIM(rn.color), ''), ?)) IN (${searchColors.map(() => '?').join(', ')})`)
+      params.push(DEFAULT_RESEARCH_NOTE_COLOR, ...searchColors)
+    }
+    clauses.push(`(${searchClauses.join(' OR ')})`)
+  }
+
+  return {
+    sql: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '',
+    params,
+  }
+}
+
+function getResearchNoteListOrder(options: ListResearchNotesOptions = {}): string {
+  if (options.sort === 'created_desc') return 'rn.created_at DESC, rn.id ASC'
+  if (options.sort === 'document_asc') return "LOWER(COALESCE(d.title, '')) ASC, COALESCE(rn.page_num, 0) ASC, rn.id ASC"
+  if (options.sort === 'page_asc') return "LOWER(COALESCE(d.title, '')) ASC, COALESCE(rn.page_num, 0) ASC, rn.id ASC"
+  if (options.sort === 'kind_asc') {
+    return "CASE rn.kind WHEN 'quote' THEN 0 WHEN 'summary' THEN 1 WHEN 'comment' THEN 2 WHEN 'idea' THEN 3 ELSE 4 END ASC, rn.updated_at DESC, rn.id ASC"
+  }
+  return 'rn.updated_at DESC, rn.id ASC'
+}
+
+function getResearchNoteListStats(): ResearchNoteListPage['stats'] {
+  const baseJoin = 'FROM research_notes rn INNER JOIN documents d ON rn.doc_id = d.id'
+  const activeProjectId = getActiveLibraryProjectId()
+  const total = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(*) as count ${baseJoin} WHERE d.library_project_id = ?`,
+    [activeProjectId],
+  )?.count || 0)
+  const documentCount = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(DISTINCT rn.doc_id) as count ${baseJoin} WHERE d.library_project_id = ?`,
+    [activeProjectId],
+  )?.count || 0)
+  const colorCount = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(DISTINCT LOWER(COALESCE(NULLIF(TRIM(rn.color), ''), ?))) as count
+     ${baseJoin} WHERE d.library_project_id = ?`,
+    [DEFAULT_RESEARCH_NOTE_COLOR, activeProjectId],
+  )?.count || 0)
+  const tags = new Set<string>()
+  queryAll<{ tags?: string | null }>(
+    `SELECT rn.tags ${baseJoin}
+     WHERE d.library_project_id = ? AND TRIM(COALESCE(rn.tags, '')) <> ''`,
+    [activeProjectId],
+  )
+    .forEach((row) => splitResearchNoteTags(row.tags).forEach((tag) => tags.add(tag)))
+  return {
+    total,
+    documentCount,
+    tags: [...tags].sort((left, right) => left.localeCompare(right, 'zh-CN')),
+    colorCount,
+  }
+}
+
+function listNotesPage(options: ListResearchNotesOptions = {}): ResearchNoteListPage {
+  const requestedLimit = Math.floor(Number(options.limit) || RESEARCH_NOTE_PAGE_SIZE)
+  const limit = Math.min(RESEARCH_NOTE_PAGE_MAX, Math.max(1, requestedLimit))
+  const offset = Math.max(0, Math.floor(Number(options.offset) || 0))
+  const where = buildResearchNoteListWhere(options)
+  const joins = `FROM research_notes rn
+    INNER JOIN documents d ON rn.doc_id = d.id
+    LEFT JOIN research_projects rp ON rn.project_id = rp.id`
+  const total = Number(queryOne<{ count: number }>(
+    `SELECT COUNT(*) as count ${joins} ${where.sql}`,
+    where.params,
+  )?.count || 0)
+  const items = queryAll<NoteRow>(
+    `SELECT rn.*,
+       d.title as doc_title,
+       d.author as doc_author,
+       d.doc_type as doc_type,
+       CASE
+         WHEN EXISTS (SELECT 1 FROM pages p WHERE p.doc_id = rn.doc_id AND (rn.page_num IS NULL OR p.page_num = rn.page_num)) THEN 1
+         ELSE 0
+       END as source_available
+     ${joins}
+     ${where.sql}
+     ORDER BY ${getResearchNoteListOrder(options)}
+     LIMIT ? OFFSET ?`,
+    [...where.params, limit, offset],
+  )
+  const includeOverview = options.includeOverview !== false
+  const scopeDocIds = includeOverview
+    ? queryAll<{ doc_id: string }>(
+      `SELECT DISTINCT rn.doc_id ${joins} ${where.sql} ORDER BY rn.doc_id`,
+      where.params,
+    ).map((row) => row.doc_id)
+    : undefined
+  return {
+    items,
+    total,
+    limit,
+    offset,
+    scopeDocIds,
+    stats: includeOverview ? getResearchNoteListStats() : undefined,
+  }
+}
+
+function deleteResearchNotes(ids: string[]): DeleteResearchNotesResult {
+  const normalizedIds = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  if (normalizedIds.length > RESEARCH_NOTE_DELETE_MAX) {
+    throw new Error(`一次最多删除 ${RESEARCH_NOTE_DELETE_MAX} 条摘录`)
+  }
+  if (normalizedIds.length === 0) return { requested: 0, deleted: 0 }
+
+  let deleted = 0
+  transaction(() => {
+    for (let offset = 0; offset < normalizedIds.length; offset += 400) {
+      const batch = normalizedIds.slice(offset, offset + 400)
+      run(
+        `DELETE FROM research_notes
+         WHERE id IN (${batch.map(() => '?').join(', ')})
+           AND doc_id IN (SELECT id FROM documents WHERE library_project_id = ?)`,
+        [...batch, getActiveLibraryProjectId()],
+      )
+      deleted += Number(queryOne<{ count: number }>('SELECT changes() as count')?.count || 0)
+    }
+  })
+  if (deleted > 0) saveDatabase()
+  return { requested: normalizedIds.length, deleted }
 }
 
 function listProjectSnapshotDocuments(projectId: string) {
@@ -709,7 +976,13 @@ function renderProjectMarkdown(
 }
 
 export function registerResearchIpc(): void {
+  const inCapturedLibraryProject = <T>(operation: () => T): T => {
+    const projectId = captureActiveLibraryProjectId()
+    return withLibraryProjectContext(projectId, operation)
+  }
+
   ipcMain.handle('research:listProjects', async (): Promise<ResearchProject[]> => {
+    const libraryProjectId = getActiveLibraryProjectId()
     return queryAll<ResearchProject>(
       `SELECT rp.*,
         (SELECT COUNT(*) FROM research_project_documents rpd WHERE rpd.project_id = rp.id) as document_count,
@@ -718,7 +991,9 @@ export function registerResearchIpc(): void {
         (SELECT COUNT(*) FROM research_outline_items roi WHERE roi.project_id = rp.id) as outline_count,
         (SELECT COUNT(*) FROM ai_research_datasets ard WHERE ard.project_id = rp.id) as ai_dataset_count
        FROM research_projects rp
+       WHERE rp.library_project_id = ?
        ORDER BY rp.updated_at DESC`,
+      [libraryProjectId],
     )
   })
 
@@ -728,18 +1003,20 @@ export function registerResearchIpc(): void {
 
     const id = nanoid()
     const now = new Date().toISOString()
+    const libraryProjectId = getActiveLibraryProjectId()
     run(
-      'INSERT INTO research_projects (id, name, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, name, data.description || '', data.status || 'active', now, now],
+      'INSERT INTO research_projects (id, library_project_id, name, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, libraryProjectId, name, data.description || '', data.status || 'active', now, now],
     )
     saveDatabase()
     return requireQueryResult(
-      queryOne<ResearchProject>('SELECT * FROM research_projects WHERE id = ?', [id]),
+      queryOne<ResearchProject>('SELECT * FROM research_projects WHERE id = ? AND library_project_id = ?', [id, libraryProjectId]),
       'Created research project was not found',
     )
   })
 
   ipcMain.handle('research:updateProject', async (_event, id: string, data: ResearchProjectUpdatePayload): Promise<boolean> => {
+    requireResearchProjectInActiveLibrary(id)
     const sets: string[] = []
     const params: unknown[] = []
     if ('name' in data) {
@@ -756,18 +1033,19 @@ export function registerResearchIpc(): void {
     }
     if (sets.length === 0) return false
     sets.push('updated_at = ?')
-    params.push(new Date().toISOString(), id)
-    run(`UPDATE research_projects SET ${sets.join(', ')} WHERE id = ?`, params)
+    params.push(new Date().toISOString(), id, getActiveLibraryProjectId())
+    run(`UPDATE research_projects SET ${sets.join(', ')} WHERE id = ? AND library_project_id = ?`, params)
     saveDatabase()
     return true
   })
 
   ipcMain.handle('research:deleteProject', async (_event, id: string): Promise<boolean> => {
+    requireResearchProjectInActiveLibrary(id)
     run('DELETE FROM research_notes WHERE project_id = ?', [id])
     run('DELETE FROM research_outline_items WHERE project_id = ?', [id])
     run('DELETE FROM research_outputs WHERE project_id = ?', [id])
     run('DELETE FROM research_project_documents WHERE project_id = ?', [id])
-    run('DELETE FROM research_projects WHERE id = ?', [id])
+    run('DELETE FROM research_projects WHERE id = ? AND library_project_id = ?', [id, getActiveLibraryProjectId()])
     saveDatabase()
     return true
   })
@@ -777,6 +1055,11 @@ export function registerResearchIpc(): void {
   ipcMain.handle('research:createOutlineItem', async (_event, data: ResearchOutlinePayload): Promise<ResearchOutlineItem> => {
     const projectId = String(data.project_id || '').trim()
     const title = String(data.title || '').trim()
+    requireResearchProjectInActiveLibrary(projectId)
+    if (data.parent_id) {
+      const parent = requireOutlineInActiveLibrary(data.parent_id)
+      if (parent.project_id !== projectId) throw new Error('Outline parent belongs to a different research project')
+    }
     if (!projectId || !title) throw new Error('大纲节点需要专题和标题')
     const now = new Date().toISOString()
     const id = nanoid()
@@ -797,7 +1080,7 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:updateOutlineItem', async (_event, id: string, data: ResearchOutlineUpdatePayload): Promise<boolean> => {
-    const current = queryOne<OutlineRow>('SELECT * FROM research_outline_items WHERE id = ?', [id])
+    const current = requireOutlineInActiveLibrary(id)
     if (!current) throw new Error('未找到大纲节点')
     const sets: string[] = []
     const params: unknown[] = []
@@ -812,6 +1095,10 @@ export function registerResearchIpc(): void {
       params.push(data.description || '')
     }
     if ('parent_id' in data) {
+      if (data.parent_id) {
+        const parent = requireOutlineInActiveLibrary(data.parent_id)
+        if (parent.project_id !== current.project_id) throw new Error('Outline parent belongs to a different research project')
+      }
       sets.push('parent_id = ?')
       params.push(data.parent_id || null)
     }
@@ -830,7 +1117,7 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:deleteOutlineItem', async (_event, id: string): Promise<boolean> => {
-    const current = queryOne<OutlineRow>('SELECT * FROM research_outline_items WHERE id = ?', [id])
+    const current = requireOutlineInActiveLibrary(id)
     if (!current) return true
     run('UPDATE research_notes SET outline_id = NULL WHERE outline_id = ?', [id])
     run('DELETE FROM research_outline_items WHERE id = ?', [id])
@@ -840,7 +1127,11 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:moveOutlineItem', async (_event, id: string, parentId: string | null, sortOrder: number): Promise<boolean> => {
-    const current = queryOne<OutlineRow>('SELECT * FROM research_outline_items WHERE id = ?', [id])
+    const current = requireOutlineInActiveLibrary(id)
+    if (parentId) {
+      const parent = requireOutlineInActiveLibrary(parentId)
+      if (parent.project_id !== current.project_id) throw new Error('Outline parent belongs to a different research project')
+    }
     if (!current) throw new Error('未找到大纲节点')
     const now = new Date().toISOString()
     run('UPDATE research_outline_items SET parent_id = ?, sort_order = ?, updated_at = ? WHERE id = ?', [parentId || null, Number(sortOrder || 0), now, id])
@@ -850,8 +1141,11 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:addDocuments', async (_event, projectId: string, docIds: string[]): Promise<boolean> => {
+    requireResearchProjectInActiveLibrary(projectId)
+    const uniqueDocIds = [...new Set(docIds.filter(Boolean))]
+    assertDocumentIdsInLibraryProject(uniqueDocIds, getActiveLibraryProjectId())
     const now = new Date().toISOString()
-    for (const docId of [...new Set(docIds.filter(Boolean))]) {
+    for (const docId of uniqueDocIds) {
       attachDocToProject(projectId, docId, now)
     }
     saveDatabase()
@@ -859,6 +1153,8 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:removeDocument', async (_event, projectId: string, docId: string): Promise<boolean> => {
+    requireResearchProjectInActiveLibrary(projectId)
+    assertDocumentInLibraryProject(docId, getActiveLibraryProjectId())
     run('DELETE FROM research_project_documents WHERE project_id = ? AND doc_id = ?', [projectId, docId])
     run('UPDATE research_projects SET updated_at = ? WHERE id = ?', [new Date().toISOString(), projectId])
     saveDatabase()
@@ -866,18 +1162,25 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:listProjectDocuments', async (_event, projectId: string): Promise<Document[]> => {
+    requireResearchProjectInActiveLibrary(projectId)
     return queryAll<Document>(
       `SELECT d.*
        FROM documents d
        INNER JOIN research_project_documents rpd ON d.id = rpd.doc_id
-       WHERE rpd.project_id = ?
+       WHERE rpd.project_id = ? AND d.library_project_id = ?
        ORDER BY rpd.created_at DESC`,
-      [projectId],
+      [projectId, getActiveLibraryProjectId()],
     )
   })
 
   ipcMain.handle('research:createNote', async (_event, data: ResearchNotePayload): Promise<ResearchNote> => {
     const note = normalizeNotePayload(data)
+    assertDocumentInLibraryProject(note.docId, getActiveLibraryProjectId())
+    if (note.projectId) requireResearchProjectInActiveLibrary(note.projectId)
+    if (note.outlineId) {
+      const outline = requireOutlineInActiveLibrary(note.outlineId)
+      if (outline.project_id !== note.projectId) throw new Error('Research note outline belongs to a different project')
+    }
     if (!note.docId || !note.excerpt) throw new Error('摘录需要文献和原文内容')
     const duplicate = findDuplicateNote(note)
     if (duplicate) {
@@ -922,7 +1225,7 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:updateNote', async (_event, id: string, data: ResearchNoteUpdatePayload): Promise<boolean> => {
-    const current = queryOne<NoteRow>('SELECT * FROM research_notes WHERE id = ?', [id])
+    const current = requireNoteInActiveLibrary(id)
     if (!current) throw new Error('未找到摘录')
     const next = normalizeNotePayload({
       project_id: current.project_id,
@@ -943,6 +1246,12 @@ export function registerResearchIpc(): void {
       ...data,
     })
     const duplicate = findDuplicateNote(next, id)
+    assertDocumentInLibraryProject(next.docId, getActiveLibraryProjectId())
+    if (next.projectId) requireResearchProjectInActiveLibrary(next.projectId)
+    if (next.outlineId) {
+      const outline = requireOutlineInActiveLibrary(next.outlineId)
+      if (outline.project_id !== next.projectId) throw new Error('Research note outline belongs to a different project')
+    }
     if (duplicate) throw new Error('这条摘录已经保存过')
     const now = new Date().toISOString()
     run(
@@ -979,6 +1288,13 @@ export function registerResearchIpc(): void {
   ipcMain.handle('research:assignNotesToOutline', async (_event, noteIds: string[], outlineId: string | null): Promise<boolean> => {
     const ids = [...new Set((noteIds || []).map((item) => String(item || '').trim()).filter(Boolean))]
     if (ids.length === 0) return true
+    const outline = outlineId ? requireOutlineInActiveLibrary(outlineId) : null
+    ids.forEach((id) => {
+      const note = requireNoteInActiveLibrary(id)
+      if (outline && note.project_id !== outline.project_id) {
+        throw new Error('Research note and outline belong to different projects')
+      }
+    })
     const now = new Date().toISOString()
     for (const id of ids) {
       run('UPDATE research_notes SET outline_id = ?, updated_at = ? WHERE id = ?', [outlineId || null, now, id])
@@ -988,6 +1304,10 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:listNotes', async (_event, projectId?: string | null): Promise<ResearchNote[]> => listNotes(projectId))
+  ipcMain.handle(
+    'research:listNotesPage',
+    async (_event, options?: ListResearchNotesOptions): Promise<ResearchNoteListPage> => listNotesPage(options || {}),
+  )
 
   ipcMain.handle(
     'research:listEvidenceRelations',
@@ -996,6 +1316,7 @@ export function registerResearchIpc(): void {
       projectId: string,
       options?: { limit?: number; cursor?: string | null },
     ): Promise<CursorPage<ResearchEvidenceRelation & { evidence: ResearchEvidence }>> => (
+      requireResearchProjectInActiveLibrary(projectId),
       listResearchEvidenceRelations(projectId, options)
     ),
   )
@@ -1003,31 +1324,44 @@ export function registerResearchIpc(): void {
   ipcMain.handle(
     'research:promoteNoteEvidence',
     async (_event, noteId: string): Promise<{ evidence: ResearchEvidence; relation: ResearchEvidenceRelation | null }> => (
+      requireNoteInActiveLibrary(noteId),
       promoteResearchNoteToEvidence(noteId)
     ),
   )
 
   ipcMain.handle('research:deleteNote', async (_event, id: string): Promise<boolean> => {
-    run('DELETE FROM research_notes WHERE id = ?', [id])
-    saveDatabase()
+    deleteResearchNotes([id])
     return true
   })
+  ipcMain.handle(
+    'research:deleteNotes',
+    async (_event, ids: string[]): Promise<DeleteResearchNotesResult> => deleteResearchNotes(ids),
+  )
 
   ipcMain.handle('research:getClaimManifest', async (
     _event,
     outputVersionId: string,
     options?: { limit?: number; cursor?: string | null },
-  ): Promise<ResearchClaimManifestPage | null> => getResearchClaimManifestPage(outputVersionId, options))
+  ): Promise<ResearchClaimManifestPage | null> => {
+    requireOutputVersionInActiveLibrary(outputVersionId)
+    return getResearchClaimManifestPage(outputVersionId, options)
+  })
 
   ipcMain.handle('research:validateClaimManifest', async (
     _event,
     outputVersionId: string,
-  ): Promise<ResearchClaimManifestValidationResult> => validateResearchClaimManifest(outputVersionId))
+  ): Promise<ResearchClaimManifestValidationResult> => {
+    requireOutputVersionInActiveLibrary(outputVersionId)
+    return validateResearchClaimManifest(outputVersionId)
+  })
 
   ipcMain.handle('research:finalizeOutputVersion', async (
     _event,
     input: { draftOutputVersionId: string; expectedClaimManifestHash: string; claimBindings: ResearchClaimBinding[] },
-  ): Promise<ResearchOutputVersion> => finalizeResearchOutputVersion(input))
+  ): Promise<ResearchOutputVersion> => {
+    requireOutputVersionInActiveLibrary(input.draftOutputVersionId)
+    return finalizeResearchOutputVersion(input)
+  })
 
   ipcMain.handle('research:synthesizeProject', async (
     _event,
@@ -1036,8 +1370,8 @@ export function registerResearchIpc(): void {
     customPrompt?: string,
     citationStyleId?: string,
   ): Promise<ResearchOutput> => {
-    const project = queryOne<ProjectRow>('SELECT * FROM research_projects WHERE id = ?', [projectId])
-    if (!project) throw new Error('专题不存在')
+    return inCapturedLibraryProject(async () => {
+    const project = requireResearchProjectInActiveLibrary(projectId)
 
     const noteCount = Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM research_notes WHERE project_id = ?', [projectId])?.count || 0)
     if (noteCount === 0) {
@@ -1106,17 +1440,18 @@ export function registerResearchIpc(): void {
       queryOne<ResearchOutput>('SELECT * FROM research_outputs WHERE id = ?', [id]),
       'Created research output was not found',
     )
+    })
   })
 
   ipcMain.handle('research:createOutput', async (_event, payload: ResearchOutputPayload): Promise<ResearchOutput> => {
+    return inCapturedLibraryProject(() => {
     const projectId = String(payload.project_id || '').trim()
     const title = String(payload.title || '').trim()
     const content = String(payload.content || '').trim()
     if (!projectId) throw new Error('请选择要保存到的研究专题')
     if (!title) throw new Error('请输入 AI 产出标题')
     if (!content) throw new Error('AI 产出内容为空，无法保存')
-    const project = queryOne<ProjectRow>('SELECT * FROM research_projects WHERE id = ?', [projectId])
-    if (!project) throw new Error('研究专题不存在')
+    requireResearchProjectInActiveLibrary(projectId)
     const id = nanoid()
     const inputSnapshotJson = buildResearchOutputSnapshotJson({
       source: 'research:createOutput',
@@ -1147,9 +1482,11 @@ export function registerResearchIpc(): void {
       queryOne<ResearchOutput>('SELECT * FROM research_outputs WHERE id = ?', [id]),
       'Created research output was not found',
     )
+    })
   })
 
   ipcMain.handle('research:listOutputs', async (_event, projectId: string): Promise<ResearchOutput[]> => {
+    requireResearchProjectInActiveLibrary(projectId)
     return queryAll<ResearchOutput>(
       `SELECT
         id,
@@ -1168,6 +1505,7 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:getOutputContent', async (_event, outputId: string): Promise<string> => {
+    requireOutputInActiveLibrary(outputId)
     const row = queryOne<{ content: string }>('SELECT content FROM research_outputs WHERE id = ?', [outputId])
     return row?.content || ''
   })
@@ -1178,6 +1516,7 @@ export function registerResearchIpc(): void {
     format: ResearchReferenceExportFormat,
     citationStyleId?: string,
   ): Promise<string> => {
+    requireResearchProjectInActiveLibrary(projectId)
     const docs = getProjectDocs(projectId)
     return docs.map((doc) => buildReferenceCitation(doc, format, citationStyleId)).join('\n\n')
   })
@@ -1187,8 +1526,7 @@ export function registerResearchIpc(): void {
     projectId: string,
     options: ResearchProjectExportOptions,
   ): Promise<ResearchProjectExportResult> => {
-    const project = queryOne<ProjectRow>('SELECT * FROM research_projects WHERE id = ?', [projectId])
-    if (!project) throw new Error('专题不存在')
+    const project = requireResearchProjectInActiveLibrary(projectId)
     const outline = listOutline(projectId)
     const notes = listNotes(projectId)
     const docs = getProjectDocs(projectId)
@@ -1210,20 +1548,48 @@ export function registerResearchIpc(): void {
   })
 
   ipcMain.handle('research:getDashboard', async (): Promise<ResearchDashboardStats> => {
-    const totalDocuments = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM documents')?.count || 0
+    const activeProjectId = getActiveLibraryProjectId()
+    const totalDocuments = queryOne<{ count: number }>(
+      'SELECT COUNT(*) as count FROM documents WHERE library_project_id = ?',
+      [activeProjectId],
+    )?.count || 0
     const recentReadCount = queryOne<{ count: number }>(
-      "SELECT COUNT(*) as count FROM documents WHERE last_opened_at IS NOT NULL AND last_opened_at >= datetime('now', '-14 days')",
+      "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND last_opened_at IS NOT NULL AND last_opened_at >= datetime('now', '-14 days')",
+      [activeProjectId],
     )?.count || 0
     const pendingProofCount =
-      queryOne<{ count: number }>("SELECT COUNT(*) as count FROM documents WHERE proof_status != 'completed'")?.count || 0
+      queryOne<{ count: number }>(
+        "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND proof_status != 'completed'",
+        [activeProjectId],
+      )?.count || 0
     const pendingMetadataCount =
-      queryOne<{ count: number }>("SELECT COUNT(*) as count FROM documents WHERE metadata_status IN ('pending', 'review')")?.count || 0
+      queryOne<{ count: number }>(
+        "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND metadata_status IN ('pending', 'review')",
+        [activeProjectId],
+      )?.count || 0
     const aiReadyCount = queryOne<{ count: number }>(
-      "SELECT COUNT(DISTINCT doc_id) as count FROM pages WHERE TRIM(COALESCE(proofed_text, '') || COALESCE(ocr_text, '')) != ''",
+      `SELECT COUNT(DISTINCT p.doc_id) as count
+       FROM pages p
+       INNER JOIN documents d ON d.id = p.doc_id
+       WHERE d.library_project_id = ?
+         AND TRIM(COALESCE(p.proofed_text, '') || COALESCE(p.ocr_text, '')) != ''`,
+      [activeProjectId],
     )?.count || 0
-    const projectCount = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM research_projects')?.count || 0
-    const noteCount = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM research_notes')?.count || 0
-    const docs = queryAll<DocumentRow>('SELECT author, metadata FROM documents')
+    const projectCount = queryOne<{ count: number }>(
+      'SELECT COUNT(*) as count FROM research_projects WHERE library_project_id = ?',
+      [activeProjectId],
+    )?.count || 0
+    const noteCount = queryOne<{ count: number }>(
+      `SELECT COUNT(*) as count
+       FROM research_notes rn
+       INNER JOIN documents d ON d.id = rn.doc_id
+       WHERE d.library_project_id = ?`,
+      [activeProjectId],
+    )?.count || 0
+    const docs = queryAll<DocumentRow>(
+      'SELECT author, metadata FROM documents WHERE library_project_id = ?',
+      [activeProjectId],
+    )
     const citationMissingCount = docs.filter((doc) => {
       const metadata = parseMetadata(doc.metadata)
       return !normalizeValue(doc.author || metadata.author) || !normalizeValue(metadata.doi || metadata.isbn || metadata.publication_year || metadata.year)

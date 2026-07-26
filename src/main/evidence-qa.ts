@@ -3,6 +3,7 @@ import { callLLM, callLLMStream, runAiTask, type AiDocumentBrief } from './ai'
 import { fullTextSearch, previewLibraryAiScope } from './semantic-search'
 import { queryAll, queryOne } from './database'
 import { resolveFolderAndDescendantIds } from './folder-scope'
+import { getActiveLibraryProjectId } from './library-projects'
 import type {
   AiSearchPlan,
   EvidenceQaCluster,
@@ -141,7 +142,18 @@ async function buildEvidencePlan(question: string): Promise<{ plan: EvidenceQaPl
 
 function normalizeScopeDocumentIds(scope?: EvidenceQaScope): string[] | undefined {
   if (!scope) return undefined
-  if (scope.type === 'documents') return uniqueStrings(scope.docIds || [])
+  const activeProjectId = getActiveLibraryProjectId()
+  if (scope.type === 'documents') {
+    const docIds = uniqueStrings(scope.docIds || [])
+    if (docIds.length === 0) return []
+    return queryAll<{ id: string }>(
+      `SELECT id
+       FROM documents
+       WHERE id IN (${docIds.map(() => '?').join(', ')})
+         AND library_project_id = ?`,
+      [...docIds, activeProjectId],
+    ).map((item) => item.id)
+  }
   if (scope.type === 'tags') {
     const tagIds = uniqueStrings(scope.tagIds || [])
     if (tagIds.length === 0) return []
@@ -152,7 +164,8 @@ function normalizeScopeDocumentIds(scope?: EvidenceQaScope): string[] | undefine
       sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
       params.push(tagId)
     })
-    sql += ' GROUP BY d.id ORDER BY d.is_favorite DESC, d.updated_at DESC'
+    sql += ' WHERE d.library_project_id = ? GROUP BY d.id ORDER BY d.is_favorite DESC, d.updated_at DESC'
+    params.push(activeProjectId)
     return queryAll<{ id: string }>(sql, params).map((item) => item.id)
   }
   if (scope.type === 'folders') {
@@ -163,8 +176,9 @@ function normalizeScopeDocumentIds(scope?: EvidenceQaScope): string[] | undefine
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
        WHERE df.folder_id IN (${folderIds.map(() => '?').join(', ')})
+         AND d.library_project_id = ?
        ORDER BY d.is_favorite DESC, d.updated_at DESC`,
-      folderIds,
+      [...folderIds, activeProjectId],
     ).map((item) => item.id)
   }
   return undefined
@@ -302,7 +316,8 @@ function getRefinementDocumentIds(scope: EvidenceQaScope | undefined, docIds: st
   return queryAll<{ id: string }>(
     `SELECT d.id
      FROM documents d
-     WHERE EXISTS (
+     WHERE d.library_project_id = ?
+       AND EXISTS (
        SELECT 1
        FROM pages p
        WHERE p.doc_id = d.id
@@ -310,7 +325,7 @@ function getRefinementDocumentIds(scope: EvidenceQaScope | undefined, docIds: st
      )
      ORDER BY d.is_favorite DESC, COALESCE(d.last_opened_at, d.updated_at) DESC, d.updated_at DESC
      LIMIT ?`,
-    [MAX_REFINEMENT_DOCS],
+    [getActiveLibraryProjectId(), MAX_REFINEMENT_DOCS],
   ).map((item) => item.id)
 }
 

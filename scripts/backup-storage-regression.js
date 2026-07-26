@@ -15,7 +15,7 @@ function assertIncludes(source, needle, label) {
 }
 
 assertIncludes(backupSource, "return readSetting('auto_backup_include_storage', 'true') !== 'false'", 'auto backup should include storage by default for enterprise data')
-assertIncludes(backupSource, 'function copyStorageForBackup', 'backup should centralize storage copy behavior')
+assertIncludes(backupSource, 'async function copyStorageForBackup', 'backup should centralize storage copy behavior without blocking the main process')
 assertIncludes(backupSource, "getStoragePagePayloadsDir(sourceStorageDir)", 'lightweight backups should still include externalized page payloads')
 assertIncludes(backupSource, "replaceManagedDirectory(dataDir, 'storage', getBackupStorageDir(backupDir))", 'backup restore should replace storage to match the imported database')
 assertIncludes(backupSource, "writeSetting('auto_backup_include_storage', 'true')", 'auto backup compaction should not switch future backups to db-only mode')
@@ -34,6 +34,9 @@ assertIncludes(backupSource, "defaultPath: `文献管理_备份_${new Date().toI
 assertIncludes(backupSource, 'function writeBackupZip', 'manual backup should write a zip package instead of leaving a folder as the user-facing artifact')
 assertIncludes(backupSource, 'copyCurrentDataTo(tempBackupDir, \'manual\')', 'manual backup should build the complete backup structure before archiving')
 assertIncludes(backupSource, 'await writeBackupZip(tempBackupDir, archivePath)', 'manual backup should archive the complete backup structure')
+assertIncludes(backupSource, "await backupDatabaseTo(join(targetDbDir, 'gujismart.db'))", 'backup should use SQLite online backup instead of synchronously copying the live database directory')
+assertIncludes(backupSource, 'await copyDirRecursiveAsync', 'large storage trees should be copied asynchronously')
+assertIncludes(backupSource, "for (const legacyFileName of ['gujismart.json', 'gujismart.json.backup'])", 'backup should copy only supported legacy database files instead of recursively nesting historical snapshots')
 assertIncludes(backupSource, "properties: ['openFile', 'openDirectory']", 'backup import should accept both new zip packages and legacy directories')
 assertIncludes(backupSource, 'const backupDir = extractedBackupDir || selectedPath', 'backup import should keep legacy directory compatibility')
 assertIncludes(backupSource, 'function assertSafeExtractEntry', 'backup import should validate zip entry paths before extraction')

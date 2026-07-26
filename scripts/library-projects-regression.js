@@ -1,0 +1,253 @@
+const assert = require('assert')
+const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs')
+const { join } = require('path')
+const { buildSync } = require('esbuild')
+
+const root = join(__dirname, '..')
+const databaseSource = readFileSync(join(root, 'src', 'main', 'database.ts'), 'utf8')
+const documentsSource = readFileSync(join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
+const semanticSearchSource = readFileSync(join(root, 'src', 'main', 'semantic-search.ts'), 'utf8')
+const embeddingSource = readFileSync(join(root, 'src', 'main', 'embedding-index.ts'), 'utf8')
+const appSource = readFileSync(join(root, 'src', 'renderer', 'src', 'App.tsx'), 'utf8')
+const libraryViewSource = readFileSync(join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
+const workspaceSource = readFileSync(join(root, 'src', 'renderer', 'src', 'utils', 'appWorkspace.ts'), 'utf8')
+
+assert.ok(databaseSource.includes('CREATE TABLE IF NOT EXISTS library_projects'), 'database must persist library projects')
+assert.ok(databaseSource.includes("VALUES (?, '默认项目', '由旧版本文献自动迁移生成'"), 'legacy documents must migrate to a default project')
+assert.ok(databaseSource.includes('trg_documents_assign_library_project'), 'new imports must inherit the active project')
+assert.ok(documentsSource.includes("const conditions: string[] = ['d.library_project_id = ?']"), 'library lists must be project scoped')
+assert.ok(semanticSearchSource.includes("const conditions: string[] = ['d.library_project_id = ?']"), 'full-text search must be project scoped')
+assert.ok(embeddingSource.includes('ec.library_project_id = ? AND ec.model_id = ?'), 'vector scans must filter project chunks in SQL')
+assert.ok(embeddingSource.includes("d.library_project_id = ?"), 'embedding queues must join documents by active project')
+assert.ok(databaseSource.includes('idx_embedding_chunks_library_project_model'), 'project vector scans must have a composite index')
+assert.ok(appSource.includes('选择本次要加载的文献项目'), 'startup must wait for project selection')
+assert.ok(appSource.includes('migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID'), 'legacy workspace must migrate only to the default project')
+assert.ok(libraryViewSource.includes("key: 'move_project'"), 'library batch menu must expose project transfer')
+assert.ok(libraryViewSource.includes("key: 'context_move_project'"), 'document context menu must expose project transfer directly')
+assert.ok(libraryViewSource.includes('setBatchProjectDocumentIds(targetIds)'), 'project transfer must snapshot the clicked or selected documents')
+assert.ok(libraryViewSource.includes("libraryProjects.filter((project) => project.id !== activeLibraryProjectId)"), 'the current project must not be offered as its own transfer target')
+assert.ok(libraryViewSource.includes('window.api.moveDocumentsToLibraryProject'), 'project transfer must cross preload explicitly')
+assert.ok(workspaceSource.includes('scopedWorkspaceKey'), 'open tabs must be persisted independently per project')
+
+const tempRoot = mkdtempSync(join(__dirname, '.tmp-library-projects-'))
+const bundlePath = join(tempRoot, 'library-projects-regression-bundle.cjs')
+const entryPath = join(tempRoot, 'library-projects-regression-entry.js')
+const electronStubPath = join(tempRoot, 'electron-stub.js')
+process.env.GUJISMART_DATA_DIR = join(tempRoot, 'data')
+
+writeFileSync(electronStubPath, `
+  exports.app = {
+    getName: () => 'gujismart-test',
+    getPath: () => ${JSON.stringify(tempRoot)}
+  }
+`)
+writeFileSync(entryPath, `
+  const database = require(${JSON.stringify(join(root, 'src', 'main', 'database.ts'))})
+  const projects = require(${JSON.stringify(join(root, 'src', 'main', 'library-projects.ts'))})
+  module.exports = { database, projects }
+`)
+buildSync({
+  entryPoints: [entryPath],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: bundlePath,
+  external: ['better-sqlite3'],
+  alias: {
+    electron: electronStubPath,
+    '@electron-toolkit/utils': join(__dirname, 'stubs', 'electron-toolkit-utils.js'),
+  },
+  logLevel: 'silent',
+})
+
+async function run() {
+  let database
+  try {
+    const modules = require(bundlePath)
+    database = modules.database
+    await database.initDatabase()
+
+    const defaultProject = modules.projects.getActiveLibraryProject()
+    assert.strictEqual(defaultProject.id, 'library_project_default')
+
+    const timestamp = '2026-01-01T00:00:00.000Z'
+    database.run(
+      `INSERT INTO documents
+       (id, title, import_status, metadata, created_at, updated_at)
+       VALUES (?, ?, 'processed', '{}', ?, ?)`,
+      ['legacy_doc', 'Legacy document', timestamp, timestamp],
+    )
+    assert.strictEqual(
+      database.queryOne('SELECT library_project_id FROM documents WHERE id = ?', ['legacy_doc']).library_project_id,
+      defaultProject.id,
+    )
+    database.run(
+      `INSERT INTO pages (id, doc_id, page_num, ocr_text, ocr_status, created_at)
+       VALUES ('legacy_page', 'legacy_doc', 1, 'preserved OCR text', 'completed', ?)`,
+      [timestamp],
+    )
+    database.run(
+      `INSERT INTO embedding_index_status
+       (doc_id, status, segment_count, embedded_count, content_hash, updated_at)
+       VALUES ('legacy_doc', 'ready', 1, 1, 'preserved-vector-hash', ?)`,
+      [timestamp],
+    )
+    database.run(
+      `INSERT INTO research_notes
+       (id, doc_id, page_num, excerpt, note, created_at, updated_at)
+       VALUES ('legacy_note', 'legacy_doc', 1, 'preserved excerpt', 'preserved note', ?, ?)`,
+      [timestamp, timestamp],
+    )
+    database.run(
+      `INSERT INTO folders (id, library_project_id, name, created_at, updated_at)
+       VALUES ('legacy_folder', ?, 'Legacy folder', ?, ?)`,
+      [defaultProject.id, timestamp, timestamp],
+    )
+    database.run("INSERT INTO document_folders (doc_id, folder_id) VALUES ('legacy_doc', 'legacy_folder')")
+    database.run(
+      `INSERT INTO tags (id, library_project_id, name, normalized_name, created_at, updated_at)
+       VALUES ('legacy_tag', ?, 'Legacy tag', 'legacy tag', ?, ?)`,
+      [defaultProject.id, timestamp, timestamp],
+    )
+    database.run("INSERT INTO document_tags (doc_id, tag_id) VALUES ('legacy_doc', 'legacy_tag')")
+    database.run(
+      `INSERT INTO search_index_segments
+       (segment_id, doc_id, page_id, page_num, text, normalized_text, text_hash, updated_at)
+       VALUES ('legacy_segment', 'legacy_doc', 'legacy_page', 1, 'preserved OCR text', 'preserved OCR text', 'segment-hash', ?)`,
+      [timestamp],
+    )
+    database.run(
+      `INSERT INTO embedding_chunks
+       (segment_id, doc_id, page_id, page_num, model_id, dim, content_hash, embedding, updated_at)
+       VALUES ('legacy_segment', 'legacy_doc', 'legacy_page', 1, 'test-model@1', 1, 'vector-hash', ?, ?)`,
+      [Buffer.alloc(4), timestamp],
+    )
+    assert.deepStrictEqual(
+      database.queryOne(
+        `SELECT
+           (SELECT library_project_id FROM search_index_segments WHERE segment_id = 'legacy_segment') AS search_project,
+           (SELECT library_project_id FROM embedding_chunks WHERE segment_id = 'legacy_segment') AS vector_project`,
+      ),
+      { search_project: defaultProject.id, vector_project: defaultProject.id },
+      'new search/vector rows must inherit the document project',
+    )
+
+    const secondProject = modules.projects.createLibraryProject({ name: 'Second project', activate: true })
+    database.run(
+      `INSERT INTO documents
+       (id, title, import_status, metadata, created_at, updated_at)
+       VALUES (?, ?, 'processed', '{}', ?, ?)`,
+      ['new_doc', 'New document', timestamp, timestamp],
+    )
+    assert.strictEqual(
+      database.queryOne('SELECT library_project_id FROM documents WHERE id = ?', ['new_doc']).library_project_id,
+      secondProject.id,
+    )
+
+    modules.projects.setActiveLibraryProject(defaultProject.id)
+    assert.throws(
+      () => modules.projects.moveDocumentsToLibraryProject(['new_doc'], defaultProject.id),
+      /current project|belongs|项目|文献/,
+      'a stale document selection from another project must be rejected',
+    )
+    const moved = modules.projects.moveDocumentsToLibraryProject(['legacy_doc', 'legacy_doc'], secondProject.id)
+    assert.deepStrictEqual(moved, {
+      requested: 1,
+      moved: 1,
+      from_project_ids: [defaultProject.id],
+      target_project_id: secondProject.id,
+    })
+    const projects = modules.projects.listLibraryProjects()
+    assert.strictEqual(projects.find((project) => project.id === defaultProject.id).document_count, 0)
+    assert.strictEqual(projects.find((project) => project.id === secondProject.id).document_count, 2)
+    assert.strictEqual(
+      database.queryOne(
+        `SELECT
+           (SELECT ocr_text FROM pages WHERE doc_id = d.id LIMIT 1) AS ocr_text,
+           (SELECT status FROM embedding_index_status WHERE doc_id = d.id) AS embedding_status,
+           (SELECT excerpt FROM research_notes WHERE doc_id = d.id LIMIT 1) AS excerpt,
+           (SELECT COUNT(*) FROM document_folders WHERE doc_id = d.id) AS folder_count,
+           (SELECT COUNT(*) FROM document_tags WHERE doc_id = d.id) AS tag_count
+         FROM documents d
+         WHERE d.id = 'legacy_doc'`,
+      ).ocr_text,
+      'preserved OCR text',
+      'moving a document must preserve its OCR/page content',
+    )
+    const preservedRelations = database.queryOne(
+      `SELECT
+         (SELECT status FROM embedding_index_status WHERE doc_id = d.id) AS embedding_status,
+         (SELECT excerpt FROM research_notes WHERE doc_id = d.id LIMIT 1) AS excerpt,
+         (SELECT COUNT(*) FROM document_folders WHERE doc_id = d.id) AS folder_count,
+         (SELECT COUNT(*) FROM document_tags WHERE doc_id = d.id) AS tag_count
+       FROM documents d
+       WHERE d.id = 'legacy_doc'`,
+    )
+    assert.deepStrictEqual(preservedRelations, {
+      embedding_status: 'ready',
+      excerpt: 'preserved excerpt',
+      folder_count: 1,
+      tag_count: 1,
+    }, 'moving a document must preserve vector state, excerpts, folders, and tags')
+    const movedOrganization = database.queryOne(
+      `SELECT
+         (SELECT f.library_project_id
+          FROM document_folders df JOIN folders f ON f.id = df.folder_id
+          WHERE df.doc_id = 'legacy_doc' LIMIT 1) AS folder_project,
+         (SELECT t.library_project_id
+          FROM document_tags dt JOIN tags t ON t.id = dt.tag_id
+          WHERE dt.doc_id = 'legacy_doc' LIMIT 1) AS tag_project,
+         (SELECT COUNT(*) FROM folders WHERE id = 'legacy_folder' AND library_project_id = ?) AS source_folder_kept,
+         (SELECT COUNT(*) FROM tags WHERE id = 'legacy_tag' AND library_project_id = ?) AS source_tag_kept`,
+      [defaultProject.id, defaultProject.id],
+    )
+    assert.deepStrictEqual(movedOrganization, {
+      folder_project: secondProject.id,
+      tag_project: secondProject.id,
+      source_folder_kept: 1,
+      source_tag_kept: 1,
+    }, 'moving a document must remap project-owned folders and tags without deleting source definitions')
+    assert.deepStrictEqual(
+      database.queryOne(
+        `SELECT
+           (SELECT library_project_id FROM search_index_segments WHERE segment_id = 'legacy_segment') AS search_project,
+           (SELECT library_project_id FROM embedding_chunks WHERE segment_id = 'legacy_segment') AS vector_project`,
+      ),
+      { search_project: secondProject.id, vector_project: secondProject.id },
+      'moving a document must propagate project ownership to search/vector rows',
+    )
+
+    await modules.projects.withLibraryProjectContext(defaultProject.id, async () => {
+      modules.projects.setActiveLibraryProject(secondProject.id)
+      await Promise.resolve()
+      assert.strictEqual(
+        modules.projects.getActiveLibraryProjectId(),
+        defaultProject.id,
+        'an async operation must retain the project captured when it started',
+      )
+    })
+    assert.strictEqual(modules.projects.getActiveLibraryProjectId(), secondProject.id)
+    assert.deepStrictEqual(database.queryAll('PRAGMA foreign_key_check'), [], 'project migration must preserve foreign keys')
+
+    console.log('Library project migration, isolation, workspace, and transfer regression passed.')
+    process.exit(0)
+  } finally {
+    try {
+      database?.closeDatabase?.()
+    } catch {
+      // Ignore cleanup errors.
+    }
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+}
+
+run().catch((error) => {
+  console.error('Library project regression failed.')
+  console.error(error)
+  try {
+    rmSync(tempRoot, { recursive: true, force: true })
+  } catch {
+    // Ignore cleanup errors.
+  }
+  process.exit(1)
+})

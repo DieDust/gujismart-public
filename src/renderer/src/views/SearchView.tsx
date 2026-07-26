@@ -1,5 +1,5 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Alert, Button, Card, Empty, Input, List, Modal, Pagination, Radio, Select, Space, Spin, Switch, Tag, Tooltip, Typography, message, type InputRef } from 'antd'
+import { Alert, Button, Card, Collapse, Empty, Input, InputNumber, List, Modal, Pagination, Radio, Select, Space, Spin, Switch, Tag, Tooltip, Typography, message, type InputRef } from 'antd'
 import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutlined, RobotOutlined, SaveOutlined, SearchOutlined, StarOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
@@ -7,6 +7,11 @@ import { getErrorMessage } from '@shared/errors'
 import { buildSearchExcerptSourceHashInput } from '@shared/search-evidence'
 import { stableLocatorFromLegacySearchLocator } from '@shared/stable-reader-locator'
 import { resolveDocumentCitation } from '../utils/citations'
+import {
+  VECTOR_SEARCH_DEFAULT_LIMIT,
+  VECTOR_SEARCH_MAX_LIMIT,
+  normalizeVectorSearchLimit,
+} from '@shared/vector-search'
 import type {
   CitationStyle,
   CitationTemplate,
@@ -72,6 +77,8 @@ interface SearchHistoryEntry {
   totalDocuments?: number
   aiSearchState: AiSearchState | null
   groupedResponse?: SearchGroupedResponse | null
+  vectorLimit?: number
+  historyTruncated?: boolean
   createdAt: string
 }
 
@@ -90,7 +97,16 @@ interface PendingSearchScrollRestore {
 
 const SEARCH_HISTORY_STORAGE_KEY = 'gujismart.search.history.v1'
 const SEARCH_RETURN_STATE_STORAGE_KEY = 'gujismart.search.return-state.v1'
+/** Remember last vector-export min similarity (0 = no filter). */
+const VECTOR_EXPORT_MIN_SCORE_STORAGE_KEY = 'gujismart.search.export.minVectorScore.v1'
+/** Remember last export max record count. */
+const EXPORT_MAX_RECORDS_STORAGE_KEY = 'gujismart.search.export.maxRecords.v1'
+/** Remember the vector Top-K selection shown before search. */
+const VECTOR_SEARCH_LIMIT_STORAGE_KEY = 'gujismart.search.vector.limit.v1'
 const DEFAULT_SEARCH_GROUP_LIMIT = 120
+/** Keep historical cache payloads at the old maximum; larger searches rerun when restored. */
+const VECTOR_SEARCH_HISTORY_HIT_LIMIT = 200
+const DEFAULT_EXPORT_MAX_RECORDS = VECTOR_SEARCH_DEFAULT_LIMIT
 const SEARCH_PAGE_SIZE = 10
 const SEARCH_DOCUMENT_HIT_PAGE_SIZE = 10
 const SEARCH_VIEWER_COUNT_CONCURRENCY = 4
@@ -144,7 +160,9 @@ function compactFilterOptions(filters: SearchOptions | SearchFilters | Record<st
 }
 
 function compactSearchFilters(filters: SearchOptions | SearchFilters | Record<string, unknown> | null | undefined): SearchFilters {
-  return compactFilterOptions(filters) as SearchFilters
+  const compacted = compactFilterOptions(filters) as Record<string, unknown>
+  delete compacted.limit
+  return compacted as SearchFilters
 }
 
 function loadSearchHistory(): SearchHistoryEntry[] {
@@ -160,6 +178,127 @@ function loadSearchHistory(): SearchHistoryEntry[] {
 
 function saveSearchHistory(entries: SearchHistoryEntry[]) {
   window.localStorage.setItem(SEARCH_HISTORY_STORAGE_KEY, JSON.stringify(entries.slice(0, 30)))
+}
+
+function normalizeExportMinVectorScore(value: unknown): number {
+  const raw = Number(value)
+  if (!Number.isFinite(raw) || raw <= 0) return 0
+  return Math.min(1, Math.max(0, Math.round(raw * 1000) / 1000))
+}
+
+function loadExportMinVectorScore(): number {
+  try {
+    const raw = window.localStorage.getItem(VECTOR_EXPORT_MIN_SCORE_STORAGE_KEY)
+    if (raw == null || raw === '') return 0
+    return normalizeExportMinVectorScore(raw)
+  } catch {
+    return 0
+  }
+}
+
+function saveExportMinVectorScore(value: number) {
+  try {
+    window.localStorage.setItem(
+      VECTOR_EXPORT_MIN_SCORE_STORAGE_KEY,
+      String(normalizeExportMinVectorScore(value)),
+    )
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function normalizeExportMaxRecords(value: unknown): number {
+  const raw = Math.round(Number(value))
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_EXPORT_MAX_RECORDS
+  return Math.min(VECTOR_SEARCH_MAX_LIMIT, Math.max(1, raw))
+}
+
+function loadExportMaxRecords(): number {
+  try {
+    const raw = window.localStorage.getItem(EXPORT_MAX_RECORDS_STORAGE_KEY)
+    if (raw == null || raw === '') return DEFAULT_EXPORT_MAX_RECORDS
+    return normalizeExportMaxRecords(raw)
+  } catch {
+    return DEFAULT_EXPORT_MAX_RECORDS
+  }
+}
+
+function saveExportMaxRecords(value: number) {
+  try {
+    window.localStorage.setItem(
+      EXPORT_MAX_RECORDS_STORAGE_KEY,
+      String(normalizeExportMaxRecords(value)),
+    )
+  } catch {
+    // ignore
+  }
+}
+
+function loadVectorSearchLimit(): number {
+  try {
+    return normalizeVectorSearchLimit(
+      window.localStorage.getItem(VECTOR_SEARCH_LIMIT_STORAGE_KEY),
+      VECTOR_SEARCH_DEFAULT_LIMIT,
+    )
+  } catch {
+    return VECTOR_SEARCH_DEFAULT_LIMIT
+  }
+}
+
+function saveVectorSearchLimit(value: number): void {
+  try {
+    window.localStorage.setItem(
+      VECTOR_SEARCH_LIMIT_STORAGE_KEY,
+      String(normalizeVectorSearchLimit(value, VECTOR_SEARCH_DEFAULT_LIMIT)),
+    )
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+/** Keep only top-N hits (by score) that pass minScore — shrinks IPC and export work. */
+function trimGroupsForExport(
+  groups: SearchDocumentGroup[],
+  maxRecords: number,
+  minScore: number,
+): SearchDocumentGroup[] {
+  const flat: Array<{ group: SearchDocumentGroup; hit: SearchHit }> = []
+  groups.forEach((group) => {
+    ;(group.hits || []).forEach((hit) => flat.push({ group, hit }))
+  })
+  flat.sort((a, b) => (Number(b.hit.score) || 0) - (Number(a.hit.score) || 0))
+  const kept = flat.filter(({ hit }) => {
+    if (minScore <= 0) return true
+    const score = Number(hit.score)
+    return Number.isFinite(score) && score >= minScore
+  }).slice(0, Math.max(1, maxRecords))
+
+  const byDoc = new Map<string, SearchDocumentGroup>()
+  for (const { group, hit } of kept) {
+    const existing = byDoc.get(group.docId)
+    if (existing) {
+      existing.hits.push(hit)
+      existing.totalHits = existing.hits.length
+      existing.score = Math.max(existing.score, Number(hit.score) || 0)
+      existing.topHits = existing.hits.slice(0, 3)
+      continue
+    }
+    byDoc.set(group.docId, {
+      ...group,
+      hits: [hit],
+      topHits: [hit],
+      totalHits: 1,
+      score: Number(hit.score) || group.score || 0,
+    })
+  }
+  return [...byDoc.values()].sort((a, b) => b.score - a.score)
+}
+
+function compactVectorGroupedResponseForHistory(response: SearchGroupedResponse): SearchGroupedResponse {
+  return {
+    ...response,
+    groups: trimGroupsForExport(response.groups || [], VECTOR_SEARCH_HISTORY_HIT_LIMIT, 0),
+  }
 }
 
 function loadSearchReturnState(): SearchReturnState | null {
@@ -386,7 +525,14 @@ function searchModeTagColor(mode: SearchMode): string {
   return 'blue'
 }
 
-function parseSavedSearchPayload(entry: SavedSearch): { keyword: string; mode: SearchMode; filters: SearchFilters; sort: SearchSort; contextMode: ContextMode } {
+function parseSavedSearchPayload(entry: SavedSearch): {
+  keyword: string
+  mode: SearchMode
+  filters: SearchFilters
+  sort: SearchSort
+  contextMode: ContextMode
+  vectorLimit: number
+} {
   try {
     const parsed = typeof entry.filters === 'string'
       ? JSON.parse(entry.filters || '{}') as unknown
@@ -399,6 +545,10 @@ function parseSavedSearchPayload(entry: SavedSearch): { keyword: string; mode: S
       filters: compactSearchFilters(filterPayload),
       sort: isSearchSort(raw.sort) ? raw.sort : 'relevance',
       contextMode: isContextMode(raw.contextMode) ? raw.contextMode : 'standard',
+      vectorLimit: normalizeVectorSearchLimit(
+        filterPayload.limit ?? raw.limit,
+        VECTOR_SEARCH_DEFAULT_LIMIT,
+      ),
     }
   } catch {
     return {
@@ -407,6 +557,7 @@ function parseSavedSearchPayload(entry: SavedSearch): { keyword: string; mode: S
       filters: {},
       sort: 'relevance',
       contextMode: 'standard',
+      vectorLimit: VECTOR_SEARCH_DEFAULT_LIMIT,
     }
   }
 }
@@ -741,11 +892,16 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const [searchMode, setSearchMode] = useState<SearchMode>('fulltext')
   /** Mode of the results currently on screen (button may differ until user re-searches). */
   const [executedSearchMode, setExecutedSearchMode] = useState<SearchMode | null>(null)
+  const [vectorSearchLimit, setVectorSearchLimit] = useState<number>(() => loadVectorSearchLimit())
   const [searchSort, setSearchSort] = useState<SearchSort>('relevance')
   const [contextMode, setContextMode] = useState<ContextMode>('standard')
   const [exportFormat, setExportFormat] = useState<ExportFormat>('txt')
   /** Default: 文献页码（书上印刷/校准页码）；可选自然页码（PDF/扫描物理页序）。 */
   const [exportPageNumberMode, setExportPageNumberMode] = useState<ExportPageNumberMode>('literature')
+  /** Vector export: only keep hits with similarity ≥ this (0 = no filter). Persisted in localStorage. */
+  const [exportMinVectorScore, setExportMinVectorScore] = useState<number>(() => loadExportMinVectorScore())
+  /** Max evidence rows / paragraphs to export. Persisted. */
+  const [exportMaxRecords, setExportMaxRecords] = useState<number>(() => loadExportMaxRecords())
   const [aiSearchState, setAiSearchState] = useState<AiSearchState | null>(null)
   const [searchHistory, setSearchHistory] = useState<SearchHistoryEntry[]>([])
   const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([])
@@ -765,6 +921,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const [exportingDiagnostics, setExportingDiagnostics] = useState(false)
   const [exportPreviewLoading, setExportPreviewLoading] = useState(false)
   const [exportPreview, setExportPreview] = useState<SearchExportPreviewResult | null>(null)
+  const [exportPreviewExpanded, setExportPreviewExpanded] = useState(false)
   const [searchPage, setSearchPage] = useState(groupedResponse?.page || 1)
   const [expandedHitDocId, setExpandedHitDocId] = useState('')
   const [documentHitPages, setDocumentHitPages] = useState<Record<string, SearchDocumentHitPageState>>({})
@@ -774,6 +931,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const pendingScrollRestoreRef = useRef<PendingSearchScrollRestore | null>(null)
   const returnStateRestoredRef = useRef(false)
   const viewerHitCountRefreshSignatureRef = useRef<string | null>(null)
+  const exportPreviewRequestIdRef = useRef(0)
 
   const filterSignature = useMemo(() => JSON.stringify({ filters: compactFilterOptions(filters), sort: searchSort, contextMode }), [filters, searchSort, contextMode])
   const selectedDocIds = filters.docIds || []
@@ -887,17 +1045,21 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     activeMode: SearchMode = searchMode,
     activeSort: SearchSort = searchSort,
     activeContextMode: ContextMode = contextMode,
+    activeVectorLimit = vectorSearchLimit,
   ) => JSON.stringify({
     keyword: String(activeKeyword || '').trim(),
     mode: activeMode,
     filters: compactFilterOptions(activeFilters),
     sort: activeSort,
     contextMode: activeContextMode,
+    ...(activeMode === 'vector'
+      ? { vectorLimit: normalizeVectorSearchLimit(activeVectorLimit, VECTOR_SEARCH_DEFAULT_LIMIT) }
+      : {}),
   })
 
   const pendingSearchSignature = useMemo(
-    () => buildSearchSignature(inputValue, filters, searchMode, searchSort, contextMode),
-    [inputValue, filters, searchMode, searchSort, contextMode],
+    () => buildSearchSignature(inputValue, filters, searchMode, searchSort, contextMode, vectorSearchLimit),
+    [inputValue, filters, searchMode, searchSort, contextMode, vectorSearchLimit],
   )
   const hasSearchSnapshot = !!groupedResponse || results.length > 0
   const searchConditionsChanged = hasSearchSnapshot && !!executedSearchSignature && pendingSearchSignature !== executedSearchSignature
@@ -937,7 +1099,14 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   }
 
   const persistCurrentSearchReturnState = () => {
-    const searchSignature = executedSearchSignature || buildSearchSignature(keyword || inputValue, filters, searchMode, searchSort, contextMode)
+    const searchSignature = executedSearchSignature || buildSearchSignature(
+      keyword || inputValue,
+      filters,
+      searchMode,
+      searchSort,
+      contextMode,
+      vectorSearchLimit,
+    )
     if (!searchSignature || (!groupedResponse && results.length === 0)) return
     const sanitizedDocumentHitPages = Object.fromEntries(Object.entries(documentHitPages).map(([docId, state]) => [
       docId,
@@ -1016,7 +1185,13 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     resultSnapshot: FlatSearchResult[],
     aiSnapshot: AiSearchState | null,
     groupedSnapshot: SearchGroupedResponse | null = null,
+    activeVectorLimit = vectorSearchLimit,
   ) => {
+    const vectorLimit = mode === 'vector'
+      ? normalizeVectorSearchLimit(activeVectorLimit, VECTOR_SEARCH_DEFAULT_LIMIT)
+      : undefined
+    const historyTruncated = mode === 'vector'
+      && Number(groupedSnapshot?.totalHits || resultSnapshot.length) > VECTOR_SEARCH_HISTORY_HIT_LIMIT
     const entry: SearchHistoryEntry = {
       id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       keyword: activeKeyword,
@@ -1026,7 +1201,11 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       totalHits: groupedSnapshot?.totalHits ?? resultSnapshot.length,
       totalDocuments: groupedSnapshot?.totalDocuments ?? uniqueStrings(resultSnapshot.map((item) => item.doc_id || '')).length,
       aiSearchState: aiSnapshot,
-      groupedResponse: groupedSnapshot,
+      groupedResponse: groupedSnapshot && mode === 'vector'
+        ? compactVectorGroupedResponseForHistory(groupedSnapshot)
+        : groupedSnapshot,
+      vectorLimit,
+      historyTruncated,
       createdAt: new Date().toISOString(),
     }
     updateSearchHistory((previous) => {
@@ -1073,9 +1252,9 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       setFilterDocuments(
         (docs || []).map((doc) => ({
           id: doc.id,
-          title: doc.title,
+          title: String(doc.title || '未命名文献'),
           author: doc.author,
-          doc_type: doc.doc_type,
+          doc_type: String(doc.doc_type || ''),
         })),
       )
       setFilterTags(tags)
@@ -1136,35 +1315,93 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
   }, [])
 
+  const isVectorExportContext = () => (
+    executedSearchMode === 'vector'
+    || searchMode === 'vector'
+    || activeResultMode === 'vector'
+    || resultsAreVector
+    || Boolean(groupedResponse?.warnings?.some((item) => String(item || '').includes('向量库语义检索')))
+  )
+
+  const applyExportMinVectorScore = (value: unknown) => {
+    const next = normalizeExportMinVectorScore(value)
+    setExportMinVectorScore(next)
+    saveExportMinVectorScore(next)
+    return next
+  }
+
+  const applyVectorSearchLimit = (value: unknown) => {
+    const next = normalizeVectorSearchLimit(value, VECTOR_SEARCH_DEFAULT_LIMIT)
+    setVectorSearchLimit(next)
+    saveVectorSearchLimit(next)
+    return next
+  }
+
+  const applyExportMaxRecords = (value: unknown) => {
+    const next = normalizeExportMaxRecords(value)
+    setExportMaxRecords(next)
+    saveExportMaxRecords(next)
+    return next
+  }
+
+  /** Prefer current on-screen groups so export/preview does not re-scan the vector index. */
+  const buildExportRequestOptions = (extra: Record<string, unknown> = {}) => {
+    const useVector = isVectorExportContext()
+    const maxRecords = normalizeExportMaxRecords(exportMaxRecords)
+    const minScore = useVector ? normalizeExportMinVectorScore(exportMinVectorScore) : 0
+    const groups = useVector ? groupedResponse?.groups : undefined
+    const trimmedGroups = groups && groups.length > 0
+      ? trimGroupsForExport(groups, maxRecords, minScore)
+      : undefined
+    return {
+      ...buildSearchOptions(filters, {
+        forExport: true,
+        forceVector: useVector,
+      }),
+      limit: useVector
+        ? normalizeVectorSearchLimit(vectorSearchLimit, VECTOR_SEARCH_DEFAULT_LIMIT)
+        : 1000,
+      searchEngine: useVector ? 'vector' as const : 'fulltext' as const,
+      maxExportRecords: maxRecords,
+      ...(useVector ? { minVectorScore: minScore } : {}),
+      ...(trimmedGroups && trimmedGroups.length > 0
+        ? {
+          exportGroups: trimmedGroups,
+          exportWarnings: groupedResponse?.warnings || [],
+        }
+        : {}),
+      ...extra,
+    }
+  }
+
   const loadExportPreview = async (citationStyleIdOverride?: string) => {
     const activeKeyword = (keyword || inputValue).trim()
     if (!activeKeyword) {
       return
     }
+    const requestId = exportPreviewRequestIdRef.current + 1
+    exportPreviewRequestIdRef.current = requestId
     setExportPreviewLoading(true)
     try {
-      const useVector = executedSearchMode === 'vector'
-        || searchMode === 'vector'
-        || Boolean(groupedResponse?.warnings?.some((item) => String(item || '').includes('向量库语义检索')))
-      const payload = await window.api.previewSearchExportExcerpts(activeKeyword, {
-        ...buildSearchOptions(filters, {
-          forExport: true,
-          forceVector: useVector,
-        }),
-        limit: 1000,
+      const payload = await window.api.previewSearchExportExcerpts(activeKeyword, buildExportRequestOptions({
         format: exportFormat,
         citationMode,
         citationStyleId: citationMode === 'auto' ? citationStyleIdOverride || selectedCitationStyleId : undefined,
         citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
-        searchEngine: useVector ? 'vector' : 'fulltext',
         pageNumberMode: exportPageNumberMode,
-      })
-      setExportPreview(payload)
+      }))
+      if (exportPreviewRequestIdRef.current === requestId) {
+        setExportPreview(payload)
+      }
     } catch (error) {
       console.error(error)
-      setExportPreview(null)
+      if (exportPreviewRequestIdRef.current === requestId) {
+        setExportPreview(null)
+      }
     } finally {
-      setExportPreviewLoading(false)
+      if (exportPreviewRequestIdRef.current === requestId) {
+        setExportPreviewLoading(false)
+      }
     }
   }
 
@@ -1178,8 +1415,9 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       const defaultStyleId = await loadCitationTemplates(true)
       setExportPageNumberMode('literature')
       setExportPreview(null)
+      setExportPreviewExpanded(false)
       setExportModalOpen(true)
-      window.setTimeout(() => void loadExportPreview(defaultStyleId), 0)
+      if (defaultStyleId) setSelectedCitationStyleId(defaultStyleId)
     })()
   }
 
@@ -1188,6 +1426,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     overrideFilters = filters,
     overrideMode: SearchMode = searchMode,
     overridePage = 1,
+    overrideVectorLimit = vectorSearchLimit,
   ) => {
     const activeKeyword = (overrideKeyword ?? inputValue).trim()
     if (!activeKeyword) return
@@ -1200,7 +1439,15 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     clearSearchReturnState()
     addHistory(activeKeyword)
     const activeSort = searchSort
-    const activeSignature = buildSearchSignature(activeKeyword, overrideFilters, overrideMode, activeSort, contextMode)
+    const activeVectorLimit = normalizeVectorSearchLimit(overrideVectorLimit, VECTOR_SEARCH_DEFAULT_LIMIT)
+    const activeSignature = buildSearchSignature(
+      activeKeyword,
+      overrideFilters,
+      overrideMode,
+      activeSort,
+      contextMode,
+      activeVectorLimit,
+    )
     viewerHitCountRefreshSignatureRef.current = activeSignature
 
     try {
@@ -1231,7 +1478,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         const folderId = (overrideFilters.folderIds || [])[0]
         const tagId = (overrideFilters.tagIds || [])[0]
         const vectorRes = await window.api.vectorSearch(activeKeyword, {
-          limit: 40,
+          limit: activeVectorLimit,
           folderId: folderId || undefined,
           tagId: tagId || undefined,
         })
@@ -1246,7 +1493,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         }
         const nextResults = vectorHitsToFlatResults(vectorRes.hits, activeKeyword)
         const warnings = [
-          `向量库语义检索（与全文检索分开）· 模型 ${vectorRes.modelId || 'embeddings'}`,
+          `向量库语义检索（与全文检索分开）· 模型 ${vectorRes.modelId || 'embeddings'} · 请求召回 ${activeVectorLimit} 条`,
           vectorRes.hint || '',
           (overrideFilters.folderIds || []).length > 1 ? '向量检索当前仅应用第一个文件夹筛选' : '',
           (overrideFilters.tagIds || []).length > 1 ? '向量检索当前仅应用第一个标签筛选' : '',
@@ -1270,7 +1517,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         setGroupedResponse(grouped)
         setExecutedSearchSignature(activeSignature)
         setExecutedSearchMode('vector')
-        persistHistoryEntry(activeKeyword, 'vector', overrideFilters, nextResults, null, grouped)
+        persistHistoryEntry(activeKeyword, 'vector', overrideFilters, nextResults, null, grouped, activeVectorLimit)
       } else {
         const reusableSnapshotId = overridePage > 1 && executedSearchSignature === activeSignature
           ? groupedResponse?.snapshotId
@@ -1357,9 +1604,12 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   }, [])
 
   useEffect(() => {
-    if (!exportModalOpen) return
-    void loadExportPreview()
-  }, [exportModalOpen, exportFormat, exportPageNumberMode, citationMode, selectedCitationStyleId, selectedCitationTemplateId, searchSort, contextMode, filterSignature])
+    if (!exportModalOpen || !exportPreviewExpanded) return
+    const timer = window.setTimeout(() => {
+      void loadExportPreview()
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [exportModalOpen, exportPreviewExpanded, exportFormat, exportPageNumberMode, exportMinVectorScore, exportMaxRecords, citationMode, selectedCitationStyleId, selectedCitationTemplateId, searchSort, contextMode, filterSignature])
 
   useEffect(() => {
     if (!shortcuts) return
@@ -1397,10 +1647,18 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   }
 
   const restoreSearchHistory = (entry: SearchHistoryEntry) => {
+    const restoredVectorLimit = normalizeVectorSearchLimit(
+      entry.vectorLimit,
+      VECTOR_SEARCH_DEFAULT_LIMIT,
+    )
     setInputValue(entry.keyword)
     setKeyword(entry.keyword)
     setSearchMode(entry.mode)
     setExecutedSearchMode(entry.mode)
+    if (entry.mode === 'vector') {
+      setVectorSearchLimit(restoredVectorLimit)
+      saveVectorSearchLimit(restoredVectorLimit)
+    }
     setSearchPage(entry.groupedResponse?.page || 1)
     setExpandedHitDocId('')
     setDocumentHitPages({})
@@ -1409,13 +1667,25 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     setAiSearchState(entry.aiSearchState)
     const restoredGrouped = entry.groupedResponse || (entry.results?.length ? groupFlatResults(entry.results, entry.keyword, entry.aiSearchState?.warnings || []) : null)
     const restoredResults = entry.results || []
-    const restoredSignature = buildSearchSignature(entry.keyword, entry.filters, entry.mode, searchSort, contextMode)
+    const restoredSignature = buildSearchSignature(
+      entry.keyword,
+      entry.filters,
+      entry.mode,
+      searchSort,
+      contextMode,
+      restoredVectorLimit,
+    )
     setGroupedResponse(restoredGrouped)
     setResults(restoredResults)
     setExecutedSearchSignature(restoredSignature)
     // Never re-count with full-text API for vector history (would look like keyword search).
     if (restoredGrouped && entry.mode !== 'vector') {
       refreshViewerHitCountsInBackground(restoredGrouped, entry.keyword, searchSort, restoredSignature, entry.mode, entry.filters, restoredResults, entry.aiSearchState)
+    }
+    if (entry.mode === 'vector' && entry.historyTruncated) {
+      void handleSearch(entry.keyword, entry.filters, 'vector', 1, restoredVectorLimit)
+      message.info(`历史记录只缓存前 ${VECTOR_SEARCH_HISTORY_HIT_LIMIT} 条，正在按原召回数量重新检索`)
+      return
     }
     message.success(entry.mode === 'vector' ? '已恢复向量库检索结果' : '已恢复历史检索')
   }
@@ -1442,10 +1712,15 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         await window.api.saveSearch(searchName, {
           keyword: activeKeyword,
           mode: searchMode,
-          filters: compactFilterOptions(filters),
+          filters: {
+            ...compactFilterOptions(filters),
+            ...(searchMode === 'vector'
+              ? { limit: normalizeVectorSearchLimit(vectorSearchLimit, VECTOR_SEARCH_DEFAULT_LIMIT) }
+              : {}),
+          },
           sort: searchSort,
           contextMode,
-          cache: groupedResponse
+          cache: groupedResponse && searchMode !== 'vector'
             ? {
                 grouped: groupedResponse,
                 results: results.slice(0, 360),
@@ -1471,11 +1746,19 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       const restoredFilters = compactSearchFilters(savedPayload?.filters || payload.filters)
       const restoredSort = savedPayload?.sort || payload.sort
       const restoredContextMode = savedPayload?.contextMode || payload.contextMode
+      const restoredVectorLimit = normalizeVectorSearchLimit(
+        savedPayload?.filters?.limit ?? payload.vectorLimit,
+        VECTOR_SEARCH_DEFAULT_LIMIT,
+      )
       setInputValue(restoredKeyword)
       setKeyword(restoredKeyword)
       setSearchMode(restoredMode)
       setSearchSort(restoredSort)
       setContextMode(restoredContextMode)
+      if (restoredMode === 'vector') {
+        setVectorSearchLimit(restoredVectorLimit)
+        saveVectorSearchLimit(restoredVectorLimit)
+      }
       replaceFilters(restoredFilters)
       setAiSearchState(null)
       setExpandedHitDocId('')
@@ -1483,7 +1766,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       clearSearchReturnState()
       // Vector / AI: always re-run live search (vector needs embeddings API; keep modes separate).
       if (restoredMode === 'vector' || restoredMode === 'ai' || !savedPayload?.cacheHit || !savedPayload?.grouped) {
-        await handleSearch(restoredKeyword, restoredFilters, restoredMode, 1)
+        await handleSearch(restoredKeyword, restoredFilters, restoredMode, 1, restoredVectorLimit)
         message.success(restoredMode === 'vector' ? '已重新执行向量库检索' : '已重新执行检索')
       } else {
         const restoredGrouped = savedPayload.grouped
@@ -1491,7 +1774,14 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         setGroupedResponse(restoredGrouped)
         setResults(restoredResults)
         setSearchPage(restoredGrouped?.page || 1)
-        setExecutedSearchSignature(buildSearchSignature(restoredKeyword, restoredFilters, restoredMode, restoredSort, restoredContextMode))
+        setExecutedSearchSignature(buildSearchSignature(
+          restoredKeyword,
+          restoredFilters,
+          restoredMode,
+          restoredSort,
+          restoredContextMode,
+          restoredVectorLimit,
+        ))
         message.success(savedPayload.cacheHit ? '已从缓存恢复检索结果' : '文献库已变化，已重新检索并刷新缓存')
       }
       await loadSavedSearches()
@@ -1599,23 +1889,27 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       const activeCitationStyleId = citationMode === 'auto'
         ? selectedCitationStyleId || await loadCitationTemplates(true)
         : undefined
-      const useVector = activeResultMode === 'vector' || resultsAreVector
-      const payload = await window.api.exportSearchExcerpts(activeKeyword, {
-        ...buildSearchOptions(filters, { forExport: true, forceVector: useVector }),
-        limit: 1000,
+      const payload = await window.api.exportSearchExcerpts(activeKeyword, buildExportRequestOptions({
         format: exportFormat,
         citationMode,
         citationStyleId: activeCitationStyleId,
         citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
-        searchEngine: useVector ? 'vector' : 'fulltext',
         pageNumberMode: exportPageNumberMode,
-      })
+      }))
       if (!payload?.canceled) {
         setExportModalOpen(false)
+        // Persist the threshold the user just used as the next default.
+        saveExportMaxRecords(exportMaxRecords)
+        if (isVectorExportContext()) {
+          saveExportMinVectorScore(exportMinVectorScore)
+        }
+        const scoreFilterNote = isVectorExportContext() && (payload.filteredByMinScore || 0) > 0
+          ? `，相似度不足跳过 ${payload.filteredByMinScore}`
+          : ''
         message.success(
-          activeResultMode === 'vector'
-            ? `已导出向量命中 ${payload.exportableParagraphs ?? payload.totalHits} 段（跳过 ${payload.skippedHits ?? 0} 条无法还原）`
-            : `已导出 ${payload.exportableParagraphs ?? payload.totalHits} 个完整段落，跳过 ${payload.skippedHits ?? 0} 条无法还原的命中`,
+          isVectorExportContext()
+            ? `已导出向量证据 ${payload.exportableParagraphs ?? payload.totalHits} 条（上限 ${payload.maxExportRecords ?? exportMaxRecords}；无法还原 ${payload.skippedHits ?? 0}${scoreFilterNote}）`
+            : `已导出 ${payload.exportableParagraphs ?? payload.totalHits} 个完整段落（上限 ${payload.maxExportRecords ?? exportMaxRecords}），跳过 ${payload.skippedHits ?? 0} 条无法还原的命中`,
         )
       }
     } catch (error: unknown) {
@@ -1634,12 +1928,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     setSavingExcerpts(true)
     try {
-      const useVector = activeResultMode === 'vector' || resultsAreVector
-      const payload = await window.api.saveSearchExcerpts(activeKeyword, {
-        ...buildSearchOptions(filters, { forExport: true, forceVector: useVector }),
-        limit: 1000,
-        searchEngine: useVector ? 'vector' : 'fulltext',
-      })
+      const payload = await window.api.saveSearchExcerpts(activeKeyword, buildExportRequestOptions())
       message.success(`已保存 ${payload.savedCount} 条完整摘录，跳过 ${payload.skippedCount} 条重复摘录`)
     } catch (error: unknown) {
       console.error(error)
@@ -1657,12 +1946,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     }
     setExportingDiagnostics(true)
     try {
-      const useVector = activeResultMode === 'vector' || resultsAreVector
-      const payload = await window.api.exportSearchDiagnostics(activeKeyword, {
-        ...buildSearchOptions(filters, { forExport: true, forceVector: useVector }),
-        limit: 1000,
-        searchEngine: useVector ? 'vector' : 'fulltext',
-      })
+      const payload = await window.api.exportSearchDiagnostics(activeKeyword, buildExportRequestOptions())
       if (!payload?.canceled) {
         message.success(`已导出诊断：${payload.totalDocuments} 篇文献、${payload.totalHits} 条命中`)
       }
@@ -1967,9 +2251,6 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             icon={<ThunderboltOutlined />}
             onClick={() => {
               setSearchMode('vector')
-              const q = inputValue.trim()
-              // Switching mode re-runs so results never stay as the other engine's hits.
-              if (q) void handleSearch(q, filters, 'vector', 1)
             }}
           >
             向量库检索
@@ -1985,6 +2266,21 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             AI 检索
           </Button>
         </Button.Group>
+        {searchMode === 'vector' ? (
+          <Space size={6}>
+            <Text style={{ color: 'var(--gs-text-secondary)', whiteSpace: 'nowrap' }}>检索前召回</Text>
+            <InputNumber
+              aria-label="向量检索召回数量"
+              min={1}
+              max={VECTOR_SEARCH_MAX_LIMIT}
+              step={100}
+              value={vectorSearchLimit}
+              onChange={applyVectorSearchLimit}
+              addonAfter="条"
+              style={{ width: 150 }}
+            />
+          </Space>
+        ) : null}
         <Select
           value={filters.translationScope || 'all'}
           onChange={(value) => setFilterPatch({ translationScope: value })}
@@ -2130,146 +2426,253 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         okText={'导出'}
         cancelText={'取消'}
         confirmLoading={exportingExcerpts}
+        width={760}
+        styles={{ body: { maxHeight: '72vh', overflowY: 'auto' } }}
       >
         <Space direction={'vertical'} size={12} style={{ width: '100%' }}>
-          <Text type={'secondary'}>
-            {activeResultMode === 'vector'
-              ? '向量导出：每条证据含相似度（如 0.520）、正文、引用与定位信息，按相关度排序，方便复制给外部 AI。'
-              : '导出关键词所在完整自然段，并附带引用、命中词和定位信息。'}
-          </Text>
-          <Select
-            value={exportFormat}
-            onChange={(value) => setExportFormat(value)}
-            style={{ width: '100%' }}
-            options={[
-              { value: 'txt', label: 'TXT' },
-              { value: 'markdown', label: 'Markdown' },
-              { value: 'csv', label: 'CSV' },
-              { value: 'json', label: 'JSON' },
-            ]}
+          <Alert
+            type="info"
+            showIcon
+            message={isVectorExportContext()
+              ? '按当前向量检索结果和相似度筛选导出，不会再次扫描向量库。'
+              : '全文导出会保持原有完整命中逻辑；预览仅在展开后生成。'}
           />
-          <div>
-            <Text style={{ display: 'block', marginBottom: 6 }}>页码类型</Text>
-            <Radio.Group
-              value={exportPageNumberMode}
-              onChange={(event) => setExportPageNumberMode(event.target.value)}
-              optionType="button"
-              buttonStyle="solid"
-              options={[
-                { value: 'literature', label: '文献页码' },
-                { value: 'natural', label: '自然页码' },
-              ]}
-            />
-            <Text type="secondary" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
-              {exportPageNumberMode === 'natural'
-                ? '自然页码：PDF/扫描影像的物理页序（第 1…N 页）。'
-                : '文献页码：书上印刷/校准后的连续页码（默认，与阅读模式「文献页码」一致）。'}
-            </Text>
-          </div>
-          <Select
-            value={citationMode}
-            onChange={(value) => setCitationMode(value)}
-            style={{ width: '100%' }}
-            options={[
-              { value: 'auto', label: '自动匹配引用格式' },
-              { value: 'template', label: '手动选择引用模板' },
-              { value: 'simple', label: '简明引用' },
-            ]}
-          />
-          {citationMode === 'auto' ? (
-            <>
-              <Select
-                value={selectedCitationStyleId}
-                placeholder={'选择引用标准'}
-                onChange={(value) => setSelectedCitationStyleId(value)}
+
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: isVectorExportContext()
+              ? 'repeat(auto-fit, minmax(240px, 1fr))'
+              : 'minmax(240px, 1fr)',
+            gap: 12,
+          }}>
+            <div>
+              <Text strong style={{ display: 'block', marginBottom: 6 }}>
+                {isVectorExportContext() ? '导出证据数量' : '导出段落数量'}
+              </Text>
+              <InputNumber
+                min={1}
+                max={VECTOR_SEARCH_MAX_LIMIT}
+                step={100}
+                value={exportMaxRecords}
+                onChange={applyExportMaxRecords}
                 style={{ width: '100%' }}
-                options={citationStyles.map((style) => ({
-                  value: style.id,
-                  label: `${style.name}${style.is_default ? '（默认）' : ''}`,
-                }))}
+                addonAfter="条"
               />
-              <Text type={'secondary'}>{'导出时会按文献类型自动选择对应模板。'}</Text>
-            </>
-          ) : null}
-          {citationMode === 'template' ? (
-            <Select
-              allowClear
-              value={selectedCitationTemplateId}
-              placeholder={'选择引用模板'}
-              onChange={(value) => setSelectedCitationTemplateId(value || undefined)}
-              style={{ width: '100%' }}
-              options={[
-                { value: '', label: '默认简明引用' },
-                ...citationTemplates.map((template) => ({
-                  value: template.id,
-                  label: `${template.name}${template.is_default ? '（默认）' : ''}`,
-                })),
-              ]}
-            />
-          ) : null}
-          {citationMode === 'simple' ? (
-            <Text type={'secondary'}>{'使用作者、标题、页码组成的简明引用。'}</Text>
-          ) : null}
-          <Card size={'small'} style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
-            <Space direction={'vertical'} size={10} style={{ width: '100%' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-                <Text strong style={{ color: 'var(--gs-text-primary)' }}>导出预览</Text>
-                <Space size={8} wrap>
-                  <Tag color={'blue'}>{exportPreview?.exportableParagraphs ?? 0} {activeResultMode === 'vector' ? '条证据' : '段'}</Tag>
-                  <Tag color={(exportPreview?.skippedHits || 0) > 0 ? 'orange' : 'green'}>跳过 {exportPreview?.skippedHits ?? 0}</Tag>
-                  {exportPreview?.exporterVersion ? (
-                    <Tag>{formatExportVersionLabel(exportPreview.exporterVersion)}</Tag>
+              <Text type="secondary" style={{ display: 'block', marginTop: 5, fontSize: 12 }}>
+                默认 {VECTOR_SEARCH_DEFAULT_LIMIT}，按相关度从高到低截取并记住选择。
+              </Text>
+            </div>
+            {isVectorExportContext() ? (
+              <div>
+                <Text strong style={{ display: 'block', marginBottom: 6 }}>最低相似度</Text>
+                <InputNumber
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  precision={3}
+                  value={exportMinVectorScore}
+                  onChange={applyExportMinVectorScore}
+                  style={{ width: '100%' }}
+                  addonBefore="≥"
+                />
+                <Text type="secondary" style={{ display: 'block', marginTop: 5, fontSize: 12 }}>
+                  {exportMinVectorScore > 0
+                    ? `仅导出相似度 ≥ ${exportMinVectorScore} 的证据；设为 0 表示不过滤。`
+                    : '0 表示不过滤相似度。'}
+                </Text>
+              </div>
+            ) : null}
+          </div>
+
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+            gap: 12,
+          }}>
+            <div>
+              <Text strong style={{ display: 'block', marginBottom: 6 }}>文件格式</Text>
+              <Select
+                value={exportFormat}
+                onChange={(value) => setExportFormat(value)}
+                style={{ width: '100%' }}
+                options={[
+                  { value: 'txt', label: 'TXT' },
+                  { value: 'markdown', label: 'Markdown' },
+                  { value: 'csv', label: 'CSV' },
+                  { value: 'json', label: 'JSON' },
+                ]}
+              />
+            </div>
+            <div>
+              <Text strong style={{ display: 'block', marginBottom: 6 }}>页码类型</Text>
+              <Radio.Group
+                value={exportPageNumberMode}
+                onChange={(event) => setExportPageNumberMode(event.target.value)}
+                optionType="button"
+                buttonStyle="solid"
+                options={[
+                  { value: 'literature', label: '文献页码' },
+                  { value: 'natural', label: '自然页码' },
+                ]}
+              />
+              <Text type="secondary" style={{ display: 'block', marginTop: 5, fontSize: 12 }}>
+                {exportPageNumberMode === 'natural' ? 'PDF/扫描物理页序' : '印刷或校准后的连续页码'}
+              </Text>
+            </div>
+          </div>
+
+          <Collapse
+            size="small"
+            items={[{
+              key: 'citation',
+              label: '引用格式（可选）',
+              children: (
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Select
+                    value={citationMode}
+                    onChange={(value) => setCitationMode(value)}
+                    style={{ width: '100%' }}
+                    options={[
+                      { value: 'auto', label: '自动匹配引用格式' },
+                      { value: 'template', label: '手动选择引用模板' },
+                      { value: 'simple', label: '简明引用' },
+                    ]}
+                  />
+                  {citationMode === 'auto' ? (
+                    <>
+                      <Select
+                        value={selectedCitationStyleId}
+                        placeholder={'选择引用标准'}
+                        onChange={(value) => setSelectedCitationStyleId(value)}
+                        style={{ width: '100%' }}
+                        options={citationStyles.map((style) => ({
+                          value: style.id,
+                          label: `${style.name}${style.is_default ? '（默认）' : ''}`,
+                        }))}
+                      />
+                      <Text type={'secondary'}>{'导出时会按文献类型自动选择对应模板。'}</Text>
+                    </>
+                  ) : null}
+                  {citationMode === 'template' ? (
+                    <Select
+                      allowClear
+                      value={selectedCitationTemplateId}
+                      placeholder={'选择引用模板'}
+                      onChange={(value) => setSelectedCitationTemplateId(value || undefined)}
+                      style={{ width: '100%' }}
+                      options={[
+                        { value: '', label: '默认简明引用' },
+                        ...citationTemplates.map((template) => ({
+                          value: template.id,
+                          label: `${template.name}${template.is_default ? '（默认）' : ''}`,
+                        })),
+                      ]}
+                    />
+                  ) : null}
+                  {citationMode === 'simple' ? (
+                    <Text type={'secondary'}>{'使用作者、标题、页码组成的简明引用。'}</Text>
                   ) : null}
                 </Space>
-              </div>
-              {exportPreviewLoading ? (
-                <Spin size={'small'} />
-              ) : exportPreview?.previewItems?.length ? (
-                <Space direction={'vertical'} size={8} style={{ width: '100%' }}>
-                  {exportPreview.previewItems.map((item, index) => (
-                    <div
-                      key={`${item.sourceKey}-${index}`}
-                      style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}
-                    >
-                      <Space size={6} wrap style={{ marginBottom: 6 }}>
-                        <Text strong>{item.title}</Text>
-                        {item.pageNum ? <Tag>第 {item.pageNum} 页</Tag> : null}
-                        {typeof item.score === 'number' && Number.isFinite(item.score) ? (
-                          <Tag color="cyan">相似度 {item.score.toFixed(3)}</Tag>
-                        ) : null}
-                        <Tooltip title={formatExportSourceTypeHint(item.sourceType)}>
-                          <Tag color={item.sourceType === 'page' ? 'green' : 'orange'}>
-                            {formatExportSourceTypeLabel(item.sourceType)}
-                          </Tag>
-                        </Tooltip>
-                        {item.hitTerms.slice(0, 3).map((term) => <Tag key={term} color={'gold'}>{term}</Tag>)}
-                      </Space>
-                      <Text
-                        style={{
-                          display: 'block',
-                          color: 'var(--gs-text-secondary)',
-                          whiteSpace: 'pre-wrap',
-                          maxHeight: 160,
-                          overflowY: 'auto',
-                        }}
-                      >
-                        {item.paragraph}
-                      </Text>
-                      <Text type={'secondary'} style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
-                        定位：{formatExportLocatorDisplay(item.locatorText, item.pageNum, item.hitTerms[0])}
-                      </Text>
-                    </div>
-                  ))}
+              ),
+            }]}
+          />
+
+          <Collapse
+            size="small"
+            activeKey={exportPreviewExpanded ? ['preview'] : []}
+            onChange={(keys) => {
+              const expanded = Array.isArray(keys) ? keys.includes('preview') : keys === 'preview'
+              setExportPreviewExpanded(expanded)
+            }}
+            items={[{
+              key: 'preview',
+              label: exportPreview?.previewItems?.length
+                ? `导出预览（前 ${exportPreview.previewItems.length} 条）`
+                : '导出预览（按需生成）',
+              extra: (
+                <Button
+                  type="link"
+                  size="small"
+                  loading={exportPreviewLoading}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setExportPreviewExpanded(true)
+                    void loadExportPreview()
+                  }}
+                >
+                  刷新
+                </Button>
+              ),
+              children: (
+                <Space direction={'vertical'} size={10} style={{ width: '100%' }}>
+                  <Space size={8} wrap>
+                    <Tag color={'blue'}>
+                      预计导出 {exportPreview?.exportableParagraphs ?? 0}
+                      {isVectorExportContext() ? ' 条证据' : ' 段'}
+                    </Tag>
+                    <Tag>上限 {exportPreview?.maxExportRecords ?? exportMaxRecords}</Tag>
+                    <Tag color={(exportPreview?.skippedHits || 0) > 0 ? 'orange' : 'green'}>
+                      无法还原 {exportPreview?.skippedHits ?? 0}
+                    </Tag>
+                    {isVectorExportContext() && (exportPreview?.filteredByMinScore || 0) > 0 ? (
+                      <Tag color="purple">相似度不足 {exportPreview?.filteredByMinScore}</Tag>
+                    ) : null}
+                    {isVectorExportContext() && exportMinVectorScore > 0 ? (
+                      <Tag color="cyan">门槛 ≥ {exportMinVectorScore}</Tag>
+                    ) : null}
+                    {exportPreview?.totalHits != null ? <Tag>命中 {exportPreview.totalHits}</Tag> : null}
+                    {exportPreview?.exporterVersion ? (
+                      <Tag>{formatExportVersionLabel(exportPreview.exporterVersion)}</Tag>
+                    ) : null}
+                  </Space>
+                  {exportPreviewLoading ? (
+                    <Spin size={'small'} />
+                  ) : exportPreview?.previewItems?.length ? (
+                    <Space direction={'vertical'} size={8} style={{ width: '100%' }}>
+                      {exportPreview.previewItems.map((item, index) => (
+                        <div
+                          key={`${item.sourceKey}-${index}`}
+                          style={{ padding: 10, borderRadius: 6, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}
+                        >
+                          <Space size={6} wrap style={{ marginBottom: 6 }}>
+                            <Text strong>{item.title}</Text>
+                            {item.pageNum ? <Tag>第 {item.pageNum} 页</Tag> : null}
+                            {typeof item.score === 'number' && Number.isFinite(item.score) ? (
+                              <Tag color="cyan">相似度 {item.score.toFixed(3)}</Tag>
+                            ) : null}
+                            <Tooltip title={formatExportSourceTypeHint(item.sourceType)}>
+                              <Tag color={item.sourceType === 'page' ? 'green' : 'orange'}>
+                                {formatExportSourceTypeLabel(item.sourceType)}
+                              </Tag>
+                            </Tooltip>
+                            {item.hitTerms.slice(0, 3).map((term) => <Tag key={term} color={'gold'}>{term}</Tag>)}
+                          </Space>
+                          <Text style={{
+                            display: 'block',
+                            color: 'var(--gs-text-secondary)',
+                            whiteSpace: 'pre-wrap',
+                            maxHeight: 140,
+                            overflowY: 'auto',
+                          }}>
+                            {item.paragraph}
+                          </Text>
+                          <Text type={'secondary'} style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+                            定位：{formatExportLocatorDisplay(item.locatorText, item.pageNum, item.hitTerms[0])}
+                          </Text>
+                        </div>
+                      ))}
+                    </Space>
+                  ) : (
+                    <Text type={'secondary'}>
+                      {activeResultMode === 'vector'
+                        ? '没有可预览的向量证据。请确认已向量化且本次检索有命中。'
+                        : '没有可预览的完整段落。可以先运行诊断导出查看缺失原因。'}
+                    </Text>
+                  )}
                 </Space>
-              ) : (
-                <Text type={'secondary'}>
-                  {activeResultMode === 'vector'
-                    ? '没有可预览的向量证据。请确认已向量化且本次检索有命中。'
-                    : '没有可预览的完整段落。可以先运行诊断导出查看缺失原因。'}
-                </Text>
-              )}
-            </Space>
-          </Card>
+              ),
+            }]}
+          />
         </Space>
       </Modal>
 
@@ -2357,7 +2760,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           showIcon
           style={{ marginBottom: 12 }}
           message="当前结果来自：向量库语义检索（不是关键词全文检索）"
-          description="按主题/语义相似度召回已向量化正文；高亮只是方便对照查询词，不代表改成了关键词检索。切换模式会自动按新模式重新搜索。"
+          description={`按主题/语义相似度召回已向量化正文；当前已召回 ${groupedResponse?.totalHits || results.length} 条。修改上方召回数量后，点击搜索即可按新数量重新检索。`}
         />
       ) : searchMode === 'vector' && !loading && !resultsAreVector ? (
         <Alert
@@ -2365,7 +2768,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           showIcon
           style={{ marginBottom: 12 }}
           message="已选中「向量库检索」"
-          description="输入主题后点搜索，或点模式按钮将自动按向量检索重跑。与全文检索互不合并。"
+          description={`请先设置召回数量（默认 ${VECTOR_SEARCH_DEFAULT_LIMIT}，最多 ${VECTOR_SEARCH_MAX_LIMIT}），再输入主题并点击搜索。与全文检索互不合并。`}
         />
       ) : null}
 
@@ -2384,7 +2787,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           showIcon
           message={
             searchMode !== activeResultMode
-              ? `模式已切换为「${searchModeLabel(searchMode)}」，当前列表仍是上次「${searchModeLabel(activeResultMode)}」的结果；点搜索或再次点模式将重新检索。`
+              ? `模式已切换为「${searchModeLabel(searchMode)}」，当前列表仍是上次「${searchModeLabel(activeResultMode)}」的结果；确认检索条件后点击搜索。`
               : '检索条件已变化，当前仍显示上一次检索结果；点击搜索后才会按新条件检索。'
           }
           style={{ marginBottom: 12 }}

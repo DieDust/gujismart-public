@@ -80,10 +80,16 @@ import {
   getOcrRegionRerecognitionCandidates,
 } from '../../shared/ocr-ir'
 import type { BatchOcrOptions, Document, DocumentPage, ImportAutoOcrTaskCreateOptions, ImportAutoOcrTaskItemInput, ImportAutoOcrTaskStartResult, OcrEngine, OcrProgressEvent, OcrRecognizeMode, OcrRecognizeResult, OcrRegionRerecognitionOptions, OcrRegionRerecognitionResult, PdfTextLayerAnalysis, PdfTextLayerPageAnalysis, TocItemV2 } from '../../shared/types'
+import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
 import { ocrRunMetadataFromProgress } from '../../shared/ocr-run-metadata'
 import { statusEnvelopeFromOcrProgress } from '../../shared/status-envelope'
 import { recordCompatibilityOcrArtifacts } from '../ocr-artifacts'
 import { globalOcrDocumentWindow } from '../ocr-document-window'
+import {
+  getActiveLibraryProjectId,
+  requireLibraryProjectId,
+  withLibraryProjectContext,
+} from '../library-projects'
 
 const AUTO_METADATA_TIMEOUT_MS = 120_000
 const AUTO_METADATA_QUEUE_TIMEOUT_MS = 30 * 60_000
@@ -6830,7 +6836,12 @@ async function processDocumentOcr(
   }
 }
 
-function getImportAutoOcrTaskConfig(jobId: string): { engine: OcrEngine; batchSize: number; totalCount: number } {
+function getImportAutoOcrTaskConfig(jobId: string): {
+  engine: OcrEngine
+  batchSize: number
+  totalCount: number
+  libraryProjectId: string
+} {
   const job = getImportAutoOcrTask(jobId)
   const engineValue = String(job.settingsSnapshot.engine || 'paddle')
   const engine: OcrEngine = engineValue === 'local_paddle' || engineValue === 'vision_model' || engineValue === 'hybrid'
@@ -6838,7 +6849,10 @@ function getImportAutoOcrTaskConfig(jobId: string): { engine: OcrEngine; batchSi
     : 'paddle'
   const rawBatchSize = Number(job.settingsSnapshot.batchSize || 5)
   const batchSize = Math.max(1, Math.min(200, Number.isSafeInteger(rawBatchSize) ? rawBatchSize : 5))
-  return { engine, batchSize, totalCount: job.totalCount }
+  const libraryProjectId = requireLibraryProjectId(
+    String(job.settingsSnapshot.libraryProjectId || DEFAULT_LIBRARY_PROJECT_ID),
+  )
+  return { engine, batchSize, totalCount: job.totalCount, libraryProjectId }
 }
 
 async function acquireDocumentOcrSlot(docId: string): Promise<void> {
@@ -6860,6 +6874,7 @@ async function processImportAutoOcrClaim(
   event: OcrStatusEvent,
   claim: ReturnType<typeof claimTaskItems>[number],
   engine: OcrEngine,
+  libraryProjectId: string,
   totalCount: number,
   getCompleted: () => number,
 ): Promise<boolean> {
@@ -6879,7 +6894,10 @@ async function processImportAutoOcrClaim(
     return false
   }
 
-  const doc = queryOne<{ id: string; page_count: number | null }>('SELECT id, page_count FROM documents WHERE id = ?', [docId])
+  const doc = queryOne<{ id: string; page_count: number | null }>(
+    'SELECT id, page_count FROM documents WHERE id = ? AND library_project_id = ?',
+    [docId, libraryProjectId],
+  )
   if (!doc) {
     failTaskItem({
       itemId: claim.itemId,
@@ -7008,6 +7026,7 @@ async function processImportAutoOcrClaim(
 
 async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promise<void> {
   const config = getImportAutoOcrTaskConfig(jobId)
+  return withLibraryProjectContext(config.libraryProjectId, async () => {
   // Claim only as many items as we can actually run. Claiming 200 then Promise.all
   // creates 200 status events + lease rows before any OCR page upload starts.
   const concurrency = Math.max(1, getOcrDocumentConcurrency(config.batchSize))
@@ -7038,6 +7057,7 @@ async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promi
             event,
             claim,
             config.engine,
+            config.libraryProjectId,
             config.totalCount,
             () => completedCount,
           )
@@ -7049,10 +7069,15 @@ async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promi
   } finally {
     resumeBackgroundSearchReindex({ reason: 'ocr-batch-deferred' })
   }
+  })
 }
 
 function startImportAutoOcrTaskRun(event: OcrStatusEvent, jobId: string): ImportAutoOcrTaskStartResult {
   const job = getImportAutoOcrTask(jobId)
+  const config = getImportAutoOcrTaskConfig(jobId)
+  if (config.libraryProjectId !== getActiveLibraryProjectId()) {
+    throw new Error('Import auto OCR task belongs to a different library project')
+  }
   const existing = activeImportAutoOcrRuns.get(jobId)
   if (existing) return { jobId, totalCount: job.totalCount, started: false }
   const taskRun = runImportAutoOcrTask(event, jobId)

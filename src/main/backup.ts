@@ -1,12 +1,14 @@
 import { dialog, shell } from 'electron'
 import { createWriteStream } from 'fs'
+import { access, copyFile, mkdir, readdir, rm, stat, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { basename, extname, isAbsolute, join, normalize, relative, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
 import { ZipArchive } from 'archiver'
 import extract from 'extract-zip'
 import Database from 'better-sqlite3'
-import { closeDatabase, getDataDir, queryAll, run, saveDatabase } from './database'
+import { backupDatabaseTo, closeDatabase, getDataDir, queryAll, run, saveDatabase, scheduleDatabaseSave } from './database'
+import { getActiveLibraryProjectId } from './library-projects'
 import type { BackupImportResult, BackupIntegrityReport, BackupResult, BackupSlot, BackupStatus, CompactAutoBackupResult } from '../shared/types'
 import { buildBackupIntegrityReport, compareBackupIntegrityReports } from '../shared/backup-integrity'
 import { validateBackupSettingsConfig } from '../shared/config-validation'
@@ -161,13 +163,27 @@ function copyDirRecursive(src: string, dest: string): void {
   }
 }
 
-function getDirSize(dir: string): number {
-  if (!existsSync(dir)) return 0
-  return readdirSync(dir, { withFileTypes: true }).reduce((sum, entry) => {
-    const targetPath = join(dir, entry.name)
-    if (entry.isDirectory()) return sum + getDirSize(targetPath)
-    return sum + statSync(targetPath).size
-  }, 0)
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await access(targetPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function copyDirRecursiveAsync(src: string, dest: string): Promise<void> {
+  await mkdir(dest, { recursive: true })
+  const entries = await readdir(src, { withFileTypes: true })
+  for (const entry of entries) {
+    const srcPath = join(src, entry.name)
+    const destPath = join(dest, entry.name)
+    if (entry.isDirectory()) {
+      await copyDirRecursiveAsync(srcPath, destPath)
+    } else if (entry.isFile()) {
+      await copyFile(srcPath, destPath)
+    }
+  }
 }
 
 function getFileTreeStats(dir: string): FileTreeStats {
@@ -186,6 +202,24 @@ function getFileTreeStats(dir: string): FileTreeStats {
       totalBytes: stats.totalBytes + statSync(targetPath).size,
     }
   }, { fileCount: 0, totalBytes: 0 })
+}
+
+async function getFileTreeStatsAsync(dir: string): Promise<FileTreeStats> {
+  if (!(await pathExists(dir))) return { fileCount: 0, totalBytes: 0 }
+  const entries = await readdir(dir, { withFileTypes: true })
+  const stats: FileTreeStats = { fileCount: 0, totalBytes: 0 }
+  for (const entry of entries) {
+    const targetPath = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      const child = await getFileTreeStatsAsync(targetPath)
+      stats.fileCount += child.fileCount
+      stats.totalBytes += child.totalBytes
+    } else if (entry.isFile()) {
+      stats.fileCount += 1
+      stats.totalBytes += (await stat(targetPath)).size
+    }
+  }
+  return stats
 }
 
 function readSetting(key: string, fallback: string): string {
@@ -361,6 +395,17 @@ function countMissingBackupPayloadRefs(backupDir: string, refs: Set<string>): nu
   return missing
 }
 
+async function countMissingBackupPayloadRefsAsync(backupDir: string, refs: Set<string>): Promise<number> {
+  if (refs.size === 0) return 0
+  const payloadRoot = getStoragePagePayloadsDir(getBackupStorageDir(backupDir))
+  let missing = 0
+  for (const ref of refs) {
+    const payloadPath = resolveBackupPayloadRefPath(payloadRoot, ref)
+    if (!payloadPath || !(await pathExists(payloadPath))) missing += 1
+  }
+  return missing
+}
+
 function collectBackupIntegrityReport(
   backupDir: string,
   options: { includesStorage?: boolean; generatedAt?: string } = {},
@@ -386,6 +431,39 @@ function collectBackupIntegrityReport(
     page_payload_total_bytes: payloadStats.totalBytes,
     page_payload_ref_count: refs.size,
     missing_page_payload_ref_count: countMissingBackupPayloadRefs(backupDir, refs),
+  }, options.generatedAt)
+}
+
+async function collectBackupIntegrityReportAsync(
+  backupDir: string,
+  options: { includesStorage?: boolean; generatedAt?: string } = {},
+): Promise<BackupIntegrityReport> {
+  const manifest = readBackupManifest(backupDir)
+  const dbDir = getBackupDbDir(backupDir)
+  const storageDir = getBackupStorageDir(backupDir)
+  const payloadDir = getStoragePagePayloadsDir(storageDir)
+  const refs = collectBackupExternalPayloadRefs(backupDir)
+  const [dbStats, storageStats, payloadStats, storagePresent, payloadPresent, missingPayloadRefs] = await Promise.all([
+    getFileTreeStatsAsync(dbDir),
+    getFileTreeStatsAsync(storageDir),
+    getFileTreeStatsAsync(payloadDir),
+    pathExists(storageDir),
+    pathExists(payloadDir),
+    countMissingBackupPayloadRefsAsync(backupDir, refs),
+  ])
+  return buildBackupIntegrityReport({
+    db_present: hasBackupDatabase(backupDir),
+    storage_present: storagePresent,
+    includes_storage: options.includesStorage ?? manifest?.includesStorage ?? storagePresent,
+    includes_page_payloads: payloadPresent,
+    db_file_count: dbStats.fileCount,
+    db_total_bytes: dbStats.totalBytes,
+    storage_file_count: storageStats.fileCount,
+    storage_total_bytes: storageStats.totalBytes,
+    page_payload_file_count: payloadStats.fileCount,
+    page_payload_total_bytes: payloadStats.totalBytes,
+    page_payload_ref_count: refs.size,
+    missing_page_payload_ref_count: missingPayloadRefs,
   }, options.generatedAt)
 }
 
@@ -451,12 +529,12 @@ async function createSafetyBackupBeforeImport(dataDir: string): Promise<string> 
   assertManagedDataChild(dataDir, safetyBackupRoot)
   assertManagedDataChild(dataDir, safetyBackupPath)
   try {
-    mkdirSync(safetyBackupRoot, { recursive: true })
-    copyCurrentDataTo(tempBackupDir, 'manual')
+    await mkdir(safetyBackupRoot, { recursive: true })
+    await copyCurrentDataTo(tempBackupDir, 'manual')
     await writeBackupZip(tempBackupDir, safetyBackupPath)
     return safetyBackupPath
   } finally {
-    rmSync(tempBackupDir, { recursive: true, force: true })
+    await rm(tempBackupDir, { recursive: true, force: true })
   }
 }
 
@@ -489,26 +567,26 @@ function getAutoBackupScheduleState(): { enabled: boolean; intervalHours: number
   }
 }
 
-function copyStorageForBackup(dataDir: string, backupDir: string, includeFullStorage: boolean): void {
+async function copyStorageForBackup(dataDir: string, backupDir: string, includeFullStorage: boolean): Promise<void> {
   const sourceStorageDir = join(dataDir, 'storage')
-  if (!existsSync(sourceStorageDir)) return
+  if (!(await pathExists(sourceStorageDir))) return
 
   const targetStorageDir = join(backupDir, 'storage')
   if (includeFullStorage) {
-    copyDirRecursive(sourceStorageDir, targetStorageDir)
+    await copyDirRecursiveAsync(sourceStorageDir, targetStorageDir)
     return
   }
 
   const sourcePayloadDir = getStoragePagePayloadsDir(sourceStorageDir)
-  if (existsSync(sourcePayloadDir)) {
-    copyDirRecursive(sourcePayloadDir, getStoragePagePayloadsDir(targetStorageDir))
+  if (await pathExists(sourcePayloadDir)) {
+    await copyDirRecursiveAsync(sourcePayloadDir, getStoragePagePayloadsDir(targetStorageDir))
   }
 }
 
-function cleanupExtraAutoBackupSlots(slotCount = AUTO_BACKUP_SLOT_COUNT): void {
+async function cleanupExtraAutoBackupSlots(slotCount = AUTO_BACKUP_SLOT_COUNT): Promise<void> {
   const root = resolve(getAutoBackupRoot())
-  if (!existsSync(root)) return
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
+  if (!(await pathExists(root))) return
+  for (const entry of await readdir(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     const match = entry.name.match(/^slot-(\d+)$/)
     if (!match) continue
@@ -516,17 +594,17 @@ function cleanupExtraAutoBackupSlots(slotCount = AUTO_BACKUP_SLOT_COUNT): void {
     if (!Number.isFinite(slot) || slot <= slotCount) continue
     const target = resolve(root, entry.name)
     if (target === root || !isPathInside(root, target)) continue
-    rmSync(target, { recursive: true, force: true })
+    await rm(target, { recursive: true, force: true })
   }
 }
 
-function writeManifest(
+async function writeManifest(
   backupDir: string,
   type: 'manual' | 'auto',
   slot?: number,
   includesStorage = true,
   credentialRequiredAfterRestore = false,
-): void {
+): Promise<void> {
   const manifest = {
     version: '1.0.0',
     app: '文献管理',
@@ -537,30 +615,40 @@ function writeManifest(
     credentialsExcluded: true,
     credentialRequiredAfterRestore,
     timestamp: new Date().toISOString(),
-    integrityReport: collectBackupIntegrityReport(backupDir, { includesStorage }),
+    integrityReport: await collectBackupIntegrityReportAsync(backupDir, { includesStorage }),
   }
-  writeFileSync(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
+  await writeFile(join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8')
 }
 
-function copyCurrentDataTo(backupDir: string, type: 'manual' | 'auto', slot?: number, options?: { includeStorage?: boolean }): string {
+async function copyDatabaseForBackup(dataDir: string, backupDir: string): Promise<void> {
+  const targetDbDir = getBackupDbDir(backupDir)
+  await mkdir(targetDbDir, { recursive: true })
+  await backupDatabaseTo(join(targetDbDir, 'gujismart.db'))
+
+  // Keep legacy JSON restore compatibility, but do not recursively nest historical
+  // SQLite snapshots (*.bak/db11) into every new backup.
+  for (const legacyFileName of ['gujismart.json', 'gujismart.json.backup']) {
+    const sourcePath = join(dataDir, 'db', legacyFileName)
+    if (await pathExists(sourcePath)) {
+      await copyFile(sourcePath, join(targetDbDir, legacyFileName))
+    }
+  }
+}
+
+async function copyCurrentDataTo(backupDir: string, type: 'manual' | 'auto', slot?: number, options?: { includeStorage?: boolean }): Promise<string> {
   const dataDir = getDataDir()
-  saveDatabase()
   const includeStorage = options?.includeStorage ?? true
 
-  if (existsSync(backupDir)) {
-    rmSync(backupDir, { recursive: true, force: true })
+  if (await pathExists(backupDir)) {
+    await rm(backupDir, { recursive: true, force: true })
   }
-  mkdirSync(backupDir, { recursive: true })
+  await mkdir(backupDir, { recursive: true })
 
-  const dbDir = join(dataDir, 'db')
-  if (existsSync(dbDir)) {
-    copyDirRecursive(dbDir, join(backupDir, 'db'))
-  }
-
-  copyStorageForBackup(dataDir, backupDir, includeStorage)
+  await copyDatabaseForBackup(dataDir, backupDir)
+  await copyStorageForBackup(dataDir, backupDir, includeStorage)
 
   const credentialRequiredAfterRestore = redactProtectedSettingsFromBackup(backupDir)
-  writeManifest(backupDir, type, slot, includeStorage, credentialRequiredAfterRestore)
+  await writeManifest(backupDir, type, slot, includeStorage, credentialRequiredAfterRestore)
   return backupDir
 }
 
@@ -576,14 +664,14 @@ export async function backupData(): Promise<string | null> {
   const archivePath = ensureZipExtension(filePath)
   const tempBackupDir = createTempBackupDir('gujismart-backup-export')
   try {
-    copyCurrentDataTo(tempBackupDir, 'manual')
+    await copyCurrentDataTo(tempBackupDir, 'manual')
     await writeBackupZip(tempBackupDir, archivePath)
     return archivePath
   } catch (error) {
     console.error('[Backup] 备份失败:', error)
     throw new Error(`备份失败: ${(error as Error).message}`)
   } finally {
-    rmSync(tempBackupDir, { recursive: true, force: true })
+    await rm(tempBackupDir, { recursive: true, force: true })
   }
 }
 
@@ -657,18 +745,19 @@ export async function runAutoBackupNow(): Promise<BackupResult> {
   autoBackupRunning = true
   try {
     const slotCount = getAutoBackupSlotCount()
-    cleanupExtraAutoBackupSlots(slotCount)
+    await cleanupExtraAutoBackupSlots(slotCount)
     const currentSlot = Math.max(1, Math.min(slotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
     const backupDir = getSlotPath(currentSlot)
-    copyCurrentDataTo(backupDir, 'auto', currentSlot, { includeStorage: getAutoBackupIncludeStorage() })
+    const includeStorage = getAutoBackupIncludeStorage()
+    await copyCurrentDataTo(backupDir, 'auto', currentSlot, { includeStorage })
 
     const nextSlot = currentSlot >= slotCount ? 1 : currentSlot + 1
     const now = new Date().toISOString()
     writeSetting('auto_backup_next_slot', String(nextSlot))
     writeSetting('auto_backup_last_at', now)
-    saveDatabase()
+    scheduleDatabaseSave()
 
-    return { success: true, path: backupDir, integrityReport: collectBackupIntegrityReport(backupDir, { includesStorage: getAutoBackupIncludeStorage() }) }
+    return { success: true, path: backupDir, integrityReport: await collectBackupIntegrityReportAsync(backupDir, { includesStorage: includeStorage }) }
   } catch (error) {
     console.error('[Backup] 自动备份失败:', error)
     return { success: false, error: (error as Error).message }
@@ -677,19 +766,19 @@ export async function runAutoBackupNow(): Promise<BackupResult> {
   }
 }
 
-export function getBackupStatus(): BackupStatus {
+export async function getBackupStatus(): Promise<BackupStatus> {
   const enabled = readSetting('auto_backup_enabled', 'true') !== 'false'
   const intervalHours = Number.parseInt(readSetting('auto_backup_interval_hours', '24'), 10) || 24
   const slotCount = getAutoBackupSlotCount()
   const includeStorage = getAutoBackupIncludeStorage()
   const autoBackupRoot = getAutoBackupRoot()
-  cleanupExtraAutoBackupSlots(slotCount)
+  await cleanupExtraAutoBackupSlots(slotCount)
   const nextSlot = Math.max(1, Math.min(slotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
   const lastBackupAt = readSetting('auto_backup_last_at', '') || null
   const nextBackupAt = enabled && lastBackupAt
     ? new Date(new Date(lastBackupAt).getTime() + intervalHours * 60 * 60 * 1000).toISOString()
     : null
-  const slots: BackupSlot[] = Array.from({ length: slotCount }, (_, index) => {
+  const slots: BackupSlot[] = await Promise.all(Array.from({ length: slotCount }, async (_, index) => {
     const slot = index + 1
     const path = getSlotPath(slot)
     const manifest = readBackupManifest(path)
@@ -707,12 +796,12 @@ export function getBackupStatus(): BackupStatus {
       exists: existsSync(path),
       timestamp,
       includesStorage: includesStorage ?? existsSync(getBackupStorageDir(path)),
-      sizeBytes: existsSync(path) ? getDirSize(path) : 0,
+      sizeBytes: existsSync(path) ? (await getFileTreeStatsAsync(path)).totalBytes : 0,
       integrityReport,
       credentialsExcluded: manifest?.credentialsExcluded === true,
       credentialRequiredAfterRestore: manifest?.credentialRequiredAfterRestore === true,
     }
-  })
+  }))
 
   return {
     enabled,
@@ -734,12 +823,12 @@ export function getBackupStatus(): BackupStatus {
   }
 }
 
-export function configureAutoBackup(
+export async function configureAutoBackup(
   enabled: boolean,
   intervalHours: number,
   includeStorage = true,
   slotCount = getAutoBackupSlotCount(),
-): BackupStatus {
+): Promise<BackupStatus> {
   const normalizedSlotCount = normalizeAutoBackupSlotCount(slotCount)
   const nextSlot = Math.max(1, Math.min(normalizedSlotCount, Number.parseInt(readSetting('auto_backup_next_slot', '1'), 10) || 1))
   writeSetting('auto_backup_enabled', enabled ? 'true' : 'false')
@@ -747,10 +836,10 @@ export function configureAutoBackup(
   writeSetting('auto_backup_include_storage', includeStorage ? 'true' : 'false')
   writeSetting('auto_backup_slot_count', String(normalizedSlotCount))
   writeSetting('auto_backup_next_slot', String(nextSlot))
-  cleanupExtraAutoBackupSlots(normalizedSlotCount)
-  saveDatabase()
+  await cleanupExtraAutoBackupSlots(normalizedSlotCount)
+  scheduleDatabaseSave()
   startAutoBackupScheduler()
-  return getBackupStatus()
+  return await getBackupStatus()
 }
 
 export async function compactAutoBackups(): Promise<CompactAutoBackupResult> {
@@ -759,17 +848,17 @@ export async function compactAutoBackups(): Promise<CompactAutoBackupResult> {
   }
 
   const root = getAutoBackupRoot()
-  const beforeBytes = getDirSize(root)
+  const beforeBytes = (await getFileTreeStatsAsync(root)).totalBytes
   try {
-    if (existsSync(root)) {
-      rmSync(root, { recursive: true, force: true })
+    if (await pathExists(root)) {
+      await rm(root, { recursive: true, force: true })
     }
-    mkdirSync(root, { recursive: true })
+    await mkdir(root, { recursive: true })
     writeSetting('auto_backup_include_storage', 'true')
     writeSetting('auto_backup_next_slot', '1')
-    saveDatabase()
+    scheduleDatabaseSave()
     const backup = await runAutoBackupNow()
-    const afterBytes = getDirSize(root)
+    const afterBytes = (await getFileTreeStatsAsync(root)).totalBytes
     return {
       success: backup.success,
       beforeBytes,
@@ -779,7 +868,7 @@ export async function compactAutoBackups(): Promise<CompactAutoBackupResult> {
       error: backup.error,
     }
   } catch (error) {
-    const afterBytes = getDirSize(root)
+    const afterBytes = (await getFileTreeStatsAsync(root)).totalBytes
     return {
       success: false,
       beforeBytes,
@@ -851,7 +940,9 @@ export async function exportDocumentListCsv(): Promise<string | null> {
   const rows = queryAll<DocumentListCsvRow>(
     `SELECT title, author, dynasty, source, doc_type, page_count, ocr_status, proof_status, import_status, created_at, updated_at
      FROM documents
-     ORDER BY updated_at DESC`
+     WHERE library_project_id = ?
+     ORDER BY updated_at DESC`,
+    [getActiveLibraryProjectId()],
   )
   const headers = ['标题', '作者', '朝代/年份', '来源', '类型', '页数', 'OCR状态', '校对状态', '入库状态', '创建时间', '更新时间']
   const escapeCsv = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`

@@ -14,7 +14,12 @@ import { markLibraryStateCacheDirty } from './library-state-cache'
 import { emitBackgroundTaskStatus } from './background-tasks'
 import { getCredentialPublicState, readProtectedSetting, writeProtectedSetting } from './settings-security'
 import { resolveFolderAndDescendantIds } from './folder-scope'
+import { getActiveLibraryProjectId } from './library-projects'
 import type { EmbeddingProgressEvent, EmbeddingProgressStatus } from '../shared/types'
+import {
+  VECTOR_SEARCH_MAX_LIMIT,
+  normalizeVectorSearchLimit,
+} from '../shared/vector-search'
 
 export const EMBEDDING_AUTO_ON_INGEST_KEY = 'embedding_auto_on_ingest'
 export const EMBEDDING_BASE_URL_KEY = 'embedding_base_url'
@@ -99,9 +104,9 @@ const PROVIDER_BATCH_CAPS: Array<{ match: RegExp; max: number }> = [
   { match: /bigmodel\.cn/i, max: 16 },
   { match: /siliconflow\.cn/i, max: 32 },
 ]
-const MAX_SEARCH_LIMIT = 50
 const DEFAULT_MAX_EMBED_CHARS = 6000
 const SCAN_CHUNK_ROWS = 400
+const VECTOR_HYDRATION_BATCH_SIZE = 400
 /** How many segment rows to load from SQLite at a time (avoid OOM on huge OCR books). */
 const SEGMENT_LOAD_WINDOW = 120
 /** Yield to the event loop between API batches so the UI stays responsive. */
@@ -110,6 +115,8 @@ const BATCH_YIELD_MS = 30
 const DOC_YIELD_MS = 50
 /** Abort hung embeddings HTTP calls (ms). */
 const EMBEDDINGS_FETCH_TIMEOUT_MS = 90_000
+/** Yield between embedding_chunks scan batches so the window does not go "Not Responding". */
+const SCAN_YIELD_EVERY_BATCHES = 1
 
 export type EmbeddingDocStatus = 'pending' | 'queued' | 'processing' | 'ready' | 'error' | 'skipped'
 
@@ -198,9 +205,15 @@ function nowIso(): string {
   return new Date().toISOString()
 }
 
-function countEmbeddingStatus(status: string): number {
+function countEmbeddingStatus(status: string, libraryProjectId = getActiveLibraryProjectId()): number {
   return Number(
-    queryOne<{ c: number }>('SELECT COUNT(*) as c FROM embedding_index_status WHERE status = ?', [status])?.c || 0,
+    queryOne<{ c: number }>(
+      `SELECT COUNT(*) as c
+       FROM embedding_index_status eis
+       INNER JOIN documents d ON d.id = eis.doc_id
+       WHERE eis.status = ? AND d.library_project_id = ?`,
+      [status, libraryProjectId],
+    )?.c || 0,
   )
 }
 
@@ -702,19 +715,21 @@ export function getEmbeddingProgressSnapshot(): EmbeddingProgressEvent {
 }
 
 export function getEmbeddingIndexStats(): EmbeddingIndexStats {
+  const libraryProjectId = getActiveLibraryProjectId()
   const model = getEmbeddingModel()
   const dimRaw = getMeta('dim')
   const dim = dimRaw ? Number(dimRaw) : null
   const modelId = dim ? `${model}@${dim}` : model
   const linked = resolveLinkedProfile()
   const linkedProfiles = getEmbeddingLinkedProfiles()
-  const countStatus = (status: string) =>
-    Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM embedding_index_status WHERE status = ?', [status])?.c || 0)
+  const countStatus = (status: string) => countEmbeddingStatus(status, libraryProjectId)
   const chunks = Number(
-    queryOne<{ c: number }>('SELECT COUNT(*) as c FROM embedding_chunks WHERE model_id = ? OR model_id LIKE ?', [
-      modelId,
-      `${model}@%`,
-    ])?.c || 0,
+    queryOne<{ c: number }>(
+      `SELECT COUNT(*) as c
+       FROM embedding_chunks
+       WHERE library_project_id = ? AND (model_id = ? OR model_id LIKE ?)`,
+      [libraryProjectId, modelId, `${model}@%`],
+    )?.c || 0,
   )
   const baseUrl = getEmbeddingBaseUrl()
   const batchSizeCap = getProviderBatchCap(baseUrl, model)
@@ -854,7 +869,11 @@ export function requeueFailedEmbeddings(): {
   clearedChunks: number
 } {
   const rows = queryAll<{ doc_id: string }>(
-    "SELECT doc_id FROM embedding_index_status WHERE status = 'error'",
+    `SELECT eis.doc_id
+     FROM embedding_index_status eis
+     INNER JOIN documents d ON d.id = eis.doc_id
+     WHERE eis.status = 'error' AND d.library_project_id = ?`,
+    [getActiveLibraryProjectId()],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
   if (ids.length === 0) return { queued: 0, skipped: 0, reindexed: 0, clearedChunks: 0 }
@@ -1044,8 +1063,11 @@ export function cancelAllPendingEmbeddings(): {
   skipped: number
 } {
   const rows = queryAll<{ doc_id: string }>(
-    `SELECT doc_id FROM embedding_index_status
-     WHERE status IN ('queued', 'processing')`,
+    `SELECT eis.doc_id
+     FROM embedding_index_status eis
+     INNER JOIN documents d ON d.id = eis.doc_id
+     WHERE eis.status IN ('queued', 'processing') AND d.library_project_id = ?`,
+    [getActiveLibraryProjectId()],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
   return cancelDocumentsForEmbedding(ids)
@@ -1265,7 +1287,11 @@ export function reindexAllReadyEmbeddings(): {
   clearedChunks: number
 } {
   const rows = queryAll<{ doc_id: string }>(
-    "SELECT doc_id FROM embedding_index_status WHERE status = 'ready'",
+    `SELECT eis.doc_id
+     FROM embedding_index_status eis
+     INNER JOIN documents d ON d.id = eis.doc_id
+     WHERE eis.status = 'ready' AND d.library_project_id = ?`,
+    [getActiveLibraryProjectId()],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
   if (ids.length === 0) return { queued: 0, skipped: 0, reindexed: 0, clearedChunks: 0 }
@@ -1288,13 +1314,14 @@ export function reindexStaleEmbeddings(): {
   const rows = queryAll<{ doc_id: string }>(
     `SELECT eis.doc_id
      FROM embedding_index_status eis
-     WHERE eis.status = 'ready'
+     INNER JOIN documents d ON d.id = eis.doc_id
+     WHERE eis.status = 'ready' AND d.library_project_id = ?
        AND NOT EXISTS (
          SELECT 1 FROM embedding_chunks ec
          WHERE ec.doc_id = eis.doc_id
            AND (ec.model_id = ? OR ec.model_id LIKE ?)
        )`,
-    [modelId, `${modelName}@%`],
+    [getActiveLibraryProjectId(), modelId, `${modelName}@%`],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
   if (ids.length === 0) {
@@ -1312,13 +1339,14 @@ export function countStaleEmbeddingDocuments(): number {
     queryOne<{ c: number }>(
       `SELECT COUNT(*) as c
        FROM embedding_index_status eis
-       WHERE eis.status = 'ready'
+       INNER JOIN documents d ON d.id = eis.doc_id
+       WHERE eis.status = 'ready' AND d.library_project_id = ?
          AND NOT EXISTS (
            SELECT 1 FROM embedding_chunks ec
            WHERE ec.doc_id = eis.doc_id
              AND (ec.model_id = ? OR ec.model_id LIKE ?)
          )`,
-      [modelId, `${modelName}@%`],
+      [getActiveLibraryProjectId(), modelId, `${modelName}@%`],
     )?.c || 0,
   )
 }
@@ -1474,6 +1502,11 @@ async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
 }
 
 async function embedDocument(docId: string): Promise<void> {
+  const libraryProjectId = queryOne<{ library_project_id: string }>(
+    'SELECT library_project_id FROM documents WHERE id = ?',
+    [docId],
+  )?.library_project_id
+  if (!libraryProjectId) throw new Error('Embedding document does not belong to a library project')
   // Only body text — never offset_map / title / href. Load in windows to avoid OOM on huge books.
   const totalSegments = Number(
     queryOne<{ c: number }>('SELECT COUNT(*) as c FROM search_index_segments WHERE doc_id = ?', [docId])?.c || 0,
@@ -1564,10 +1597,11 @@ async function embedDocument(docId: string): Promise<void> {
           const modelId = `${modelName}@${dim}`
           run(
             `INSERT OR REPLACE INTO embedding_chunks
-             (segment_id, doc_id, page_id, page_num, model_id, dim, content_hash, embedding, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (segment_id, library_project_id, doc_id, page_id, page_num, model_id, dim, content_hash, embedding, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               seg.segment_id,
+              libraryProjectId,
               seg.doc_id,
               seg.page_id,
               seg.page_num,
@@ -1632,14 +1666,19 @@ async function embedDocument(docId: string): Promise<void> {
 
 async function processEmbeddingQueue(): Promise<void> {
   if (queueRunning || queuePaused) return
+  const libraryProjectId = getActiveLibraryProjectId()
   queueRunning = true
   try {
     while (!queuePaused) {
+      if (getActiveLibraryProjectId() !== libraryProjectId) break
       const next = queryOne<{ doc_id: string }>(
-        `SELECT doc_id FROM embedding_index_status
-         WHERE status = 'queued'
-         ORDER BY updated_at ASC
+        `SELECT eis.doc_id
+         FROM embedding_index_status eis
+         INNER JOIN documents d ON d.id = eis.doc_id
+         WHERE eis.status = 'queued' AND d.library_project_id = ?
+         ORDER BY eis.updated_at ASC
          LIMIT 1`,
+        [libraryProjectId],
       )
       if (!next?.doc_id) break
       try {
@@ -1683,9 +1722,9 @@ async function processEmbeddingQueue(): Promise<void> {
       }
     }
     const remaining = Number(
-      queryOne<{ c: number }>("SELECT COUNT(*) as c FROM embedding_index_status WHERE status = 'queued'")?.c || 0,
+      countEmbeddingStatus('queued', libraryProjectId),
     )
-    const processing = countEmbeddingStatus('processing')
+    const processing = countEmbeddingStatus('processing', libraryProjectId)
     if (remaining === 0 && processing === 0 && !queuePaused) {
       emitQueueBackgroundProgress(
         'completed',
@@ -1712,9 +1751,7 @@ async function processEmbeddingQueue(): Promise<void> {
     })
   } finally {
     queueRunning = false
-    const stillQueued = Number(
-      queryOne<{ c: number }>("SELECT COUNT(*) as c FROM embedding_index_status WHERE status = 'queued'")?.c || 0,
-    )
+    const stillQueued = countEmbeddingStatus('queued')
     if (stillQueued > 0 && !queuePaused) scheduleEmbeddingQueue()
   }
 }
@@ -1729,8 +1766,14 @@ export async function vectorSearch(
   const modelName = getEmbeddingModel()
   const dimMeta = getMeta('dim')
   const modelId = dimMeta ? `${modelName}@${dimMeta}` : getMeta('model_id') || modelName
+  const activeProjectId = getActiveLibraryProjectId()
   const totalChunks = Number(
-    queryOne<{ c: number }>('SELECT COUNT(*) as c FROM embedding_chunks WHERE model_id = ?', [modelId])?.c || 0,
+    queryOne<{ c: number }>(
+      `SELECT COUNT(*) as c
+       FROM embedding_chunks ec
+       WHERE ec.library_project_id = ? AND ec.model_id = ?`,
+      [activeProjectId, modelId],
+    )?.c || 0,
   )
   if (totalChunks <= 0) {
     return {
@@ -1779,9 +1822,51 @@ export async function vectorSearch(
       : tagSet
   }
 
-  const limit = Math.min(MAX_SEARCH_LIMIT, Math.max(1, Math.round(Number(options?.limit || 20)) || 20))
+  // Preserve the historical service/MCP fallback of 20; the desktop UI explicitly sends 200.
+  const limit = normalizeVectorSearchLimit(options?.limit, 20)
   type Cand = { segmentId: string; docId: string; pageId: string | null; pageNum: number | null; score: number }
-  const best: Cand[] = []
+  const bestHeap: Cand[] = []
+
+  const swapHeapItems = (left: number, right: number): void => {
+    const value = bestHeap[left]
+    bestHeap[left] = bestHeap[right]
+    bestHeap[right] = value
+  }
+
+  const siftHeapUp = (startIndex: number): void => {
+    let index = startIndex
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2)
+      if (bestHeap[parent].score <= bestHeap[index].score) break
+      swapHeapItems(parent, index)
+      index = parent
+    }
+  }
+
+  const siftHeapDown = (startIndex: number): void => {
+    let index = startIndex
+    for (;;) {
+      const left = index * 2 + 1
+      const right = left + 1
+      let smallest = index
+      if (left < bestHeap.length && bestHeap[left].score < bestHeap[smallest].score) smallest = left
+      if (right < bestHeap.length && bestHeap[right].score < bestHeap[smallest].score) smallest = right
+      if (smallest === index) return
+      swapHeapItems(index, smallest)
+      index = smallest
+    }
+  }
+
+  const retainCandidate = (candidate: Cand): void => {
+    if (bestHeap.length < limit) {
+      bestHeap.push(candidate)
+      siftHeapUp(bestHeap.length - 1)
+      return
+    }
+    if (candidate.score <= bestHeap[0].score) return
+    bestHeap[0] = candidate
+    siftHeapDown(0)
+  }
 
   const considerRow = (row: {
     segment_id: string
@@ -1794,88 +1879,118 @@ export async function vectorSearch(
     const emb = bufferToFloat32(Buffer.isBuffer(row.embedding) ? row.embedding : Buffer.from(row.embedding as ArrayBuffer))
     if (emb.length !== queryVec.length) return
     const score = cosine(queryVec, emb)
-    if (best.length < limit) {
-      best.push({
-        segmentId: row.segment_id,
-        docId: row.doc_id,
-        pageId: row.page_id,
-        pageNum: row.page_num,
-        score,
-      })
-      best.sort((a, b) => b.score - a.score)
-      return
-    }
-    if (score > best[best.length - 1].score) {
-      best[best.length - 1] = {
-        segmentId: row.segment_id,
-        docId: row.doc_id,
-        pageId: row.page_id,
-        pageNum: row.page_num,
-        score,
-      }
-      best.sort((a, b) => b.score - a.score)
+    retainCandidate({
+      segmentId: row.segment_id,
+      docId: row.doc_id,
+      pageId: row.page_id,
+      pageNum: row.page_num,
+      score,
+    })
+  }
+
+  const yieldScanBatch = async (batchIndex: number): Promise<void> => {
+    if (SCAN_YIELD_EVERY_BATCHES <= 0) return
+    if (batchIndex > 0 && batchIndex % SCAN_YIELD_EVERY_BATCHES === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve))
     }
   }
 
   // In-document search: query only this doc's chunks (SQL-level), never leak other docs.
   if (scopedDocId) {
-    let offset = 0
+    let lastRowId = 0
+    let batchIndex = 0
     for (;;) {
       const rows = queryAll<{
+        row_id: number
         segment_id: string
         doc_id: string
         page_id: string | null
         page_num: number | null
         embedding: Buffer
       }>(
-        `SELECT segment_id, doc_id, page_id, page_num, embedding
-         FROM embedding_chunks
-         WHERE model_id = ? AND doc_id = ?
-         LIMIT ? OFFSET ?`,
-        [modelId, scopedDocId, SCAN_CHUNK_ROWS, offset],
+        `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
+         FROM embedding_chunks ec
+         WHERE ec.library_project_id = ? AND ec.model_id = ? AND ec.doc_id = ? AND ec.rowid > ?
+         ORDER BY ec.rowid ASC
+         LIMIT ?`,
+        [activeProjectId, modelId, scopedDocId, lastRowId, SCAN_CHUNK_ROWS],
       )
       if (rows.length === 0) break
       rows.forEach(considerRow)
-      offset += rows.length
+      lastRowId = Number(rows[rows.length - 1].row_id || lastRowId)
+      batchIndex += 1
+      await yieldScanBatch(batchIndex)
       if (rows.length < SCAN_CHUNK_ROWS) break
     }
   } else {
-    let offset = 0
+    let lastRowId = 0
+    let batchIndex = 0
     for (;;) {
       const rows = queryAll<{
+        row_id: number
         segment_id: string
         doc_id: string
         page_id: string | null
         page_num: number | null
         embedding: Buffer
       }>(
-        `SELECT segment_id, doc_id, page_id, page_num, embedding
-         FROM embedding_chunks
-         WHERE model_id = ?
-         LIMIT ? OFFSET ?`,
-        [modelId, SCAN_CHUNK_ROWS, offset],
+        `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
+         FROM embedding_chunks ec
+         WHERE ec.library_project_id = ? AND ec.model_id = ? AND ec.rowid > ?
+         ORDER BY ec.rowid ASC
+         LIMIT ?`,
+        [activeProjectId, modelId, lastRowId, SCAN_CHUNK_ROWS],
       )
       if (rows.length === 0) break
       rows.forEach(considerRow)
-      offset += rows.length
+      lastRowId = Number(rows[rows.length - 1].row_id || lastRowId)
+      batchIndex += 1
+      await yieldScanBatch(batchIndex)
       if (rows.length < SCAN_CHUNK_ROWS) break
     }
   }
 
-  const hits: VectorSearchHit[] = best
+  const best = bestHeap
     .filter((item) => !scopedDocId || item.docId === scopedDocId)
-    .map((item) => {
-      const doc = queryOne<{ title?: string | null; author?: string | null }>(
-        'SELECT title, author FROM documents WHERE id = ?',
-        [item.docId],
-      )
-      const seg = queryOne<{ text?: string | null; normalized_text?: string | null }>(
-        'SELECT text, normalized_text FROM search_index_segments WHERE segment_id = ? AND doc_id = ?',
-        [item.segmentId, item.docId],
-      ) || queryOne<{ text?: string | null; normalized_text?: string | null }>(
-        'SELECT text, normalized_text FROM search_index_segments WHERE segment_id = ?',
-        [item.segmentId],
-      )
+    .sort((left, right) => right.score - left.score)
+  const documentsById = new Map<string, { title?: string | null; author?: string | null }>()
+  const documentIds = [...new Set(best.map((item) => item.docId).filter(Boolean))]
+  for (let index = 0; index < documentIds.length; index += VECTOR_HYDRATION_BATCH_SIZE) {
+    const batch = documentIds.slice(index, index + VECTOR_HYDRATION_BATCH_SIZE)
+    const rows = queryAll<{ id: string; title?: string | null; author?: string | null }>(
+      `SELECT id, title, author FROM documents WHERE id IN (${batch.map(() => '?').join(', ')})`,
+      batch,
+    )
+    rows.forEach((row) => documentsById.set(row.id, row))
+  }
+
+  type SegmentTextRow = {
+    segment_id: string
+    doc_id: string
+    text?: string | null
+    normalized_text?: string | null
+  }
+  const segmentsByDocumentAndId = new Map<string, SegmentTextRow>()
+  const segmentsById = new Map<string, SegmentTextRow>()
+  const segmentIds = [...new Set(best.map((item) => item.segmentId).filter(Boolean))]
+  for (let index = 0; index < segmentIds.length; index += VECTOR_HYDRATION_BATCH_SIZE) {
+    const batch = segmentIds.slice(index, index + VECTOR_HYDRATION_BATCH_SIZE)
+    const rows = queryAll<SegmentTextRow>(
+      `SELECT segment_id, doc_id, text, normalized_text
+       FROM search_index_segments
+       WHERE segment_id IN (${batch.map(() => '?').join(', ')})`,
+      batch,
+    )
+    rows.forEach((row) => {
+      segmentsByDocumentAndId.set(`${row.doc_id}\u0000${row.segment_id}`, row)
+      if (!segmentsById.has(row.segment_id)) segmentsById.set(row.segment_id, row)
+    })
+  }
+
+  const hits: VectorSearchHit[] = best.map((item) => {
+      const doc = documentsById.get(item.docId)
+      const seg = segmentsByDocumentAndId.get(`${item.docId}\u0000${item.segmentId}`)
+        || segmentsById.get(item.segmentId)
       const excerpt = String(seg?.normalized_text || seg?.text || '').replace(/\s+/g, ' ').trim().slice(0, 240)
       return {
         documentId: item.docId,
@@ -1900,13 +2015,25 @@ export async function vectorSearch(
   }
 }
 
-/** Startup: resume queue if any. */
-export function resumeEmbeddingQueueOnStartup(): void {
+export function resumeEmbeddingQueueForActiveProject(): void {
+  const libraryProjectId = getActiveLibraryProjectId()
   const queued = Number(
-    queryOne<{ c: number }>("SELECT COUNT(*) as c FROM embedding_index_status WHERE status IN ('queued','processing')")?.c || 0,
+    queryOne<{ c: number }>(
+      `SELECT COUNT(*) as c
+       FROM embedding_index_status eis
+       INNER JOIN documents d ON d.id = eis.doc_id
+       WHERE eis.status IN ('queued','processing') AND d.library_project_id = ?`,
+      [libraryProjectId],
+    )?.c || 0,
   )
   if (queued > 0) {
-    run("UPDATE embedding_index_status SET status = 'queued' WHERE status = 'processing'")
+    run(
+      `UPDATE embedding_index_status
+       SET status = 'queued'
+       WHERE status = 'processing'
+         AND doc_id IN (SELECT id FROM documents WHERE library_project_id = ?)`,
+      [libraryProjectId],
+    )
     saveDatabase()
     sessionTotal = Math.max(sessionTotal, queued)
     scheduleEmbeddingQueue()
@@ -1916,4 +2043,9 @@ export function resumeEmbeddingQueueOnStartup(): void {
       message: `启动恢复：继续向量化 ${queued} 篇`,
     })
   }
+}
+
+/** Startup: resume only the active project's queue. */
+export function resumeEmbeddingQueueOnStartup(): void {
+  resumeEmbeddingQueueForActiveProject()
 }

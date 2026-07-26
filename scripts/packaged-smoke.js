@@ -1,10 +1,31 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { spawnSync } = require('child_process')
 const { _electron: electron } = require('playwright')
 
 const root = path.resolve(__dirname, '..')
 const unpacked = path.resolve(process.env.GUJISMART_UNPACKED_DIR || path.join(root, 'dist', 'win-unpacked'))
+
+function verifyPackagedRuntime(executable) {
+  const probe = path.join(root, 'scripts', 'packaged-runtime-probe.js')
+  const result = spawnSync(executable, [probe], {
+    cwd: root,
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      GUJISMART_PACKAGED_RESOURCES: path.join(unpacked, 'resources'),
+    },
+    encoding: 'utf8',
+    timeout: 30_000,
+    windowsHide: true,
+  })
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    throw new Error(`Packaged runtime dependency probe failed:\n${result.stderr || result.stdout}`)
+  }
+  if (result.stdout.trim()) console.log(result.stdout.trim())
+}
 
 async function main() {
   if (process.platform !== 'win32') throw new Error('Packaged smoke currently requires Windows')
@@ -14,6 +35,7 @@ async function main() {
     const candidates = [path.join(unpacked, 'resources', 'licenses', required), path.join(unpacked, 'resources', 'release-metadata', required)]
     if (!candidates.some((candidate) => fs.existsSync(candidate))) throw new Error(`Packaged metadata missing: ${required}`)
   }
+  verifyPackagedRuntime(executable)
   const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-packaged-smoke-'))
   const userDataDir = path.join(smokeRoot, 'chromium')
   const dataDir = path.join(smokeRoot, 'data')

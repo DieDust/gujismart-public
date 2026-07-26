@@ -65,12 +65,22 @@ async function run() {
     assert.strictEqual(task.totalCount, 0)
     assert.strictEqual(task.settingsSnapshot.engine, 'paddle')
     assert.strictEqual(task.settingsSnapshot.batchSize, 7)
+    assert.strictEqual(task.settingsSnapshot.libraryProjectId, 'library_project_default')
 
     const documents = Array.from({ length: 450 }, (_, index) => ({
       docId: `doc-${String(index).padStart(3, '0')}`,
       sourceOrder: index,
       sourceType: index % 2 === 0 ? 'pdf-file' : 'image-file',
     }))
+    database.transaction(() => {
+      documents.forEach((item) => {
+        database.run(
+          `INSERT INTO documents (id, title, import_status, metadata, created_at, updated_at)
+           VALUES (?, ?, 'processed', '{}', ?, ?)`,
+          [item.docId, item.docId, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'],
+        )
+      })
+    })
     importAutoOcr.appendImportAutoOcrItems(task.id, documents.slice(0, 200), { nowMs: 1_010 })
     importAutoOcr.appendImportAutoOcrItems(task.id, documents.slice(200, 400), { nowMs: 1_011 })
     importAutoOcr.appendImportAutoOcrItems(task.id, documents.slice(400), { nowMs: 1_012 })
