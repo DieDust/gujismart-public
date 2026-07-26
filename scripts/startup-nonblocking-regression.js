@@ -15,6 +15,10 @@ const libraryView = readSource('src', 'renderer', 'src', 'views', 'LibraryView.t
 const startupRecovery = readSource('src', 'main', 'startup-recovery.ts')
 const startupTiming = readSource('src', 'main', 'startup-timing.ts')
 const metadataReclassifier = readSource('src', 'main', 'metadata-reclassifier.ts')
+const libraryProjectsIpc = readSource('src', 'main', 'ipc', 'library-projects.ts')
+const libraryProjects = readSource('src', 'main', 'library-projects.ts')
+const embeddingIndex = readSource('src', 'main', 'embedding-index.ts')
+const embeddingIpc = readSource('src', 'main', 'ipc', 'embedding.ts')
 function sliceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker)
   assert(start >= 0, `Missing start marker: ${startMarker}`)
@@ -48,6 +52,26 @@ const orphanStorageCleanupBody = sliceBetween(
   startupRecovery,
   'async function removeOrphanStorageDirs()',
   'async function recoverInterruptedPdfCompressionSources',
+)
+const setActiveLibraryProjectHandler = sliceBetween(
+  libraryProjectsIpc,
+  "'libraryProjects:setActive'",
+  "'libraryProjects:addDocuments'",
+)
+const projectBackgroundResumeBody = sliceBetween(
+  libraryProjectsIpc,
+  'function scheduleProjectBackgroundResume',
+  'export function registerLibraryProjectIpc',
+)
+const resumeEmbeddingQueueForActiveProjectBody = sliceBetween(
+  embeddingIndex,
+  'export function resumeEmbeddingQueueForActiveProject()',
+  '/** Startup: resume only',
+)
+const setActiveLibraryProjectBody = sliceBetween(
+  libraryProjects,
+  'export function setActiveLibraryProject(projectId: string)',
+  'interface ProjectTagRow',
 )
 
 assert(
@@ -163,14 +187,36 @@ assert(
 )
 assert(
   mainIndex.includes('const STARTUP_MAINTENANCE_DELAY_MS = 45_000')
-    && mainIndex.includes('const IMPORT_AUTO_OCR_RESUME_DELAY_MS = 15_000')
-    && mainIndex.includes('const BATCH_OCR_RESUME_DELAY_MS = 25_000')
     && /setTimeout\(\(\) => \{[\s\S]{0,1200}allowManagedFileAccessPaths\(listStoredLocalResourcePaths\(\{ includePageImages: false \}\)\)/.test(mainIndex)
-    && mainIndex.includes('resumePendingImportAutoOcrTasks(sender)')
-    && mainIndex.includes('batchProcessor.resumePendingQueueFromDatabase()')
-    && !/did-finish-load[\s\S]{0,220}resumePendingImportAutoOcrTasks\(mainWindow\.webContents\)/.test(mainIndex)
-    && !/did-finish-load[\s\S]{0,220}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(mainIndex),
-  'Startup resource allow-list preloading and bulk OCR resume should be delayed so large libraries do not block the first window.',
+    && !mainIndex.includes('resumePendingImportAutoOcrTasks(sender)')
+    && !/did-finish-load[\s\S]{0,1600}batchProcessor\.resumePendingQueueFromDatabase\(\)/.test(mainIndex),
+  'Startup resource allow-list preloading should be delayed, while project queues must not start before the user selects a project.',
+)
+assert(
+  libraryProjectsIpc.includes('const PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS')
+    && setActiveLibraryProjectHandler.includes('scheduleProjectBackgroundResume(event.sender)')
+    && !setActiveLibraryProjectHandler.includes('resumeEmbeddingQueueForActiveProject()')
+    && !setActiveLibraryProjectHandler.includes('resumePendingImportAutoOcrTasks(event.sender)')
+    && projectBackgroundResumeBody.includes('resumeEmbeddingQueueForActiveProject()')
+    && projectBackgroundResumeBody.includes('resumePendingImportAutoOcrTasks(sender)')
+    && projectBackgroundResumeBody.includes('batchProcessor.resumePendingQueueFromDatabase()'),
+  'Project selection must return before vector/OCR/batch queue recovery, then resume only the selected project after an interactive grace.',
+)
+assert(
+  !embeddingIpc.includes('resumeEmbeddingQueueOnStartup')
+    && !mainIndex.includes('IMPORT_AUTO_OCR_RESUME_DELAY_MS')
+    && !mainIndex.includes('BATCH_OCR_RESUME_DELAY_MS'),
+  'No vector or OCR queue may start while the project-selection gate is still open.',
+)
+assert(
+  !resumeEmbeddingQueueForActiveProjectBody.includes('saveDatabase()')
+    && resumeEmbeddingQueueForActiveProjectBody.includes('scheduleDatabaseSave({ minDelayMs:'),
+  'Embedding queue recovery must not synchronously checkpoint a large WAL on the project-switch IPC path.',
+)
+assert(
+  !setActiveLibraryProjectBody.includes('scheduleDatabaseSave()')
+    && setActiveLibraryProjectBody.includes('active_library_project_id'),
+  'Changing the active project is already durable in WAL and must not schedule an interactive-path checkpoint.',
 )
 assert(
   ocrIpc.includes('export function resumePendingImportAutoOcrTasks')

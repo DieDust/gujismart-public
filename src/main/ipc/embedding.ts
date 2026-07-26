@@ -12,15 +12,12 @@ import {
   reindexDocumentsForEmbedding,
   reindexStaleEmbeddings,
   requeueFailedEmbeddings,
-  resumeEmbeddingQueueOnStartup,
   setEmbeddingQueuePaused,
   setEmbeddingSettings,
   vectorSearch,
 } from '../embedding-index'
 
 export function registerEmbeddingIpc(): void {
-  resumeEmbeddingQueueOnStartup()
-
   ipcMain.handle('embedding:getStats', async () => getEmbeddingIndexStats())
   ipcMain.handle('embedding:getProgressSnapshot', async () => getEmbeddingProgressSnapshot())
 

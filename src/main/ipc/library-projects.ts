@@ -1,4 +1,4 @@
-import { ipcMain } from 'electron'
+import { ipcMain, type WebContents } from 'electron'
 import {
   addDocumentsToLibraryProject,
   copyDocumentsToLibraryProject,
@@ -18,7 +18,40 @@ import type {
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { resumeEmbeddingQueueForActiveProject } from '../embedding-index'
 import { notifySearchContentChanged } from '../semantic-search'
+import { batchProcessor } from '../batch-processor'
 import { resumePendingImportAutoOcrTasks } from './ocr'
+
+const PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS = 10_000
+let projectBackgroundResumeTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleProjectBackgroundResume(sender: WebContents): void {
+  if (projectBackgroundResumeTimer) clearTimeout(projectBackgroundResumeTimer)
+  projectBackgroundResumeTimer = setTimeout(() => {
+    projectBackgroundResumeTimer = null
+    if (sender.isDestroyed()) return
+    try {
+      resumeEmbeddingQueueForActiveProject()
+    } catch (error) {
+      console.warn('[LibraryProjects] Failed to resume project embedding queue:', error)
+    }
+    try {
+      resumePendingImportAutoOcrTasks(sender)
+    } catch (error) {
+      console.warn('[LibraryProjects] Failed to resume project OCR queue:', error)
+    }
+    try {
+      const summary = batchProcessor.resumePendingQueueFromDatabase()
+      if (summary.resumedItems > 0) {
+        console.log(
+          `[LibraryProjects] Resumed batch OCR for selected project: ${summary.resumedItems} item(s) in ${summary.resumedJobs} job(s)`,
+        )
+      }
+    } catch (error) {
+      console.warn('[LibraryProjects] Failed to resume project batch OCR queue:', error)
+    }
+  }, PROJECT_SWITCH_BACKGROUND_RESUME_DELAY_MS)
+  projectBackgroundResumeTimer.unref?.()
+}
 
 export function registerLibraryProjectIpc(): void {
   ipcMain.handle('libraryProjects:list', async (): Promise<LibraryProject[]> => {
@@ -38,16 +71,7 @@ export function registerLibraryProjectIpc(): void {
     async (event, projectId: string): Promise<LibraryProject> => {
       const project = setActiveLibraryProject(projectId)
       markLibraryStateCacheDirty([project.id])
-      try {
-        resumeEmbeddingQueueForActiveProject()
-      } catch (error) {
-        console.warn('[LibraryProjects] Failed to resume project embedding queue:', error)
-      }
-      try {
-        resumePendingImportAutoOcrTasks(event.sender)
-      } catch (error) {
-        console.warn('[LibraryProjects] Failed to resume project OCR queue:', error)
-      }
+      scheduleProjectBackgroundResume(event.sender)
       return project
     },
   )

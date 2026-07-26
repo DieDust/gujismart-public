@@ -2041,7 +2041,7 @@ export function resumeEmbeddingQueueForActiveProject(): void {
          )`,
       [libraryProjectId],
     )
-    saveDatabase()
+    scheduleDatabaseSave({ minDelayMs: 15_000 })
     sessionTotal = Math.max(sessionTotal, queued)
     scheduleEmbeddingQueue()
     sendEmbeddingProgress({

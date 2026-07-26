@@ -1596,8 +1596,6 @@ CREATE INDEX IF NOT EXISTS idx_document_toc_doc_page ON document_toc_items(doc_i
 CREATE INDEX IF NOT EXISTS idx_document_toc_doc_source ON document_toc_items(doc_id, source);
 CREATE INDEX IF NOT EXISTS idx_search_segments_doc_id ON search_index_segments(doc_id);
 CREATE INDEX IF NOT EXISTS idx_search_segments_page_num ON search_index_segments(doc_id, page_num, ordinal);
-CREATE INDEX IF NOT EXISTS idx_search_segments_library_project ON search_index_segments(library_project_id, doc_id, page_num, ordinal);
-CREATE INDEX IF NOT EXISTS idx_embedding_chunks_library_project_model ON embedding_chunks(library_project_id, model_id, doc_id, page_num);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_doc_id ON search_ngram_index(doc_id);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_segment ON search_ngram_index(segment_id);
 CREATE INDEX IF NOT EXISTS idx_search_ngram_hit_count ON search_ngram_index(gram, hit_count);
@@ -2628,14 +2626,6 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
        WHERE library_project_id IS NULL
           OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = ai_research_records.library_project_id)`,
     ).run(defaultLibraryProjectId)
-    sqlite.exec(`
-      UPDATE search_index_segments
-      SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = search_index_segments.doc_id)
-      WHERE library_project_id IS NULL;
-      UPDATE embedding_chunks
-      SET library_project_id = (SELECT d.library_project_id FROM documents d WHERE d.id = embedding_chunks.doc_id)
-      WHERE library_project_id IS NULL;
-    `)
   })()
   migrateFoldersToLibraryProjects(sqlite, defaultLibraryProjectId)
   sqlite.exec(`
@@ -2690,13 +2680,6 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
       WHERE segment_id = NEW.segment_id AND model_id = NEW.model_id;
     END;
     DROP TRIGGER IF EXISTS trg_documents_propagate_library_project;
-    CREATE TRIGGER trg_documents_propagate_library_project
-    AFTER UPDATE OF library_project_id ON documents
-    WHEN COALESCE(NEW.library_project_id, '') <> COALESCE(OLD.library_project_id, '')
-    BEGIN
-      UPDATE search_index_segments SET library_project_id = NEW.library_project_id WHERE doc_id = NEW.id;
-      UPDATE embedding_chunks SET library_project_id = NEW.library_project_id WHERE doc_id = NEW.id;
-    END;
   `)
 
   addColumnIfMissing(sqlite, 'ai_results', "prompt_hash TEXT DEFAULT ''", 'prompt_hash')
@@ -2986,7 +2969,6 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
 
     CREATE INDEX IF NOT EXISTS idx_embedding_chunks_doc ON embedding_chunks(doc_id);
     CREATE INDEX IF NOT EXISTS idx_embedding_chunks_model ON embedding_chunks(model_id);
-    CREATE INDEX IF NOT EXISTS idx_embedding_chunks_library_project_model ON embedding_chunks(library_project_id, model_id, doc_id, page_num);
     CREATE INDEX IF NOT EXISTS idx_embedding_status_updated ON embedding_index_status(updated_at);
   `)
 
@@ -3326,6 +3308,9 @@ export async function initDatabase(): Promise<void> {
     const database = new Database(dbFilePath)
     database.pragma('foreign_keys = ON')
     database.pragma('journal_mode = WAL')
+    // SQLite's automatic WAL checkpoint runs synchronously on the committing
+    // connection. On a large upgrade this can freeze Electron before first paint.
+    database.pragma('wal_autocheckpoint = 0')
     database.pragma('synchronous = NORMAL')
     database.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
     db = database

@@ -23,7 +23,7 @@ import {
   withStartupPhaseSync,
 } from './startup-timing'
 import { closeStartupSplash } from './startup-splash'
-import { resumePendingImportAutoOcrTasks, shutdownOcrRuntime } from './ipc/ocr'
+import { shutdownOcrRuntime } from './ipc/ocr'
 import { shutdownBookTranslationRuntime, shutdownDocumentDeleteRuntime, shutdownDocumentImportRuntime } from './ipc/documents'
 import { batchProcessor } from './batch-processor'
 import { initializeSettingsSecurity } from './settings-security'
@@ -41,13 +41,8 @@ let quitPromptOpen = false
 let runtimeShutdownStarted = false
 let runtimeShutdownPromise: Promise<void> | null = null
 let startupMaintenanceScheduled = false
-let importAutoOcrRecoveryScheduled = false
 let fileCapabilitySweepTimer: NodeJS.Timeout | null = null
 const STARTUP_MAINTENANCE_DELAY_MS = 45_000
-// Resume interrupted OCR soon after first paint, but not immediately on load.
-// Long enough for the library list to paint; short enough that bulk OCR feels continuous.
-const IMPORT_AUTO_OCR_RESUME_DELAY_MS = 15_000
-const BATCH_OCR_RESUME_DELAY_MS = 25_000
 const FILE_CAPABILITY_SWEEP_INTERVAL_MS = 60_000
 
 type ConsoleMethodName = 'log' | 'info' | 'warn' | 'error' | 'debug'
@@ -271,38 +266,6 @@ function createWindow(): void {
     console.log(`[Main] Renderer finished loading: ${mainWindow?.webContents.getURL() || ''}`)
     markStartupEvent('renderer-did-finish-load')
     showMainWindowFallback('did-finish-load')
-    // Never resume bulk OCR on the first paint path. After a short grace period,
-    // auto-continue interrupted import-auto OCR and recoverable batch queues so
-    // large uploads are not left abandoned until the user clicks again.
-    if (!importAutoOcrRecoveryScheduled && mainWindow && !mainWindow.isDestroyed()) {
-      importAutoOcrRecoveryScheduled = true
-      const sender = mainWindow.webContents
-      setTimeout(() => {
-        if (sender.isDestroyed()) return
-        try {
-          const resumed = resumePendingImportAutoOcrTasks(sender)
-          if (resumed > 0) {
-            console.log(`[Main] Deferred resume of ${resumed} import auto-OCR task(s) after interactive grace`)
-          }
-        } catch (error) {
-          console.warn('[Main] Failed to resume pending import auto-OCR tasks', error)
-        }
-      }, IMPORT_AUTO_OCR_RESUME_DELAY_MS).unref?.()
-
-      setTimeout(() => {
-        if (sender.isDestroyed()) return
-        try {
-          const summary = batchProcessor.resumePendingQueueFromDatabase()
-          if (summary.resumedItems > 0) {
-            console.log(
-              `[Main] Deferred resume of batch OCR: ${summary.resumedItems} item(s) in ${summary.resumedJobs} job(s)`,
-            )
-          }
-        } catch (error) {
-          console.warn('[Main] Failed to resume pending batch OCR queue', error)
-        }
-      }, BATCH_OCR_RESUME_DELAY_MS).unref?.()
-    }
     if (rendererRecoveryResetTimer) {
       clearTimeout(rendererRecoveryResetTimer)
     }

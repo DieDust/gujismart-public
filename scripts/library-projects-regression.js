@@ -20,7 +20,21 @@ assert.ok(documentsSource.includes('FROM library_project_documents project_scope
 assert.ok(semanticSearchSource.includes('FROM library_project_documents active_project_scope'), 'full-text search must use project memberships')
 assert.ok(embeddingSource.includes('project_scope.document_id = ec.doc_id'), 'vector scans must filter by project memberships in SQL')
 assert.ok(embeddingSource.includes('project_scope.document_id = d.id'), 'embedding queues must join active project memberships')
-assert.ok(databaseSource.includes('idx_embedding_chunks_library_project_model'), 'project vector scans must have a composite index')
+assert.ok(
+  !databaseSource.includes('idx_search_segments_library_project')
+    && !databaseSource.includes('idx_embedding_chunks_library_project_model'),
+  'shared search/vector tables must not build obsolete project indexes during a large-library upgrade',
+)
+assert.ok(
+  !/UPDATE search_index_segments\s+SET library_project_id = \(SELECT d\.library_project_id[\s\S]*?WHERE library_project_id IS NULL;/.test(databaseSource)
+    && !/UPDATE embedding_chunks\s+SET library_project_id = \(SELECT d\.library_project_id[\s\S]*?WHERE library_project_id IS NULL;/.test(databaseSource),
+  'project migration must not rewrite every shared search segment or vector chunk before first paint',
+)
+assert.ok(
+  databaseSource.includes('DROP TRIGGER IF EXISTS trg_documents_propagate_library_project')
+    && !databaseSource.includes('CREATE TRIGGER trg_documents_propagate_library_project'),
+  'moving a shared document must not rewrite its canonical search/vector rows',
+)
 assert.ok(appSource.includes('选择本次要加载的文献项目'), 'startup must wait for project selection')
 assert.ok(appSource.includes('migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID'), 'legacy workspace must migrate only to the default project')
 assert.ok(libraryViewSource.includes("key: 'move_project'"), 'library batch menu must expose project transfer')
@@ -405,8 +419,8 @@ async function run() {
            (SELECT library_project_id FROM search_index_segments WHERE segment_id = 'legacy_segment') AS search_project,
            (SELECT library_project_id FROM embedding_chunks WHERE segment_id = 'legacy_segment') AS vector_project`,
       ),
-      { search_project: secondProject.id, vector_project: secondProject.id },
-      'moving a document must propagate project ownership to search/vector rows',
+      { search_project: defaultProject.id, vector_project: defaultProject.id },
+      'moving a document must leave canonical search/vector rows untouched because project scope comes from membership',
     )
 
     await modules.projects.withLibraryProjectContext(defaultProject.id, async () => {

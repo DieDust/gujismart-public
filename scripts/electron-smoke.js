@@ -73,7 +73,6 @@ async function submitLibrarySearch(window) {
 }
 
 async function clickMenu(window, label) {
-  await dismissBlockingModal(window)
   const items = window.locator('.ant-menu-item, .ant-menu-submenu-title')
   const index = await items.evaluateAll((nodes, target) => {
     return nodes.findIndex((node) => (node.textContent || '').trim() === target)
@@ -83,7 +82,20 @@ async function clickMenu(window, label) {
     throw new Error(`Missing menu item: ${label}`)
   }
 
-  await items.nth(index).click()
+  const item = items.nth(index)
+  let lastError = null
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await dismissBlockingModal(window)
+    try {
+      await item.click({ timeout: 2000 })
+      lastError = null
+      break
+    } catch (error) {
+      lastError = error
+      await window.waitForTimeout(500)
+    }
+  }
+  if (lastError) throw lastError
   await window.waitForTimeout(700)
 }
 

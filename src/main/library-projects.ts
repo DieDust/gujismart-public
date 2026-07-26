@@ -217,7 +217,6 @@ export function setActiveLibraryProject(projectId: string): LibraryProject {
   getDatabase().prepare(
     "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_library_project_id', ?)",
   ).run(normalizedId)
-  scheduleDatabaseSave()
   return project
 }
 

@@ -18,6 +18,10 @@ assert(
   'Main database busy retries should be bounded to a short UI-safe window',
 )
 assert(
+  databaseSource.includes("database.pragma('wal_autocheckpoint = 0')"),
+  'SQLite automatic checkpoints must be disabled because they run on the committing main-process write',
+)
+assert(
   databaseSource.includes('BEGIN IMMEDIATE TRANSACTION'),
   'Main database write transactions should acquire the writer lock before doing read-then-write OCR work',
 )
