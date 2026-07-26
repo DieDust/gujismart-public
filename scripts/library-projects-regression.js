@@ -1,5 +1,5 @@
 const assert = require('assert')
-const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs')
+const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs')
 const { join } = require('path')
 const { buildSync } = require('esbuild')
 
@@ -24,9 +24,12 @@ assert.ok(appSource.includes('选择本次要加载的文献项目'), 'startup m
 assert.ok(appSource.includes('migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID'), 'legacy workspace must migrate only to the default project')
 assert.ok(libraryViewSource.includes("key: 'move_project'"), 'library batch menu must expose project transfer')
 assert.ok(libraryViewSource.includes("key: 'context_move_project'"), 'document context menu must expose project transfer directly')
+assert.ok(libraryViewSource.includes("key: 'copy_project'"), 'library batch menu must expose project copy')
+assert.ok(libraryViewSource.includes("key: 'context_copy_project'"), 'document context menu must expose project copy directly')
 assert.ok(libraryViewSource.includes('setBatchProjectDocumentIds(targetIds)'), 'project transfer must snapshot the clicked or selected documents')
 assert.ok(libraryViewSource.includes("libraryProjects.filter((project) => project.id !== activeLibraryProjectId)"), 'the current project must not be offered as its own transfer target')
 assert.ok(libraryViewSource.includes('window.api.moveDocumentsToLibraryProject'), 'project transfer must cross preload explicitly')
+assert.ok(libraryViewSource.includes('window.api.copyDocumentsToLibraryProject'), 'project copy must cross preload explicitly')
 assert.ok(workspaceSource.includes('scopedWorkspaceKey'), 'open tabs must be persisted independently per project')
 
 const tempRoot = mkdtempSync(join(__dirname, '.tmp-library-projects-'))
@@ -73,19 +76,31 @@ async function run() {
     const timestamp = '2026-01-01T00:00:00.000Z'
     database.run(
       `INSERT INTO documents
-       (id, title, import_status, metadata, created_at, updated_at)
-       VALUES (?, ?, 'processed', '{}', ?, ?)`,
-      ['legacy_doc', 'Legacy document', timestamp, timestamp],
+       (id, title, file_path, thumb_path, import_status, metadata, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'processed', '{}', ?, ?)`,
+      [
+        'legacy_doc',
+        'Legacy document',
+        join(process.env.GUJISMART_DATA_DIR, 'storage', 'legacy_doc', 'source.pdf'),
+        join(process.env.GUJISMART_DATA_DIR, 'storage', 'legacy_doc', 'thumb.png'),
+        timestamp,
+        timestamp,
+      ],
     )
+    const legacyStorageRoot = join(process.env.GUJISMART_DATA_DIR, 'storage', 'legacy_doc')
+    mkdirSync(legacyStorageRoot, { recursive: true })
+    writeFileSync(join(legacyStorageRoot, 'source.pdf'), 'source-pdf-content')
+    writeFileSync(join(legacyStorageRoot, 'thumb.png'), 'source-thumbnail')
     assert.strictEqual(
       database.queryOne('SELECT library_project_id FROM documents WHERE id = ?', ['legacy_doc']).library_project_id,
       defaultProject.id,
     )
     database.run(
-      `INSERT INTO pages (id, doc_id, page_num, ocr_text, ocr_status, created_at)
-       VALUES ('legacy_page', 'legacy_doc', 1, 'preserved OCR text', 'completed', ?)`,
-      [timestamp],
+      `INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_status, created_at)
+       VALUES ('legacy_page', 'legacy_doc', 1, ?, 'preserved OCR text', 'completed', ?)`,
+      [join(legacyStorageRoot, 'page-1.png'), timestamp],
     )
+    writeFileSync(join(legacyStorageRoot, 'page-1.png'), 'source-page-image')
     database.run(
       `INSERT INTO embedding_index_status
        (doc_id, status, segment_count, embedded_count, content_hash, updated_at)
@@ -150,6 +165,110 @@ async function run() {
       /current project|belongs|项目|文献/,
       'a stale document selection from another project must be rejected',
     )
+    const copied = await modules.projects.copyDocumentsToLibraryProject(
+      ['legacy_doc', 'legacy_doc'],
+      secondProject.id,
+    )
+    assert.strictEqual(copied.requested, 1)
+    assert.strictEqual(copied.copied, 1)
+    assert.strictEqual(copied.source_project_id, defaultProject.id)
+    assert.strictEqual(copied.target_project_id, secondProject.id)
+    assert.strictEqual(copied.documents.length, 1)
+    assert.strictEqual(copied.documents[0].source_document_id, 'legacy_doc')
+    const copiedDocId = copied.documents[0].copied_document_id
+    assert.ok(copiedDocId && copiedDocId !== 'legacy_doc')
+    const copiedDocument = database.queryOne(
+      `SELECT
+         d.library_project_id,
+         d.file_path,
+         d.thumb_path,
+         (SELECT id FROM pages WHERE doc_id = d.id LIMIT 1) AS page_id,
+         (SELECT image_path FROM pages WHERE doc_id = d.id LIMIT 1) AS image_path,
+         (SELECT ocr_text FROM pages WHERE doc_id = d.id LIMIT 1) AS ocr_text,
+         (SELECT status FROM embedding_index_status WHERE doc_id = d.id) AS embedding_status,
+         (SELECT excerpt FROM research_notes WHERE doc_id = d.id LIMIT 1) AS excerpt,
+         (SELECT project_id FROM research_notes WHERE doc_id = d.id LIMIT 1) AS excerpt_project_id,
+         (SELECT COUNT(*) FROM document_folders WHERE doc_id = d.id) AS folder_count,
+         (SELECT COUNT(*) FROM document_tags WHERE doc_id = d.id) AS tag_count
+       FROM documents d
+       WHERE d.id = ?`,
+      [copiedDocId],
+    )
+    assert.deepStrictEqual(
+      {
+        library_project_id: copiedDocument.library_project_id,
+        ocr_text: copiedDocument.ocr_text,
+        embedding_status: copiedDocument.embedding_status,
+        excerpt: copiedDocument.excerpt,
+        excerpt_project_id: copiedDocument.excerpt_project_id,
+        folder_count: copiedDocument.folder_count,
+        tag_count: copiedDocument.tag_count,
+      },
+      {
+        library_project_id: secondProject.id,
+        ocr_text: 'preserved OCR text',
+        embedding_status: 'ready',
+        excerpt: 'preserved excerpt',
+        excerpt_project_id: null,
+        folder_count: 1,
+        tag_count: 1,
+      },
+      'copying must preserve isolated document content and organization in the target project',
+    )
+    assert.notStrictEqual(copiedDocument.page_id, 'legacy_page')
+    assert.notStrictEqual(copiedDocument.file_path, join(legacyStorageRoot, 'source.pdf'))
+    assert.strictEqual(readFileSync(copiedDocument.file_path, 'utf8'), 'source-pdf-content')
+    assert.strictEqual(readFileSync(copiedDocument.thumb_path, 'utf8'), 'source-thumbnail')
+    assert.strictEqual(readFileSync(copiedDocument.image_path, 'utf8'), 'source-page-image')
+    const copiedSearchVector = database.queryOne(
+      `SELECT
+         sis.library_project_id AS search_project,
+         sis.segment_id AS search_segment,
+         sis.page_id AS search_page,
+         ec.library_project_id AS vector_project,
+         ec.segment_id AS vector_segment,
+         ec.page_id AS vector_page
+       FROM search_index_segments sis
+       JOIN embedding_chunks ec ON ec.segment_id = sis.segment_id
+       WHERE sis.doc_id = ?`,
+      [copiedDocId],
+    )
+    assert.deepStrictEqual(
+      {
+        search_project: copiedSearchVector.search_project,
+        search_page: copiedSearchVector.search_page,
+        vector_project: copiedSearchVector.vector_project,
+        vector_page: copiedSearchVector.vector_page,
+      },
+      {
+        search_project: secondProject.id,
+        search_page: copiedDocument.page_id,
+        vector_project: secondProject.id,
+        vector_page: copiedDocument.page_id,
+      },
+      'copied search and vector rows must be remapped to the target document and page',
+    )
+    assert.notStrictEqual(copiedSearchVector.search_segment, 'legacy_segment')
+    assert.strictEqual(copiedSearchVector.vector_segment, copiedSearchVector.search_segment)
+
+    database.run('UPDATE documents SET title = ? WHERE id = ?', ['Changed copied title', copiedDocId])
+    database.run('UPDATE pages SET ocr_text = ? WHERE doc_id = ?', ['Changed copied OCR', copiedDocId])
+    writeFileSync(copiedDocument.file_path, 'changed-copy-content')
+    assert.deepStrictEqual(
+      database.queryOne(
+        `SELECT d.title, p.ocr_text
+         FROM documents d JOIN pages p ON p.doc_id = d.id
+         WHERE d.id = 'legacy_doc'`,
+      ),
+      { title: 'Legacy document', ocr_text: 'preserved OCR text' },
+      'editing the copied database records must not mutate the source document',
+    )
+    assert.strictEqual(
+      readFileSync(join(legacyStorageRoot, 'source.pdf'), 'utf8'),
+      'source-pdf-content',
+      'editing a copied physical file must not mutate the source file',
+    )
+
     const moved = modules.projects.moveDocumentsToLibraryProject(['legacy_doc', 'legacy_doc'], secondProject.id)
     assert.deepStrictEqual(moved, {
       requested: 1,
@@ -159,7 +278,7 @@ async function run() {
     })
     const projects = modules.projects.listLibraryProjects()
     assert.strictEqual(projects.find((project) => project.id === defaultProject.id).document_count, 0)
-    assert.strictEqual(projects.find((project) => project.id === secondProject.id).document_count, 2)
+    assert.strictEqual(projects.find((project) => project.id === secondProject.id).document_count, 3)
     assert.strictEqual(
       database.queryOne(
         `SELECT
@@ -229,7 +348,7 @@ async function run() {
     assert.strictEqual(modules.projects.getActiveLibraryProjectId(), secondProject.id)
     assert.deepStrictEqual(database.queryAll('PRAGMA foreign_key_check'), [], 'project migration must preserve foreign keys')
 
-    console.log('Library project migration, isolation, workspace, and transfer regression passed.')
+    console.log('Library project migration, isolation, workspace, transfer, and copy regression passed.')
     process.exit(0)
   } finally {
     try {

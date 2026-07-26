@@ -108,6 +108,7 @@ import type {
   DocumentMetadataResult,
   DocumentPage,
   DocumentReadingWindow,
+  CopyDocumentsToLibraryProjectResult,
   CreateLibraryProjectPayload,
   LibraryProject,
   MoveDocumentsToLibraryProjectResult,
@@ -353,6 +354,12 @@ const api = {
     targetProjectId: string,
   ): Promise<MoveDocumentsToLibraryProjectResult> =>
     ipcRenderer.invoke('libraryProjects:moveDocuments', documentIds, targetProjectId),
+
+  copyDocumentsToLibraryProject: (
+    documentIds: string[],
+    targetProjectId: string,
+  ): Promise<CopyDocumentsToLibraryProjectResult> =>
+    ipcRenderer.invoke('libraryProjects:copyDocuments', documentIds, targetProjectId),
 
   /** Filter dropdown metadata only (documents table; no pages scan). */
   listDocumentFilterOptions: (): Promise<DocumentFilterOption[]> =>

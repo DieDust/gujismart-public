@@ -3430,6 +3430,27 @@ export function refreshSearchSegmentsFtsForDocument(docId: string): void {
   }
 }
 
+export function appendSearchSegmentsFtsForDocument(docId: string): void {
+  if (!ftsAvailable || !docId) return
+  const database = getDatabase()
+  runOn(database,
+    `INSERT INTO search_segments_fts (rowid, title, normalized_text)
+     SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+     FROM search_index_segments
+     WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+    [docId]
+  )
+  if (searchTrigramFtsAvailable) {
+    runOn(database,
+      `INSERT INTO search_segments_trigram (rowid, normalized_text)
+       SELECT rowid, COALESCE(normalized_text, text, '')
+       FROM search_index_segments
+       WHERE doc_id = ? AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+      [docId]
+    )
+  }
+}
+
 export function refreshSearchIndexForPages(pageIds: string[]): void {
   if (!ftsAvailable || pageIds.length === 0) return
   const database = getDatabase()

@@ -1,5 +1,6 @@
 import { ipcMain } from 'electron'
 import {
+  copyDocumentsToLibraryProject,
   createLibraryProject,
   getActiveLibraryProject,
   listLibraryProjects,
@@ -7,12 +8,14 @@ import {
   setActiveLibraryProject,
 } from '../library-projects'
 import type {
+  CopyDocumentsToLibraryProjectResult,
   CreateLibraryProjectPayload,
   LibraryProject,
   MoveDocumentsToLibraryProjectResult,
 } from '../../shared/types'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { resumeEmbeddingQueueForActiveProject } from '../embedding-index'
+import { notifySearchContentChanged } from '../semantic-search'
 import { resumePendingImportAutoOcrTasks } from './ocr'
 
 export function registerLibraryProjectIpc(): void {
@@ -51,6 +54,15 @@ export function registerLibraryProjectIpc(): void {
     async (_event, documentIds: string[], targetProjectId: string): Promise<MoveDocumentsToLibraryProjectResult> => {
       const result = moveDocumentsToLibraryProject(documentIds, targetProjectId)
       markLibraryStateCacheDirty([...result.from_project_ids, result.target_project_id])
+      return result
+    },
+  )
+  ipcMain.handle(
+    'libraryProjects:copyDocuments',
+    async (_event, documentIds: string[], targetProjectId: string): Promise<CopyDocumentsToLibraryProjectResult> => {
+      const result = await copyDocumentsToLibraryProject(documentIds, targetProjectId)
+      markLibraryStateCacheDirty([result.source_project_id, result.target_project_id])
+      notifySearchContentChanged()
       return result
     },
   )

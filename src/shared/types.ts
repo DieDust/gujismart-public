@@ -1244,6 +1244,19 @@ export interface MoveDocumentsToLibraryProjectResult {
   target_project_id: string
 }
 
+export interface CopiedLibraryProjectDocument {
+  source_document_id: string
+  copied_document_id: string
+}
+
+export interface CopyDocumentsToLibraryProjectResult {
+  requested: number
+  copied: number
+  source_project_id: string
+  target_project_id: string
+  documents: CopiedLibraryProjectDocument[]
+}
+
 export interface Document {
   id: string
   library_project_id: string

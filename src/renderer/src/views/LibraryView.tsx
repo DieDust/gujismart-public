@@ -6,6 +6,7 @@ import {
   CheckSquareOutlined,
   CloseCircleOutlined,
   CloseOutlined,
+  CopyOutlined,
   DeleteOutlined,
   DownOutlined,
   EditOutlined,
@@ -1709,6 +1710,7 @@ function buildBatchMenuItems(): MenuProps['items'] {
         { key: 'add_tags', label: '批量添加标签' },
         { key: 'add_folder', label: '批量加入文件夹' },
         { key: 'move_project', label: '转移到文献项目', icon: <SwapOutlined /> },
+        { key: 'copy_project', label: '复制到文献项目', icon: <CopyOutlined /> },
         { key: 'synthesize', label: 'AI 文献综述' },
       ],
     },
@@ -2552,7 +2554,8 @@ export default function LibraryView({
   const [batchProjectModalOpen, setBatchProjectModalOpen] = useState(false)
   const [batchProjectTargetId, setBatchProjectTargetId] = useState<string | null>(null)
   const [batchProjectDocumentIds, setBatchProjectDocumentIds] = useState<string[]>([])
-  const [batchProjectMoving, setBatchProjectMoving] = useState(false)
+  const [batchProjectOperation, setBatchProjectOperation] = useState<'move' | 'copy'>('move')
+  const [batchProjectBusy, setBatchProjectBusy] = useState(false)
   const [folderDropTarget, setFolderDropTarget] = useState<{ id: string; position: FolderDropPosition } | null>(null)
   const [sidebarWidth, setSidebarWidth] = useState(250)
   const [sectionHeights, setSectionHeights] = useState({ smart: 24, folder: 30, tag: 46 })
@@ -6491,7 +6494,7 @@ export default function LibraryView({
   const batchMenuItems: MenuProps['items'] = buildBatchMenuItems()
   const targetLibraryProjects = libraryProjects.filter((project) => project.id !== activeLibraryProjectId)
 
-  const openProjectTransfer = (documentIds: string[]): void => {
+  const openProjectTransfer = (documentIds: string[], operation: 'move' | 'copy' = 'move'): void => {
     const targetIds = [...new Set(documentIds.filter(Boolean))]
     if (targetIds.length === 0) {
       message.info('请先选择文献')
@@ -6503,10 +6506,11 @@ export default function LibraryView({
     }
     setBatchProjectDocumentIds(targetIds)
     setBatchProjectTargetId(targetLibraryProjects[0]?.id || null)
+    setBatchProjectOperation(operation)
     setBatchProjectModalOpen(true)
   }
 
-  const handleBatchMoveToProject = async (): Promise<void> => {
+  const handleProjectOperation = async (): Promise<void> => {
     if (batchProjectDocumentIds.length === 0) {
       message.info('请先选择文献')
       return
@@ -6516,8 +6520,23 @@ export default function LibraryView({
       return
     }
     const targetIds = [...batchProjectDocumentIds]
-    setBatchProjectMoving(true)
+    setBatchProjectBusy(true)
     try {
+      if (batchProjectOperation === 'copy') {
+        const result = await window.api.copyDocumentsToLibraryProject(targetIds, batchProjectTargetId)
+        if (result.copied > 0) {
+          setBatchProjectModalOpen(false)
+          setBatchProjectTargetId(null)
+          setBatchProjectDocumentIds([])
+          message.success(`已复制 ${result.copied} 篇文献到目标项目`)
+          onLibraryProjectsChanged?.()
+          scheduleSmartViewCountsRefresh(200)
+        } else {
+          message.info('没有可复制的文献')
+        }
+        return
+      }
+
       const result = await window.api.moveDocumentsToLibraryProject(targetIds, batchProjectTargetId)
       if (result.moved > 0) {
         applySubmittedDocumentDeletion(targetIds, true)
@@ -6535,9 +6554,9 @@ export default function LibraryView({
         message.info('所选文献已经位于目标项目，未发生变化')
       }
     } catch (error) {
-      message.error(getErrorMessage(error, '转移文献失败'))
+      message.error(getErrorMessage(error, batchProjectOperation === 'copy' ? '复制文献失败' : '转移文献失败'))
     } finally {
-      setBatchProjectMoving(false)
+      setBatchProjectBusy(false)
     }
   }
 
@@ -6707,7 +6726,10 @@ export default function LibraryView({
       setBatchFolderModalOpen(true)
     }
     if (key === 'move_project') {
-      openProjectTransfer(selectedIds)
+      openProjectTransfer(selectedIds, 'move')
+    }
+    if (key === 'copy_project') {
+      openProjectTransfer(selectedIds, 'copy')
     }
     if (key === 'cancel_embedding') {
       if (selectedIds.length === 0) {
@@ -6782,10 +6804,16 @@ export default function LibraryView({
       label: '转移到文献项目',
       icon: <SwapOutlined />,
     }
+    const copyItem = {
+      key: 'context_copy_project',
+      label: '复制到文献项目',
+      icon: <CopyOutlined />,
+    }
     if (selectedIdSet.has(docId) && selectedIds.length > 0) {
       return [
         { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
         transferItem,
+        copyItem,
         { type: 'divider' as const },
         ...(batchMenuItems || []),
       ]
@@ -6794,6 +6822,7 @@ export default function LibraryView({
       ...(singleItems || []),
       { type: 'divider' as const },
       transferItem,
+      copyItem,
     ]
   }, [batchMenuItems, selectedIdSet, selectedIds.length])
 
@@ -6807,7 +6836,14 @@ export default function LibraryView({
         const targetIds = selectedIdSet.has(docId) && selectedIds.length > 0
           ? selectedIds
           : [docId]
-        openProjectTransfer(targetIds)
+        openProjectTransfer(targetIds, 'move')
+        return
+      }
+      if (info.key === 'context_copy_project') {
+        const targetIds = selectedIdSet.has(docId) && selectedIds.length > 0
+          ? selectedIds
+          : [docId]
+        openProjectTransfer(targetIds, 'copy')
         return
       }
       if (selectedIdSet.has(docId) && selectedIds.length > 0) {
@@ -8499,15 +8535,15 @@ export default function LibraryView({
       </Modal>
 
       <Modal
-        title="转移到文献项目"
+        title={batchProjectOperation === 'copy' ? '复制到文献项目' : '转移到文献项目'}
         open={batchProjectModalOpen}
-        okText={`转移 ${batchProjectDocumentIds.length} 篇`}
+        okText={`${batchProjectOperation === 'copy' ? '复制' : '转移'} ${batchProjectDocumentIds.length} 篇`}
         cancelText="取消"
-        confirmLoading={batchProjectMoving}
+        confirmLoading={batchProjectBusy}
         okButtonProps={{ disabled: !batchProjectTargetId }}
-        onOk={() => void handleBatchMoveToProject()}
+        onOk={() => void handleProjectOperation()}
         onCancel={() => {
-          if (batchProjectMoving) return
+          if (batchProjectBusy) return
           setBatchProjectModalOpen(false)
           setBatchProjectTargetId(null)
           setBatchProjectDocumentIds([])
@@ -8517,8 +8553,10 @@ export default function LibraryView({
           <Alert
             type="info"
             showIcon
-            message="只改变文献所属项目"
-            description="文献正文、OCR、向量、标签、文件夹、摘录和研究关联都会完整保留。转移后它将从当前项目列表消失，并出现在目标项目。"
+            message={batchProjectOperation === 'copy' ? '在目标项目创建独立副本' : '只改变文献所属项目'}
+            description={batchProjectOperation === 'copy'
+              ? '源项目会保留原文献；目标项目会得到独立文件和独立文献记录。正文、OCR、校对、向量、全文索引、标签、文件夹、摘录、翻译和文献级 AI 结果会复制。研究项目归属与 AI 对话仍留在源项目。复制会占用额外磁盘空间。'
+              : '文献正文、OCR、向量、标签、文件夹、摘录和研究关联都会完整保留。转移后它将从当前项目列表消失，并出现在目标项目。'}
           />
           <Select
             style={{ width: '100%' }}
