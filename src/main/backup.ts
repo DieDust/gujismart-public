@@ -940,7 +940,11 @@ export async function exportDocumentListCsv(): Promise<string | null> {
   const rows = queryAll<DocumentListCsvRow>(
     `SELECT title, author, dynasty, source, doc_type, page_count, ocr_status, proof_status, import_status, created_at, updated_at
      FROM documents
-     WHERE library_project_id = ?
+     WHERE EXISTS (
+       SELECT 1 FROM library_project_documents project_scope
+       WHERE project_scope.document_id = documents.id
+         AND project_scope.project_id = ?
+     )
      ORDER BY updated_at DESC`,
     [getActiveLibraryProjectId()],
   )

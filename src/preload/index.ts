@@ -108,6 +108,7 @@ import type {
   DocumentMetadataResult,
   DocumentPage,
   DocumentReadingWindow,
+  AddDocumentsToLibraryProjectResult,
   CopyDocumentsToLibraryProjectResult,
   CreateLibraryProjectPayload,
   LibraryProject,
@@ -348,6 +349,12 @@ const api = {
 
   setActiveLibraryProject: (projectId: string): Promise<LibraryProject> =>
     ipcRenderer.invoke('libraryProjects:setActive', projectId),
+
+  addDocumentsToLibraryProject: (
+    documentIds: string[],
+    targetProjectId: string,
+  ): Promise<AddDocumentsToLibraryProjectResult> =>
+    ipcRenderer.invoke('libraryProjects:addDocuments', documentIds, targetProjectId),
 
   moveDocumentsToLibraryProject: (
     documentIds: string[],

@@ -200,16 +200,11 @@ function parseMetadata(value: unknown): DocumentMetadataResult {
 }
 
 export function clearMetadataTagBindings(docId?: string): MetadataTagBindingCleanupResult {
-  const libraryProjectId = docId
-    ? queryOne<{ library_project_id?: string | null }>(
-      'SELECT library_project_id FROM documents WHERE id = ?',
-      [docId],
-    )?.library_project_id || getActiveLibraryProjectId()
-    : getActiveLibraryProjectId()
-  const relationFilter = docId ? 'doc_id = ? AND ' : 'doc_id IN (SELECT id FROM documents WHERE library_project_id = ?) AND '
-  const relationFilterWithAlias = docId ? 'dt.doc_id = ? AND ' : 'dt.doc_id IN (SELECT id FROM documents WHERE library_project_id = ?) AND '
-  const params = [docId || libraryProjectId]
-  const countParams = [docId || libraryProjectId]
+  const libraryProjectId = getActiveLibraryProjectId()
+  const relationFilter = docId ? 'doc_id = ? AND ' : 'doc_id IN (SELECT document_id FROM library_project_documents WHERE project_id = ?) AND '
+  const relationFilterWithAlias = docId ? 'dt.doc_id = ? AND ' : 'dt.doc_id IN (SELECT document_id FROM library_project_documents WHERE project_id = ?) AND '
+  const params = [docId || libraryProjectId, libraryProjectId]
+  const countParams = [docId || libraryProjectId, libraryProjectId]
   const metadataBindingPredicate = `(
         COALESCE(dt.is_metadata, 0) = 1
         OR TRIM(COALESCE(dt.source_field, '')) != ''
@@ -235,6 +230,7 @@ export function clearMetadataTagBindings(docId?: string): MetadataTagBindingClea
      FROM document_tags dt
      INNER JOIN tags t ON t.id = dt.tag_id
      WHERE ${relationFilterWithAlias}${metadataBindingPredicate}
+       AND t.library_project_id = ?
        AND COALESCE(dt.is_manual, 0) = 1
        AND COALESCE(t.source, 'manual') = 'manual'`,
     countParams,
@@ -244,18 +240,23 @@ export function clearMetadataTagBindings(docId?: string): MetadataTagBindingClea
      FROM document_tags dt
      INNER JOIN tags t ON t.id = dt.tag_id
      WHERE ${relationFilterWithAlias}${metadataBindingPredicate}
+       AND t.library_project_id = ?
        AND (
          COALESCE(dt.is_manual, 0) = 0
          OR COALESCE(t.source, 'manual') != 'manual'
        )`,
     countParams,
   )?.count || 0
-  const tagCountBefore = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM tags')?.count || 0
+  const tagCountBefore = queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM tags WHERE library_project_id = ?',
+    [libraryProjectId],
+  )?.count || 0
 
   transaction(() => {
     run(
       `DELETE FROM document_tags
        WHERE ${relationFilter}${metadataBindingPredicateWithoutAlias}
+         AND tag_id IN (SELECT id FROM tags WHERE library_project_id = ?)
          AND (
            COALESCE(is_manual, 0) = 0
            OR tag_id IN (
@@ -269,13 +270,17 @@ export function clearMetadataTagBindings(docId?: string): MetadataTagBindingClea
     run(
       `UPDATE document_tags
        SET is_metadata = 0, source_field = NULL, confidence = NULL, updated_at = ?
-       WHERE ${relationFilter}${metadataBindingPredicateWithoutAlias}`,
+       WHERE ${relationFilter}${metadataBindingPredicateWithoutAlias}
+         AND tag_id IN (SELECT id FROM tags WHERE library_project_id = ?)`,
       [new Date().toISOString(), ...params],
     )
   })
   refreshTagUsage()
   saveDatabase()
-  const tagCountAfter = queryOne<{ count: number }>('SELECT COUNT(*) as count FROM tags')?.count || 0
+  const tagCountAfter = queryOne<{ count: number }>(
+    'SELECT COUNT(*) as count FROM tags WHERE library_project_id = ?',
+    [libraryProjectId],
+  )?.count || 0
   return {
     removedRelations: deleteCount,
     keptManualRelations: keepManualCount,
@@ -286,16 +291,21 @@ export function clearMetadataTagBindings(docId?: string): MetadataTagBindingClea
 export function ensureDisabledMetadataTagBindingsCleared(): MetadataTagBindingCleanupResult | null {
   if (isMetadataTagBindingEnabled()) return null
 
+  const libraryProjectId = getActiveLibraryProjectId()
   const pendingCount = queryOne<{ count: number }>(
     `SELECT COUNT(*) as count
      FROM document_tags dt
      INNER JOIN tags t ON t.id = dt.tag_id
-     WHERE COALESCE(dt.is_metadata, 0) = 1
+     WHERE t.library_project_id = ?
+       AND (
+         COALESCE(dt.is_metadata, 0) = 1
        OR TRIM(COALESCE(dt.source_field, '')) != ''
        OR (
          COALESCE(dt.is_manual, 0) = 0
          AND COALESCE(t.source, 'manual') != 'manual'
-       )`,
+       )
+     )`,
+    [libraryProjectId],
   )?.count || 0
   if (pendingCount === 0) return null
 
@@ -395,16 +405,16 @@ export function upsertTag(
 
 function linkMetadataTag(docId: string, tagId: string, sourceField: string, confidence: number): boolean {
   const now = new Date().toISOString()
+  const libraryProjectId = getActiveLibraryProjectId()
   const relationTargets = queryOne<{ doc_exists: number; tag_exists: number }>(
     `SELECT
       EXISTS(SELECT 1 FROM documents WHERE id = ?) as doc_exists,
       EXISTS(
         SELECT 1
         FROM tags t
-        INNER JOIN documents d ON d.id = ?
-        WHERE t.id = ? AND t.library_project_id = d.library_project_id
+        WHERE t.id = ? AND t.library_project_id = ?
       ) as tag_exists`,
-    [docId, docId, tagId],
+    [docId, tagId, libraryProjectId],
   )
   if (!relationTargets?.doc_exists || !relationTargets?.tag_exists) return false
   const existing = queryOne<{ is_manual?: number }>(
@@ -430,7 +440,7 @@ function linkMetadataTag(docId: string, tagId: string, sourceField: string, conf
   return true
 }
 
-function detachStaleDocTypeTags(docId: string, nextDocType: string): void {
+function detachStaleDocTypeTags(docId: string, nextDocType: string, libraryProjectId: string): void {
   const normalizedNext = normalizeComparableTagName(nextDocType)
   const rows = queryAll<{
     tag_id: string
@@ -443,8 +453,8 @@ function detachStaleDocTypeTags(docId: string, nextDocType: string): void {
     `SELECT dt.tag_id, t.name, t.source, dt.is_manual, dt.is_metadata, dt.source_field
      FROM document_tags dt
      INNER JOIN tags t ON t.id = dt.tag_id
-     WHERE dt.doc_id = ?`,
-    [docId],
+     WHERE dt.doc_id = ? AND t.library_project_id = ?`,
+    [docId, libraryProjectId],
   )
 
   for (const row of rows) {
@@ -480,38 +490,39 @@ function syncMetadataTagsForDocument(
   docType: string,
   baseInfo?: MetadataTagBaseInfo,
 ): MetadataTagSyncStats {
-  const libraryProjectId = queryOne<{ library_project_id?: string | null }>(
-    'SELECT library_project_id FROM documents WHERE id = ?',
-    [docId],
-  )?.library_project_id || getActiveLibraryProjectId()
+  const libraryProjectId = getActiveLibraryProjectId()
   const normalizedDocType = normalizeHistoryDocType(docType)
   const suggestions = collectMetadataTagValues(metadata, normalizedDocType, baseInfo)
   const existingMetadataRelations = queryOne<{ count: number }>(
     `SELECT COUNT(*) as count
-     FROM document_tags
-     WHERE doc_id = ?
+     FROM document_tags dt
+     INNER JOIN tags t ON t.id = dt.tag_id
+     WHERE dt.doc_id = ?
+       AND t.library_project_id = ?
        AND (
-         COALESCE(is_metadata, 0) = 1
-         OR TRIM(COALESCE(source_field, '')) != ''
+         COALESCE(dt.is_metadata, 0) = 1
+         OR TRIM(COALESCE(dt.source_field, '')) != ''
        )`,
-    [docId],
+    [docId, libraryProjectId],
   )?.count || 0
   let linkedRelations = 0
 
   transaction(() => {
-    detachStaleDocTypeTags(docId, normalizedDocType)
+    detachStaleDocTypeTags(docId, normalizedDocType, libraryProjectId)
     run(
       `DELETE FROM document_tags
        WHERE doc_id = ?
          AND is_metadata = 1
-         AND COALESCE(is_manual, 0) = 0`,
-      [docId],
+         AND COALESCE(is_manual, 0) = 0
+         AND tag_id IN (SELECT id FROM tags WHERE library_project_id = ?)`,
+      [docId, libraryProjectId],
     )
     run(
       `UPDATE document_tags
        SET is_metadata = 0, source_field = NULL, confidence = NULL, updated_at = ?
-       WHERE doc_id = ? AND is_metadata = 1`,
-      [new Date().toISOString(), docId],
+       WHERE doc_id = ? AND is_metadata = 1
+         AND tag_id IN (SELECT id FROM tags WHERE library_project_id = ?)`,
+      [new Date().toISOString(), docId, libraryProjectId],
     )
 
     for (const suggestion of suggestions) {

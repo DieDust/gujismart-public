@@ -1244,6 +1244,14 @@ export interface MoveDocumentsToLibraryProjectResult {
   target_project_id: string
 }
 
+export interface AddDocumentsToLibraryProjectResult {
+  requested: number
+  added: number
+  already_present: number
+  source_project_id: string
+  target_project_id: string
+}
+
 export interface CopiedLibraryProjectDocument {
   source_document_id: string
   copied_document_id: string
@@ -2592,6 +2600,7 @@ export type ResearchOutlineUpdatePayload = Partial<ResearchOutlinePayload>
 
 export interface ResearchNote {
   id: string
+  library_project_id: string
   project_id: string | null
   doc_id: string
   page_num: number | null

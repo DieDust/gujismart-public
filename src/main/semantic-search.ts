@@ -1,4 +1,4 @@
-﻿import { Index as FlexSearchIndex } from 'flexsearch'
+import { Index as FlexSearchIndex } from 'flexsearch'
 import { nanoid } from 'nanoid'
 import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
@@ -513,7 +513,12 @@ function chunkValues<T>(values: T[], size = 800): T[][] {
 
 function activeDocumentCondition(alias = 'd'): string {
   const projectId = getActiveLibraryProjectId().replace(/'/g, "''")
-  return `${alias}.library_project_id = '${projectId}'
+  return `EXISTS (
+      SELECT 1
+      FROM library_project_documents active_project_scope
+      WHERE active_project_scope.document_id = ${alias}.id
+        AND active_project_scope.project_id = '${projectId}'
+    )
     AND COALESCE(${alias}.import_status, '') <> '${DELETING_IMPORT_STATUS}'`
 }
 
@@ -576,7 +581,7 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
     return queryAll<{ id: string }>(
       `SELECT id
        FROM documents
-       WHERE library_project_id = ?
+       WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = documents.id AND project_scope.project_id = ?)
          AND ${activeDocumentCondition('documents')}
        ORDER BY is_favorite DESC, updated_at DESC`,
       [activeProjectId],
@@ -590,7 +595,7 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
       `SELECT id
        FROM documents
        WHERE id IN (${placeholders})
-         AND library_project_id = ?
+         AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = documents.id AND project_scope.project_id = ?)
          AND ${activeDocumentCondition('documents')}
        ORDER BY is_favorite DESC, updated_at DESC`,
       [...normalized.docIds, activeProjectId],
@@ -606,7 +611,7 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
        WHERE df.folder_id IN (${placeholders})
-         AND d.library_project_id = ?
+         AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          AND ${activeDocumentCondition('d')}
        ORDER BY d.is_favorite DESC, d.updated_at DESC`,
       [...folderIds, activeProjectId],
@@ -622,7 +627,7 @@ function resolveScopeDocumentIds(scope?: LibraryAiScope): string[] {
     sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
     params.push(tagId)
   })
-  sql += ` WHERE d.library_project_id = ? AND ${activeDocumentCondition('d')} GROUP BY d.id ORDER BY d.is_favorite DESC, d.updated_at DESC`
+  sql += ` WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?) AND ${activeDocumentCondition('d')} GROUP BY d.id ORDER BY d.is_favorite DESC, d.updated_at DESC`
   params.push(activeProjectId)
 
   return queryAll<{ id: string }>(sql, params).map((item) => item.id)
@@ -2257,7 +2262,7 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
   }
 
   let sql = 'SELECT DISTINCT d.id FROM documents d'
-  const conditions: string[] = ['d.library_project_id = ?']
+  const conditions: string[] = ['EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)']
   const params: Array<string | number> = [activeProjectId]
   if (!resolvedOptions.importStatus) conditions.push(activeDocumentCondition('d'))
 

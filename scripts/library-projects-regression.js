@@ -13,22 +13,26 @@ const libraryViewSource = readFileSync(join(root, 'src', 'renderer', 'src', 'vie
 const workspaceSource = readFileSync(join(root, 'src', 'renderer', 'src', 'utils', 'appWorkspace.ts'), 'utf8')
 
 assert.ok(databaseSource.includes('CREATE TABLE IF NOT EXISTS library_projects'), 'database must persist library projects')
+assert.ok(databaseSource.includes('CREATE TABLE IF NOT EXISTS library_project_documents'), 'projects must use a many-to-many document membership table')
 assert.ok(databaseSource.includes("VALUES (?, '默认项目', '由旧版本文献自动迁移生成'"), 'legacy documents must migrate to a default project')
 assert.ok(databaseSource.includes('trg_documents_assign_library_project'), 'new imports must inherit the active project')
-assert.ok(documentsSource.includes("const conditions: string[] = ['d.library_project_id = ?']"), 'library lists must be project scoped')
-assert.ok(semanticSearchSource.includes("const conditions: string[] = ['d.library_project_id = ?']"), 'full-text search must be project scoped')
-assert.ok(embeddingSource.includes('ec.library_project_id = ? AND ec.model_id = ?'), 'vector scans must filter project chunks in SQL')
-assert.ok(embeddingSource.includes("d.library_project_id = ?"), 'embedding queues must join documents by active project')
+assert.ok(documentsSource.includes('FROM library_project_documents project_scope'), 'library lists must use project memberships')
+assert.ok(semanticSearchSource.includes('FROM library_project_documents active_project_scope'), 'full-text search must use project memberships')
+assert.ok(embeddingSource.includes('project_scope.document_id = ec.doc_id'), 'vector scans must filter by project memberships in SQL')
+assert.ok(embeddingSource.includes('project_scope.document_id = d.id'), 'embedding queues must join active project memberships')
 assert.ok(databaseSource.includes('idx_embedding_chunks_library_project_model'), 'project vector scans must have a composite index')
 assert.ok(appSource.includes('选择本次要加载的文献项目'), 'startup must wait for project selection')
 assert.ok(appSource.includes('migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID'), 'legacy workspace must migrate only to the default project')
 assert.ok(libraryViewSource.includes("key: 'move_project'"), 'library batch menu must expose project transfer')
 assert.ok(libraryViewSource.includes("key: 'context_move_project'"), 'document context menu must expose project transfer directly')
+assert.ok(libraryViewSource.includes("key: 'link_project'"), 'library batch menu must expose synchronized project linking')
+assert.ok(libraryViewSource.includes("key: 'context_link_project'"), 'document context menu must expose synchronized project linking')
 assert.ok(libraryViewSource.includes("key: 'copy_project'"), 'library batch menu must expose project copy')
 assert.ok(libraryViewSource.includes("key: 'context_copy_project'"), 'document context menu must expose project copy directly')
 assert.ok(libraryViewSource.includes('setBatchProjectDocumentIds(targetIds)'), 'project transfer must snapshot the clicked or selected documents')
 assert.ok(libraryViewSource.includes("libraryProjects.filter((project) => project.id !== activeLibraryProjectId)"), 'the current project must not be offered as its own transfer target')
 assert.ok(libraryViewSource.includes('window.api.moveDocumentsToLibraryProject'), 'project transfer must cross preload explicitly')
+assert.ok(libraryViewSource.includes('window.api.addDocumentsToLibraryProject'), 'project linking must cross preload explicitly')
 assert.ok(libraryViewSource.includes('window.api.copyDocumentsToLibraryProject'), 'project copy must cross preload explicitly')
 assert.ok(workspaceSource.includes('scopedWorkspaceKey'), 'open tabs must be persisted independently per project')
 
@@ -95,6 +99,14 @@ async function run() {
       database.queryOne('SELECT library_project_id FROM documents WHERE id = ?', ['legacy_doc']).library_project_id,
       defaultProject.id,
     )
+    assert.strictEqual(
+      database.queryOne(
+        'SELECT COUNT(*) AS count FROM library_project_documents WHERE project_id = ? AND document_id = ?',
+        [defaultProject.id, 'legacy_doc'],
+      ).count,
+      1,
+      'new documents must automatically receive a project membership',
+    )
     database.run(
       `INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, ocr_status, created_at)
        VALUES ('legacy_page', 'legacy_doc', 1, ?, 'preserved OCR text', 'completed', ?)`,
@@ -109,9 +121,9 @@ async function run() {
     )
     database.run(
       `INSERT INTO research_notes
-       (id, doc_id, page_num, excerpt, note, created_at, updated_at)
-       VALUES ('legacy_note', 'legacy_doc', 1, 'preserved excerpt', 'preserved note', ?, ?)`,
-      [timestamp, timestamp],
+       (id, library_project_id, doc_id, page_num, excerpt, note, created_at, updated_at)
+       VALUES ('legacy_note', ?, 'legacy_doc', 1, 'preserved excerpt', 'preserved note', ?, ?)`,
+      [defaultProject.id, timestamp, timestamp],
     )
     database.run(
       `INSERT INTO folders (id, library_project_id, name, created_at, updated_at)
@@ -158,6 +170,13 @@ async function run() {
       database.queryOne('SELECT library_project_id FROM documents WHERE id = ?', ['new_doc']).library_project_id,
       secondProject.id,
     )
+    assert.strictEqual(
+      database.queryOne(
+        'SELECT COUNT(*) AS count FROM library_project_documents WHERE project_id = ? AND document_id = ?',
+        [secondProject.id, 'new_doc'],
+      ).count,
+      1,
+    )
 
     modules.projects.setActiveLibraryProject(defaultProject.id)
     assert.throws(
@@ -165,6 +184,60 @@ async function run() {
       /current project|belongs|项目|文献/,
       'a stale document selection from another project must be rejected',
     )
+    const linked = modules.projects.addDocumentsToLibraryProject(
+      ['legacy_doc', 'legacy_doc'],
+      secondProject.id,
+    )
+    assert.deepStrictEqual(linked, {
+      requested: 1,
+      added: 1,
+      already_present: 0,
+      source_project_id: defaultProject.id,
+      target_project_id: secondProject.id,
+    })
+    assert.strictEqual(
+      database.queryOne(
+        'SELECT COUNT(*) AS count FROM library_project_documents WHERE document_id = ?',
+        ['legacy_doc'],
+      ).count,
+      2,
+      'linking must reuse one canonical document across projects',
+    )
+    assert.strictEqual(
+      database.queryOne('SELECT COUNT(*) AS count FROM documents WHERE id = ?', ['legacy_doc']).count,
+      1,
+      'linking must not clone the document row',
+    )
+    assert.strictEqual(
+      database.queryOne('SELECT COUNT(*) AS count FROM embedding_chunks WHERE doc_id = ?', ['legacy_doc']).count,
+      1,
+      'linking must reuse the vector index',
+    )
+    assert.strictEqual(
+      database.queryOne(
+        'SELECT COUNT(*) AS count FROM research_notes WHERE doc_id = ? AND library_project_id = ?',
+        ['legacy_doc', secondProject.id],
+      ).count,
+      0,
+      'project-specific excerpts must not leak into a linked project',
+    )
+    database.run('UPDATE documents SET title = ? WHERE id = ?', ['Shared document title', 'legacy_doc'])
+    database.run('UPDATE pages SET ocr_text = ? WHERE doc_id = ?', ['Shared OCR text', 'legacy_doc'])
+    modules.projects.setActiveLibraryProject(secondProject.id)
+    assert.deepStrictEqual(
+      database.queryOne(
+        `SELECT d.title, p.ocr_text
+         FROM documents d
+         INNER JOIN pages p ON p.doc_id = d.id
+         INNER JOIN library_project_documents lpd ON lpd.document_id = d.id
+         WHERE lpd.project_id = ? AND d.id = ?`,
+        [secondProject.id, 'legacy_doc'],
+      ),
+      { title: 'Shared document title', ocr_text: 'Shared OCR text' },
+      'edits to a linked document must be visible from every project',
+    )
+    modules.projects.setActiveLibraryProject(defaultProject.id)
+
     const copied = await modules.projects.copyDocumentsToLibraryProject(
       ['legacy_doc', 'legacy_doc'],
       secondProject.id,
@@ -206,7 +279,7 @@ async function run() {
       },
       {
         library_project_id: secondProject.id,
-        ocr_text: 'preserved OCR text',
+        ocr_text: 'Shared OCR text',
         embedding_status: 'ready',
         excerpt: 'preserved excerpt',
         excerpt_project_id: null,
@@ -260,7 +333,7 @@ async function run() {
          FROM documents d JOIN pages p ON p.doc_id = d.id
          WHERE d.id = 'legacy_doc'`,
       ),
-      { title: 'Legacy document', ocr_text: 'preserved OCR text' },
+      { title: 'Shared document title', ocr_text: 'Shared OCR text' },
       'editing the copied database records must not mutate the source document',
     )
     assert.strictEqual(
@@ -290,7 +363,7 @@ async function run() {
          FROM documents d
          WHERE d.id = 'legacy_doc'`,
       ).ocr_text,
-      'preserved OCR text',
+      'Shared OCR text',
       'moving a document must preserve its OCR/page content',
     )
     const preservedRelations = database.queryOne(

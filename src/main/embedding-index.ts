@@ -211,7 +211,7 @@ function countEmbeddingStatus(status: string, libraryProjectId = getActiveLibrar
       `SELECT COUNT(*) as c
        FROM embedding_index_status eis
        INNER JOIN documents d ON d.id = eis.doc_id
-       WHERE eis.status = ? AND d.library_project_id = ?`,
+       WHERE eis.status = ? AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
       [status, libraryProjectId],
     )?.c || 0,
   )
@@ -727,7 +727,12 @@ export function getEmbeddingIndexStats(): EmbeddingIndexStats {
     queryOne<{ c: number }>(
       `SELECT COUNT(*) as c
        FROM embedding_chunks
-       WHERE library_project_id = ? AND (model_id = ? OR model_id LIKE ?)`,
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = embedding_chunks.doc_id
+           AND project_scope.project_id = ?
+       )
+         AND (model_id = ? OR model_id LIKE ?)`,
       [libraryProjectId, modelId, `${model}@%`],
     )?.c || 0,
   )
@@ -872,7 +877,7 @@ export function requeueFailedEmbeddings(): {
     `SELECT eis.doc_id
      FROM embedding_index_status eis
      INNER JOIN documents d ON d.id = eis.doc_id
-     WHERE eis.status = 'error' AND d.library_project_id = ?`,
+     WHERE eis.status = 'error' AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
     [getActiveLibraryProjectId()],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
@@ -1066,7 +1071,7 @@ export function cancelAllPendingEmbeddings(): {
     `SELECT eis.doc_id
      FROM embedding_index_status eis
      INNER JOIN documents d ON d.id = eis.doc_id
-     WHERE eis.status IN ('queued', 'processing') AND d.library_project_id = ?`,
+     WHERE eis.status IN ('queued', 'processing') AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
     [getActiveLibraryProjectId()],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
@@ -1290,7 +1295,7 @@ export function reindexAllReadyEmbeddings(): {
     `SELECT eis.doc_id
      FROM embedding_index_status eis
      INNER JOIN documents d ON d.id = eis.doc_id
-     WHERE eis.status = 'ready' AND d.library_project_id = ?`,
+     WHERE eis.status = 'ready' AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
     [getActiveLibraryProjectId()],
   )
   const ids = rows.map((row) => String(row.doc_id || '').trim()).filter(Boolean)
@@ -1315,7 +1320,7 @@ export function reindexStaleEmbeddings(): {
     `SELECT eis.doc_id
      FROM embedding_index_status eis
      INNER JOIN documents d ON d.id = eis.doc_id
-     WHERE eis.status = 'ready' AND d.library_project_id = ?
+     WHERE eis.status = 'ready' AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        AND NOT EXISTS (
          SELECT 1 FROM embedding_chunks ec
          WHERE ec.doc_id = eis.doc_id
@@ -1340,7 +1345,7 @@ export function countStaleEmbeddingDocuments(): number {
       `SELECT COUNT(*) as c
        FROM embedding_index_status eis
        INNER JOIN documents d ON d.id = eis.doc_id
-       WHERE eis.status = 'ready' AND d.library_project_id = ?
+       WHERE eis.status = 'ready' AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          AND NOT EXISTS (
            SELECT 1 FROM embedding_chunks ec
            WHERE ec.doc_id = eis.doc_id
@@ -1675,7 +1680,7 @@ async function processEmbeddingQueue(): Promise<void> {
         `SELECT eis.doc_id
          FROM embedding_index_status eis
          INNER JOIN documents d ON d.id = eis.doc_id
-         WHERE eis.status = 'queued' AND d.library_project_id = ?
+         WHERE eis.status = 'queued' AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          ORDER BY eis.updated_at ASC
          LIMIT 1`,
         [libraryProjectId],
@@ -1771,7 +1776,7 @@ export async function vectorSearch(
     queryOne<{ c: number }>(
       `SELECT COUNT(*) as c
        FROM embedding_chunks ec
-       WHERE ec.library_project_id = ? AND ec.model_id = ?`,
+       WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = ec.doc_id AND project_scope.project_id = ?) AND ec.model_id = ?`,
       [activeProjectId, modelId],
     )?.c || 0,
   )
@@ -1910,7 +1915,7 @@ export async function vectorSearch(
       }>(
         `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
          FROM embedding_chunks ec
-         WHERE ec.library_project_id = ? AND ec.model_id = ? AND ec.doc_id = ? AND ec.rowid > ?
+         WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = ec.doc_id AND project_scope.project_id = ?) AND ec.model_id = ? AND ec.doc_id = ? AND ec.rowid > ?
          ORDER BY ec.rowid ASC
          LIMIT ?`,
         [activeProjectId, modelId, scopedDocId, lastRowId, SCAN_CHUNK_ROWS],
@@ -1936,7 +1941,7 @@ export async function vectorSearch(
       }>(
         `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
          FROM embedding_chunks ec
-         WHERE ec.library_project_id = ? AND ec.model_id = ? AND ec.rowid > ?
+         WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = ec.doc_id AND project_scope.project_id = ?) AND ec.model_id = ? AND ec.rowid > ?
          ORDER BY ec.rowid ASC
          LIMIT ?`,
         [activeProjectId, modelId, lastRowId, SCAN_CHUNK_ROWS],
@@ -2022,7 +2027,7 @@ export function resumeEmbeddingQueueForActiveProject(): void {
       `SELECT COUNT(*) as c
        FROM embedding_index_status eis
        INNER JOIN documents d ON d.id = eis.doc_id
-       WHERE eis.status IN ('queued','processing') AND d.library_project_id = ?`,
+       WHERE eis.status IN ('queued','processing') AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
       [libraryProjectId],
     )?.c || 0,
   )
@@ -2031,7 +2036,9 @@ export function resumeEmbeddingQueueForActiveProject(): void {
       `UPDATE embedding_index_status
        SET status = 'queued'
        WHERE status = 'processing'
-         AND doc_id IN (SELECT id FROM documents WHERE library_project_id = ?)`,
+         AND doc_id IN (
+           SELECT document_id FROM library_project_documents WHERE project_id = ?
+         )`,
       [libraryProjectId],
     )
     saveDatabase()

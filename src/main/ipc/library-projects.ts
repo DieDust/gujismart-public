@@ -1,5 +1,6 @@
 import { ipcMain } from 'electron'
 import {
+  addDocumentsToLibraryProject,
   copyDocumentsToLibraryProject,
   createLibraryProject,
   getActiveLibraryProject,
@@ -8,6 +9,7 @@ import {
   setActiveLibraryProject,
 } from '../library-projects'
 import type {
+  AddDocumentsToLibraryProjectResult,
   CopyDocumentsToLibraryProjectResult,
   CreateLibraryProjectPayload,
   LibraryProject,
@@ -47,6 +49,14 @@ export function registerLibraryProjectIpc(): void {
         console.warn('[LibraryProjects] Failed to resume project OCR queue:', error)
       }
       return project
+    },
+  )
+  ipcMain.handle(
+    'libraryProjects:addDocuments',
+    async (_event, documentIds: string[], targetProjectId: string): Promise<AddDocumentsToLibraryProjectResult> => {
+      const result = addDocumentsToLibraryProject(documentIds, targetProjectId)
+      markLibraryStateCacheDirty([result.source_project_id, result.target_project_id])
+      return result
     },
   )
   ipcMain.handle(

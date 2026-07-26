@@ -19,6 +19,7 @@ import { listDocumentsPage } from '../ipc/documents'
 import { resolveSearchEvidence } from '../search-evidence-resolver'
 import { querySearchV2 } from '../semantic-search'
 import { getEmbeddingIndexStats, vectorSearch } from '../embedding-index'
+import { getActiveLibraryProjectId } from '../library-projects'
 import { VECTOR_SEARCH_MAX_LIMIT } from '../../shared/vector-search'
 
 const MAX_SEARCH_LIMIT = VECTOR_SEARCH_MAX_LIMIT
@@ -311,7 +312,17 @@ export async function callLibraryTool(
     case 'get_document': {
       const docId = String(input.docId || '').trim()
       if (!docId) return toolError('invalid_args', 'docId is required')
-      const doc = queryOne<Record<string, unknown>>('SELECT * FROM documents WHERE id = ?', [docId])
+      const libraryProjectId = getActiveLibraryProjectId()
+      const doc = queryOne<Record<string, unknown>>(
+        `SELECT * FROM documents
+         WHERE id = ?
+           AND EXISTS (
+             SELECT 1 FROM library_project_documents project_scope
+             WHERE project_scope.document_id = documents.id
+               AND project_scope.project_id = ?
+           )`,
+        [docId, libraryProjectId],
+      )
       if (!doc) return toolError('not_found', `Document not found: ${docId}`)
       const includePages = Boolean(input.includePages)
       const pageCount = Number(
@@ -331,12 +342,12 @@ export async function callLibraryTool(
         )?.c || 0,
       )
       const tags = queryAll<{ id: string; name: string }>(
-        'SELECT t.id, t.name FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? ORDER BY t.name',
-        [docId],
+        'SELECT t.id, t.name FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? AND t.library_project_id = ? ORDER BY t.name',
+        [docId, libraryProjectId],
       )
       const folders = queryAll<{ id: string; name: string }>(
-        'SELECT f.id, f.name FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? ORDER BY f.name',
-        [docId],
+        'SELECT f.id, f.name FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? AND f.library_project_id = ? ORDER BY f.name',
+        [docId, libraryProjectId],
       )
       const sanitized = sanitizeDocListItem(doc)
       const document: Record<string, unknown> = {
@@ -478,32 +489,48 @@ export async function callLibraryTool(
     }
 
     case 'list_folders': {
+      const libraryProjectId = getActiveLibraryProjectId()
       const folders = queryAll<{ id: string; name: string; parent_id: string | null; sort_order: number }>(
-        'SELECT id, name, parent_id, sort_order FROM folders ORDER BY sort_order ASC, name ASC',
+        'SELECT id, name, parent_id, sort_order FROM folders WHERE library_project_id = ? ORDER BY sort_order ASC, name ASC',
+        [libraryProjectId],
       )
       return { ok: true, folders }
     }
 
     case 'list_tags': {
+      const libraryProjectId = getActiveLibraryProjectId()
       const search = String(input.search || '').trim()
       const tags = search
         ? queryAll<{ id: string; name: string; usage_count: number }>(
-          'SELECT id, name, usage_count FROM tags WHERE name LIKE ? ORDER BY usage_count DESC, name ASC LIMIT 200',
-          [`%${search}%`],
+          'SELECT id, name, usage_count FROM tags WHERE library_project_id = ? AND name LIKE ? ORDER BY usage_count DESC, name ASC LIMIT 200',
+          [libraryProjectId, `%${search}%`],
         )
         : queryAll<{ id: string; name: string; usage_count: number }>(
-          'SELECT id, name, usage_count FROM tags ORDER BY usage_count DESC, name ASC LIMIT 500',
+          'SELECT id, name, usage_count FROM tags WHERE library_project_id = ? ORDER BY usage_count DESC, name ASC LIMIT 500',
+          [libraryProjectId],
         )
       return { ok: true, tags }
     }
 
     case 'library_stats': {
-      const documents = Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM documents')?.c || 0)
-      const pages = Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM pages')?.c || 0)
-      const folders = Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM folders')?.c || 0)
-      const tags = Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM tags')?.c || 0)
+      const libraryProjectId = getActiveLibraryProjectId()
+      const documentScopeSql = 'SELECT document_id FROM library_project_documents WHERE project_id = ?'
+      const documents = Number(queryOne<{ c: number }>(
+        `SELECT COUNT(*) as c FROM documents WHERE id IN (${documentScopeSql})`,
+        [libraryProjectId],
+      )?.c || 0)
+      const pages = Number(queryOne<{ c: number }>(
+        `SELECT COUNT(*) as c FROM pages WHERE doc_id IN (${documentScopeSql})`,
+        [libraryProjectId],
+      )?.c || 0)
+      const folders = Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM folders WHERE library_project_id = ?', [libraryProjectId])?.c || 0)
+      const tags = Number(queryOne<{ c: number }>('SELECT COUNT(*) as c FROM tags WHERE library_project_id = ?', [libraryProjectId])?.c || 0)
       const ocrCompleted = Number(
-        queryOne<{ c: number }>("SELECT COUNT(*) as c FROM documents WHERE ocr_status = 'completed'")?.c || 0,
+        queryOne<{ c: number }>(
+          `SELECT COUNT(*) as c FROM documents
+           WHERE ocr_status = 'completed' AND id IN (${documentScopeSql})`,
+          [libraryProjectId],
+        )?.c || 0,
       )
       return {
         ok: true,

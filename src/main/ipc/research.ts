@@ -369,8 +369,7 @@ function requireNoteInActiveLibrary(noteId: string): NoteRow {
   const note = queryOne<NoteRow>(
     `SELECT rn.*
      FROM research_notes rn
-     INNER JOIN documents d ON d.id = rn.doc_id
-     WHERE rn.id = ? AND d.library_project_id = ?`,
+     WHERE rn.id = ? AND rn.library_project_id = ?`,
     [noteId, getActiveLibraryProjectId()],
   )
   if (!note) throw new Error('Research note does not belong to the active library project')
@@ -405,7 +404,7 @@ function getProjectDocIds(projectId: string): string[] {
     `SELECT rpd.doc_id
      FROM research_project_documents rpd
      INNER JOIN documents d ON d.id = rpd.doc_id
-     WHERE rpd.project_id = ? AND d.library_project_id = ?
+     WHERE rpd.project_id = ? AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
      ORDER BY rpd.created_at DESC`,
     [projectId, getActiveLibraryProjectId()],
   ).map((item) => item.doc_id)
@@ -445,7 +444,7 @@ function listNotes(projectId?: string | null): NoteRow[] {
        END as source_available
      FROM research_notes rn
      INNER JOIN documents d ON rn.doc_id = d.id
-     WHERE d.library_project_id = ?
+     WHERE rn.library_project_id = ?
      ${projectId ? 'AND rn.project_id = ?' : ''}
      ORDER BY COALESCE(rn.sort_order, 0) ASC, rn.updated_at DESC`,
     params,
@@ -477,7 +476,7 @@ function splitResearchNoteTags(value: unknown): string[] {
 }
 
 function buildResearchNoteListWhere(options: ListResearchNotesOptions = {}): { sql: string; params: unknown[] } {
-  const clauses: string[] = ['d.library_project_id = ?']
+  const clauses: string[] = ['rn.library_project_id = ?']
   const params: unknown[] = [getActiveLibraryProjectId()]
   const projectId = String(options.projectId || '').trim()
   if (projectId) requireResearchProjectInActiveLibrary(projectId)
@@ -550,22 +549,22 @@ function getResearchNoteListStats(): ResearchNoteListPage['stats'] {
   const baseJoin = 'FROM research_notes rn INNER JOIN documents d ON rn.doc_id = d.id'
   const activeProjectId = getActiveLibraryProjectId()
   const total = Number(queryOne<{ count: number }>(
-    `SELECT COUNT(*) as count ${baseJoin} WHERE d.library_project_id = ?`,
+    `SELECT COUNT(*) as count ${baseJoin} WHERE rn.library_project_id = ?`,
     [activeProjectId],
   )?.count || 0)
   const documentCount = Number(queryOne<{ count: number }>(
-    `SELECT COUNT(DISTINCT rn.doc_id) as count ${baseJoin} WHERE d.library_project_id = ?`,
+    `SELECT COUNT(DISTINCT rn.doc_id) as count ${baseJoin} WHERE rn.library_project_id = ?`,
     [activeProjectId],
   )?.count || 0)
   const colorCount = Number(queryOne<{ count: number }>(
     `SELECT COUNT(DISTINCT LOWER(COALESCE(NULLIF(TRIM(rn.color), ''), ?))) as count
-     ${baseJoin} WHERE d.library_project_id = ?`,
+     ${baseJoin} WHERE rn.library_project_id = ?`,
     [DEFAULT_RESEARCH_NOTE_COLOR, activeProjectId],
   )?.count || 0)
   const tags = new Set<string>()
   queryAll<{ tags?: string | null }>(
     `SELECT rn.tags ${baseJoin}
-     WHERE d.library_project_id = ? AND TRIM(COALESCE(rn.tags, '')) <> ''`,
+     WHERE rn.library_project_id = ? AND TRIM(COALESCE(rn.tags, '')) <> ''`,
     [activeProjectId],
   )
     .forEach((row) => splitResearchNoteTags(row.tags).forEach((tag) => tags.add(tag)))
@@ -635,7 +634,7 @@ function deleteResearchNotes(ids: string[]): DeleteResearchNotesResult {
       run(
         `DELETE FROM research_notes
          WHERE id IN (${batch.map(() => '?').join(', ')})
-           AND doc_id IN (SELECT id FROM documents WHERE library_project_id = ?)`,
+           AND library_project_id = ?`,
         [...batch, getActiveLibraryProjectId()],
       )
       deleted += Number(queryOne<{ count: number }>('SELECT changes() as count')?.count || 0)
@@ -775,7 +774,8 @@ function buildResearchOutputSnapshotJson(options: {
 }
 
 function findDuplicateNote(note: ReturnType<typeof normalizeNotePayload>, excludeId?: string): { id: string } | null {
-  const params: unknown[] = [note.docId, note.sourceHash]
+  const libraryProjectId = getActiveLibraryProjectId()
+  const params: unknown[] = [libraryProjectId, note.docId, note.sourceHash]
   let excludeSql = ''
   if (excludeId) {
     excludeSql = 'AND id != ?'
@@ -784,18 +784,18 @@ function findDuplicateNote(note: ReturnType<typeof normalizeNotePayload>, exclud
   if (note.sourceHash) {
     const byHash = queryOne<{ id: string }>(
       `SELECT id FROM research_notes
-       WHERE doc_id = ? AND source_hash = ? ${excludeSql}
+       WHERE library_project_id = ? AND doc_id = ? AND source_hash = ? ${excludeSql}
        LIMIT 1`,
       params,
     )
     if (byHash) return byHash
   }
   if (note.locatorJson) return null
-  const excerptParams: unknown[] = [note.docId, note.excerpt]
+  const excerptParams: unknown[] = [libraryProjectId, note.docId, note.excerpt]
   if (excludeId) excerptParams.push(excludeId)
   return queryOne<{ id: string }>(
     `SELECT id FROM research_notes
-     WHERE doc_id = ? AND excerpt = ? ${excludeId ? 'AND id != ?' : ''}
+     WHERE library_project_id = ? AND doc_id = ? AND excerpt = ? ${excludeId ? 'AND id != ?' : ''}
      LIMIT 1`,
     excerptParams,
   )
@@ -1167,7 +1167,7 @@ export function registerResearchIpc(): void {
       `SELECT d.*
        FROM documents d
        INNER JOIN research_project_documents rpd ON d.id = rpd.doc_id
-       WHERE rpd.project_id = ? AND d.library_project_id = ?
+       WHERE rpd.project_id = ? AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        ORDER BY rpd.created_at DESC`,
       [projectId, getActiveLibraryProjectId()],
     )
@@ -1189,14 +1189,16 @@ export function registerResearchIpc(): void {
 
     const id = nanoid()
     const now = new Date().toISOString()
+    const libraryProjectId = getActiveLibraryProjectId()
     run(
       `INSERT INTO research_notes (
-        id, project_id, doc_id, page_num, excerpt, note, tags, source_type, source_id,
+        id, library_project_id, project_id, doc_id, page_num, excerpt, note, tags, source_type, source_id,
         kind, outline_id, color, locator_json, citation_text, source_hash, sort_order,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
+        libraryProjectId,
         note.projectId,
         note.docId,
         note.pageNum,
@@ -1259,7 +1261,7 @@ export function registerResearchIpc(): void {
        SET project_id = ?, doc_id = ?, page_num = ?, excerpt = ?, note = ?, tags = ?,
            source_type = ?, source_id = ?, kind = ?, outline_id = ?, color = ?,
            locator_json = ?, citation_text = ?, source_hash = ?, sort_order = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND library_project_id = ?`,
       [
         next.projectId,
         next.docId,
@@ -1278,6 +1280,7 @@ export function registerResearchIpc(): void {
         next.sortOrder,
         now,
         id,
+        getActiveLibraryProjectId(),
       ],
     )
     attachDocToProject(next.projectId, next.docId, now)
@@ -1550,28 +1553,52 @@ export function registerResearchIpc(): void {
   ipcMain.handle('research:getDashboard', async (): Promise<ResearchDashboardStats> => {
     const activeProjectId = getActiveLibraryProjectId()
     const totalDocuments = queryOne<{ count: number }>(
-      'SELECT COUNT(*) as count FROM documents WHERE library_project_id = ?',
+      `SELECT COUNT(*) as count FROM documents
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )`,
       [activeProjectId],
     )?.count || 0
     const recentReadCount = queryOne<{ count: number }>(
-      "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND last_opened_at IS NOT NULL AND last_opened_at >= datetime('now', '-14 days')",
+      `SELECT COUNT(*) as count FROM documents
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )
+         AND last_opened_at IS NOT NULL
+         AND last_opened_at >= datetime('now', '-14 days')`,
       [activeProjectId],
     )?.count || 0
     const pendingProofCount =
       queryOne<{ count: number }>(
-        "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND proof_status != 'completed'",
+        `SELECT COUNT(*) as count FROM documents
+         WHERE EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )
+           AND proof_status != 'completed'`,
         [activeProjectId],
       )?.count || 0
     const pendingMetadataCount =
       queryOne<{ count: number }>(
-        "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND metadata_status IN ('pending', 'review')",
+        `SELECT COUNT(*) as count FROM documents
+         WHERE EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )
+           AND metadata_status IN ('pending', 'review')`,
         [activeProjectId],
       )?.count || 0
     const aiReadyCount = queryOne<{ count: number }>(
       `SELECT COUNT(DISTINCT p.doc_id) as count
        FROM pages p
        INNER JOIN documents d ON d.id = p.doc_id
-       WHERE d.library_project_id = ?
+       WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          AND TRIM(COALESCE(p.proofed_text, '') || COALESCE(p.ocr_text, '')) != ''`,
       [activeProjectId],
     )?.count || 0
@@ -1582,12 +1609,16 @@ export function registerResearchIpc(): void {
     const noteCount = queryOne<{ count: number }>(
       `SELECT COUNT(*) as count
        FROM research_notes rn
-       INNER JOIN documents d ON d.id = rn.doc_id
-       WHERE d.library_project_id = ?`,
+       WHERE rn.library_project_id = ?`,
       [activeProjectId],
     )?.count || 0
     const docs = queryAll<DocumentRow>(
-      'SELECT author, metadata FROM documents WHERE library_project_id = ?',
+      `SELECT author, metadata FROM documents
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )`,
       [activeProjectId],
     )
     const citationMissingCount = docs.filter((doc) => {

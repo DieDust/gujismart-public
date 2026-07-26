@@ -363,6 +363,16 @@ CREATE TABLE IF NOT EXISTS documents (
   FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS library_project_documents (
+  project_id TEXT NOT NULL,
+  document_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, document_id),
+  FOREIGN KEY (project_id) REFERENCES library_projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS pages (
   id TEXT PRIMARY KEY,
   doc_id TEXT NOT NULL,
@@ -800,6 +810,7 @@ CREATE TABLE IF NOT EXISTS research_outline_items (
 
 CREATE TABLE IF NOT EXISTS research_notes (
   id TEXT PRIMARY KEY,
+  library_project_id TEXT,
   project_id TEXT,
   doc_id TEXT NOT NULL,
   page_num INTEGER,
@@ -817,6 +828,7 @@ CREATE TABLE IF NOT EXISTS research_notes (
   sort_order INTEGER DEFAULT 0,
   created_at TEXT,
   updated_at TEXT,
+  FOREIGN KEY (library_project_id) REFERENCES library_projects(id) ON DELETE CASCADE,
   FOREIGN KEY (project_id) REFERENCES research_projects(id) ON DELETE SET NULL,
   FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
   FOREIGN KEY (outline_id) REFERENCES research_outline_items(id) ON DELETE SET NULL
@@ -1542,6 +1554,7 @@ CREATE INDEX IF NOT EXISTS idx_citation_templates_style_id ON citation_templates
 CREATE INDEX IF NOT EXISTS idx_citation_templates_style_type ON citation_templates(style_id, format_type);
 CREATE INDEX IF NOT EXISTS idx_documents_import_status ON documents(import_status);
 CREATE INDEX IF NOT EXISTS idx_documents_library_project ON documents(library_project_id, import_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_library_project_documents_document ON library_project_documents(document_id, project_id);
 CREATE INDEX IF NOT EXISTS idx_folders_library_project ON folders(library_project_id, parent_id, sort_order);
 CREATE INDEX IF NOT EXISTS idx_documents_ocr_status ON documents(ocr_status);
 CREATE INDEX IF NOT EXISTS idx_documents_doc_type ON documents(doc_type);
@@ -1551,6 +1564,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_metadata_status ON documents(metadata_s
 CREATE INDEX IF NOT EXISTS idx_tags_normalized_name ON tags(normalized_name);
 CREATE INDEX IF NOT EXISTS idx_tags_library_project ON tags(library_project_id, normalized_name);
 CREATE INDEX IF NOT EXISTS idx_research_notes_project_id ON research_notes(project_id);
+CREATE INDEX IF NOT EXISTS idx_research_notes_library_project ON research_notes(library_project_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_research_notes_doc_id ON research_notes(doc_id);
 CREATE INDEX IF NOT EXISTS idx_research_notes_outline_id ON research_notes(outline_id);
 CREATE INDEX IF NOT EXISTS idx_research_notes_source_hash ON research_notes(doc_id, source_hash);
@@ -2427,10 +2441,30 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
         "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_library_project_id', ?)",
       ).run(defaultLibraryProjectId)
     }
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS library_project_documents (
+        project_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, document_id),
+        FOREIGN KEY (project_id) REFERENCES library_projects(id) ON DELETE CASCADE,
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+      );
+    `)
+    sqlite.prepare(
+      `INSERT OR IGNORE INTO library_project_documents
+       (project_id, document_id, created_at, updated_at)
+       SELECT library_project_id, id, COALESCE(created_at, ?), COALESCE(updated_at, created_at, ?)
+       FROM documents
+       WHERE library_project_id IS NOT NULL`,
+    ).run(libraryProjectMigrationNow, libraryProjectMigrationNow)
   })()
   sqlite.exec(`
     CREATE INDEX IF NOT EXISTS idx_documents_library_project
       ON documents(library_project_id, import_status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_library_project_documents_document
+      ON library_project_documents(document_id, project_id);
     CREATE TRIGGER IF NOT EXISTS trg_documents_assign_library_project
     AFTER INSERT ON documents
     WHEN NEW.library_project_id IS NULL
@@ -2448,6 +2482,43 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
         '${defaultLibraryProjectId}'
       )
       WHERE id = NEW.id;
+    END;
+    DROP TRIGGER IF EXISTS trg_documents_add_project_membership;
+    CREATE TRIGGER trg_documents_add_project_membership
+    AFTER INSERT ON documents
+    BEGIN
+      INSERT OR IGNORE INTO library_project_documents
+        (project_id, document_id, created_at, updated_at)
+      VALUES (
+        COALESCE(
+          (SELECT id FROM library_projects WHERE id = NEW.library_project_id),
+          (
+            SELECT s.value
+            FROM settings s
+            INNER JOIN library_projects lp ON lp.id = s.value
+            WHERE s.key = 'active_library_project_id'
+            LIMIT 1
+          ),
+          '${defaultLibraryProjectId}'
+        ),
+        NEW.id,
+        COALESCE(NEW.created_at, datetime('now')),
+        COALESCE(NEW.updated_at, NEW.created_at, datetime('now'))
+      );
+    END;
+    DROP TRIGGER IF EXISTS trg_documents_update_project_membership;
+    CREATE TRIGGER trg_documents_update_project_membership
+    AFTER UPDATE OF library_project_id ON documents
+    WHEN NEW.library_project_id IS NOT NULL
+    BEGIN
+      INSERT OR IGNORE INTO library_project_documents
+        (project_id, document_id, created_at, updated_at)
+      VALUES (
+        NEW.library_project_id,
+        NEW.id,
+        COALESCE(NEW.created_at, datetime('now')),
+        COALESCE(NEW.updated_at, NEW.created_at, datetime('now'))
+      );
     END;
   `)
 
@@ -2478,6 +2549,7 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   ).run(defaultLibraryProjectId)
 
   addColumnIfMissing(sqlite, 'folders', 'library_project_id TEXT', 'library_project_id')
+  addColumnIfMissing(sqlite, 'research_notes', 'library_project_id TEXT', 'library_project_id')
   addColumnIfMissing(sqlite, 'research_projects', 'library_project_id TEXT', 'library_project_id')
   addColumnIfMissing(sqlite, 'ai_research_tasks', 'library_project_id TEXT', 'library_project_id')
   addColumnIfMissing(sqlite, 'ai_research_datasets', 'library_project_id TEXT', 'library_project_id')
@@ -2517,6 +2589,16 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
        )
        WHERE library_project_id IS NULL
           OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = research_projects.library_project_id)`,
+    ).run(defaultLibraryProjectId)
+    sqlite.prepare(
+      `UPDATE research_notes
+       SET library_project_id = COALESCE(
+         (SELECT rp.library_project_id FROM research_projects rp WHERE rp.id = research_notes.project_id),
+         (SELECT d.library_project_id FROM documents d WHERE d.id = research_notes.doc_id),
+         ?
+       )
+       WHERE library_project_id IS NULL
+          OR NOT EXISTS (SELECT 1 FROM library_projects lp WHERE lp.id = research_notes.library_project_id)`,
     ).run(defaultLibraryProjectId)
     sqlite.prepare(
       `UPDATE ai_research_tasks
@@ -2563,6 +2645,28 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
       ON tags(library_project_id, normalized_name);
     CREATE INDEX IF NOT EXISTS idx_research_projects_library_project
       ON research_projects(library_project_id, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_research_notes_library_project
+      ON research_notes(library_project_id, updated_at);
+    DROP TRIGGER IF EXISTS trg_research_notes_assign_library_project;
+    CREATE TRIGGER trg_research_notes_assign_library_project
+    AFTER INSERT ON research_notes
+    WHEN NEW.library_project_id IS NULL
+    BEGIN
+      UPDATE research_notes
+      SET library_project_id = COALESCE(
+        (SELECT rp.library_project_id FROM research_projects rp WHERE rp.id = NEW.project_id),
+        (SELECT d.library_project_id FROM documents d WHERE d.id = NEW.doc_id),
+        (
+          SELECT s.value
+          FROM settings s
+          INNER JOIN library_projects lp ON lp.id = s.value
+          WHERE s.key = 'active_library_project_id'
+          LIMIT 1
+        ),
+        '${defaultLibraryProjectId}'
+      )
+      WHERE id = NEW.id;
+    END;
     CREATE INDEX IF NOT EXISTS idx_ai_research_tasks_library_project
       ON ai_research_tasks(library_project_id, updated_at);
     CREATE INDEX IF NOT EXISTS idx_ai_research_datasets_library_project

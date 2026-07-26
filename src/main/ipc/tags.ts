@@ -45,7 +45,7 @@ export function registerTagIpc(): void {
         FROM document_tags dt
         INNER JOIN documents d ON d.id = dt.doc_id
         WHERE dt.tag_id = t.id
-          AND d.library_project_id = ?
+          AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
           AND COALESCE(d.import_status, '') <> 'deleting'
       ) AS usage_count
       FROM tags t
@@ -158,7 +158,9 @@ export function registerTagIpc(): void {
       run(
         `DELETE FROM document_tags
          WHERE tag_id = ?
-           AND doc_id IN (SELECT id FROM documents WHERE library_project_id = ?)`,
+           AND doc_id IN (
+             SELECT document_id FROM library_project_documents WHERE project_id = ?
+           )`,
         [id, libraryProjectId],
       )
       run('DELETE FROM tags WHERE id = ? AND library_project_id = ?', [id, libraryProjectId])

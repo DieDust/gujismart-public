@@ -64,7 +64,7 @@ export function buildCumulativeFolderDocumentCounts(libraryProjectId?: string): 
      FROM document_folders df
      INNER JOIN documents d ON d.id = df.doc_id
      WHERE COALESCE(d.import_status, '') <> 'deleting'
-       AND d.library_project_id = ?`,
+       AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
     [projectId],
   ).forEach((row) => {
     if (!row.folder_id || !row.doc_id) return

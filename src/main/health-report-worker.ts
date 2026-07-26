@@ -231,11 +231,11 @@ function buildDocumentHealthReport(sqlite: NativeDatabase, libraryProjectId: str
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND ${buildPageContentAvailableCondition('p')}) as text_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p')}) as ocr_completed_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
-      (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
+      (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id AND rn.library_project_id = ?) as research_note_count,
       (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count
     FROM documents d
-    WHERE d.library_project_id = ?`,
-    [libraryProjectId],
+    WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
+    [libraryProjectId, libraryProjectId],
   )
   const rows = docs
     .map((doc) => {
@@ -254,7 +254,7 @@ function buildDocumentHealthReport(sqlite: NativeDatabase, libraryProjectId: str
       SUM(CASE WHEN ${buildPageContentAvailableCondition('pages')} THEN 1 ELSE 0 END) as text_pages
     FROM pages
     INNER JOIN documents d ON d.id = pages.doc_id
-    WHERE d.library_project_id = ?`,
+    WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
     [libraryProjectId],
   )
 
@@ -270,18 +270,29 @@ function buildDocumentHealthReport(sqlite: NativeDatabase, libraryProjectId: str
         `SELECT COUNT(*) as count
          FROM search_index_segments sis
          INNER JOIN documents d ON d.id = sis.doc_id
-         WHERE d.library_project_id = ?`,
+         WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
         [libraryProjectId],
       )?.count || 0),
-      tags: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM tags')?.count || 0),
-      folders: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM folders')?.count || 0),
-      researchProjects: Number(queryOne<{ count: number }>(sqlite, 'SELECT COUNT(*) as count FROM research_projects')?.count || 0),
+      tags: Number(queryOne<{ count: number }>(
+        sqlite,
+        'SELECT COUNT(*) as count FROM tags WHERE library_project_id = ?',
+        [libraryProjectId],
+      )?.count || 0),
+      folders: Number(queryOne<{ count: number }>(
+        sqlite,
+        'SELECT COUNT(*) as count FROM folders WHERE library_project_id = ?',
+        [libraryProjectId],
+      )?.count || 0),
+      researchProjects: Number(queryOne<{ count: number }>(
+        sqlite,
+        'SELECT COUNT(*) as count FROM research_projects WHERE library_project_id = ?',
+        [libraryProjectId],
+      )?.count || 0),
       researchNotes: Number(queryOne<{ count: number }>(
         sqlite,
         `SELECT COUNT(*) as count
          FROM research_notes rn
-         INNER JOIN documents d ON d.id = rn.doc_id
-         WHERE d.library_project_id = ?`,
+         WHERE rn.library_project_id = ?`,
         [libraryProjectId],
       )?.count || 0),
       missingAuthor: countIssue('missing_author'),

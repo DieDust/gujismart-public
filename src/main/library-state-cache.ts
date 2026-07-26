@@ -250,7 +250,7 @@ function unknownTypeFilter(): string {
 }
 
 function activeDocumentWhere(extra = '1 = 1'): string {
-  return `WHERE d.library_project_id = ? AND COALESCE(d.import_status, '') <> 'deleting' AND ${extra}`
+  return `WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?) AND COALESCE(d.import_status, '') <> 'deleting' AND ${extra}`
 }
 
 function buildFolderCounts(projectId: string): Record<string, number> {
@@ -263,7 +263,7 @@ function buildTagCounts(projectId: string): Record<string, number> {
      FROM tags t
      LEFT JOIN document_tags dt ON dt.tag_id = t.id
      LEFT JOIN documents d ON d.id = dt.doc_id
-       AND d.library_project_id = ?
+       AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        AND COALESCE(d.import_status, '') <> 'deleting'
      WHERE t.library_project_id = ?
      GROUP BY t.id`,
@@ -285,7 +285,7 @@ function buildCache(): LibraryStateCache {
     proofed: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.proof_status = 'completed'")}`, [projectId]),
     unproofed: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("COALESCE(d.proof_status, 'pending') <> 'completed'")}`, [projectId]),
     metadataPending: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.metadata_status IN ('pending', 'review')")}`, [projectId]),
-    unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE d.library_project_id = ? AND d.import_status = 'unstored'`, [projectId]),
+    unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?) AND d.import_status = 'unstored'`, [projectId]),
     vectorized: count(
       `SELECT COUNT(*) AS count FROM documents d
        ${activeDocumentWhere(embeddingStatusExistsSql('ready'))}`, [projectId],
@@ -312,10 +312,16 @@ function buildCache(): LibraryStateCache {
     unfiledDocumentTotal: count(
       `SELECT COUNT(*) AS count
        FROM documents d
-       WHERE d.library_project_id = ?
+       WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          AND COALESCE(d.import_status, '') <> 'deleting'
-         AND NOT EXISTS (SELECT 1 FROM document_folders df_unfiled WHERE df_unfiled.doc_id = d.id)`,
-      [projectId],
+         AND NOT EXISTS (
+           SELECT 1
+           FROM document_folders df_unfiled
+           INNER JOIN folders f_unfiled ON f_unfiled.id = df_unfiled.folder_id
+           WHERE df_unfiled.doc_id = d.id
+             AND f_unfiled.library_project_id = ?
+         )`,
+      [projectId, projectId],
     ),
     folderDocumentCounts: buildFolderCounts(projectId),
     tagDocumentCounts: buildTagCounts(projectId),

@@ -6895,7 +6895,13 @@ async function processImportAutoOcrClaim(
   }
 
   const doc = queryOne<{ id: string; page_count: number | null }>(
-    'SELECT id, page_count FROM documents WHERE id = ? AND library_project_id = ?',
+    `SELECT id, page_count FROM documents
+     WHERE id = ?
+       AND EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )`,
     [docId, libraryProjectId],
   )
   if (!doc) {

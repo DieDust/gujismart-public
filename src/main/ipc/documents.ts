@@ -1,4 +1,4 @@
-﻿import { ipcMain, dialog } from 'electron'
+import { ipcMain, dialog } from 'electron'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
 import type { WebContents } from 'electron'
@@ -49,6 +49,7 @@ import { importSelectionService } from '../import-selections'
 import {
   assertDocumentInLibraryProject,
   captureActiveLibraryProjectId,
+  ensureDocumentLibraryProjectMembership,
   getActiveLibraryProjectId,
   withLibraryProjectContext,
 } from '../library-projects'
@@ -434,8 +435,14 @@ function getDocumentsForDelete(docIds: string[]): DocumentFileRow[] {
   const rows: DocumentFileRow[] = []
   runForIdChunks(docIds, (chunkIds, placeholders) => {
     rows.push(...queryAll<DocumentFileRow>(
-      `SELECT id FROM documents WHERE id IN (${placeholders})`,
-      chunkIds,
+      `SELECT id FROM documents
+       WHERE id IN (${placeholders})
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
+      [...chunkIds, getActiveLibraryProjectId()],
     ))
   })
   return rows
@@ -2898,7 +2905,7 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
       FROM documents d`
 
   const params: unknown[] = [getActiveLibraryProjectId()]
-  const conditions: string[] = ['d.library_project_id = ?']
+  const conditions: string[] = ['EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)']
 
   if (requestedFolderIds.length > 0 && scopedFolderIds.length === 0) {
     conditions.push('1 = 0')
@@ -2908,7 +2915,14 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
     params.push(...scopedFolderIds)
   }
   if (options?.unfiledOnly) {
-    conditions.push('NOT EXISTS (SELECT 1 FROM document_folders df_unfiled WHERE df_unfiled.doc_id = d.id)')
+    conditions.push(`NOT EXISTS (
+      SELECT 1
+      FROM document_folders df_unfiled
+      INNER JOIN folders f_unfiled ON f_unfiled.id = df_unfiled.folder_id
+      WHERE df_unfiled.doc_id = d.id
+        AND f_unfiled.library_project_id = ?
+    )`)
+    params.push(getActiveLibraryProjectId())
   }
 
   if (options?.tagId) {
@@ -3727,11 +3741,11 @@ function getDocumentHealthReport(libraryProjectId = getActiveLibraryProjectId())
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND ${buildPageContentAvailableCondition('p')}) as text_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.ocr_status = 'completed' AND ${buildPageContentAvailableCondition('p')}) as ocr_completed_page_count,
       (SELECT COUNT(*) FROM pages p WHERE p.doc_id = d.id AND p.image_path IS NOT NULL AND TRIM(p.image_path) <> '') as image_page_count,
-      (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id) as research_note_count,
+      (SELECT COUNT(*) FROM research_notes rn WHERE rn.doc_id = d.id AND rn.library_project_id = ?) as research_note_count,
       (SELECT COUNT(*) FROM search_index_segments sis WHERE sis.doc_id = d.id) as search_segment_count
     FROM documents d
-    WHERE d.library_project_id = ?`,
-    [libraryProjectId],
+    WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
+    [libraryProjectId, libraryProjectId],
   )
   const rows = docs
     .map(buildDocumentHealthRow)
@@ -3743,7 +3757,7 @@ function getDocumentHealthReport(libraryProjectId = getActiveLibraryProjectId())
       SUM(CASE WHEN ${buildPageContentAvailableCondition('pages')} THEN 1 ELSE 0 END) as text_pages
     FROM pages
     INNER JOIN documents d ON d.id = pages.doc_id
-    WHERE d.library_project_id = ?`,
+    WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
     [libraryProjectId],
   )
 
@@ -3758,17 +3772,25 @@ function getDocumentHealthReport(libraryProjectId = getActiveLibraryProjectId())
         `SELECT COUNT(*) as count
          FROM search_index_segments sis
          INNER JOIN documents d ON d.id = sis.doc_id
-         WHERE d.library_project_id = ?`,
+         WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
         [libraryProjectId],
       )?.count || 0),
-      tags: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM tags')?.count || 0),
-      folders: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM folders')?.count || 0),
-      researchProjects: Number(queryOne<{ count: number }>('SELECT COUNT(*) as count FROM research_projects')?.count || 0),
+      tags: Number(queryOne<{ count: number }>(
+        'SELECT COUNT(*) as count FROM tags WHERE library_project_id = ?',
+        [libraryProjectId],
+      )?.count || 0),
+      folders: Number(queryOne<{ count: number }>(
+        'SELECT COUNT(*) as count FROM folders WHERE library_project_id = ?',
+        [libraryProjectId],
+      )?.count || 0),
+      researchProjects: Number(queryOne<{ count: number }>(
+        'SELECT COUNT(*) as count FROM research_projects WHERE library_project_id = ?',
+        [libraryProjectId],
+      )?.count || 0),
       researchNotes: Number(queryOne<{ count: number }>(
         `SELECT COUNT(*) as count
          FROM research_notes rn
-         INNER JOIN documents d ON d.id = rn.doc_id
-         WHERE d.library_project_id = ?`,
+         WHERE rn.library_project_id = ?`,
         [libraryProjectId],
       )?.count || 0),
       missingAuthor: countIssue('missing_author'),
@@ -4208,14 +4230,13 @@ export function registerDocumentIpc(): void {
           const possibleDuplicate = queryOne<{ id: string }>(
              `SELECT id
               FROM documents
-              WHERE library_project_id = ?
-                AND COALESCE(import_status, '') <> 'deleting'
+              WHERE COALESCE(import_status, '') <> 'deleting'
                AND (
                  json_extract(metadata, '$.pdf_size_bytes') = ?
                  OR json_extract(metadata, '$.pdf_original_size_bytes') = ?
                )
              LIMIT 1`,
-            [libraryProjectId, sourceStats.size, sourceStats.size],
+            [sourceStats.size, sourceStats.size],
           )
           if (possibleDuplicate?.id) {
             pdfFingerprint = await getPdfFingerprintAsync(filePath, ({ bytesDone, totalBytes }) => {
@@ -4239,12 +4260,11 @@ export function registerDocumentIpc(): void {
           const existing = queryOne<ExistingPdfImportRow>(
              `SELECT id, title, file_path, metadata
               FROM documents
-              WHERE library_project_id = ?
-                AND json_extract(metadata, '$.pdf_sha256') = ?
+              WHERE json_extract(metadata, '$.pdf_sha256') = ?
                AND COALESCE(import_status, '') <> 'deleting'
              ORDER BY updated_at DESC
              LIMIT 1`,
-            [libraryProjectId, pdfFingerprint.sha256],
+            [pdfFingerprint.sha256],
           )
           if (existing?.id) {
             const existingPdfPath = resolveManagedStoragePath(existing.file_path, existing.id)
@@ -4254,6 +4274,7 @@ export function registerDocumentIpc(): void {
             if (!restored.restored) {
               throw new Error(restored.error || 'PDF 补回失败')
             }
+            ensureDocumentLibraryProjectMembership(existing.id, libraryProjectId)
             results.push({
               id: existing.id,
               title: existing.title,
@@ -4447,12 +4468,11 @@ export function registerDocumentIpc(): void {
             const existing = queryOne<ExistingPdfImportRow>(
               `SELECT id, title, file_path, metadata
                FROM documents
-               WHERE library_project_id = ?
-                 AND json_extract(metadata, '$.pdf_sha256') = ?
+               WHERE json_extract(metadata, '$.pdf_sha256') = ?
                  AND COALESCE(import_status, '') <> 'deleting'
                ORDER BY updated_at DESC
                LIMIT 1`,
-              [libraryProjectId, pdfFingerprint.sha256],
+              [pdfFingerprint.sha256],
             )
             if (existing?.id) {
               const existingPdfPath = resolveManagedStoragePath(existing.file_path, existing.id)
@@ -4462,6 +4482,7 @@ export function registerDocumentIpc(): void {
               if (!restored.restored) {
                 throw new Error(restored.error || 'PDF 补回失败')
               }
+              ensureDocumentLibraryProjectMembership(existing.id, libraryProjectId)
               results.push({
                 id: existing.id,
                 title: existing.title,
@@ -4677,7 +4698,11 @@ export function registerDocumentIpc(): void {
     }>(
       `SELECT id, title, author, doc_type, page_count, ocr_status
        FROM documents
-       WHERE library_project_id = ?
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )
          AND COALESCE(import_status, '') <> 'deleting'
        ORDER BY updated_at DESC, created_at DESC`,
       [activeProjectId],
@@ -4690,7 +4715,13 @@ export function registerDocumentIpc(): void {
 
   ipcMain.handle('documents:get', async (_event, id: string): Promise<DocumentDetail | null> => {
     const doc = queryOne<Document>(
-      'SELECT * FROM documents WHERE id = ? AND library_project_id = ?',
+      `SELECT * FROM documents
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [id, getActiveLibraryProjectId()],
     )
     if (!doc) return null
@@ -4699,8 +4730,8 @@ export function registerDocumentIpc(): void {
     await ensureDeferredPdfPageRecordsReadyForRead(doc)
 
     const pages = hydratePagePayloadRows(queryAll<DocumentPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [id]))
-    const tags = queryAll<Tag>('SELECT t.* FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? ORDER BY t.usage_count DESC, t.name ASC', [id])
-    const folders = queryAll<Folder>('SELECT f.* FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? ORDER BY f.sort_order ASC, f.name ASC', [id])
+    const tags = queryAll<Tag>('SELECT t.* FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? AND t.library_project_id = ? ORDER BY t.usage_count DESC, t.name ASC', [id, getActiveLibraryProjectId()])
+    const folders = queryAll<Folder>('SELECT f.* FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? AND f.library_project_id = ? ORDER BY f.sort_order ASC, f.name ASC', [id, getActiveLibraryProjectId()])
 
     const storageDir = join(getDataDir(), 'storage')
     if (doc.file_path) doc.file_path = migratePath(doc.file_path, storageDir)
@@ -4729,7 +4760,13 @@ export function registerDocumentIpc(): void {
 
   ipcMain.handle('documents:getLight', async (_event, id: string): Promise<DocumentLightDetail | null> => {
     const doc = queryOne<Document>(
-      'SELECT * FROM documents WHERE id = ? AND library_project_id = ?',
+      `SELECT * FROM documents
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [id, getActiveLibraryProjectId()],
     )
     if (!doc) return null
@@ -4757,8 +4794,8 @@ export function registerDocumentIpc(): void {
       WHERE doc_id = ?
       ORDER BY page_num
     `, [id])
-    const tags = queryAll<Tag>('SELECT t.* FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? ORDER BY t.usage_count DESC, t.name ASC', [id])
-    const folders = queryAll<Folder>('SELECT f.* FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? ORDER BY f.sort_order ASC, f.name ASC', [id])
+    const tags = queryAll<Tag>('SELECT t.* FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? AND t.library_project_id = ? ORDER BY t.usage_count DESC, t.name ASC', [id, getActiveLibraryProjectId()])
+    const folders = queryAll<Folder>('SELECT f.* FROM folders f INNER JOIN document_folders df ON f.id = df.folder_id WHERE df.doc_id = ? AND f.library_project_id = ? ORDER BY f.sort_order ASC, f.name ASC', [id, getActiveLibraryProjectId()])
 
     const storageDir = join(getDataDir(), 'storage')
     if (doc.file_path) doc.file_path = migratePath(doc.file_path, storageDir)
@@ -4958,7 +4995,13 @@ export function registerDocumentIpc(): void {
     rejectProtectedPathFields(data, ['file_path', 'thumb_path'])
     const libraryProjectId = getActiveLibraryProjectId()
     const doc = queryOne<Document>(
-      'SELECT * FROM documents WHERE id = ? AND library_project_id = ?',
+      `SELECT * FROM documents
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [id, libraryProjectId],
     )
     if (!doc) return false
@@ -5005,7 +5048,16 @@ export function registerDocumentIpc(): void {
 
     sets.push('updated_at = ?')
     params.push(new Date().toISOString(), id, libraryProjectId)
-    run(`UPDATE documents SET ${sets.join(', ')} WHERE id = ? AND library_project_id = ?`, params)
+    run(
+      `UPDATE documents SET ${sets.join(', ')}
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
+      params,
+    )
     if (
       'metadata' in data
       || 'doc_type' in data
@@ -5029,13 +5081,25 @@ export function registerDocumentIpc(): void {
   ipcMain.handle('documents:toggleFavorite', async (_event, id: string, nextValue?: boolean) => {
     const libraryProjectId = getActiveLibraryProjectId()
     const doc = queryOne<{ is_favorite: number }>(
-      'SELECT is_favorite FROM documents WHERE id = ? AND library_project_id = ?',
+      `SELECT is_favorite FROM documents
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [id, libraryProjectId],
     )
     if (!doc) return false
     const isFavorite = typeof nextValue === 'boolean' ? nextValue : doc.is_favorite !== 1
     run(
-      'UPDATE documents SET is_favorite = ?, favorite_at = ?, updated_at = ? WHERE id = ? AND library_project_id = ?',
+      `UPDATE documents SET is_favorite = ?, favorite_at = ?, updated_at = ?
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [isFavorite ? 1 : 0, isFavorite ? new Date().toISOString() : null, new Date().toISOString(), id, libraryProjectId]
     )
     scheduleDatabaseSave()
@@ -5047,7 +5111,13 @@ export function registerDocumentIpc(): void {
     const libraryProjectId = getActiveLibraryProjectId()
     assertDocumentInLibraryProject(id, libraryProjectId)
     run(
-      'UPDATE documents SET read_status = ?, updated_at = ? WHERE id = ? AND library_project_id = ?',
+      `UPDATE documents SET read_status = ?, updated_at = ?
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [readStatus, new Date().toISOString(), id, libraryProjectId],
     )
     scheduleDatabaseSave()
@@ -5059,7 +5129,13 @@ export function registerDocumentIpc(): void {
     const libraryProjectId = getActiveLibraryProjectId()
     assertDocumentInLibraryProject(id, libraryProjectId)
     run(
-      'UPDATE documents SET rating = ?, updated_at = ? WHERE id = ? AND library_project_id = ?',
+      `UPDATE documents SET rating = ?, updated_at = ?
+       WHERE id = ?
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [rating, new Date().toISOString(), id, libraryProjectId],
     )
     scheduleDatabaseSave()
@@ -5412,7 +5488,11 @@ export function registerDocumentIpc(): void {
   ipcMain.handle('documents:deleteZeroPage', async (): Promise<DeleteDocumentsResult> => {
     const rows = queryAll<{ id: string }>(
       `SELECT id FROM documents
-       WHERE library_project_id = ?
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )
          AND COALESCE(page_count, 0) <= 0
          AND COALESCE(import_status, '') <> 'deleting'`,
       [getActiveLibraryProjectId()],

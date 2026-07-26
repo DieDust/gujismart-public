@@ -13,6 +13,7 @@ import {
 import { hydratePagePayloadRow } from './page-payload-store'
 import { buildTranslationUnitDrafts } from '../shared/translation-units'
 import {
+  type AddDocumentsToLibraryProjectResult,
   type CopyDocumentsToLibraryProjectResult,
   DEFAULT_LIBRARY_PROJECT_ID,
   type CreateLibraryProjectPayload,
@@ -65,10 +66,10 @@ export function filterDocumentIdsForLibraryProject(documentIds: string[], projec
     const chunk = uniqueIds.slice(offset, offset + 400)
     const placeholders = chunk.map(() => '?').join(', ')
     const rows = sqlite.prepare(
-      `SELECT id
-       FROM documents
-       WHERE library_project_id = ?
-         AND id IN (${placeholders})`,
+      `SELECT document_id AS id
+       FROM library_project_documents
+       WHERE project_id = ?
+         AND document_id IN (${placeholders})`,
     ).all(normalizedProjectId, ...chunk) as Array<{ id: string }>
     matched.push(...rows.map((row) => row.id))
   }
@@ -93,6 +94,27 @@ export function assertDocumentInLibraryProject(documentId: string, projectId: st
   return normalizedId
 }
 
+export function ensureDocumentLibraryProjectMembership(documentId: string, projectId: string): boolean {
+  const normalizedDocumentId = String(documentId || '').trim()
+  const normalizedProjectId = requireLibraryProjectId(projectId)
+  if (!normalizedDocumentId) throw new Error('文献不存在')
+  const sqlite = getDatabase()
+  if (!sqlite.prepare('SELECT 1 FROM documents WHERE id = ?').get(normalizedDocumentId)) {
+    throw new Error('文献不存在')
+  }
+  const now = new Date().toISOString()
+  const result = sqlite.prepare(
+    `INSERT OR IGNORE INTO library_project_documents
+     (project_id, document_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(normalizedProjectId, normalizedDocumentId, now, now)
+  if (result.changes > 0) {
+    sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id = ?').run(now, normalizedProjectId)
+    scheduleDatabaseSave()
+  }
+  return result.changes > 0
+}
+
 function normalizeProject(row: ProjectRow): LibraryProject {
   return {
     ...row,
@@ -114,7 +136,8 @@ export function listLibraryProjects(): LibraryProject[] {
        lp.updated_at,
        COUNT(CASE WHEN d.import_status != 'deleting' THEN 1 END) AS document_count
      FROM library_projects lp
-     LEFT JOIN documents d ON d.library_project_id = lp.id
+     LEFT JOIN library_project_documents lpd ON lpd.project_id = lp.id
+     LEFT JOIN documents d ON d.id = lpd.document_id
      GROUP BY lp.id
      ORDER BY lp.is_default DESC, lp.updated_at DESC, lp.name COLLATE NOCASE ASC`,
   ).all() as ProjectRow[]
@@ -325,12 +348,18 @@ function ensureFolderInLibraryProject(
 
 function remapDocumentOrganizationForProject(
   documentId: string,
+  sourceProjectId: string,
   targetProjectId: string,
   tagMapping: Map<string, string>,
   folderMapping: Map<string, string>,
 ): void {
   const sqlite = getDatabase()
-  const tagIds = sqlite.prepare('SELECT tag_id FROM document_tags WHERE doc_id = ?').all(documentId) as Array<{ tag_id: string }>
+  const tagIds = sqlite.prepare(
+    `SELECT dt.tag_id
+     FROM document_tags dt
+     INNER JOIN tags t ON t.id = dt.tag_id
+     WHERE dt.doc_id = ? AND t.library_project_id = ?`,
+  ).all(documentId, sourceProjectId) as Array<{ tag_id: string }>
   tagIds.forEach(({ tag_id: sourceTagId }) => {
     const targetTagId = ensureTagInLibraryProject(sourceTagId, targetProjectId, tagMapping)
     if (targetTagId === sourceTagId) return
@@ -344,7 +373,12 @@ function remapDocumentOrganizationForProject(
     sqlite.prepare('DELETE FROM document_tags WHERE doc_id = ? AND tag_id = ?').run(documentId, sourceTagId)
   })
 
-  const folderIds = sqlite.prepare('SELECT folder_id FROM document_folders WHERE doc_id = ?').all(documentId) as Array<{ folder_id: string }>
+  const folderIds = sqlite.prepare(
+    `SELECT df.folder_id
+     FROM document_folders df
+     INNER JOIN folders f ON f.id = df.folder_id
+     WHERE df.doc_id = ? AND f.library_project_id = ?`,
+  ).all(documentId, sourceProjectId) as Array<{ folder_id: string }>
   folderIds.forEach(({ folder_id: sourceFolderId }) => {
     const targetFolderId = ensureFolderInLibraryProject(sourceFolderId, targetProjectId, folderMapping)
     if (targetFolderId === sourceFolderId) return
@@ -573,24 +607,52 @@ function remapEmbeddedCopyReferences(value: SqliteValue, mappings: Map<string, s
 function copyDocumentOrganizationToProject(
   sourceDocumentId: string,
   copiedDocumentId: string,
+  sourceProjectId: string,
   targetProjectId: string,
   tagMapping: Map<string, string>,
   folderMapping: Map<string, string>,
 ): void {
-  cloneDocumentRows('document_tags', 'doc_id = ?', [sourceDocumentId], (row) => ({
-    ...row,
-    doc_id: copiedDocumentId,
-    tag_id: ensureTagInLibraryProject(String(row.tag_id || ''), targetProjectId, tagMapping),
-  }))
-  cloneDocumentRows('document_folders', 'doc_id = ?', [sourceDocumentId], (row) => ({
-    ...row,
-    doc_id: copiedDocumentId,
-    folder_id: ensureFolderInLibraryProject(String(row.folder_id || ''), targetProjectId, folderMapping),
-  }))
+  const sqlite = getDatabase()
+  const tagRows = sqlite.prepare(
+    `SELECT dt.*
+     FROM document_tags dt
+     INNER JOIN tags t ON t.id = dt.tag_id
+     WHERE dt.doc_id = ? AND t.library_project_id = ?`,
+  ).all(sourceDocumentId, sourceProjectId) as SqliteRow[]
+  tagRows.forEach((row) => {
+    sqlite.prepare(
+      `INSERT OR IGNORE INTO document_tags
+       (doc_id, tag_id, is_manual, is_metadata, source_field, confidence, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      copiedDocumentId,
+      ensureTagInLibraryProject(String(row.tag_id || ''), targetProjectId, tagMapping),
+      row.is_manual,
+      row.is_metadata,
+      row.source_field,
+      row.confidence,
+      row.created_at,
+      row.updated_at,
+    )
+  })
+  const folderRows = sqlite.prepare(
+    `SELECT df.*
+     FROM document_folders df
+     INNER JOIN folders f ON f.id = df.folder_id
+     WHERE df.doc_id = ? AND f.library_project_id = ?`,
+  ).all(sourceDocumentId, sourceProjectId) as SqliteRow[]
+  folderRows.forEach((row) => {
+    sqlite.prepare('INSERT OR IGNORE INTO document_folders (doc_id, folder_id) VALUES (?, ?)')
+      .run(
+        copiedDocumentId,
+        ensureFolderInLibraryProject(String(row.folder_id || ''), targetProjectId, folderMapping),
+      )
+  })
 }
 
 function copyDocumentDatabaseRows(
   plan: DocumentCopyPlan,
+  sourceProjectId: string,
   targetProjectId: string,
   tagMapping: Map<string, string>,
   folderMapping: Map<string, string>,
@@ -712,9 +774,14 @@ function copyDocumentDatabaseRows(
     ...row,
     doc_id: plan.copiedDocumentId,
   }))
-  cloneDocumentRows('research_notes', 'doc_id = ?', [plan.sourceDocumentId], (row) => ({
+  cloneDocumentRows(
+    'research_notes',
+    'doc_id = ? AND library_project_id = ?',
+    [plan.sourceDocumentId, sourceProjectId],
+    (row) => ({
     ...row,
     id: `research_note_${randomUUID()}`,
+    library_project_id: targetProjectId,
     project_id: null,
     doc_id: plan.copiedDocumentId,
     outline_id: null,
@@ -725,6 +792,7 @@ function copyDocumentDatabaseRows(
   copyDocumentOrganizationToProject(
     plan.sourceDocumentId,
     plan.copiedDocumentId,
+    sourceProjectId,
     targetProjectId,
     tagMapping,
     folderMapping,
@@ -774,7 +842,7 @@ export async function copyDocumentsToLibraryProject(
     const folderMapping = new Map<string, string>()
     sqlite.transaction(() => {
       plans.forEach((plan) => {
-        copyDocumentDatabaseRows(plan, normalizedTargetId, tagMapping, folderMapping)
+        copyDocumentDatabaseRows(plan, sourceProjectId, normalizedTargetId, tagMapping, folderMapping)
       })
       sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id = ?')
         .run(new Date().toISOString(), normalizedTargetId)
@@ -813,6 +881,65 @@ export async function copyDocumentsToLibraryProject(
   }
 }
 
+export function addDocumentsToLibraryProject(
+  documentIds: string[],
+  targetProjectId: string,
+): AddDocumentsToLibraryProjectResult {
+  const uniqueIds = [...new Set((documentIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  const normalizedTargetId = requireLibraryProjectId(String(targetProjectId || '').trim())
+  const sourceProjectId = getActiveLibraryProjectId()
+  if (normalizedTargetId === sourceProjectId) throw new Error('目标项目不能与当前项目相同')
+  if (uniqueIds.length === 0) {
+    return {
+      requested: 0,
+      added: 0,
+      already_present: 0,
+      source_project_id: sourceProjectId,
+      target_project_id: normalizedTargetId,
+    }
+  }
+  assertDocumentIdsInLibraryProject(uniqueIds, sourceProjectId)
+
+  const sqlite = getDatabase()
+  const tagMapping = new Map<string, string>()
+  const folderMapping = new Map<string, string>()
+  let added = 0
+  sqlite.transaction(() => {
+    const now = new Date().toISOString()
+    uniqueIds.forEach((documentId) => {
+      const result = sqlite.prepare(
+        `INSERT OR IGNORE INTO library_project_documents
+         (project_id, document_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run(normalizedTargetId, documentId, now, now)
+      added += result.changes
+      copyDocumentOrganizationToProject(
+        documentId,
+        documentId,
+        sourceProjectId,
+        normalizedTargetId,
+        tagMapping,
+        folderMapping,
+      )
+    })
+    sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id IN (?, ?)')
+      .run(now, sourceProjectId, normalizedTargetId)
+  })()
+  try {
+    refreshTagUsageForTags([...new Set(tagMapping.values())])
+  } catch (error) {
+    console.warn('[LibraryProjects] Failed to refresh linked tag usage:', error)
+  }
+  scheduleDatabaseSave()
+  return {
+    requested: uniqueIds.length,
+    added,
+    already_present: uniqueIds.length - added,
+    source_project_id: sourceProjectId,
+    target_project_id: normalizedTargetId,
+  }
+}
+
 export function moveDocumentsToLibraryProject(
   documentIds: string[],
   targetProjectId: string,
@@ -833,41 +960,54 @@ export function moveDocumentsToLibraryProject(
   }
 
   const sourceProjectId = getActiveLibraryProjectId()
+  if (normalizedTargetId === sourceProjectId) throw new Error('目标项目不能与当前项目相同')
   assertDocumentIdsInLibraryProject(uniqueIds, sourceProjectId)
-  const fromProjectIds = new Set<string>()
   const tagMapping = new Map<string, string>()
   const folderMapping = new Map<string, string>()
   let moved = 0
   sqlite.transaction(() => {
+    const now = new Date().toISOString()
     for (let offset = 0; offset < uniqueIds.length; offset += 400) {
       const chunk = uniqueIds.slice(offset, offset + 400)
       const placeholders = chunk.map(() => '?').join(', ')
-      const rows = sqlite.prepare(
-        `SELECT DISTINCT library_project_id
-         FROM documents
-         WHERE id IN (${placeholders}) AND library_project_id != ?`,
-      ).all(...chunk, normalizedTargetId) as Array<{ library_project_id?: string }>
-      rows.forEach((row) => {
-        if (row.library_project_id) fromProjectIds.add(row.library_project_id)
-      })
       chunk.forEach((documentId) => {
-        remapDocumentOrganizationForProject(documentId, normalizedTargetId, tagMapping, folderMapping)
+        sqlite.prepare(
+          `INSERT OR IGNORE INTO library_project_documents
+           (project_id, document_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?)`,
+        ).run(normalizedTargetId, documentId, now, now)
+        remapDocumentOrganizationForProject(
+          documentId,
+          sourceProjectId,
+          normalizedTargetId,
+          tagMapping,
+          folderMapping,
+        )
       })
-      const result = sqlite.prepare(
+      sqlite.prepare(
         `UPDATE documents
          SET library_project_id = ?, updated_at = ?
-         WHERE id IN (${placeholders}) AND library_project_id != ?`,
-      ).run(normalizedTargetId, new Date().toISOString(), ...chunk, normalizedTargetId)
+         WHERE library_project_id = ? AND id IN (${placeholders})`,
+      ).run(normalizedTargetId, now, sourceProjectId, ...chunk)
+      sqlite.prepare(
+        `UPDATE research_notes
+         SET library_project_id = ?, project_id = NULL, outline_id = NULL, updated_at = ?
+         WHERE library_project_id = ? AND doc_id IN (${placeholders})`,
+      ).run(normalizedTargetId, now, sourceProjectId, ...chunk)
+      const result = sqlite.prepare(
+        `DELETE FROM library_project_documents
+         WHERE project_id = ? AND document_id IN (${placeholders})`,
+      ).run(sourceProjectId, ...chunk)
       moved += result.changes
     }
-    sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id = ?')
-      .run(new Date().toISOString(), normalizedTargetId)
+    sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id IN (?, ?)')
+      .run(now, sourceProjectId, normalizedTargetId)
   })()
   scheduleDatabaseSave()
   return {
     requested: uniqueIds.length,
     moved,
-    from_project_ids: [...fromProjectIds],
+    from_project_ids: moved > 0 ? [sourceProjectId] : [],
     target_project_id: normalizedTargetId,
   }
 }

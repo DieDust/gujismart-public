@@ -1,4 +1,4 @@
-﻿import { ipcMain, dialog } from 'electron'
+import { ipcMain, dialog } from 'electron'
 import { queryAll, queryOne, run, saveDatabase, transaction } from '../database'
 import { nanoid } from 'nanoid'
 import { join, extname } from 'path'
@@ -364,7 +364,7 @@ function buildFolderOverview(): FolderOverviewResult {
     `SELECT df.folder_id, COUNT(DISTINCT df.doc_id) as count
      FROM document_folders df
      INNER JOIN documents d ON d.id = df.doc_id
-     WHERE d.library_project_id = ?
+     WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        AND COALESCE(d.import_status, '') <> 'deleting'
      GROUP BY df.folder_id`,
     [activeProjectId],
@@ -396,7 +396,7 @@ function buildFolderOverview(): FolderOverviewResult {
        ) as first_page_image_path
      FROM document_folders df
      INNER JOIN documents d ON d.id = df.doc_id
-     WHERE d.library_project_id = ?
+     WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        AND COALESCE(d.import_status, '') <> 'deleting'
      ORDER BY COALESCE(d.updated_at, d.created_at, '') DESC, d.title ASC`,
     [activeProjectId],
@@ -447,16 +447,28 @@ function buildFolderOverview(): FolderOverviewResult {
   }))
 
   const totalDocumentCount = Number(queryOne<{ count: number }>(
-    "SELECT COUNT(*) as count FROM documents WHERE library_project_id = ? AND COALESCE(import_status, '') <> 'deleting'",
+    `SELECT COUNT(*) as count FROM documents
+     WHERE EXISTS (
+       SELECT 1 FROM library_project_documents project_scope
+       WHERE project_scope.document_id = documents.id
+         AND project_scope.project_id = ?
+     )
+       AND COALESCE(import_status, '') <> 'deleting'`,
     [activeProjectId],
   )?.count || 0)
   const unfiledDocumentCount = Number(queryOne<{ count: number }>(
     `SELECT COUNT(*) as count
      FROM documents d
-     WHERE d.library_project_id = ?
+     WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        AND COALESCE(d.import_status, '') <> 'deleting'
-       AND NOT EXISTS (SELECT 1 FROM document_folders df WHERE df.doc_id = d.id)`,
-    [activeProjectId],
+       AND NOT EXISTS (
+         SELECT 1
+         FROM document_folders df
+         INNER JOIN folders f ON f.id = df.folder_id
+         WHERE df.doc_id = d.id
+           AND f.library_project_id = ?
+       )`,
+    [activeProjectId, activeProjectId],
   )?.count || 0)
 
   return {
@@ -555,13 +567,20 @@ function getFolderContent(options?: FolderContentOptions | string | null): Folde
     FROM documents d
     ${normalizedFolderId ? 'INNER JOIN document_folders df ON d.id = df.doc_id' : ''}
   `
-  const conditions = ["d.library_project_id = ?", "COALESCE(d.import_status, '') <> 'deleting'"]
+  const conditions = ["EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)", "COALESCE(d.import_status, '') <> 'deleting'"]
   const params: unknown[] = [getActiveLibraryProjectId()]
   if (normalizedFolderId) {
     conditions.push('df.folder_id = ?')
     params.push(normalizedFolderId)
   } else if (unfiledOnly) {
-    conditions.push('NOT EXISTS (SELECT 1 FROM document_folders df_unfiled WHERE df_unfiled.doc_id = d.id)')
+    conditions.push(`NOT EXISTS (
+      SELECT 1
+      FROM document_folders df_unfiled
+      INNER JOIN folders f_unfiled ON f_unfiled.id = df_unfiled.folder_id
+      WHERE df_unfiled.doc_id = d.id
+        AND f_unfiled.library_project_id = ?
+    )`)
+    params.push(getActiveLibraryProjectId())
   }
 
   const whereSql = `WHERE ${conditions.join(' AND ')}`
@@ -840,7 +859,7 @@ export function registerFolderIpc(): void {
       `SELECT DISTINCT d.*
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
-       WHERE d.library_project_id = ?
+       WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          AND df.folder_id IN (${folderIds.map(() => '?').join(', ')})
        ORDER BY d.updated_at DESC`,
       [libraryProjectId, ...folderIds]

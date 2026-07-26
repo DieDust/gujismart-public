@@ -185,7 +185,11 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
       `SELECT id
        FROM documents
        WHERE id IN (${docIds.map(() => '?').join(', ')})
-         AND library_project_id = ?`,
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
       [...docIds, activeProjectId],
     ).map((item) => item.id)
   }
@@ -199,7 +203,7 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
       sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
       params.push(tagId)
     })
-    sql += ' WHERE d.library_project_id = ? GROUP BY d.id ORDER BY d.updated_at DESC'
+    sql += ' WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?) GROUP BY d.id ORDER BY d.updated_at DESC'
     params.push(activeProjectId)
     return queryAll<{ id: string }>(sql, params).map((item) => item.id)
   }
@@ -211,7 +215,7 @@ function getDocumentIdsForScope(scope: LibraryAiScope): string[] | undefined {
        FROM documents d
        INNER JOIN document_folders df ON d.id = df.doc_id
        WHERE df.folder_id IN (${folderIds.map(() => '?').join(', ')})
-         AND d.library_project_id = ?
+         AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
        ORDER BY d.updated_at DESC`,
       [...folderIds, activeProjectId],
     ).map((item) => item.id)
@@ -829,7 +833,12 @@ function getScopeDocumentSummary(scope: LibraryAiScope): { label: string; count:
   const docIds = getDocumentIdsForScope(scope)
   if (!docIds) {
     const count = Number(queryOne<{ count: number }>(
-      'SELECT COUNT(*) as count FROM documents WHERE library_project_id = ?',
+      `SELECT COUNT(*) as count FROM documents
+       WHERE EXISTS (
+         SELECT 1 FROM library_project_documents project_scope
+         WHERE project_scope.document_id = documents.id
+           AND project_scope.project_id = ?
+       )`,
       [getActiveLibraryProjectId()],
     )?.count || 0)
     return { label: '整个数据库', count, titles: [] }

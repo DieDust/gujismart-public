@@ -233,7 +233,7 @@ assert(
   'Full document reads should allow only managed page image paths on demand.',
 )
 assert(
-  /documents:getLight[\s\S]{0,2200}allowManagedFileAccessPath\(page\.image_path\)/.test(documentsIpc),
+  /documents:getLight[\s\S]{0,3200}allowManagedFileAccessPath\(page\.image_path\)/.test(documentsIpc),
   'Light document reads should allow only managed page image paths on demand.',
 )
 assert(

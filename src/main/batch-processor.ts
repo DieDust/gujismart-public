@@ -27,6 +27,7 @@ import {
   startLegacyBatchItem,
 } from './task-batch-compat'
 import { bridgeLegacyBatchQueue } from './task-scheduler'
+import { getActiveLibraryProjectId } from './library-projects'
 import type { OcrPageResult } from './ocr'
 import type { BatchJob, BatchProgressEvent, Document, DocumentPage, PageOcrOptions } from '../shared/types'
 
@@ -556,7 +557,13 @@ class BatchProcessor {
        INNER JOIN documents d ON d.id = b.doc_id
        WHERE b.status IN ('pending', 'processing')
          AND COALESCE(d.import_status, '') <> 'deleting'
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = d.id
+             AND project_scope.project_id = ?
+         )
        ORDER BY COALESCE(b.created_at, ''), b.rowid`,
+      [getActiveLibraryProjectId()],
     )
 
     const groups = new Map<string, BatchQueueResumeRow[]>()

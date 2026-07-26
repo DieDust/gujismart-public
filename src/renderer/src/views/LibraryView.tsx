@@ -1709,8 +1709,9 @@ function buildBatchMenuItems(): MenuProps['items'] {
         { key: 'metadata_extract', label: '批量抓取元数据' },
         { key: 'add_tags', label: '批量添加标签' },
         { key: 'add_folder', label: '批量加入文件夹' },
+        { key: 'link_project', label: '添加到其他项目（同步）', icon: <PlusOutlined /> },
         { key: 'move_project', label: '转移到文献项目', icon: <SwapOutlined /> },
-        { key: 'copy_project', label: '复制到文献项目', icon: <CopyOutlined /> },
+        { key: 'copy_project', label: '创建独立副本', icon: <CopyOutlined /> },
         { key: 'synthesize', label: 'AI 文献综述' },
       ],
     },
@@ -2464,8 +2465,8 @@ function DocumentVirtualRow({
                 <Button type="text" size="small" icon={<MoreOutlined />} />
               </Dropdown>
               <Popconfirm
-                title="删除文献"
-                description="确定要删除这篇文献吗？后台删除提交后不会阻塞界面。"
+                title="从总库永久删除文献"
+                description="将从所有项目删除这篇文献及其文件、OCR、向量和关联数据。此操作不是只从当前项目移除。"
                 onConfirm={(event) => void context.handleDelete(event ?? { stopPropagation() {} }, doc.id)}
                 onCancel={(event) => event?.stopPropagation()}
                 okText="删除"
@@ -2554,7 +2555,7 @@ export default function LibraryView({
   const [batchProjectModalOpen, setBatchProjectModalOpen] = useState(false)
   const [batchProjectTargetId, setBatchProjectTargetId] = useState<string | null>(null)
   const [batchProjectDocumentIds, setBatchProjectDocumentIds] = useState<string[]>([])
-  const [batchProjectOperation, setBatchProjectOperation] = useState<'move' | 'copy'>('move')
+  const [batchProjectOperation, setBatchProjectOperation] = useState<'link' | 'move' | 'copy'>('link')
   const [batchProjectBusy, setBatchProjectBusy] = useState(false)
   const [folderDropTarget, setFolderDropTarget] = useState<{ id: string; position: FolderDropPosition } | null>(null)
   const [sidebarWidth, setSidebarWidth] = useState(250)
@@ -6494,7 +6495,7 @@ export default function LibraryView({
   const batchMenuItems: MenuProps['items'] = buildBatchMenuItems()
   const targetLibraryProjects = libraryProjects.filter((project) => project.id !== activeLibraryProjectId)
 
-  const openProjectTransfer = (documentIds: string[], operation: 'move' | 'copy' = 'move'): void => {
+  const openProjectTransfer = (documentIds: string[], operation: 'link' | 'move' | 'copy' = 'link'): void => {
     const targetIds = [...new Set(documentIds.filter(Boolean))]
     if (targetIds.length === 0) {
       message.info('请先选择文献')
@@ -6522,13 +6523,27 @@ export default function LibraryView({
     const targetIds = [...batchProjectDocumentIds]
     setBatchProjectBusy(true)
     try {
+      if (batchProjectOperation === 'link') {
+        const result = await window.api.addDocumentsToLibraryProject(targetIds, batchProjectTargetId)
+        setBatchProjectModalOpen(false)
+        setBatchProjectTargetId(null)
+        setBatchProjectDocumentIds([])
+        if (result.added > 0) {
+          message.success(`已将 ${result.added} 篇文献同步加入目标项目`)
+          onLibraryProjectsChanged?.()
+          scheduleSmartViewCountsRefresh(200)
+        } else {
+          message.info('所选文献已经在目标项目中')
+        }
+        return
+      }
       if (batchProjectOperation === 'copy') {
         const result = await window.api.copyDocumentsToLibraryProject(targetIds, batchProjectTargetId)
         if (result.copied > 0) {
           setBatchProjectModalOpen(false)
           setBatchProjectTargetId(null)
           setBatchProjectDocumentIds([])
-          message.success(`已复制 ${result.copied} 篇文献到目标项目`)
+          message.success(`已在目标项目创建 ${result.copied} 篇独立副本`)
           onLibraryProjectsChanged?.()
           scheduleSmartViewCountsRefresh(200)
         } else {
@@ -6554,7 +6569,12 @@ export default function LibraryView({
         message.info('所选文献已经位于目标项目，未发生变化')
       }
     } catch (error) {
-      message.error(getErrorMessage(error, batchProjectOperation === 'copy' ? '复制文献失败' : '转移文献失败'))
+      const fallback = batchProjectOperation === 'copy'
+        ? '创建独立副本失败'
+        : batchProjectOperation === 'link'
+          ? '添加到项目失败'
+          : '转移文献失败'
+      message.error(getErrorMessage(error, fallback))
     } finally {
       setBatchProjectBusy(false)
     }
@@ -6725,6 +6745,9 @@ export default function LibraryView({
       setBatchFolderTargetId(null)
       setBatchFolderModalOpen(true)
     }
+    if (key === 'link_project') {
+      openProjectTransfer(selectedIds, 'link')
+    }
     if (key === 'move_project') {
       openProjectTransfer(selectedIds, 'move')
     }
@@ -6768,8 +6791,8 @@ export default function LibraryView({
     }
     if (key === 'delete_selected') {
       Modal.confirm({
-        title: `删除 ${selectedIds.length} 篇文献？`,
-        content: '会提交后台删除所选文献，不会阻塞当前界面。',
+        title: `从总库永久删除 ${selectedIds.length} 篇文献？`,
+        content: '将从所有项目删除所选文献及其文件、OCR、向量和关联数据。此操作不是只从当前项目移除。',
         okText: '删除文献',
         cancelText: '取消',
         okButtonProps: { danger: true },
@@ -6804,14 +6827,20 @@ export default function LibraryView({
       label: '转移到文献项目',
       icon: <SwapOutlined />,
     }
+    const linkItem = {
+      key: 'context_link_project',
+      label: '添加到其他项目（同步）',
+      icon: <PlusOutlined />,
+    }
     const copyItem = {
       key: 'context_copy_project',
-      label: '复制到文献项目',
+      label: '创建独立副本',
       icon: <CopyOutlined />,
     }
     if (selectedIdSet.has(docId) && selectedIds.length > 0) {
       return [
         { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
+        linkItem,
         transferItem,
         copyItem,
         { type: 'divider' as const },
@@ -6821,6 +6850,7 @@ export default function LibraryView({
     return [
       ...(singleItems || []),
       { type: 'divider' as const },
+      linkItem,
       transferItem,
       copyItem,
     ]
@@ -6830,6 +6860,13 @@ export default function LibraryView({
     return (info) => {
       if (info.key === 'open_new_tab') {
         handleDocumentOpen(docId)
+        return
+      }
+      if (info.key === 'context_link_project') {
+        const targetIds = selectedIdSet.has(docId) && selectedIds.length > 0
+          ? selectedIds
+          : [docId]
+        openProjectTransfer(targetIds, 'link')
         return
       }
       if (info.key === 'context_move_project') {
@@ -7555,8 +7592,8 @@ export default function LibraryView({
                   </Button>
                 </Dropdown>
                 <Popconfirm
-                  title="批量删除"
-                  description={`提交后台删除 ${selectedIds.length} 篇文献，不会阻塞当前界面。`}
+                  title="从总库批量永久删除"
+                  description={`将从所有项目永久删除 ${selectedIds.length} 篇文献及其文件、OCR、向量和关联数据。`}
                   okText="删除"
                   cancelText="取消"
                   onConfirm={() => void handleBatchDelete()}
@@ -8187,8 +8224,8 @@ export default function LibraryView({
                           </Dropdown>
 
                           <Popconfirm
-                            title="删除文献"
-                            description="确定要删除这篇文献吗？"
+                            title="从总库永久删除文献"
+                            description="将从所有项目删除这篇文献及其文件、OCR、向量和关联数据。"
                             onConfirm={(event) => void handleDelete(event ?? { stopPropagation() {} }, doc.id)}
                             onCancel={(event) => event?.stopPropagation()}
                             okText="删除"
@@ -8535,9 +8572,17 @@ export default function LibraryView({
       </Modal>
 
       <Modal
-        title={batchProjectOperation === 'copy' ? '复制到文献项目' : '转移到文献项目'}
+        title={batchProjectOperation === 'copy'
+          ? '创建独立副本'
+          : batchProjectOperation === 'link'
+            ? '添加到其他项目（同步）'
+            : '转移到文献项目'}
         open={batchProjectModalOpen}
-        okText={`${batchProjectOperation === 'copy' ? '复制' : '转移'} ${batchProjectDocumentIds.length} 篇`}
+        okText={`${batchProjectOperation === 'copy'
+          ? '创建副本'
+          : batchProjectOperation === 'link'
+            ? '同步加入'
+            : '转移'} ${batchProjectDocumentIds.length} 篇`}
         cancelText="取消"
         confirmLoading={batchProjectBusy}
         okButtonProps={{ disabled: !batchProjectTargetId }}
@@ -8553,10 +8598,16 @@ export default function LibraryView({
           <Alert
             type="info"
             showIcon
-            message={batchProjectOperation === 'copy' ? '在目标项目创建独立副本' : '只改变文献所属项目'}
+            message={batchProjectOperation === 'copy'
+              ? '在目标项目创建独立副本'
+              : batchProjectOperation === 'link'
+                ? '同一篇文献，可同时用于多个项目'
+                : '移动项目关联，不搬动文献文件'}
             description={batchProjectOperation === 'copy'
               ? '源项目会保留原文献；目标项目会得到独立文件和独立文献记录。正文、OCR、校对、向量、全文索引、标签、文件夹、摘录、翻译和文献级 AI 结果会复制。研究项目归属与 AI 对话仍留在源项目。复制会占用额外磁盘空间。'
-              : '文献正文、OCR、向量、标签、文件夹、摘录和研究关联都会完整保留。转移后它将从当前项目列表消失，并出现在目标项目。'}
+              : batchProjectOperation === 'link'
+                ? '目标项目只增加关联，不复制文件、OCR、向量或全文索引。两个项目看到的是同一篇文献，正文、校对和元数据修改会同步；标签、文件夹、摘录、研究项目和 AI 对话仍按项目独立。'
+                : '文献文件不会复制；系统会把当前项目关联迁移到目标项目。正文、OCR、校对、向量和全文索引保持原样，文献会从当前项目列表消失并出现在目标项目。'}
           />
           <Select
             style={{ width: '100%' }}
