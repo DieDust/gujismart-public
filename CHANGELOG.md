@@ -2,11 +2,33 @@
 
 ## Unreleased
 
+## 1.2.5 - 2026-07-27
+
 ### 中文
+
+#### 项目选择首屏响应
 
 - 优化从启动软件到项目选择页可操作之间的顿卡：项目选择页改为独立轻量入口，完整工作区、Ant Design 和各业务模块仅在选择或新建项目后加载。
 - 所选项目直接作为工作区初始状态传入，避免完整界面加载后重复读取项目与闪回选择页；项目新建、切换、恢复任务和单库隔离逻辑保持不变。
 - 在约 835 MB 的真实数据库副本上，项目选择页稳定可操作时间由约 2.3-2.6 秒降至约 0.84-0.96 秒；首屏 JavaScript 由约 1.48 MB 降至约 166 KB。
+
+#### 下载
+
+- `GujiSmart-1.2.5-Setup-x64.exe`
+- `GujiSmart-1.2.5-Portable-x64.exe`
+
+### English
+
+#### Responsive Project Selection Startup
+
+- Moved the project selection screen into a lightweight entry so the full workspace, Ant Design, and feature modules load only after a project is selected or created.
+- Passes the selected project directly into the workspace initial state, avoiding a duplicate project fetch and project-gate flash while preserving project creation, switching, recovery, and single-library isolation behavior.
+- On an approximately 835 MB real database copy, stable project-gate readiness improved from about 2.3-2.6 seconds to about 0.84-0.96 seconds, while initial JavaScript dropped from about 1.48 MB to about 166 KB.
+
+#### Downloads
+
+- `GujiSmart-1.2.5-Setup-x64.exe`
+- `GujiSmart-1.2.5-Portable-x64.exe`
 
 ## 1.2.4 - 2026-07-27
 
