@@ -25,6 +25,7 @@ const DATABASE_CHECKPOINT_MIN_INTERVAL_MS = 5000
 // Defer WAL checkpoints so bulk OCR/delete writes do not stall UI IPC immediately after each batch.
 const DATABASE_CHECKPOINT_DEFER_MS = 2500
 const STARTUP_DATABASE_MAINTENANCE_INTERVAL_MS = 24 * 60 * 60 * 1000
+const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_DATABASE_BYTES = 256 * 1024 * 1024
 const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT = 100_000
 const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_SEGMENT_LIMIT = 500_000
 let deferredDatabaseSaveTimer: ReturnType<typeof setTimeout> | null = null
@@ -2113,7 +2114,16 @@ function tableHasMoreRowsThan(sqlite: NativeDatabase, tableName: string, limit: 
 }
 
 export function isLargeLibraryForAutomaticMaintenance(sqlite: NativeDatabase = getDatabase()): boolean {
-  return tableHasMoreRowsThan(sqlite, 'pages', LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT)
+  let databaseBytes = 0
+  try {
+    databaseBytes = dbFilePath && existsSync(dbFilePath) ? statSync(dbFilePath).size : 0
+    const walPath = dbFilePath ? `${dbFilePath}-wal` : ''
+    if (walPath && existsSync(walPath)) databaseBytes += statSync(walPath).size
+  } catch {
+    databaseBytes = 0
+  }
+  return databaseBytes >= LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_DATABASE_BYTES
+    || tableHasMoreRowsThan(sqlite, 'pages', LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT)
     || tableHasMoreRowsThan(sqlite, 'search_index_segments', LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_SEGMENT_LIMIT)
 }
 

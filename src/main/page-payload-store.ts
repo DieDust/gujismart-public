@@ -1,13 +1,19 @@
 import type Database from 'better-sqlite3'
-import { queryAll, queryOne, run } from './database'
+import { getDatabase, queryAll, run } from './database'
 import {
-  canonicalizePagePayloadRef,
   deleteUnreferencedPayloadFiles,
-  pagePayloadRefExists,
   readPagePayloadValue,
-  scanPayloadDirectory,
   writePagePayloadRef,
 } from './page-payload-files'
+import {
+  collectReferencedPagePayloadRefsFromDatabase,
+  getPagePayloadStorageStatsForDatabase,
+  INLINE_JSON_MAX_CHARS,
+  INLINE_TEXT_MAX_CHARS,
+  type PagePayloadStorageStats,
+} from './page-payload-statistics'
+
+export type { PagePayloadStorageStats } from './page-payload-statistics'
 
 type NativeDatabase = Database.Database
 
@@ -30,18 +36,6 @@ export interface PagePayloadRefs {
 
 export type PagePayloadRow<T> = T & PagePayloadRefs
 
-export interface PagePayloadStorageStats {
-  externalFileCount: number
-  externalBytes: number
-  referencedFileCount: number
-  missingReferencedFileCount: number
-  orphanedFileCount: number
-  orphanedBytes: number
-  estimatedMissingReferencedBytes: number
-  inlineCandidateRows: number
-  inlineCandidateBytes: number
-}
-
 export interface PagePayloadCleanupResult {
   scannedFiles: number
   deletedFiles: number
@@ -59,14 +53,6 @@ export interface PagePayloadExternalizeResult {
   externalizedBytes: number
 }
 
-const INLINE_TEXT_MAX_CHARS = 4096
-const INLINE_JSON_MAX_CHARS = 8192
-const PAYLOAD_REF_COLUMNS = [
-  { table: 'pages', columns: ['ocr_text_ref', 'ocr_result_ref', 'proofed_text_ref'] },
-  { table: 'page_ocr_versions', columns: ['ocr_text_ref', 'ocr_result_ref'] },
-  { table: 'page_ai_layout_cache', columns: ['result_text_ref'] },
-  { table: 'page_translation_cache', columns: ['source_text_ref', 'translation_text_ref'] },
-] as const
 function normalizeFieldValue(value: unknown): string | null {
   if (value === undefined || value === null) return null
   if (typeof value === 'string') return value
@@ -122,19 +108,7 @@ export function hydratePagePayloadRows<T>(rows: Array<PagePayloadRow<T>>): T[] {
 }
 
 export function collectReferencedPagePayloadRefs(): Set<string> {
-  const refs = new Set<string>()
-  for (const source of PAYLOAD_REF_COLUMNS) {
-    const rows = queryAll<Record<string, unknown>>(
-      `SELECT ${source.columns.join(', ')} FROM ${source.table}`,
-    )
-    for (const row of rows) {
-      for (const column of source.columns) {
-        const canonical = canonicalizePagePayloadRef(typeof row[column] === 'string' ? String(row[column]) : null)
-        if (canonical) refs.add(canonical)
-      }
-    }
-  }
-  return refs
+  return collectReferencedPagePayloadRefsFromDatabase(getDatabase())
 }
 
 export function cleanupUnreferencedPagePayloads(): PagePayloadCleanupResult {
@@ -142,86 +116,7 @@ export function cleanupUnreferencedPagePayloads(): PagePayloadCleanupResult {
 }
 
 export function getPagePayloadStorageStats(): PagePayloadStorageStats {
-  const external = scanPayloadDirectory()
-  const referencedRefs = collectReferencedPagePayloadRefs()
-  let referencedFileCount = 0
-  let missingReferencedFileCount = 0
-  let orphanedFileCount = 0
-  let orphanedBytes = 0
-  for (const ref of external.refs) {
-    if (referencedRefs.has(ref)) {
-      referencedFileCount += 1
-    } else {
-      orphanedFileCount += 1
-    }
-  }
-  for (const ref of referencedRefs) {
-    if (!pagePayloadRefExists(ref)) missingReferencedFileCount += 1
-  }
-  orphanedBytes = external.fileCount > 0
-    ? Math.round((external.bytes / external.fileCount) * orphanedFileCount)
-    : 0
-  const estimatedMissingReferencedBytes = external.fileCount > 0
-    ? Math.round((external.bytes / external.fileCount) * missingReferencedFileCount)
-    : 0
-  const pageRow = queryOne<{ rows?: number | null; bytes?: number | null }>(
-    `SELECT COUNT(*) AS rows,
-            COALESCE(SUM(length(COALESCE(ocr_text, '')) + length(COALESCE(ocr_result, '')) + length(COALESCE(proofed_text, ''))), 0) AS bytes
-     FROM pages
-     WHERE (
-       ((ocr_text_ref IS NULL OR ocr_text_ref = '') AND length(COALESCE(ocr_text, '')) > ?)
-       OR ((ocr_result_ref IS NULL OR ocr_result_ref = '') AND length(COALESCE(ocr_result, '')) > ?)
-       OR ((proofed_text_ref IS NULL OR proofed_text_ref = '') AND length(COALESCE(proofed_text, '')) > ?)
-     )`,
-    [INLINE_TEXT_MAX_CHARS, INLINE_JSON_MAX_CHARS, INLINE_TEXT_MAX_CHARS],
-  )
-  const versionRow = queryOne<{ rows?: number | null; bytes?: number | null }>(
-    `SELECT COUNT(*) AS rows,
-            COALESCE(SUM(length(COALESCE(ocr_text, '')) + length(COALESCE(ocr_result, ''))), 0) AS bytes
-     FROM page_ocr_versions
-     WHERE (
-       ((ocr_text_ref IS NULL OR ocr_text_ref = '') AND length(COALESCE(ocr_text, '')) > ?)
-       OR ((ocr_result_ref IS NULL OR ocr_result_ref = '') AND length(COALESCE(ocr_result, '')) > ?)
-     )`,
-    [INLINE_TEXT_MAX_CHARS, INLINE_JSON_MAX_CHARS],
-  )
-  const aiCacheRow = queryOne<{ rows?: number | null; bytes?: number | null }>(
-    `SELECT COUNT(*) AS rows,
-            COALESCE(SUM(length(COALESCE(result_text, ''))), 0) AS bytes
-     FROM page_ai_layout_cache
-     WHERE (result_text_ref IS NULL OR result_text_ref = '')
-       AND length(COALESCE(result_text, '')) > ?`,
-    [INLINE_TEXT_MAX_CHARS],
-  )
-  const translationCacheRow = queryOne<{ rows?: number | null; bytes?: number | null }>(
-    `SELECT COUNT(*) AS rows,
-            COALESCE(SUM(length(COALESCE(source_text, '')) + length(COALESCE(translation_text, ''))), 0) AS bytes
-     FROM page_translation_cache
-     WHERE (
-       ((source_text_ref IS NULL OR source_text_ref = '') AND length(COALESCE(source_text, '')) > ?)
-       OR ((translation_text_ref IS NULL OR translation_text_ref = '') AND length(COALESCE(translation_text, '')) > ?)
-     )`,
-    [INLINE_TEXT_MAX_CHARS, INLINE_TEXT_MAX_CHARS],
-  )
-  const inlineCandidateRows = Number(pageRow?.rows || 0)
-    + Number(versionRow?.rows || 0)
-    + Number(aiCacheRow?.rows || 0)
-    + Number(translationCacheRow?.rows || 0)
-  const inlineCandidateBytes = Number(pageRow?.bytes || 0)
-    + Number(versionRow?.bytes || 0)
-    + Number(aiCacheRow?.bytes || 0)
-    + Number(translationCacheRow?.bytes || 0)
-  return {
-    externalFileCount: external.fileCount,
-    externalBytes: external.bytes,
-    referencedFileCount,
-    missingReferencedFileCount,
-    orphanedFileCount,
-    orphanedBytes,
-    estimatedMissingReferencedBytes,
-    inlineCandidateRows,
-    inlineCandidateBytes,
-  }
+  return getPagePayloadStorageStatsForDatabase(getDatabase())
 }
 
 export function externalizeLargePagePayloads(options: PagePayloadExternalizeOptions = {}): PagePayloadExternalizeResult {

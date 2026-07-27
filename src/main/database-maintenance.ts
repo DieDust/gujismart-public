@@ -16,6 +16,12 @@ import { SEARCH_INDEX_VERSION, SEARCH_NGRAM_INDEX_ENABLED } from './search-index
 import { getDatabase, getDatabaseFilePath, isSearchSegmentsFtsRebuildNeeded, queryOne, rebuildSearchTables, run, scheduleDatabaseSave } from './database'
 import { emitBackgroundTaskStatus } from './background-tasks'
 import { cleanupUnreferencedPagePayloads, externalizeLargePayloads, getPagePayloadStorageStats } from './page-payload-store'
+import { resolvePayloadDataDir } from './page-payload-files'
+import type { PagePayloadStorageStats } from './page-payload-statistics'
+import {
+  isDatabaseDiagnosticsWorkerAvailable,
+  runDatabaseDiagnosticsWorkerTask,
+} from './database-diagnostics-worker-client'
 
 // Keep rowid-list batches below SQLite's bound-parameter ceiling. Full ngram
 // cleanup uses rowid ranges instead, so it can safely sweep much larger slices.
@@ -394,8 +400,11 @@ function tableRowCount(tables: DatabaseTableStorageStat[], tableName: string): n
   return tables.find((table) => table.tableName === tableName)?.rowCount || 0
 }
 
-function estimateStorageLayers(tables: DatabaseTableStorageStat[], searchIndex: DatabaseSearchIndexStorageStat): DatabaseStorageLayerStat[] {
-  const payloadStats = getPagePayloadStorageStats()
+function estimateStorageLayers(
+  tables: DatabaseTableStorageStat[],
+  searchIndex: DatabaseSearchIndexStorageStat,
+  payloadStats: PagePayloadStorageStats,
+): DatabaseStorageLayerStat[] {
   const metadataRows = [
     'documents',
     'folders',
@@ -513,7 +522,7 @@ function buildRequiredMaintenance(diagnostics: Omit<DatabaseStorageDiagnostics, 
   }
 }
 
-export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
+function buildDatabaseStorageDiagnostics(pagePayloadStats: PagePayloadStorageStats): DatabaseStorageDiagnostics {
   const databasePath = getDatabaseFilePath()
   const databaseBytes = fileSize(databasePath)
   const pageSize = getStoragePragma('page_size')
@@ -523,7 +532,6 @@ export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
   const compactionRecommended = isDatabaseCompactionWorthwhile(freelistBytes, databaseBytes)
   const tables = getSafeTables()
   const searchIndex = getSearchIndexStorage()
-  const pagePayloadStats = getPagePayloadStorageStats()
   const persistedMaintenanceState = readPersistedMaintenanceState()
   const legacyIndexPresent = searchIndex.ngramRows > 0 || searchIndex.singleCharNgramRows > 0 || searchIndex.ngramPositionsBytes > 0
   let maintenanceState: DatabaseMaintenanceState = {
@@ -549,7 +557,7 @@ export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
     searchIndexVersion: SEARCH_INDEX_VERSION,
     storageModelVersion: STORAGE_MODEL_VERSION,
     tables,
-    storageLayers: estimateStorageLayers(tables, searchIndex),
+    storageLayers: estimateStorageLayers(tables, searchIndex, pagePayloadStats),
     externalPayloads: {
       fileCount: pagePayloadStats.externalFileCount,
       referencedFileCount: pagePayloadStats.referencedFileCount,
@@ -589,6 +597,24 @@ export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
     ...normalizedBase,
     warnings: buildWarnings(normalizedBase),
     requiredMaintenance,
+  }
+}
+
+export function getDatabaseStorageDiagnostics(): DatabaseStorageDiagnostics {
+  return buildDatabaseStorageDiagnostics(getPagePayloadStorageStats())
+}
+
+export async function getDatabaseStorageDiagnosticsAsync(): Promise<DatabaseStorageDiagnostics> {
+  if (!isDatabaseDiagnosticsWorkerAvailable()) return getDatabaseStorageDiagnostics()
+  try {
+    const pagePayloadStats = await runDatabaseDiagnosticsWorkerTask({
+      dbFilePath: getDatabaseFilePath(),
+      dataDir: resolvePayloadDataDir(),
+    })
+    return buildDatabaseStorageDiagnostics(pagePayloadStats)
+  } catch (error) {
+    console.warn('[DatabaseDiagnostics] Worker scan failed, falling back to main process', error)
+    return getDatabaseStorageDiagnostics()
   }
 }
 

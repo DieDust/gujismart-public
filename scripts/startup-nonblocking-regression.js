@@ -23,6 +23,11 @@ const embeddingIpc = readSource('src', 'main', 'ipc', 'embedding.ts')
 const rendererMain = readSource('src', 'renderer', 'src', 'main.tsx')
 const projectBootstrap = readSource('src', 'renderer', 'src', 'ProjectBootstrap.tsx')
 const appShell = readSource('src', 'renderer', 'src', 'AppShell.tsx')
+const electronViteConfig = readSource('electron.vite.config.ts')
+const databaseMaintenance = readSource('src', 'main', 'database-maintenance.ts')
+const databaseMaintenanceIpc = readSource('src', 'main', 'ipc', 'database-maintenance.ts')
+const databaseDiagnosticsWorker = readSource('src', 'main', 'database-diagnostics-worker.ts')
+const databaseDiagnosticsWorkerClient = readSource('src', 'main', 'database-diagnostics-worker-client.ts')
 function sliceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker)
   assert(start >= 0, `Missing start marker: ${startMarker}`)
@@ -298,9 +303,27 @@ assert(
 assert(
   database.includes('tableHasMoreRowsThan')
     && database.includes('export function isLargeLibraryForAutomaticMaintenance')
+    && database.includes('const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_DATABASE_BYTES = 256 * 1024 * 1024')
+    && database.includes('statSync(dbFilePath).size')
+    && database.includes("statSync(walPath).size")
     && !/function isLargeLibraryForAutomaticMaintenance\(sqlite[\s\S]{0,260}COUNT\(\*\)/.test(database)
     && database.includes('startup_database_maintenance_skipped_large_library_at'),
-  'Large-library startup maintenance guard should use bounded probes and skip automatic maintenance for very large libraries.',
+  'Large-library startup maintenance guard should include database bytes and bounded row probes before automatic maintenance.',
+)
+assert(
+  electronViteConfig.includes("'database-diagnostics-worker': resolve(__dirname, 'src/main/database-diagnostics-worker.ts')")
+    && databaseDiagnosticsWorker.includes("new Database(message.task.dbFilePath, { readonly: true, fileMustExist: true })")
+    && databaseDiagnosticsWorker.includes('getPagePayloadStorageStatsForDatabase(sqlite)')
+    && databaseDiagnosticsWorkerClient.includes("join(__dirname, 'database-diagnostics-worker.js')")
+    && databaseMaintenance.includes('export async function getDatabaseStorageDiagnosticsAsync()')
+    && databaseMaintenance.includes('runDatabaseDiagnosticsWorkerTask({')
+    && databaseMaintenanceIpc.includes('return await getDatabaseStorageDiagnosticsAsync()'),
+  'Automatic and settings database diagnostics should scan large payload tables in a read-only worker instead of blocking Electron main.',
+)
+assert(
+  /function estimateStorageLayers\([\s\S]{0,220}payloadStats: PagePayloadStorageStats/.test(databaseMaintenance)
+    && !/function estimateStorageLayers\([\s\S]{0,220}getPagePayloadStorageStats\(\)/.test(databaseMaintenance),
+  'Database diagnostics should reuse one page-payload scan instead of repeating the full scan for storage layers.',
 )
 assert(
   mainIndex.includes('isLargeLibraryForAutomaticMaintenance')

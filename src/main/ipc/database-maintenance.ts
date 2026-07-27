@@ -7,6 +7,7 @@ import {
   externalizePagePayloadStorage,
   exportDatabaseStorageDiagnostics,
   getDatabaseStorageDiagnostics,
+  getDatabaseStorageDiagnosticsAsync,
   optimizeLegacyDatabaseStorage,
 } from '../database-maintenance'
 import { queueAllDocumentsReindex } from '../semantic-search'
@@ -28,7 +29,7 @@ function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics
 
 export function registerDatabaseMaintenanceIpc(): void {
   ipcMain.handle('database:getStorageDiagnostics', async (): Promise<DatabaseStorageDiagnostics> => {
-    return getDatabaseStorageDiagnostics()
+    return await getDatabaseStorageDiagnosticsAsync()
   })
 
   ipcMain.handle('database:exportStorageDiagnostics', async (): Promise<DatabaseMaintenanceResult> => {

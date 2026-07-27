@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### 中文
+
+#### 项目进入与后台维护响应
+
+- 将进入项目后自动执行的数据库完整诊断移到独立只读 worker，保留自动升级提示、设置页诊断和导出诊断功能，同时避免页面大字段与外置文件扫描阻塞 Electron 主进程。
+- 大库保护现在同时按数据库文件、WAL 体积、页面数和检索段数判断；体积较大但页面数不多的文献库不再于启动 45 秒后自动执行全库维护。
+- 数据库诊断复用同一次页面大字段统计，不再为了存储分层重复扫描整库。
+
+### English
+
+#### Responsive Project Entry and Background Maintenance
+
+- Moved automatic full database diagnostics to a read-only worker, preserving upgrade prompts, settings diagnostics, and diagnostic exports without blocking Electron's main process.
+- Large-library protection now considers database and WAL bytes in addition to page and search-segment counts, so byte-heavy libraries no longer run full automatic maintenance 45 seconds after startup.
+- Reuses one page-payload statistics pass per diagnostic instead of scanning the same large tables twice.
+
 ## 1.2.5 - 2026-07-27
 
 ### 中文

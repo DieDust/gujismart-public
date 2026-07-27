@@ -13,6 +13,7 @@ import { fileCapabilityService } from './file-capabilities'
 import { importSelectionService } from './import-selections'
 import { shutdownHealthReportWorkers } from './health-report-worker-client'
 import { shutdownSearchIndexWorkers } from './search-index-worker-client'
+import { shutdownDatabaseDiagnosticsWorkers } from './database-diagnostics-worker-client'
 import { ensureDisabledMetadataTagBindingsCleared, ensureEnabledMetadataTagBindingsRebuilt } from './metadata-tags'
 import { shutdownStartupRecovery } from './startup-recovery'
 import {
@@ -435,6 +436,7 @@ async function shutdownApplicationRuntime(): Promise<void> {
       console.warn('[Main] Failed to shutdown PDF asset runtime cleanly', error)
     })
     await Promise.allSettled([
+      shutdownDatabaseDiagnosticsWorkers(),
       shutdownHealthReportWorkers(),
       shutdownSearchIndexWorkers(),
     ])
