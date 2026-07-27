@@ -586,10 +586,17 @@ function waitForDatabaseUpgradeUi(): Promise<void> {
   })
 }
 
-export default function App() {
+export interface AppProps {
+  initialLibraryProject: LibraryProject
+  initialLibraryProjects: LibraryProject[]
+}
+
+export default function App({ initialLibraryProject, initialLibraryProjects }: AppProps) {
   const initialWorkspaceRef = useRef<ReturnType<typeof loadAppWorkspace> | null>(null)
   if (!initialWorkspaceRef.current) {
-    initialWorkspaceRef.current = loadAppWorkspace(window.localStorage)
+    initialWorkspaceRef.current = loadAppWorkspace(window.localStorage, initialLibraryProject.id, {
+      migrateGlobalWorkspace: initialLibraryProject.id === DEFAULT_LIBRARY_PROJECT_ID,
+    })
   }
   const initialWorkspace = initialWorkspaceRef.current
   const [tabs, setTabs] = useState<AppTab[]>(() => initialWorkspace.tabs)
@@ -620,11 +627,9 @@ export default function App() {
   const [libraryAiInitialTab, setLibraryAiInitialTab] = useState<LibraryAiTab>('qa')
   const [libraryAiResearchProjectId, setLibraryAiResearchProjectId] = useState<string | null>(null)
   const [activeResearchProjectId, setActiveResearchProjectId] = useState<string | null>(null)
-  const [libraryProjects, setLibraryProjects] = useState<LibraryProject[]>([])
-  const [activeLibraryProject, setActiveLibraryProject] = useState<LibraryProject | null>(null)
-  const [workspaceProjectId, setWorkspaceProjectId] = useState<string | null>(null)
-  const [libraryProjectLoading, setLibraryProjectLoading] = useState(true)
-  const [libraryProjectError, setLibraryProjectError] = useState('')
+  const [libraryProjects, setLibraryProjects] = useState<LibraryProject[]>(initialLibraryProjects)
+  const [activeLibraryProject, setActiveLibraryProject] = useState<LibraryProject | null>(initialLibraryProject)
+  const [workspaceProjectId, setWorkspaceProjectId] = useState<string | null>(initialLibraryProject.id)
   const [libraryProjectSwitching, setLibraryProjectSwitching] = useState(false)
   const [libraryProjectCreateOpen, setLibraryProjectCreateOpen] = useState(false)
   const [libraryProjectCreateName, setLibraryProjectCreateName] = useState('')
@@ -706,8 +711,6 @@ export default function App() {
   }, [tabSearchKey, tabs])
 
   const loadLibraryProjectChoices = async (): Promise<void> => {
-    setLibraryProjectLoading(true)
-    setLibraryProjectError('')
     try {
       const [projects, activeProject] = await Promise.all([
         window.api.listLibraryProjects(),
@@ -716,15 +719,9 @@ export default function App() {
       setLibraryProjects(projects)
       setActiveLibraryProject(activeProject)
     } catch (error) {
-      setLibraryProjectError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setLibraryProjectLoading(false)
+      console.warn('[LibraryProjects] Failed to refresh project choices', error)
     }
   }
-
-  useEffect(() => {
-    void loadLibraryProjectChoices()
-  }, [])
 
   useEffect(() => {
     if (!workspaceProjectId) return
@@ -3129,70 +3126,6 @@ export default function App() {
       />
     </Modal>
   )
-
-  if (!workspaceProjectId) {
-    return (
-      <div className="library-project-gate">
-        <div className="library-project-gate-card">
-          <div className="library-project-gate-brand">
-            <span className="brand-icon">智</span>
-            <div>
-              <strong>{PRODUCT_NAME}</strong>
-              <span>选择本次要加载的文献项目</span>
-            </div>
-          </div>
-          {libraryProjectLoading ? (
-            <div className="library-project-gate-loading">
-              <Spin size="large" />
-              <span>正在读取项目…</span>
-            </div>
-          ) : libraryProjectError ? (
-            <Alert
-              type="error"
-              showIcon
-              message="项目列表加载失败"
-              description={libraryProjectError}
-              action={<Button onClick={() => void loadLibraryProjectChoices()}>重试</Button>}
-            />
-          ) : (
-            <>
-              <div className="library-project-gate-list">
-                {libraryProjects.map((project) => (
-                  <button
-                    type="button"
-                    key={project.id}
-                    data-library-project-choice="true"
-                    className={`library-project-gate-item ${activeLibraryProject?.id === project.id ? 'is-last-active' : ''}`}
-                    onClick={() => void activateLibraryProject(project)}
-                    disabled={libraryProjectSwitching}
-                  >
-                    <span className="library-project-gate-item-color" style={{ background: project.color }} />
-                    <span className="library-project-gate-item-content">
-                      <strong>{project.name}</strong>
-                      <span>{project.document_count.toLocaleString()} 篇文献{project.is_default ? ' · 旧版文献默认归入' : ''}</span>
-                    </span>
-                    {activeLibraryProject?.id === project.id ? <span className="library-project-last-badge">上次使用</span> : null}
-                    <RightOutlined />
-                  </button>
-                ))}
-              </div>
-              <Button
-                className="library-project-gate-create"
-                type="dashed"
-                size="large"
-                block
-                icon={<PlusOutlined />}
-                onClick={() => setLibraryProjectCreateOpen(true)}
-              >
-                新建文献项目
-              </Button>
-            </>
-          )}
-        </div>
-        {libraryProjectCreateModal}
-      </div>
-    )
-  }
 
   const libraryProjectMenuItems: MenuProps['items'] = [
     ...libraryProjects.map((project) => ({

@@ -20,6 +20,9 @@ const libraryProjects = readSource('src', 'main', 'library-projects.ts')
 const libraryStateCache = readSource('src', 'main', 'library-state-cache.ts')
 const embeddingIndex = readSource('src', 'main', 'embedding-index.ts')
 const embeddingIpc = readSource('src', 'main', 'ipc', 'embedding.ts')
+const rendererMain = readSource('src', 'renderer', 'src', 'main.tsx')
+const projectBootstrap = readSource('src', 'renderer', 'src', 'ProjectBootstrap.tsx')
+const appShell = readSource('src', 'renderer', 'src', 'AppShell.tsx')
 function sliceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker)
   assert(start >= 0, `Missing start marker: ${startMarker}`)
@@ -99,6 +102,16 @@ assert(
     && mainIndex.includes("logStartupTimingSummary('window-ready-to-show')")
     && mainIndex.includes("logStartupTimingSummary('after-createWindow')"),
   'Main open path should time initDatabase, createWindow, and window-ready checkpoints without blocking recovery.',
+)
+assert(
+  rendererMain.includes("import ProjectBootstrap from './ProjectBootstrap'")
+    && !rendererMain.includes("from './App'")
+    && !rendererMain.includes("from 'antd'")
+    && projectBootstrap.includes("const loadAppShell = () => import('./AppShell')")
+    && projectBootstrap.includes('data-project-gate-ready="true"')
+    && projectBootstrap.includes('data-library-project-choice="true"')
+    && appShell.includes("import App from './App'"),
+  'Project selection must stay in a lightweight renderer entry and load Ant Design/full workspace only after selection.',
 )
 assert(
   !mainIndex.includes('openStartupSplash()')

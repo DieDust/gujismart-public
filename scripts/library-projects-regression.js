@@ -9,6 +9,9 @@ const documentsSource = readFileSync(join(root, 'src', 'main', 'ipc', 'documents
 const semanticSearchSource = readFileSync(join(root, 'src', 'main', 'semantic-search.ts'), 'utf8')
 const embeddingSource = readFileSync(join(root, 'src', 'main', 'embedding-index.ts'), 'utf8')
 const appSource = readFileSync(join(root, 'src', 'renderer', 'src', 'App.tsx'), 'utf8')
+const rendererMainSource = readFileSync(join(root, 'src', 'renderer', 'src', 'main.tsx'), 'utf8')
+const projectBootstrapSource = readFileSync(join(root, 'src', 'renderer', 'src', 'ProjectBootstrap.tsx'), 'utf8')
+const appShellSource = readFileSync(join(root, 'src', 'renderer', 'src', 'AppShell.tsx'), 'utf8')
 const libraryViewSource = readFileSync(join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
 const workspaceSource = readFileSync(join(root, 'src', 'renderer', 'src', 'utils', 'appWorkspace.ts'), 'utf8')
 
@@ -35,12 +38,20 @@ assert.ok(
     && !databaseSource.includes('CREATE TRIGGER trg_documents_propagate_library_project'),
   'moving a shared document must not rewrite its canonical search/vector rows',
 )
-assert.ok(appSource.includes('选择本次要加载的文献项目'), 'startup must wait for project selection')
+assert.ok(projectBootstrapSource.includes('选择本次要加载的文献项目'), 'startup must wait for project selection')
 assert.ok(appSource.includes('migrateGlobalWorkspace: project.id === DEFAULT_LIBRARY_PROJECT_ID'), 'legacy workspace must migrate only to the default project')
 assert.ok(
   appSource.includes('void window.api.listLibraryProjects()')
     && !appSource.includes('const refreshedProjects = await window.api.listLibraryProjects()'),
   'project selection should enter the selected workspace before refreshing project counts in the background',
+)
+assert.ok(
+  rendererMainSource.includes("import ProjectBootstrap from './ProjectBootstrap'")
+    && !rendererMainSource.includes("from './App'")
+    && !rendererMainSource.includes("from 'antd'")
+    && projectBootstrapSource.includes("const loadAppShell = () => import('./AppShell')")
+    && appShellSource.includes("import App from './App'"),
+  'project selection must not parse the full workspace bundle before the user chooses a project',
 )
 assert.ok(libraryViewSource.includes("key: 'move_project'"), 'library batch menu must expose project transfer')
 assert.ok(libraryViewSource.includes("key: 'context_move_project'"), 'document context menu must expose project transfer directly')

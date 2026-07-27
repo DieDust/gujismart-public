@@ -100,6 +100,8 @@ async function clickMenu(window, label) {
 }
 
 async function verifyProjectCreateAndSwitch(window, originalProjectName) {
+  await window.locator('.sidebar-project-switcher').waitFor({ state: 'visible', timeout: 8000 })
+  await window.waitForTimeout(800)
   await dismissBlockingModal(window)
   const switcher = window.locator('.sidebar-project-switcher')
   await switcher.click()
@@ -1712,13 +1714,16 @@ async function run() {
   })
 
   try {
+    const startupStartedAt = Date.now()
     const window = await app.firstWindow({ timeout: 20000 })
     await window.waitForLoadState('domcontentloaded')
-    await window.waitForTimeout(1500)
 
     const title = await window.title()
     expectContains(title, '\u6587\u732e\u7ba1\u7406', 'window title')
     const projectChoices = window.locator('[data-library-project-choice="true"]')
+    await window.locator('[data-project-gate-ready="true"]').waitFor({ state: 'visible', timeout: 8000 })
+    const projectGateReadyMs = Date.now() - startupStartedAt
+    console.log(`[smoke] Project gate ready in ${projectGateReadyMs}ms`)
     if (await projectChoices.count() > 0) {
       const originalProjectName = (await projectChoices.first().locator('strong').innerText()).trim()
       await projectChoices.first().click()
