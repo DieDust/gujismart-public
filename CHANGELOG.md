@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.2.6 - 2026-07-28
+
 ### 中文
 
 #### 项目进入与后台维护响应
@@ -10,6 +12,11 @@
 - 大库保护现在同时按数据库文件、WAL 体积、页面数和检索段数判断；体积较大但页面数不多的文献库不再于启动 45 秒后自动执行全库维护。
 - 数据库诊断复用同一次页面大字段统计，不再为了存储分层重复扫描整库。
 
+#### 下载
+
+- `GujiSmart-1.2.6-Setup-x64.exe`
+- `GujiSmart-1.2.6-Portable-x64.exe`
+
 ### English
 
 #### Responsive Project Entry and Background Maintenance
@@ -17,6 +24,11 @@
 - Moved automatic full database diagnostics to a read-only worker, preserving upgrade prompts, settings diagnostics, and diagnostic exports without blocking Electron's main process.
 - Large-library protection now considers database and WAL bytes in addition to page and search-segment counts, so byte-heavy libraries no longer run full automatic maintenance 45 seconds after startup.
 - Reuses one page-payload statistics pass per diagnostic instead of scanning the same large tables twice.
+
+#### Downloads
+
+- `GujiSmart-1.2.6-Setup-x64.exe`
+- `GujiSmart-1.2.6-Portable-x64.exe`
 
 ## 1.2.5 - 2026-07-27
 
