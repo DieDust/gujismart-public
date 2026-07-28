@@ -1,6 +1,6 @@
 {
   "name": "gujismart",
-  "version": "1.2.8",
+  "version": "1.2.9",
   "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
   "main": "./out/main/index.js",
   "author": "DieDust",
@@ -51,7 +51,7 @@
     "check:library-grid-card-layout": "node scripts/library-grid-card-layout-regression.js",
     "check:facsimile-stacked-vertical-blocks": "node scripts/facsimile-stacked-vertical-blocks-regression.js",
     "check:database-storage-maintenance": "node scripts/database-storage-maintenance-regression.js",
-    "check:document-delete-resilience": "node scripts/document-delete-search-index-resilience-regression.js",
+    "check:document-delete-resilience": "node scripts/document-delete-search-index-resilience-regression.js && electron scripts/document-delete-worker-integration-regression.js",
     "check:backup-storage": "node scripts/backup-storage-regression.js",
     "check:library-return-cache": "node scripts/library-return-cache-regression.js",
     "check:source-reader-image": "node scripts/source-reader-image-regression.js",

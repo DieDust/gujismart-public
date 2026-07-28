@@ -367,9 +367,9 @@ assert(
   documentsIpc.includes('beginDatabaseCheckpointDeferral')
     && /function markDocumentsDeleting[\s\S]{0,650}scheduleDatabaseSave\(\)/.test(documentsIpc)
     && /function scheduleDocumentDeleteJob[\s\S]{0,220}beginDatabaseCheckpointDeferral\(\)/.test(documentsIpc)
-    && /function scheduleDocumentDeleteJob[\s\S]{0,2200}releaseCheckpointDeferral\(\)/.test(documentsIpc)
+    && /function scheduleDocumentDeleteJob[\s\S]{0,4200}runDocumentDeleteWorkerTask\(\{[\s\S]{0,4200}releaseCheckpointDeferral\(\)/.test(documentsIpc)
     && !/export async function shutdownDocumentDeleteRuntime[\s\S]{0,220}saveDatabase\(\)/.test(documentsIpc),
-  'Document delete markers should use WAL durability while automatic checkpoints remain blocked for the lifetime of the delete job.',
+  'Document delete markers should use WAL durability while the worker-backed delete job keeps automatic checkpoints deferred.',
 )
 assert(
   startupRecovery.includes('let startupRecoveryPromise: Promise<void> | null = null')
@@ -453,7 +453,8 @@ assert(
 assert(
   documentsIpc.includes('activeDocumentDeleteJobs')
     && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime')
-    && /function scheduleDocumentDeleteJob[\s\S]{0,1800}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,500}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc),
+    && /function scheduleDocumentDeleteJob[\s\S]{0,5000}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,500}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc)
+    && /export async function shutdownDocumentDeleteRuntime[\s\S]{0,500}shutdownDocumentDeleteWorkers\(\)/.test(documentsIpc),
   'Document delete jobs should be tracked so shutdown can wait for active delete cleanup.',
 )
 assert(

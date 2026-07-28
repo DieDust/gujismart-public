@@ -30,6 +30,9 @@ function sliceBetween(source, startNeedle, endNeedle, label) {
 const packageJson = JSON.parse(read('package.json'))
 const documentsIpc = read('src/main/ipc/documents.ts')
 const database = read('src/main/database.ts')
+const workerClient = read('src/main/document-delete-worker-client.ts')
+const worker = read('src/main/document-delete-worker.ts')
+const electronViteConfig = read('electron.vite.config.ts')
 
 const deleteFtsBody = sliceBetween(
   documentsIpc,
@@ -119,6 +122,19 @@ assertIncludes(resumeDeleteBody, 'getDocumentsForDeleteRecovery(docIds)', 'inter
 assertNotIncludes(resumeDeleteBody, 'getDocumentsForDelete(docIds)', 'interrupted permanent deletion must not depend on the currently selected project')
 assertIncludes(fileCleanupBody, 'DELETE_FILE_CLEANUP_CONCURRENCY', 'document file cleanup should use bounded concurrency')
 assertIncludes(fileCleanupBody, 'await Promise.all(workers)', 'document file cleanup should wait for its bounded workers')
+assertIncludes(electronViteConfig, "'document-delete-worker'", 'production build should emit the document delete worker entry')
+assertIncludes(workerClient, "new Worker(workerPath)", 'document deletion should run in a worker thread')
+assertIncludes(workerClient, "join(__dirname, 'document-delete-worker.js')", 'worker client should resolve the packaged worker entry')
+assertIncludes(deleteJobBody, 'isDocumentDeleteWorkerAvailable()', 'production delete scheduler should select the worker path')
+assertIncludes(deleteJobBody, 'runDocumentDeleteWorkerTask({', 'production delete scheduler should submit the complete database task')
+assertIncludes(deleteJobBody, 'dbFilePath: getDatabaseFilePath()', 'delete worker should use the active library database')
+assertIncludes(worker, "sqlite.prepare(`DELETE FROM documents", 'final document deletion should execute inside the worker')
+assertIncludes(worker, "deleteRowsByDocIds(sqlite, 'embedding_chunks'", 'vector cleanup should execute inside the worker')
+assertIncludes(worker, 'parentPort?.postMessage({', 'worker should report progress without blocking the main process')
+assertIncludes(worker, 'rowid AS delete_rowid', 'worker row drains should use an explicit rowid alias')
+assertIncludes(documentsIpc, 'rowid AS delete_rowid', 'compatibility row drains should use an explicit rowid alias')
+assertNotIncludes(worker, 'row.rowid', 'worker must not rely on SQLite preserving the rowid result-column name')
+assertNotIncludes(deleteJobBody, 'await deleteDocumentData(batch)\n            await yieldToEventLoop()', 'production path must not rely only on yielding between synchronous SQL calls')
 
 assertIncludes(resetSearchTablesBody, 'DROP TABLE IF EXISTS search_segments_trigram', 'reset should drop trigram FTS')
 assertIncludes(resetSearchTablesBody, 'DROP TABLE IF EXISTS search_segments_fts', 'reset should drop segment FTS')
@@ -132,7 +148,7 @@ assertIncludes(resetSearchTablesBody, 'ensureIndexes(database)', 'reset should r
 assertIncludes(resetSearchTablesBody, 'ensureFts(database)', 'reset should recreate FTS tables')
 assertIncludes(resetSearchTablesBody, 'rebuildFts(database)', 'reset should repopulate page FTS before background segment rebuild catches up')
 
-if (packageJson.scripts['check:document-delete-resilience'] !== 'node scripts/document-delete-search-index-resilience-regression.js') {
+if (packageJson.scripts['check:document-delete-resilience'] !== 'node scripts/document-delete-search-index-resilience-regression.js && electron scripts/document-delete-worker-integration-regression.js') {
   throw new Error('package.json is missing check:document-delete-resilience')
 }
 if (!String(packageJson.scripts.check || '').includes('check:document-delete-resilience')) {

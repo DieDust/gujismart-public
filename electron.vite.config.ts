@@ -12,6 +12,7 @@ export default defineConfig({
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
           'database-diagnostics-worker': resolve(__dirname, 'src/main/database-diagnostics-worker.ts'),
+          'document-delete-worker': resolve(__dirname, 'src/main/document-delete-worker.ts'),
           'health-report-worker': resolve(__dirname, 'src/main/health-report-worker.ts'),
           'search-index-worker': resolve(__dirname, 'src/main/search-index-worker.ts')
         }

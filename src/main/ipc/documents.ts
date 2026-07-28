@@ -19,6 +19,11 @@ import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
 import { normalizePageResult, normalizeStoredGujiOcrResultForRead } from '../ocr'
 import { emitBackgroundTaskStatus } from '../background-tasks'
 import { isHealthReportWorkerAvailable, runHealthReportWorkerTask } from '../health-report-worker-client'
+import {
+  isDocumentDeleteWorkerAvailable,
+  runDocumentDeleteWorkerTask,
+  shutdownDocumentDeleteWorkers,
+} from '../document-delete-worker-client'
 import { buildPdfCompressionMetadata, getPdfCompressionSettings } from '../pdf-compression'
 import { getPdfInfo, getPdfPageCountFast } from '../pdf-info'
 import {
@@ -282,6 +287,7 @@ const DELETE_SLOW_STEP_MS = 700
 const DELETE_FILE_CLEANUP_CONCURRENCY = 2
 const activeDocumentDeleteIds = new Set<string>()
 const activeDocumentDeleteJobs = new Set<Promise<void>>()
+let documentDeleteRuntimeShuttingDown = false
 const activeDocumentImportJobs = new Set<Promise<void>>()
 let documentImportShuttingDown = false
 const activeBookTranslationJobTasks = new Set<Promise<void>>()
@@ -348,13 +354,16 @@ async function deleteRowsByColumnAsync(tableName: string, columnName: string, do
   }
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
     while (true) {
-      const rows = queryAll<{ rowid: number }>(
-        `SELECT rowid FROM "${tableName}" WHERE "${columnName}" IN (${placeholders}) LIMIT ?`,
+      const rows = queryAll<{ delete_rowid: number }>(
+        `SELECT rowid AS delete_rowid
+         FROM "${tableName}"
+         WHERE "${columnName}" IN (${placeholders})
+         LIMIT ?`,
         [...chunkIds, DELETE_ROW_CHUNK_SIZE],
       )
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
-      run(`DELETE FROM "${tableName}" WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      run(`DELETE FROM "${tableName}" WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.delete_rowid))
       await yieldToEventLoop()
     }
   })
@@ -367,8 +376,8 @@ async function deleteRowsByDocIdsAsync(tableName: string, docIds: string[]): Pro
 async function deleteOcrPageAttemptsByDocIdsAsync(docIds: string[]): Promise<void> {
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
     while (true) {
-      const rows = queryAll<{ rowid: number }>(
-        `SELECT attempt.rowid
+      const rows = queryAll<{ delete_rowid: number }>(
+        `SELECT attempt.rowid AS delete_rowid
          FROM ocr_page_attempts attempt
          INNER JOIN ocr_runs run ON run.id = attempt.run_id
          WHERE run.doc_id IN (${placeholders})
@@ -377,7 +386,7 @@ async function deleteOcrPageAttemptsByDocIdsAsync(docIds: string[]): Promise<voi
       )
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
-      run(`DELETE FROM ocr_page_attempts WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      run(`DELETE FROM ocr_page_attempts WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.delete_rowid))
       await yieldToEventLoop()
     }
   })
@@ -387,13 +396,13 @@ async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
   if (!isFtsAvailable()) return
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
     while (true) {
-      const rows = queryAll<{ rowid: number }>(
-        `SELECT rowid FROM pages_fts WHERE doc_id IN (${placeholders}) LIMIT ?`,
+      const rows = queryAll<{ delete_rowid: number }>(
+        `SELECT rowid AS delete_rowid FROM pages_fts WHERE doc_id IN (${placeholders}) LIMIT ?`,
         [...chunkIds, DELETE_ROW_CHUNK_SIZE],
       )
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
-      run(`DELETE FROM pages_fts WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      run(`DELETE FROM pages_fts WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.delete_rowid))
       await yieldToEventLoop()
     }
 
@@ -401,8 +410,8 @@ async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
     // on large libraries freezes the main process for seconds.
     if (!isSearchSegmentsFtsRebuildNeeded()) {
       while (true) {
-        const segmentRows = queryAll<{ rowid: number; title: string | null; normalized_text: string | null; text: string | null }>(
-          `SELECT rowid, title, normalized_text, text
+        const segmentRows = queryAll<{ delete_rowid: number; title: string | null; normalized_text: string | null; text: string | null }>(
+          `SELECT rowid AS delete_rowid, title, normalized_text, text
            FROM search_index_segments
            WHERE doc_id IN (${placeholders})
              AND TRIM(COALESCE(normalized_text, text, '')) != ''
@@ -415,13 +424,13 @@ async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
             run(
               `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
                VALUES ('delete', ?, ?, ?)`,
-              [row.rowid, String(row.title || ''), String(row.normalized_text || row.text || '')],
+              [row.delete_rowid, String(row.title || ''), String(row.normalized_text || row.text || '')],
             )
             if (isSearchTrigramFtsAvailable()) {
               run(
                 `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
                  VALUES ('delete', ?, ?)`,
-                [row.rowid, String(row.normalized_text || row.text || '')],
+                [row.delete_rowid, String(row.normalized_text || row.text || '')],
               )
             }
           }
@@ -430,7 +439,7 @@ async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
         const rowPlaceholders = segmentRows.map(() => '?').join(', ')
         run(
           `DELETE FROM search_index_segments WHERE rowid IN (${rowPlaceholders})`,
-          segmentRows.map((row) => row.rowid),
+          segmentRows.map((row) => row.delete_rowid),
         )
         await yieldToEventLoop()
       }
@@ -441,8 +450,8 @@ async function deleteFtsRowsByDocIdsAsync(docIds: string[]): Promise<void> {
 async function deleteAiChatTurnsByDocIdsAsync(docIds: string[]): Promise<void> {
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
     while (true) {
-      const rows = queryAll<{ rowid: number }>(
-        `SELECT t.rowid
+      const rows = queryAll<{ delete_rowid: number }>(
+        `SELECT t.rowid AS delete_rowid
          FROM ai_chat_turns t
          JOIN ai_chat_sessions s ON s.id = t.session_id
          WHERE s.doc_id IN (${placeholders})
@@ -451,7 +460,7 @@ async function deleteAiChatTurnsByDocIdsAsync(docIds: string[]): Promise<void> {
       )
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
-      run(`DELETE FROM ai_chat_turns WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      run(`DELETE FROM ai_chat_turns WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.delete_rowid))
       await yieldToEventLoop()
     }
   })
@@ -654,33 +663,52 @@ async function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]):
 }
 
 function scheduleDocumentDeleteJob(docIds: string[]): void {
+  if (documentDeleteRuntimeShuttingDown) return
   const releaseCheckpointDeferral = beginDatabaseCheckpointDeferral()
   const job = new Promise<void>((resolve) => {
     setImmediate(() => {
       void (async () => {
         const affectedTagIds = new Set<string>()
         let recoveredSearchIndexIssue = false
+        let deletedIds = docIds
         try {
-          // Process a few documents at a time so list/settings IPC can run between batches.
-          for (let offset = 0; offset < docIds.length; offset += DELETE_DOC_BATCH_SIZE) {
-            const batch = docIds.slice(offset, offset + DELETE_DOC_BATCH_SIZE)
-            getAffectedTagIdsForDelete(batch).forEach((tagId) => affectedTagIds.add(tagId))
-            const deleteResult = await deleteDocumentData(batch)
-            if (deleteResult.recoveredSearchIndexIssue) recoveredSearchIndexIssue = true
-            await yieldToEventLoop()
+          if (isDocumentDeleteWorkerAvailable()) {
+            // better-sqlite3 is synchronous. The complete destructive pipeline must
+            // stay outside Electron's main process so one slow table/index scan can
+            // never freeze the renderer or project picker.
+            const workerResult = await runDocumentDeleteWorkerTask({
+              dbFilePath: getDatabaseFilePath(),
+              documentIds: docIds,
+            })
+            deletedIds = workerResult.deletedIds
+            workerResult.affectedTagIds.forEach((tagId) => affectedTagIds.add(tagId))
+            recoveredSearchIndexIssue = workerResult.recoveredSearchIndexIssue
+          } else {
+            // Source-only integration tests do not emit worker entry files. Keep a
+            // bounded compatibility path for them; production builds always include
+            // document-delete-worker.js and never run heavy deletes on this path.
+            for (let offset = 0; offset < docIds.length; offset += DELETE_DOC_BATCH_SIZE) {
+              const batch = docIds.slice(offset, offset + DELETE_DOC_BATCH_SIZE)
+              getAffectedTagIdsForDelete(batch).forEach((tagId) => affectedTagIds.add(tagId))
+              const deleteResult = await deleteDocumentData(batch)
+              if (deleteResult.recoveredSearchIndexIssue) recoveredSearchIndexIssue = true
+              await yieldToEventLoop()
+            }
           }
           if (recoveredSearchIndexIssue) {
             queueAllDocumentsReindex()
           }
           notifySearchContentChanged()
           refreshDeletedDocumentTags([...affectedTagIds])
-          const cleanupTasks = getDeleteCleanupTasks(docIds.map((id) => ({ id })))
+          const cleanupTasks = getDeleteCleanupTasks(deletedIds.map((id) => ({ id })))
           await cleanupDeletedDocumentFilesInBackground(cleanupTasks)
           // Long delay: avoid checkpoint fighting the next UI paint after bulk delete.
           scheduleDatabaseSave({ minDelayMs: 15_000 })
         } catch (error) {
           console.error('[Documents] Background document delete failed:', error)
-          markDocumentsDeleteFailed(docIds, error)
+          if (!documentDeleteRuntimeShuttingDown) {
+            markDocumentsDeleteFailed(docIds, error)
+          }
         } finally {
           docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
           releaseCheckpointDeferral()
@@ -756,9 +784,13 @@ export async function shutdownDocumentImportRuntime(timeoutMs = 30000): Promise<
 }
 
 export async function shutdownDocumentDeleteRuntime(timeoutMs = 30000): Promise<void> {
+  documentDeleteRuntimeShuttingDown = true
   const activeJobs = [...activeDocumentDeleteJobs]
-  if (activeJobs.length === 0) return
-  await waitForDocumentDeleteShutdown(activeJobs, timeoutMs)
+  if (activeJobs.length > 0) {
+    await waitForDocumentDeleteShutdown(activeJobs, timeoutMs)
+  }
+  await shutdownDocumentDeleteWorkers()
+  await waitForDocumentDeleteShutdown([...activeDocumentDeleteJobs], 2_000)
 }
 
 class BookTranslationShutdownError extends Error {

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 1.2.9 - 2026-07-28
+
+### 中文
+
+#### 批量删除无响应修复
+
+- 修复批量永久删除中的 SQLite `rowid` 字段名兼容问题：部分关联表会把未显式命名的 `rowid` 返回为主键字段，旧代码因此反复读取同一批记录而无法完成；现在所有分批清理都使用稳定别名，重启后也能继续完成此前卡住的删除任务。
+- 将向量、OCR、全文索引及其他关联数据的完整删除流水线移到独立数据库 worker。即使用户库中的某条 SQLite 清理语句耗时较长，Electron 主进程和窗口仍保持响应。
+- 增加真实 worker 压力回归：用故意变慢的同步 SQLite 删除语句验证主线程心跳持续运行，并覆盖向量行、标签关系、项目关系和最终文献记录的完整清理。
+
+#### 下载
+
+- `GujiSmart-1.2.9-Setup-x64.exe`
+- `GujiSmart-1.2.9-Portable-x64.exe`
+
+### English
+
+#### Responsive Bulk-Deletion Recovery
+
+- Fixed SQLite `rowid` result-name handling during batched permanent deletion. Some relation tables returned an implicit rowid under the primary-key column name, causing the old loop to repeatedly select the same rows forever. Every row drain now uses an explicit stable alias, including startup recovery of already-stuck deletions.
+- Moved the complete vector, OCR, full-text index, and related-data deletion pipeline to a dedicated database worker. A slow synchronous SQLite cleanup statement can no longer block Electron's main process or freeze the window.
+- Added a real worker stress regression that deliberately slows a synchronous SQLite delete while verifying continuous main-thread heartbeats and complete cleanup of vector rows, tags, project relations, and document records.
+
+#### Downloads
+
+- `GujiSmart-1.2.9-Setup-x64.exe`
+- `GujiSmart-1.2.9-Portable-x64.exe`
+
 ## 1.2.8 - 2026-07-28
 
 ### 中文
