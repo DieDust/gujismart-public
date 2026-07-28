@@ -12,7 +12,7 @@ import type {
 } from '../shared/types'
 import { validateErrorEnvelope } from '../shared/error-envelope'
 import { isTaskStatus } from '../shared/task-contract'
-import { queryAll, queryOne, run, scheduleDatabaseSave, transaction } from './database'
+import { queryAll, queryOne, run, scheduleDatabaseSave, transaction, transactionAsync } from './database'
 
 const MAX_PAGE_SIZE = 200
 const MAX_JSON_BYTES = 256 * 1024
@@ -693,29 +693,39 @@ export function resumeTaskJob(jobIdValue: string, options?: { nowMs?: number }):
   return getTaskJob(jobId)
 }
 
+function cancelTaskJobInCurrentTransaction(jobId: string, nowMs: number): void {
+  const job = queryOne<TaskJobRow>('SELECT * FROM task_jobs WHERE id = ?', [jobId])
+  if (!job) throw new Error('task_job_not_found')
+  if (job.status === 'completed') throw new Error('task_job_terminal')
+  run(
+    `UPDATE task_attempts SET status = 'canceled', finished_at = ?
+     WHERE job_id = ? AND status = 'running'`,
+    [nowMs, jobId],
+  )
+  run(
+    `UPDATE task_items SET status = 'canceled', completion_kind = NULL, active_attempt_id = NULL,
+     lease_owner = NULL, lease_token = NULL, leased_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+     completed_at = ?, updated_at = ?
+     WHERE job_id = ? AND status IN ('queued', 'running', 'paused', 'error')`,
+    [nowMs, nowMs, jobId],
+  )
+  run("UPDATE task_jobs SET status = 'canceled', completion_kind = NULL, completed_at = ?, updated_at = ? WHERE id = ?", [nowMs, nowMs, jobId])
+  addEvent({ jobId, eventType: 'job_canceled', status: 'canceled', nowMs })
+  refreshJobCounts(jobId, nowMs)
+}
+
 export function cancelTaskJob(jobIdValue: string, options?: { nowMs?: number }): TaskJobRecord {
   const jobId = requiredText(jobIdValue, 'task_job_id_invalid')
   const nowMs = nowValue(options?.nowMs)
-  transaction(() => {
-    const job = queryOne<TaskJobRow>('SELECT * FROM task_jobs WHERE id = ?', [jobId])
-    if (!job) throw new Error('task_job_not_found')
-    if (job.status === 'completed') throw new Error('task_job_terminal')
-    run(
-      `UPDATE task_attempts SET status = 'canceled', finished_at = ?
-       WHERE job_id = ? AND status = 'running'`,
-      [nowMs, jobId],
-    )
-    run(
-      `UPDATE task_items SET status = 'canceled', completion_kind = NULL, active_attempt_id = NULL,
-       lease_owner = NULL, lease_token = NULL, leased_at = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
-       completed_at = ?, updated_at = ?
-       WHERE job_id = ? AND status IN ('queued', 'running', 'paused', 'error')`,
-      [nowMs, nowMs, jobId],
-    )
-    run("UPDATE task_jobs SET status = 'canceled', completion_kind = NULL, completed_at = ?, updated_at = ? WHERE id = ?", [nowMs, nowMs, jobId])
-    addEvent({ jobId, eventType: 'job_canceled', status: 'canceled', nowMs })
-    refreshJobCounts(jobId, nowMs)
-  })
+  transaction(() => cancelTaskJobInCurrentTransaction(jobId, nowMs))
+  scheduleDatabaseSave()
+  return getTaskJob(jobId)
+}
+
+export async function cancelTaskJobAsync(jobIdValue: string, options?: { nowMs?: number }): Promise<TaskJobRecord> {
+  const jobId = requiredText(jobIdValue, 'task_job_id_invalid')
+  const nowMs = nowValue(options?.nowMs)
+  await transactionAsync(() => cancelTaskJobInCurrentTransaction(jobId, nowMs))
   scheduleDatabaseSave()
   return getTaskJob(jobId)
 }

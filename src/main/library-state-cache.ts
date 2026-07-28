@@ -1,5 +1,5 @@
 import type { LibrarySmartViewCounts, LibraryStateCache } from '../shared/types'
-import { isLargeLibraryForAutomaticMaintenance, queryAll, queryOne, run, scheduleDatabaseSave } from './database'
+import { isLargeLibraryForAutomaticMaintenance, queryAll, queryAllAsync, queryOne, run, runAsync, scheduleDatabaseSave } from './database'
 import { buildCumulativeFolderDocumentCounts } from './folder-scope'
 import { getActiveLibraryProjectId } from './library-projects'
 
@@ -11,6 +11,8 @@ const LIBRARY_STATE_CACHE_COLD_START_DELAY_MS = 18_000
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let refreshRunning = false
 let refreshPending = false
+const pendingSmartViewCacheWrites = new Map<string, { cacheJson: string; dirty: number; updatedAt: string }>()
+let smartViewCacheWriteRunning = false
 
 const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   all: 0,
@@ -190,6 +192,14 @@ function readCacheRow(projectId = getActiveLibraryProjectId()): CacheRow | null 
   return queryOne<CacheRow>('SELECT cache_json, dirty, updated_at FROM library_state_cache WHERE cache_key = ?', [cacheKey(projectId)])
 }
 
+async function readCacheRowAsync(projectId: string): Promise<CacheRow | null> {
+  const rows = await queryAllAsync<CacheRow>(
+    'SELECT cache_json, dirty, updated_at FROM library_state_cache WHERE cache_key = ?',
+    [cacheKey(projectId)],
+  )
+  return rows[0] || null
+}
+
 export function getLibraryStateCache(): LibraryStateCache {
   const row = readCacheRow()
   if (!row?.cache_json) {
@@ -273,9 +283,8 @@ function buildTagCounts(projectId: string): Record<string, number> {
   return Object.fromEntries(rows.map((row) => [row.id, numberValue(row.count)]))
 }
 
-function buildSmartViewCounts(projectId: string): LibrarySmartViewCounts {
-  const row = queryOne<SmartViewCountRow>(
-    `SELECT
+function smartViewCountSql(): string {
+  return `SELECT
        COUNT(*) AS all_count,
        COALESCE(SUM(CASE WHEN ${buildMissingMetadataFilter()} THEN 1 ELSE 0 END), 0) AS missing_metadata_count,
        COALESCE(SUM(CASE WHEN ${buildOcrIncompleteCondition()} THEN 1 ELSE 0 END), 0) AS unrecognized_count,
@@ -296,9 +305,10 @@ function buildSmartViewCounts(projectId: string): LibrarySmartViewCounts {
      INNER JOIN documents d ON d.id = project_scope.document_id
      LEFT JOIN embedding_index_status eis ON eis.doc_id = d.id
      WHERE project_scope.project_id = ?
-       AND COALESCE(d.import_status, '') <> 'deleting'`,
-    [projectId],
-  )
+       AND COALESCE(d.import_status, '') <> 'deleting'`
+}
+
+function normalizeSmartViewCounts(row?: SmartViewCountRow | null): LibrarySmartViewCounts {
   return {
     all: numberValue(row?.all_count),
     missingMetadata: numberValue(row?.missing_metadata_count),
@@ -317,6 +327,15 @@ function buildSmartViewCounts(projectId: string): LibrarySmartViewCounts {
     embeddingProcessing: numberValue(row?.embedding_processing_count),
     embeddingError: numberValue(row?.embedding_error_count),
   }
+}
+
+function buildSmartViewCounts(projectId: string): LibrarySmartViewCounts {
+  return normalizeSmartViewCounts(queryOne<SmartViewCountRow>(smartViewCountSql(), [projectId]))
+}
+
+async function buildSmartViewCountsAsync(projectId: string): Promise<LibrarySmartViewCounts> {
+  const rows = await queryAllAsync<SmartViewCountRow>(smartViewCountSql(), [projectId])
+  return normalizeSmartViewCounts(rows[0])
 }
 
 function buildCache(): LibraryStateCache {
@@ -371,9 +390,63 @@ export function refreshLibraryStateCache(): LibraryStateCache {
   return cache
 }
 
-export function refreshLibrarySmartViewCounts(): LibrarySmartViewCounts {
+function scheduleSmartViewCacheWrite(
+  projectId: string,
+  cacheJson: string,
+  dirty: number,
+  updatedAt: string,
+): void {
+  pendingSmartViewCacheWrites.set(projectId, { cacheJson, dirty, updatedAt })
+  if (smartViewCacheWriteRunning) return
+  smartViewCacheWriteRunning = true
+  setImmediate(() => {
+    void (async () => {
+      try {
+        while (pendingSmartViewCacheWrites.size > 0) {
+          const pending = [...pendingSmartViewCacheWrites.entries()]
+          pendingSmartViewCacheWrites.clear()
+          for (const [pendingProjectId, payload] of pending) {
+            try {
+              await runAsync(
+                `INSERT INTO library_state_cache (cache_key, cache_json, dirty, updated_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(cache_key) DO UPDATE SET
+                   cache_json = excluded.cache_json,
+                   dirty = excluded.dirty,
+                   updated_at = excluded.updated_at`,
+                [cacheKey(pendingProjectId), payload.cacheJson, payload.dirty, payload.updatedAt],
+              )
+              scheduleDatabaseSave({ minDelayMs: 15_000 })
+            } catch (error) {
+              console.warn('[LibraryStateCache] Deferred smart-view snapshot write failed', error)
+            }
+          }
+        }
+      } finally {
+        smartViewCacheWriteRunning = false
+        if (pendingSmartViewCacheWrites.size > 0) {
+          const latest = [...pendingSmartViewCacheWrites.entries()]
+          pendingSmartViewCacheWrites.clear()
+          latest.forEach(([pendingProjectId, payload]) => {
+            scheduleSmartViewCacheWrite(
+              pendingProjectId,
+              payload.cacheJson,
+              payload.dirty,
+              payload.updatedAt,
+            )
+          })
+        }
+      }
+    })()
+  })
+}
+
+export async function refreshLibrarySmartViewCounts(): Promise<LibrarySmartViewCounts> {
   const projectId = getActiveLibraryProjectId()
-  const row = readCacheRow(projectId)
+  const [row, smartViewCounts] = await Promise.all([
+    readCacheRowAsync(projectId),
+    buildSmartViewCountsAsync(projectId),
+  ])
   let cache = emptyCache(true)
   if (row?.cache_json) {
     try {
@@ -382,26 +455,21 @@ export function refreshLibrarySmartViewCounts(): LibrarySmartViewCounts {
       cache = emptyCache(true)
     }
   }
-  const smartViewCounts = buildSmartViewCounts(projectId)
   const updatedAt = new Date().toISOString()
   const dirty = row?.dirty === 0 ? 0 : 1
-  run(
-    `INSERT INTO library_state_cache (cache_key, cache_json, dirty, updated_at)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(cache_key) DO UPDATE SET
-       cache_json = excluded.cache_json,
-       dirty = excluded.dirty,
-       updated_at = excluded.updated_at`,
-    [cacheKey(projectId), JSON.stringify({
+  scheduleSmartViewCacheWrite(
+    projectId,
+    JSON.stringify({
       version: CACHE_VERSION,
       smartViewCounts,
       unfiledDocumentTotal: cache.unfiledDocumentTotal,
       folderDocumentCounts: cache.folderDocumentCounts,
       tagDocumentCounts: cache.tagDocumentCounts,
       lastCalibratedAt: cache.lastCalibratedAt,
-    }), dirty, updatedAt],
+    }),
+    dirty,
+    updatedAt,
   )
-  scheduleDatabaseSave({ minDelayMs: 15_000 })
   return smartViewCounts
 }
 
@@ -444,4 +512,44 @@ export function markLibraryStateCacheDirty(projectIds?: string[]): LibraryStateC
     }
   }
   return getLibraryStateCache()
+}
+
+export async function markLibraryStateCacheDirtyAsync(projectIds?: string[]): Promise<void> {
+  const activeProjectId = getActiveLibraryProjectId()
+  const scopedProjectIds = [...new Set((projectIds?.length ? projectIds : [activeProjectId]).filter(Boolean))]
+  const now = new Date().toISOString()
+  for (const projectId of scopedProjectIds) {
+    const row = readCacheRow(projectId)
+    let cacheJson = row?.cache_json || ''
+    if (!cacheJson) {
+      const cache = emptyCache(true)
+      cacheJson = JSON.stringify({
+        version: cache.version,
+        smartViewCounts: cache.smartViewCounts,
+        unfiledDocumentTotal: cache.unfiledDocumentTotal,
+        folderDocumentCounts: cache.folderDocumentCounts,
+        tagDocumentCounts: cache.tagDocumentCounts,
+        lastCalibratedAt: cache.lastCalibratedAt,
+      })
+    }
+    if (row?.cache_json) {
+      await runAsync(
+        'UPDATE library_state_cache SET dirty = 1, updated_at = ? WHERE cache_key = ?',
+        [now, cacheKey(projectId)],
+      )
+    } else {
+      await runAsync(
+        'INSERT INTO library_state_cache (cache_key, cache_json, dirty, updated_at) VALUES (?, ?, 1, ?)',
+        [cacheKey(projectId), cacheJson, now],
+      )
+    }
+  }
+  scheduleDatabaseSave()
+  if (scopedProjectIds.includes(activeProjectId)) {
+    if (isLargeLibraryForAutomaticMaintenance()) {
+      console.log('[LibraryStateCache] Keeping dirty snapshot on large library (no automatic rebuild)')
+    } else {
+      scheduleLibraryStateCacheRefresh()
+    }
+  }
 }

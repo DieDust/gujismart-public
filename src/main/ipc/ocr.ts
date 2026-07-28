@@ -4,7 +4,7 @@ import { readdir, readFile, rm, writeFile } from 'fs/promises'
 import { basename, delimiter, dirname, join, parse } from 'path'
 import { nanoid } from 'nanoid'
 import { autoExtractAndApply } from '../ai'
-import { clearPageSearchIndexForDocuments, getDataDir, queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { clearPageSearchIndexForDocuments, getDataDir, queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction, transactionAsync } from '../database'
 import { autoCleanupPdfAssetsIfEnabled, restorePdfAssetForDocument } from '../pdf-assets'
 import { analyzePdfTextLayer } from '../pdf-preflight'
 import { allowFileAccessPath } from '../file-access'
@@ -59,7 +59,7 @@ import {
   recoverInterruptedImportAutoOcrTasks,
 } from '../import-auto-ocr-task'
 import {
-  cancelTaskJob,
+  cancelTaskJobAsync,
   claimTaskItems,
   completeTaskItem,
   failTaskItem,
@@ -5390,12 +5390,12 @@ function updateDocumentCanceledStatus(docId: string): void {
 }
 
 /** Cancel persisted queue rows for one document so resume cannot pick it up again. */
-function cancelPersistedOcrQueueForDocument(docId: string): void {
+async function cancelPersistedOcrQueueForDocument(docId: string): Promise<void> {
   const safeDocId = String(docId || '').trim()
   if (!safeDocId) return
   const nowMs = Date.now()
   const nowIso = new Date(nowMs).toISOString()
-  transaction(() => {
+  await transactionAsync(() => {
     run(
       `UPDATE batch_queue
        SET status = 'failed',
@@ -5432,21 +5432,27 @@ function cancelPersistedOcrQueueForDocument(docId: string): void {
         safeDocId,
       ],
     )
+    // Keep the document/page status change in the same acquired write
+    // transaction so OCR cannot retake the writer lock between cancellation
+    // records and the visible document state.
+    updateDocumentCanceledStatus(safeDocId)
   })
   scheduleDatabaseSave()
 }
 
-function cancelAllPersistedOcrQueues(): { canceledJobs: number; canceledDocuments: number } {
+async function cancelAllPersistedOcrQueues(): Promise<{ canceledJobs: number; canceledDocuments: number }> {
   const nowMs = Date.now()
   const nowIso = new Date(nowMs).toISOString()
   const resumableJobs = listResumableImportAutoOcrTasks()
-  resumableJobs.forEach((job) => {
+  let canceledJobs = 0
+  for (const job of resumableJobs) {
     try {
-      cancelTaskJob(job.id, { nowMs })
+      await cancelTaskJobAsync(job.id, { nowMs })
+      canceledJobs += 1
     } catch (error) {
       console.warn('[OCR] Failed to cancel import-auto job', job.id, error)
     }
-  })
+  }
 
   const queuedDocs = queryAll<{ id: string }>(
     `SELECT id FROM documents
@@ -5460,7 +5466,7 @@ function cancelAllPersistedOcrQueues(): { canceledJobs: number; canceledDocument
     canceledOcrDocIds.add(docId)
   }
 
-  transaction(() => {
+  await transactionAsync(() => {
     run(
       `UPDATE batch_queue
        SET status = 'failed',
@@ -5499,7 +5505,7 @@ function cancelAllPersistedOcrQueues(): { canceledJobs: number; canceledDocument
     }
   })
   scheduleDatabaseSave()
-  return { canceledJobs: resumableJobs.length, canceledDocuments: queuedDocs.length }
+  return { canceledJobs, canceledDocuments: queuedDocs.length }
 }
 
 function markDocumentTocDirty(docId: string): void {
@@ -7195,8 +7201,7 @@ export function registerOcrIpc(): void {
     // Force-release in-memory slot even when network OCR never honors AbortSignal.
     forceReleaseActiveOcrTask(safeDocId)
     // Also drop persisted queue rows; otherwise restart/resume re-picks the same doc.
-    cancelPersistedOcrQueueForDocument(safeDocId)
-    updateDocumentCanceledStatus(safeDocId)
+    await cancelPersistedOcrQueueForDocument(safeDocId)
     emitOcrCanceledOrCompletedStatus(event, safeDocId, 0)
     // Always true when status was updated — queued docs have no active AbortController.
     return true
@@ -7213,7 +7218,7 @@ export function registerOcrIpc(): void {
     }
     const releasedActiveIds = forceReleaseAllActiveOcrTasks()
 
-    const summary = cancelAllPersistedOcrQueues()
+    const summary = await cancelAllPersistedOcrQueues()
     // Also mark any DB-updated docs as canceled for UI events.
     const canceledDocIds = queryAll<{ id: string }>(
       `SELECT id FROM documents

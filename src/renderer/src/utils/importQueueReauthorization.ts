@@ -1,11 +1,26 @@
 import type { ImportSelectionBatchItem } from '@shared/types'
 
+function normalizeLabel(value: string): string {
+  const normalizedPath = value.trim().replace(/\\/g, '/')
+  return (normalizedPath.split('/').pop() || normalizedPath).toLocaleLowerCase()
+}
+
 function consumeLabel(labels: string[], displayName: string): boolean {
-  const normalized = displayName.trim().toLocaleLowerCase()
-  const index = labels.findIndex((label) => label.trim().toLocaleLowerCase() === normalized)
+  const normalized = normalizeLabel(displayName)
+  const index = labels.findIndex((label) => normalizeLabel(label) === normalized)
   if (index < 0) return false
   labels.splice(index, 1)
   return true
+}
+
+export function getPendingImportDisplayLabels(
+  pendingGrantIds: string[],
+  displayNames?: Map<string, string>,
+): string[] {
+  if (!displayNames) return []
+  return pendingGrantIds
+    .map((grantId) => displayNames.get(grantId) || '')
+    .filter(Boolean)
 }
 
 export function matchReauthorizedItems(

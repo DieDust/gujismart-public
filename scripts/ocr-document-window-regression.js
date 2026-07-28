@@ -76,6 +76,26 @@ async function main() {
       || batchProcessor.includes('globalOcrDocumentWindow.run('),
     'legacy resumed OCR should share the global document window',
   )
+  assert.ok(
+    ocrIpc.includes('async function cancelPersistedOcrQueueForDocument')
+      && ocrIpc.includes('await transactionAsync(() => {')
+      && ocrIpc.includes('await cancelPersistedOcrQueueForDocument(safeDocId)'),
+    'single-document OCR cancellation must wait asynchronously for SQLite before persisting queue and document state',
+  )
+  assert.ok(
+    ocrIpc.includes('async function cancelAllPersistedOcrQueues')
+      && ocrIpc.includes('const summary = await cancelAllPersistedOcrQueues()'),
+    'cancel-all must use the same nonblocking SQLite writer-lock path',
+  )
+  const cancelHandler = ocrIpc.slice(
+    ocrIpc.indexOf("ipcMain.handle('ocr:cancelDocument'"),
+    ocrIpc.indexOf("ipcMain.handle('ocr:cancelAllPending'"),
+  )
+  assert.ok(
+    cancelHandler.indexOf('forceReleaseActiveOcrTask(safeDocId)')
+      < cancelHandler.indexOf('await cancelPersistedOcrQueueForDocument(safeDocId)'),
+    'OCR cancellation must abort and release the live task before waiting for the database writer lock',
+  )
 
   console.log('OCR document sliding-window regression passed.')
 }

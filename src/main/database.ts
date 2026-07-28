@@ -3727,6 +3727,25 @@ export function queryAll<T = Record<string, unknown>>(sql: string, params?: unkn
   return rows
 }
 
+export async function queryAllAsync<T = Record<string, unknown>>(
+  sql: string,
+  params?: unknown[],
+  options?: { maxWaitMs?: number },
+): Promise<T[]> {
+  const database = getDatabase()
+  const maxWaitMs = Math.max(0, Number(options?.maxWaitMs ?? DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS))
+  const deadline = Date.now() + maxWaitMs
+  while (true) {
+    try {
+      const stmt = database.prepare(sql)
+      return params ? stmt.all(...params) as T[] : stmt.all() as T[]
+    } catch (error) {
+      if (!isDatabaseBusyError(error) || Date.now() >= deadline) throw error
+      await sleepAsync(Math.min(DATABASE_ASYNC_BUSY_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())))
+    }
+  }
+}
+
 export function queryOne<T = Record<string, unknown>>(sql: string, params?: unknown[]): T | null {
   const database = getDatabase()
   let row: T | undefined

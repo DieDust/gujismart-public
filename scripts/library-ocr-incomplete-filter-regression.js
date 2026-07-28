@@ -67,7 +67,7 @@ assert(
 
 const sidebarCacheBlock = sliceBetween(
   libraryCacheSource,
-  'function buildSmartViewCounts',
+  'function smartViewCountSql',
   'function buildCache',
   'library sidebar smart-view aggregate',
 )

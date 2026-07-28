@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## 1.2.14 - 2026-07-29
+
+### 中文
+
+#### 永久删除写锁与中断导入恢复
+
+- 修复永久删除或批量永久删除在真正进入后台队列之前，因同步刷新项目侧栏缓存而直接提示 `documents:deleteBatch: database is locked`、导致文献根本无法删除的问题。删除入口现在只进行异步读取，删除标记、项目缓存失效和完整清理统一在后台写入队列中依次执行。
+- 删除请求会在数据库被导入、OCR 或其他任务短暂占用时异步等待，不阻塞 Electron 主进程；向量、OCR、全文索引、标签、摘录、项目关系和原文文件仍按原有永久删除语义完整清理。
+- 修复中断导入后把已经处理完成的文件名继续保存为“待重新授权”，从而反复要求重新选择、选择后却显示“已加入导入队列：0 个文件”的问题。
+- 重新授权大目录时，即使前一个扫描批次没有找到目标文件也会继续扫描；全部目标已匹配后会及时停止，不再无意义扫描整个目录。选择不匹配时会明确提示重新选择原文件或包含它的目录。
+- 重新授权提示新增“放弃任务”。它只移除未完成的断点续传记录，不会删除已导入文献、原文、OCR 或其他数据。
+- 修复手动或自动刷新智能视图时，为了保存统计快照而同步争抢 SQLite 写锁，导致提示“智能视图状态刷新失败”的问题。统计读取现在异步执行，快照写入在后台合并并重试；即使 OCR、导入或删除正在写库，刷新结果也能先正常显示。
+- 修复取消单篇 OCR 时，任务已经收到终止信号但持久化取消状态被 SQLite 写锁拦截，导致提示 `ocr:cancelDocument: database is locked` 的问题。现在会先立即中止运行和释放 OCR 槽位，再异步等待写锁，将任务队列、文献和页面状态原子保存。
+- “取消全部 OCR”同步使用非阻塞写锁等待，避免任务在当前界面看似取消、重启后却又被恢复。
+
+#### 下载
+
+- `GujiSmart-1.2.14-Setup-x64.exe`
+- `GujiSmart-1.2.14-Portable-x64.exe`
+
+### English
+
+#### Permanent-Deletion Writer Lock and Interrupted Import Recovery
+
+- Fixed permanent and batch deletion failing before reaching the background queue because synchronous project-cache invalidation surfaced `documents:deleteBatch: database is locked`. The submission path is now read-only and asynchronous; delete markers, project-cache invalidation, and complete cleanup run serially on the background writer queue.
+- Delete requests now wait asynchronously while import, OCR, or another task briefly owns SQLite's writer lock without blocking Electron's main process. Vectors, OCR, full-text indexes, tags, excerpts, project memberships, and source files retain their complete permanent-delete semantics.
+- Fixed completed file names remaining in interrupted-import authorization snapshots, which caused repeated reauthorization prompts followed by “0 files added to the import queue.”
+- Directory reauthorization now continues after empty intermediate scan batches and stops as soon as every requested file is matched. A completed but unmatched selection now gives an actionable explanation.
+- Added a “Discard task” action that removes only the stale resume record; already imported documents, source files, OCR, and all other data are preserved.
+- Fixed manual and automatic Smart View refreshes competing synchronously for SQLite's writer lock merely to persist a count snapshot. Count reads are now asynchronous, while snapshot writes are coalesced and retried in the background so current results can render while OCR, imports, or deletion are writing.
+- Fixed single-document OCR cancellation aborting the live task but then surfacing `ocr:cancelDocument: database is locked` before its cancellation state could be persisted. The live request and OCR slot are released first, followed by an asynchronously acquired transaction that atomically updates task, document, and page state.
+- “Cancel all OCR” now uses the same nonblocking writer-lock path so canceled work cannot silently return after restart.
+
+#### Downloads
+
+- `GujiSmart-1.2.14-Setup-x64.exe`
+- `GujiSmart-1.2.14-Portable-x64.exe`
+
 ## 1.2.12 - 2026-07-29
 
 ### 中文

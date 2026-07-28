@@ -67,7 +67,7 @@ import { toggleSelectionId } from '../utils/interactionKernel'
 import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
-import { matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
+import { getPendingImportDisplayLabels, matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
 import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
@@ -5276,7 +5276,7 @@ export default function LibraryView({
       ? job.remainingAuthorizationLabels || []
       : hasUndiscoveredSources
         ? job.sourceLabels
-        : [...(job.displayNames?.values() || [])]
+        : getPendingImportDisplayLabels(job.filePaths, job.displayNames)
     const pendingCount = job.filePaths.length
       + (isReauthorization ? sourceLabels.length : 0)
       + (hasUndiscoveredSources ? 1 : 0)
@@ -5701,7 +5701,7 @@ export default function LibraryView({
         } finally {
           remainingBeforeRefill = job.filePaths.length
           await refillImportSelectionJob(job)
-          if (job.filePaths.length > 0) {
+          if (job.filePaths.length > 0 || !job.selectionDone) {
             importQueueRef.current.unshift(job)
           } else if (job.selectionDone && (job.remainingAuthorizationLabels?.length || 0) > 0) {
             replaceAuthorizationRequiredJobs([
@@ -5725,6 +5725,10 @@ export default function LibraryView({
           persistImportQueueSnapshot()
         }
         if (remainingBeforeRefill > 0) break
+        if (!job.selectionDone && job.filePaths.length === 0) {
+          await delay(0)
+          continue
+        }
         if (job.filePaths.length === 0) {
           await loadBaseData()
         } else {
@@ -5782,9 +5786,20 @@ export default function LibraryView({
       nextFilePaths.push(filePath)
     }
 
+    const isReauthorizationReplacement = typeof options?.jobId === 'number'
+    const selectionDone = options?.selectionDone ?? true
+    const remainingAuthorizationCount = options?.remainingAuthorizationLabels?.length || 0
+    if (nextFilePaths.length === 0 && selectionDone && isReauthorizationReplacement) {
+      if (remainingAuthorizationCount > 0) {
+        message.warning({ content: '所选文件与待恢复的导入任务不匹配，请重新选择原文件或包含它的目录', key: 'import-reauthorization-mismatch', duration: 5 })
+        return false
+      }
+      message.info({ content: '没有需要继续导入的文件，旧导入任务已结清', key: 'import-reauthorization-complete', duration: 4 })
+      return true
+    }
     if (nextFilePaths.length === 0
-      && (options?.selectionDone ?? true)
-      && (options?.remainingAuthorizationLabels?.length || 0) === 0) {
+      && selectionDone
+      && remainingAuthorizationCount === 0) {
       message.info({ content: '这些文件已在当前导入队列中', key: 'import-queue-duplicate', duration: 3 })
       return false
     }
@@ -5817,7 +5832,9 @@ export default function LibraryView({
     refreshImportQueueLength()
     persistImportQueueSnapshot()
 
-    if (importQueueRunningRef.current) {
+    if (nextFilePaths.length === 0 && !selectionDone) {
+      message.loading({ content: '正在继续扫描所选目录，查找上次未完成的文件…', key: 'import', duration: 0 })
+    } else if (importQueueRunningRef.current) {
       message.success({ content: `已加入导入队列：${nextFilePaths.length} 个文件，将在当前任务后自动处理`, key: 'import-queued', duration: 4 })
     } else {
       message.loading({ content: `已加入导入队列：${nextFilePaths.length} 个文件`, key: 'import', duration: 0 })
@@ -5901,14 +5918,20 @@ export default function LibraryView({
     const folderAssignments = new Map(items
       .map((item) => [item.grantId, sourceFolderIds.get(item.sourceId)] as const)
       .filter((entry): entry is readonly [string, string] => Boolean(entry[1])))
+    const itemReauthorizationSatisfied = Boolean(
+      reauthorizationJob
+      && !sourceMatch
+      && (remainingAuthorizationLabels?.length || 0) === 0,
+    )
+    const effectiveSelectionDone = batchResult.value.done || itemReauthorizationSatisfied
     if (grantIds.length === 0 && batchResult.value.done && !reauthorizationJob) {
       message.info('没有找到可导入的文件')
       return false
     }
     const replacementEstablished = enqueueImportJob(grantIds, targetFolderId || null, folderAssignments, {
       selectionId: selection.selectionId,
-      nextCursor: batchResult.value.nextCursor,
-      selectionDone: batchResult.value.done,
+      nextCursor: effectiveSelectionDone ? null : batchResult.value.nextCursor,
+      selectionDone: effectiveSelectionDone,
       sourceLabels: selection.sources.map((source) => source.displayName),
       sourceFolderIds,
       displayNames: new Map(items.map((item) => [item.grantId, item.displayName])),
@@ -5920,7 +5943,7 @@ export default function LibraryView({
       jobId: reauthorizationJob?.id,
       libraryProjectId: reauthorizationJob?.libraryProjectId || activeLibraryProjectId,
     })
-    ownershipTransferred = replacementEstablished && !batchResult.value.done
+    ownershipTransferred = replacementEstablished && !effectiveSelectionDone
     return replacementEstablished
     } finally {
       if (!ownershipTransferred) await window.api.releaseImportSelection(selection.selectionId)
@@ -5947,6 +5970,24 @@ export default function LibraryView({
         if (nextJob) window.setTimeout(() => promptImportQueueReauthorization(nextJob), 0)
       },
       onCancel: () => undefined,
+    })
+  }
+
+  const discardImportQueueReauthorization = (job: LibraryImportQueueJobSnapshotV2) => {
+    Modal.confirm({
+      title: '放弃这个未完成的导入任务？',
+      content: '只会删除这条断点续传记录；已经导入的文献、原文、OCR 和其他数据都不会被删除。',
+      okText: '放弃任务',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        const nextJobs = transitionAuthorizationJobs(authorizationRequiredJobsRef.current, job.id, {
+          replacementEstablished: true,
+        })
+        replaceAuthorizationRequiredJobs(nextJobs)
+        persistImportQueueSnapshot()
+        message.success('已放弃未完成的导入任务')
+      },
     })
   }
 
@@ -7861,9 +7902,14 @@ export default function LibraryView({
             description={(
               <Space wrap size={8}>
                 {authorizationRequiredJobs.map((job) => (
-                  <Button key={job.id} size="small" onClick={() => promptImportQueueReauthorization(job)}>
-                    重新选择（约 {job.pendingCount} 个文件）
-                  </Button>
+                  <Space key={job.id} size={4}>
+                    <Button size="small" onClick={() => promptImportQueueReauthorization(job)}>
+                      重新选择（约 {job.pendingCount} 个文件）
+                    </Button>
+                    <Button size="small" danger type="text" onClick={() => discardImportQueueReauthorization(job)}>
+                      放弃任务
+                    </Button>
+                  </Space>
                 ))}
               </Space>
             )}

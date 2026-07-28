@@ -2,6 +2,7 @@ const assert = require('assert')
 const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('fs')
 const { join } = require('path')
 const { buildSync } = require('esbuild')
+const Database = require('better-sqlite3')
 
 const root = join(__dirname, '..')
 const databaseSource = readFileSync(join(root, 'src', 'main', 'database.ts'), 'utf8')
@@ -110,6 +111,7 @@ buildSync({
 
 async function run() {
   let database
+  let lockWriter
   try {
     const modules = require(bundlePath)
     database = modules.database
@@ -533,14 +535,26 @@ async function run() {
       `large project selection should stay bounded, took ${selectionDurationMs}ms`,
     )
     const smartCountsStartedAt = Date.now()
-    const smartCounts = modules.libraryState.refreshLibrarySmartViewCounts()
+    lockWriter = new Database(database.getDatabaseFilePath())
+    lockWriter.pragma('journal_mode = WAL')
+    lockWriter.pragma('busy_timeout = 0')
+    lockWriter.exec('BEGIN IMMEDIATE')
+    lockWriter.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(
+      'smart_view_refresh_writer_lock',
+      'holding',
+    )
+    const smartCounts = await modules.libraryState.refreshLibrarySmartViewCounts()
     const smartCountsDurationMs = Date.now() - smartCountsStartedAt
     assert.strictEqual(smartCounts.all, 20_000)
     assert.strictEqual(smartCounts.notVectorized, 20_000)
     assert.ok(
       smartCountsDurationMs < 1_500,
-      `large-project smart-view refresh should stay bounded, took ${smartCountsDurationMs}ms`,
+      `large-project smart-view refresh should stay bounded under a competing writer lock, took ${smartCountsDurationMs}ms`,
     )
+    lockWriter.exec('COMMIT')
+    lockWriter.close()
+    lockWriter = null
+    await new Promise((resolve) => setTimeout(resolve, 150))
     const creationStartedAt = Date.now()
     const emptyProject = modules.projects.createLibraryProject({ name: 'Fast empty project', activate: true })
     const creationDurationMs = Date.now() - creationStartedAt
@@ -557,6 +571,12 @@ async function run() {
     console.log('Library project migration, isolation, workspace, transfer, and copy regression passed.')
     process.exit(0)
   } finally {
+    try {
+      if (lockWriter?.inTransaction) lockWriter.exec('ROLLBACK')
+    } catch {
+      // Ignore cleanup errors.
+    }
+    lockWriter?.close()
     try {
       database?.closeDatabase?.()
     } catch {

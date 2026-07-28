@@ -56,7 +56,7 @@ function createFixture() {
     WITH RECURSIVE fixture(value) AS (
       SELECT 1
       UNION ALL
-      SELECT value + 1 FROM fixture WHERE value < 250000
+      SELECT value + 1 FROM fixture WHERE value < 500000
     )
     INSERT INTO delete_cpu_fixture(value) SELECT value FROM fixture;
     CREATE TRIGGER slow_document_delete

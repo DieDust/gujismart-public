@@ -15,7 +15,24 @@ try {
     platform: 'node',
     format: 'cjs',
   })
-  const { matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } = require(outfile)
+  const {
+    getPendingImportDisplayLabels,
+    matchReauthorizedItems,
+    matchReauthorizedSources,
+    transitionAuthorizationJobs,
+  } = require(outfile)
+
+  assert.deepStrictEqual(
+    getPendingImportDisplayLabels(
+      ['g2'],
+      new Map([
+        ['g1', 'already-imported.pdf'],
+        ['g2', 'still-pending.pdf'],
+      ]),
+    ),
+    ['still-pending.pdf'],
+    'persisted authorization labels must only include grant IDs that are still pending',
+  )
 
   const itemMatch = matchReauthorizedItems(
     ['a.pdf', 'a.pdf', 'b.txt'],
@@ -27,6 +44,16 @@ try {
   )
   assert.deepStrictEqual(itemMatch.matchedItems.map((item) => item.grantId), ['g1', 'g3'])
   assert.deepStrictEqual(itemMatch.remainingLabels, ['b.txt'])
+  const pathItemMatch = matchReauthorizedItems(
+    ['old-folder\\nested\\target.pdf'],
+    [{ grantId: 'path-grant', sourceId: 'path-source', displayName: 'target.pdf' }],
+  )
+  assert.deepStrictEqual(
+    pathItemMatch.matchedItems.map((item) => item.grantId),
+    ['path-grant'],
+    'reauthorization should match the original path label by basename',
+  )
+  assert.deepStrictEqual(pathItemMatch.remainingLabels, [])
 
   const sourceMatch = matchReauthorizedSources(
     ['第一批', '第二批'],
@@ -64,6 +91,13 @@ try {
   assert(library.includes("okText: '重新选择'"), 'reauthorization prompt must offer a reselect action')
   assert(library.includes('onCancel: () => undefined'), 'cancel must preserve the authorization-required job')
   assert(library.includes('remainingAuthorizationLabels'), 'partial coverage must remain explicit in the active queue job')
+  assert(library.includes('getPendingImportDisplayLabels(job.filePaths, job.displayNames)'), 'snapshot must exclude labels for files that already completed')
+  assert(!library.includes('...(job.displayNames?.values() || [])'), 'snapshot must not persist every historical display label')
+  assert(library.includes('job.filePaths.length > 0 || !job.selectionDone'), 'empty directory batches must remain queued until scanning finishes')
+  assert(library.includes('正在继续扫描所选目录，查找上次未完成的文件'), 'directory reauthorization must explain an empty intermediate batch')
+  assert(library.includes('所选文件与待恢复的导入任务不匹配'), 'a completed unmatched selection must remain actionable')
+  assert(library.includes('const discardImportQueueReauthorization ='), 'stale resume records must be discardable')
+  assert(library.includes('放弃任务'), 'authorization banner must expose the discard action')
   assert(library.includes('className="import-reauthorization-banner"'), 'all pending jobs need a persistent retry entry')
   assert(library.includes('authorizationRequiredJobs.map((job)'), 'persistent UI must render every pending authorization job')
   assert(!library.includes('const importFilePaths = async'), 'legacy renderer path queue helper must be removed')

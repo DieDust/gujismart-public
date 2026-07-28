@@ -12,7 +12,7 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { beginDatabaseCheckpointDeferral, clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, runAsync, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { beginDatabaseCheckpointDeferral, clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryAllAsync, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, runAsync, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { beginStartupPhase } from '../startup-timing'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
@@ -42,7 +42,7 @@ import {
 } from '../pdf-assets'
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
-import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { markLibraryStateCacheDirty, markLibraryStateCacheDirtyAsync } from '../library-state-cache'
 import { applyManualLiteraturePageAnchor, recomputeLiteraturePageMap, resetLiteraturePageMap } from '../literature-page-map'
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
@@ -467,21 +467,43 @@ async function deleteAiChatTurnsByDocIdsAsync(docIds: string[]): Promise<void> {
   })
 }
 
-function getDocumentsForDelete(docIds: string[]): DocumentFileRow[] {
+async function getDocumentsForDelete(docIds: string[], libraryProjectId: string): Promise<DocumentFileRow[]> {
   const rows: DocumentFileRow[] = []
-  runForIdChunks(docIds, (chunkIds, placeholders) => {
-    rows.push(...queryAll<DocumentFileRow>(
+  for (let offset = 0; offset < docIds.length; offset += DELETE_SQL_CHUNK_SIZE) {
+    const chunkIds = docIds.slice(offset, offset + DELETE_SQL_CHUNK_SIZE)
+    if (chunkIds.length === 0) continue
+    const placeholders = chunkIds.map(() => '?').join(', ')
+    rows.push(...await queryAllAsync<DocumentFileRow>(
       `SELECT id FROM documents
        WHERE id IN (${placeholders})
          AND EXISTS (
            SELECT 1 FROM library_project_documents project_scope
-           WHERE project_scope.document_id = documents.id
-             AND project_scope.project_id = ?
-         )`,
-      [...chunkIds, getActiveLibraryProjectId()],
+            WHERE project_scope.document_id = documents.id
+              AND project_scope.project_id = ?
+          )`,
+      [...chunkIds, libraryProjectId],
     ))
-  })
+  }
   return rows
+}
+
+async function getDocumentLibraryProjectIds(docIds: string[]): Promise<string[]> {
+  const projectIds = new Set<string>()
+  for (let offset = 0; offset < docIds.length; offset += DELETE_SQL_CHUNK_SIZE) {
+    const chunkIds = docIds.slice(offset, offset + DELETE_SQL_CHUNK_SIZE)
+    if (chunkIds.length === 0) continue
+    const placeholders = chunkIds.map(() => '?').join(', ')
+    const rows = await queryAllAsync<{ project_id: string }>(
+      `SELECT DISTINCT project_id
+       FROM library_project_documents
+       WHERE document_id IN (${placeholders})`,
+      chunkIds,
+    )
+    rows.forEach((row) => {
+      if (row.project_id) projectIds.add(row.project_id)
+    })
+  }
+  return [...projectIds]
 }
 
 function getDocumentsForDeleteRecovery(docIds: string[]): DocumentFileRow[] {
@@ -688,6 +710,11 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
           // long-running delete owns SQLite's writer lock, without surfacing
           // SQLITE_BUSY/SQLITE_LOCKED to the renderer.
           await markDocumentsDeleting(docIds)
+          try {
+            await markLibraryStateCacheDirtyAsync(await getDocumentLibraryProjectIds(docIds))
+          } catch (cacheError) {
+            console.warn('[Documents] Failed to mark project caches dirty before background delete', cacheError)
+          }
           if (isDocumentDeleteWorkerAvailable()) {
             // better-sqlite3 is synchronous. The complete destructive pipeline must
             // stay outside Electron's main process so one slow table/index scan can
@@ -5616,7 +5643,8 @@ export function registerDocumentIpc(): void {
       return { deletedIds: [], failedIds: [], successCount: 0 }
     }
 
-    const docs = getDocumentsForDelete(docIds)
+    const libraryProjectId = captureActiveLibraryProjectId()
+    const docs = await getDocumentsForDelete(docIds, libraryProjectId)
     const existingIds = new Set(docs.map((doc) => doc.id))
     const submittedIds = docs
       .map((doc) => doc.id)
@@ -5624,7 +5652,6 @@ export function registerDocumentIpc(): void {
 
     if (submittedIds.length > 0) {
       submittedIds.forEach((docId) => activeDocumentDeleteIds.add(docId))
-      markLibraryStateCacheDirty()
       scheduleDocumentDeleteJob(submittedIds)
     }
 
