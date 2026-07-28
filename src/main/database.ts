@@ -38,6 +38,8 @@ let databaseCheckpointDeferralCount = 0
 let lastDatabaseCheckpointAt = 0
 const DATABASE_BUSY_TIMEOUT_MS = 250
 const DATABASE_BUSY_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1200]
+const DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000
+const DATABASE_ASYNC_BUSY_RETRY_DELAY_MS = 100
 
 function sleepSync(ms: number): void {
   const buffer = new SharedArrayBuffer(4)
@@ -301,6 +303,10 @@ export function getDatabase(): NativeDatabase {
 export function getDatabaseFilePath(): string {
   if (!dbFilePath) throw new Error('Database not initialized')
   return dbFilePath
+}
+
+function sleepAsync(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export async function backupDatabaseTo(destinationPath: string): Promise<void> {
@@ -3733,6 +3739,29 @@ export function queryOne<T = Record<string, unknown>>(sql: string, params?: unkn
 
 export function run(sql: string, params?: unknown[]): void {
   runOn(getDatabase(), sql, params)
+}
+
+export async function runAsync(
+  sql: string,
+  params?: unknown[],
+  options?: { maxWaitMs?: number },
+): Promise<void> {
+  const database = getDatabase()
+  const maxWaitMs = Math.max(0, Number(options?.maxWaitMs ?? DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS))
+  const deadline = Date.now() + maxWaitMs
+  while (true) {
+    try {
+      if (params) {
+        database.prepare(sql).run(...params)
+      } else {
+        database.exec(sql)
+      }
+      return
+    } catch (error) {
+      if (!isDatabaseBusyError(error) || Date.now() >= deadline) throw error
+      await sleepAsync(Math.min(DATABASE_ASYNC_BUSY_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())))
+    }
+  }
 }
 
 export function transaction(fn: () => void): void {

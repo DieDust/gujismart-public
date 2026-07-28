@@ -12,7 +12,7 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { beginDatabaseCheckpointDeferral, clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { beginDatabaseCheckpointDeferral, clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, runAsync, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { beginStartupPhase } from '../startup-timing'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
@@ -287,6 +287,7 @@ const DELETE_SLOW_STEP_MS = 700
 const DELETE_FILE_CLEANUP_CONCURRENCY = 2
 const activeDocumentDeleteIds = new Set<string>()
 const activeDocumentDeleteJobs = new Set<Promise<void>>()
+let documentDeleteJobQueueTail: Promise<void> = Promise.resolve()
 let documentDeleteRuntimeShuttingDown = false
 const activeDocumentImportJobs = new Set<Promise<void>>()
 let documentImportShuttingDown = false
@@ -531,30 +532,36 @@ function getDeleteCleanupTasks(docs: DocumentFileRow[]): DeletePathTask[] {
   return cleanupTasks
 }
 
-function markDocumentsDeleting(docIds: string[]): void {
+async function markDocumentsDeleting(docIds: string[]): Promise<void> {
   const now = new Date().toISOString()
-  runForIdChunks(docIds, (chunkIds, placeholders) => {
-    run(
+  for (let index = 0; index < docIds.length; index += DELETE_SQL_CHUNK_SIZE) {
+    const chunkIds = docIds.slice(index, index + DELETE_SQL_CHUNK_SIZE)
+    if (chunkIds.length === 0) continue
+    const placeholders = chunkIds.map(() => '?').join(', ')
+    await runAsync(
       `UPDATE documents
        SET import_status = ?, error_message = NULL, updated_at = ?
        WHERE id IN (${placeholders})`,
       ['deleting', now, ...chunkIds],
     )
-  })
+  }
   scheduleDatabaseSave()
 }
 
-function markDocumentsDeleteFailed(docIds: string[], error: unknown): void {
+async function markDocumentsDeleteFailed(docIds: string[], error: unknown): Promise<void> {
   const message = formatDocumentDeleteFailureMessage(error)
   const now = new Date().toISOString()
-  runForIdChunks(docIds, (chunkIds, placeholders) => {
-    run(
+  for (let index = 0; index < docIds.length; index += DELETE_SQL_CHUNK_SIZE) {
+    const chunkIds = docIds.slice(index, index + DELETE_SQL_CHUNK_SIZE)
+    if (chunkIds.length === 0) continue
+    const placeholders = chunkIds.map(() => '?').join(', ')
+    await runAsync(
       `UPDATE documents
        SET import_status = ?, error_message = ?, updated_at = ?
        WHERE id IN (${placeholders})`,
       ['error', message.slice(0, 1000), now, ...chunkIds],
     )
-  })
+  }
   scheduleDatabaseSave()
 }
 
@@ -664,14 +671,23 @@ async function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]):
 
 function scheduleDocumentDeleteJob(docIds: string[]): void {
   if (documentDeleteRuntimeShuttingDown) return
-  const releaseCheckpointDeferral = beginDatabaseCheckpointDeferral()
-  const job = new Promise<void>((resolve) => {
+  const runQueuedJob = (): Promise<void> => new Promise<void>((resolve) => {
     setImmediate(() => {
       void (async () => {
+        if (documentDeleteRuntimeShuttingDown) {
+          docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
+          return
+        }
+        const releaseCheckpointDeferral = beginDatabaseCheckpointDeferral()
         const affectedTagIds = new Set<string>()
         let recoveredSearchIndexIssue = false
         let deletedIds = docIds
         try {
+          // The marker write is part of the same serial queue as the worker. A
+          // second delete request can therefore be accepted immediately while a
+          // long-running delete owns SQLite's writer lock, without surfacing
+          // SQLITE_BUSY/SQLITE_LOCKED to the renderer.
+          await markDocumentsDeleting(docIds)
           if (isDocumentDeleteWorkerAvailable()) {
             // better-sqlite3 is synchronous. The complete destructive pipeline must
             // stay outside Electron's main process so one slow table/index scan can
@@ -707,7 +723,11 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
         } catch (error) {
           console.error('[Documents] Background document delete failed:', error)
           if (!documentDeleteRuntimeShuttingDown) {
-            markDocumentsDeleteFailed(docIds, error)
+            try {
+              await markDocumentsDeleteFailed(docIds, error)
+            } catch (markError) {
+              console.error('[Documents] Failed to persist document delete error state:', markError)
+            }
           }
         } finally {
           docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
@@ -716,6 +736,8 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
       })().finally(resolve)
     })
   })
+  const job = documentDeleteJobQueueTail.then(runQueuedJob, runQueuedJob)
+  documentDeleteJobQueueTail = job.then(() => undefined, () => undefined)
   activeDocumentDeleteJobs.add(job)
   void job.finally(() => {
     activeDocumentDeleteJobs.delete(job)
@@ -5602,7 +5624,6 @@ export function registerDocumentIpc(): void {
 
     if (submittedIds.length > 0) {
       submittedIds.forEach((docId) => activeDocumentDeleteIds.add(docId))
-      markDocumentsDeleting(submittedIds)
       markLibraryStateCacheDirty()
       scheduleDocumentDeleteJob(submittedIds)
     }

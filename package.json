@@ -1,6 +1,6 @@
 {
   "name": "gujismart",
-  "version": "1.2.9",
+  "version": "1.2.10",
   "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
   "main": "./out/main/index.js",
   "author": "DieDust",
@@ -74,7 +74,7 @@
     "check:paddle-ocr-token-pool": "node scripts/paddle-ocr-token-pool-regression.js && electron scripts/paddle-ocr-token-pool-integration-regression.js",
     "check:batch-processor-save": "node scripts/batch-processor-save-regression.js",
     "check:startup-nonblocking": "node scripts/startup-nonblocking-regression.js",
-    "check:database-busy": "node scripts/database-busy-retry-regression.js && electron scripts/database-checkpoint-worker-regression.js",
+    "check:database-busy": "node scripts/database-busy-retry-regression.js && electron scripts/database-checkpoint-worker-regression.js && electron scripts/database-async-busy-retry-integration-regression.js",
     "check:ai-floating-panel-viewport": "node scripts/ai-floating-panel-viewport-regression.js",
     "check:ai-library-quick-actions": "node scripts/ai-library-quick-actions-regression.js",
     "check:ai-evidence-keyword-first": "node scripts/ai-evidence-keyword-first-regression.js",

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 1.2.10 - 2026-07-28
+
+### 中文
+
+#### 批量删除吞吐与写锁恢复
+
+- 永久删除改为单一后台写入队列：连续提交多批删除时，界面会立即移除所选文献，数据库标记和物理清理依次执行，不再让两个删除任务争抢 SQLite 写锁并向用户显示 `database is locked`。
+- 删除状态写入遇到 OCR、导入等短暂占锁时改为异步等待重试，Electron 主进程仍可处理窗口与交互；SQLite 的向量、OCR、全文索引及其他关联数据仍会完整清理。
+- 后台 worker 的文献批次由 4 篇提升到 25 篇，关联行批次由 80 条提升到 2,000 条；全文索引删除由逐条命令改为批量 `INSERT ... SELECT`，显著减少事务和 WAL 提交次数。
+- 在删除 worker 中按需补齐 OCR 产物、翻译上下文和研究证据等外键子表索引，避免删除父记录时反复全表扫描；索引创建不占用软件启动主线程。
+- 新增真实写锁恢复测试和大批量向量删除压力回归。自动化夹具中 320 篇文献及 32,000 条向量记录约 0.25 秒完成清理，同时主进程心跳持续响应。
+
+#### 下载
+
+- `GujiSmart-1.2.10-Setup-x64.exe`
+- `GujiSmart-1.2.10-Portable-x64.exe`
+
+### English
+
+#### Bulk-Deletion Throughput and Writer-Lock Recovery
+
+- Serialized permanent deletion through one background writer queue. Consecutive submissions disappear from the UI immediately, while database markers and physical cleanup run in order instead of competing for SQLite's writer lock and surfacing `database is locked`.
+- Delete-state writes now wait and retry asynchronously when OCR, import, or another short write temporarily owns the database. Electron's main process remains responsive while vectors, OCR, full-text indexes, and all other related data are still cleaned completely.
+- Increased worker batches from 4 to 25 documents and relation drains from 80 to 2,000 rows. Full-text index cleanup now uses batched `INSERT ... SELECT` delete commands to eliminate thousands of small transactions and WAL commits.
+- Added delete-time child-key indexes for OCR artifacts, translation contexts, and research evidence inside the worker, preventing repeated full-table scans without moving index creation onto the startup main thread.
+- Added a real writer-lock recovery test and a high-volume vector deletion regression. The automated fixture cleans 320 documents and 32,000 vector rows in about 0.25 seconds while Electron main-process heartbeats continue.
+
+#### Downloads
+
+- `GujiSmart-1.2.10-Setup-x64.exe`
+- `GujiSmart-1.2.10-Portable-x64.exe`
+
 ## 1.2.9 - 2026-07-28
 
 ### 中文

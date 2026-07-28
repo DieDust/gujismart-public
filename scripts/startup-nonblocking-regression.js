@@ -365,9 +365,9 @@ assert(
 )
 assert(
   documentsIpc.includes('beginDatabaseCheckpointDeferral')
-    && /function markDocumentsDeleting[\s\S]{0,650}scheduleDatabaseSave\(\)/.test(documentsIpc)
-    && /function scheduleDocumentDeleteJob[\s\S]{0,220}beginDatabaseCheckpointDeferral\(\)/.test(documentsIpc)
-    && /function scheduleDocumentDeleteJob[\s\S]{0,4200}runDocumentDeleteWorkerTask\(\{[\s\S]{0,4200}releaseCheckpointDeferral\(\)/.test(documentsIpc)
+    && /async function markDocumentsDeleting[\s\S]{0,900}await runAsync\([\s\S]{0,900}scheduleDatabaseSave\(\)/.test(documentsIpc)
+    && /function scheduleDocumentDeleteJob[\s\S]{0,900}beginDatabaseCheckpointDeferral\(\)[\s\S]{0,1200}await markDocumentsDeleting\(docIds\)/.test(documentsIpc)
+    && /function scheduleDocumentDeleteJob[\s\S]{0,5200}runDocumentDeleteWorkerTask\(\{[\s\S]{0,4200}releaseCheckpointDeferral\(\)/.test(documentsIpc)
     && !/export async function shutdownDocumentDeleteRuntime[\s\S]{0,220}saveDatabase\(\)/.test(documentsIpc),
   'Document delete markers should use WAL durability while the worker-backed delete job keeps automatic checkpoints deferred.',
 )

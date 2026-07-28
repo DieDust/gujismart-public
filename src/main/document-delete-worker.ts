@@ -11,8 +11,11 @@ if (!parentPort) {
 }
 
 const ID_CHUNK_SIZE = 100
-const ROW_CHUNK_SIZE = 80
-const DOCUMENT_BATCH_SIZE = 4
+// The old main-thread path used 80-row drains to preserve UI responsiveness.
+// This code runs in a worker, so a larger bounded batch removes thousands of
+// per-statement WAL commits without risking an Electron renderer freeze.
+const ROW_CHUNK_SIZE = 2_000
+const DOCUMENT_BATCH_SIZE = 25
 const DATABASE_BUSY_TIMEOUT_MS = 5_000
 
 type NativeDatabase = Database.Database
@@ -36,6 +39,22 @@ function isDatabaseMalformedError(error: unknown): boolean {
 
 function tableExists(sqlite: NativeDatabase, tableName: string): boolean {
   return !!sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName)
+}
+
+function ensureDeleteIndexes(sqlite: NativeDatabase): void {
+  const indexes = [
+    ['ocr_artifact_versions', 'CREATE INDEX IF NOT EXISTS idx_ocr_artifacts_doc ON ocr_artifact_versions(doc_id, page_num)'],
+    ['ocr_artifact_versions', 'CREATE INDEX IF NOT EXISTS idx_ocr_artifacts_attempt ON ocr_artifact_versions(attempt_id)'],
+    ['translation_context_snapshots', 'CREATE INDEX IF NOT EXISTS idx_translation_context_snapshots_doc ON translation_context_snapshots(doc_id, created_at)'],
+    ['translation_unit_revisions', 'CREATE INDEX IF NOT EXISTS idx_translation_unit_revisions_context ON translation_unit_revisions(context_snapshot_id)'],
+    ['translation_attempts', 'CREATE INDEX IF NOT EXISTS idx_translation_attempts_context ON translation_attempts(context_snapshot_id)'],
+    ['translation_attempts', 'CREATE INDEX IF NOT EXISTS idx_translation_attempts_base_revision ON translation_attempts(base_revision_id)'],
+    ['translation_attempts', 'CREATE INDEX IF NOT EXISTS idx_translation_attempts_candidate_revision ON translation_attempts(candidate_revision_id)'],
+    ['research_record_versions', 'CREATE INDEX IF NOT EXISTS idx_research_record_versions_evidence ON research_record_versions(evidence_id)'],
+  ] as const
+  for (const [tableName, sql] of indexes) {
+    if (tableExists(sqlite, tableName)) sqlite.exec(sql)
+  }
 }
 
 function runForIdChunks(
@@ -141,40 +160,35 @@ function deleteFtsRows(sqlite: NativeDatabase, documentIds: string[]): void {
   const hasTrigram = tableExists(sqlite, 'search_segments_trigram')
   runForIdChunks(documentIds, (chunkIds, placeholders) => {
     const selectSegments = sqlite.prepare(
-      `SELECT rowid AS delete_rowid, title, normalized_text, text
+      `SELECT rowid AS delete_rowid
        FROM search_index_segments
        WHERE doc_id IN (${placeholders})
          AND TRIM(COALESCE(normalized_text, text, '')) != ''
        LIMIT ?`,
     )
-    const deleteFts = sqlite.prepare(
-      `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
-       VALUES ('delete', ?, ?, ?)`,
-    )
-    const deleteTrigram = hasTrigram
-      ? sqlite.prepare(
-        `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
-         VALUES ('delete', ?, ?)`,
-      )
-      : null
     while (true) {
-      const rows = selectSegments.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{
-        delete_rowid: number
-        title: string | null
-        normalized_text: string | null
-        text: string | null
-      }>
+      const rows = selectSegments.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
       if (rows.length === 0) break
-      sqlite.transaction(() => {
-        for (const row of rows) {
-          const normalizedText = String(row.normalized_text || row.text || '')
-          deleteFts.run(row.delete_rowid, String(row.title || ''), normalizedText)
-          deleteTrigram?.run(row.delete_rowid, normalizedText)
-        }
-      })()
       const rowPlaceholders = rows.map(() => '?').join(', ')
-      sqlite.prepare(`DELETE FROM search_index_segments WHERE rowid IN (${rowPlaceholders})`)
-        .run(...rows.map((row) => row.delete_rowid))
+      const rowIds = rows.map((row) => row.delete_rowid)
+      sqlite.transaction(() => {
+        sqlite.prepare(
+          `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+           SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+           FROM search_index_segments
+           WHERE rowid IN (${rowPlaceholders})`,
+        ).run(...rowIds)
+        if (hasTrigram) {
+          sqlite.prepare(
+            `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+             SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+             FROM search_index_segments
+             WHERE rowid IN (${rowPlaceholders})`,
+          ).run(...rowIds)
+        }
+        sqlite.prepare(`DELETE FROM search_index_segments WHERE rowid IN (${rowPlaceholders})`)
+          .run(...rowIds)
+      })()
     }
   })
 }
@@ -387,6 +401,7 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
     sqlite.pragma('journal_mode = WAL')
     sqlite.pragma('synchronous = NORMAL')
     sqlite.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
+    ensureDeleteIndexes(sqlite)
 
     const affectedTagIds = getAffectedTagIds(sqlite, documentIds)
     const deletedIds: string[] = []

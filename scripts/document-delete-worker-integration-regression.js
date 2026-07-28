@@ -164,9 +164,52 @@ async function run() {
       `Electron main-thread heartbeat lagged ${maximumHeartbeatLagMs}ms during worker deletion`,
     )
 
+    sqlite.exec('DROP TRIGGER slow_document_delete; DROP TABLE delete_cpu_fixture;')
+    const bulkDocumentCount = 320
+    const bulkDocumentIds = Array.from({ length: bulkDocumentCount }, (_, index) => `bulk-delete-${index}`)
+    const insertDocument = sqlite.prepare(
+      "INSERT INTO documents (id, import_status) VALUES (?, 'deleting')",
+    )
+    const insertEmbedding = sqlite.prepare(
+      'INSERT INTO embedding_chunks (doc_id, embedding) VALUES (?, ?)',
+    )
+    const insertTag = sqlite.prepare(
+      'INSERT INTO document_tags (doc_id, tag_id) VALUES (?, ?)',
+    )
+    const insertProject = sqlite.prepare(
+      'INSERT INTO library_project_documents (document_id) VALUES (?)',
+    )
+    sqlite.transaction(() => {
+      bulkDocumentIds.forEach((documentId, index) => {
+        insertDocument.run(documentId)
+        insertTag.run(documentId, `bulk-tag-${index % 5}`)
+        insertProject.run(documentId)
+        for (let chunk = 0; chunk < 100; chunk += 1) {
+          insertEmbedding.run(documentId, Buffer.alloc(512, chunk % 255))
+        }
+      })
+    })()
+    const bulkStartedAt = Date.now()
+    const bulkResult = await runWorkerTask(bulkDocumentIds)
+    const bulkElapsedMs = Date.now() - bulkStartedAt
+    assert.strictEqual(bulkResult.deletedIds.length, bulkDocumentCount)
+    assert.strictEqual(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM documents').get().count,
+      0,
+    )
+    assert.strictEqual(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM embedding_chunks').get().count,
+      0,
+    )
+    assert(
+      bulkElapsedMs < 10_000,
+      `320-document vector cleanup exceeded the regression budget (${bulkElapsedMs}ms)`,
+    )
+
     console.log(
       `Document delete worker integration regression passed (${elapsedMs}ms, `
-      + `${heartbeatCount} heartbeats, max lag ${maximumHeartbeatLagMs}ms)`,
+      + `${heartbeatCount} heartbeats, max lag ${maximumHeartbeatLagMs}ms; `
+      + `${bulkDocumentCount} documents with 32,000 vectors in ${bulkElapsedMs}ms)`,
     )
   } finally {
     sqlite?.close()

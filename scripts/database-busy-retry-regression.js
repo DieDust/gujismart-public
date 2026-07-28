@@ -24,6 +24,12 @@ assert(
   'Main database busy retries should be bounded to a short UI-safe window',
 )
 assert(
+  databaseSource.includes('export async function runAsync(')
+    && databaseSource.includes('DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000')
+    && databaseSource.includes('await sleepAsync('),
+  'Queued background writes should retry SQLite locks asynchronously instead of sleeping on Electron main',
+)
+assert(
   databaseSource.includes("database.pragma('wal_autocheckpoint = 0')"),
   'SQLite automatic checkpoints must be disabled because they run on the committing main-process write',
 )
