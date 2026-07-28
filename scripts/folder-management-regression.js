@@ -51,6 +51,13 @@ assertIncludes(foldersIpc, "ipcMain.handle('folders:getOverview'", 'main process
 assertIncludes(foldersIpc, "ipcMain.handle('folders:getContent'", 'main process should register folder content IPC')
 assertIncludes(foldersIpc, "ipcMain.handle('folders:move'", 'main process should register explicit folder move IPC')
 assertIncludes(foldersIpc, "ipcMain.handle('folders:moveDocuments'", 'main process should register explicit document move IPC')
+assertIncludes(foldersIpc, 'await transactionAsync(() => {', 'folder deletion should wait asynchronously for the SQLite writer lock')
+assertIncludes(foldersIpc, 'scheduleDatabaseSave()', 'folder deletion should defer checkpoints instead of blocking the main process')
+assertNotIncludes(
+  foldersIpc.slice(foldersIpc.indexOf("ipcMain.handle('folders:delete'"), foldersIpc.indexOf("ipcMain.handle('folders:addDocument'")),
+  'saveDatabase()',
+  'folder deletion must not run a synchronous checkpoint after releasing the write lock',
+)
 assertIncludes(foldersIpc, 'function assertFolderMoveAllowed', 'folder move should validate safety before mutating')
 assertIncludes(foldersIpc, 'if (folderId && nextParentId === folderId)', 'folder parent validation should prevent moving into itself')
 assertIncludes(foldersIpc, 'resolveFolderAndDescendantIds([folderId])', 'folder move should prevent moving into descendants')

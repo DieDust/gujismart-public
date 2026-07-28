@@ -1,5 +1,5 @@
 import { ipcMain, dialog } from 'electron'
-import { queryAll, queryOne, run, saveDatabase, transaction } from '../database'
+import { queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction, transactionAsync } from '../database'
 import { nanoid } from 'nanoid'
 import { join, extname } from 'path'
 import { existsSync, readdirSync, statSync } from 'fs'
@@ -782,18 +782,21 @@ export function registerFolderIpc(): void {
   ipcMain.handle('folders:delete', async (_event, id: string): Promise<boolean> => {
     const folderId = String(id || '').trim()
     if (!folderId) return false
-    const folder = queryOne<Pick<Folder, 'id'>>(
-      'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
-      [folderId, getActiveLibraryProjectId()],
-    )
-    if (!folder) return false
-
-    transaction(() => {
+    const libraryProjectId = captureActiveLibraryProjectId()
+    let deleted = false
+    await transactionAsync(() => {
+      const folder = queryOne<Pick<Folder, 'id'>>(
+        'SELECT id FROM folders WHERE id = ? AND library_project_id = ?',
+        [folderId, libraryProjectId],
+      )
+      if (!folder) return
       run('DELETE FROM document_folders WHERE folder_id = ?', [folderId])
       run('UPDATE folders SET parent_id = NULL, updated_at = ? WHERE parent_id = ?', [new Date().toISOString(), folderId])
-      run('DELETE FROM folders WHERE id = ?', [folderId])
-    })
-    saveDatabase()
+      run('DELETE FROM folders WHERE id = ? AND library_project_id = ?', [folderId, libraryProjectId])
+      deleted = true
+    }, { maxWaitMs: 60_000 })
+    if (!deleted) return false
+    scheduleDatabaseSave()
     markLibraryStateCacheDirty()
     return true
   })

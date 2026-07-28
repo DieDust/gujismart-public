@@ -81,6 +81,39 @@ async function run() {
       Date.now() - startedAt < 3_000,
       `expected lock recovery within 3 seconds, took ${Date.now() - startedAt}ms`,
     )
+
+    writer.exec('BEGIN IMMEDIATE')
+    writer.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(
+      'async_transaction_writer',
+      'holding',
+    )
+    const transactionHeartbeatStart = heartbeatCount
+    const releaseTransactionWriter = wait(450).then(() => {
+      writer.exec('COMMIT')
+    })
+    await database.transactionAsync(() => {
+      database.run(
+        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+        ['async_transaction_retry', 'completed'],
+      )
+      database.run(
+        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+        ['async_transaction_atomic', 'completed'],
+      )
+    }, { maxWaitMs: 5_000 })
+    await releaseTransactionWriter
+    assert.strictEqual(
+      database.queryOne("SELECT value FROM settings WHERE key = 'async_transaction_retry'")?.value,
+      'completed',
+    )
+    assert.strictEqual(
+      database.queryOne("SELECT value FROM settings WHERE key = 'async_transaction_atomic'")?.value,
+      'completed',
+    )
+    assert(
+      heartbeatCount - transactionHeartbeatStart >= 2,
+      `expected the event loop to make progress during transaction lock retry, saw ${heartbeatCount - transactionHeartbeatStart} heartbeats`,
+    )
     console.log(
       `Database async busy retry integration regression passed (${heartbeatCount} heartbeats, ${Date.now() - startedAt}ms).`,
     )

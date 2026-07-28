@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 1.2.12 - 2026-07-29
+
+### 中文
+
+#### 文件夹删除写锁恢复
+
+- 修复 OCR、导入、批量删除或后台数据库任务持有 SQLite 写锁时，删除文件夹直接提示 `database is locked` 的问题。
+- 文件夹删除现在会异步等待写锁释放，等待期间窗口和其他交互保持响应；获得写锁后，解除文件夹归属、将直接子文件夹移到根层并删除目标文件夹仍在同一事务内原子完成。
+- 删除文件夹仍只删除文件夹及其归属关系，不会删除文件夹中的文献、OCR、向量或原文文件。
+- 删除完成后的 WAL 检查点改为延迟后台执行，避免刚释放写锁后再次同步阻塞 Electron 主进程。
+
+#### 下载
+
+- `GujiSmart-1.2.12-Setup-x64.exe`
+- `GujiSmart-1.2.12-Portable-x64.exe`
+
+### English
+
+#### Folder-Deletion Writer-Lock Recovery
+
+- Fixed folder deletion surfacing `database is locked` while OCR, imports, bulk deletion, or another background database task owns SQLite's writer lock.
+- Folder deletion now waits asynchronously for the writer lock while the window and other interactions remain responsive. Once acquired, detaching document memberships, moving direct child folders to the root, and deleting the target folder still complete atomically in one transaction.
+- Deleting a folder continues to remove only the folder and its memberships; documents, OCR, vectors, and source files are preserved.
+- The post-delete WAL checkpoint is now deferred to the background instead of synchronously blocking Electron's main process immediately after the writer lock is released.
+
+#### Downloads
+
+- `GujiSmart-1.2.12-Setup-x64.exe`
+- `GujiSmart-1.2.12-Portable-x64.exe`
+
 ## 1.2.11 - 2026-07-28
 
 ### 中文

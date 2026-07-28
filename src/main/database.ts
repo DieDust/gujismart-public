@@ -3764,6 +3764,28 @@ export async function runAsync(
   }
 }
 
+export async function transactionAsync(
+  fn: () => void,
+  options?: { maxWaitMs?: number },
+): Promise<void> {
+  const database = getDatabase()
+  await runAsync('BEGIN IMMEDIATE TRANSACTION', undefined, options)
+  try {
+    // Keep the acquired write transaction entirely synchronous. The only
+    // yielding/retry point is before BEGIN succeeds, so unrelated IPC work
+    // cannot accidentally run inside this transaction.
+    fn()
+    database.exec('COMMIT')
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK')
+    } catch (rollbackError) {
+      if (!isDatabaseBusyError(rollbackError)) throw rollbackError
+    }
+    throw error
+  }
+}
+
 export function transaction(fn: () => void): void {
   const database = getDatabase()
   runWithBusyRetry(() => database.exec('BEGIN IMMEDIATE TRANSACTION'))
