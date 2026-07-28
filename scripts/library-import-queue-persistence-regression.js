@@ -227,14 +227,26 @@ assert(
     && processImportJobBody.includes('const shouldDeferImportPdfPreview = shouldAttemptAutoOcrForPreview && previewAutoOcrConfigReady')
     && processImportJobBody.includes('createImportAutoOcrTask({')
     && processImportJobBody.includes('appendImportAutoOcrItems(task.jobId, appendBatch)')
-    && processImportJobBody.includes('startImportAutoOcrTask(autoOcrTaskJobId)'),
-  'Library import should snapshot automatic OCR readiness and persist every imported OCR item before starting execution.',
+    && processImportJobBody.includes('startImportAutoOcrTask(task.jobId)'),
+  'Library import should snapshot automatic OCR readiness and persist each completed import batch before starting its OCR execution.',
 )
 assert(
   !processImportJobBody.includes('const autoOcrQueue:')
+    && !processImportJobBody.includes('const ensureAutoOcrTask = async')
+    && !processImportJobBody.includes('let autoOcrTaskJobId:')
     && processImportJobBody.includes('for (const appendBatch of chunkArray(autoOcrItems, 200))')
-    && processImportJobBody.includes('persistedAutoOcrCount = appended.totalCount'),
-  'Import auto-OCR must not retain unsubmitted future batches in renderer memory.',
+    && processImportJobBody.includes('taskPersistedCount = appended.totalCount')
+    && processImportJobBody.includes('persistedAutoOcrCount += Math.max(taskPersistedCount, started.totalCount)'),
+  'Import auto-OCR must use self-contained per-batch jobs instead of retaining unsubmitted future batches in renderer memory.',
+)
+assert(
+  processImportJobBody.indexOf('const task = await window.api.createImportAutoOcrTask({')
+    > processImportJobBody.indexOf('await processImportedBatchResults(batchQueuedResults)')
+    && processImportJobBody.indexOf('const started = await window.api.startImportAutoOcrTask(task.jobId)')
+      > processImportJobBody.indexOf('appendImportAutoOcrItems(task.jobId, appendBatch)')
+    && processImportJobBody.indexOf('const started = await window.api.startImportAutoOcrTask(task.jobId)')
+      < processImportJobBody.indexOf('await refreshLibraryAfterImport()'),
+  'Each imported batch should start its durable OCR job before the final large-library list refresh and before later import batches finish.',
 )
 assert(
   librarySource.includes('const cancelScheduledImportListRefresh = useCallback')

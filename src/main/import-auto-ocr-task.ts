@@ -154,7 +154,35 @@ export function recoverInterruptedImportAutoOcrTasks(
        AND COALESCE(json_extract(tj.settings_snapshot_json, '$.libraryProjectId'), ?) = ?`,
     [IMPORT_AUTO_OCR_TASK_KIND, DEFAULT_LIBRARY_PROJECT_ID, libraryProjectId],
   )
-  if (interrupted.length === 0) return 0
+  // Older builds could start a still-growing import task from the project
+  // background-resume timer. If its first item failed before the next import
+  // batch was appended, the job stayed "error" even though it later contained
+  // queued items, so no startup/project recovery would ever select it again.
+  const strandedJobs = queryAll<{ job_id: string }>(
+    `SELECT DISTINCT tj.id AS job_id
+     FROM task_jobs tj
+     WHERE tj.kind = ?
+       AND tj.status = 'error'
+       AND COALESCE(json_extract(tj.settings_snapshot_json, '$.libraryProjectId'), ?) = ?
+       AND EXISTS (
+         SELECT 1 FROM task_items ti
+         WHERE ti.job_id = tj.id AND ti.status = 'queued'
+       )`,
+    [IMPORT_AUTO_OCR_TASK_KIND, DEFAULT_LIBRARY_PROJECT_ID, libraryProjectId],
+  )
+  const hasQueuedDocuments = Boolean(queryAll<{ found: number }>(
+    `SELECT 1 AS found
+     FROM task_items ti
+     INNER JOIN task_jobs tj ON tj.id = ti.job_id
+     WHERE tj.kind = ?
+       AND tj.status IN ('queued', 'running', 'error')
+       AND ti.status = 'queued'
+       AND COALESCE(json_extract(tj.settings_snapshot_json, '$.libraryProjectId'), ?) = ?
+       AND COALESCE(ti.domain_ref, '') <> ''
+     LIMIT 1`,
+    [IMPORT_AUTO_OCR_TASK_KIND, DEFAULT_LIBRARY_PROJECT_ID, libraryProjectId],
+  )[0])
+  if (interrupted.length === 0 && strandedJobs.length === 0 && !hasQueuedDocuments) return 0
   transaction(() => {
     interrupted.forEach((item) => {
       if (item.attempt_id) {
@@ -173,7 +201,46 @@ export function recoverInterruptedImportAutoOcrTasks(
         [nowMs, item.job_id],
       )
     })
+    strandedJobs.forEach((job) => {
+      run(
+        `UPDATE task_jobs
+         SET status = 'queued',
+             completion_kind = NULL,
+             error_json = NULL,
+             completed_at = NULL,
+             updated_at = ?
+         WHERE id = ? AND status = 'error'`,
+        [nowMs, job.job_id],
+      )
+    })
+    const now = new Date(nowMs).toISOString()
+    run(
+      `UPDATE documents
+       SET ocr_status = 'queued',
+           import_status = 'processing',
+           metadata_status = 'pending',
+           error_message = NULL,
+           updated_at = ?
+       WHERE id IN (
+         SELECT ti.domain_ref
+         FROM task_items ti
+         INNER JOIN task_jobs tj ON tj.id = ti.job_id
+         WHERE tj.kind = ?
+           AND tj.status IN ('queued', 'running')
+           AND ti.status = 'queued'
+           AND COALESCE(json_extract(tj.settings_snapshot_json, '$.libraryProjectId'), ?) = ?
+           AND COALESCE(ti.domain_ref, '') <> ''
+       )
+         AND COALESCE(import_status, '') <> 'deleting'
+         AND COALESCE(ocr_status, 'pending') NOT IN ('completed', 'processing')
+         AND EXISTS (
+           SELECT 1 FROM library_project_documents project_scope
+           WHERE project_scope.document_id = documents.id
+             AND project_scope.project_id = ?
+         )`,
+      [now, IMPORT_AUTO_OCR_TASK_KIND, DEFAULT_LIBRARY_PROJECT_ID, libraryProjectId, libraryProjectId],
+    )
   })
   scheduleDatabaseSave()
-  return interrupted.length
+  return interrupted.length + strandedJobs.length
 }

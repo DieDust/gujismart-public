@@ -186,7 +186,7 @@ assert(
     && librarySource.includes('const previewAutoOcrConfigReady = shouldAttemptAutoOcrForPreview ? await hasOcrEngineConfig(engine) : false')
     && librarySource.includes('const shouldDeferImportPdfPreview = shouldAttemptAutoOcrForPreview && previewAutoOcrConfigReady')
     && librarySource.includes('createImportAutoOcrTask({')
-    && librarySource.includes('startImportAutoOcrTask(autoOcrTaskJobId)'),
+    && librarySource.includes('startImportAutoOcrTask(task.jobId)'),
   'Import preview deferral and persistent auto-OCR execution should share one stable readiness/config snapshot.',
 )
 

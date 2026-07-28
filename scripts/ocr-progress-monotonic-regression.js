@@ -39,6 +39,12 @@ assert(
   'active OCR progress events should be throttled while terminal progress events still flush immediately',
 )
 assert(
+  ocrSource.includes("ipcMain.handle('ocr:appendImportAutoTask', async (event, jobId")
+    && ocrSource.includes("SET ocr_status = 'queued',")
+    && ocrSource.includes("message: '导入完成，OCR 已入队'"),
+  'Persisted import-auto OCR items should become visibly queued before the worker claims them.',
+)
+assert(
   documentStoreSource.includes('function hasDocumentPatchChange')
     && documentStoreSource.includes('Object.entries(patch).some')
     && documentStoreSource.includes('!hasDocumentPatchChange(document, data)')

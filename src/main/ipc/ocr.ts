@@ -7133,9 +7133,44 @@ export function registerOcrIpc(): void {
     return { jobId: task.id, engine: config.engine, batchSize: config.batchSize, totalCount: task.totalCount }
   })
 
-  ipcMain.handle('ocr:appendImportAutoTask', async (_event, jobId: string, items: ImportAutoOcrTaskItemInput[]) => {
+  ipcMain.handle('ocr:appendImportAutoTask', async (event, jobId: string, items: ImportAutoOcrTaskItemInput[]) => {
     const before = getImportAutoOcrTask(jobId).totalCount
     const task = appendImportAutoOcrItems(jobId, items)
+    const config = getImportAutoOcrTaskConfig(jobId)
+    const queuedDocIds = [...new Set(items.map((item) => String(item.docId || '').trim()).filter(Boolean))]
+    const now = new Date().toISOString()
+    for (let offset = 0; offset < queuedDocIds.length; offset += 100) {
+      const chunk = queuedDocIds.slice(offset, offset + 100)
+      const placeholders = chunk.map(() => '?').join(', ')
+      run(
+        `UPDATE documents
+         SET ocr_status = 'queued',
+             import_status = 'processing',
+             metadata_status = 'pending',
+             error_message = NULL,
+             updated_at = ?
+         WHERE id IN (${placeholders})
+           AND COALESCE(import_status, '') <> 'deleting'
+           AND COALESCE(ocr_status, 'pending') NOT IN ('completed', 'processing')
+           AND EXISTS (
+             SELECT 1 FROM library_project_documents project_scope
+             WHERE project_scope.document_id = documents.id
+               AND project_scope.project_id = ?
+           )`,
+        [now, ...chunk, config.libraryProjectId],
+      )
+      for (const docId of chunk) {
+        emitOcrStatus(event, {
+          docId,
+          status: 'queued',
+          phase: 'queued',
+          progress: 0,
+          message: '导入完成，OCR 已入队',
+        })
+      }
+      await yieldToEventLoop()
+    }
+    if (queuedDocIds.length > 0) scheduleDatabaseSave()
     return { jobId: task.id, appendedCount: Math.max(0, task.totalCount - before), totalCount: task.totalCount }
   })
 

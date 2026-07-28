@@ -105,6 +105,41 @@ async function run() {
     assert.strictEqual(scheduler.getTaskItem(interruptedClaim.itemId).status, 'queued')
     assert.strictEqual(importAutoOcr.listImportAutoOcrItems(task.id)[0].docId, documents[0].docId)
 
+    const strandedTask = importAutoOcr.createImportAutoOcrTask({
+      engine: 'paddle',
+      batchSize: 2,
+      sourceImportJobId: 'stranded-import-fixture',
+      nowMs: 3_000,
+    })
+    importAutoOcr.appendImportAutoOcrItems(strandedTask.id, [documents[0]], { nowMs: 3_010 })
+    const failedClaim = scheduler.claimTaskItems({
+      jobId: strandedTask.id,
+      workerId: 'stranded-worker',
+      limit: 1,
+      leaseMs: 60_000,
+      nowMs: 3_020,
+    })[0]
+    scheduler.failTaskItem({
+      itemId: failedClaim.itemId,
+      leaseToken: failedClaim.leaseToken,
+      error: { code: 'fixture_failure', message: 'fixture failure', recoverable: true },
+      nowMs: 3_030,
+    })
+    assert.strictEqual(importAutoOcr.getImportAutoOcrTask(strandedTask.id).status, 'error')
+    importAutoOcr.appendImportAutoOcrItems(strandedTask.id, [documents[1]], { nowMs: 3_040 })
+    assert.strictEqual(
+      importAutoOcr.getImportAutoOcrTask(strandedTask.id).status,
+      'error',
+      'legacy append race should be reproduced before recovery',
+    )
+    assert.strictEqual(importAutoOcr.recoverInterruptedImportAutoOcrTasks(3_050), 1)
+    assert.strictEqual(importAutoOcr.getImportAutoOcrTask(strandedTask.id).status, 'queued')
+    assert.strictEqual(
+      database.queryOne('SELECT ocr_status FROM documents WHERE id = ?', [documents[1].docId]).ocr_status,
+      'queued',
+      'stranded import-auto OCR documents should become visibly queued during recovery',
+    )
+
     const librarySource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8').replace(/\r\n/g, '\n')
     assert.ok(!librarySource.includes('const autoOcrQueue:'), 'renderer must not own an unsubmitted Paddle auto-OCR queue')
     assert.ok(librarySource.includes('createImportAutoOcrTask('))

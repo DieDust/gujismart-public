@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 1.2.11 - 2026-07-28
+
+### 中文
+
+#### 批量导入后的 OCR 队列恢复
+
+- 修复一次导入几十本文献时，自动 OCR 必须等全部导入和大库列表刷新结束后才启动的问题。现在每个已完成的导入小批次都会先完整持久化，再立即启动 OCR，后续文献可继续导入。
+- 修复旧版在项目后台恢复与导入任务同时发生时，OCR 任务已进入错误状态、后续文献却仍被追加为排队状态，导致重启或换版本后一直显示“待 OCR”的问题；项目恢复时会自动重新打开这类遗留任务并继续处理。
+- 文献写入持久化 OCR 队列后会立即显示“已入队”，无需等待 worker 真正领取任务才更新界面状态。
+- 保留全局 OCR 文档窗口与大型 PDF 单本处理限制。批量任务可持续推进，但不会把几十本文献无上限地同时提交给 OCR 服务。
+
+#### 下载
+
+- `GujiSmart-1.2.11-Setup-x64.exe`
+- `GujiSmart-1.2.11-Portable-x64.exe`
+
+### English
+
+#### OCR Queue Recovery After Bulk Imports
+
+- Fixed automatic OCR waiting for every imported book and the final large-library refresh before it could start. Each completed import batch is now persisted as a self-contained task and starts immediately while later files continue importing.
+- Fixed a legacy race where project background recovery could start a still-growing import task, leave the job in an error state, and then append more queued documents that were never selected after restart or upgrade. Project recovery now reopens these stranded jobs and resumes their queued documents.
+- Documents now become visibly queued as soon as they are persisted to the OCR task instead of waiting for a worker claim.
+- Preserved the global OCR document window and single-heavy-PDF limit, so bulk work continues without submitting dozens of books to the OCR service without bounds.
+
+#### Downloads
+
+- `GujiSmart-1.2.11-Setup-x64.exe`
+- `GujiSmart-1.2.11-Portable-x64.exe`
+
 ## 1.2.10 - 2026-07-28
 
 ### 中文

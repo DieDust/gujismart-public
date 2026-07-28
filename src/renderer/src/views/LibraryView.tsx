@@ -5394,22 +5394,8 @@ export default function LibraryView({
       const previewAutoOcrConfigReady = shouldAttemptAutoOcrForPreview ? await hasOcrEngineConfig(engine) : false
       const shouldDeferImportPdfPreview = shouldAttemptAutoOcrForPreview && previewAutoOcrConfigReady
       const autoOcrBatchSize = await getConfiguredBatchSize()
-      let autoOcrTask: Awaited<ReturnType<typeof window.api.createImportAutoOcrTask>> | null = null
-      let autoOcrTaskJobId: string | null = null
       let autoOcrCandidateCount = 0
       let persistedAutoOcrCount = 0
-      const ensureAutoOcrTask = async () => {
-        if (!autoOcrTask) {
-          autoOcrTask = await window.api.createImportAutoOcrTask({
-            engine,
-            batchSize: autoOcrBatchSize,
-            sourceImportJobId: String(job.id),
-            libraryProjectId,
-          })
-          autoOcrTaskJobId = autoOcrTask.jobId
-        }
-        return autoOcrTask
-      }
       let importedCount = 0
       let restoredDuplicateCount = 0
       let skippedDuplicateCount = 0
@@ -5561,11 +5547,22 @@ export default function LibraryView({
 
         const { pdfPreviewQueue, deferredPdfPreviewQueue, autoOcrItems } = await processImportedBatchResults(batchQueuedResults)
         if (autoOcrItems.length > 0) {
-          const task = await ensureAutoOcrTask()
+          // Each completed import batch becomes a self-contained durable OCR job.
+          // Starting it now lets OCR overlap the remaining imports without allowing
+          // startup/project recovery to run a half-staged job that is still receiving items.
+          const task = await window.api.createImportAutoOcrTask({
+            engine,
+            batchSize: autoOcrBatchSize,
+            sourceImportJobId: `${job.id}:${batchIndex}`,
+            libraryProjectId,
+          })
+          let taskPersistedCount = 0
           for (const appendBatch of chunkArray(autoOcrItems, 200)) {
             const appended = await window.api.appendImportAutoOcrItems(task.jobId, appendBatch)
-            persistedAutoOcrCount = appended.totalCount
+            taskPersistedCount = appended.totalCount
           }
+          const started = await window.api.startImportAutoOcrTask(task.jobId)
+          persistedAutoOcrCount += Math.max(taskPersistedCount, started.totalCount)
         }
 
         if (settledBatchFileCount > 0) {
@@ -5618,10 +5615,9 @@ export default function LibraryView({
         scheduleImportListRefresh()
       }
 
-      if (autoOcrTaskJobId && persistedAutoOcrCount > 0) {
-        const started = await window.api.startImportAutoOcrTask(autoOcrTaskJobId)
+      if (persistedAutoOcrCount > 0) {
         message.success({
-          content: `已持久化并启动 OCR 任务，共 ${started.totalCount} 篇；关闭软件后仍会按原顺序续跑。`,
+          content: `已持久化并启动 OCR 任务，共 ${persistedAutoOcrCount} 篇；后续文献导入时 OCR 已同步开始，关闭软件后仍会续跑。`,
           key: 'auto-ocr',
           duration: 6,
         })
