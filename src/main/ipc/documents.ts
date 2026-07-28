@@ -12,7 +12,7 @@ import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
 import { getMetadataCandidates, runAiTask } from '../ai'
 import { getActiveTranslationGlossary, getTranslationGlossaryVersionSignature } from '../glossary-service'
-import { clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
+import { beginDatabaseCheckpointDeferral, clearPageSearchIndexForDocuments, getDataDir, getDatabaseFilePath, isFtsAvailable, isLargeLibraryForAutomaticMaintenance, isSearchSegmentsFtsRebuildNeeded, isSearchTrigramFtsAvailable, queryAll, queryOne, resetRebuildableSearchTables, refreshTagUsageForTags, resolveManagedStoragePath, run, saveDatabase, scheduleDatabaseSave, transaction } from '../database'
 import { beginStartupPhase } from '../startup-timing'
 import { normalizeChineseSearchText } from '../text-normalization'
 import { clearDocumentTocAutogenAttempt, saveDocumentToc } from '../toc-service'
@@ -342,16 +342,42 @@ async function timeDeleteStepAsync(label: string, callback: () => Promise<void>,
   }
 }
 
-async function deleteRowsByDocIdsAsync(tableName: string, docIds: string[]): Promise<void> {
+async function deleteRowsByColumnAsync(tableName: string, columnName: string, docIds: string[]): Promise<void> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(columnName)) {
+    throw new Error(`Unsafe delete relation identifier: ${tableName}.${columnName}`)
+  }
   await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
     while (true) {
       const rows = queryAll<{ rowid: number }>(
-        `SELECT rowid FROM ${tableName} WHERE doc_id IN (${placeholders}) LIMIT ?`,
+        `SELECT rowid FROM "${tableName}" WHERE "${columnName}" IN (${placeholders}) LIMIT ?`,
         [...chunkIds, DELETE_ROW_CHUNK_SIZE],
       )
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
-      run(`DELETE FROM ${tableName} WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      run(`DELETE FROM "${tableName}" WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
+      await yieldToEventLoop()
+    }
+  })
+}
+
+async function deleteRowsByDocIdsAsync(tableName: string, docIds: string[]): Promise<void> {
+  await deleteRowsByColumnAsync(tableName, 'doc_id', docIds)
+}
+
+async function deleteOcrPageAttemptsByDocIdsAsync(docIds: string[]): Promise<void> {
+  await runForIdChunksAsync(docIds, async (chunkIds, placeholders) => {
+    while (true) {
+      const rows = queryAll<{ rowid: number }>(
+        `SELECT attempt.rowid
+         FROM ocr_page_attempts attempt
+         INNER JOIN ocr_runs run ON run.id = attempt.run_id
+         WHERE run.doc_id IN (${placeholders})
+         LIMIT ?`,
+        [...chunkIds, DELETE_ROW_CHUNK_SIZE],
+      )
+      if (rows.length === 0) break
+      const rowPlaceholders = rows.map(() => '?').join(', ')
+      run(`DELETE FROM ocr_page_attempts WHERE rowid IN (${rowPlaceholders})`, rows.map((row) => row.rowid))
       await yieldToEventLoop()
     }
   })
@@ -448,6 +474,19 @@ function getDocumentsForDelete(docIds: string[]): DocumentFileRow[] {
   return rows
 }
 
+function getDocumentsForDeleteRecovery(docIds: string[]): DocumentFileRow[] {
+  const rows: DocumentFileRow[] = []
+  runForIdChunks(docIds, (chunkIds, placeholders) => {
+    rows.push(...queryAll<DocumentFileRow>(
+      `SELECT id FROM documents
+       WHERE id IN (${placeholders})
+         AND import_status = 'deleting'`,
+      chunkIds,
+    ))
+  })
+  return rows
+}
+
 function getAffectedTagIdsForDelete(docIds: string[]): string[] {
   const tagIds: string[] = []
   runForIdChunks(docIds, (chunkIds, placeholders) => {
@@ -524,10 +563,18 @@ async function deleteDocumentData(docIds: string[]): Promise<DeleteDocumentDataR
     recoveredSearchIndexIssue = recoveredSearchIndexIssue || !completed
   }
 
+  // Large vector BLOB cascades can monopolize Electron's main thread when the
+  // final document row is removed. Drain them in small, yielding batches first.
+  await timeDeleteStepAsync('embedding_chunks', () => deleteRowsByDocIdsAsync('embedding_chunks', docIds))
+  await timeDeleteStepAsync('embedding_index_status', () => deleteRowsByDocIdsAsync('embedding_index_status', docIds))
+  await yieldToEventLoop()
   await runSearchIndexStep('search_ngram_index', () => deleteRowsByDocIdsAsync('search_ngram_index', docIds))
   await yieldToEventLoop()
   await timeDeleteStepAsync('metadata_candidates', () => deleteRowsByDocIdsAsync('metadata_candidates', docIds))
   await timeDeleteStepAsync('page_ocr_versions', () => deleteRowsByDocIdsAsync('page_ocr_versions', docIds))
+  await timeDeleteStepAsync('ocr_artifact_versions', () => deleteRowsByDocIdsAsync('ocr_artifact_versions', docIds))
+  await timeDeleteStepAsync('ocr_page_attempts', () => deleteOcrPageAttemptsByDocIdsAsync(docIds))
+  await timeDeleteStepAsync('ocr_runs', () => deleteRowsByDocIdsAsync('ocr_runs', docIds))
   await yieldToEventLoop()
   await timeDeleteStepAsync('page_ai_layout_cache', () => deleteRowsByDocIdsAsync('page_ai_layout_cache', docIds))
   await timeDeleteStepAsync('page_translation_cache', () => deleteRowsByDocIdsAsync('page_translation_cache', docIds))
@@ -539,11 +586,16 @@ async function deleteDocumentData(docIds: string[]): Promise<DeleteDocumentDataR
   await yieldToEventLoop()
   await timeDeleteStepAsync('research_notes', () => deleteRowsByDocIdsAsync('research_notes', docIds))
   await timeDeleteStepAsync('research_project_documents', () => deleteRowsByDocIdsAsync('research_project_documents', docIds))
+  await timeDeleteStepAsync('research_evidence', () => deleteRowsByDocIdsAsync('research_evidence', docIds))
+  await timeDeleteStepAsync('ai_research_records', () => deleteRowsByDocIdsAsync('ai_research_records', docIds))
   await timeDeleteStepAsync('ai_results', () => deleteRowsByDocIdsAsync('ai_results', docIds))
   await yieldToEventLoop()
   await timeDeleteStepAsync('ai_chat_turns', () => deleteAiChatTurnsByDocIdsAsync(docIds))
   await timeDeleteStepAsync('ai_chat_sessions', () => deleteRowsByDocIdsAsync('ai_chat_sessions', docIds))
   await timeDeleteStepAsync('batch_queue', () => deleteRowsByDocIdsAsync('batch_queue', docIds))
+  await timeDeleteStepAsync('citation_snapshots', () => deleteRowsByColumnAsync('citation_snapshots', 'document_id', docIds))
+  await timeDeleteStepAsync('export_snapshots', () => deleteRowsByColumnAsync('export_snapshots', 'document_id', docIds))
+  await timeDeleteStepAsync('translation_context_snapshots', () => deleteRowsByDocIdsAsync('translation_context_snapshots', docIds))
   await yieldToEventLoop()
   await runSearchIndexStep('fts', () => deleteFtsRowsByDocIdsAsync(docIds))
   // Segments may already be removed during FTS cleanup; this pass is a residual sweep.
@@ -554,6 +606,7 @@ async function deleteDocumentData(docIds: string[]): Promise<DeleteDocumentDataR
   await yieldToEventLoop()
   await timeDeleteStepAsync('document_folders', () => deleteRowsByDocIdsAsync('document_folders', docIds))
   await timeDeleteStepAsync('document_tags', () => deleteRowsByDocIdsAsync('document_tags', docIds))
+  await timeDeleteStepAsync('library_project_documents', () => deleteRowsByColumnAsync('library_project_documents', 'document_id', docIds))
   await timeDeleteStepAsync('documents', async () => {
     await runForIdChunksAsync(docIds, (chunkIds, placeholders) => {
       run(`DELETE FROM documents WHERE id IN (${placeholders})`, chunkIds)
@@ -601,6 +654,7 @@ async function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]):
 }
 
 function scheduleDocumentDeleteJob(docIds: string[]): void {
+  const releaseCheckpointDeferral = beginDatabaseCheckpointDeferral()
   const job = new Promise<void>((resolve) => {
     setImmediate(() => {
       void (async () => {
@@ -629,6 +683,7 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
           markDocumentsDeleteFailed(docIds, error)
         } finally {
           docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
+          releaseCheckpointDeferral()
         }
       })().finally(resolve)
     })
@@ -703,7 +758,6 @@ export async function shutdownDocumentImportRuntime(timeoutMs = 30000): Promise<
 export async function shutdownDocumentDeleteRuntime(timeoutMs = 30000): Promise<void> {
   const activeJobs = [...activeDocumentDeleteJobs]
   if (activeJobs.length === 0) return
-  saveDatabase()
   await waitForDocumentDeleteShutdown(activeJobs, timeoutMs)
 }
 
@@ -737,7 +791,9 @@ export function resumeInterruptedDocumentDeletes(): InterruptedDocumentDeleteRec
     .filter(Boolean)
   if (docIds.length === 0) return { queuedDocuments: 0, cleanupTasks: 0 }
 
-  const docs = getDocumentsForDelete(docIds)
+  // These rows were already confirmed for permanent deletion before the prior
+  // process exited. Recovery must not depend on which project the user opens.
+  const docs = getDocumentsForDeleteRecovery(docIds)
   const existingIds = docs.map((doc) => doc.id).filter((docId) => !activeDocumentDeleteIds.has(docId))
   if (existingIds.length === 0) return { queuedDocuments: 0, cleanupTasks: 0 }
 

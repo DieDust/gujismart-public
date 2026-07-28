@@ -61,6 +61,12 @@ const deleteByIdsBody = sliceBetween(
   "ipcMain.handle('documents:savePages'",
   'document delete submission body',
 )
+const resumeDeleteBody = sliceBetween(
+  documentsIpc,
+  'export function resumeInterruptedDocumentDeletes',
+  'function resolveImportOcrEngine',
+  'interrupted document delete recovery body',
+)
 const fileCleanupBody = sliceBetween(
   documentsIpc,
   'async function cleanupDeletedDocumentFilesInBackground',
@@ -96,6 +102,12 @@ assertNotIncludes(deleteFtsBody, 'DELETE FROM search_segments_trigram WHERE rowi
 assertIncludes(deleteJobBody, 'if (recoveredSearchIndexIssue)', 'delete job should branch after recovering a rebuildable search-index issue')
 assertIncludes(deleteJobBody, 'queueAllDocumentsReindex()', 'delete job should rebuild search indexes for remaining documents after reset')
 assertIncludes(deleteJobBody, 'DELETE_DOC_BATCH_SIZE', 'delete job should process documents in small batches so UI IPC can run between them')
+assertIncludes(deleteDataBody, "timeDeleteStepAsync('embedding_chunks'", 'vector BLOB rows should be drained in bounded batches before the document cascade')
+assertIncludes(deleteDataBody, "timeDeleteStepAsync('embedding_index_status'", 'vector index status should be removed before the document cascade')
+assertIncludes(deleteDataBody, "timeDeleteStepAsync('ocr_page_attempts'", 'OCR attempt cascades should be flattened before deleting document rows')
+assertIncludes(deleteDataBody, "timeDeleteStepAsync('library_project_documents'", 'project membership cascades should be flattened before deleting document rows')
+assertIncludes(deleteJobBody, 'beginDatabaseCheckpointDeferral()', 'delete jobs should suppress automatic checkpoints while bulk writes are active')
+assertIncludes(deleteJobBody, 'releaseCheckpointDeferral()', 'delete jobs should release checkpoint suppression after all cleanup finishes')
 assertIncludes(markDeletingBody, 'scheduleDatabaseSave()', 'delete marker should defer WAL checkpoint work off the IPC response path')
 assertNotIncludes(markDeletingBody, 'saveDatabase()', 'delete marker should not synchronously checkpoint the database')
 assertNotIncludes(deleteByIdsBody, 'getDeleteCleanupTasks(', 'delete submission should not inspect every document directory synchronously')
@@ -103,6 +115,8 @@ assertNotIncludes(deleteByIdsBody, 'getAffectedTagIdsForDelete(', 'delete submis
 assertIncludes(deleteJobBody, 'getDeleteCleanupTasks', 'background delete job should prepare safe cleanup targets')
 assertIncludes(deleteJobBody, 'getAffectedTagIdsForDelete(batch)', 'background delete job should capture affected tags before deleting relations')
 assertNotIncludes(documentsIpc, 'scheduleDocumentDeleteJob(existingIds, tagIds)', 'interrupted delete recovery should use the same nonblocking scheduler contract')
+assertIncludes(resumeDeleteBody, 'getDocumentsForDeleteRecovery(docIds)', 'interrupted permanent deletion should resume across projects')
+assertNotIncludes(resumeDeleteBody, 'getDocumentsForDelete(docIds)', 'interrupted permanent deletion must not depend on the currently selected project')
 assertIncludes(fileCleanupBody, 'DELETE_FILE_CLEANUP_CONCURRENCY', 'document file cleanup should use bounded concurrency')
 assertIncludes(fileCleanupBody, 'await Promise.all(workers)', 'document file cleanup should wait for its bounded workers')
 

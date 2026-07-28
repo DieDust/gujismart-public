@@ -364,10 +364,12 @@ assert(
   'Library view should refresh after startup recovery completes.',
 )
 assert(
-  documentsIpc.includes('saveDatabase, scheduleDatabaseSave')
+  documentsIpc.includes('beginDatabaseCheckpointDeferral')
     && /function markDocumentsDeleting[\s\S]{0,650}scheduleDatabaseSave\(\)/.test(documentsIpc)
-    && /export async function shutdownDocumentDeleteRuntime[\s\S]{0,220}saveDatabase\(\)/.test(documentsIpc),
-  'Document delete markers should use WAL durability without blocking IPC and flush during orderly shutdown.',
+    && /function scheduleDocumentDeleteJob[\s\S]{0,220}beginDatabaseCheckpointDeferral\(\)/.test(documentsIpc)
+    && /function scheduleDocumentDeleteJob[\s\S]{0,2200}releaseCheckpointDeferral\(\)/.test(documentsIpc)
+    && !/export async function shutdownDocumentDeleteRuntime[\s\S]{0,220}saveDatabase\(\)/.test(documentsIpc),
+  'Document delete markers should use WAL durability while automatic checkpoints remain blocked for the lifetime of the delete job.',
 )
 assert(
   startupRecovery.includes('let startupRecoveryPromise: Promise<void> | null = null')

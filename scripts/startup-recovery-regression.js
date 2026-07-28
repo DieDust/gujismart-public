@@ -17,8 +17,9 @@ writeFileSync(entryPath, `
   const database = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'database.ts'))})
   const search = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'semantic-search.ts'))})
   const startupRecovery = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'startup-recovery.ts'))})
+  const documents = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'ipc', 'documents.ts'))})
   const pdfAssets = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'pdf-assets.ts'))})
-  module.exports = { database, search, startupRecovery, pdfAssets }
+  module.exports = { database, search, startupRecovery, documents, pdfAssets }
 `)
 
 buildSync({
@@ -348,6 +349,27 @@ async function run() {
       thumbPath: repositoryProtectedFile,
     })
     insertPage(database, 'page_deleting_1', 'doc_deleting', 1, 'processing')
+    database.transaction(() => {
+      const embedding = Buffer.alloc(256, 7)
+      for (let index = 0; index < 640; index += 1) {
+        database.run(
+          `INSERT INTO embedding_chunks
+           (segment_id, library_project_id, doc_id, page_id, page_num, model_id, dim, content_hash, embedding, updated_at)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
+          [
+            `delete-segment-${index}`,
+            'library_project_default',
+            'doc_deleting',
+            index + 1,
+            'delete-regression-model',
+            64,
+            `delete-hash-${index}`,
+            embedding,
+            new Date().toISOString(),
+          ],
+        )
+      }
+    })
     insertDocument(database, 'managed_delete_boundaries', {
       importStatus: 'deleting',
       ocrStatus: 'processing',
@@ -372,7 +394,6 @@ async function run() {
       'INSERT INTO batch_queue (id, batch_id, doc_id, status, batch_size, progress, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       ['batch_deleting_stale', 'startup_resume_batch', 'doc_deleting', 'pending', 5, 0, null, new Date().toISOString()],
     )
-
     const summary = await startupRecovery.runStartupRecovery()
     assert.strictEqual(summary.resetSearchIndexJobs, 3)
     assert.strictEqual(summary.resetAiLayoutCacheRows, 1)
@@ -546,6 +567,11 @@ async function run() {
       () => database.queryOne('SELECT id FROM documents WHERE id = ?', ['doc_deleting']) === null,
       'interrupted document delete to finish',
     )
+    assert.strictEqual(
+      Number(database.queryOne('SELECT COUNT(*) as count FROM embedding_chunks WHERE doc_id = ?', ['doc_deleting'])?.count || 0),
+      0,
+      'interrupted deletion should drain all vector chunks',
+    )
     await waitFor(
       () => database.queryOne('SELECT id FROM documents WHERE id = ?', ['managed_delete_boundaries']) === null,
       'boundary document delete to finish',
@@ -566,6 +592,54 @@ async function run() {
     assert.strictEqual(readFileSync(parentProtectedFile, 'utf8'), 'parent bytes')
     assert.strictEqual(readFileSync(siblingProtectedFile, 'utf8'), 'sibling bytes')
     assert.strictEqual(readFileSync(similarProtectedFile, 'utf8'), 'similar prefix bytes')
+
+    const bulkDeleteFixtureCount = 320
+    database.transaction(() => {
+      for (let index = 0; index < bulkDeleteFixtureCount; index += 1) {
+        insertDocument(database, `bulk_delete_${index}`, {
+          importStatus: 'deleting',
+          ocrStatus: 'processing',
+          pageCount: 0,
+        })
+      }
+    })
+    const bulkDeleteRecovery = modules.documents.resumeInterruptedDocumentDeletes()
+    assert.strictEqual(
+      bulkDeleteRecovery.queuedDocuments,
+      bulkDeleteFixtureCount,
+      'startup delete scheduler should accept hundreds of interrupted documents',
+    )
+    await waitFor(
+      () => Number(database.queryOne("SELECT COUNT(*) as count FROM documents WHERE import_status = 'deleting'")?.count || 0) === 0,
+      'hundreds of interrupted document deletes to finish',
+    )
+
+    insertDocument(database, 'doc_cross_project_deleting', {
+      importStatus: 'deleting',
+      ocrStatus: 'processing',
+    })
+    const alternateProjectId = 'library_project_recovery_other'
+    const projectNow = new Date().toISOString()
+    database.run(
+      `INSERT INTO library_projects
+       (id, name, description, color, is_default, created_at, updated_at)
+       VALUES (?, ?, '', NULL, 0, ?, ?)`,
+      [alternateProjectId, 'Recovery Project', projectNow, projectNow],
+    )
+    database.run(
+      "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_library_project_id', ?)",
+      [alternateProjectId],
+    )
+    const crossProjectDelete = modules.documents.resumeInterruptedDocumentDeletes()
+    assert.strictEqual(
+      crossProjectDelete.queuedDocuments,
+      1,
+      'interrupted permanent deletion should resume even when another project is active',
+    )
+    await waitFor(
+      () => database.queryOne('SELECT id FROM documents WHERE id = ?', ['doc_cross_project_deleting']) === null,
+      'cross-project interrupted document delete to finish',
+    )
 
     const secondSummary = await startupRecovery.runStartupRecovery()
     assert.strictEqual(secondSummary.resetSearchIndexJobs, 0)

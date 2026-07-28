@@ -11,6 +11,10 @@ import {
 } from '../shared/history-citation'
 import { setPayloadDataDir } from './page-payload-files'
 import { withStartupPhaseSync } from './startup-timing'
+import {
+  isDatabaseDiagnosticsWorkerAvailable,
+  runDatabaseCheckpointWorkerTask,
+} from './database-diagnostics-worker-client'
 
 type NativeDatabase = Database.Database
 
@@ -29,6 +33,8 @@ const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_DATABASE_BYTES = 256 * 1024 * 1024
 const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_PAGE_LIMIT = 100_000
 const LARGE_LIBRARY_AUTOMATIC_MAINTENANCE_SEGMENT_LIMIT = 500_000
 let deferredDatabaseSaveTimer: ReturnType<typeof setTimeout> | null = null
+let deferredDatabaseCheckpointPromise: Promise<void> | null = null
+let databaseCheckpointDeferralCount = 0
 let lastDatabaseCheckpointAt = 0
 const DATABASE_BUSY_TIMEOUT_MS = 250
 const DATABASE_BUSY_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1200]
@@ -3610,8 +3616,23 @@ export function saveDatabase(): void {
   }
 }
 
+export function beginDatabaseCheckpointDeferral(): () => void {
+  databaseCheckpointDeferralCount += 1
+  if (deferredDatabaseSaveTimer) {
+    clearTimeout(deferredDatabaseSaveTimer)
+    deferredDatabaseSaveTimer = null
+  }
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    databaseCheckpointDeferralCount = Math.max(0, databaseCheckpointDeferralCount - 1)
+  }
+}
+
 export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void {
   if (!db || !dbFilePath) return
+  if (databaseCheckpointDeferralCount > 0 || deferredDatabaseCheckpointPromise) return
 
   const elapsed = Date.now() - lastDatabaseCheckpointAt
   const requestedMinDelay = Math.max(0, Math.round(Number(options?.minDelayMs || 0)))
@@ -3631,14 +3652,24 @@ export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void {
   deferredDatabaseSaveTimer = setTimeout(() => {
     deferredDatabaseSaveTimer = null
     if (!db || !dbFilePath) return
-
-    try {
-      if (!checkpointDatabase()) {
-        scheduleDatabaseSave()
-      }
-    } catch (error) {
-      console.error('[Database] Deferred save failed', error)
+    if (databaseCheckpointDeferralCount > 0 || deferredDatabaseCheckpointPromise) return
+    if (!isDatabaseDiagnosticsWorkerAvailable()) {
+      // WAL commits are already durable. Never fall back to a synchronous
+      // automatic checkpoint on Electron's main thread.
+      console.warn('[Database] Deferred checkpoint worker unavailable; leaving WAL for clean exit or manual maintenance')
+      return
     }
+    const checkpointPath = dbFilePath
+    deferredDatabaseCheckpointPromise = runDatabaseCheckpointWorkerTask({
+      dbFilePath: checkpointPath,
+      mode: 'PASSIVE',
+    }).then((result) => {
+      if (result.busy === 0) lastDatabaseCheckpointAt = Date.now()
+    }).catch((error: unknown) => {
+      console.error('[Database] Deferred checkpoint worker failed', error)
+    }).finally(() => {
+      deferredDatabaseCheckpointPromise = null
+    })
   }, delay)
   deferredDatabaseSaveTimer.unref?.()
 }
@@ -3658,6 +3689,8 @@ export function closeDatabase(): void {
     db.close()
     db = null
   }
+  deferredDatabaseCheckpointPromise = null
+  databaseCheckpointDeferralCount = 0
 }
 
 export function listStoredLocalResourcePaths(options?: { includePageImages?: boolean }): string[] {

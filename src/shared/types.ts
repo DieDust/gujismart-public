@@ -1244,6 +1244,15 @@ export interface MoveDocumentsToLibraryProjectResult {
   target_project_id: string
 }
 
+export interface RemoveDocumentsFromLibraryProjectResult {
+  requested: number
+  removed: number
+  removed_document_ids: string[]
+  reassigned_to_default: number
+  skipped_last_default: number
+  source_project_id: string
+}
+
 export interface AddDocumentsToLibraryProjectResult {
   requested: number
   added: number

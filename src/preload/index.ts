@@ -113,6 +113,7 @@ import type {
   CreateLibraryProjectPayload,
   LibraryProject,
   MoveDocumentsToLibraryProjectResult,
+  RemoveDocumentsFromLibraryProjectResult,
   DocumentUpdatePayload,
   ImportDocumentResult,
   ImportDocumentOptions,
@@ -125,6 +126,7 @@ import type {
   LibraryAiScope,
   LibraryAiScopePreview,
   LibraryAiSearchResponse,
+  LibrarySmartViewCounts,
   LibraryStateCache,
   ListDocumentOptions,
   ListResearchNotesOptions,
@@ -362,6 +364,11 @@ const api = {
   ): Promise<MoveDocumentsToLibraryProjectResult> =>
     ipcRenderer.invoke('libraryProjects:moveDocuments', documentIds, targetProjectId),
 
+  removeDocumentsFromLibraryProject: (
+    documentIds: string[],
+  ): Promise<RemoveDocumentsFromLibraryProjectResult> =>
+    ipcRenderer.invoke('libraryProjects:removeDocuments', documentIds),
+
   copyDocumentsToLibraryProject: (
     documentIds: string[],
     targetProjectId: string,
@@ -378,6 +385,8 @@ const api = {
     ipcRenderer.invoke('library:getStateCache'),
   refreshLibraryStateCache: (): Promise<LibraryStateCache> =>
     ipcRenderer.invoke('library:refreshStateCache'),
+  refreshLibrarySmartViewCounts: (): Promise<LibrarySmartViewCounts> =>
+    ipcRenderer.invoke('library:refreshSmartViewCounts'),
   markLibraryStateCacheDirty: (): Promise<LibraryStateCache> =>
     ipcRenderer.invoke('library:markStateCacheDirty'),
 

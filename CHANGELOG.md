@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+## 1.2.8 - 2026-07-28
+
+### 中文
+
+#### 大批量永久删除恢复
+
+- 修复一次永久删除数百篇文献后，向量 BLOB、OCR 记录和其他关联数据由 SQLite 主线程级联清理，导致窗口长时间无响应的问题；现在会按小批次清理并在批次之间让出事件循环。
+- 自动 WAL 检查点改由数据库工作线程执行，批量删除期间暂停自动检查点，避免重启后恢复删除任务与数据库检查点同时争用主线程。
+- 已中断的永久删除会跨项目继续完成，不再因为用户重启后选择了其他项目而残留在“正在删除”状态。
+
+#### 下载
+
+- `GujiSmart-1.2.8-Setup-x64.exe`
+- `GujiSmart-1.2.8-Portable-x64.exe`
+
+### English
+
+#### Bulk Permanent-Deletion Recovery
+
+- Fixed long window hangs after permanently deleting hundreds of documents. Vector BLOBs, OCR records, and other related rows are now drained in small yielding batches before the final document rows are removed.
+- Moved automatic WAL checkpoints to the database worker and suppresses them while a bulk delete is active, preventing startup delete recovery and checkpoints from competing on Electron's main thread.
+- Interrupted permanent deletions now resume across projects instead of remaining stuck when the user opens a different project after restarting.
+
+#### Downloads
+
+- `GujiSmart-1.2.8-Setup-x64.exe`
+- `GujiSmart-1.2.8-Portable-x64.exe`
+
+## 1.2.7 - 2026-07-28
+
+### 中文
+
+#### 文献移除与智能视图同步
+
+- 文献删除拆分为“从当前项目移除”和“从总库永久删除”：项目移除只解除当前项目关联并清理项目专属整理数据，PDF、OCR、校对、向量及其他项目中的同一文献保持不变；永久删除仍会从所有项目删除完整文献数据。
+- 单篇操作、右键菜单和批量处理均提供两种删除方式，并使用独立确认说明避免误删。
+- 修复导入文献后智能视图计数仍显示旧状态的问题；导入、OCR 和向量状态变化会合并为约 5 秒一次的轻量项目统计刷新，避免重复执行完整侧栏统计。
+- 智能视图标题增加手动刷新按钮；项目或筛选范围变化时会取消旧刷新任务，避免过期状态写回当前界面。
+
+#### 下载
+
+- `GujiSmart-1.2.7-Setup-x64.exe`
+- `GujiSmart-1.2.7-Portable-x64.exe`
+
+### English
+
+#### Project Removal and Smart View Sync
+
+- Split document removal into “remove from current project” and “permanently delete from library.” Project removal only detaches the active project and clears project-specific organization data while preserving PDFs, OCR, proofreading, vectors, and memberships in other projects; permanent deletion still removes the complete document from every project.
+- Added both removal choices to single-document actions, context menus, and batch actions, with distinct confirmation text to reduce accidental deletion.
+- Fixed stale Smart View counts after imports. Import, OCR, and embedding status changes now coalesce into a lightweight project-scoped refresh about once every five seconds instead of rebuilding all sidebar statistics.
+- Added a manual Smart View refresh button; stale scheduled refreshes are canceled when the active project or list scope changes.
+
+#### Downloads
+
+- `GujiSmart-1.2.7-Setup-x64.exe`
+- `GujiSmart-1.2.7-Portable-x64.exe`
+
 ## 1.2.6 - 2026-07-28
 
 ### 中文

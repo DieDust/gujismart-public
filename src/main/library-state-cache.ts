@@ -31,20 +31,6 @@ const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   embeddingError: 0,
 }
 
-function embeddingStatusExistsSql(status: string): string {
-  return `EXISTS (
-    SELECT 1 FROM embedding_index_status eis
-    WHERE eis.doc_id = d.id AND eis.status = '${status}'
-  )`
-}
-
-function embeddingNotReadySql(): string {
-  return `NOT EXISTS (
-    SELECT 1 FROM embedding_index_status eis
-    WHERE eis.doc_id = d.id AND eis.status = 'ready'
-  )`
-}
-
 interface CacheRow {
   cache_json?: string | null
   dirty?: number | null
@@ -58,6 +44,25 @@ interface CountRow {
 interface IdCountRow {
   id: string
   count?: number | null
+}
+
+interface SmartViewCountRow {
+  all_count?: number | null
+  missing_metadata_count?: number | null
+  unrecognized_count?: number | null
+  suspicious_title_count?: number | null
+  unknown_type_count?: number | null
+  favorite_count?: number | null
+  unread_count?: number | null
+  proofed_count?: number | null
+  unproofed_count?: number | null
+  metadata_pending_count?: number | null
+  unstored_count?: number | null
+  vectorized_count?: number | null
+  not_vectorized_count?: number | null
+  embedding_queued_count?: number | null
+  embedding_processing_count?: number | null
+  embedding_error_count?: number | null
 }
 
 function numberValue(value: unknown): number {
@@ -249,10 +254,6 @@ function unknownTypeFilter(): string {
   return `(TRIM(COALESCE(d.doc_type, '')) = '' OR d.doc_type IN ('unknown', '其他'))`
 }
 
-function activeDocumentWhere(extra = '1 = 1'): string {
-  return `WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?) AND COALESCE(d.import_status, '') <> 'deleting' AND ${extra}`
-}
-
 function buildFolderCounts(projectId: string): Record<string, number> {
   return buildCumulativeFolderDocumentCounts(projectId)
 }
@@ -272,41 +273,55 @@ function buildTagCounts(projectId: string): Record<string, number> {
   return Object.fromEntries(rows.map((row) => [row.id, numberValue(row.count)]))
 }
 
+function buildSmartViewCounts(projectId: string): LibrarySmartViewCounts {
+  const row = queryOne<SmartViewCountRow>(
+    `SELECT
+       COUNT(*) AS all_count,
+       COALESCE(SUM(CASE WHEN ${buildMissingMetadataFilter()} THEN 1 ELSE 0 END), 0) AS missing_metadata_count,
+       COALESCE(SUM(CASE WHEN ${buildOcrIncompleteCondition()} THEN 1 ELSE 0 END), 0) AS unrecognized_count,
+       COALESCE(SUM(CASE WHEN ${suspiciousTitleFilter()} THEN 1 ELSE 0 END), 0) AS suspicious_title_count,
+       COALESCE(SUM(CASE WHEN ${unknownTypeFilter()} THEN 1 ELSE 0 END), 0) AS unknown_type_count,
+       COALESCE(SUM(CASE WHEN d.is_favorite = 1 THEN 1 ELSE 0 END), 0) AS favorite_count,
+       COALESCE(SUM(CASE WHEN d.read_status = 'unread' THEN 1 ELSE 0 END), 0) AS unread_count,
+       COALESCE(SUM(CASE WHEN d.proof_status = 'completed' THEN 1 ELSE 0 END), 0) AS proofed_count,
+       COALESCE(SUM(CASE WHEN COALESCE(d.proof_status, 'pending') <> 'completed' THEN 1 ELSE 0 END), 0) AS unproofed_count,
+       COALESCE(SUM(CASE WHEN d.metadata_status IN ('pending', 'review') THEN 1 ELSE 0 END), 0) AS metadata_pending_count,
+       COALESCE(SUM(CASE WHEN d.import_status = 'unstored' THEN 1 ELSE 0 END), 0) AS unstored_count,
+       COALESCE(SUM(CASE WHEN eis.status = 'ready' THEN 1 ELSE 0 END), 0) AS vectorized_count,
+       COALESCE(SUM(CASE WHEN COALESCE(eis.status, '') <> 'ready' THEN 1 ELSE 0 END), 0) AS not_vectorized_count,
+       COALESCE(SUM(CASE WHEN eis.status = 'queued' THEN 1 ELSE 0 END), 0) AS embedding_queued_count,
+       COALESCE(SUM(CASE WHEN eis.status = 'processing' THEN 1 ELSE 0 END), 0) AS embedding_processing_count,
+       COALESCE(SUM(CASE WHEN eis.status = 'error' THEN 1 ELSE 0 END), 0) AS embedding_error_count
+     FROM library_project_documents project_scope
+     INNER JOIN documents d ON d.id = project_scope.document_id
+     LEFT JOIN embedding_index_status eis ON eis.doc_id = d.id
+     WHERE project_scope.project_id = ?
+       AND COALESCE(d.import_status, '') <> 'deleting'`,
+    [projectId],
+  )
+  return {
+    all: numberValue(row?.all_count),
+    missingMetadata: numberValue(row?.missing_metadata_count),
+    unrecognized: numberValue(row?.unrecognized_count),
+    suspiciousTitle: numberValue(row?.suspicious_title_count),
+    unknownType: numberValue(row?.unknown_type_count),
+    favorite: numberValue(row?.favorite_count),
+    unread: numberValue(row?.unread_count),
+    proofed: numberValue(row?.proofed_count),
+    unproofed: numberValue(row?.unproofed_count),
+    metadataPending: numberValue(row?.metadata_pending_count),
+    unstored: numberValue(row?.unstored_count),
+    vectorized: numberValue(row?.vectorized_count),
+    notVectorized: numberValue(row?.not_vectorized_count),
+    embeddingQueued: numberValue(row?.embedding_queued_count),
+    embeddingProcessing: numberValue(row?.embedding_processing_count),
+    embeddingError: numberValue(row?.embedding_error_count),
+  }
+}
+
 function buildCache(): LibraryStateCache {
   const projectId = getActiveLibraryProjectId()
-  const smartViewCounts: LibrarySmartViewCounts = {
-    all: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere()}`, [projectId]),
-    missingMetadata: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere(buildMissingMetadataFilter())}`, [projectId]),
-    unrecognized: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere(buildOcrIncompleteCondition())}`, [projectId]),
-    suspiciousTitle: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere(suspiciousTitleFilter())}`, [projectId]),
-    unknownType: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere(unknownTypeFilter())}`, [projectId]),
-    favorite: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere('d.is_favorite = 1')}`, [projectId]),
-    unread: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.read_status = 'unread'")}`, [projectId]),
-    proofed: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.proof_status = 'completed'")}`, [projectId]),
-    unproofed: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("COALESCE(d.proof_status, 'pending') <> 'completed'")}`, [projectId]),
-    metadataPending: count(`SELECT COUNT(*) AS count FROM documents d ${activeDocumentWhere("d.metadata_status IN ('pending', 'review')")}`, [projectId]),
-    unstored: count(`SELECT COUNT(*) AS count FROM documents d WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?) AND d.import_status = 'unstored'`, [projectId]),
-    vectorized: count(
-      `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(embeddingStatusExistsSql('ready'))}`, [projectId],
-    ),
-    notVectorized: count(
-      `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(embeddingNotReadySql())}`, [projectId],
-    ),
-    embeddingQueued: count(
-      `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(embeddingStatusExistsSql('queued'))}`, [projectId],
-    ),
-    embeddingProcessing: count(
-      `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(embeddingStatusExistsSql('processing'))}`, [projectId],
-    ),
-    embeddingError: count(
-      `SELECT COUNT(*) AS count FROM documents d
-       ${activeDocumentWhere(embeddingStatusExistsSql('error'))}`, [projectId],
-    ),
-  }
+  const smartViewCounts = buildSmartViewCounts(projectId)
   return {
     smartViewCounts,
     unfiledDocumentTotal: count(
@@ -354,6 +369,40 @@ export function refreshLibraryStateCache(): LibraryStateCache {
   )
   scheduleDatabaseSave()
   return cache
+}
+
+export function refreshLibrarySmartViewCounts(): LibrarySmartViewCounts {
+  const projectId = getActiveLibraryProjectId()
+  const row = readCacheRow(projectId)
+  let cache = emptyCache(true)
+  if (row?.cache_json) {
+    try {
+      cache = normalizeCache(JSON.parse(row.cache_json), row, row.dirty === 0 ? 'cache' : 'snapshot')
+    } catch {
+      cache = emptyCache(true)
+    }
+  }
+  const smartViewCounts = buildSmartViewCounts(projectId)
+  const updatedAt = new Date().toISOString()
+  const dirty = row?.dirty === 0 ? 0 : 1
+  run(
+    `INSERT INTO library_state_cache (cache_key, cache_json, dirty, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(cache_key) DO UPDATE SET
+       cache_json = excluded.cache_json,
+       dirty = excluded.dirty,
+       updated_at = excluded.updated_at`,
+    [cacheKey(projectId), JSON.stringify({
+      version: CACHE_VERSION,
+      smartViewCounts,
+      unfiledDocumentTotal: cache.unfiledDocumentTotal,
+      folderDocumentCounts: cache.folderDocumentCounts,
+      tagDocumentCounts: cache.tagDocumentCounts,
+      lastCalibratedAt: cache.lastCalibratedAt,
+    }), dirty, updatedAt],
+  )
+  scheduleDatabaseSave({ minDelayMs: 15_000 })
+  return smartViewCounts
 }
 
 export function markLibraryStateCacheDirty(projectIds?: string[]): LibraryStateCache {

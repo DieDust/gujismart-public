@@ -16,6 +16,7 @@ import {
   ImportOutlined,
   InboxOutlined,
   MoreOutlined,
+  MinusCircleOutlined,
   ExportOutlined,
   PictureOutlined,
   PlusOutlined,
@@ -138,7 +139,7 @@ const BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY = 'background-startup-recovery'
 const BACKGROUND_EMBEDDING_MESSAGE_KEY = 'background-embedding-index'
 const HEALTH_REPORT_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_REFRESH_DEBOUNCE_MS = 600
-const SMART_COUNTS_REFRESH_DEBOUNCE_MS = 800
+const SMART_COUNTS_REFRESH_INTERVAL_MS = 5_000
 const BASE_DATA_BUSY_RETRY_DELAYS_MS = [800, 1600, 3200]
 const LIBRARY_LIST_REQUEST_TIMEOUT_MS = 90_000
 const LIBRARY_LIST_BUSY_RETRY_DELAYS_MS = [800, 2000, 4000, 8000]
@@ -981,6 +982,7 @@ interface DocumentCardContext {
   getDragDocIds: (docId: string) => string[]
   handleDocumentDragStart: (event: DragEvent<HTMLElement>, docId: string) => void
   handleBatchMenu: MenuProps['onClick']
+  handleRemoveFromProject: (event: StopPropagationEvent, docId: string) => Promise<void>
   handleDelete: (event: StopPropagationEvent, docId: string) => Promise<void>
   handleCleanupPdfAssets: (doc: DocumentItem) => Promise<void>
   handleRestorePdfAssets: (doc: DocumentItem) => Promise<void>
@@ -1741,11 +1743,12 @@ function buildBatchMenuItems(): MenuProps['items'] {
     },
     {
       key: 'group_danger',
-      label: '删除',
+      label: '移除与删除',
       icon: <DeleteOutlined />,
-      danger: true,
       children: [
-        { key: 'delete_selected', label: '删除所选文献', danger: true },
+        { key: 'remove_selected', label: '从当前项目移除', icon: <MinusCircleOutlined /> },
+        { type: 'divider' },
+        { key: 'delete_selected', label: '从总库永久删除', danger: true },
         { key: 'delete_zero_page', label: '清除零页文献', danger: true },
       ],
     },
@@ -2465,6 +2468,18 @@ function DocumentVirtualRow({
                 <Button type="text" size="small" icon={<MoreOutlined />} />
               </Dropdown>
               <Popconfirm
+                title="从当前项目移除文献"
+                description="只移除当前项目关联；其他项目和文献正文数据会保留。"
+                onConfirm={(event) => void context.handleRemoveFromProject(event ?? { stopPropagation() {} }, doc.id)}
+                onCancel={(event) => event?.stopPropagation()}
+                okText="移出项目"
+                cancelText="取消"
+              >
+                <Tooltip title="从当前项目移除">
+                  <Button type="text" size="small" icon={<MinusCircleOutlined />} onClick={(event) => event.stopPropagation()} />
+                </Tooltip>
+              </Popconfirm>
+              <Popconfirm
                 title="从总库永久删除文献"
                 description="将从所有项目删除这篇文献及其文件、OCR、向量和关联数据。此操作不是只从当前项目移除。"
                 onConfirm={(event) => void context.handleDelete(event ?? { stopPropagation() {} }, doc.id)}
@@ -2572,6 +2587,7 @@ export default function LibraryView({
   const [documentTotal, setDocumentTotal] = useState(0)
   const [unfiledDocumentTotal, setUnfiledDocumentTotal] = useState(0)
   const [smartViewCounts, setSmartViewCounts] = useState<Record<SmartViewCountKey, number>>(EMPTY_SMART_VIEW_COUNTS)
+  const [smartViewRefreshing, setSmartViewRefreshing] = useState(false)
   const [listLoadingMore, setListLoadingMore] = useState(false)
   const [listHasMore, setListHasMore] = useState(false)
   const [searchInput, setSearchInput] = useState(searchKey)
@@ -2871,38 +2887,54 @@ export default function LibraryView({
     }
   }, [currentLibraryScopeKey, setFolders])
 
-  const loadSmartViewCounts = useCallback(async (options?: { refresh?: boolean }) => {
+  const loadSmartViewCounts = useCallback(async (options?: { refresh?: boolean; manual?: boolean }) => {
+    if (options?.manual) setSmartViewRefreshing(true)
     try {
-      const stateCache = options?.refresh
-        ? await window.api.refreshLibraryStateCache()
-        : await window.api.getLibraryStateCache()
-      setSmartViewCounts(stateCache.smartViewCounts)
-      setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
-      const nextFolders = applyLibraryStateCacheToFolders(folders, stateCache)
-      const nextTags = applyLibraryStateCacheToTags(tags, stateCache)
-      setFolders(nextFolders)
-      setTags(nextTags)
-      patchLibraryWarmCache(currentLibraryScopeKey, {
-        smartViewCounts: stateCache.smartViewCounts,
-        unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
-        folders: nextFolders,
-        tags: nextTags,
-      })
+      if (options?.refresh) {
+        const counts = await window.api.refreshLibrarySmartViewCounts()
+        setSmartViewCounts(counts)
+        patchLibraryWarmCache(currentLibraryScopeKey, { smartViewCounts: counts })
+        if (options.manual) message.success('智能视图状态已刷新')
+      } else {
+        const stateCache = await window.api.getLibraryStateCache()
+        setSmartViewCounts(stateCache.smartViewCounts)
+        setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
+        const nextFolders = applyLibraryStateCacheToFolders(folders, stateCache)
+        const nextTags = applyLibraryStateCacheToTags(tags, stateCache)
+        setFolders(nextFolders)
+        setTags(nextTags)
+        patchLibraryWarmCache(currentLibraryScopeKey, {
+          smartViewCounts: stateCache.smartViewCounts,
+          unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
+          folders: nextFolders,
+          tags: nextTags,
+        })
+      }
     } catch (error) {
       console.warn('[LibraryView] Failed to load smart view counts', error)
+      if (options?.manual) message.error('智能视图状态刷新失败')
+    } finally {
+      if (options?.manual) setSmartViewRefreshing(false)
     }
   }, [currentLibraryScopeKey, folders, setFolders, tags])
 
-  const scheduleSmartViewCountsRefresh = useCallback((delayMs = SMART_COUNTS_REFRESH_DEBOUNCE_MS) => {
-    if (smartCountsRefreshTimerRef.current) {
-      window.clearTimeout(smartCountsRefreshTimerRef.current)
-    }
-
+  const scheduleSmartViewCountsRefresh = useCallback((delayMs = SMART_COUNTS_REFRESH_INTERVAL_MS) => {
+    if (smartCountsRefreshTimerRef.current) return
     smartCountsRefreshTimerRef.current = window.setTimeout(() => {
       smartCountsRefreshTimerRef.current = null
-      void loadSmartViewCounts()
-    }, delayMs)
+      void loadSmartViewCounts({ refresh: true })
+    }, Math.max(SMART_COUNTS_REFRESH_INTERVAL_MS, delayMs))
   }, [loadSmartViewCounts])
+
+  useEffect(() => {
+    scheduleSmartViewCountsRefresh()
+    return () => {
+      if (smartCountsRefreshTimerRef.current) {
+        window.clearTimeout(smartCountsRefreshTimerRef.current)
+        smartCountsRefreshTimerRef.current = null
+      }
+    }
+  }, [currentLibraryScopeKey, scheduleSmartViewCountsRefresh])
 
   const scheduleBaseDataRefresh = useCallback((delayMs = BASE_DATA_REFRESH_DEBOUNCE_MS) => {
     if (baseDataRefreshTimerRef.current) {
@@ -3156,7 +3188,8 @@ export default function LibraryView({
     setListHasMore(false)
     libraryContentRef.current?.scrollTo({ top: 0 })
     await loadDocuments(filter, { reset: true, silent: true })
-  }, [filter, loadDocuments])
+    scheduleSmartViewCountsRefresh()
+  }, [filter, loadDocuments, scheduleSmartViewCountsRefresh])
 
   const maybeLoadMoreFromScroll = useCallback((target: HTMLElement) => {
     const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight
@@ -3400,7 +3433,8 @@ export default function LibraryView({
     if (events.some(isImmediateOcrProgressEvent)) {
       scheduleHealthReportRefresh()
     }
-  }, [scheduleBaseDataRefresh, scheduleHealthReportRefresh, scheduleImportListRefresh, updateDocumentsInList])
+    scheduleSmartViewCountsRefresh()
+  }, [scheduleBaseDataRefresh, scheduleHealthReportRefresh, scheduleImportListRefresh, scheduleSmartViewCountsRefresh, updateDocumentsInList])
 
   useEffect(() => {
     // Yield one frame so the shell can paint before the first heavy IPC burst.
@@ -3409,15 +3443,6 @@ export default function LibraryView({
     }, 0)
     return () => window.clearTimeout(timer)
   }, [loadBaseData])
-
-  useEffect(() => {
-    return () => {
-      if (smartCountsRefreshTimerRef.current) {
-        window.clearTimeout(smartCountsRefreshTimerRef.current)
-        smartCountsRefreshTimerRef.current = null
-      }
-    }
-  }, [])
 
   useEffect(() => {
     if (lastInitialFilterRef.current && isSameFilter(lastInitialFilterRef.current, initialFilter)) return
@@ -4322,18 +4347,83 @@ export default function LibraryView({
     })
   }, [currentLibraryScopeKey, documentTotal, removeDocumentsFromList])
 
-  const handleDelete = async (event: StopPropagationEvent, docId: string) => {
-    event.stopPropagation()
+  const submitProjectRemoval = useCallback(async (documentIds: string[], exitBatchMode: boolean) => {
+    const targetIds = [...new Set(documentIds.map((id) => String(id || '').trim()).filter(Boolean))]
+    if (targetIds.length === 0) return
     try {
-      const success = await window.api.deleteDocument(docId)
-      if (success) {
-        applySubmittedDocumentDeletion([docId], false)
-        message.success('已提交后台删除')
+      const result = await window.api.removeDocumentsFromLibraryProject(targetIds)
+      if (result.removed_document_ids.length > 0) {
+        applySubmittedDocumentDeletion(result.removed_document_ids, exitBatchMode)
+        onLibraryDocumentsMoved?.(result.removed_document_ids)
+        onLibraryProjectsChanged?.()
+        scheduleSmartViewCountsRefresh()
+        window.setTimeout(() => {
+          void loadDocuments(filter, { reset: true, silent: true })
+        }, 120)
+      }
+      if (result.reassigned_to_default > 0) {
+        message.success(`已从当前项目移除 ${result.removed} 篇，其中 ${result.reassigned_to_default} 篇已归入默认项目`)
+      } else if (result.removed > 0) {
+        message.success(`已从当前项目移除 ${result.removed} 篇文献`)
+      }
+      if (result.skipped_last_default > 0) {
+        message.warning(`有 ${result.skipped_last_default} 篇仅存在于默认项目，不能移除；如不再需要，请使用“从总库永久删除”`)
       }
     } catch (error) {
-      console.error(error)
-      message.error('删除文献失败')
+      console.error('[Library] 从当前项目移除文献失败:', error)
+      message.error(getErrorMessage(error, '从当前项目移除失败'))
     }
+  }, [applySubmittedDocumentDeletion, filter, loadDocuments, onLibraryDocumentsMoved, onLibraryProjectsChanged, scheduleSmartViewCountsRefresh])
+
+  const submitPermanentDelete = useCallback(async (documentIds: string[], exitBatchMode: boolean) => {
+    const targetIds = [...new Set(documentIds.map((id) => String(id || '').trim()).filter(Boolean))]
+    if (targetIds.length === 0) return
+    try {
+      const result = await window.api.deleteDocumentsBatch(targetIds)
+      applySubmittedDocumentDeletion(result.deletedIds, exitBatchMode)
+      scheduleSmartViewCountsRefresh()
+      if (result.failedIds.length > 0) {
+        message.warning(`已提交 ${result.successCount} 篇后台永久删除，${result.failedIds.length} 篇提交失败`)
+      } else {
+        message.success(`已提交 ${result.successCount} 篇文献后台永久删除`)
+      }
+    } catch (error) {
+      console.error('[Library] 永久删除文献失败:', error)
+      message.error(getErrorMessage(error, '永久删除文献失败'))
+    }
+  }, [applySubmittedDocumentDeletion, scheduleSmartViewCountsRefresh])
+
+  const confirmProjectRemoval = useCallback((documentIds: string[], exitBatchMode: boolean) => {
+    const count = documentIds.length
+    Modal.confirm({
+      title: `从当前项目移除 ${count} 篇文献？`,
+      content: '只解除当前项目关联；PDF、OCR、校对、向量和其他项目中的同一文献会保留。当前项目的标签、文件夹、摘录、研究关联和文献 AI 对话会移除。',
+      okText: '移出项目',
+      cancelText: '取消',
+      onOk: () => submitProjectRemoval(documentIds, exitBatchMode),
+    })
+  }, [submitProjectRemoval])
+
+  const confirmPermanentDelete = useCallback((documentIds: string[], exitBatchMode: boolean) => {
+    const count = documentIds.length
+    Modal.confirm({
+      title: `从总库永久删除 ${count} 篇文献？`,
+      content: '将从所有项目删除文献及其文件、OCR、校对、向量、摘录和关联数据，此操作不可撤销。',
+      okText: '永久删除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: () => submitPermanentDelete(documentIds, exitBatchMode),
+    })
+  }, [submitPermanentDelete])
+
+  const handleRemoveFromProject = async (event: StopPropagationEvent, docId: string) => {
+    event.stopPropagation()
+    await submitProjectRemoval([docId], false)
+  }
+
+  const handleDelete = async (event: StopPropagationEvent, docId: string) => {
+    event.stopPropagation()
+    await submitPermanentDelete([docId], false)
   }
 
   const handleCleanupPdfAssets = async (doc: DocumentItem) => {
@@ -4517,19 +4607,7 @@ export default function LibraryView({
       return
     }
 
-    try {
-      const targetIds = [...selectedIds]
-      const result = await window.api.deleteDocumentsBatch(targetIds)
-      applySubmittedDocumentDeletion(result.deletedIds, true)
-      if (result.failedIds.length > 0) {
-        message.warning(`已提交 ${result.successCount} 篇后台删除，${result.failedIds.length} 篇提交失败`)
-      } else {
-        message.success(`已提交 ${result.successCount} 篇文献后台删除`)
-      }
-    } catch (error) {
-      console.error('[Library] 批量删除文献失败:', error)
-      message.error('批量删除文献失败')
-    }
+    await submitPermanentDelete(selectedIds, true)
   }
 
   const handleDeleteZeroPageDocuments = () => {
@@ -6789,15 +6867,19 @@ export default function LibraryView({
     if (String(key).startsWith('export:')) {
       openBatchExportModal(String(key).replace('export:', '') as DocumentExportFormat)
     }
+    if (key === 'remove_selected') {
+      if (selectedIds.length === 0) {
+        message.info('请先选择文献')
+        return
+      }
+      confirmProjectRemoval([...selectedIds], true)
+    }
     if (key === 'delete_selected') {
-      Modal.confirm({
-        title: `从总库永久删除 ${selectedIds.length} 篇文献？`,
-        content: '将从所有项目删除所选文献及其文件、OCR、向量和关联数据。此操作不是只从当前项目移除。',
-        okText: '删除文献',
-        cancelText: '取消',
-        okButtonProps: { danger: true },
-        onOk: () => void handleBatchDelete(),
-      })
+      if (selectedIds.length === 0) {
+        message.info('请先选择文献')
+        return
+      }
+      confirmPermanentDelete([...selectedIds], true)
     }
     if (key === 'delete_zero_page') handleDeleteZeroPageDocuments()
     if (key === 'cleanup_pdf_assets') handleBatchCleanupPdfAssets()
@@ -6837,14 +6919,29 @@ export default function LibraryView({
       label: '创建独立副本',
       icon: <CopyOutlined />,
     }
+    const removeItem = {
+      key: 'context_remove_project',
+      label: '从当前项目移除',
+      icon: <MinusCircleOutlined />,
+    }
+    const deleteItem = {
+      key: 'context_delete_library',
+      label: '从总库永久删除',
+      icon: <DeleteOutlined />,
+      danger: true,
+    }
     if (selectedIdSet.has(docId) && selectedIds.length > 0) {
+      const contextBatchItems = (batchMenuItems || []).filter((item) => item?.key !== 'group_danger')
       return [
         { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
         linkItem,
         transferItem,
         copyItem,
         { type: 'divider' as const },
-        ...(batchMenuItems || []),
+        removeItem,
+        deleteItem,
+        { type: 'divider' as const },
+        ...contextBatchItems,
       ]
     }
     return [
@@ -6853,6 +6950,9 @@ export default function LibraryView({
       linkItem,
       transferItem,
       copyItem,
+      { type: 'divider' as const },
+      removeItem,
+      deleteItem,
     ]
   }, [batchMenuItems, selectedIdSet, selectedIds.length])
 
@@ -6881,6 +6981,20 @@ export default function LibraryView({
           ? selectedIds
           : [docId]
         openProjectTransfer(targetIds, 'copy')
+        return
+      }
+      if (info.key === 'context_remove_project') {
+        const targetIds = selectedIdSet.has(docId) && selectedIds.length > 0
+          ? [...selectedIds]
+          : [docId]
+        confirmProjectRemoval(targetIds, selectedIds.length > 0)
+        return
+      }
+      if (info.key === 'context_delete_library') {
+        const targetIds = selectedIdSet.has(docId) && selectedIds.length > 0
+          ? [...selectedIds]
+          : [docId]
+        confirmPermanentDelete(targetIds, selectedIds.length > 0)
         return
       }
       if (selectedIdSet.has(docId) && selectedIds.length > 0) {
@@ -7034,6 +7148,7 @@ export default function LibraryView({
     getDragDocIds,
     handleDocumentDragStart,
     handleBatchMenu,
+    handleRemoveFromProject,
     handleDelete,
     handleCleanupPdfAssets,
     handleRestorePdfAssets,
@@ -7059,6 +7174,7 @@ export default function LibraryView({
     handleCleanupPdfAssets,
     handleForceRerunDocument,
     handleQuickAddTagToDocument,
+    handleRemoveFromProject,
     handleRestorePdfAssets,
     handleAiExtractForDoc,
     handleTranslateBook,
@@ -7104,54 +7220,73 @@ export default function LibraryView({
                   <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12, fontWeight: 600 }}>智能视图</span>
                   <DownOutlined style={{ fontSize: 12, transform: collapsedSections.smart ? 'rotate(-90deg)' : 'rotate(0deg)', transition: 'transform 0.2s ease' }} />
                 </div>
-                <Popover
-                  trigger="click"
-                  open={smartViewCustomizeOpen}
-                  onOpenChange={setSmartViewCustomizeOpen}
-                  placement="bottomLeft"
-                  title="自定义智能视图"
-                  content={(
-                    <div style={{ width: 240, maxHeight: 360, overflowY: 'auto' }}>
-                      <div style={{ color: 'var(--gs-text-secondary)', fontSize: 12, marginBottom: 8 }}>
-                        勾选要显示的分类。可与文件夹/标签组合筛选（如「某文件夹 ∩ 已向量化」）。
-                      </div>
-                      <Space direction="vertical" size={4} style={{ width: '100%' }}>
-                        {SMART_VIEW_CATALOG.map((item) => (
-                          <Checkbox
-                            key={item.key}
-                            checked={item.locked || smartViewVisibleKeys.includes(item.key)}
-                            disabled={item.locked}
-                            onChange={(event) => handleSmartViewVisibleChange(item.key, event.target.checked)}
-                          >
-                            {item.label}
-                          </Checkbox>
-                        ))}
-                      </Space>
-                      <Button
-                        size="small"
-                        type="link"
-                        style={{ paddingInline: 0, marginTop: 8 }}
-                        onClick={() => {
-                          const keys = [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
-                          setSmartViewVisibleKeys(keys)
-                          saveSmartViewVisibleKeys(keys)
-                        }}
-                      >
-                        恢复默认
-                      </Button>
-                    </div>
-                  )}
-                >
-                  <Tooltip title="自定义显示分类">
-                    <Button
+                <div style={{ display: 'flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+                  <Tooltip title="刷新智能视图状态">
+                   <Button
                       size="small"
                       type="text"
-                      icon={<SettingOutlined />}
-                      onClick={(event) => event.stopPropagation()}
-                      aria-label="自定义智能视图"
+                      loading={smartViewRefreshing}
+                      icon={<ReloadOutlined />}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        if (smartCountsRefreshTimerRef.current) {
+                          window.clearTimeout(smartCountsRefreshTimerRef.current)
+                          smartCountsRefreshTimerRef.current = null
+                        }
+                        void loadSmartViewCounts({ refresh: true, manual: true })
+                      }}
+                      aria-label="刷新智能视图状态"
                     />
                   </Tooltip>
-                </Popover>
+                  <Popover
+                    trigger="click"
+                    open={smartViewCustomizeOpen}
+                    onOpenChange={setSmartViewCustomizeOpen}
+                    placement="bottomLeft"
+                    title="自定义智能视图"
+                    content={(
+                      <div style={{ width: 240, maxHeight: 360, overflowY: 'auto' }}>
+                        <div style={{ color: 'var(--gs-text-secondary)', fontSize: 12, marginBottom: 8 }}>
+                          勾选要显示的分类。可与文件夹/标签组合筛选（如「某文件夹 ∩ 已向量化」）。
+                        </div>
+                        <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                          {SMART_VIEW_CATALOG.map((item) => (
+                            <Checkbox
+                              key={item.key}
+                              checked={item.locked || smartViewVisibleKeys.includes(item.key)}
+                              disabled={item.locked}
+                              onChange={(event) => handleSmartViewVisibleChange(item.key, event.target.checked)}
+                            >
+                              {item.label}
+                            </Checkbox>
+                          ))}
+                        </Space>
+                        <Button
+                          size="small"
+                          type="link"
+                          style={{ paddingInline: 0, marginTop: 8 }}
+                          onClick={() => {
+                            const keys = [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+                            setSmartViewVisibleKeys(keys)
+                            saveSmartViewVisibleKeys(keys)
+                          }}
+                        >
+                          恢复默认
+                        </Button>
+                      </div>
+                    )}
+                  >
+                    <Tooltip title="自定义显示分类">
+                      <Button
+                        size="small"
+                        type="text"
+                        icon={<SettingOutlined />}
+                        onClick={(event) => event.stopPropagation()}
+                        aria-label="自定义智能视图"
+                      />
+                    </Tooltip>
+                  </Popover>
+                </div>
               </div>
               {!collapsedSections.smart ? (
                 <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', paddingRight: 2 }}>
@@ -7591,6 +7726,14 @@ export default function LibraryView({
                     批量操作{selectedIds.length > 0 ? ` (${selectedIds.length})` : ''}
                   </Button>
                 </Dropdown>
+                <Button
+                  size="small"
+                  icon={<MinusCircleOutlined />}
+                  disabled={selectedIds.length === 0}
+                  onClick={() => confirmProjectRemoval([...selectedIds], true)}
+                >
+                  移出项目
+                </Button>
                 <Popconfirm
                   title="从总库批量永久删除"
                   description={`将从所有项目永久删除 ${selectedIds.length} 篇文献及其文件、OCR、向量和关联数据。`}
@@ -7599,7 +7742,7 @@ export default function LibraryView({
                   onConfirm={() => void handleBatchDelete()}
                 >
                   <Button size="small" danger icon={<DeleteOutlined />} disabled={selectedIds.length === 0}>
-                    删除
+                    永久删除
                   </Button>
                 </Popconfirm>
               </>
@@ -8222,6 +8365,19 @@ export default function LibraryView({
                           <Dropdown menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
                             <Button type="text" size="small" icon={<MoreOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
                           </Dropdown>
+
+                          <Popconfirm
+                            title="从当前项目移除文献"
+                            description="只移除当前项目关联；其他项目和文献正文数据会保留。"
+                            onConfirm={(event) => void handleRemoveFromProject(event ?? { stopPropagation() {} }, doc.id)}
+                            onCancel={(event) => event?.stopPropagation()}
+                            okText="移出项目"
+                            cancelText="取消"
+                          >
+                            <Tooltip title="从当前项目移除">
+                              <Button type="text" size="small" icon={<MinusCircleOutlined />} style={{ width: 24, height: 24, padding: 0 }} onClick={(event) => event.stopPropagation()} />
+                            </Tooltip>
+                          </Popconfirm>
 
                           <Popconfirm
                             title="从总库永久删除文献"

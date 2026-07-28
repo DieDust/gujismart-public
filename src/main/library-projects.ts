@@ -20,6 +20,7 @@ import {
   type DocumentPage,
   type LibraryProject,
   type MoveDocumentsToLibraryProjectResult,
+  type RemoveDocumentsFromLibraryProjectResult,
 } from '../shared/types'
 
 interface ProjectRow {
@@ -966,6 +967,148 @@ export function addDocumentsToLibraryProject(
     already_present: uniqueIds.length - added,
     source_project_id: sourceProjectId,
     target_project_id: normalizedTargetId,
+  }
+}
+
+export function removeDocumentsFromLibraryProject(
+  documentIds: string[],
+): RemoveDocumentsFromLibraryProjectResult {
+  const uniqueIds = [...new Set((documentIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  const sourceProjectId = getActiveLibraryProjectId()
+  if (uniqueIds.length === 0) {
+    return {
+      requested: 0,
+      removed: 0,
+      removed_document_ids: [],
+      reassigned_to_default: 0,
+      skipped_last_default: 0,
+      source_project_id: sourceProjectId,
+    }
+  }
+  assertDocumentIdsInLibraryProject(uniqueIds, sourceProjectId)
+
+  const sqlite = getDatabase()
+  const removedDocumentIds: string[] = []
+  const affectedTagIds = new Set<string>()
+  let reassignedToDefault = 0
+  let skippedLastDefault = 0
+  const now = new Date().toISOString()
+
+  sqlite.transaction(() => {
+    for (let offset = 0; offset < uniqueIds.length; offset += 400) {
+      const chunk = uniqueIds.slice(offset, offset + 400)
+      const placeholders = chunk.map(() => '?').join(', ')
+      const membershipRows = sqlite.prepare(
+        `SELECT document_id, project_id
+         FROM library_project_documents
+         WHERE document_id IN (${placeholders})
+         ORDER BY document_id, project_id`,
+      ).all(...chunk) as Array<{ document_id: string; project_id: string }>
+      const membershipsByDocument = new Map<string, string[]>()
+      membershipRows.forEach((row) => {
+        const memberships = membershipsByDocument.get(row.document_id) || []
+        memberships.push(row.project_id)
+        membershipsByDocument.set(row.document_id, memberships)
+      })
+
+      const removableIds: string[] = []
+      const nextOwnerByDocument = new Map<string, string>()
+      chunk.forEach((documentId) => {
+        const otherProjectIds = (membershipsByDocument.get(documentId) || [])
+          .filter((projectId) => projectId !== sourceProjectId)
+        if (otherProjectIds.length === 0 && sourceProjectId === DEFAULT_LIBRARY_PROJECT_ID) {
+          skippedLastDefault += 1
+          return
+        }
+        if (otherProjectIds.length === 0) {
+          requireLibraryProjectId(DEFAULT_LIBRARY_PROJECT_ID)
+          sqlite.prepare(
+            `INSERT OR IGNORE INTO library_project_documents
+             (project_id, document_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?)`,
+          ).run(DEFAULT_LIBRARY_PROJECT_ID, documentId, now, now)
+          otherProjectIds.push(DEFAULT_LIBRARY_PROJECT_ID)
+          reassignedToDefault += 1
+        }
+        const nextOwner = otherProjectIds.includes(DEFAULT_LIBRARY_PROJECT_ID)
+          ? DEFAULT_LIBRARY_PROJECT_ID
+          : otherProjectIds[0]
+        nextOwnerByDocument.set(documentId, nextOwner)
+        removableIds.push(documentId)
+      })
+      if (removableIds.length === 0) continue
+
+      const removablePlaceholders = removableIds.map(() => '?').join(', ')
+      const tagRows = sqlite.prepare(
+        `SELECT DISTINCT dt.tag_id
+         FROM document_tags dt
+         INNER JOIN tags t ON t.id = dt.tag_id
+         WHERE t.library_project_id = ?
+           AND dt.doc_id IN (${removablePlaceholders})`,
+      ).all(sourceProjectId, ...removableIds) as Array<{ tag_id: string }>
+      tagRows.forEach((row) => affectedTagIds.add(row.tag_id))
+
+      sqlite.prepare(
+        `DELETE FROM document_tags
+         WHERE doc_id IN (${removablePlaceholders})
+           AND tag_id IN (SELECT id FROM tags WHERE library_project_id = ?)`,
+      ).run(...removableIds, sourceProjectId)
+      sqlite.prepare(
+        `DELETE FROM document_folders
+         WHERE doc_id IN (${removablePlaceholders})
+           AND folder_id IN (SELECT id FROM folders WHERE library_project_id = ?)`,
+      ).run(...removableIds, sourceProjectId)
+      sqlite.prepare(
+        `DELETE FROM research_notes
+         WHERE library_project_id = ? AND doc_id IN (${removablePlaceholders})`,
+      ).run(sourceProjectId, ...removableIds)
+      sqlite.prepare(
+        `DELETE FROM research_project_documents
+         WHERE doc_id IN (${removablePlaceholders})
+           AND project_id IN (SELECT id FROM research_projects WHERE library_project_id = ?)`,
+      ).run(...removableIds, sourceProjectId)
+      sqlite.prepare(
+        `DELETE FROM ai_chat_sessions
+         WHERE library_project_id = ? AND doc_id IN (${removablePlaceholders})`,
+      ).run(sourceProjectId, ...removableIds)
+      sqlite.prepare(
+        `DELETE FROM library_project_documents
+         WHERE project_id = ? AND document_id IN (${removablePlaceholders})`,
+      ).run(sourceProjectId, ...removableIds)
+
+      const updateOwner = sqlite.prepare(
+        `UPDATE documents
+         SET library_project_id = ?, updated_at = ?
+         WHERE id = ? AND library_project_id = ?`,
+      )
+      removableIds.forEach((documentId) => {
+        updateOwner.run(nextOwnerByDocument.get(documentId), now, documentId, sourceProjectId)
+      })
+      removedDocumentIds.push(...removableIds)
+    }
+
+    if (removedDocumentIds.length > 0) {
+      sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id = ?').run(now, sourceProjectId)
+      if (reassignedToDefault > 0) {
+        sqlite.prepare('UPDATE library_projects SET updated_at = ? WHERE id = ?')
+          .run(now, DEFAULT_LIBRARY_PROJECT_ID)
+      }
+    }
+  })()
+
+  try {
+    refreshTagUsageForTags([...affectedTagIds])
+  } catch (error) {
+    console.warn('[LibraryProjects] Failed to refresh tag usage after project removal:', error)
+  }
+  if (removedDocumentIds.length > 0) scheduleDatabaseSave()
+  return {
+    requested: uniqueIds.length,
+    removed: removedDocumentIds.length,
+    removed_document_ids: removedDocumentIds,
+    reassigned_to_default: reassignedToDefault,
+    skipped_last_default: skippedLastDefault,
+    source_project_id: sourceProjectId,
   }
 }
 

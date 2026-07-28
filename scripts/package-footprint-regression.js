@@ -18,7 +18,6 @@ const rendererOnlyDependencies = [
   'react',
   'react-dom',
   'react-markdown',
-  'react-router-dom',
   'react-window',
   'rehype-raw',
   'remark-gfm',

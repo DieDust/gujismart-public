@@ -67,16 +67,17 @@ assert(
 
 const sidebarCacheBlock = sliceBetween(
   libraryCacheSource,
+  'function buildSmartViewCounts',
   'function buildCache',
-  'export function refreshLibraryStateCache',
-  'library sidebar project cache',
+  'library sidebar smart-view aggregate',
 )
 
 assert(
-  sidebarCacheBlock.includes('activeDocumentWhere(buildOcrIncompleteCondition())')
-    && sidebarCacheBlock.includes('const projectId = getActiveLibraryProjectId()')
+  sidebarCacheBlock.includes('CASE WHEN ${buildOcrIncompleteCondition()} THEN 1 ELSE 0 END')
+    && sidebarCacheBlock.includes('FROM library_project_documents project_scope')
+    && sidebarCacheBlock.includes('WHERE project_scope.project_id = ?')
     && !sidebarCacheBlock.includes("COALESCE(d.ocr_status, 'pending') <> 'completed' OR COALESCE(d.page_count, 0) = 0"),
-  'project sidebar cache should use the same OCR incomplete condition as the document list instead of over-counting legacy pending documents with OCR text.',
+  'project smart-view counts should use the same OCR incomplete condition as the document list instead of over-counting legacy pending documents with OCR text.',
 )
 
 assert(

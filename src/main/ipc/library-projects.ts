@@ -6,6 +6,7 @@ import {
   getActiveLibraryProject,
   listLibraryProjects,
   moveDocumentsToLibraryProject,
+  removeDocumentsFromLibraryProject,
   setActiveLibraryProject,
 } from '../library-projects'
 import type {
@@ -14,7 +15,9 @@ import type {
   CreateLibraryProjectPayload,
   LibraryProject,
   MoveDocumentsToLibraryProjectResult,
+  RemoveDocumentsFromLibraryProjectResult,
 } from '../../shared/types'
+import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
 import { markLibraryStateCacheDirty } from '../library-state-cache'
 import { resumeEmbeddingQueueForActiveProject } from '../embedding-index'
 import { notifySearchContentChanged } from '../semantic-search'
@@ -81,6 +84,17 @@ export function registerLibraryProjectIpc(): void {
     async (_event, documentIds: string[], targetProjectId: string): Promise<AddDocumentsToLibraryProjectResult> => {
       const result = addDocumentsToLibraryProject(documentIds, targetProjectId)
       markLibraryStateCacheDirty([result.source_project_id, result.target_project_id])
+      return result
+    },
+  )
+  ipcMain.handle(
+    'libraryProjects:removeDocuments',
+    async (_event, documentIds: string[]): Promise<RemoveDocumentsFromLibraryProjectResult> => {
+      const result = removeDocumentsFromLibraryProject(documentIds)
+      const affectedProjects = [result.source_project_id]
+      if (result.reassigned_to_default > 0) affectedProjects.push(DEFAULT_LIBRARY_PROJECT_ID)
+      markLibraryStateCacheDirty(affectedProjects)
+      if (result.removed > 0) notifySearchContentChanged()
       return result
     },
   )

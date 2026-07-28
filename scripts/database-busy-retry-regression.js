@@ -8,6 +8,12 @@ function assert(condition, message) {
 const root = path.join(__dirname, '..')
 const databaseSource = fs.readFileSync(path.join(root, 'src', 'main', 'database.ts'), 'utf8')
 const searchWorkerSource = fs.readFileSync(path.join(root, 'src', 'main', 'search-index-worker.ts'), 'utf8')
+const diagnosticsWorkerSource = fs.readFileSync(path.join(root, 'src', 'main', 'database-diagnostics-worker.ts'), 'utf8')
+const diagnosticsWorkerClientSource = fs.readFileSync(path.join(root, 'src', 'main', 'database-diagnostics-worker-client.ts'), 'utf8')
+const scheduledSaveBody = databaseSource.slice(
+  databaseSource.indexOf('export function scheduleDatabaseSave'),
+  databaseSource.indexOf('export function closeDatabase'),
+)
 
 assert(
   databaseSource.includes('const DATABASE_BUSY_TIMEOUT_MS = 250'),
@@ -28,9 +34,18 @@ assert(
 assert(
   databaseSource.includes('function checkpointDatabase(options?: { retryBusy?: boolean; mode?: \'PASSIVE\' | \'TRUNCATE\' }): boolean')
     && databaseSource.includes('wal_checkpoint(${mode})')
-    && databaseSource.includes('if (!checkpointDatabase())')
-    && databaseSource.includes('scheduleDatabaseSave()'),
-  'Deferred database checkpoints should skip busy locks and reschedule instead of blocking the main process',
+    && databaseSource.includes('runDatabaseCheckpointWorkerTask')
+    && diagnosticsWorkerClientSource.includes('runDatabaseCheckpointWorkerTask')
+    && diagnosticsWorkerSource.includes("message.type === 'checkpointDatabase'")
+    && diagnosticsWorkerSource.includes('wal_checkpoint(${message.task.mode})'),
+  'Deferred database checkpoints should run on the database worker instead of blocking the Electron main process',
+)
+assert(
+  databaseSource.includes('export function beginDatabaseCheckpointDeferral')
+    && databaseSource.includes('databaseCheckpointDeferralCount > 0')
+    && databaseSource.includes('Never fall back to a synchronous')
+    && !scheduledSaveBody.includes('checkpointDatabase('),
+  'Bulk write jobs should be able to suppress automatic checkpoints and the scheduler must not fall back to a synchronous main-thread checkpoint',
 )
 assert(
   databaseSource.includes("checkpointDatabase({ retryBusy: true, mode: 'TRUNCATE' })")

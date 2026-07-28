@@ -9,8 +9,20 @@ export interface DatabaseDiagnosticsWorkerTask {
   dataDir: string
 }
 
+export interface DatabaseCheckpointWorkerTask {
+  dbFilePath: string
+  mode: 'PASSIVE' | 'TRUNCATE'
+}
+
+export interface DatabaseCheckpointWorkerResult {
+  busy: number
+  logFrames: number
+  checkpointedFrames: number
+}
+
 type WorkerMessage =
   | { type: 'result'; stats: PagePayloadStorageStats }
+  | { type: 'checkpointResult'; result: DatabaseCheckpointWorkerResult }
   | { type: 'error'; error: string }
 
 const activeWorkers = new Set<Worker>()
@@ -61,6 +73,48 @@ export function runDatabaseDiagnosticsWorkerTask(
       finish(() => reject(new Error(`Database diagnostics worker exited with code ${code}`)))
     })
     worker.postMessage({ type: 'scanPagePayloadStorage', task })
+  }).catch((error: unknown) => {
+    throw new Error(getErrorMessage(error))
+  })
+}
+
+export function runDatabaseCheckpointWorkerTask(
+  task: DatabaseCheckpointWorkerTask,
+): Promise<DatabaseCheckpointWorkerResult> {
+  const workerPath = getWorkerScriptPath()
+  if (!workerPath) return Promise.reject(new Error('Database checkpoint worker script not found'))
+
+  return new Promise<DatabaseCheckpointWorkerResult>((resolve, reject) => {
+    const worker = new Worker(workerPath)
+    let settled = false
+    activeWorkers.add(worker)
+
+    const cleanup = (): void => {
+      activeWorkers.delete(worker)
+      worker.removeAllListeners()
+    }
+
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      void worker.terminate().finally(callback)
+    }
+
+    worker.on('message', (message: WorkerMessage) => {
+      if (!message || typeof message !== 'object') return
+      if (message.type === 'checkpointResult') {
+        finish(() => resolve(message.result))
+        return
+      }
+      if (message.type === 'error') finish(() => reject(new Error(message.error)))
+    })
+    worker.on('error', (error) => finish(() => reject(error)))
+    worker.on('exit', (code) => {
+      if (settled) return
+      finish(() => reject(new Error(`Database checkpoint worker exited before returning a result (code ${code})`)))
+    })
+    worker.postMessage({ type: 'checkpointDatabase', task })
   }).catch((error: unknown) => {
     throw new Error(getErrorMessage(error))
   })

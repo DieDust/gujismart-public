@@ -13,6 +13,9 @@ const rendererMainSource = readFileSync(join(root, 'src', 'renderer', 'src', 'ma
 const projectBootstrapSource = readFileSync(join(root, 'src', 'renderer', 'src', 'ProjectBootstrap.tsx'), 'utf8')
 const appShellSource = readFileSync(join(root, 'src', 'renderer', 'src', 'AppShell.tsx'), 'utf8')
 const libraryViewSource = readFileSync(join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
+const libraryProjectsIpcSource = readFileSync(join(root, 'src', 'main', 'ipc', 'library-projects.ts'), 'utf8')
+const preloadSource = readFileSync(join(root, 'src', 'preload', 'index.ts'), 'utf8')
+const sharedTypesSource = readFileSync(join(root, 'src', 'shared', 'types.ts'), 'utf8')
 const workspaceSource = readFileSync(join(root, 'src', 'renderer', 'src', 'utils', 'appWorkspace.ts'), 'utf8')
 
 assert.ok(databaseSource.includes('CREATE TABLE IF NOT EXISTS library_projects'), 'database must persist library projects')
@@ -64,6 +67,13 @@ assert.ok(libraryViewSource.includes("libraryProjects.filter((project) => projec
 assert.ok(libraryViewSource.includes('window.api.moveDocumentsToLibraryProject'), 'project transfer must cross preload explicitly')
 assert.ok(libraryViewSource.includes('window.api.addDocumentsToLibraryProject'), 'project linking must cross preload explicitly')
 assert.ok(libraryViewSource.includes('window.api.copyDocumentsToLibraryProject'), 'project copy must cross preload explicitly')
+assert.ok(libraryViewSource.includes("key: 'remove_selected'"), 'batch deletion menu must expose current-project removal')
+assert.ok(libraryViewSource.includes("key: 'context_remove_project'"), 'document context menu must expose current-project removal')
+assert.ok(libraryViewSource.includes('window.api.removeDocumentsFromLibraryProject'), 'project removal must cross preload explicitly')
+assert.ok(libraryProjectsIpcSource.includes("'libraryProjects:removeDocuments'"), 'main IPC must register project removal')
+assert.ok(preloadSource.includes('removeDocumentsFromLibraryProject'), 'preload must expose project removal')
+assert.ok(sharedTypesSource.includes('RemoveDocumentsFromLibraryProjectResult'), 'shared contract must describe project removal results')
+assert.ok(libraryViewSource.includes('从总库永久删除'), 'permanent deletion must remain visibly distinct from project removal')
 assert.ok(workspaceSource.includes('scopedWorkspaceKey'), 'open tabs must be persisted independently per project')
 
 const tempRoot = mkdtempSync(join(__dirname, '.tmp-library-projects-'))
@@ -81,7 +91,8 @@ writeFileSync(electronStubPath, `
 writeFileSync(entryPath, `
   const database = require(${JSON.stringify(join(root, 'src', 'main', 'database.ts'))})
   const projects = require(${JSON.stringify(join(root, 'src', 'main', 'library-projects.ts'))})
-  module.exports = { database, projects }
+  const libraryState = require(${JSON.stringify(join(root, 'src', 'main', 'library-state-cache.ts'))})
+  module.exports = { database, projects, libraryState }
 `)
 buildSync({
   entryPoints: [entryPath],
@@ -450,6 +461,56 @@ async function run() {
     })
     assert.strictEqual(modules.projects.getActiveLibraryProjectId(), secondProject.id)
 
+    const removedFromSecond = modules.projects.removeDocumentsFromLibraryProject(['legacy_doc', 'legacy_doc'])
+    assert.deepStrictEqual(removedFromSecond, {
+      requested: 1,
+      removed: 1,
+      removed_document_ids: ['legacy_doc'],
+      reassigned_to_default: 1,
+      skipped_last_default: 0,
+      source_project_id: secondProject.id,
+    })
+    assert.deepStrictEqual(
+      database.queryOne(
+        `SELECT
+           (SELECT COUNT(*) FROM documents WHERE id = 'legacy_doc') AS document_count,
+           (SELECT COUNT(*) FROM pages WHERE doc_id = 'legacy_doc') AS page_count,
+           (SELECT COUNT(*) FROM embedding_index_status WHERE doc_id = 'legacy_doc') AS vector_status_count,
+           (SELECT COUNT(*) FROM library_project_documents WHERE project_id = ? AND document_id = 'legacy_doc') AS default_membership,
+           (SELECT COUNT(*) FROM library_project_documents WHERE project_id = ? AND document_id = 'legacy_doc') AS second_membership,
+           (SELECT COUNT(*) FROM research_notes WHERE library_project_id = ? AND doc_id = 'legacy_doc') AS removed_project_notes,
+           (SELECT COUNT(*) FROM document_tags dt JOIN tags t ON t.id = dt.tag_id WHERE dt.doc_id = 'legacy_doc' AND t.library_project_id = ?) AS removed_project_tags,
+           (SELECT COUNT(*) FROM document_folders df JOIN folders f ON f.id = df.folder_id WHERE df.doc_id = 'legacy_doc' AND f.library_project_id = ?) AS removed_project_folders`,
+        [defaultProject.id, secondProject.id, secondProject.id, secondProject.id, secondProject.id],
+      ),
+      {
+        document_count: 1,
+        page_count: 1,
+        vector_status_count: 1,
+        default_membership: 1,
+        second_membership: 0,
+        removed_project_notes: 0,
+        removed_project_tags: 0,
+        removed_project_folders: 0,
+      },
+      'removing from a project must preserve canonical content while cleaning that project relations',
+    )
+
+    modules.projects.setActiveLibraryProject(defaultProject.id)
+    assert.deepStrictEqual(
+      modules.projects.removeDocumentsFromLibraryProject(['legacy_doc']),
+      {
+        requested: 1,
+        removed: 0,
+        removed_document_ids: [],
+        reassigned_to_default: 0,
+        skipped_last_default: 1,
+        source_project_id: defaultProject.id,
+      },
+      'the final default-project membership must not become an invisible orphan',
+    )
+    modules.projects.setActiveLibraryProject(secondProject.id)
+
     const largeProject = modules.projects.createLibraryProject({ name: 'Large selection project', activate: false })
     const sqlite = database.getDatabase()
     const insertLargeDocument = sqlite.prepare(
@@ -471,6 +532,15 @@ async function run() {
       selectionDurationMs < 1_500,
       `large project selection should stay bounded, took ${selectionDurationMs}ms`,
     )
+    const smartCountsStartedAt = Date.now()
+    const smartCounts = modules.libraryState.refreshLibrarySmartViewCounts()
+    const smartCountsDurationMs = Date.now() - smartCountsStartedAt
+    assert.strictEqual(smartCounts.all, 20_000)
+    assert.strictEqual(smartCounts.notVectorized, 20_000)
+    assert.ok(
+      smartCountsDurationMs < 1_500,
+      `large-project smart-view refresh should stay bounded, took ${smartCountsDurationMs}ms`,
+    )
     const creationStartedAt = Date.now()
     const emptyProject = modules.projects.createLibraryProject({ name: 'Fast empty project', activate: true })
     const creationDurationMs = Date.now() - creationStartedAt
@@ -480,7 +550,7 @@ async function run() {
       `empty project creation should not aggregate the large library, took ${creationDurationMs}ms`,
     )
     console.log(
-      `Large project responsiveness: select=${selectionDurationMs}ms create=${creationDurationMs}ms documents=20000`,
+      `Large project responsiveness: select=${selectionDurationMs}ms smart=${smartCountsDurationMs}ms create=${creationDurationMs}ms documents=20000`,
     )
     assert.deepStrictEqual(database.queryAll('PRAGMA foreign_key_check'), [], 'project migration must preserve foreign keys')
 
