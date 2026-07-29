@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 1.2.16 - 2026-07-29
+
+### 中文
+
+#### OCR 重试即时入队与锁等待
+
+- 修复点击“继续 OCR”或“重新 OCR”后只显示顶部“正在重新处理”，文献没有进度条、没有“停止全部 OCR”，也迟迟未进入 OCR 队列的问题。
+- OCR 重试不再在入队前额外等待文献状态写入和详情读取；当前文献使用原有 OCR 引擎直接提交，完整队列状态由主进程统一持久化。
+- 前端会立即显示“正在加入 OCR 队列”、0% 进度和停止入口；主进程也会先发布可取消的排队状态，再异步等待 SQLite 写入机会。数据库正被导入、删除或其他任务占用时，界面仍保持响应。
+- 队列写入成功后会原子清除旧的重试计数和错误时间；写入失败会释放内存中的排队占位并显示明确原因，不再留下无法取消的假队列状态。
+- 保留原有断点恢复、OCR 引擎选择、批量并发、页图准备和结果保存逻辑，不减少 OCR 功能。
+
+#### 下载
+
+- `GujiSmart-1.2.16-Setup-x64.exe`
+- `GujiSmart-1.2.16-Portable-x64.exe`
+
+### English
+
+#### Immediate OCR Retry Queueing and Writer-Lock Waiting
+
+- Fixed “Continue OCR” or “Retry OCR” showing only the top processing notice while no document progress bar, cancel-all action, or visible OCR queue entry appeared.
+- OCR retry no longer waits for a separate document status write and detail read before enqueueing. It submits with the document's existing OCR engine, while the main process persists the complete queue state.
+- The renderer now immediately shows “Joining OCR queue,” 0% progress, and a stop action. The main process also publishes a cancellable queued state before asynchronously waiting for a SQLite writer opportunity, keeping the interface responsive while imports, deletion, or another task is writing.
+- Successful queue persistence atomically clears stale retry counters and timestamps. Failed persistence releases in-memory queue reservations and reports the reason instead of leaving an uncancellable phantom queue state.
+- Existing restart recovery, OCR engine selection, batch concurrency, page-image preparation, and result persistence behavior remain intact.
+
+#### Downloads
+
+- `GujiSmart-1.2.16-Setup-x64.exe`
+- `GujiSmart-1.2.16-Portable-x64.exe`
+
 ## 1.2.15 - 2026-07-29
 
 ### 中文

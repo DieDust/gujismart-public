@@ -4932,14 +4932,8 @@ export default function LibraryView({
     const uniqueDocIds = Array.from(new Set(docIds.filter(Boolean)))
     if (uniqueDocIds.length === 0) return 0
 
-    const configuredBatchSize = await getConfiguredBatchSize()
-    // “每批 N 篇” = 文档并发 N（同时处理），不是“等 N 本全部跑完才收下一批”。
-    const documentConcurrency = Math.max(1, Math.min(MAX_IMPORT_BATCH_SIZE, configuredBatchSize))
-    let successCount = 0
-    let shouldRefreshAfterBatches = false
-    const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'
-
-    // Mark every selected id as queued in UI immediately (user-visible “进队”).
+    // Enter visible queue state before any settings/database IPC. A busy writer
+    // must not leave the retry action stuck at “正在重新处理” with no progress bar.
     const now = Date.now()
     setOcrProgressByDoc((current) => {
       const next = { ...current }
@@ -4950,7 +4944,7 @@ export default function LibraryView({
           status: 'queued',
           phase: 'queued',
           progress: 0,
-          message: `OCR 已入队，共 ${uniqueDocIds.length} 篇`,
+          message: `正在加入 OCR 队列，共 ${uniqueDocIds.length} 篇`,
           updatedAt: now,
         }
       })
@@ -4962,7 +4956,14 @@ export default function LibraryView({
       data: { ocr_status: 'queued', import_status: 'processing', error_message: null },
     })))
 
+    let successCount = 0
+    let shouldRefreshAfterBatches = false
+    const requiresPageImagesBeforeOcr = engine === 'local_paddle' || engine === 'vision_model' || engine === 'hybrid'
+
     try {
+      const configuredBatchSize = await getConfiguredBatchSize()
+      // “每批 N 篇” = 文档并发 N（同时处理），不是“等 N 本全部跑完才收下一批”。
+      const documentConcurrency = Math.max(1, Math.min(MAX_IMPORT_BATCH_SIZE, configuredBatchSize))
       let ocrBatch = uniqueDocIds
       if (requiresPageImagesBeforeOcr) {
         ocrBatch = []
@@ -5014,6 +5015,35 @@ export default function LibraryView({
       })
       shouldRefreshAfterBatches = true
       scheduleImportListRefresh()
+    } catch (error) {
+      const reason = getErrorMessage(error, '未知错误')
+      const failedAt = Date.now()
+      const unresolvedDocIds = uniqueDocIds.filter((docId) => {
+        const info = ocrProgressByDocRef.current[docId]
+        return !info || isActiveOcrProgress(info)
+      })
+      setOcrProgressByDoc((current) => {
+        const next = { ...current }
+        unresolvedDocIds.forEach((docId) => {
+          next[docId] = {
+            ...(next[docId] || { docId, progress: 0 }),
+            docId,
+            status: 'error',
+            phase: 'error',
+            progress: 0,
+            message: 'OCR 入队或处理失败',
+            errorMessage: reason,
+            updatedAt: failedAt,
+          }
+        })
+        ocrProgressByDocRef.current = next
+        return next
+      })
+      updateDocumentsInList(unresolvedDocIds.map((id) => ({
+        id,
+        data: { ocr_status: 'error', import_status: 'error', error_message: reason },
+      })))
+      throw error
     } finally {
       // Drop batch line; keep a single summary toast if docs are still processing via IPC.
       clearSharedOcrProgressToast({ keepIfActiveDocs: true })
@@ -6267,15 +6297,10 @@ export default function LibraryView({
       last_retry_at: null,
     })
     try {
-      await window.api.updateDocument(doc.id, {
-        ocr_status: 'pending',
-        import_status: 'stored',
-        error_message: null,
-        retry_count: 0,
-        last_retry_at: null,
-      })
-      const latestDoc = await window.api.getDocumentLight(doc.id)
-      const storedEngine = parseDocMetadata(latestDoc || doc).ocr_engine
+      // The OCR enqueue path persists the complete queued state. Avoid a
+      // separate writer update and detail read before enqueue; either could be
+      // delayed by database contention and previously prevented queue entry.
+      const storedEngine = parseDocMetadata(doc).ocr_engine
       const retryEngine = isOcrEngine(storedEngine) ? storedEngine : undefined
       const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || 'paddle', OCR_ACTIVITY_MESSAGE_KEY)
       clearSharedOcrProgressToast({ keepIfActiveDocs: true })
@@ -6287,14 +6312,8 @@ export default function LibraryView({
     } catch (error) {
       console.error(error)
       const reason = (error as Error)?.message || '未知错误'
-      await window.api.updateDocument(doc.id, {
-        import_status: 'error',
-        ocr_status: 'error',
-        error_message: `重试失败：${reason}`,
-      })
       clearSharedOcrProgressToast()
       message.error({ content: `重试失败：${reason}`, key: OCR_RESULT_MESSAGE_KEY, duration: 6 })
-      await loadDocuments(filter, { silent: true })
     } finally {
       setImportProgressText('')
     }

@@ -42,6 +42,12 @@ const flushOcrStatusBufferBody = sliceBetween(
   'useEffect(() => {\n    // Yield one frame so the shell can paint before the first heavy IPC burst.\n    const timer = window.setTimeout(() => {\n      void loadBaseData()',
   'OCR status UI flush',
 )
+const runOcrInConfiguredBatchesBody = sliceBetween(
+  librarySource,
+  'const runOcrInConfiguredBatches = async',
+  'const handleCancelOcr = async',
+  'OCR queue submission helper',
+)
 const handleBatchOcrBody = sliceBetween(
   librarySource,
   'const handleBatchOcr = async',
@@ -288,6 +294,26 @@ assert(
   handleRetryDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], retryEngine || \'paddle\', OCR_ACTIVITY_MESSAGE_KEY)')
     && !handleRetryDocumentBody.includes("message.warning({ content: '重新处理未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })\n      }\n      await loadDocuments(filter, { silent: true })"),
   'Single document retry success path should not await an extra list reload after runOcrInConfiguredBatches.',
+)
+assert(
+  runOcrInConfiguredBatchesBody.indexOf('setOcrProgressByDoc((current) => {')
+    < runOcrInConfiguredBatchesBody.indexOf('const configuredBatchSize = await getConfiguredBatchSize()')
+    && runOcrInConfiguredBatchesBody.indexOf("data: { ocr_status: 'queued', import_status: 'processing', error_message: null }")
+      < runOcrInConfiguredBatchesBody.indexOf('const configuredBatchSize = await getConfiguredBatchSize()'),
+  'OCR retry should show a queued progress bar and cancel-all action before any settings/database IPC can wait.',
+)
+assert(
+  !handleRetryDocumentBody.includes("await window.api.updateDocument(doc.id, {\n        ocr_status: 'pending'")
+    && !handleRetryDocumentBody.includes("await window.api.updateDocument(doc.id, {\n        import_status: 'error'")
+    && !handleRetryDocumentBody.includes('await window.api.getDocumentLight(doc.id)')
+    && handleRetryDocumentBody.includes('const storedEngine = parseDocMetadata(doc).ocr_engine'),
+  'Single-document retry must enter the OCR queue without blocking status writes or detail reads.',
+)
+assert(
+  runOcrInConfiguredBatchesBody.includes("message: 'OCR 入队或处理失败'")
+    && runOcrInConfiguredBatchesBody.includes('const unresolvedDocIds = uniqueDocIds.filter')
+    && runOcrInConfiguredBatchesBody.includes('throw error'),
+  'OCR queue submission failures should leave a visible terminal state instead of stale queued progress.',
 )
 assert(
   handleForceRerunDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true })')

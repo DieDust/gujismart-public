@@ -7311,39 +7311,77 @@ export function registerOcrIpc(): void {
     let recoverableQueueItemIdsByDocId = new Map<string, string>()
 
     try {
-      // Persist recovery metadata in chunks so a 10k enqueue cannot freeze open.
-      if (persistForRecovery && queuedDocIds.length > 0) {
-        for (let offset = 0; offset < queuedDocIds.length; offset += 50) {
-          const chunk = queuedDocIds.slice(offset, offset + 50)
-          const partial = createRecoverableBatchOcrItems(chunk, documentConcurrency)
-          partial.forEach((itemId, docId) => recoverableQueueItemIdsByDocId.set(docId, itemId))
-          await yieldToEventLoop()
-        }
-      }
+      // Confirm queue entry immediately. Persistence may briefly wait for an
+      // import/delete writer, but the renderer must already have a cancellable
+      // queued state instead of appearing to ignore the click.
+      queuedDocIds.forEach((docId) => {
+        emitOcrStatus(event, {
+          docId,
+          status: 'queued',
+          phase: 'queued',
+          progress: 0,
+          message: 'OCR 正在写入队列',
+        })
+      })
 
-      // Mark queued status in SQL chunks; emit one light progress event per doc so the
-      // library can show “N 篇处理中 / M 篇等待” immediately (not only when claimed).
-      if (queuedDocIds.length > 0) {
-        const now = new Date().toISOString()
-        for (let offset = 0; offset < queuedDocIds.length; offset += 100) {
-          const chunk = queuedDocIds.slice(offset, offset + 100)
-          const placeholders = chunk.map(() => '?').join(', ')
-          run(
-            `UPDATE documents SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = ?, updated_at = ? WHERE id IN (${placeholders})`,
-            ['queued', 'processing', 'pending', null, now, ...chunk],
-          )
-          for (const docId of chunk) {
-            emitOcrStatus(event, {
-              docId,
-              status: 'queued',
-              phase: 'queued',
-              progress: 0,
-              message: 'OCR 已入队',
-            })
-          }
-          await yieldToEventLoop()
+      try {
+        if (queuedDocIds.length > 0) {
+          // Acquire the next writer opportunity asynchronously before the
+          // compatibility task bridge performs its short synchronous writes.
+          await transactionAsync(() => undefined, { maxWaitMs: 30_000 })
         }
-        scheduleDatabaseSave()
+
+        // Persist recovery metadata in chunks so a 10k enqueue cannot freeze open.
+        if (persistForRecovery && queuedDocIds.length > 0) {
+          for (let offset = 0; offset < queuedDocIds.length; offset += 50) {
+            const chunk = queuedDocIds.slice(offset, offset + 50)
+            const partial = createRecoverableBatchOcrItems(chunk, documentConcurrency)
+            partial.forEach((itemId, docId) => recoverableQueueItemIdsByDocId.set(docId, itemId))
+            await yieldToEventLoop()
+          }
+        }
+
+        // Mark queued status in SQL chunks; emit one light progress event per doc so the
+        // library can show “N 篇处理中 / M 篇等待” immediately (not only when claimed).
+        if (queuedDocIds.length > 0) {
+          const now = new Date().toISOString()
+          for (let offset = 0; offset < queuedDocIds.length; offset += 100) {
+            const chunk = queuedDocIds.slice(offset, offset + 100)
+            const placeholders = chunk.map(() => '?').join(', ')
+            run(
+              `UPDATE documents
+               SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = ?,
+                   retry_count = 0, last_retry_at = NULL, updated_at = ?
+               WHERE id IN (${placeholders})`,
+              ['queued', 'processing', 'pending', null, now, ...chunk],
+            )
+            for (const docId of chunk) {
+              emitOcrStatus(event, {
+                docId,
+                status: 'queued',
+                phase: 'queued',
+                progress: 0,
+                message: 'OCR 已入队',
+              })
+            }
+            await yieldToEventLoop()
+          }
+          scheduleDatabaseSave()
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error || '未知错误')
+        queuedDocIds.forEach((docId) => {
+          queuedOcrDocIds.delete(docId)
+          emitOcrStatus(event, {
+            docId,
+            status: 'error',
+            phase: 'error',
+            progress: 0,
+            message: 'OCR 入队失败',
+            errorMessage: `OCR 入队失败：${reason}`,
+          })
+        })
+        throw error
       }
 
       await runBoundedDocumentWorkers(queuedDocIds, documentConcurrency, async (docId) => {

@@ -62,6 +62,10 @@ async function main() {
   const libraryView = fs.readFileSync(path.join(root, 'src/renderer/src/views/LibraryView.tsx'), 'utf8')
   const ocrIpc = fs.readFileSync(path.join(root, 'src/main/ipc/ocr.ts'), 'utf8')
   const batchProcessor = fs.readFileSync(path.join(root, 'src/main/batch-processor.ts'), 'utf8')
+  const manualBatchHandler = ocrIpc.slice(
+    ocrIpc.indexOf("ipcMain.handle('documents:batchOcr'"),
+    ocrIpc.indexOf("ipcMain.handle('pages:rerunOcr'"),
+  )
   assert.ok(libraryView.includes("const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'"), 'Library should use one aggregate OCR message key')
   assert.ok(libraryView.includes('buildOcrActivitySummary(Object.values(nextProgressByDoc))'), 'Library should aggregate document progress')
   assert.ok(!libraryView.includes('message.loading({\n          content: getOcrProgressText(nextInfo),\n          key: toastKey'), 'Library must not open one persistent toast per document')
@@ -95,6 +99,19 @@ async function main() {
     cancelHandler.indexOf('forceReleaseActiveOcrTask(safeDocId)')
       < cancelHandler.indexOf('await cancelPersistedOcrQueueForDocument(safeDocId)'),
     'OCR cancellation must abort and release the live task before waiting for the database writer lock',
+  )
+  assert.ok(
+    manualBatchHandler.indexOf("message: 'OCR 正在写入队列'")
+      < manualBatchHandler.indexOf('await transactionAsync(() => undefined, { maxWaitMs: 30_000 })')
+      && manualBatchHandler.indexOf('await transactionAsync(() => undefined, { maxWaitMs: 30_000 })')
+        < manualBatchHandler.indexOf('createRecoverableBatchOcrItems(chunk, documentConcurrency)'),
+    'Manual OCR should publish queue entry before asynchronously waiting for its persistence writer slot',
+  )
+  assert.ok(
+    manualBatchHandler.includes('queuedOcrDocIds.delete(docId)')
+      && manualBatchHandler.includes("message: 'OCR 入队失败'")
+      && manualBatchHandler.includes('retry_count = 0, last_retry_at = NULL'),
+    'Failed queue persistence must release in-memory queue slots and successful enqueue must atomically reset retry state',
   )
 
   console.log('OCR document sliding-window regression passed.')
