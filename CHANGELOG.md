@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 1.2.18 - 2026-07-29
+
+### 中文
+
+#### OCR 永久等待与数据库写入优先级
+
+- 修复导入后自动 OCR 与手动“继续 OCR”同时处理同一篇文献时互相占用“文献槽位”和“全局并发槽位”，导致界面长期显示 `0 篇处理中，1 篇等待` 或 `1 篇处理中`、但页数始终不增长的问题。自动恢复现在必须先取得文献所有权，再申请全局 OCR 并发位，不再形成循环等待。
+- 手动 OCR、导入后自动 OCR 和旧版批处理恢复现在共用同一套按文献串行调度。同一篇文献不会被多条队列重复识别；其他文献仍可按设置并发处理。自动队列取得任务后还会重新核对持久化租约，已被取消或替代的旧任务不会重新启动；文献已完整识别时会直接结清旧队列项。
+- 取消单篇或全部 OCR 时，即使远端请求不响应中止信号，也会立即释放全局并发位和按文献占用，后续 OCR 不再被旧请求永久挡住。晚到的旧请求继续受取消信号保护，不能覆盖新任务结果。
+- 新增前台数据库写入优先级协调：OCR 入队、取消、刷新等写入正在等待时，后台永久删除 worker 会在下一条删除语句前暂停，待前台事务完成后再继续。物理删除范围不变，向量、全文索引、标签、摘录、项目关系和原文文件仍会完整清理。
+- 普通界面启用单实例保护，避免旧版本或重复启动的第二个主进程同时写入同一 SQLite 数据库；再次启动会唤醒已有窗口。无界面的 MCP 模式保持独立运行方式。
+- 新增同文献串行、不同文献并发、强制取消释放槽位、删除 worker 前台写入优先级和真实双连接锁竞争回归测试。
+
+#### 下载
+
+- `GujiSmart-1.2.18-Setup-x64.exe`
+- `GujiSmart-1.2.18-Portable-x64.exe`
+
+### English
+
+#### Permanent OCR Waiting and Foreground Database Priority
+
+- Fixed a circular wait between import-auto OCR and manual “Continue OCR” for the same document. Automatic recovery now acquires document ownership before requesting a global OCR slot, so the UI no longer remains indefinitely at `0 processing, 1 waiting` or `1 processing` without page progress.
+- Manual OCR, import-auto OCR, and legacy batch recovery now share per-document serialization. The same document cannot be processed by multiple queue paths while different documents retain configured concurrency. Claimed automatic tasks revalidate their persisted lease, and already completed documents settle stale queue items without duplicate OCR.
+- Canceling one or all OCR tasks now releases both the global slot and document ownership even when a remote request ignores abort. Late work remains guarded by its abort signal and cannot overwrite a newer run.
+- Added foreground database writer priority. While OCR enqueue, cancellation, or another foreground transaction is waiting, the permanent-delete worker pauses before its next delete statement and resumes after the foreground commit. Deletion coverage remains complete for vectors, full-text indexes, tags, excerpts, project relations, and source files.
+- Added single-instance protection for the desktop UI so an older or duplicate main process cannot write the same SQLite database concurrently. A second launch focuses the existing window; headless MCP mode remains independent.
+- Added regressions for same-document serialization, cross-document concurrency, forced release of hung OCR slots, delete-worker writer priority, and real two-connection lock contention.
+
+#### Downloads
+
+- `GujiSmart-1.2.18-Setup-x64.exe`
+- `GujiSmart-1.2.18-Portable-x64.exe`
+
 ## 1.2.17 - 2026-07-29
 
 ### 中文

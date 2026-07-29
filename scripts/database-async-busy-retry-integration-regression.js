@@ -62,12 +62,17 @@ async function run() {
       writer.exec('COMMIT')
     })
     const startedAt = Date.now()
-    await database.runAsync(
+    const foregroundWriterState = new Int32Array(database.getForegroundDatabaseWriterBuffer())
+    const pendingRun = database.runAsync(
       'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
       ['async_busy_retry', 'completed'],
       { maxWaitMs: 5_000 },
     )
+    await wait(50)
+    assert(Atomics.load(foregroundWriterState, 0) > 0, 'foreground priority must remain visible while waiting for SQLite')
+    await pendingRun
     await releaseWriter
+    assert.strictEqual(Atomics.load(foregroundWriterState, 0), 0)
 
     const stored = database.queryOne(
       "SELECT value FROM settings WHERE key = 'async_busy_retry'",

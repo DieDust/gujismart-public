@@ -48,6 +48,48 @@ async function main() {
   for (let index = 0; index < releases.length; index += 1) releases[index]?.()
   await Promise.all(tasks)
 
+  const ownershipScheduler = new SlidingWindowScheduler()
+  const ownershipStarted = []
+  let releaseOwnedDocument
+  const firstOwned = ownershipScheduler.runForDocument('doc-shared', 2, async () => {
+    ownershipStarted.push('first')
+    await new Promise((resolve) => { releaseOwnedDocument = resolve })
+  })
+  const secondOwned = ownershipScheduler.runForDocument('doc-shared', 2, async () => {
+    ownershipStarted.push('second')
+  })
+  const otherOwned = ownershipScheduler.runForDocument('doc-other', 2, async () => {
+    ownershipStarted.push('other')
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepStrictEqual(
+    ownershipStarted,
+    ['first', 'other'],
+    'the same document must be serialized while a different document can use another slot',
+  )
+  releaseOwnedDocument()
+  await Promise.all([firstOwned, secondOwned, otherOwned])
+  assert.deepStrictEqual(ownershipStarted, ['first', 'other', 'second'])
+
+  const releasableScheduler = new SlidingWindowScheduler()
+  let forceRelease
+  const forcedRelease = new Promise((resolve) => { forceRelease = resolve })
+  const hung = releasableScheduler.runForDocument(
+    'doc-hung',
+    1,
+    async () => new Promise(() => undefined),
+    forcedRelease,
+  )
+  let followerStarted = false
+  const follower = releasableScheduler.runForDocument('doc-follower', 1, async () => {
+    followerStarted = true
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.strictEqual(followerStarted, false)
+  forceRelease()
+  await Promise.all([hung, follower])
+  assert.strictEqual(followerStarted, true, 'forced cancellation must release a hung global OCR slot')
+
   assert.strictEqual(
     buildOcrActivitySummary([
       { status: 'processing' },
@@ -71,14 +113,25 @@ async function main() {
   assert.ok(!libraryView.includes('message.loading({\n          content: getOcrProgressText(nextInfo),\n          key: toastKey'), 'Library must not open one persistent toast per document')
   assert.ok(
     ocrIpc.includes('runBoundedDocumentWorkers')
-      && (ocrIpc.match(/globalOcrDocumentWindow\.run\(/g) || []).length >= 2
+      && (ocrIpc.match(/globalOcrDocumentWindow\.runForDocument\(/g) || []).length >= 2
       && ocrIpc.includes('getOcrDocumentConcurrency'),
-    'automatic and manual OCR should share the global document window via the bounded worker pool',
+    'automatic and manual OCR should share document ownership and the global window via the bounded worker pool',
   )
   assert.ok(
-    batchProcessor.includes('globalOcrDocumentWindow.run(getOcrDocumentConcurrency()')
-      || batchProcessor.includes('globalOcrDocumentWindow.run('),
-    'legacy resumed OCR should share the global document window',
+    batchProcessor.includes('globalOcrDocumentWindow.runForDocument(docId, getOcrDocumentConcurrency()'),
+    'legacy resumed OCR should share document ownership and the global window',
+  )
+  const importAutoWorker = ocrIpc.slice(
+    ocrIpc.indexOf('async function runImportAutoOcrTask'),
+    ocrIpc.indexOf('function startImportAutoOcrTaskRun'),
+  )
+  const importAutoAcquireIndex = importAutoWorker.indexOf('await acquireDocumentOcrSlot(docId)')
+  assert.ok(
+    importAutoAcquireIndex >= 0
+      && importAutoWorker.indexOf('await processImportAutoOcrClaim(', importAutoAcquireIndex) > importAutoAcquireIndex
+      && ocrIpc.includes('activeTask.done,')
+      && manualBatchHandler.includes('}, activeTask.done)'),
+    'document ownership must precede the global slot, and forced cancel must release hung slots',
   )
   assert.ok(
     ocrIpc.includes('async function cancelPersistedOcrQueueForDocument')

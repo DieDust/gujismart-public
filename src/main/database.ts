@@ -42,6 +42,21 @@ const DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000
 // Delete/import workers can expose short writer windows. Poll often enough to
 // claim one without blocking Electron's event loop or repeatedly missing it.
 const DATABASE_ASYNC_BUSY_RETRY_DELAY_MS = 25
+const foregroundDatabaseWriterState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
+
+function beginForegroundDatabaseWrite(): void {
+  Atomics.add(foregroundDatabaseWriterState, 0, 1)
+  Atomics.notify(foregroundDatabaseWriterState, 0)
+}
+
+function endForegroundDatabaseWrite(): void {
+  Atomics.sub(foregroundDatabaseWriterState, 0, 1)
+  Atomics.notify(foregroundDatabaseWriterState, 0)
+}
+
+export function getForegroundDatabaseWriterBuffer(): SharedArrayBuffer {
+  return foregroundDatabaseWriterState.buffer as SharedArrayBuffer
+}
 
 function sleepSync(ms: number): void {
   const buffer = new SharedArrayBuffer(4)
@@ -3770,18 +3785,23 @@ export async function runAsync(
   const database = getDatabase()
   const maxWaitMs = Math.max(0, Number(options?.maxWaitMs ?? DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS))
   const deadline = Date.now() + maxWaitMs
-  while (true) {
-    try {
-      if (params) {
-        database.prepare(sql).run(...params)
-      } else {
-        database.exec(sql)
+  beginForegroundDatabaseWrite()
+  try {
+    while (true) {
+      try {
+        if (params) {
+          database.prepare(sql).run(...params)
+        } else {
+          database.exec(sql)
+        }
+        return
+      } catch (error) {
+        if (!isDatabaseBusyError(error) || Date.now() >= deadline) throw error
+        await sleepAsync(Math.min(DATABASE_ASYNC_BUSY_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())))
       }
-      return
-    } catch (error) {
-      if (!isDatabaseBusyError(error) || Date.now() >= deadline) throw error
-      await sleepAsync(Math.min(DATABASE_ASYNC_BUSY_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())))
     }
+  } finally {
+    endForegroundDatabaseWrite()
   }
 }
 
@@ -3790,20 +3810,25 @@ export async function transactionAsync(
   options?: { maxWaitMs?: number },
 ): Promise<void> {
   const database = getDatabase()
-  await runAsync('BEGIN IMMEDIATE TRANSACTION', undefined, options)
+  beginForegroundDatabaseWrite()
   try {
-    // Keep the acquired write transaction entirely synchronous. The only
-    // yielding/retry point is before BEGIN succeeds, so unrelated IPC work
-    // cannot accidentally run inside this transaction.
-    fn()
-    database.exec('COMMIT')
-  } catch (error) {
+    await runAsync('BEGIN IMMEDIATE TRANSACTION', undefined, options)
     try {
-      database.exec('ROLLBACK')
-    } catch (rollbackError) {
-      if (!isDatabaseBusyError(rollbackError)) throw rollbackError
+      // Keep the acquired write transaction entirely synchronous. The only
+      // yielding/retry point is before BEGIN succeeds, so unrelated IPC work
+      // cannot accidentally run inside this transaction.
+      fn()
+      database.exec('COMMIT')
+    } catch (error) {
+      try {
+        database.exec('ROLLBACK')
+      } catch (rollbackError) {
+        if (!isDatabaseBusyError(rollbackError)) throw rollbackError
+      }
+      throw error
     }
-    throw error
+  } finally {
+    endForegroundDatabaseWrite()
   }
 }
 
@@ -3816,17 +3841,22 @@ export function transaction(fn: () => void): void {
     fn()
     return
   }
-  runWithBusyRetry(() => database.exec('BEGIN IMMEDIATE TRANSACTION'))
+  beginForegroundDatabaseWrite()
   try {
-    fn()
-    runWithBusyRetry(() => database.exec('COMMIT'))
-  } catch (error) {
+    runWithBusyRetry(() => database.exec('BEGIN IMMEDIATE TRANSACTION'))
     try {
-      database.exec('ROLLBACK')
-    } catch (rollbackError) {
-      if (!isDatabaseBusyError(rollbackError)) throw rollbackError
+      fn()
+      runWithBusyRetry(() => database.exec('COMMIT'))
+    } catch (error) {
+      try {
+        database.exec('ROLLBACK')
+      } catch (rollbackError) {
+        if (!isDatabaseBusyError(rollbackError)) throw rollbackError
+      }
+      throw error
     }
-    throw error
+  } finally {
+    endForegroundDatabaseWrite()
   }
 }
 

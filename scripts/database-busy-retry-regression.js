@@ -44,6 +44,12 @@ assert(
   'Synchronous task helpers must join an already acquired async writer transaction instead of issuing a second BEGIN',
 )
 assert(
+  databaseSource.includes('export function getForegroundDatabaseWriterBuffer()')
+    && databaseSource.includes('beginForegroundDatabaseWrite()')
+    && databaseSource.includes('endForegroundDatabaseWrite()'),
+  'foreground writes should expose shared priority state so delete workers cannot starve OCR',
+)
+assert(
   databaseSource.includes('function checkpointDatabase(options?: { retryBusy?: boolean; mode?: \'PASSIVE\' | \'TRUNCATE\' }): boolean')
     && databaseSource.includes('wal_checkpoint(${mode})')
     && databaseSource.includes('runDatabaseCheckpointWorkerTask')

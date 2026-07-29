@@ -159,7 +159,7 @@ function createFixture() {
   return { sqlite, documentIds, preservedArtifactCount }
 }
 
-function runWorkerTask(documentIds, onProgress) {
+function runWorkerTask(documentIds, onProgress, foregroundWriterBuffer) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(workerPath)
     const progress = []
@@ -184,7 +184,7 @@ function runWorkerTask(documentIds, onProgress) {
     })
     worker.postMessage({
       type: 'deleteDocuments',
-      task: { dbFilePath: databasePath, documentIds },
+      task: { dbFilePath: databasePath, documentIds, foregroundWriterBuffer },
     })
   })
 }
@@ -243,6 +243,26 @@ async function run() {
     assert(
       maximumHeartbeatLagMs < 250,
       `Electron main-thread heartbeat lagged ${maximumHeartbeatLagMs}ms during worker deletion`,
+    )
+
+    const priorityDocumentId = 'foreground-priority-delete'
+    sqlite.prepare("INSERT INTO documents (id, import_status) VALUES (?, 'deleting')").run(priorityDocumentId)
+    sqlite.prepare('INSERT INTO embedding_chunks (doc_id, embedding) VALUES (?, ?)').run(priorityDocumentId, Buffer.alloc(512))
+    const priorityState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
+    Atomics.store(priorityState, 0, 1)
+    const priorityDelete = runWorkerTask([priorityDocumentId], undefined, priorityState.buffer)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.strictEqual(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM documents WHERE id = ?').get(priorityDocumentId).count,
+      1,
+      'delete worker must pause while a foreground OCR/database writer is requesting priority',
+    )
+    Atomics.store(priorityState, 0, 0)
+    Atomics.notify(priorityState, 0)
+    await priorityDelete
+    assert.strictEqual(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM documents WHERE id = ?').get(priorityDocumentId).count,
+      0,
     )
 
     sqlite.exec('DROP TRIGGER slow_document_delete; DROP TABLE delete_cpu_fixture;')

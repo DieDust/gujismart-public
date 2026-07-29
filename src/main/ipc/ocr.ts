@@ -6886,6 +6886,7 @@ async function processImportAutoOcrClaim(
   libraryProjectId: string,
   totalCount: number,
   getCompleted: () => number,
+  documentConcurrency: number,
 ): Promise<boolean> {
   const docId = String(claim.input.docId || claim.domainRef || '').trim()
   if (!docId) {
@@ -6897,14 +6898,22 @@ async function processImportAutoOcrClaim(
     return false
   }
 
-  await acquireDocumentOcrSlot(docId)
   if (ocrRuntimeShuttingDown) {
     releaseTaskItemLease({ itemId: claim.itemId, leaseToken: claim.leaseToken })
     return false
   }
 
-  const doc = queryOne<{ id: string; page_count: number | null }>(
-    `SELECT id, page_count FROM documents
+  const persistedClaim = queryOne<{ status: string; lease_token: string | null }>(
+    'SELECT status, lease_token FROM task_items WHERE id = ?',
+    [claim.itemId],
+  )
+  if (persistedClaim?.status !== 'running' || persistedClaim.lease_token !== claim.leaseToken) {
+    queuedOcrDocIds.delete(docId)
+    return false
+  }
+
+  const doc = queryOne<{ id: string; page_count: number | null; ocr_status: string | null }>(
+    `SELECT id, page_count, ocr_status FROM documents
      WHERE id = ?
        AND EXISTS (
          SELECT 1 FROM library_project_documents project_scope
@@ -6920,6 +6929,11 @@ async function processImportAutoOcrClaim(
       error: { code: 'import_auto_ocr_document_not_found', message: '待 OCR 文献已不存在。', recoverable: false },
     })
     return false
+  }
+  if (doc.ocr_status === 'completed' && !hasIncompleteOcrPages(docId)) {
+    completeTaskItem({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+    queuedOcrDocIds.delete(docId)
+    return true
   }
 
   const controller = new AbortController()
@@ -6980,16 +6994,29 @@ async function processImportAutoOcrClaim(
   try {
     if (canceledOcrDocIds.has(docId)) controller.abort()
     timedOutOcrDocIds.delete(docId)
-    const result = await runDocumentOcrWithWallTimeout(
-      event,
+    let result: { success: boolean; errorMessage?: string; timedOut?: boolean } = {
+      success: false,
+      errorMessage: OCR_CANCELED_MESSAGE,
+    }
+    const heavy = isHeavyPdfOcrDocument(docId)
+    await globalOcrDocumentWindow.runForDocument(
       docId,
-      Math.max(totalCount, 1),
-      getCompleted,
-      engine,
-      false,
-      controller,
-      Number(doc.page_count || 0) || 0,
+      heavy ? 1 : documentConcurrency,
+      async () => {
+        result = await runDocumentOcrWithWallTimeout(
+          event,
+          docId,
+          Math.max(totalCount, 1),
+          getCompleted,
+          engine,
+          false,
+          controller,
+          Number(doc.page_count || 0) || 0,
+        )
+      },
+      activeTask.done,
     )
+    if (controller.signal.aborted || canceledOcrDocIds.has(docId)) return false
     if (result.success) {
       completeTaskItem({ itemId: claim.itemId, leaseToken: claim.leaseToken })
       return true
@@ -7064,20 +7091,37 @@ async function runImportAutoOcrTask(event: OcrStatusEvent, jobId: string): Promi
           return
         }
         const docId = String(claim.input.docId || claim.domainRef || '').trim()
-        const heavy = Boolean(docId && isHeavyPdfOcrDocument(docId))
-        // Heavy PDFs share the same global document window with limit 1 effectively
-        // via globalOcrDocumentWindow + sequential heavy preference inside process path.
-        await globalOcrDocumentWindow.run(heavy ? 1 : concurrency, async () => {
-          const success = await processImportAutoOcrClaim(
+        if (!docId) {
+          await processImportAutoOcrClaim(
             event,
             claim,
             config.engine,
             config.libraryProjectId,
             config.totalCount,
             () => completedCount,
+            concurrency,
           )
-          if (success) completedCount += 1
-        })
+          return
+        }
+        // Acquire document ownership before the global OCR slot. The reverse
+        // order deadlocked manual retry against import-auto recovery because
+        // each side held one resource while waiting for the other.
+        await acquireDocumentOcrSlot(docId)
+        if (ocrRuntimeShuttingDown) {
+          queuedOcrDocIds.delete(docId)
+          releaseTaskItemLease({ itemId: claim.itemId, leaseToken: claim.leaseToken })
+          return
+        }
+        const success = await processImportAutoOcrClaim(
+          event,
+          claim,
+          config.engine,
+          config.libraryProjectId,
+          config.totalCount,
+          () => completedCount,
+          concurrency,
+        )
+        if (success) completedCount += 1
       })
       await yieldToEventLoop()
     }
@@ -7424,7 +7468,7 @@ export function registerOcrIpc(): void {
           await updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')
           await yieldToEventLoop()
 
-          await globalOcrDocumentWindow.run(slotLimit, async () => {
+          await globalOcrDocumentWindow.runForDocument(docId, slotLimit, async () => {
             const pageCount = Number(doc?.page_count || 0) || 0
             const result = await runDocumentOcrWithWallTimeout(
               event,
@@ -7454,7 +7498,7 @@ export function registerOcrIpc(): void {
                 errorMessage: result.errorMessage,
               })
             }
-          })
+          }, activeTask.done)
         } finally {
           if (activeOcrTasks.get(docId)?.controller === controller) {
             activeOcrTasks.delete(docId)

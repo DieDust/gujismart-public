@@ -452,7 +452,7 @@ assert(
 assert(
   ocrIpcSource.includes('const heavyPdfDocIds = new Set<string>()')
     && ocrIpcSource.includes('const slotLimit = heavy ? 1 : documentConcurrency')
-    && ocrIpcSource.includes('globalOcrDocumentWindow.run(slotLimit, async () => {')
+    && ocrIpcSource.includes('globalOcrDocumentWindow.runForDocument(docId, slotLimit, async () => {')
     && ocrIpcSource.includes('runBoundedDocumentWorkers')
     && ocrIpcSource.includes('isHeavyPdfOcrDocument')
     && !ocrIpcSource.includes('if (Number(doc.page_count || 0) >= 180) heavyPdfDocIds.add(docId)'),

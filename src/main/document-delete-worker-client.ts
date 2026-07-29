@@ -2,10 +2,12 @@ import { existsSync } from 'fs'
 import { join } from 'path'
 import { Worker } from 'worker_threads'
 import { getErrorMessage } from '../shared/errors'
+import { getForegroundDatabaseWriterBuffer } from './database'
 
 export interface DocumentDeleteWorkerTask {
   dbFilePath: string
   documentIds: string[]
+  foregroundWriterBuffer?: SharedArrayBuffer
 }
 
 export interface DocumentDeleteWorkerResult {
@@ -86,7 +88,13 @@ export function runDocumentDeleteWorkerTask(
       if (settled) return
       finish(() => reject(new Error(`Document delete worker exited before returning a result (code ${code})`)))
     })
-    worker.postMessage({ type: 'deleteDocuments', task })
+    worker.postMessage({
+      type: 'deleteDocuments',
+      task: {
+        ...task,
+        foregroundWriterBuffer: getForegroundDatabaseWriterBuffer(),
+      },
+    })
   }).catch((error: unknown) => {
     throw new Error(getErrorMessage(error))
   })

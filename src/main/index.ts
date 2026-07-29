@@ -532,8 +532,20 @@ if (mcpLaunch.isMcp) {
       app.exit(1)
     })
 } else {
-  markStartupEvent('main-module-loaded')
-  app.whenReady()
+  const hasSingleInstanceLock = app.requestSingleInstanceLock()
+  if (!hasSingleInstanceLock) {
+    runtimeShutdownStarted = true
+    quitConfirmed = true
+    app.quit()
+  } else {
+    app.on('second-instance', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    })
+    markStartupEvent('main-module-loaded')
+    app.whenReady()
     .then(async () => {
       markStartupEvent('app-when-ready')
       // Startup diagnostic splash was a temporary remote-debug tool; do not open it on normal launches.
@@ -597,11 +609,12 @@ if (mcpLaunch.isMcp) {
       app.quit()
     })
 
-  app.on('window-all-closed', () => {
-    void shutdownApplicationRuntime().finally(() => {
-      app.quit()
+    app.on('window-all-closed', () => {
+      void shutdownApplicationRuntime().finally(() => {
+        app.quit()
+      })
     })
-  })
+  }
 }
 
 app.on('before-quit', (event) => {

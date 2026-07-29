@@ -2,6 +2,7 @@ type PendingTask<T> = {
   run: () => Promise<T>
   resolve: (value: T | PromiseLike<T>) => void
   reject: (reason?: unknown) => void
+  releaseWhen?: Promise<void>
 }
 
 function normalizeLimit(value: number): number {
@@ -15,6 +16,7 @@ export class SlidingWindowScheduler {
   /** Per-running-task slot limits; capacity is min(active limits ∪ next limit). */
   private readonly activeSlotLimits: number[] = []
   private readonly queue: Array<QueuedTask<unknown>> = []
+  private readonly documentTails = new Map<string, Promise<void>>()
 
   run<T>(limit: number, task: () => Promise<T>): Promise<T> {
     const taskLimit = normalizeLimit(limit)
@@ -22,6 +24,43 @@ export class SlidingWindowScheduler {
       this.queue.push({ run: task, resolve, reject, limit: taskLimit } as QueuedTask<unknown>)
       this.drain()
     })
+  }
+
+  private runUntilReleased(limit: number, task: () => Promise<void>, releaseWhen: Promise<void>): Promise<void> {
+    const taskLimit = normalizeLimit(limit)
+    return new Promise<void>((resolve, reject) => {
+      this.queue.push({ run: task, resolve, reject, limit: taskLimit, releaseWhen } as QueuedTask<unknown>)
+      this.drain()
+    })
+  }
+
+  async runForDocument(
+    documentId: string,
+    limit: number,
+    task: () => Promise<void>,
+    releaseWhen?: Promise<void>,
+  ): Promise<void> {
+    const key = String(documentId || '').trim()
+    if (!key) {
+      if (releaseWhen) return this.runUntilReleased(limit, task, releaseWhen)
+      return this.run(limit, task)
+    }
+
+    const previous = this.documentTails.get(key) || Promise.resolve()
+    let releaseCurrent: () => void = () => undefined
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve
+    })
+    this.documentTails.set(key, current)
+
+    await previous
+    try {
+      if (releaseWhen) return await this.runUntilReleased(limit, task, releaseWhen)
+      return await this.run(limit, task)
+    } finally {
+      releaseCurrent()
+      if (this.documentTails.get(key) === current) this.documentTails.delete(key)
+    }
   }
 
   private currentCapacity(nextLimit: number): number {
@@ -46,7 +85,11 @@ export class SlidingWindowScheduler {
       if (!pending) return
       this.activeCount += 1
       this.activeSlotLimits.push(pending.limit)
-      void pending.run()
+      const work = pending.run()
+      const tracked = pending.releaseWhen
+        ? Promise.race([work, pending.releaseWhen])
+        : work
+      void tracked
         .then(pending.resolve, pending.reject)
         .finally(() => {
           this.activeCount -= 1

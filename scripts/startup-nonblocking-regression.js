@@ -109,6 +109,12 @@ assert(
   'Main open path should time initDatabase, createWindow, and window-ready checkpoints without blocking recovery.',
 )
 assert(
+  mainIndex.includes('app.requestSingleInstanceLock()')
+    && mainIndex.includes("app.on('second-instance'")
+    && mainIndex.includes('mainWindow.focus()'),
+  'GUI launches must share one app instance so two main processes cannot contend for the same SQLite database.',
+)
+assert(
   rendererMain.includes("import ProjectBootstrap from './ProjectBootstrap'")
     && !rendererMain.includes("from './App'")
     && !rendererMain.includes("from 'antd'")

@@ -22,12 +22,24 @@ const DATABASE_BUSY_TIMEOUT_MS = 5_000
 // pause can repeatedly starve OCR/import writers while a large delete job
 // reacquires SQLite immediately for its next batch.
 const INTER_BATCH_WRITER_GRACE_MS = 150
+const FOREGROUND_WRITER_POLL_MS = 50
 
 type NativeDatabase = Database.Database
 
 type WorkerMessage = {
   type: 'deleteDocuments'
   task: DocumentDeleteWorkerTask
+}
+
+let foregroundWriterState: Int32Array | null = null
+
+function waitForForegroundWriter(): void {
+  const state = foregroundWriterState
+  if (!state) return
+  while (Atomics.load(state, 0) > 0) {
+    const observed = Atomics.load(state, 0)
+    Atomics.wait(state, 0, observed, FOREGROUND_WRITER_POLL_MS)
+  }
 }
 
 function uniqueIds(ids: string[]): string[] {
@@ -88,6 +100,7 @@ function deleteRowsByColumn(
       const rows = selectRows.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
+      waitForForegroundWriter()
       sqlite.prepare(`DELETE FROM "${tableName}" WHERE rowid IN (${rowPlaceholders})`)
         .run(...rows.map((row) => row.delete_rowid))
     }
@@ -114,6 +127,7 @@ function deleteDocumentRowsAfterExplicitCleanup(sqlite: NativeDatabase, document
   // connection; all relation cleanup continues to run with FK enforcement on.
   sqlite.pragma('foreign_keys = OFF')
   try {
+    waitForForegroundWriter()
     const deleteRows = sqlite.transaction(() => {
       runForIdChunks(documentIds, (chunkIds, placeholders) => {
         sqlite.prepare(`DELETE FROM documents WHERE id IN (${placeholders})`).run(...chunkIds)
@@ -139,6 +153,7 @@ function deleteAiChatTurns(sqlite: NativeDatabase, documentIds: string[]): void 
       const rows = selectRows.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
+      waitForForegroundWriter()
       sqlite.prepare(`DELETE FROM ai_chat_turns WHERE rowid IN (${rowPlaceholders})`)
         .run(...rows.map((row) => row.delete_rowid))
     }
@@ -155,6 +170,7 @@ function deleteFtsRows(sqlite: NativeDatabase, documentIds: string[]): void {
         const rows = selectRows.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
         if (rows.length === 0) break
         const rowPlaceholders = rows.map(() => '?').join(', ')
+        waitForForegroundWriter()
         sqlite.prepare(`DELETE FROM pages_fts WHERE rowid IN (${rowPlaceholders})`)
           .run(...rows.map((row) => row.delete_rowid))
       }
@@ -176,6 +192,7 @@ function deleteFtsRows(sqlite: NativeDatabase, documentIds: string[]): void {
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
       const rowIds = rows.map((row) => row.delete_rowid)
+      waitForForegroundWriter()
       sqlite.transaction(() => {
         sqlite.prepare(
           `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
@@ -199,6 +216,7 @@ function deleteFtsRows(sqlite: NativeDatabase, documentIds: string[]): void {
 }
 
 function resetRebuildableSearchTables(sqlite: NativeDatabase): void {
+  waitForForegroundWriter()
   sqlite.exec(`
     DROP TABLE IF EXISTS search_segments_trigram;
     DROP TABLE IF EXISTS search_segments_fts;
@@ -398,6 +416,9 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
 
   const sqlite = new Database(task.dbFilePath, { fileMustExist: true })
   try {
+    foregroundWriterState = task.foregroundWriterBuffer
+      ? new Int32Array(task.foregroundWriterBuffer)
+      : null
     sqlite.pragma('foreign_keys = ON')
     sqlite.pragma('journal_mode = WAL')
     sqlite.pragma('synchronous = NORMAL')
@@ -428,6 +449,7 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
     }
     return { deletedIds, affectedTagIds, recoveredSearchIndexIssue }
   } finally {
+    foregroundWriterState = null
     sqlite.close()
   }
 }

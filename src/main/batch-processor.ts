@@ -653,7 +653,7 @@ class BatchProcessor {
   private async processBatch(job: BatchJob, docIds: string[]): Promise<void> {
     for (const docId of docIds) {
       if (job.status !== 'running' || this.shuttingDown) return
-      await globalOcrDocumentWindow.run(getOcrDocumentConcurrency(), async () => {
+      await globalOcrDocumentWindow.runForDocument(docId, getOcrDocumentConcurrency(), async () => {
       const controller = new AbortController()
       this.activeControllers.add(controller)
       const jobControllers = this.activeControllersByJob.get(job.id) || new Set<AbortController>()
