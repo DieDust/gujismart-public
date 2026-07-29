@@ -39,7 +39,9 @@ let lastDatabaseCheckpointAt = 0
 const DATABASE_BUSY_TIMEOUT_MS = 250
 const DATABASE_BUSY_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1200]
 const DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000
-const DATABASE_ASYNC_BUSY_RETRY_DELAY_MS = 100
+// Delete/import workers can expose short writer windows. Poll often enough to
+// claim one without blocking Electron's event loop or repeatedly missing it.
+const DATABASE_ASYNC_BUSY_RETRY_DELAY_MS = 25
 
 function sleepSync(ms: number): void {
   const buffer = new SharedArrayBuffer(4)
@@ -3807,6 +3809,13 @@ export async function transactionAsync(
 
 export function transaction(fn: () => void): void {
   const database = getDatabase()
+  // Helpers such as the task scheduler use transaction() internally. When a
+  // caller already acquired an async writer transaction, join it instead of
+  // issuing another BEGIN (which would fail and also reopen a writer race).
+  if (database.inTransaction) {
+    fn()
+    return
+  }
   runWithBusyRetry(() => database.exec('BEGIN IMMEDIATE TRANSACTION'))
   try {
     fn()

@@ -102,10 +102,19 @@ async function main() {
   )
   assert.ok(
     manualBatchHandler.indexOf("message: 'OCR 正在写入队列'")
-      < manualBatchHandler.indexOf('await transactionAsync(() => undefined, { maxWaitMs: 30_000 })')
-      && manualBatchHandler.indexOf('await transactionAsync(() => undefined, { maxWaitMs: 30_000 })')
-        < manualBatchHandler.indexOf('createRecoverableBatchOcrItems(chunk, documentConcurrency)'),
-    'Manual OCR should publish queue entry before asynchronously waiting for its persistence writer slot',
+      < manualBatchHandler.indexOf('await transactionAsync(() => {')
+      && manualBatchHandler.indexOf('await transactionAsync(() => {')
+        < manualBatchHandler.indexOf('createRecoverableBatchOcrItems(persistedChunk, documentConcurrency)')
+      && manualBatchHandler.indexOf('createRecoverableBatchOcrItems(persistedChunk, documentConcurrency)')
+        < manualBatchHandler.indexOf("['queued', 'processing', 'pending', null, now, ...persistedChunk]"),
+    'Manual OCR should publish queue entry before atomically persisting recovery and document state under the acquired writer lock',
+  )
+  assert.ok(
+    !manualBatchHandler.includes('transactionAsync(() => undefined')
+      && ocrIpc.includes('async function updateRecoverableBatchOcrItem(')
+      && ocrIpc.includes("await updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
+      && ocrIpc.includes('OCR_QUEUE_WRITER_MAX_WAIT_MS = 5 * 60 * 1000'),
+    'OCR queue persistence and recovery state transitions must keep the async writer lock through their actual writes',
   )
   assert.ok(
     manualBatchHandler.includes('queuedOcrDocIds.delete(docId)')

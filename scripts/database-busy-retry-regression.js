@@ -26,8 +26,9 @@ assert(
 assert(
   databaseSource.includes('export async function runAsync(')
     && databaseSource.includes('DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000')
+    && databaseSource.includes('DATABASE_ASYNC_BUSY_RETRY_DELAY_MS = 25')
     && databaseSource.includes('await sleepAsync('),
-  'Queued background writes should retry SQLite locks asynchronously instead of sleeping on Electron main',
+  'Queued background writes should retry SQLite locks asynchronously and frequently enough to claim short writer windows',
 )
 assert(
   databaseSource.includes("database.pragma('wal_autocheckpoint = 0')"),
@@ -36,6 +37,11 @@ assert(
 assert(
   databaseSource.includes('BEGIN IMMEDIATE TRANSACTION'),
   'Main database write transactions should acquire the writer lock before doing read-then-write OCR work',
+)
+assert(
+  databaseSource.includes('if (database.inTransaction)')
+    && databaseSource.includes('Helpers such as the task scheduler use transaction() internally'),
+  'Synchronous task helpers must join an already acquired async writer transaction instead of issuing a second BEGIN',
 )
 assert(
   databaseSource.includes('function checkpointDatabase(options?: { retryBusy?: boolean; mode?: \'PASSIVE\' | \'TRUNCATE\' }): boolean')

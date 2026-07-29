@@ -18,7 +18,10 @@ const ID_CHUNK_SIZE = 100
 const ROW_CHUNK_SIZE = 2_000
 const DOCUMENT_BATCH_SIZE = 25
 const DATABASE_BUSY_TIMEOUT_MS = 5_000
-const INTER_BATCH_WRITER_GRACE_MS = 25
+// Leave a window wider than foreground writer retry intervals. A very short
+// pause can repeatedly starve OCR/import writers while a large delete job
+// reacquires SQLite immediately for its next batch.
+const INTER_BATCH_WRITER_GRACE_MS = 150
 
 type NativeDatabase = Database.Database
 

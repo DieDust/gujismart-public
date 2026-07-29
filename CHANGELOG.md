@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 1.2.17 - 2026-07-29
+
+### 中文
+
+#### OCR 队列写锁与删除并发
+
+- 修复 `1.2.16` 中 OCR 已显示入队进度、但实际持久化仍提示 `documents:batchOcr: database is locked`，继而把文献标记为“识别失败 / 处理失败”的问题。
+- OCR 可恢复任务、批处理队列和文献排队状态现在在同一个真正持有 SQLite 写锁的事务中原子写入；不再先取得并释放写锁、随后才执行多次同步写入，从根源上关闭删除 worker 重新抢锁的竞态窗口。
+- OCR 开始和完成时的可恢复任务状态也改为异步等待写入机会，数据库被删除、导入或其他后台任务短暂占用时不会直接中断 OCR。
+- 数据库异步写入检查间隔由 100ms 缩短为 25ms，大批量删除每 25 篇主动让出 150ms 的前台写入窗口，避免 OCR、导入、文件夹操作和状态刷新长期错过锁释放时机。删除范围保持不变，数百篇删除只增加少量公平调度时间。
+- 新增真实双连接写锁集成测试：一个连接持有写锁时，OCR 队列等待且界面事件循环继续运行；锁释放后任务记录与文献状态同时成功落库。
+
+#### 下载
+
+- `GujiSmart-1.2.17-Setup-x64.exe`
+- `GujiSmart-1.2.17-Portable-x64.exe`
+
+### English
+
+#### OCR Queue Writer Locks and Concurrent Deletion
+
+- Fixed `1.2.16` showing OCR queue progress but still failing persistence with `documents:batchOcr: database is locked`, which then marked the document as recognition and processing failed.
+- Recoverable OCR tasks, legacy batch rows, and document queue state are now written atomically inside the same transaction while its SQLite writer lock remains held. The previous acquire-release probe followed by several synchronous writes no longer leaves a race for the deletion worker to reclaim the lock.
+- Recoverable task transitions at OCR start and completion now also wait asynchronously for a writer opportunity, so brief contention from deletion, import, or another background task does not abort OCR.
+- Asynchronous writer polling now runs every 25ms instead of 100ms, while large deletion yields a 150ms foreground writer window after each 25-document batch. This prevents OCR, import, folder operations, and status refresh from repeatedly missing lock-release windows. Deletion coverage is unchanged, with only a small fairness delay for large batches.
+- Added a real two-connection writer-lock integration test: OCR queue persistence waits without blocking the event loop, then commits task and document state together after the competing writer releases the lock.
+
+#### Downloads
+
+- `GujiSmart-1.2.17-Setup-x64.exe`
+- `GujiSmart-1.2.17-Portable-x64.exe`
+
 ## 1.2.16 - 2026-07-29
 
 ### 中文

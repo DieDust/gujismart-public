@@ -4,6 +4,7 @@ const os = require('os')
 const path = require('path')
 const { buildSync } = require('esbuild')
 const { Module } = require('module')
+const Database = require('better-sqlite3')
 
 const root = path.resolve(__dirname, '..')
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-task-scheduler-'))
@@ -40,6 +41,7 @@ function expectCode(fn, code) {
 
 async function run() {
   let database
+  let competingWriter
   try {
     buildSync({
       entryPoints: [entryPath],
@@ -215,6 +217,38 @@ async function run() {
     assert.strictEqual(compatibleBatch.count, 2)
     assert.strictEqual(database.queryOne("SELECT COUNT(*) AS count FROM batch_queue WHERE batch_id = 'compat-batch'").count, 2)
     assert.strictEqual(scheduler.getTaskJob(compatibleBatch.jobId).totalCount, 2)
+    competingWriter = new Database(database.getDatabaseFilePath())
+    competingWriter.pragma('journal_mode = WAL')
+    competingWriter.pragma('busy_timeout = 0')
+    competingWriter.exec('BEGIN IMMEDIATE')
+    competingWriter.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(
+      'ocr_queue_contention_fixture',
+      'holding',
+    )
+    let writerWaitHeartbeats = 0
+    const writerWaitHeartbeat = setInterval(() => { writerWaitHeartbeats += 1 }, 25)
+    const releaseCompetingWriter = new Promise((resolve) => {
+      setTimeout(() => {
+        competingWriter.exec('COMMIT')
+        resolve()
+      }, 450)
+    })
+    let asyncCompatibleBatch = null
+    await database.transactionAsync(() => {
+      asyncCompatibleBatch = batchCompatibility.createLegacyBatchTask(['compat-doc-1'], 1, {
+        batchId: 'compat-async-writer-batch',
+        nowMs: 4_005,
+      })
+      database.run("UPDATE documents SET import_status = 'processing' WHERE id = 'compat-doc-1'")
+    }, { maxWaitMs: 5_000 })
+    await releaseCompetingWriter
+    clearInterval(writerWaitHeartbeat)
+    assert.strictEqual(asyncCompatibleBatch?.count, 1)
+    assert.strictEqual(database.queryOne("SELECT COUNT(*) AS count FROM batch_queue WHERE batch_id = 'compat-async-writer-batch'").count, 1)
+    assert.strictEqual(database.queryOne("SELECT import_status FROM documents WHERE id = 'compat-doc-1'").import_status, 'processing')
+    assert(writerWaitHeartbeats >= 2, 'OCR queue writer contention must not block the Electron event loop')
+    competingWriter.close()
+    competingWriter = null
     const firstCompatibleItem = compatibleBatch.items[0]
     const started = batchCompatibility.startLegacyBatchItem(firstCompatibleItem.legacyItemId, 'compat-worker', {
       leaseMs: 1_000,
@@ -284,6 +318,12 @@ async function run() {
 
     console.log('Task scheduler SQLite integration regression checks passed.')
   } finally {
+    try {
+      if (competingWriter?.inTransaction) competingWriter.exec('ROLLBACK')
+    } catch {
+      // Best-effort contention fixture cleanup.
+    }
+    competingWriter?.close()
     database?.closeDatabase()
     fs.rmSync(tempRoot, { recursive: true, force: true })
   }

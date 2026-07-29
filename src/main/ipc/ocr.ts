@@ -116,6 +116,7 @@ const MAX_OCR_DOCUMENT_TIMEOUT_MINUTES = 720
 const HEAVY_PDF_DOC_SIZE_BYTES = 200 * 1024 * 1024
 const HEAVY_PDF_DOC_PAGE_COUNT = 1000
 const RECOVERABLE_BATCH_OCR_PREFIX = 'recoverable_ocr'
+const OCR_QUEUE_WRITER_MAX_WAIT_MS = 5 * 60 * 1000
 // Long leases + frequent heartbeats keep multi-hour bulk OCR from being re-queued mid-book.
 const IMPORT_AUTO_OCR_LEASE_MS = 30 * 60 * 1000
 const IMPORT_AUTO_OCR_HEARTBEAT_MS = 20 * 1000
@@ -602,22 +603,24 @@ function createRecoverableBatchOcrItems(docIds: string[], batchSize: number): Ma
   return new Map(persisted.items.map((item) => [item.docId, item.legacyItemId]))
 }
 
-function updateRecoverableBatchOcrItem(
+async function updateRecoverableBatchOcrItem(
   itemIdsByDocId: Map<string, string>,
   docId: string,
   status: 'processing' | 'completed' | 'failed',
   errorMessage?: string,
-): void {
+): Promise<void> {
   const itemId = itemIdsByDocId.get(docId)
   if (!itemId) return
 
-  if (status === 'processing') {
-    startLegacyBatchItem(itemId, `documents-batch-ocr:${docId}`)
-  } else if (status === 'completed') {
-    completeLegacyBatchItem(itemId, { message: errorMessage })
-  } else {
-    failLegacyBatchItem(itemId, { errorMessage: errorMessage || 'OCR 处理失败', recoverable: true })
-  }
+  await transactionAsync(() => {
+    if (status === 'processing') {
+      startLegacyBatchItem(itemId, `documents-batch-ocr:${docId}`)
+    } else if (status === 'completed') {
+      completeLegacyBatchItem(itemId, { message: errorMessage })
+    } else {
+      failLegacyBatchItem(itemId, { errorMessage: errorMessage || 'OCR 处理失败', recoverable: true })
+    }
+  }, { maxWaitMs: OCR_QUEUE_WRITER_MAX_WAIT_MS })
 }
 
 export async function shutdownOcrRuntime(timeoutMs = 3000): Promise<void> {
@@ -7325,37 +7328,33 @@ export function registerOcrIpc(): void {
       })
 
       try {
-        if (queuedDocIds.length > 0) {
-          // Acquire the next writer opportunity asynchronously before the
-          // compatibility task bridge performs its short synchronous writes.
-          await transactionAsync(() => undefined, { maxWaitMs: 30_000 })
-        }
-
-        // Persist recovery metadata in chunks so a 10k enqueue cannot freeze open.
-        if (persistForRecovery && queuedDocIds.length > 0) {
-          for (let offset = 0; offset < queuedDocIds.length; offset += 50) {
-            const chunk = queuedDocIds.slice(offset, offset + 50)
-            const partial = createRecoverableBatchOcrItems(chunk, documentConcurrency)
-            partial.forEach((itemId, docId) => recoverableQueueItemIdsByDocId.set(docId, itemId))
-            await yieldToEventLoop()
-          }
-        }
-
-        // Mark queued status in SQL chunks; emit one light progress event per doc so the
-        // library can show “N 篇处理中 / M 篇等待” immediately (not only when claimed).
+        // Persist recovery records and visible document status while the same
+        // asynchronously acquired writer transaction is still held. The old
+        // acquire-and-release probe allowed a delete worker to steal the lock
+        // before these writes began.
         if (queuedDocIds.length > 0) {
           const now = new Date().toISOString()
-          for (let offset = 0; offset < queuedDocIds.length; offset += 100) {
-            const chunk = queuedDocIds.slice(offset, offset + 100)
-            const placeholders = chunk.map(() => '?').join(', ')
-            run(
-              `UPDATE documents
-               SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = ?,
-                   retry_count = 0, last_retry_at = NULL, updated_at = ?
-               WHERE id IN (${placeholders})`,
-              ['queued', 'processing', 'pending', null, now, ...chunk],
-            )
-            for (const docId of chunk) {
+          for (let offset = 0; offset < queuedDocIds.length; offset += 50) {
+            const candidateChunk = queuedDocIds.slice(offset, offset + 50)
+            let persistedChunk: string[] = []
+            let partial = new Map<string, string>()
+            await transactionAsync(() => {
+              persistedChunk = candidateChunk.filter((docId) => !canceledOcrDocIds.has(docId))
+              if (persistedChunk.length === 0) return
+              if (persistForRecovery) {
+                partial = createRecoverableBatchOcrItems(persistedChunk, documentConcurrency)
+              }
+              const placeholders = persistedChunk.map(() => '?').join(', ')
+              run(
+                `UPDATE documents
+                 SET ocr_status = ?, import_status = ?, metadata_status = ?, error_message = ?,
+                     retry_count = 0, last_retry_at = NULL, updated_at = ?
+                 WHERE id IN (${placeholders})`,
+                ['queued', 'processing', 'pending', null, now, ...persistedChunk],
+              )
+            }, { maxWaitMs: OCR_QUEUE_WRITER_MAX_WAIT_MS })
+            partial.forEach((itemId, docId) => recoverableQueueItemIdsByDocId.set(docId, itemId))
+            for (const docId of persistedChunk) {
               emitOcrStatus(event, {
                 docId,
                 status: 'queued',
@@ -7422,7 +7421,7 @@ export function registerOcrIpc(): void {
             totalPages: Number(doc?.page_count || 0) || undefined,
             message: heavy ? '超大 PDF 识别中…' : 'OCR 识别中',
           })
-          updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')
+          await updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')
           await yieldToEventLoop()
 
           await globalOcrDocumentWindow.run(slotLimit, async () => {
@@ -7440,7 +7439,7 @@ export function registerOcrIpc(): void {
             completedCount += 1
             if (result.success) successCount += 1
             if (result.success || result.errorMessage !== OCR_CANCELED_MESSAGE || !ocrRuntimeShuttingDown) {
-              updateRecoverableBatchOcrItem(
+              await updateRecoverableBatchOcrItem(
                 recoverableQueueItemIdsByDocId,
                 docId,
                 result.success ? 'completed' : 'failed',

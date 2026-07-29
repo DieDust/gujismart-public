@@ -96,10 +96,12 @@ async function run() {
         'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
         ['async_transaction_retry', 'completed'],
       )
-      database.run(
-        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
-        ['async_transaction_atomic', 'completed'],
-      )
+      database.transaction(() => {
+        database.run(
+          'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+          ['async_transaction_atomic', 'completed'],
+        )
+      })
     }, { maxWaitMs: 5_000 })
     await releaseTransactionWriter
     assert.strictEqual(

@@ -155,7 +155,7 @@ assertIncludes(worker, "deleteRowsByDocIds(sqlite, 'ocr_runs'", 'OCR cleanup sho
 assertIncludes(worker, 'function deleteDocumentRowsAfterExplicitCleanup', 'final document removal should avoid redundant legacy child-table scans')
 assertIncludes(worker, "sqlite.pragma('foreign_keys = OFF')", 'final document removal should disable only redundant cascade checks')
 assertIncludes(worker, "sqlite.pragma('foreign_keys = ON')", 'foreign-key enforcement must be restored immediately after final document removal')
-assertIncludes(worker, 'INTER_BATCH_WRITER_GRACE_MS', 'bulk deletion should yield the SQLite writer between document batches')
+assertIncludes(worker, 'const INTER_BATCH_WRITER_GRACE_MS = 150', 'bulk deletion should leave a foreground-visible SQLite writer window between document batches')
 assertIncludes(workerClient, 'options?.onProgress?.({', 'delete worker progress should be forwarded to the main process')
 assertIncludes(deleteJobBody, "kind: 'document-delete'", 'delete jobs should publish visible background task progress')
 assertIncludes(deleteJobBody, 'onProgress: (progress)', 'worker progress should reach the renderer task stream')
