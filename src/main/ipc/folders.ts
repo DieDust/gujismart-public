@@ -794,7 +794,14 @@ export function registerFolderIpc(): void {
       run('UPDATE folders SET parent_id = NULL, updated_at = ? WHERE parent_id = ?', [new Date().toISOString(), folderId])
       run('DELETE FROM folders WHERE id = ? AND library_project_id = ?', [folderId, libraryProjectId])
       deleted = true
-    }, { maxWaitMs: 60_000 })
+    }, {
+      maxWaitMs: 60_000,
+      activity: {
+        category: 'foreground-write',
+        label: '文件夹：删除',
+        detail: '正在删除文件夹关系',
+      },
+    })
     if (!deleted) return false
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()

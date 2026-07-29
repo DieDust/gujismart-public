@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 1.2.19 - 2026-07-29
+
+### 中文
+
+#### 数据库写锁与后台队列诊断
+
+- 设置的“数据管理”新增数据库占用监视，每 2 秒以独立工作线程进行一次无等待 SQLite 写锁探测；探测不会读取正文、标题、文件路径或密钥，也不会阻塞 Electron 主线程。
+- 占用状态明确区分“写锁可用”“已确认内部持锁任务”“内部任务疑似占用”“未归属写锁”和“探测失败”。SQLite 无法提供外部持锁者名称时，界面会如实标明可能来自另一个 GujiSmart、旧版本进程或未登记连接，不再笼统显示 `database is locked`。
+- 批量永久删除从提交起登记队列状态，显示文献数量、排队/等待/运行阶段、已完成数量和持续时间；后续删除被旧任务挡住时，可以直接看到前序任务仍在运行，而不会误以为新任务持有数据库锁。
+- OCR 入队、OCR 取消、文件夹删除、全文索引、WAL 检查点和普通前台写事务均登记业务名称与锁等待；面板保留最近锁等待及其恢复/失败结果，并支持一键复制不含文献内容的占用信息供远程排查。
+- 新增真实双连接锁竞争回归：验证写锁空闲、外部连接持锁、释放后恢复，以及删除任务与锁等待记录的完整诊断链路。
+
+#### 下载
+
+- `GujiSmart-1.2.19-Setup-x64.exe`
+- `GujiSmart-1.2.19-Portable-x64.exe`
+
+### English
+
+#### Database Writer-Lock and Background Queue Diagnostics
+
+- Added a database occupancy monitor under Data Management. A dedicated worker performs a non-waiting SQLite writer-lock probe every two seconds without reading document content, titles, file paths, or credentials and without blocking Electron's main thread.
+- The UI now distinguishes an available writer, a confirmed internal owner, a correlated internal candidate, an unattributed writer lock, and a probe failure. When SQLite cannot name an external owner, the monitor explicitly reports a possible second GujiSmart, older-version process, or unregistered connection instead of flattening every case into `database is locked`.
+- Permanent bulk deletes are registered from submission onward with queue, wait, and running states, document counts, completed progress, and elapsed time. A later delete waiting behind an older job is now visible as queued rather than misidentified as the lock owner.
+- OCR enqueue/cancel, folder deletion, search indexing, WAL checkpoints, and ordinary foreground write transactions now publish diagnostic activity names and lock waits. Recent recovered/failed waits are retained, and the safe occupancy report can be copied for remote troubleshooting.
+- Added a real two-connection lock regression covering available, externally occupied, and released writer states plus delete activity and lock-wait recording.
+
+#### Downloads
+
+- `GujiSmart-1.2.19-Setup-x64.exe`
+- `GujiSmart-1.2.19-Portable-x64.exe`
+
 ## 1.2.18 - 2026-07-29
 
 ### 中文

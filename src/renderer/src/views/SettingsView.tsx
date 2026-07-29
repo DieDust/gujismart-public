@@ -23,7 +23,7 @@ import {
 import { DEFAULT_SHORTCUTS, SHORTCUT_SETTING_KEYS, SHORTCUTS_CHANGED_EVENT, normalizeShortcutInput, shortcutFromKeyboardEvent, type ShortcutAction } from '../utils/shortcuts'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { getErrorMessage } from '@shared/errors'
-import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseStorageDiagnostics, type EmbeddingIndexStats, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type McpSetupInfo, type OcrEngine, type PaddleOcrTokenPoolState, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
+import { PRODUCT_FULL_NAME, PRODUCT_NAME, PRODUCT_SUBTITLE, type AppUpdateInfo, type BackupStatus, type BackgroundTaskProgressEvent, type DatabaseLockActivity, type DatabaseLockDiagnostics, type DatabaseLockDiagnosticsStatus, type DatabaseStorageDiagnostics, type EmbeddingIndexStats, type LlmProviderProfile, type LocalPaddleOcrDownloadProgress, type LocalPaddleOcrStatus, type McpSetupInfo, type OcrEngine, type PaddleOcrTokenPoolState, type PdfRepositoryStatus, type ResearchProject, type TranslationGlossaryScope, type TranslationGlossaryTerm } from '@shared/types'
 
 const { Title, Text } = Typography
 
@@ -353,6 +353,35 @@ function formatCount(value?: number): string {
   return Math.max(0, Number(value || 0)).toLocaleString()
 }
 
+function formatDatabaseLockElapsed(value?: number): string {
+  const seconds = Math.max(0, Math.round(Number(value || 0) / 1000))
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = seconds % 60
+  return remainingSeconds > 0 ? `${minutes} 分 ${remainingSeconds} 秒` : `${minutes} 分钟`
+}
+
+function formatDatabaseLockActivityState(activity: DatabaseLockActivity): string {
+  switch (activity.state) {
+    case 'queued': return '排队'
+    case 'waiting': return '等待写锁'
+    case 'holding': return '正在持有写锁'
+    case 'running': return '运行中'
+    default: return activity.state
+  }
+}
+
+function getDatabaseLockStatusDisplay(status?: DatabaseLockDiagnosticsStatus): { label: string; color: string } {
+  switch (status) {
+    case 'available': return { label: '写锁可用', color: 'success' }
+    case 'busy-confirmed-internal': return { label: '已定位内部持锁任务', color: 'warning' }
+    case 'busy-internal-candidate': return { label: '内部任务疑似占用', color: 'warning' }
+    case 'busy-unattributed': return { label: '未归属写锁', color: 'error' }
+    case 'probe-error': return { label: '探测失败', color: 'error' }
+    default: return { label: '等待探测', color: 'default' }
+  }
+}
+
 function formatDatabaseMaintenanceStage(value?: string | null): string {
   switch (value) {
     case 'idle':
@@ -537,6 +566,9 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const [backupBusy, setBackupBusy] = useState(false)
   const [backupDropActive, setBackupDropActive] = useState(false)
   const [databaseDiagnostics, setDatabaseDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
+  const [databaseLockDiagnostics, setDatabaseLockDiagnostics] = useState<DatabaseLockDiagnostics | null>(null)
+  const [databaseLockDiagnosticsLoading, setDatabaseLockDiagnosticsLoading] = useState(false)
+  const databaseLockDiagnosticsRequestInFlightRef = useRef(false)
   const [databaseMaintenanceBusy, setDatabaseMaintenanceBusy] = useState(false)
   const [databaseMaintenanceProgress, setDatabaseMaintenanceProgress] = useState<BackgroundTaskProgressEvent | null>(null)
   const [autoBackupEnabled, setAutoBackupEnabled] = useState(true)
@@ -608,6 +640,8 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
   const watchedVisionOcrModel = Form.useWatch('vision_ocr_model', form)
   const watchedVisionOcrUseLlmConfig = Form.useWatch('vision_ocr_use_llm_config', form)
   const databaseCompactionWorthwhile = isDatabaseCompactionWorthwhile(databaseDiagnostics)
+  const databaseLockStatusDisplay = getDatabaseLockStatusDisplay(databaseLockDiagnostics?.status)
+  const likelyDatabaseOwnerIds = new Set(databaseLockDiagnostics?.likelyOwners.map((activity) => activity.id) || [])
 
   const setSettingsDirty = useCallback((dirty: boolean) => {
     dirtyRef.current = dirty
@@ -2135,10 +2169,54 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  const refreshDatabaseLockDiagnostics = useCallback(async (options?: { silent?: boolean }) => {
+    if (databaseLockDiagnosticsRequestInFlightRef.current) return
+    databaseLockDiagnosticsRequestInFlightRef.current = true
+    if (!options?.silent) setDatabaseLockDiagnosticsLoading(true)
+    try {
+      setDatabaseLockDiagnostics(await window.api.getDatabaseLockDiagnostics())
+    } catch (error) {
+      if (!options?.silent) message.error(getErrorMessage(error, '读取数据库占用状态失败'))
+    } finally {
+      databaseLockDiagnosticsRequestInFlightRef.current = false
+      if (!options?.silent) setDatabaseLockDiagnosticsLoading(false)
+    }
+  }, [])
+
+  const handleCopyDatabaseLockDiagnostics = async () => {
+    try {
+      const diagnostics = databaseLockDiagnostics || await window.api.getDatabaseLockDiagnostics()
+      await navigator.clipboard.writeText(JSON.stringify({
+        status: diagnostics.status,
+        checkedAt: diagnostics.checkedAt,
+        processId: diagnostics.processId,
+        writerAvailable: diagnostics.writerAvailable,
+        probeElapsedMs: diagnostics.probeElapsedMs,
+        ownerConfidence: diagnostics.ownerConfidence,
+        message: diagnostics.message,
+        activeActivities: diagnostics.activeActivities,
+        recentBusyIncidents: diagnostics.recentBusyIncidents,
+        probeError: diagnostics.probeError,
+      }, null, 2))
+      message.success('数据库占用信息已复制')
+    } catch (error) {
+      message.error(getErrorMessage(error, '复制数据库占用信息失败'))
+    }
+  }
+
   useEffect(() => {
     if (activeSettingsSection !== 'data' || databaseMaintenanceBusy) return
     void refreshDatabaseDiagnostics()
   }, [activeSettingsSection])
+
+  useEffect(() => {
+    if (activeSettingsSection !== 'data') return
+    void refreshDatabaseLockDiagnostics()
+    const timer = window.setInterval(() => {
+      void refreshDatabaseLockDiagnostics({ silent: true })
+    }, 2_000)
+    return () => window.clearInterval(timer)
+  }, [activeSettingsSection, refreshDatabaseLockDiagnostics])
 
   const handleExportDatabaseDiagnostics = async () => {
     setDatabaseMaintenanceBusy(true)
@@ -2978,6 +3056,101 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               message="备份会保留数据库、OCR 文本、标签和配置"
               description="自动备份默认不包含原文 PDF/EPUB，完整迁移请使用导出完整备份。"
             />
+
+            <div style={{ marginBottom: 16, padding: 12, borderRadius: 6, border: '1px solid rgba(214,168,95,0.22)', background: 'rgba(214,168,95,0.045)' }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 10, flexWrap: 'wrap' }}>
+                <div style={{ minWidth: 0 }}>
+                  <Space size={8} wrap>
+                    <Text strong style={{ color: 'var(--gs-text-primary)' }}>数据库占用监视</Text>
+                    <Tag color={databaseLockStatusDisplay.color}>{databaseLockStatusDisplay.label}</Tag>
+                  </Space>
+                  <div style={{ marginTop: 4 }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {databaseLockDiagnostics?.message || '正在进行首次写锁探测…'}
+                    </Text>
+                  </div>
+                </div>
+                <Space size={8} wrap>
+                  <Button
+                    size="small"
+                    icon={<CopyOutlined />}
+                    disabled={!databaseLockDiagnostics}
+                    onClick={() => void handleCopyDatabaseLockDiagnostics()}
+                  >
+                    复制占用信息
+                  </Button>
+                  <Button
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    loading={databaseLockDiagnosticsLoading}
+                    onClick={() => void refreshDatabaseLockDiagnostics()}
+                  >
+                    立即探测
+                  </Button>
+                </Space>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 10 }}>
+                <div style={{ padding: 9, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>当前软件进程</Text>
+                  <br />
+                  <Text strong>PID {databaseLockDiagnostics?.processId || '—'}</Text>
+                </div>
+                <div style={{ padding: 9, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>写锁探测耗时</Text>
+                  <br />
+                  <Text strong>{databaseLockDiagnostics ? `${databaseLockDiagnostics.probeElapsedMs} ms` : '—'}</Text>
+                </div>
+                <div style={{ padding: 9, borderRadius: 6, background: 'rgba(255,255,255,0.03)' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>已登记活动</Text>
+                  <br />
+                  <Text strong>{databaseLockDiagnostics?.activeActivities.length || 0} 项</Text>
+                </div>
+              </div>
+
+              {databaseLockDiagnostics?.activeActivities.length ? (
+                <div style={{ display: 'grid', gap: 6, marginBottom: 10 }}>
+                  {databaseLockDiagnostics.activeActivities.map((activity) => (
+                    <div key={activity.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(130px, 1fr) auto', gap: 10, alignItems: 'center', padding: '8px 10px', borderRadius: 6, background: likelyDatabaseOwnerIds.has(activity.id) ? 'rgba(214,168,95,0.12)' : 'rgba(255,255,255,0.025)', border: likelyDatabaseOwnerIds.has(activity.id) ? '1px solid rgba(214,168,95,0.3)' : '1px solid rgba(255,255,255,0.05)' }}>
+                      <div style={{ minWidth: 0 }}>
+                        <Text strong style={{ fontSize: 12 }}>{activity.label}</Text>
+                        <br />
+                        <Text type="secondary" style={{ fontSize: 12, overflowWrap: 'anywhere' }}>
+                          {activity.detail || '无补充信息'}
+                        </Text>
+                      </div>
+                      <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        <Tag color={activity.state === 'holding' ? 'error' : activity.state === 'queued' ? 'default' : 'warning'} style={{ marginInlineEnd: 0 }}>
+                          {formatDatabaseLockActivityState(activity)}
+                        </Tag>
+                        <br />
+                        <Text type="secondary" style={{ fontSize: 11 }}>{formatDatabaseLockElapsed(activity.elapsedMs)}</Text>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 10 }}>当前没有已登记的数据库任务。</Text>
+              )}
+
+              {databaseLockDiagnostics?.recentBusyIncidents.length ? (
+                <div style={{ marginBottom: 8 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>最近锁等待</Text>
+                  {databaseLockDiagnostics.recentBusyIncidents.slice(0, 3).map((incident) => (
+                    <div key={incident.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginTop: 4, fontSize: 12 }}>
+                      <Text style={{ fontSize: 12 }}>{incident.operationLabel}</Text>
+                      <Text type={incident.outcome === 'failed' ? 'danger' : 'secondary'} style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                        等待 {formatDatabaseLockElapsed(incident.waitedMs)} · {incident.outcome === 'failed' ? '失败' : '已恢复'}
+                      </Text>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              <Text type="secondary" style={{ fontSize: 11, lineHeight: 1.5 }}>
+                SQLite 不提供外部持锁者的业务名称。若显示“未归属写锁”，通常表示另一个 GujiSmart/旧版本进程或未登记连接；面板不会读取或上传用户的数据库内容。
+              </Text>
+            </div>
 
             <Card size="small" style={{ marginBottom: 16, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 12 }}>

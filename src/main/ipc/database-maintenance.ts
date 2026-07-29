@@ -1,5 +1,5 @@
 import { ipcMain } from 'electron'
-import type { DatabaseMaintenanceResult, DatabaseStorageDiagnostics } from '../../shared/types'
+import type { DatabaseLockDiagnostics, DatabaseMaintenanceResult, DatabaseStorageDiagnostics } from '../../shared/types'
 import {
   clearLegacySearchNgramIndex,
   cleanupExternalPagePayloadStorage,
@@ -11,6 +11,7 @@ import {
   optimizeLegacyDatabaseStorage,
 } from '../database-maintenance'
 import { queueAllDocumentsReindex } from '../semantic-search'
+import { getDatabaseLockDiagnostics } from '../database-lock-diagnostics'
 
 function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics): boolean {
   const reasons = diagnostics.requiredMaintenance?.reasons || []
@@ -30,6 +31,10 @@ function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics
 export function registerDatabaseMaintenanceIpc(): void {
   ipcMain.handle('database:getStorageDiagnostics', async (): Promise<DatabaseStorageDiagnostics> => {
     return await getDatabaseStorageDiagnosticsAsync()
+  })
+
+  ipcMain.handle('database:getLockDiagnostics', async (): Promise<DatabaseLockDiagnostics> => {
+    return await getDatabaseLockDiagnostics()
   })
 
   ipcMain.handle('database:exportStorageDiagnostics', async (): Promise<DatabaseMaintenanceResult> => {

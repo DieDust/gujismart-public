@@ -81,6 +81,12 @@ import { deriveOcrTextFromIr, ensureOcrResultIr, getOcrPageIr } from '../../shar
 import { allowFileAccessPath, allowManagedFileAccessPath, assertAllowedLocalFilePath } from '../file-access'
 import { documentPipelineDiagnosticsFromImportProgress } from '../../shared/document-pipeline-diagnostics'
 import { statusEnvelopeFromImportProgress } from '../../shared/status-envelope'
+import {
+  beginDatabaseActivity,
+  finishDatabaseActivity,
+  recordDatabaseBusyIncident,
+  updateDatabaseActivity,
+} from '../database-lock-monitor'
 import type {
   AiTaskOptions,
   AiLayoutCacheItem,
@@ -580,6 +586,13 @@ async function markDocumentsDeleting(docIds: string[]): Promise<void> {
        SET import_status = ?, error_message = NULL, updated_at = ?
        WHERE id IN (${placeholders})`,
       ['deleting', now, ...chunkIds],
+      {
+        activity: {
+          category: 'document-delete',
+          label: '批量永久删除：写入删除标记',
+          detail: `${docIds.length} 篇文献`,
+        },
+      },
     )
   }
   scheduleDatabaseSave()
@@ -597,6 +610,13 @@ async function markDocumentsDeleteFailed(docIds: string[], error: unknown): Prom
        SET import_status = ?, error_message = ?, updated_at = ?
        WHERE id IN (${placeholders})`,
       ['error', message.slice(0, 1000), now, ...chunkIds],
+      {
+        activity: {
+          category: 'document-delete',
+          label: '批量永久删除：恢复失败状态',
+          detail: `${docIds.length} 篇文献`,
+        },
+      },
     )
   }
   scheduleDatabaseSave()
@@ -709,6 +729,13 @@ async function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]):
 function scheduleDocumentDeleteJob(docIds: string[]): void {
   if (documentDeleteRuntimeShuttingDown) return
   const taskId = `document-delete:${nanoid()}`
+  const activityStartedAt = Date.now()
+  const databaseActivityId = beginDatabaseActivity({
+    category: 'document-delete',
+    label: '后台永久删除',
+    state: 'queued',
+    detail: `${docIds.length} 篇文献，等待前序删除任务`,
+  })
   emitBackgroundTaskStatus({
     taskId,
     kind: 'document-delete',
@@ -723,8 +750,13 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
       void (async () => {
         if (documentDeleteRuntimeShuttingDown) {
           docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
+          finishDatabaseActivity(databaseActivityId)
           return
         }
+        updateDatabaseActivity(databaseActivityId, {
+          state: 'waiting',
+          detail: `${docIds.length} 篇文献，正在取得数据库写入机会`,
+        })
         const releaseCheckpointDeferral = beginDatabaseCheckpointDeferral()
         const affectedTagIds = new Set<string>()
         let recoveredSearchIndexIssue = false
@@ -735,6 +767,10 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
           // long-running delete owns SQLite's writer lock, without surfacing
           // SQLITE_BUSY/SQLITE_LOCKED to the renderer.
           await markDocumentsDeleting(docIds)
+          updateDatabaseActivity(databaseActivityId, {
+            state: 'running',
+            detail: `${docIds.length} 篇文献，已隐藏，正在后台删除`,
+          })
           emitBackgroundTaskStatus({
             taskId,
             kind: 'document-delete',
@@ -758,6 +794,10 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
               documentIds: docIds,
             }, {
               onProgress: (progress) => {
+                updateDatabaseActivity(databaseActivityId, {
+                  state: 'running',
+                  detail: `${progress.completed}/${progress.total} 篇；${progress.message}`,
+                })
                 emitBackgroundTaskStatus({
                   taskId,
                   kind: 'document-delete',
@@ -808,6 +848,10 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
             completedCount: deletedIds.length,
             message: '数据库删除完成，正在清理原文文件',
           })
+          updateDatabaseActivity(databaseActivityId, {
+            state: 'running',
+            detail: `数据库已删除 ${deletedIds.length}/${docIds.length} 篇，正在清理原文文件`,
+          })
           await cleanupDeletedDocumentFilesInBackground(cleanupTasks)
           // Long delay: avoid checkpoint fighting the next UI paint after bulk delete.
           scheduleDatabaseSave({ minDelayMs: 15_000 })
@@ -822,6 +866,14 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
           })
         } catch (error) {
           console.error('[Documents] Background document delete failed:', error)
+          if (/database is locked|database table is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(getErrorMessage(error))) {
+            recordDatabaseBusyIncident(
+              databaseActivityId,
+              error,
+              Date.now() - activityStartedAt,
+              'failed',
+            )
+          }
           if (!documentDeleteRuntimeShuttingDown) {
             try {
               await markDocumentsDeleteFailed(docIds, error)
@@ -842,6 +894,7 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
         } finally {
           docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
           releaseCheckpointDeferral()
+          finishDatabaseActivity(databaseActivityId)
         }
       })().finally(resolve)
     })

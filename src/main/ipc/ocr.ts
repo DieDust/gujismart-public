@@ -620,7 +620,14 @@ async function updateRecoverableBatchOcrItem(
     } else {
       failLegacyBatchItem(itemId, { errorMessage: errorMessage || 'OCR 处理失败', recoverable: true })
     }
-  }, { maxWaitMs: OCR_QUEUE_WRITER_MAX_WAIT_MS })
+  }, {
+    maxWaitMs: OCR_QUEUE_WRITER_MAX_WAIT_MS,
+    activity: {
+      category: 'ocr',
+      label: 'OCR 队列：更新任务状态',
+      detail: `任务状态：${status}`,
+    },
+  })
 }
 
 export async function shutdownOcrRuntime(timeoutMs = 3000): Promise<void> {
@@ -5439,6 +5446,12 @@ async function cancelPersistedOcrQueueForDocument(docId: string): Promise<void> 
     // transaction so OCR cannot retake the writer lock between cancellation
     // records and the visible document state.
     updateDocumentCanceledStatus(safeDocId)
+  }, {
+    activity: {
+      category: 'ocr',
+      label: 'OCR 队列：取消单篇',
+      detail: '正在取消持久化 OCR 队列记录',
+    },
   })
   scheduleDatabaseSave()
 }
@@ -5506,6 +5519,12 @@ async function cancelAllPersistedOcrQueues(): Promise<{ canceledJobs: number; ca
         )
       }
     }
+  }, {
+    activity: {
+      category: 'ocr',
+      label: 'OCR 队列：取消全部',
+      detail: `${queuedDocs.length} 篇文献`,
+    },
   })
   scheduleDatabaseSave()
   return { canceledJobs, canceledDocuments: queuedDocs.length }
@@ -7396,7 +7415,14 @@ export function registerOcrIpc(): void {
                  WHERE id IN (${placeholders})`,
                 ['queued', 'processing', 'pending', null, now, ...persistedChunk],
               )
-            }, { maxWaitMs: OCR_QUEUE_WRITER_MAX_WAIT_MS })
+            }, {
+              maxWaitMs: OCR_QUEUE_WRITER_MAX_WAIT_MS,
+              activity: {
+                category: 'ocr',
+                label: 'OCR 队列：批量入队',
+                detail: `${candidateChunk.length} 篇文献`,
+              },
+            })
             partial.forEach((itemId, docId) => recoverableQueueItemIdsByDocId.set(docId, itemId))
             for (const docId of persistedChunk) {
               emitOcrStatus(event, {

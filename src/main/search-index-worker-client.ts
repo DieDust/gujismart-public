@@ -3,6 +3,7 @@ import { join } from 'path'
 import { Worker } from 'worker_threads'
 import { getErrorMessage } from '../shared/errors'
 import type { SearchReindexDocumentResult } from '../shared/types'
+import { beginDatabaseActivity, finishDatabaseActivity, updateDatabaseActivity } from './database-lock-monitor'
 
 export interface SearchIndexWorkerTask {
   dbFilePath: string
@@ -47,6 +48,13 @@ export function runSearchIndexWorkerTask(
     return Promise.reject(new Error('Search index worker script not found'))
   }
 
+  const databaseActivityId = beginDatabaseActivity({
+    category: 'search-index',
+    label: '后台全文索引',
+    state: 'running',
+    detail: `正在处理第 ${task.completedCount + 1}/${task.totalCount} 篇`,
+  })
+
   return new Promise<SearchReindexDocumentResult>((resolve, reject) => {
     const worker = new Worker(workerPath)
     let settled = false
@@ -61,12 +69,17 @@ export function runSearchIndexWorkerTask(
       if (settled) return
       settled = true
       cleanup()
+      finishDatabaseActivity(databaseActivityId)
       void worker.terminate().finally(callback)
     }
 
     worker.on('message', (message: WorkerMessage) => {
       if (!message || typeof message !== 'object') return
       if (message.type === 'progress') {
+        updateDatabaseActivity(databaseActivityId, {
+          state: message.payload.status === 'queued' ? 'queued' : 'running',
+          detail: message.payload.message || `正在处理第 ${task.completedCount + 1}/${task.totalCount} 篇`,
+        })
         onProgress(message.payload)
         return
       }

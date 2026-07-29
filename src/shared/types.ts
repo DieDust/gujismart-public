@@ -143,6 +143,58 @@ export interface DatabaseStorageDiagnostics {
   maintenanceState: DatabaseMaintenanceState
 }
 
+export type DatabaseLockActivityCategory =
+  | 'document-delete'
+  | 'ocr'
+  | 'import'
+  | 'search-index'
+  | 'checkpoint'
+  | 'maintenance'
+  | 'foreground-write'
+  | 'other'
+
+export type DatabaseLockActivityState = 'queued' | 'waiting' | 'holding' | 'running'
+
+export interface DatabaseLockActivity {
+  id: string
+  category: DatabaseLockActivityCategory
+  label: string
+  state: DatabaseLockActivityState
+  startedAt: string
+  elapsedMs: number
+  detail?: string
+}
+
+export interface DatabaseBusyIncident {
+  id: string
+  operationLabel: string
+  occurredAt: string
+  waitedMs: number
+  outcome: 'recovered' | 'failed'
+  error: string
+}
+
+export type DatabaseLockDiagnosticsStatus =
+  | 'available'
+  | 'busy-confirmed-internal'
+  | 'busy-internal-candidate'
+  | 'busy-unattributed'
+  | 'probe-error'
+
+export interface DatabaseLockDiagnostics {
+  status: DatabaseLockDiagnosticsStatus
+  checkedAt: string
+  processId: number
+  writerAvailable: boolean
+  probeElapsedMs: number
+  ownerConfidence: 'confirmed' | 'candidate' | 'none'
+  message: string
+  activeActivities: DatabaseLockActivity[]
+  likelyOwners: DatabaseLockActivity[]
+  recentBusyIncidents: DatabaseBusyIncident[]
+  probeError?: string
+}
+
 export interface DatabaseMaintenanceResult {
   success: boolean
   message: string

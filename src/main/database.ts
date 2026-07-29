@@ -15,6 +15,13 @@ import {
   isDatabaseDiagnosticsWorkerAvailable,
   runDatabaseCheckpointWorkerTask,
 } from './database-diagnostics-worker-client'
+import {
+  beginDatabaseActivity,
+  finishDatabaseActivity,
+  recordDatabaseBusyIncident,
+  updateDatabaseActivity,
+  type DatabaseActivityDescriptor,
+} from './database-lock-monitor'
 
 type NativeDatabase = Database.Database
 
@@ -3683,6 +3690,12 @@ export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void {
       return
     }
     const checkpointPath = dbFilePath
+    const checkpointActivityId = beginDatabaseActivity({
+      category: 'checkpoint',
+      label: '数据库 WAL 检查点',
+      state: 'running',
+      detail: '后台回收已提交的 WAL 页面',
+    })
     deferredDatabaseCheckpointPromise = runDatabaseCheckpointWorkerTask({
       dbFilePath: checkpointPath,
       mode: 'PASSIVE',
@@ -3692,6 +3705,7 @@ export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void {
       console.error('[Database] Deferred checkpoint worker failed', error)
     }).finally(() => {
       deferredDatabaseCheckpointPromise = null
+      finishDatabaseActivity(checkpointActivityId)
     })
   }, delay)
   deferredDatabaseSaveTimer.unref?.()
@@ -3777,14 +3791,28 @@ export function run(sql: string, params?: unknown[]): void {
   runOn(getDatabase(), sql, params)
 }
 
+export interface DatabaseWriteOptions {
+  maxWaitMs?: number
+  activity?: DatabaseActivityDescriptor | false
+}
+
 export async function runAsync(
   sql: string,
   params?: unknown[],
-  options?: { maxWaitMs?: number },
+  options?: DatabaseWriteOptions,
 ): Promise<void> {
   const database = getDatabase()
   const maxWaitMs = Math.max(0, Number(options?.maxWaitMs ?? DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS))
+  const startedAt = Date.now()
   const deadline = Date.now() + maxWaitMs
+  const activityId = options?.activity === false
+    ? null
+    : beginDatabaseActivity(options?.activity || {
+      category: 'foreground-write',
+      label: '前台数据库写入',
+      state: 'waiting',
+    })
+  let lastBusyError: unknown = null
   beginForegroundDatabaseWrite()
   try {
     while (true) {
@@ -3794,25 +3822,46 @@ export async function runAsync(
         } else {
           database.exec(sql)
         }
+        if (lastBusyError) {
+          recordDatabaseBusyIncident(activityId, lastBusyError, Date.now() - startedAt, 'recovered')
+        }
         return
       } catch (error) {
-        if (!isDatabaseBusyError(error) || Date.now() >= deadline) throw error
+        if (!isDatabaseBusyError(error)) throw error
+        lastBusyError = error
+        if (Date.now() >= deadline) {
+          recordDatabaseBusyIncident(activityId, error, Date.now() - startedAt, 'failed')
+          throw error
+        }
         await sleepAsync(Math.min(DATABASE_ASYNC_BUSY_RETRY_DELAY_MS, Math.max(1, deadline - Date.now())))
       }
     }
   } finally {
     endForegroundDatabaseWrite()
+    if (activityId) finishDatabaseActivity(activityId)
   }
 }
 
 export async function transactionAsync(
   fn: () => void,
-  options?: { maxWaitMs?: number },
+  options?: DatabaseWriteOptions,
 ): Promise<void> {
   const database = getDatabase()
+  const startedAt = Date.now()
+  const activityId = options?.activity === false
+    ? null
+    : beginDatabaseActivity(options?.activity || {
+      category: 'foreground-write',
+      label: '前台数据库事务',
+      state: 'waiting',
+    })
   beginForegroundDatabaseWrite()
   try {
-    await runAsync('BEGIN IMMEDIATE TRANSACTION', undefined, options)
+    await runAsync('BEGIN IMMEDIATE TRANSACTION', undefined, {
+      maxWaitMs: options?.maxWaitMs,
+      activity: false,
+    })
+    if (activityId) updateDatabaseActivity(activityId, { state: 'holding' })
     try {
       // Keep the acquired write transaction entirely synchronous. The only
       // yielding/retry point is before BEGIN succeeds, so unrelated IPC work
@@ -3827,12 +3876,18 @@ export async function transactionAsync(
       }
       throw error
     }
+  } catch (error) {
+    if (isDatabaseBusyError(error)) {
+      recordDatabaseBusyIncident(activityId, error, Date.now() - startedAt, 'failed')
+    }
+    throw error
   } finally {
     endForegroundDatabaseWrite()
+    if (activityId) finishDatabaseActivity(activityId)
   }
 }
 
-export function transaction(fn: () => void): void {
+export function transaction(fn: () => void, options?: { activity?: DatabaseActivityDescriptor | false }): void {
   const database = getDatabase()
   // Helpers such as the task scheduler use transaction() internally. When a
   // caller already acquired an async writer transaction, join it instead of
@@ -3841,9 +3896,18 @@ export function transaction(fn: () => void): void {
     fn()
     return
   }
+  const startedAt = Date.now()
+  const activityId = options?.activity === false
+    ? null
+    : beginDatabaseActivity(options?.activity || {
+      category: 'foreground-write',
+      label: '同步数据库事务',
+      state: 'waiting',
+    })
   beginForegroundDatabaseWrite()
   try {
     runWithBusyRetry(() => database.exec('BEGIN IMMEDIATE TRANSACTION'))
+    if (activityId) updateDatabaseActivity(activityId, { state: 'holding' })
     try {
       fn()
       runWithBusyRetry(() => database.exec('COMMIT'))
@@ -3855,8 +3919,14 @@ export function transaction(fn: () => void): void {
       }
       throw error
     }
+  } catch (error) {
+    if (isDatabaseBusyError(error)) {
+      recordDatabaseBusyIncident(activityId, error, Date.now() - startedAt, 'failed')
+    }
+    throw error
   } finally {
     endForegroundDatabaseWrite()
+    if (activityId) finishDatabaseActivity(activityId)
   }
 }
 

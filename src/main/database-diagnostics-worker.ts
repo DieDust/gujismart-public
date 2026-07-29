@@ -7,6 +7,8 @@ import type {
   DatabaseCheckpointWorkerResult,
   DatabaseCheckpointWorkerTask,
   DatabaseDiagnosticsWorkerTask,
+  DatabaseLockProbeWorkerResult,
+  DatabaseLockProbeWorkerTask,
 } from './database-diagnostics-worker-client'
 
 if (!parentPort) {
@@ -16,6 +18,14 @@ if (!parentPort) {
 type DatabaseDiagnosticsWorkerMessage =
   | { type: 'scanPagePayloadStorage'; task: DatabaseDiagnosticsWorkerTask }
   | { type: 'checkpointDatabase'; task: DatabaseCheckpointWorkerTask }
+  | { type: 'probeDatabaseLock'; task: DatabaseLockProbeWorkerTask }
+
+function isDatabaseBusyError(error: unknown): boolean {
+  const record = typeof error === 'object' && error !== null ? error as { code?: unknown; message?: unknown } : {}
+  const code = String(record.code || '')
+  const message = String(record.message || error || '')
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || /database is locked|database table is locked/i.test(message)
+}
 
 parentPort.on('message', (message: DatabaseDiagnosticsWorkerMessage) => {
   if (!message?.task) return
@@ -45,6 +55,31 @@ parentPort.on('message', (message: DatabaseDiagnosticsWorkerMessage) => {
         checkpointedFrames: Number(row.checkpointed || 0),
       }
       parentPort?.postMessage({ type: 'checkpointResult', result })
+      return
+    }
+    if (message.type === 'probeDatabaseLock') {
+      const startedAt = Date.now()
+      sqlite = new Database(message.task.dbFilePath, { fileMustExist: true })
+      sqlite.pragma('busy_timeout = 0')
+      try {
+        sqlite.exec('BEGIN IMMEDIATE TRANSACTION')
+        sqlite.exec('ROLLBACK')
+        const result: DatabaseLockProbeWorkerResult = {
+          writerAvailable: true,
+          busy: false,
+          elapsedMs: Date.now() - startedAt,
+        }
+        parentPort?.postMessage({ type: 'lockProbeResult', result })
+      } catch (error) {
+        if (sqlite.inTransaction) sqlite.exec('ROLLBACK')
+        const result: DatabaseLockProbeWorkerResult = {
+          writerAvailable: false,
+          busy: isDatabaseBusyError(error),
+          elapsedMs: Date.now() - startedAt,
+          error: getErrorMessage(error),
+        }
+        parentPort?.postMessage({ type: 'lockProbeResult', result })
+      }
     }
   } catch (error) {
     parentPort?.postMessage({ type: 'error', error: getErrorMessage(error) })

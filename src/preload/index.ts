@@ -60,6 +60,7 @@ import type {
   BookTranslationProgressEvent,
   BookTranslationStartResult,
   DatabaseMaintenanceResult,
+  DatabaseLockDiagnostics,
   DatabaseStorageDiagnostics,
   ActiveTranslationGlossaryPayload,
   AppPathName,
@@ -1033,6 +1034,8 @@ const api = {
   exportDocumentList: (): Promise<BackupResult> => ipcRenderer.invoke('backup:exportDocumentList'),
   getDatabaseStorageDiagnostics: (): Promise<DatabaseStorageDiagnostics> =>
     ipcRenderer.invoke('database:getStorageDiagnostics'),
+  getDatabaseLockDiagnostics: (): Promise<DatabaseLockDiagnostics> =>
+    ipcRenderer.invoke('database:getLockDiagnostics'),
   exportDatabaseStorageDiagnostics: (): Promise<DatabaseMaintenanceResult> =>
     ipcRenderer.invoke('database:exportStorageDiagnostics'),
   compactDatabase: (): Promise<DatabaseMaintenanceResult> =>
