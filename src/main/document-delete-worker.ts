@@ -12,10 +12,12 @@ if (!parentPort) {
 }
 
 const ID_CHUNK_SIZE = 100
-// The old main-thread path used 80-row drains to preserve UI responsiveness.
-// This code runs in a worker, so a larger bounded batch removes thousands of
-// per-statement WAL commits without risking an Electron renderer freeze.
-const ROW_CHUNK_SIZE = 2_000
+// Worker threads keep Electron responsive, but SQLite still permits only one
+// writer. Keep each write statement bounded so OCR/import can acquire the
+// writer between chunks instead of waiting behind one multi-minute DELETE.
+const ROW_CHUNK_SIZE = 500
+const LARGE_PAYLOAD_ROW_CHUNK_SIZE = 100
+const FTS_ROW_CHUNK_SIZE = 250
 const DOCUMENT_BATCH_SIZE = 25
 const DATABASE_BUSY_TIMEOUT_MS = 5_000
 // Leave a window wider than foreground writer retry intervals. A very short
@@ -78,11 +80,31 @@ function runForIdChunks(
   }
 }
 
+function getDeleteRowChunkSize(tableName: string): number {
+  if (tableName === 'embedding_chunks'
+    || tableName === 'page_ocr_versions'
+    || tableName === 'ocr_artifact_versions'
+    || tableName === 'pages') {
+    return LARGE_PAYLOAD_ROW_CHUNK_SIZE
+  }
+  return ROW_CHUNK_SIZE
+}
+
+function withForeignKeysDisabled(sqlite: NativeDatabase, callback: () => void): void {
+  sqlite.pragma('foreign_keys = OFF')
+  try {
+    callback()
+  } finally {
+    sqlite.pragma('foreign_keys = ON')
+  }
+}
+
 function deleteRowsByColumn(
   sqlite: NativeDatabase,
   tableName: string,
   columnName: string,
   documentIds: string[],
+  rowChunkSize = getDeleteRowChunkSize(tableName),
 ): void {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(columnName)) {
     throw new Error(`Unsafe delete relation identifier: ${tableName}.${columnName}`)
@@ -97,7 +119,7 @@ function deleteRowsByColumn(
        LIMIT ?`,
     )
     while (true) {
-      const rows = selectRows.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
+      const rows = selectRows.all(...chunkIds, rowChunkSize) as Array<{ delete_rowid: number }>
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
       waitForForegroundWriter()
@@ -112,11 +134,29 @@ function deleteRowsByDocIds(sqlite: NativeDatabase, tableName: string, documentI
 }
 
 function deleteOcrData(sqlite: NativeDatabase, documentIds: string[]): void {
-  // ocr_runs(doc_id), ocr_page_attempts(run_id) and
-  // ocr_artifact_versions(run_id) already have schema indexes. Deleting from
-  // the root lets SQLite cascade through those indexes and avoids building
-  // new global indexes over a user's entire OCR history during deletion.
-  deleteRowsByDocIds(sqlite, 'ocr_runs', documentIds)
+  if (!tableExists(sqlite, 'ocr_runs')) return
+
+  const runIds: string[] = []
+  runForIdChunks(documentIds, (chunkIds, placeholders) => {
+    const rows = sqlite.prepare(
+      `SELECT id FROM ocr_runs WHERE doc_id IN (${placeholders})`,
+    ).all(...chunkIds) as Array<{ id: string }>
+    rows.forEach((row) => {
+      if (row.id) runIds.push(row.id)
+    })
+  })
+  if (runIds.length === 0) return
+
+  // Deleting an OCR run through FK cascades is catastrophically expensive on
+  // older libraries: artifact.attempt_id and attempt.page_id are not indexed,
+  // so SQLite can rescan the complete OCR history once per page attempt. Drain
+  // artifacts through the indexed run_id first, then remove attempts and runs
+  // with only the now-redundant FK checks disabled.
+  deleteRowsByColumn(sqlite, 'ocr_artifact_versions', 'run_id', runIds)
+  withForeignKeysDisabled(sqlite, () => {
+    deleteRowsByColumn(sqlite, 'ocr_page_attempts', 'run_id', runIds)
+    deleteRowsByColumn(sqlite, 'ocr_runs', 'id', runIds)
+  })
 }
 
 function deleteDocumentRowsAfterExplicitCleanup(sqlite: NativeDatabase, documentIds: string[]): void {
@@ -125,8 +165,7 @@ function deleteDocumentRowsAfterExplicitCleanup(sqlite: NativeDatabase, document
   // once per document (notably OCR artifact doc_id), even though no selected
   // rows remain. Disable only the redundant final checks inside this worker
   // connection; all relation cleanup continues to run with FK enforcement on.
-  sqlite.pragma('foreign_keys = OFF')
-  try {
+  withForeignKeysDisabled(sqlite, () => {
     waitForForegroundWriter()
     const deleteRows = sqlite.transaction(() => {
       runForIdChunks(documentIds, (chunkIds, placeholders) => {
@@ -134,9 +173,16 @@ function deleteDocumentRowsAfterExplicitCleanup(sqlite: NativeDatabase, document
       })
     })
     deleteRows.immediate()
-  } finally {
-    sqlite.pragma('foreign_keys = ON')
-  }
+  })
+}
+
+function deletePageRowsAfterExplicitCleanup(sqlite: NativeDatabase, documentIds: string[]): void {
+  // Direct page relations are drained before this step. Leaving FK checks on
+  // would still scan unindexed legacy page_id columns once for every page even
+  // though no matching children remain.
+  withForeignKeysDisabled(sqlite, () => {
+    deleteRowsByDocIds(sqlite, 'pages', documentIds)
+  })
 }
 
 function deleteAiChatTurns(sqlite: NativeDatabase, documentIds: string[]): void {
@@ -167,7 +213,7 @@ function deleteFtsRows(sqlite: NativeDatabase, documentIds: string[]): void {
         `SELECT rowid AS delete_rowid FROM pages_fts WHERE doc_id IN (${placeholders}) LIMIT ?`,
       )
       while (true) {
-        const rows = selectRows.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
+        const rows = selectRows.all(...chunkIds, FTS_ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
         if (rows.length === 0) break
         const rowPlaceholders = rows.map(() => '?').join(', ')
         waitForForegroundWriter()
@@ -188,7 +234,7 @@ function deleteFtsRows(sqlite: NativeDatabase, documentIds: string[]): void {
        LIMIT ?`,
     )
     while (true) {
-      const rows = selectSegments.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
+      const rows = selectSegments.all(...chunkIds, FTS_ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
       if (rows.length === 0) break
       const rowPlaceholders = rows.map(() => '?').join(', ')
       const rowIds = rows.map((row) => row.delete_rowid)
@@ -357,11 +403,15 @@ function getAffectedTagIds(sqlite: NativeDatabase, documentIds: string[]): strin
 function deleteDocumentBatch(
   sqlite: NativeDatabase,
   documentIds: string[],
+  reportStage: (message: string) => void,
 ): { recoveredSearchIndexIssue: boolean } {
   let recoveredSearchIndexIssue = false
 
+  reportStage('正在清理向量数据')
   deleteRowsByDocIds(sqlite, 'embedding_chunks', documentIds)
   deleteRowsByDocIds(sqlite, 'embedding_index_status', documentIds)
+
+  reportStage('正在清理全文检索数据')
   try {
     deleteRowsByDocIds(sqlite, 'search_ngram_index', documentIds)
   } catch (error) {
@@ -369,9 +419,13 @@ function deleteDocumentBatch(
     recoveredSearchIndexIssue = true
     resetRebuildableSearchTables(sqlite)
   }
+
+  reportStage('正在清理 OCR 历史数据')
   deleteRowsByDocIds(sqlite, 'metadata_candidates', documentIds)
   deleteRowsByDocIds(sqlite, 'page_ocr_versions', documentIds)
   deleteOcrData(sqlite, documentIds)
+
+  reportStage('正在清理批处理、AI 与翻译数据')
   deleteRowsByDocIds(sqlite, 'page_ai_layout_cache', documentIds)
   deleteRowsByDocIds(sqlite, 'page_translation_cache', documentIds)
   deleteRowsByDocIds(sqlite, 'page_translation_units', documentIds)
@@ -390,6 +444,7 @@ function deleteDocumentBatch(
   deleteRowsByColumn(sqlite, 'export_snapshots', 'document_id', documentIds)
   deleteRowsByDocIds(sqlite, 'translation_context_snapshots', documentIds)
 
+  reportStage('正在清理全文索引与页面数据')
   try {
     deleteFtsRows(sqlite, documentIds)
     deleteRowsByDocIds(sqlite, 'search_index_segments', documentIds)
@@ -400,7 +455,9 @@ function deleteDocumentBatch(
     resetRebuildableSearchTables(sqlite)
   }
 
-  deleteRowsByDocIds(sqlite, 'pages', documentIds)
+  deletePageRowsAfterExplicitCleanup(sqlite, documentIds)
+
+  reportStage('正在清理标签、项目关系与文献主记录')
   deleteRowsByDocIds(sqlite, 'document_folders', documentIds)
   deleteRowsByDocIds(sqlite, 'document_tags', documentIds)
   deleteRowsByColumn(sqlite, 'library_project_documents', 'document_id', documentIds)
@@ -421,6 +478,10 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
       : null
     sqlite.pragma('foreign_keys = ON')
     sqlite.pragma('journal_mode = WAL')
+    // This is connection-local. The main connection already disables it, but
+    // every new worker connection otherwise defaults back to 1,000 WAL pages
+    // and performs checkpoint I/O on its own commit path.
+    sqlite.pragma('wal_autocheckpoint = 0')
     sqlite.pragma('synchronous = NORMAL')
     sqlite.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
 
@@ -436,7 +497,14 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
     let recoveredSearchIndexIssue = false
     for (let offset = 0; offset < documentIds.length; offset += DOCUMENT_BATCH_SIZE) {
       const batch = documentIds.slice(offset, offset + DOCUMENT_BATCH_SIZE)
-      const result = deleteDocumentBatch(sqlite, batch)
+      const result = deleteDocumentBatch(sqlite, batch, (message) => {
+        emitProgress({
+          completed: deletedIds.length,
+          total: documentIds.length,
+          phase: 'deleting',
+          message,
+        })
+      })
       if (result.recoveredSearchIndexIssue) recoveredSearchIndexIssue = true
       deletedIds.push(...batch)
       emitProgress({

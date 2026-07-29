@@ -72,7 +72,8 @@ export function runDocumentDeleteWorkerTask(
           phase: message.phase,
           message: message.message,
         })
-        if (message.completed === message.total || message.completed % 25 === 0) {
+        if (message.completed === message.total
+          || (message.message === '正在后台删除文献' && message.completed % 25 === 0)) {
           console.log(`[Documents] Background delete progress: ${message.completed}/${message.total}`)
         }
         return

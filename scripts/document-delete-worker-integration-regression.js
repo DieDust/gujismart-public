@@ -129,11 +129,11 @@ function createFixture() {
         insertEmbedding.run(documentId, Buffer.alloc(512, chunk % 255))
       }
       const runId = `ocr-run-${index}`
-      const attemptId = `ocr-attempt-${index}`
       const pageId = `ocr-page-${index}`
       insertOcrRun.run(runId, documentId)
-      insertOcrAttempt.run(attemptId, runId, pageId)
-      for (let artifact = 0; artifact < 40; artifact += 1) {
+      for (let artifact = 0; artifact < 200; artifact += 1) {
+        const attemptId = `ocr-attempt-${index}-${artifact}`
+        insertOcrAttempt.run(attemptId, runId, `${pageId}-${artifact}`)
         insertOcrArtifact.run(
           `ocr-artifact-${index}-${artifact}`,
           runId,
@@ -215,6 +215,9 @@ async function run() {
     assert.deepStrictEqual([...result.affectedTagIds].sort(), ['tag-0', 'tag-1', 'tag-2'])
     assert.strictEqual(progress[0]?.phase, 'preparing')
     assert.strictEqual(progress[0]?.completed, 0)
+    assert(progress.some((entry) => entry.message === '正在清理向量数据'))
+    assert(progress.some((entry) => entry.message === '正在清理 OCR 历史数据'))
+    assert(progress.some((entry) => entry.message === '正在清理全文索引与页面数据'))
     assert.strictEqual(progress.at(-1)?.phase, 'deleting')
     assert.strictEqual(progress.at(-1)?.completed, fixture.documentIds.length)
     assert.strictEqual(

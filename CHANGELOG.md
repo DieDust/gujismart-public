@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 1.2.20 - 2026-07-29
+
+### 中文
+
+#### 批量永久删除写锁与 OCR 恢复
+
+- 根据数据库占用监视的现场信息，确认同一进程内的后台永久删除在首批 `0/N` 阶段长期占用 SQLite 写锁，导致 OCR 入队、取消、文件夹操作和智能视图刷新依次超时；问题不是用户数据库损坏，也不是旧版本外部进程持锁。
+- 修复 OCR 历史的退化级联删除：先通过已有的 `run_id` 索引分块清理 OCR 产物，再显式删除页尝试和运行记录，避免未索引的 `attempt_id` / `page_id` 外键让 SQLite 为每一页重复扫描整张 OCR 历史表。
+- 页面所有子数据清理完成后，不再执行冗余的旧库外键全表复查；向量、OCR、全文索引、AI、翻译、标签、项目关系和文献主记录仍会完整物理删除，不改为仅隐藏或软删除。
+- 删除 worker 的普通写入批次由 2,000 行缩小到 500 行，向量 BLOB、OCR 产物和页面等大负载表缩小到 100 行，FTS 清理缩小到 250 行，使 OCR、导入等前台写入能够在批次间取得写锁。
+- 删除 worker 连接关闭默认的 WAL 自动检查点，避免提交路径额外承担检查点 I/O；进度新增向量、全文检索、OCR、AI/翻译、页面和主记录阶段，数据库占用监视可直接显示当前清理位置。
+- 扩充真实 SQLite worker 回归：在缺少 OCR `attempt_id` 索引、保留其他文献 OCR 历史以及 320 篇 / 32,000 条向量的条件下，验证删除完成、前台写入可穿插、外键无残留且 Electron 主线程持续响应。
+
+#### 下载
+
+- `GujiSmart-1.2.20-Setup-x64.exe`
+- `GujiSmart-1.2.20-Portable-x64.exe`
+
+### English
+
+#### Bulk Permanent-Delete Writer Locks and OCR Recovery
+
+- Used the database occupancy report to confirm that the in-process permanent-delete worker held the SQLite writer during the initial `0/N` batch, causing OCR enqueue/cancel, folder actions, and Smart View refreshes to time out. The incident was not database corruption or an external older process.
+- Replaced the regressed OCR cascade path with indexed, layered cleanup: OCR artifacts are drained in bounded batches through `run_id` before page attempts and run records are removed, avoiding repeated full-history scans through unindexed `attempt_id` and `page_id` foreign keys.
+- After all page children are explicitly cleaned, page removal skips redundant legacy foreign-key rescans. Vectors, OCR history, full-text indexes, AI and translation data, tags, project memberships, and document rows remain fully and physically removed.
+- Reduced ordinary delete-worker statements from 2,000 to 500 rows, large vector/OCR/page payload statements to 100 rows, and FTS statements to 250 rows so foreground OCR and import writers can acquire SQLite between chunks.
+- Disabled connection-local WAL auto-checkpointing in the delete worker and added stage-level progress for vector, search, OCR, AI/translation, page, and final record cleanup so occupancy reports identify the active phase.
+- Expanded real SQLite worker coverage for a missing OCR attempt index, preserved unrelated OCR history, and 320 documents with 32,000 vectors while checking interleaved foreground writes, foreign-key integrity, and Electron main-thread responsiveness.
+
+#### Downloads
+
+- `GujiSmart-1.2.20-Setup-x64.exe`
+- `GujiSmart-1.2.20-Portable-x64.exe`
+
 ## 1.2.19 - 2026-07-29
 
 ### 中文
