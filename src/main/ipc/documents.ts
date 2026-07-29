@@ -298,6 +298,21 @@ function uniqueDocumentIds(ids: string[]): string[] {
   return [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))]
 }
 
+function recordDocumentOpenedInBackground(docId: string): void {
+  const safeDocId = String(docId || '').trim()
+  if (!safeDocId) return
+  void runAsync(
+    'UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?',
+    [new Date().toISOString(), safeDocId],
+    { maxWaitMs: 5_000 },
+  ).then(() => {
+    scheduleDatabaseSave()
+  }).catch((error) => {
+    // Opening/reading is more important than optional recent-item bookkeeping.
+    console.warn('[Documents] Deferred last-opened update skipped', safeDocId, error)
+  })
+}
+
 function runForIdChunks(ids: string[], callback: (chunkIds: string[], placeholders: string) => void): void {
   for (let index = 0; index < ids.length; index += DELETE_SQL_CHUNK_SIZE) {
     const chunkIds = ids.slice(index, index + DELETE_SQL_CHUNK_SIZE)
@@ -693,6 +708,16 @@ async function cleanupDeletedDocumentFilesInBackground(tasks: DeletePathTask[]):
 
 function scheduleDocumentDeleteJob(docIds: string[]): void {
   if (documentDeleteRuntimeShuttingDown) return
+  const taskId = `document-delete:${nanoid()}`
+  emitBackgroundTaskStatus({
+    taskId,
+    kind: 'document-delete',
+    status: 'queued',
+    progress: 0,
+    totalCount: docIds.length,
+    completedCount: 0,
+    message: `已提交 ${docIds.length} 篇文献，等待后台删除`,
+  })
   const runQueuedJob = (): Promise<void> => new Promise<void>((resolve) => {
     setImmediate(() => {
       void (async () => {
@@ -710,6 +735,15 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
           // long-running delete owns SQLite's writer lock, without surfacing
           // SQLITE_BUSY/SQLITE_LOCKED to the renderer.
           await markDocumentsDeleting(docIds)
+          emitBackgroundTaskStatus({
+            taskId,
+            kind: 'document-delete',
+            status: 'processing',
+            progress: 0,
+            totalCount: docIds.length,
+            completedCount: 0,
+            message: '正在准备后台删除',
+          })
           try {
             await markLibraryStateCacheDirtyAsync(await getDocumentLibraryProjectIds(docIds))
           } catch (cacheError) {
@@ -722,6 +756,18 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
             const workerResult = await runDocumentDeleteWorkerTask({
               dbFilePath: getDatabaseFilePath(),
               documentIds: docIds,
+            }, {
+              onProgress: (progress) => {
+                emitBackgroundTaskStatus({
+                  taskId,
+                  kind: 'document-delete',
+                  status: 'processing',
+                  progress: progress.total > 0 ? progress.completed / progress.total : 0,
+                  totalCount: progress.total,
+                  completedCount: progress.completed,
+                  message: progress.message,
+                })
+              },
             })
             deletedIds = workerResult.deletedIds
             workerResult.affectedTagIds.forEach((tagId) => affectedTagIds.add(tagId))
@@ -735,6 +781,15 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
               getAffectedTagIdsForDelete(batch).forEach((tagId) => affectedTagIds.add(tagId))
               const deleteResult = await deleteDocumentData(batch)
               if (deleteResult.recoveredSearchIndexIssue) recoveredSearchIndexIssue = true
+              emitBackgroundTaskStatus({
+                taskId,
+                kind: 'document-delete',
+                status: 'processing',
+                progress: Math.min(1, (offset + batch.length) / docIds.length),
+                totalCount: docIds.length,
+                completedCount: Math.min(docIds.length, offset + batch.length),
+                message: '正在后台删除文献',
+              })
               await yieldToEventLoop()
             }
           }
@@ -744,9 +799,27 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
           notifySearchContentChanged()
           refreshDeletedDocumentTags([...affectedTagIds])
           const cleanupTasks = getDeleteCleanupTasks(deletedIds.map((id) => ({ id })))
+          emitBackgroundTaskStatus({
+            taskId,
+            kind: 'document-delete',
+            status: 'processing',
+            progress: 0.99,
+            totalCount: docIds.length,
+            completedCount: deletedIds.length,
+            message: '数据库删除完成，正在清理原文文件',
+          })
           await cleanupDeletedDocumentFilesInBackground(cleanupTasks)
           // Long delay: avoid checkpoint fighting the next UI paint after bulk delete.
           scheduleDatabaseSave({ minDelayMs: 15_000 })
+          emitBackgroundTaskStatus({
+            taskId,
+            kind: 'document-delete',
+            status: 'completed',
+            progress: 1,
+            totalCount: docIds.length,
+            completedCount: deletedIds.length,
+            message: `已完成删除 ${deletedIds.length} 篇文献`,
+          })
         } catch (error) {
           console.error('[Documents] Background document delete failed:', error)
           if (!documentDeleteRuntimeShuttingDown) {
@@ -756,6 +829,16 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
               console.error('[Documents] Failed to persist document delete error state:', markError)
             }
           }
+          emitBackgroundTaskStatus({
+            taskId,
+            kind: 'document-delete',
+            status: 'error',
+            progress: 1,
+            totalCount: docIds.length,
+            completedCount: 0,
+            message: '后台删除失败，文献已恢复显示',
+            errorMessage: formatDocumentDeleteFailureMessage(error),
+          })
         } finally {
           docIds.forEach((docId) => activeDocumentDeleteIds.delete(docId))
           releaseCheckpointDeferral()
@@ -832,14 +915,13 @@ export async function shutdownDocumentImportRuntime(timeoutMs = 30000): Promise<
   await waitForDocumentImportShutdown(activeJobs, timeoutMs)
 }
 
-export async function shutdownDocumentDeleteRuntime(timeoutMs = 30000): Promise<void> {
+export async function shutdownDocumentDeleteRuntime(timeoutMs = 2_000): Promise<void> {
   documentDeleteRuntimeShuttingDown = true
-  const activeJobs = [...activeDocumentDeleteJobs]
-  if (activeJobs.length > 0) {
-    await waitForDocumentDeleteShutdown(activeJobs, timeoutMs)
-  }
+  // Terminate SQLite workers first. Waiting while a worker owns a schema/write
+  // lock prevents OCR/import shutdown from persisting and makes the app appear
+  // impossible to close. Rows already marked `deleting` are resumed next start.
   await shutdownDocumentDeleteWorkers()
-  await waitForDocumentDeleteShutdown([...activeDocumentDeleteJobs], 2_000)
+  await waitForDocumentDeleteShutdown([...activeDocumentDeleteJobs], timeoutMs)
 }
 
 class BookTranslationShutdownError extends Error {
@@ -4863,7 +4945,7 @@ export function registerDocumentIpc(): void {
     )
     if (!doc) return null
 
-    run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?', [new Date().toISOString(), id])
+    recordDocumentOpenedInBackground(id)
     await ensureDeferredPdfPageRecordsReadyForRead(doc)
 
     const pages = hydratePagePayloadRows(queryAll<DocumentPage>('SELECT * FROM pages WHERE doc_id = ? ORDER BY page_num', [id]))
@@ -4908,7 +4990,7 @@ export function registerDocumentIpc(): void {
     )
     if (!doc) return null
 
-    run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?', [new Date().toISOString(), id])
+    recordDocumentOpenedInBackground(id)
     await ensureDeferredPdfPageRecordsReadyForRead(doc)
 
     const pages = queryAll<DocumentLightPage>(`
@@ -5093,7 +5175,7 @@ export function registerDocumentIpc(): void {
   ipcMain.handle('documents:getReadingWindow', async (_event, docId: string, pageIndex?: number, radius?: number): Promise<DocumentReadingWindow | null> => {
     const doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [docId])
     if (!doc) return null
-    run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?', [new Date().toISOString(), docId])
+    recordDocumentOpenedInBackground(docId)
     const pageCount = Number(doc.page_count || 0)
     const safeIndex = Math.max(0, Math.min(Math.max(0, pageCount - 1), Math.round(Number(pageIndex || 0))))
     const safeRadius = Math.max(0, Math.min(20, Math.round(Number(radius ?? 2))))

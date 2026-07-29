@@ -137,6 +137,7 @@ const BACKGROUND_HEALTH_REPORT_MESSAGE_KEY = 'background-health-report'
 const BACKGROUND_OCR_FINALIZE_MESSAGE_KEY = 'background-ocr-finalize'
 const BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY = 'background-startup-recovery'
 const BACKGROUND_EMBEDDING_MESSAGE_KEY = 'background-embedding-index'
+const BACKGROUND_DOCUMENT_DELETE_MESSAGE_KEY = 'background-document-delete'
 const HEALTH_REPORT_REFRESH_DEBOUNCE_MS = 800
 const BASE_DATA_REFRESH_DEBOUNCE_MS = 600
 const SMART_COUNTS_REFRESH_INTERVAL_MS = 5_000
@@ -3521,6 +3522,41 @@ export default function LibraryView({
         ? `（${Math.min(Number(event.completedCount || 0), Number(event.totalCount))}/${event.totalCount}）`
         : ''
 
+      if (event.kind === 'document-delete') {
+        if (event.status === 'queued' || event.status === 'processing') {
+          message.loading({
+            content: `${event.message || '正在后台删除文献'}${countText}`,
+            key: BACKGROUND_DOCUMENT_DELETE_MESSAGE_KEY,
+            duration: 0,
+          })
+          return
+        }
+
+        if (event.status === 'completed') {
+          message.success({
+            content: event.message || '后台删除完成',
+            key: BACKGROUND_DOCUMENT_DELETE_MESSAGE_KEY,
+            duration: 4,
+          })
+          void Promise.all([
+            loadBaseData(),
+            loadDocuments(filter, { silent: true }),
+          ])
+          scheduleHealthReportRefresh(1_000)
+          scheduleSmartViewCountsRefresh(200)
+          return
+        }
+
+        message.error({
+          content: event.errorMessage ? `后台删除失败：${event.errorMessage}` : '后台删除失败，文献已恢复显示',
+          key: BACKGROUND_DOCUMENT_DELETE_MESSAGE_KEY,
+          duration: 8,
+        })
+        void loadDocuments(filter, { silent: true })
+        scheduleSmartViewCountsRefresh(200)
+        return
+      }
+
       if (event.kind === 'ocr-finalize') {
         if (event.status === 'queued' || event.status === 'processing') {
           message.loading({
@@ -3694,6 +3730,7 @@ export default function LibraryView({
       message.destroy(BACKGROUND_OCR_FINALIZE_MESSAGE_KEY)
       message.destroy(BACKGROUND_STARTUP_RECOVERY_MESSAGE_KEY)
       message.destroy(BACKGROUND_EMBEDDING_MESSAGE_KEY)
+      message.destroy(BACKGROUND_DOCUMENT_DELETE_MESSAGE_KEY)
     }
   }, [filter, loadBaseData, loadDocuments, loadHealthReport, scheduleHealthReportRefresh, scheduleSmartViewCountsRefresh])
 

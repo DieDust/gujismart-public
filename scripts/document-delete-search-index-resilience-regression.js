@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const assert = require('assert')
 
 const root = path.resolve(__dirname, '..')
 
@@ -34,6 +35,9 @@ const libraryStateCache = read('src/main/library-state-cache.ts')
 const workerClient = read('src/main/document-delete-worker-client.ts')
 const worker = read('src/main/document-delete-worker.ts')
 const electronViteConfig = read('electron.vite.config.ts')
+const mainIndex = read('src/main/index.ts')
+const sharedTypes = read('src/shared/types.ts')
+const libraryView = read('src/renderer/src/views/LibraryView.tsx')
 
 const deleteFtsBody = sliceBetween(
   documentsIpc,
@@ -82,6 +86,12 @@ const resetSearchTablesBody = sliceBetween(
   'export function resetRebuildableSearchTables',
   'export function refreshSearchSegmentsFtsForDocument',
   'database rebuildable search reset body',
+)
+const shutdownDeleteBody = sliceBetween(
+  documentsIpc,
+  'export async function shutdownDocumentDeleteRuntime',
+  'class BookTranslationShutdownError',
+  'document delete shutdown body',
 )
 
 assertIncludes(documentsIpc, 'function isDatabaseMalformedError', 'document deletion should detect SQLite malformed errors')
@@ -138,10 +148,32 @@ assertNotIncludes(worker, 'row.rowid', 'worker must not rely on SQLite preservin
 assertIncludes(worker, 'const ROW_CHUNK_SIZE = 2_000', 'worker row drains should use high-throughput bounded batches')
 assertIncludes(worker, 'const DOCUMENT_BATCH_SIZE = 25', 'worker should amortize relation cleanup across multiple documents')
 assertIncludes(worker, "SELECT 'delete', rowid", 'worker should batch FTS delete commands with INSERT-SELECT')
-assertIncludes(worker, 'function ensureDeleteIndexes', 'worker should create missing child-key indexes away from the main process')
-assertIncludes(worker, 'idx_ocr_artifacts_doc', 'OCR artifact deletion should have a document-key index')
-assertIncludes(worker, 'idx_translation_context_snapshots_doc', 'translation snapshot deletion should have a document-key index')
-assertIncludes(worker, 'idx_research_record_versions_evidence', 'research evidence cascades should have a child-key index')
+assertNotIncludes(worker, 'function ensureDeleteIndexes', 'normal deletion must not build global indexes while the user is waiting')
+assertNotIncludes(worker, 'idx_ocr_artifacts_doc', 'normal deletion must not scan the entire OCR history to add a redundant index')
+assertIncludes(worker, 'function deleteOcrData', 'OCR cleanup should follow the indexed OCR run relation')
+assertIncludes(worker, "deleteRowsByDocIds(sqlite, 'ocr_runs'", 'OCR cleanup should cascade from indexed document runs')
+assertIncludes(worker, 'function deleteDocumentRowsAfterExplicitCleanup', 'final document removal should avoid redundant legacy child-table scans')
+assertIncludes(worker, "sqlite.pragma('foreign_keys = OFF')", 'final document removal should disable only redundant cascade checks')
+assertIncludes(worker, "sqlite.pragma('foreign_keys = ON')", 'foreign-key enforcement must be restored immediately after final document removal')
+assertIncludes(worker, 'INTER_BATCH_WRITER_GRACE_MS', 'bulk deletion should yield the SQLite writer between document batches')
+assertIncludes(workerClient, 'options?.onProgress?.({', 'delete worker progress should be forwarded to the main process')
+assertIncludes(deleteJobBody, "kind: 'document-delete'", 'delete jobs should publish visible background task progress')
+assertIncludes(deleteJobBody, 'onProgress: (progress)', 'worker progress should reach the renderer task stream')
+assertIncludes(sharedTypes, "'document-delete'", 'background task types should include document deletion')
+assertIncludes(libraryView, "event.kind === 'document-delete'", 'library view should display document delete progress')
+assertIncludes(documentsIpc, 'function recordDocumentOpenedInBackground', 'opening a document should defer optional recent-item bookkeeping')
+assertIncludes(documentsIpc, 'recordDocumentOpenedInBackground(id)', 'document detail reads should not synchronously acquire a writer lock')
+assertNotIncludes(documentsIpc, "run('UPDATE documents SET last_opened_at = ?, updated_at = updated_at WHERE id = ?'", 'document reads must not fail when recent-item bookkeeping cannot acquire the writer')
+assert(
+  shutdownDeleteBody.indexOf('await shutdownDocumentDeleteWorkers()')
+    < shutdownDeleteBody.indexOf('await waitForDocumentDeleteShutdown'),
+  'shutdown should terminate delete workers before waiting for queued cleanup',
+)
+assert(
+  mainIndex.indexOf('await shutdownDocumentDeleteRuntime()')
+    < mainIndex.indexOf('await shutdownOcrRuntime()'),
+  'application shutdown should release delete locks before OCR persists its state',
+)
 assertIncludes(documentsIpc, 'let documentDeleteJobQueueTail: Promise<void> = Promise.resolve()', 'delete submissions should share one SQLite writer queue')
 assertIncludes(deleteJobBody, 'documentDeleteJobQueueTail.then(runQueuedJob, runQueuedJob)', 'delete jobs should run serially')
 assertIncludes(deleteJobBody, 'await markDocumentsDeleting(docIds)', 'delete markers should wait inside the serial writer queue')

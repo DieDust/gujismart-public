@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+## 1.2.15 - 2026-07-29
+
+### 中文
+
+#### 大批量删除锁死、进度与退出恢复
+
+- 修复永久删除数百至上千篇文献时，删除 worker 在真正处理文献前为整座数据库同步创建多组索引，长时间独占 SQLite 写锁，继而导致删除无进度、OCR 停止、智能视图刷新失败、文件夹删除失败和文献详情无法打开的问题。正常删除不再执行全库建索引。
+- OCR 记录现在沿数据库已有的 `ocr_runs -> attempts -> artifacts` 索引关系级联清理，向量、全文索引、标签、摘录、项目关系及原文文件仍按原有永久删除语义完整清除，不阉割删除范围。
+- 大批量删除继续使用独立 worker 和 25 篇一批的事务边界，并在批次之间短暂释放写入机会，让 OCR、导入和前台状态保存能够继续推进。
+- 新增可见的后台删除进度，显示等待、准备、已完成篇数、原文清理、完成或失败状态；失败后先恢复未删除文献，再刷新列表。
+- 打开文献详情、轻量详情和阅读窗口时，最近打开时间改为后台尽力写入。即使另一个任务短暂持有写锁，文献内容仍可正常读取。
+- 退出软件时优先终止删除 worker，再等待 OCR、导入等任务保存状态；未完成且已标记为删除中的文献会在下次启动继续恢复，不再让退出长期卡死。
+
+#### 下载
+
+- `GujiSmart-1.2.15-Setup-x64.exe`
+- `GujiSmart-1.2.15-Portable-x64.exe`
+
+### English
+
+#### Bulk-Delete Lockups, Progress, and Shutdown Recovery
+
+- Fixed bulk permanent deletion creating several whole-library indexes before processing documents. That schema write could monopolize SQLite and stall deletion progress, OCR, Smart View refresh, folder deletion, and document detail loading. Normal deletion no longer performs global index creation.
+- OCR history now cascades through the existing indexed `ocr_runs -> attempts -> artifacts` relations. Vectors, full-text indexes, tags, excerpts, project memberships, and source files retain their complete permanent-delete semantics.
+- Bulk deletion remains isolated in a worker with 25-document transaction boundaries and now leaves a short writer opportunity between batches so OCR, imports, and foreground state updates can continue.
+- Added visible background deletion progress for queued, preparing, completed-count, source-file cleanup, completion, and failure states. Failed rows are restored before the library refreshes.
+- Document detail, lightweight detail, and reading-window loads now record recent-open timestamps on a best-effort background path, so content reads remain available during brief writer contention.
+- Application shutdown now terminates delete workers before OCR and import runtimes persist their state. Interrupted rows remain recoverable on the next start instead of keeping the application stuck during exit.
+
+#### Downloads
+
+- `GujiSmart-1.2.15-Setup-x64.exe`
+- `GujiSmart-1.2.15-Portable-x64.exe`
+
 ## 1.2.14 - 2026-07-29
 
 ### 中文

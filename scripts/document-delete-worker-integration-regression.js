@@ -39,6 +39,31 @@ function createFixture() {
       FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
     );
     CREATE INDEX idx_embedding_chunks_doc ON embedding_chunks(doc_id);
+    CREATE TABLE ocr_runs (
+      id TEXT PRIMARY KEY,
+      doc_id TEXT NOT NULL,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_ocr_runs_doc ON ocr_runs(doc_id);
+    CREATE TABLE ocr_page_attempts (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      page_id TEXT NOT NULL,
+      attempt_no INTEGER NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES ocr_runs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_ocr_page_attempts_run ON ocr_page_attempts(run_id);
+    CREATE TABLE ocr_artifact_versions (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      doc_id TEXT NOT NULL,
+      page_id TEXT NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES ocr_runs(id) ON DELETE CASCADE,
+      FOREIGN KEY (attempt_id) REFERENCES ocr_page_attempts(id) ON DELETE CASCADE,
+      FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_ocr_artifacts_run ON ocr_artifact_versions(run_id);
     CREATE TABLE document_tags (
       doc_id TEXT NOT NULL,
       tag_id TEXT NOT NULL,
@@ -47,6 +72,9 @@ function createFixture() {
     CREATE TABLE library_project_documents (
       document_id TEXT NOT NULL,
       FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+    );
+    CREATE TABLE writer_probe (
+      value INTEGER NOT NULL
     );
 
     -- This deliberately turns the final DELETE into one long synchronous
@@ -80,7 +108,18 @@ function createFixture() {
   const insertProject = sqlite.prepare(
     'INSERT INTO library_project_documents (document_id) VALUES (?)',
   )
+  const insertOcrRun = sqlite.prepare(
+    'INSERT INTO ocr_runs (id, doc_id) VALUES (?, ?)',
+  )
+  const insertOcrAttempt = sqlite.prepare(
+    'INSERT INTO ocr_page_attempts (id, run_id, page_id, attempt_no) VALUES (?, ?, ?, 1)',
+  )
+  const insertOcrArtifact = sqlite.prepare(
+    'INSERT INTO ocr_artifact_versions (id, run_id, attempt_id, doc_id, page_id) VALUES (?, ?, ?, ?, ?)',
+  )
   const documentIds = Array.from({ length: 8 }, (_, index) => `delete-${index}`)
+  const preservedDocumentId = 'preserved-document'
+  const preservedArtifactCount = 5_000
   sqlite.transaction(() => {
     documentIds.forEach((documentId, index) => {
       insertDocument.run(documentId)
@@ -89,14 +128,41 @@ function createFixture() {
       for (let chunk = 0; chunk < 40; chunk += 1) {
         insertEmbedding.run(documentId, Buffer.alloc(512, chunk % 255))
       }
+      const runId = `ocr-run-${index}`
+      const attemptId = `ocr-attempt-${index}`
+      const pageId = `ocr-page-${index}`
+      insertOcrRun.run(runId, documentId)
+      insertOcrAttempt.run(attemptId, runId, pageId)
+      for (let artifact = 0; artifact < 40; artifact += 1) {
+        insertOcrArtifact.run(
+          `ocr-artifact-${index}-${artifact}`,
+          runId,
+          attemptId,
+          documentId,
+          pageId,
+        )
+      }
     })
+    insertDocument.run(preservedDocumentId)
+    insertOcrRun.run('preserved-ocr-run', preservedDocumentId)
+    insertOcrAttempt.run('preserved-ocr-attempt', 'preserved-ocr-run', 'preserved-page')
+    for (let artifact = 0; artifact < preservedArtifactCount; artifact += 1) {
+      insertOcrArtifact.run(
+        `preserved-ocr-artifact-${artifact}`,
+        'preserved-ocr-run',
+        'preserved-ocr-attempt',
+        preservedDocumentId,
+        'preserved-page',
+      )
+    }
   })()
-  return { sqlite, documentIds }
+  return { sqlite, documentIds, preservedArtifactCount }
 }
 
-function runWorkerTask(documentIds) {
+function runWorkerTask(documentIds, onProgress) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(workerPath)
+    const progress = []
     let settled = false
     const finish = (callback) => {
       if (settled) return
@@ -105,7 +171,11 @@ function runWorkerTask(documentIds) {
       void worker.terminate().finally(callback)
     }
     worker.on('message', (message) => {
-      if (message?.type === 'result') finish(() => resolve(message.result))
+      if (message?.type === 'progress') {
+        progress.push(message)
+        onProgress?.(message)
+      }
+      if (message?.type === 'result') finish(() => resolve({ result: message.result, progress }))
       if (message?.type === 'error') finish(() => reject(new Error(message.error)))
     })
     worker.on('error', (error) => finish(() => reject(error)))
@@ -137,20 +207,31 @@ async function run() {
     }, 10)
 
     const startedAt = Date.now()
-    const result = await runWorkerTask(fixture.documentIds)
+    const { result, progress } = await runWorkerTask(fixture.documentIds)
     const elapsedMs = Date.now() - startedAt
     clearInterval(heartbeat)
 
     assert.deepStrictEqual(result.deletedIds, fixture.documentIds)
     assert.deepStrictEqual([...result.affectedTagIds].sort(), ['tag-0', 'tag-1', 'tag-2'])
+    assert.strictEqual(progress[0]?.phase, 'preparing')
+    assert.strictEqual(progress[0]?.completed, 0)
+    assert.strictEqual(progress.at(-1)?.phase, 'deleting')
+    assert.strictEqual(progress.at(-1)?.completed, fixture.documentIds.length)
     assert.strictEqual(
       sqlite.prepare('SELECT COUNT(*) AS count FROM documents').get().count,
-      0,
+      1,
     )
     assert.strictEqual(
       sqlite.prepare('SELECT COUNT(*) AS count FROM embedding_chunks').get().count,
       0,
     )
+    assert.strictEqual(sqlite.prepare('SELECT COUNT(*) AS count FROM ocr_runs').get().count, 1)
+    assert.strictEqual(sqlite.prepare('SELECT COUNT(*) AS count FROM ocr_page_attempts').get().count, 1)
+    assert.strictEqual(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM ocr_artifact_versions').get().count,
+      fixture.preservedArtifactCount,
+    )
+    assert.deepStrictEqual(sqlite.pragma('foreign_key_check'), [])
     assert(
       elapsedMs >= 100,
       `slow-delete fixture did not exercise a meaningful blocking statement (${elapsedMs}ms)`,
@@ -189,18 +270,40 @@ async function run() {
         }
       })
     })()
+    let concurrentWriteCompleted = false
+    let concurrentWriteError = null
     const bulkStartedAt = Date.now()
-    const bulkResult = await runWorkerTask(bulkDocumentIds)
+    const { result: bulkResult, progress: bulkProgress } = await runWorkerTask(
+      bulkDocumentIds,
+      (progressEvent) => {
+        if (concurrentWriteCompleted || progressEvent.phase !== 'deleting' || progressEvent.completed >= bulkDocumentCount) return
+        try {
+          sqlite.prepare('INSERT INTO writer_probe (value) VALUES (?)').run(progressEvent.completed)
+          concurrentWriteCompleted = true
+        } catch (error) {
+          concurrentWriteError = error
+        }
+      },
+    )
     const bulkElapsedMs = Date.now() - bulkStartedAt
     assert.strictEqual(bulkResult.deletedIds.length, bulkDocumentCount)
+    assert.strictEqual(bulkProgress[0]?.phase, 'preparing')
+    assert.strictEqual(bulkProgress.at(-1)?.completed, bulkDocumentCount)
+    assert.ifError(concurrentWriteError)
+    assert(concurrentWriteCompleted, 'a foreground/OCR-style writer should run between delete batches')
     assert.strictEqual(
       sqlite.prepare('SELECT COUNT(*) AS count FROM documents').get().count,
-      0,
+      1,
     )
     assert.strictEqual(
       sqlite.prepare('SELECT COUNT(*) AS count FROM embedding_chunks').get().count,
       0,
     )
+    assert.strictEqual(
+      sqlite.prepare('SELECT COUNT(*) AS count FROM ocr_artifact_versions').get().count,
+      fixture.preservedArtifactCount,
+    )
+    assert.deepStrictEqual(sqlite.pragma('foreign_key_check'), [])
     assert(
       bulkElapsedMs < 10_000,
       `320-document vector cleanup exceeded the regression budget (${bulkElapsedMs}ms)`,

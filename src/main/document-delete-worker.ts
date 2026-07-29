@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { parentPort } from 'worker_threads'
 import { getErrorMessage } from '../shared/errors'
 import type {
+  DocumentDeleteWorkerProgress,
   DocumentDeleteWorkerResult,
   DocumentDeleteWorkerTask,
 } from './document-delete-worker-client'
@@ -17,6 +18,7 @@ const ID_CHUNK_SIZE = 100
 const ROW_CHUNK_SIZE = 2_000
 const DOCUMENT_BATCH_SIZE = 25
 const DATABASE_BUSY_TIMEOUT_MS = 5_000
+const INTER_BATCH_WRITER_GRACE_MS = 25
 
 type NativeDatabase = Database.Database
 
@@ -41,20 +43,13 @@ function tableExists(sqlite: NativeDatabase, tableName: string): boolean {
   return !!sqlite.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName)
 }
 
-function ensureDeleteIndexes(sqlite: NativeDatabase): void {
-  const indexes = [
-    ['ocr_artifact_versions', 'CREATE INDEX IF NOT EXISTS idx_ocr_artifacts_doc ON ocr_artifact_versions(doc_id, page_num)'],
-    ['ocr_artifact_versions', 'CREATE INDEX IF NOT EXISTS idx_ocr_artifacts_attempt ON ocr_artifact_versions(attempt_id)'],
-    ['translation_context_snapshots', 'CREATE INDEX IF NOT EXISTS idx_translation_context_snapshots_doc ON translation_context_snapshots(doc_id, created_at)'],
-    ['translation_unit_revisions', 'CREATE INDEX IF NOT EXISTS idx_translation_unit_revisions_context ON translation_unit_revisions(context_snapshot_id)'],
-    ['translation_attempts', 'CREATE INDEX IF NOT EXISTS idx_translation_attempts_context ON translation_attempts(context_snapshot_id)'],
-    ['translation_attempts', 'CREATE INDEX IF NOT EXISTS idx_translation_attempts_base_revision ON translation_attempts(base_revision_id)'],
-    ['translation_attempts', 'CREATE INDEX IF NOT EXISTS idx_translation_attempts_candidate_revision ON translation_attempts(candidate_revision_id)'],
-    ['research_record_versions', 'CREATE INDEX IF NOT EXISTS idx_research_record_versions_evidence ON research_record_versions(evidence_id)'],
-  ] as const
-  for (const [tableName, sql] of indexes) {
-    if (tableExists(sqlite, tableName)) sqlite.exec(sql)
-  }
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4)
+  Atomics.wait(new Int32Array(buffer), 0, 0, Math.max(0, ms))
+}
+
+function emitProgress(progress: DocumentDeleteWorkerProgress): void {
+  parentPort?.postMessage({ type: 'progress', ...progress })
 }
 
 function runForIdChunks(
@@ -100,24 +95,31 @@ function deleteRowsByDocIds(sqlite: NativeDatabase, tableName: string, documentI
   deleteRowsByColumn(sqlite, tableName, 'doc_id', documentIds)
 }
 
-function deleteOcrPageAttempts(sqlite: NativeDatabase, documentIds: string[]): void {
-  if (!tableExists(sqlite, 'ocr_page_attempts') || !tableExists(sqlite, 'ocr_runs')) return
-  runForIdChunks(documentIds, (chunkIds, placeholders) => {
-    const selectRows = sqlite.prepare(
-      `SELECT attempt.rowid AS delete_rowid
-       FROM ocr_page_attempts attempt
-       INNER JOIN ocr_runs run ON run.id = attempt.run_id
-       WHERE run.doc_id IN (${placeholders})
-       LIMIT ?`,
-    )
-    while (true) {
-      const rows = selectRows.all(...chunkIds, ROW_CHUNK_SIZE) as Array<{ delete_rowid: number }>
-      if (rows.length === 0) break
-      const rowPlaceholders = rows.map(() => '?').join(', ')
-      sqlite.prepare(`DELETE FROM ocr_page_attempts WHERE rowid IN (${rowPlaceholders})`)
-        .run(...rows.map((row) => row.delete_rowid))
-    }
-  })
+function deleteOcrData(sqlite: NativeDatabase, documentIds: string[]): void {
+  // ocr_runs(doc_id), ocr_page_attempts(run_id) and
+  // ocr_artifact_versions(run_id) already have schema indexes. Deleting from
+  // the root lets SQLite cascade through those indexes and avoids building
+  // new global indexes over a user's entire OCR history during deletion.
+  deleteRowsByDocIds(sqlite, 'ocr_runs', documentIds)
+}
+
+function deleteDocumentRowsAfterExplicitCleanup(sqlite: NativeDatabase, documentIds: string[]): void {
+  // Every direct document relation is removed above. Keeping FK cascades on for
+  // this final statement makes SQLite rescan unindexed legacy child columns
+  // once per document (notably OCR artifact doc_id), even though no selected
+  // rows remain. Disable only the redundant final checks inside this worker
+  // connection; all relation cleanup continues to run with FK enforcement on.
+  sqlite.pragma('foreign_keys = OFF')
+  try {
+    const deleteRows = sqlite.transaction(() => {
+      runForIdChunks(documentIds, (chunkIds, placeholders) => {
+        sqlite.prepare(`DELETE FROM documents WHERE id IN (${placeholders})`).run(...chunkIds)
+      })
+    })
+    deleteRows.immediate()
+  } finally {
+    sqlite.pragma('foreign_keys = ON')
+  }
 }
 
 function deleteAiChatTurns(sqlite: NativeDatabase, documentIds: string[]): void {
@@ -348,9 +350,7 @@ function deleteDocumentBatch(
   }
   deleteRowsByDocIds(sqlite, 'metadata_candidates', documentIds)
   deleteRowsByDocIds(sqlite, 'page_ocr_versions', documentIds)
-  deleteRowsByDocIds(sqlite, 'ocr_artifact_versions', documentIds)
-  deleteOcrPageAttempts(sqlite, documentIds)
-  deleteRowsByDocIds(sqlite, 'ocr_runs', documentIds)
+  deleteOcrData(sqlite, documentIds)
   deleteRowsByDocIds(sqlite, 'page_ai_layout_cache', documentIds)
   deleteRowsByDocIds(sqlite, 'page_translation_cache', documentIds)
   deleteRowsByDocIds(sqlite, 'page_translation_units', documentIds)
@@ -383,9 +383,7 @@ function deleteDocumentBatch(
   deleteRowsByDocIds(sqlite, 'document_folders', documentIds)
   deleteRowsByDocIds(sqlite, 'document_tags', documentIds)
   deleteRowsByColumn(sqlite, 'library_project_documents', 'document_id', documentIds)
-  runForIdChunks(documentIds, (chunkIds, placeholders) => {
-    sqlite.prepare(`DELETE FROM documents WHERE id IN (${placeholders})`).run(...chunkIds)
-  })
+  deleteDocumentRowsAfterExplicitCleanup(sqlite, documentIds)
   return { recoveredSearchIndexIssue }
 }
 
@@ -401,7 +399,13 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
     sqlite.pragma('journal_mode = WAL')
     sqlite.pragma('synchronous = NORMAL')
     sqlite.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
-    ensureDeleteIndexes(sqlite)
+
+    emitProgress({
+      completed: 0,
+      total: documentIds.length,
+      phase: 'preparing',
+      message: '正在准备删除，文献已从列表隐藏',
+    })
 
     const affectedTagIds = getAffectedTagIds(sqlite, documentIds)
     const deletedIds: string[] = []
@@ -411,11 +415,13 @@ function deleteDocuments(task: DocumentDeleteWorkerTask): DocumentDeleteWorkerRe
       const result = deleteDocumentBatch(sqlite, batch)
       if (result.recoveredSearchIndexIssue) recoveredSearchIndexIssue = true
       deletedIds.push(...batch)
-      parentPort?.postMessage({
-        type: 'progress',
+      emitProgress({
         completed: deletedIds.length,
         total: documentIds.length,
+        phase: 'deleting',
+        message: '正在后台删除文献',
       })
+      if (deletedIds.length < documentIds.length) sleepSync(INTER_BATCH_WRITER_GRACE_MS)
     }
     return { deletedIds, affectedTagIds, recoveredSearchIndexIssue }
   } finally {

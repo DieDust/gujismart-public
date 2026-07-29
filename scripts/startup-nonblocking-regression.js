@@ -377,7 +377,7 @@ assert(
     && startupRecovery.includes('async function startupRecoveryCheckpoint()')
     && startupRecovery.includes('export async function shutdownStartupRecovery')
     && /export async function shutdownStartupRecovery\(\)[\s\S]{0,120}startupRecoveryCancelRequested = true[\s\S]{0,120}await startupRecoveryPromise/.test(startupRecovery)
-    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,500}await shutdownStartupRecovery\(\)[\s\S]{0,1200}closeDatabase\(\)/.test(mainIndex),
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,1100}await shutdownStartupRecovery\(\)[\s\S]{0,1800}closeDatabase\(\)/.test(mainIndex),
   'Runtime shutdown should ask scheduled startup recovery to stop at a safe checkpoint before closing the database.',
 )
 assert(
@@ -416,8 +416,8 @@ assert(
 )
 assert(
   mainIndex.includes('shutdownDocumentDeleteRuntime')
-    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,2200}await shutdownDocumentDeleteRuntime\(\)[\s\S]{0,1300}closeDatabase\(\)/.test(mainIndex),
-  'Runtime shutdown should wait briefly for active document delete jobs before closing the database.',
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,900}await shutdownDocumentDeleteRuntime\(\)[\s\S]{0,700}await shutdownOcrRuntime\(\)[\s\S]{0,1800}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should terminate document delete workers before OCR persists state and the database closes.',
 )
 assert(
   mainIndex.includes('shutdownDocumentImportRuntime')
@@ -431,8 +431,8 @@ assert(
 )
 assert(
   mainIndex.includes('shutdownBookTranslationRuntime')
-    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,1300}await batchProcessor\.shutdownRuntime\(\)[\s\S]{0,500}await shutdownBookTranslationRuntime\(\)[\s\S]{0,500}await shutdownDocumentDeleteRuntime\(\)[\s\S]{0,1300}closeDatabase\(\)/.test(mainIndex),
-  'Runtime shutdown should wait for active book translation work before delete cleanup and database close.',
+    && /async function shutdownApplicationRuntime\(\)[\s\S]{0,1500}await batchProcessor\.shutdownRuntime\(\)[\s\S]{0,500}await shutdownBookTranslationRuntime\(\)[\s\S]{0,1300}closeDatabase\(\)/.test(mainIndex),
+  'Runtime shutdown should wait for active book translation work before database close.',
 )
 assert(
   mainIndex.includes('shutdownPdfAssetRuntime')
@@ -453,7 +453,7 @@ assert(
 assert(
   documentsIpc.includes('activeDocumentDeleteJobs')
     && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime')
-    && /function scheduleDocumentDeleteJob[\s\S]{0,5000}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,500}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc)
+    && /function scheduleDocumentDeleteJob[\s\S]{0,8000}activeDocumentDeleteJobs\.add\(job\)[\s\S]{0,700}activeDocumentDeleteJobs\.delete\(job\)/.test(documentsIpc)
     && /export async function shutdownDocumentDeleteRuntime[\s\S]{0,500}shutdownDocumentDeleteWorkers\(\)/.test(documentsIpc),
   'Document delete jobs should be tracked so shutdown can wait for active delete cleanup.',
 )
@@ -465,9 +465,10 @@ assert(
 )
 assert(
   documentsIpc.includes('export async function shutdownDocumentImportRuntime(timeoutMs = 30000)')
-    && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime(timeoutMs = 30000)')
+    && documentsIpc.includes('export async function shutdownDocumentDeleteRuntime(timeoutMs = 2_000)')
+    && /export async function shutdownDocumentDeleteRuntime[\s\S]{0,500}await shutdownDocumentDeleteWorkers\(\)[\s\S]{0,200}await waitForDocumentDeleteShutdown/.test(documentsIpc)
     && /for \(const \[fileIndex, entry\] of lease\.entries\.entries\(\)\) \{[\s\S]{0,400}if \(documentImportShuttingDown\) break/.test(documentsIpc),
-  'Document import/delete shutdown should wait long enough for database writes to settle and stop import at file boundaries.',
+  'Import shutdown should stop at file boundaries while delete shutdown releases SQLite workers before its bounded wait.',
 )
 assert(
   documentsIpc.includes('activeBookTranslationJobTasks')

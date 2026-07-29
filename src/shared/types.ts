@@ -1502,7 +1502,7 @@ export interface TaskProgressEvent {
   message: string
 }
 
-export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance' | 'embedding-index'
+export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance' | 'embedding-index' | 'document-delete'
 
 export interface EmbeddingLinkedProfile {
   id: string

@@ -14,8 +14,15 @@ export interface DocumentDeleteWorkerResult {
   recoveredSearchIndexIssue: boolean
 }
 
+export interface DocumentDeleteWorkerProgress {
+  completed: number
+  total: number
+  phase: 'preparing' | 'deleting'
+  message: string
+}
+
 type DocumentDeleteWorkerMessage =
-  | { type: 'progress'; completed: number; total: number }
+  | ({ type: 'progress' } & DocumentDeleteWorkerProgress)
   | { type: 'result'; result: DocumentDeleteWorkerResult }
   | { type: 'error'; error: string }
 
@@ -32,6 +39,7 @@ export function isDocumentDeleteWorkerAvailable(): boolean {
 
 export function runDocumentDeleteWorkerTask(
   task: DocumentDeleteWorkerTask,
+  options?: { onProgress?: (progress: DocumentDeleteWorkerProgress) => void },
 ): Promise<DocumentDeleteWorkerResult> {
   const workerPath = getWorkerScriptPath()
   if (!workerPath) return Promise.reject(new Error('Document delete worker script not found'))
@@ -56,6 +64,12 @@ export function runDocumentDeleteWorkerTask(
     worker.on('message', (message: DocumentDeleteWorkerMessage) => {
       if (!message || typeof message !== 'object') return
       if (message.type === 'progress') {
+        options?.onProgress?.({
+          completed: message.completed,
+          total: message.total,
+          phase: message.phase,
+          message: message.message,
+        })
         if (message.completed === message.total || message.completed % 25 === 0) {
           console.log(`[Documents] Background delete progress: ${message.completed}/${message.total}`)
         }

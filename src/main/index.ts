@@ -414,6 +414,11 @@ async function shutdownApplicationRuntime(): Promise<void> {
     }
     fileCapabilityService.revokeAll()
     stopAutoBackupScheduler()
+    // Stop database delete workers before OCR/import shutdown tries to persist
+    // state. A long delete must never keep the whole application alive.
+    await shutdownDocumentDeleteRuntime().catch((error) => {
+      console.warn('[Main] Failed to shutdown document delete runtime cleanly', error)
+    })
     await shutdownStartupRecovery().catch((error) => {
       console.warn('[Main] Failed to shutdown startup recovery cleanly', error)
     })
@@ -428,9 +433,6 @@ async function shutdownApplicationRuntime(): Promise<void> {
     })
     await shutdownBookTranslationRuntime().catch((error) => {
       console.warn('[Main] Failed to shutdown book translation runtime cleanly', error)
-    })
-    await shutdownDocumentDeleteRuntime().catch((error) => {
-      console.warn('[Main] Failed to shutdown document delete runtime cleanly', error)
     })
     await shutdownPdfAssetRuntime().catch((error) => {
       console.warn('[Main] Failed to shutdown PDF asset runtime cleanly', error)
