@@ -635,6 +635,7 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
   const [libraryProjectCreateName, setLibraryProjectCreateName] = useState('')
   const [libraryProjectCreateBusy, setLibraryProjectCreateBusy] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
+  const settingsViewRef = useRef<SettingsViewHandle>(null)
   const [databaseUpgradeDiagnostics, setDatabaseUpgradeDiagnostics] = useState<DatabaseStorageDiagnostics | null>(null)
   const [databaseUpgradeVisible, setDatabaseUpgradeVisible] = useState(false)
   const [databaseUpgradeBusy, setDatabaseUpgradeBusy] = useState(false)
@@ -747,8 +748,14 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
     return () => window.removeEventListener('beforeunload', saveBeforeUnload)
   }, [activeTabId, siderCollapsed, tabGroups, tabs, workspaceProjectId])
 
-  const activateLibraryProject = async (project: LibraryProject): Promise<void> => {
+  const activateLibraryProject = async (project: LibraryProject, settingsLeaveConfirmed = false): Promise<void> => {
     if (libraryProjectSwitching) return
+    if (!settingsLeaveConfirmed && activeTab.kind === 'view' && activeTab.view === 'settings' && settingsDirty) {
+      runWithSettingsLeaveGuard(() => {
+        void activateLibraryProject(project, true)
+      })
+      return
+    }
     setLibraryProjectSwitching(true)
     try {
       if (workspaceProjectId) {
@@ -791,7 +798,7 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
     if (!name || libraryProjectCreateBusy) return
     setLibraryProjectCreateBusy(true)
     try {
-      const project = await window.api.createLibraryProject({ name, activate: true })
+      const project = await window.api.createLibraryProject({ name, activate: false })
       setLibraryProjectCreateOpen(false)
       setLibraryProjectCreateName('')
       await activateLibraryProject(project)
@@ -812,7 +819,6 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
     })
   }
 
-  const settingsViewRef = useRef<SettingsViewHandle>(null)
   const floatingPanelRef = useRef<HTMLDivElement>(null)
   const tabStripRef = useRef<HTMLDivElement>(null)
   const suppressTabClickRef = useRef(false)

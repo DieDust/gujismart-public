@@ -15,6 +15,7 @@ import {
   findSuspiciousRepeatedOcrText,
   formatSuspiciousRepeatedOcrTextIssue,
   getOcrDocumentConcurrency,
+  getOcrHeavyPdfDocumentConcurrency,
   type OcrRepeatedTextIssue,
   type OcrPageRecord,
   type OcrPageProgressPayload,
@@ -84,7 +85,7 @@ import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
 import { ocrRunMetadataFromProgress } from '../../shared/ocr-run-metadata'
 import { statusEnvelopeFromOcrProgress } from '../../shared/status-envelope'
 import { recordCompatibilityOcrArtifacts } from '../ocr-artifacts'
-import { globalOcrDocumentWindow } from '../ocr-document-window'
+import { globalOcrDocumentWindow, heavyPdfOcrDocumentWindow } from '../ocr-document-window'
 import {
   getActiveLibraryProjectId,
   requireLibraryProjectId,
@@ -104,6 +105,11 @@ const OCR_ASYNC_PDF_GUJI_LARGE_PAGE_RANGE_CHUNK_SIZE = 80
 const OCR_ASYNC_PDF_GUJI_LARGE_PAGE_THRESHOLD = 180
 const OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE = 10
 const OCR_AUTO_FAILED_PAGE_RETRY_LIMIT = 24
+const OCR_TARGETED_PDF_RETRY_PAGE_LIMIT = 100
+const OCR_TARGETED_PDF_RETRY_MAX_WORKERS = 2
+const OCR_AUTO_RETRY_TOTAL_BUDGET_MS = 6 * 60 * 1000
+const OCR_ORIGINAL_PDF_RETRY_BUDGET_MS = 3 * 60 * 1000
+const OCR_SINGLE_PAGE_RETRY_TIMEOUT_MS = 75 * 1000
 const OCR_FINALIZE_PAGE_CHUNK_SIZE = 250
 const OCR_FINALIZE_PAGE_LOOKUP_CHUNK_SIZE = 500
 const OCR_STATUS_EVENT_THROTTLE_MS = 250
@@ -123,6 +129,7 @@ const IMPORT_AUTO_OCR_HEARTBEAT_MS = 20 * 1000
 const OCR_LAYOUT_QUALITY_REJECTED_PREFIX = '[layout_quality_rejected]'
 const OCR_ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
 const OCR_ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'
+const OCR_ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX = '[async_pdf_incomplete_chunk]'
 const OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX = '[async_pdf_quality_retryable]'
 const OCR_ORIGINAL_PDF_RETRY_ATTEMPTS = 3
 const OCR_FEIJIANG_REFERENCE_ENV = 'GUJISMART_OCR_REFERENCE_JSON_DIR'
@@ -1035,6 +1042,7 @@ function isRetryableOcrError(error: unknown): boolean {
 function isAsyncPdfRecoverableStallError(error: unknown): boolean {
   const message = String((error as Error)?.message || error || '')
   return message.includes(OCR_ASYNC_JOB_STALLED_PREFIX)
+    || message.includes(OCR_ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX)
 }
 
 function throwIfOcrCanceled(signal?: AbortSignal, docId?: string): void {
@@ -1972,6 +1980,23 @@ function isHeavyPdfOcrDocument(docId: string): boolean {
   const pageCount = Math.max(Number(doc.page_count || 0), Number.isFinite(metadataPageCount) ? metadataPageCount : 0)
   const fileSize = getDocumentPdfSizeBytes(filePath)
   return fileSize >= HEAVY_PDF_DOC_SIZE_BYTES || pageCount >= HEAVY_PDF_DOC_PAGE_COUNT
+}
+
+function runOcrDocumentInConfiguredWindows(
+  docId: string,
+  documentConcurrency: number,
+  heavy: boolean,
+  task: () => Promise<void>,
+  releaseWhen?: Promise<void>,
+): Promise<void> {
+  const runInTotalWindow = () => globalOcrDocumentWindow.runForDocument(
+    docId,
+    documentConcurrency,
+    task,
+    releaseWhen,
+  )
+  if (!heavy) return runInTotalWindow()
+  return heavyPdfOcrDocumentWindow.run(getOcrHeavyPdfDocumentConcurrency(), runInTotalWindow)
 }
 
 function shouldUsePdfOcrForWork(pdfPath: string | null, pages: OcrPageRow[], pagesForOcr: OcrPageRow[], pageCount = 0): boolean {
@@ -3032,8 +3057,13 @@ function getAutomaticSinglePageRetryOptions(
   return baseOptions
 }
 
-function getIncompletePagesForSinglePageRetry(docId: string, excludedPageIds: Set<string> = new Set()): OcrPageRow[] {
+function getIncompletePagesForSinglePageRetry(
+  docId: string,
+  excludedPageIds: Set<string> = new Set(),
+  limit = OCR_AUTO_FAILED_PAGE_RETRY_LIMIT,
+): OcrPageRow[] {
   const excludedIds = [...excludedPageIds].map((pageId) => String(pageId || '').trim()).filter(Boolean)
+  const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || OCR_AUTO_FAILED_PAGE_RETRY_LIMIT)))
   const exclusionClause = excludedIds.length > 0
     ? `AND id NOT IN (${excludedIds.map(() => '?').join(', ')})`
     : ''
@@ -3053,7 +3083,7 @@ function getIncompletePagesForSinglePageRetry(docId: string, excludedPageIds: Se
         )
       ORDER BY page_num
       LIMIT ?`,
-    [docId, ...excludedIds, OCR_AUTO_FAILED_PAGE_RETRY_LIMIT],
+    [docId, ...excludedIds, safeLimit],
   ))
 }
 
@@ -3112,11 +3142,21 @@ function getOriginalPdfRetryStrategies(
   fallbackPageCount: number,
   pageRangeChunkSize?: number,
   gujiProfile = false,
+  targetedOnly = false,
 ): OriginalPdfRetryStrategy[] {
   const normalizedTargetPageNums = [...new Set(targetPageNums
     .map((pageNum) => Math.floor(Number(pageNum)))
     .filter((pageNum) => Number.isFinite(pageNum) && pageNum > 0))]
     .sort((left, right) => left - right)
+  if (targetedOnly) {
+    const targetedChunkSize = pageRangeChunkSize || OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE
+    return [{
+      targetPageNums: gujiProfile
+        ? getOriginalPdfRetryPageRangeTargetNums(normalizedTargetPageNums, fallbackPageCount, targetedChunkSize)
+        : normalizedTargetPageNums,
+      pageRangeChunkSize: targetedChunkSize,
+    }].filter((strategy) => strategy.targetPageNums.length > 0)
+  }
   if (!gujiProfile) {
     return [{
       targetPageNums: normalizedTargetPageNums,
@@ -3143,6 +3183,7 @@ async function retryIncompletePagesWithOriginalPdfOcr(
   pdfPath: string | null,
   signal?: AbortSignal,
   onProgress?: (payload: { pageNum?: number; completedPages: number; totalPages: number; error?: string }) => void,
+  options?: { targetedOnly?: boolean },
 ): Promise<OcrPageResult[] | null> {
   if (!pdfPath || !shouldUseAsyncPdfOcr(pdfPath)) return null
   const resultsByPageId = new Map<string, OcrPageResult>()
@@ -3152,7 +3193,11 @@ async function retryIncompletePagesWithOriginalPdfOcr(
   let completedPages = 0
 
   while (true) {
-    const pages = getIncompletePagesForSinglePageRetry(doc.id, attemptedPageIds)
+    const pages = getIncompletePagesForSinglePageRetry(
+      doc.id,
+      attemptedPageIds,
+      options?.targetedOnly ? OCR_TARGETED_PDF_RETRY_PAGE_LIMIT : OCR_AUTO_FAILED_PAGE_RETRY_LIMIT,
+    )
     if (pages.length === 0) break
     pages.forEach((page) => attemptedPageIds.add(page.id))
     const pageNums = pages
@@ -3177,13 +3222,17 @@ async function retryIncompletePagesWithOriginalPdfOcr(
       ? getVerticalFallbackOcrOptions(baseRetryOptions)
       : baseRetryOptions
     const fallbackPageCount = getAutomaticRetryFallbackPageCount(doc, pages)
-    const pageRangeChunkSize = retryOptions.profile === 'guji_print_vertical'
+    const pageRangeChunkSize = options?.targetedOnly
+      ? OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE
+      : retryOptions.profile === 'guji_print_vertical'
       ? OCR_ASYNC_PDF_GUJI_PAGE_RANGE_CHUNK_SIZE
       : undefined
     let remainingPages = pages
     const lastRetryErrorsByPageId = new Map<string, string>()
 
-    const maxAttempts = retryOptions.profile === 'guji_print_vertical' ? OCR_ORIGINAL_PDF_RETRY_ATTEMPTS : 1
+    const maxAttempts = options?.targetedOnly
+      ? 1
+      : retryOptions.profile === 'guji_print_vertical' ? OCR_ORIGINAL_PDF_RETRY_ATTEMPTS : 1
     for (let attempt = 1; attempt <= maxAttempts && remainingPages.length > 0; attempt += 1) {
       const targetPageNums = remainingPages
         .map((page) => Number(page.page_num || 0))
@@ -3193,6 +3242,7 @@ async function retryIncompletePagesWithOriginalPdfOcr(
         fallbackPageCount,
         pageRangeChunkSize,
         retryOptions.profile === 'guji_print_vertical',
+        Boolean(options?.targetedOnly),
       )[Math.min(attempt - 1, maxAttempts - 1)]
       if (!retryStrategy) break
       const resultIndexByPageNum = new Map(retryStrategy.targetPageNums.map((pageNum, index) => [pageNum, index]))
@@ -3211,6 +3261,7 @@ async function retryIncompletePagesWithOriginalPdfOcr(
           fallbackPageCount,
           pageRangeChunkSize: retryStrategy.pageRangeChunkSize,
           requireFullFileUpload: retryStrategy.requireFullFileUpload,
+          maxWorkers: options?.targetedOnly ? OCR_TARGETED_PDF_RETRY_MAX_WORKERS : undefined,
         })
         const pageItems = remainingPages.map((page, index) => {
           const pageNum = Number(page.page_num || index + 1)
@@ -3332,37 +3383,90 @@ type FailedPageRetryProgress = {
   message?: string
 }
 
+type OriginalPdfRetryMode = 'full' | 'targeted' | 'skip'
+
+async function runWithOcrRetryTimeout<T>(
+  timeoutMs: number,
+  parentSignal: AbortSignal | undefined,
+  timeoutMessage: string,
+  task: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  throwIfOcrCanceled(parentSignal)
+  if (timeoutMs <= 0) throw new Error(timeoutMessage)
+  const controller = new AbortController()
+  let didTimeout = false
+  const timer = setTimeout(() => {
+    didTimeout = true
+    controller.abort()
+  }, timeoutMs)
+  const onParentAbort = () => controller.abort()
+  parentSignal?.addEventListener('abort', onParentAbort, { once: true })
+  try {
+    return await task(controller.signal)
+  } catch (error) {
+    if (parentSignal?.aborted) throw new Error(OCR_CANCELED_MESSAGE)
+    if (didTimeout && isOcrAbortError(error)) throw new Error(timeoutMessage)
+    throw error
+  } finally {
+    clearTimeout(timer)
+    parentSignal?.removeEventListener('abort', onParentAbort)
+  }
+}
+
 /**
  * After bulk/async OCR, retry pages still incomplete.
  * - Does NOT loop forever: each page is attempted at most once.
- * - skipOriginalPdfRetry: when bulk path already used async PDF, skip a second
- *   full-PDF async job (that is what often freezes UI at “0/1 页”).
+ * - Streaming/stalled PDF jobs use a targeted original-PDF retry rather than
+ *   submitting the whole book again.
+ * - The whole automatic recovery round and every single-page request have
+ *   bounded time budgets so one bad page cannot hold the batch indefinitely.
  */
 async function retryIncompletePagesWithSinglePageOcr(
   doc: Pick<OcrDocumentRow, 'id' | 'title' | 'author' | 'source' | 'doc_type' | 'metadata'>,
   pdfPath: string | null,
   signal?: AbortSignal,
   onProgress?: (payload: FailedPageRetryProgress) => void,
-  options?: { skipOriginalPdfRetry?: boolean },
+  options?: { originalPdfRetryMode?: OriginalPdfRetryMode },
 ): Promise<OcrPageResult[]> {
   const resultsByPageId = new Map<string, OcrPageResult>()
+  const retryDeadline = Date.now() + OCR_AUTO_RETRY_TOTAL_BUDGET_MS
+  const originalPdfRetryMode = options?.originalPdfRetryMode || 'full'
 
-  // Second full-PDF async pass is expensive and frequently hangs bulk batches.
-  // Prefer real single-page image OCR when bulk already used async PDF.
-  if (!options?.skipOriginalPdfRetry) {
+  if (originalPdfRetryMode !== 'skip') {
     onProgress?.({
       completedPages: 0,
       totalPages: 1,
       message: '正在用原 PDF 补跑未完成页…',
     })
-    const originalPdfRetryResults = await retryIncompletePagesWithOriginalPdfOcr(doc, pdfPath, signal, onProgress)
-    if (originalPdfRetryResults) {
-      originalPdfRetryResults.forEach((pageResult) => {
-        resultsByPageId.set(pageResult.pageId, pageResult)
-      })
-      if (originalPdfRetryResults.length > 0 && originalPdfRetryResults.every((pageResult) => pageResult.status === 'completed')) {
-        return [...resultsByPageId.values()]
+    try {
+      const originalPdfBudgetMs = Math.min(
+        OCR_ORIGINAL_PDF_RETRY_BUDGET_MS,
+        Math.max(1, retryDeadline - Date.now()),
+      )
+      const originalPdfRetryResults = await runWithOcrRetryTimeout(
+        originalPdfBudgetMs,
+        signal,
+        '原 PDF 定向补跑超过 3 分钟，已停止等待并改用单页补跑。',
+        (retrySignal) => retryIncompletePagesWithOriginalPdfOcr(
+          doc,
+          pdfPath,
+          retrySignal,
+          onProgress,
+          { targetedOnly: originalPdfRetryMode === 'targeted' },
+        ),
+      )
+      if (originalPdfRetryResults) {
+        originalPdfRetryResults.forEach((pageResult) => {
+          resultsByPageId.set(pageResult.pageId, pageResult)
+        })
+        if (originalPdfRetryResults.length > 0 && originalPdfRetryResults.every((pageResult) => pageResult.status === 'completed')) {
+          return [...resultsByPageId.values()]
+        }
       }
+    } catch (error) {
+      if (signal?.aborted || isOcrAbortError(error)) throw error
+      const message = (error as Error)?.message || String(error || '原 PDF 补跑失败')
+      onProgress?.({ completedPages: 0, totalPages: 1, error: message, message })
     }
   }
 
@@ -3383,8 +3487,32 @@ async function retryIncompletePagesWithSinglePageOcr(
     message: `开始单页补跑 ${pages.length} 个未完成页…`,
   })
 
-  for (const originalPage of pages) {
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const originalPage = pages[pageIndex]
     throwIfOcrCanceled(signal)
+    const remainingBudgetMs = retryDeadline - Date.now()
+    if (remainingBudgetMs <= 0) {
+      const message = '本轮自动补跑已达到 6 分钟上限，已停止等待并继续后续文献。'
+      for (const skippedPage of pages.slice(pageIndex)) {
+        const skippedPageNum = typeof skippedPage.page_num === 'number' ? skippedPage.page_num : undefined
+        completedPages += 1
+        resultsByPageId.set(skippedPage.id, {
+          pageId: skippedPage.id,
+          result: null,
+          text: '',
+          status: 'error',
+          error: message,
+        })
+        onProgress?.({
+          pageNum: skippedPageNum,
+          completedPages,
+          totalPages,
+          error: message,
+          message,
+        })
+      }
+      break
+    }
     attemptedPageIds.add(originalPage.id)
     const pageNum = typeof originalPage.page_num === 'number' ? originalPage.page_num : undefined
     onProgress?.({
@@ -3431,7 +3559,13 @@ async function retryIncompletePagesWithSinglePageOcr(
 
     try {
       const retryOptions = getAutomaticSinglePageRetryOptions(doc, page)
-      const result = await recognizeSinglePage(withRequiredImage(page), doc, retryOptions, signal)
+      const pageTimeoutMs = Math.min(OCR_SINGLE_PAGE_RETRY_TIMEOUT_MS, remainingBudgetMs)
+      const result = await runWithOcrRetryTimeout(
+        pageTimeoutMs,
+        signal,
+        `第 ${pageNum || '?'} 页单页补跑超过 ${Math.ceil(pageTimeoutMs / 1000)} 秒，已停止等待。`,
+        (retrySignal) => recognizeSinglePage(withRequiredImage(page), doc, retryOptions, retrySignal),
+      )
       const text = getOcrResultText(result)
       completedPages += 1
       onProgress?.({
@@ -6031,6 +6165,7 @@ async function processDocumentOcr(
     throwIfOcrCanceled(signal)
     let pageResults: OcrPageResult[] = []
     let pageResultsPersistedInChunks = false
+    let autoRetriedIncompletePages = false
     let streamedAsyncPageSummary: { total: number; completed: number; failed: number; pending: number } | null = null
     let usedNativePdfTextOnly = false
 
@@ -6474,10 +6609,12 @@ async function processDocumentOcr(
                 totalPages: getDocTotalPages() || payload.totalPages,
                 pageNum: payload.pageNum,
                 errorMessage: payload.error,
-                message: `正在自动补跑未完成页：${payload.completedPages}/${payload.totalPages} 页`,
+                message: payload.message || `正在自动补跑未完成页：${payload.completedPages}/${payload.totalPages} 页`,
               })
             },
+            { originalPdfRetryMode: 'targeted' },
           )
+          autoRetriedIncompletePages = true
           canUsePdfAsync = false
         } else if (!isPdfChunkStructureError(error) || !canFallbackToImageOcr(pagesForOcr)) {
           throw error
@@ -6617,7 +6754,7 @@ async function processDocumentOcr(
 
     let persistedPageSummary = summarizeDocumentOcrPages(docId)
     persistedPageSummary = await syncGujiPaddleReferenceResults(persistedPageSummary)
-    if (engine !== 'local_paddle' && (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0)) {
+    if (!autoRetriedIncompletePages && engine !== 'local_paddle' && (persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0)) {
       const failedOrPending = Math.max(0, persistedPageSummary.failed + persistedPageSummary.pending)
       emitOcrStatus(event, {
         docId,
@@ -6659,8 +6796,9 @@ async function processDocumentOcr(
               || `正在补跑未完成页 ${payload.completedPages}/${payload.totalPages}`,
           })
         },
-        { skipOriginalPdfRetry: pageResultsPersistedInChunks },
+        { originalPdfRetryMode: pageResultsPersistedInChunks ? 'targeted' : 'full' },
       )
+      autoRetriedIncompletePages = true
       if (retryResults.length > 0) {
         await savePageOcrResultsBatchedDeferred(retryResults, 'paddle', { refreshSearch: false })
         persistedPageSummary = summarizeDocumentOcrPages(docId)
@@ -7018,9 +7156,10 @@ async function processImportAutoOcrClaim(
       errorMessage: OCR_CANCELED_MESSAGE,
     }
     const heavy = isHeavyPdfOcrDocument(docId)
-    await globalOcrDocumentWindow.runForDocument(
+    await runOcrDocumentInConfiguredWindows(
       docId,
-      heavy ? 1 : documentConcurrency,
+      documentConcurrency,
+      heavy,
       async () => {
         result = await runDocumentOcrWithWallTimeout(
           event,
@@ -7355,14 +7494,18 @@ export function registerOcrIpc(): void {
         emitOcrAlreadyRunningStatus(event, docId)
         continue
       }
-      const forceFullRerun = options?.forceFullRerun === true
+      const retryFailedPagesOnly = options?.retryFailedPagesOnly === true
+      const forceFullRerun = !retryFailedPagesOnly && options?.forceFullRerun === true
       forceFullRerunByDocId.set(docId, forceFullRerun)
       canceledOcrDocIds.delete(docId)
       timedOutOcrDocIds.delete(docId)
       // Prefer document-level status; only hit pages table when status claims completed.
-      const needsWork = forceFullRerun
-        || doc.ocr_status !== 'completed'
-        || hasIncompleteOcrPages(docId)
+      const hasIncompletePages = retryFailedPagesOnly || doc.ocr_status === 'completed'
+        ? hasIncompleteOcrPages(docId)
+        : false
+      const needsWork = retryFailedPagesOnly
+        ? hasIncompletePages
+        : forceFullRerun || doc.ocr_status !== 'completed' || hasIncompletePages
       if (!needsWork) continue
       queuedOcrDocIds.add(docId)
       queuedDocIds.push(docId)
@@ -7469,10 +7612,9 @@ export function registerOcrIpc(): void {
           }
         }
 
-        // Only true monsters serialize (1000+ pages or 200MB+). Otherwise honor user batch_size concurrency.
+        // Large scans have their own configurable sub-window; batch size remains the total OCR limit.
         const heavy = isHeavyPdfOcrDocument(docId)
         if (heavy) heavyPdfDocIds.add(docId)
-        const slotLimit = heavy ? 1 : documentConcurrency
 
         const controller = new AbortController()
         const preCanceled = canceledOcrDocIds.has(docId)
@@ -7494,7 +7636,7 @@ export function registerOcrIpc(): void {
           await updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')
           await yieldToEventLoop()
 
-          await globalOcrDocumentWindow.runForDocument(docId, slotLimit, async () => {
+          await runOcrDocumentInConfiguredWindows(docId, documentConcurrency, heavy, async () => {
             const pageCount = Number(doc?.page_count || 0) || 0
             const result = await runDocumentOcrWithWallTimeout(
               event,

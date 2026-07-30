@@ -81,9 +81,13 @@ try {
   assert.strictEqual(settings.getSettingDefinition('theme').rendererVisible, true)
   assert.strictEqual(settings.getSettingDefinition('auto_ai_after_ocr').defaultValue, 'false')
   assert.deepStrictEqual(settings.validateSettingValue('batch_size', '10'), { key: 'batch_size', value: '10', known: true })
+  assert.deepStrictEqual(settings.validateSettingValue('ocr_async_pdf_chunk_concurrency', '8'), { key: 'ocr_async_pdf_chunk_concurrency', value: '8', known: true })
+  assert.deepStrictEqual(settings.validateSettingValue('ocr_heavy_pdf_document_concurrency', '6'), { key: 'ocr_heavy_pdf_document_concurrency', value: '6', known: true })
   assert.deepStrictEqual(settings.validateSettingValue('auto_ocr_after_import', 'TRUE'), { key: 'auto_ocr_after_import', value: 'true', known: true })
   assert.deepStrictEqual(settings.validateSettingValue('future_compatible_key', 'value'), { key: 'future_compatible_key', value: 'value', known: false })
   assert.throws(() => settings.validateSettingValue('batch_size', '0'), /setting_value_out_of_range/)
+  assert.throws(() => settings.validateSettingValue('ocr_async_pdf_chunk_concurrency', '9'), /setting_value_out_of_range/)
+  assert.throws(() => settings.validateSettingValue('ocr_heavy_pdf_document_concurrency', '21'), /setting_value_out_of_range/)
   assert.throws(() => settings.validateSettingValue('auto_ocr_after_import', 'yes'), /setting_value_invalid_boolean/)
 
   const settingsView = readFileSync(path.join(root, 'src/renderer/src/views/SettingsView.tsx'), 'utf8')

@@ -9,6 +9,7 @@ const tempRoot = mkdtempSync(join(__dirname, '.tmp-startup-recovery-'))
 const tempDataDir = join(tempRoot, 'data')
 const bundlePath = join(tempRoot, 'startup-recovery-bundle.cjs')
 const entryPath = join(tempRoot, 'startup-recovery-entry.js')
+const deleteWorkerPath = join(tempRoot, 'document-delete-worker.js')
 
 process.env.GUJISMART_DATA_DIR = tempDataDir
 process.env.GUJISMART_AUTO_REINDEX = '0'
@@ -33,6 +34,18 @@ buildSync({
     electron: join(__dirname, 'stubs', 'electron.js'),
     '@electron-toolkit/utils': join(__dirname, 'stubs', 'electron-toolkit-utils.js'),
   },
+  logLevel: 'silent',
+})
+
+// Production always ships this worker beside the main bundle. Build the same
+// sibling entry so startup recovery exercises the nonblocking product path.
+buildSync({
+  entryPoints: [join(__dirname, '..', 'src', 'main', 'document-delete-worker.ts')],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: deleteWorkerPath,
+  external: ['better-sqlite3'],
   logLevel: 'silent',
 })
 

@@ -165,8 +165,12 @@ const DEFAULT_OCR_CONCURRENCY = 6
 const MAX_OCR_CONCURRENCY = 32
 const DEFAULT_DOC_CONCURRENCY = 3
 export const MAX_DOC_CONCURRENCY = 20
-const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 1
-const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 1
+const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 4
+const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 8
+const DEFAULT_HEAVY_PDF_DOCUMENT_CONCURRENCY = 2
+const MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS = 3
+const ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX = '[async_pdf_incomplete_chunk]'
+const ASYNC_PDF_RELIABILITY_MODE_COOLDOWN_MS = 10 * 60 * 1000
 const MAX_RETRY_ATTEMPTS = 4
 const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 240
 const DEFAULT_OCR_UPLOAD_TIMEOUT_SECONDS = 3600
@@ -324,8 +328,65 @@ function createLimiter(concurrency: number) {
   }
 }
 
+function createAdaptiveLimiter(getConcurrency: () => number) {
+  let activeCount = 0
+  const queue: Array<{ start: () => void; signal?: AbortSignal; onAbort: () => void }> = []
+
+  const drain = () => {
+    const concurrency = Math.max(1, Math.floor(Number(getConcurrency()) || 1))
+    while (activeCount < concurrency && queue.length > 0) {
+      const entry = queue.shift()
+      if (!entry) return
+      if (entry.signal?.aborted) {
+        entry.onAbort()
+        continue
+      }
+      activeCount += 1
+      entry.signal?.removeEventListener('abort', entry.onAbort)
+      entry.start()
+    }
+  }
+
+  return function limit<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let started = false
+      let entry: { start: () => void; signal?: AbortSignal; onAbort: () => void }
+      const onAbort = () => {
+        if (started) return
+        const queueIndex = queue.indexOf(entry)
+        if (queueIndex >= 0) queue.splice(queueIndex, 1)
+        reject(new OcrAbortError())
+      }
+      entry = {
+        signal,
+        onAbort,
+        start: () => {
+          started = true
+          void fn()
+            .then(resolve, reject)
+            .finally(() => {
+              activeCount = Math.max(0, activeCount - 1)
+              drain()
+            })
+        },
+      }
+      if (signal?.aborted) {
+        reject(new OcrAbortError())
+        return
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      queue.push(entry)
+      drain()
+    })
+  }
+}
+
 const asyncSubmitLimit = createLimiter(MAX_DOC_CONCURRENCY)
 const asyncPollLimit = createLimiter(16)
+let asyncPdfReliabilityModeUntil = 0
+const asyncPdfJobLimit = createAdaptiveLimiter(() => (
+  Date.now() < asyncPdfReliabilityModeUntil ? 1 : getAsyncPdfChunkConcurrency()
+))
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -390,8 +451,25 @@ export function getOcrDocumentConcurrency(requested?: unknown): number {
   return getNumericSetting('batch_size', DEFAULT_DOC_CONCURRENCY, MAX_DOC_CONCURRENCY)
 }
 
+export function getOcrHeavyPdfDocumentConcurrency(): number {
+  return getNumericSetting(
+    'ocr_heavy_pdf_document_concurrency',
+    DEFAULT_HEAVY_PDF_DOCUMENT_CONCURRENCY,
+    MAX_DOC_CONCURRENCY,
+  )
+}
+
 function getAsyncPdfChunkConcurrency(): number {
   return getNumericSetting('ocr_async_pdf_chunk_concurrency', DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY, MAX_ASYNC_PDF_CHUNK_CONCURRENCY)
+}
+
+function activateAsyncPdfReliabilityMode(): boolean {
+  const wasActive = Date.now() < asyncPdfReliabilityModeUntil
+  asyncPdfReliabilityModeUntil = Math.max(
+    asyncPdfReliabilityModeUntil,
+    Date.now() + ASYNC_PDF_RELIABILITY_MODE_COOLDOWN_MS,
+  )
+  return !wasActive
 }
 
 function normalizeAsyncOcrModel(model: unknown): AsyncOcrModel {
@@ -458,8 +536,11 @@ async function fetchWithTimeout(input: Parameters<typeof fetch>[0], init: Reques
   }
 }
 
-function getAsyncPdfWorkerCount(plan: PdfChunkPlan): number {
-  const configured = getAsyncPdfChunkConcurrency()
+function getAsyncPdfWorkerCount(plan: PdfChunkPlan, requestedMaxWorkers?: number): number {
+  const requestedLimit = Number.isFinite(Number(requestedMaxWorkers))
+    ? Math.max(1, Math.min(MAX_ASYNC_PDF_CHUNK_CONCURRENCY, Math.floor(Number(requestedMaxWorkers))))
+    : MAX_ASYNC_PDF_CHUNK_CONCURRENCY
+  const configured = Math.min(getAsyncPdfChunkConcurrency(), requestedLimit)
   if (plan.sourceSize >= 900 * 1024 * 1024 || plan.totalPages >= 2500) {
     return Math.min(2, configured, Math.max(1, plan.estimatedTotalChunks))
   }
@@ -4116,6 +4197,7 @@ interface RecognizePdfAsyncOptions {
   ocrOptions?: PageOcrOptions
   requireFullFileUpload?: boolean
   pageRangeChunkSize?: number
+  maxWorkers?: number
 }
 
 interface AsyncPdfSubmitOptions {
@@ -5297,6 +5379,7 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
   let nextTargetCursor = 0
   let chunkCreationQueue = Promise.resolve()
   let chunkCompleteQueue = Promise.resolve()
+  const chunkFailures: unknown[] = []
 
   const getCompletedPagesAcrossChunks = () => completedByChunk.reduce((sum, value) => sum + value, 0)
 
@@ -5394,70 +5477,103 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
         uploadPageCount: chunk.uploadPageCount,
         progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
       })
-      const excludedTokenIds = new Set<string>()
-      let jsonUrl = ''
-      while (!jsonUrl) {
-        const submission = await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
-          onProgress?.({
-            status: 'queued',
-            state: 'queued',
-            errorMessage: queuePayload.errorMessage,
-            chunkIndex: chunkIndex + 1,
-            totalChunks,
-            chunkStartPage,
-            chunkEndPage,
-            completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
-            totalPages,
-            fallbackWholePdf: chunk.fallbackWholePdf,
-            fallbackReason: chunk.fallbackReason,
-            fullFileUpload: chunk.fullFileUpload,
-            uploadPageCount: chunk.uploadPageCount,
-            progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
-          })
-        }, { pageRanges: chunk.pageRanges, optionalPayload }, excludedTokenIds)
-        try {
-          jsonUrl = await waitForAsyncPdfResult(submission.jobId, submission.lease, (payload) => {
-            const chunkCompleted = getChunkCompletedPages(chunk, payload)
-            const chunkTotal = getTotalPages(payload, chunk.uploadPageCount || chunk.pageCount)
-            completedByChunk[chunkIndex] = Math.max(completedByChunk[chunkIndex] || 0, chunkCompleted)
-            const completedPages = Math.min(getCompletedPagesAcrossChunks(), totalPages)
-            onProgress?.({
-              ...payload,
-              chunkIndex: chunkIndex + 1,
-              totalChunks,
-              chunkStartPage,
-              chunkEndPage,
-              completedPages,
-              totalPages,
-              fallbackWholePdf: chunk.fallbackWholePdf,
-              fallbackReason: chunk.fallbackReason,
-              fullFileUpload: chunk.fullFileUpload,
-              uploadPageCount: chunk.uploadPageCount,
-              progress: chunkTotal > 0 ? completedPages / Math.max(1, totalPages) : payload.progress,
-            })
-          }, signal)
-        } catch (error) {
-          if (!isPaddleOcrTokenFailure(error)) throw error
-          markPaddleOcrTokenFailure(submission.lease, error)
-          excludedTokenIds.add(submission.lease.id)
-          completedByChunk[chunkIndex] = 0
-          onProgress?.({
-            status: 'queued',
-            state: 'queued',
-            errorMessage: `${submission.lease.label} 额度已用完或 Token 无效，正在切换下一个 Token，只重试第 ${chunkStartPage}-${chunkEndPage} 页。`,
-            chunkIndex: chunkIndex + 1,
-            totalChunks,
-            chunkStartPage,
-            chunkEndPage,
-            completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
-            totalPages,
-            progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
-          })
+      let normalizedChunkResults: Array<OcrResultPayload | null> = []
+      for (let resultAttempt = 1; resultAttempt <= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS; resultAttempt += 1) {
+        normalizedChunkResults = await asyncPdfJobLimit(async () => {
+          const excludedTokenIds = new Set<string>()
+          let jsonUrl = ''
+          while (!jsonUrl) {
+            const submission = await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
+              onProgress?.({
+                status: 'queued',
+                state: 'queued',
+                errorMessage: queuePayload.errorMessage,
+                chunkIndex: chunkIndex + 1,
+                totalChunks,
+                chunkStartPage,
+                chunkEndPage,
+                completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+                totalPages,
+                fallbackWholePdf: chunk.fallbackWholePdf,
+                fallbackReason: chunk.fallbackReason,
+                fullFileUpload: chunk.fullFileUpload,
+                uploadPageCount: chunk.uploadPageCount,
+                progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+              })
+            }, { pageRanges: chunk.pageRanges, optionalPayload }, excludedTokenIds)
+            try {
+              jsonUrl = await waitForAsyncPdfResult(submission.jobId, submission.lease, (payload) => {
+                const chunkCompleted = getChunkCompletedPages(chunk, payload)
+                const chunkTotal = getTotalPages(payload, chunk.uploadPageCount || chunk.pageCount)
+                completedByChunk[chunkIndex] = Math.max(completedByChunk[chunkIndex] || 0, chunkCompleted)
+                const completedPages = Math.min(getCompletedPagesAcrossChunks(), totalPages)
+                onProgress?.({
+                  ...payload,
+                  chunkIndex: chunkIndex + 1,
+                  totalChunks,
+                  chunkStartPage,
+                  chunkEndPage,
+                  completedPages,
+                  totalPages,
+                  fallbackWholePdf: chunk.fallbackWholePdf,
+                  fallbackReason: chunk.fallbackReason,
+                  fullFileUpload: chunk.fullFileUpload,
+                  uploadPageCount: chunk.uploadPageCount,
+                  progress: chunkTotal > 0 ? completedPages / Math.max(1, totalPages) : payload.progress,
+                })
+              }, signal)
+            } catch (error) {
+              if (!isPaddleOcrTokenFailure(error)) throw error
+              markPaddleOcrTokenFailure(submission.lease, error)
+              excludedTokenIds.add(submission.lease.id)
+              completedByChunk[chunkIndex] = 0
+              onProgress?.({
+                status: 'queued',
+                state: 'queued',
+                errorMessage: `${submission.lease.label} 额度已用完或 Token 无效，正在切换下一个 Token，只重试第 ${chunkStartPage}-${chunkEndPage} 页。`,
+                chunkIndex: chunkIndex + 1,
+                totalChunks,
+                chunkStartPage,
+                chunkEndPage,
+                completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+                totalPages,
+                progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+              })
+            }
+          }
+          throwIfAborted(signal)
+          const pagePayloads = await fetchAsyncPdfJsonLines(jsonUrl, model, signal)
+          return normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)
+        }, signal)
+        const expectedResultCount = chunk.sourcePageIndexes.length || chunk.uploadPageCount || chunk.pageCount
+        const missingResultOffsets = Array.from({ length: expectedResultCount }, (_, index) => index)
+          .filter((index) => !normalizedChunkResults[index])
+        if (normalizedChunkResults.length >= expectedResultCount && missingResultOffsets.length === 0) break
+
+        const missingPageNums = missingResultOffsets
+          .map((index) => (chunk.sourcePageIndexes[index] ?? (chunk.startPageIndex + index)) + 1)
+        const missingSummary = missingPageNums.length > 0
+          ? missingPageNums.slice(0, 8).join('、') + (missingPageNums.length > 8 ? '…' : '')
+          : `${chunkStartPage}-${chunkEndPage}`
+        const switchedToReliabilityMode = activateAsyncPdfReliabilityMode()
+        if (resultAttempt >= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS) {
+          throw new Error(`${ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX} 第 ${missingSummary} 页未返回完整 OCR 结果，已停止重复提交并转入失败页补跑。`)
         }
+        onProgress?.({
+          status: 'queued',
+          state: 'queued',
+          errorMessage: switchedToReliabilityMode
+            ? `第 ${missingSummary} 页结果不完整，已临时切换稳健模式并串行重试当前分片（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`
+            : `第 ${missingSummary} 页结果不完整，正在串行重试当前分片（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`,
+          chunkIndex: chunkIndex + 1,
+          totalChunks,
+          chunkStartPage,
+          chunkEndPage,
+          completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+          totalPages,
+          progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+        })
       }
-      throwIfAborted(signal)
-      const pagePayloads = await fetchAsyncPdfJsonLines(jsonUrl, model, signal)
-      const normalizedChunkResults = await normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)
       const sourcePageIndexes = chunk.sourcePageIndexes.length > 0
         ? chunk.sourcePageIndexes
         : normalizedChunkResults.map((_, index) => index)
@@ -5487,14 +5603,20 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
       throwIfAborted(signal)
       const next = await getNextChunk()
       if (!next) return
-      await processChunk(next.chunk, next.chunkIndex)
+      try {
+        await processChunk(next.chunk, next.chunkIndex)
+      } catch (error) {
+        if (isOcrAbortError(error)) throw error
+        chunkFailures.push(error)
+      }
     }
   }
 
   let retryPlan: PdfChunkPlan | null = null
   try {
-    const workerCount = getAsyncPdfWorkerCount(plan)
+    const workerCount = getAsyncPdfWorkerCount(plan, options?.maxWorkers)
     await Promise.all(Array.from({ length: workerCount }, () => worker()))
+    if (chunkFailures.length > 0) throw chunkFailures[0]
   } catch (error) {
     if (!retriedWholePdfUploadWithChunks && shouldRetryWholePdfUploadWithChunking(error, plan)) {
       retriedWholePdfUploadWithChunks = true

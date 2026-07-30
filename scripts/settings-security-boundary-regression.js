@@ -49,6 +49,21 @@ for (const [name, source] of [['SettingsView', settingsView], ['OnboardingWizard
   assert.ok(!/settings\.(?:llm|vision_ocr|paddleocr)_api_key\b/.test(source), `${name} must not expect saved plaintext credentials`)
 }
 assert.ok(!settingsView.includes('profile.apiKey'), 'settings profile selection must not refill a saved secret')
+assert.ok(
+  settingsView.includes('name="ocr_async_pdf_chunk_concurrency"')
+    && settingsView.includes('name="ocr_heavy_pdf_document_concurrency"'),
+  'global Settings must expose both asynchronous PDF chunk and heavy-document concurrency controls',
+)
+assert.ok(
+  appView.includes("activeTab.view === 'settings' && settingsDirty")
+    && appView.includes('runWithSettingsLeaveGuard(() => {')
+    && appView.includes('void activateLibraryProject(project, true)'),
+  'project switching must preserve the global settings leave guard instead of silently dropping API drafts',
+)
+assert.ok(
+  appView.includes("createLibraryProject({ name, activate: false })"),
+  'creating a project from global settings must not change the active project before the leave guard resolves',
+)
 const preload = read('src/preload/index.ts')
 assert.ok(preload.includes("ipcRenderer.invoke('settings:credential:prepare'"), 'preload must exchange transient renderer drafts for opaque refs')
 assert.ok(preload.includes("ipcRenderer.invoke('settings:credential:commit'"), 'preload must commit credentials through the dedicated channel')

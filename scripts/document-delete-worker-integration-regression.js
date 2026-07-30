@@ -206,6 +206,14 @@ async function run() {
       heartbeatCount += 1
     }, 10)
 
+    // Let Electron finish Windows input-method startup before measuring worker
+    // responsiveness; otherwise TSF initialization can consume the whole short
+    // fixture window and make a healthy worker look like a blocked main thread.
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    heartbeatCount = 0
+    maximumHeartbeatLagMs = 0
+    lastHeartbeatAt = Date.now()
+
     const startedAt = Date.now()
     const { result, progress } = await runWorkerTask(fixture.documentIds)
     const elapsedMs = Date.now() - startedAt

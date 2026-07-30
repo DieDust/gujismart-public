@@ -48,6 +48,54 @@ async function main() {
   for (let index = 0; index < releases.length; index += 1) releases[index]?.()
   await Promise.all(tasks)
 
+  const heavyScheduler = new SlidingWindowScheduler()
+  const heavyReleases = []
+  const heavyStarted = []
+  const heavyTasks = Array.from({ length: 4 }, (_, index) => heavyScheduler.run(2, async () => {
+    heavyStarted.push(index)
+    await new Promise((resolve) => { heavyReleases[index] = resolve })
+  }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepStrictEqual(heavyStarted, [0, 1], 'large PDFs should retain a bounded two-document window')
+  heavyReleases[0]()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepStrictEqual(heavyStarted, [0, 1, 2], 'the next large PDF should start when one bounded slot is released')
+  heavyStarted.forEach((index) => heavyReleases[index]?.())
+  await new Promise((resolve) => setImmediate(resolve))
+  for (let index = 0; index < heavyReleases.length; index += 1) heavyReleases[index]?.()
+  await Promise.all(heavyTasks)
+
+  const combinedTotalScheduler = new SlidingWindowScheduler()
+  const combinedHeavyScheduler = new SlidingWindowScheduler()
+  const combinedHeavyStarted = []
+  const combinedOrdinaryStarted = []
+  let combinedActive = 0
+  let combinedPeak = 0
+  let releaseCombined
+  const combinedBarrier = new Promise((resolve) => { releaseCombined = resolve })
+  const combinedHeavyTasks = Array.from({ length: 3 }, (_, index) => combinedHeavyScheduler.run(2, () => (
+    combinedTotalScheduler.run(4, async () => {
+      combinedHeavyStarted.push(index)
+      combinedActive += 1
+      combinedPeak = Math.max(combinedPeak, combinedActive)
+      await combinedBarrier
+      combinedActive -= 1
+    })
+  )))
+  const combinedOrdinaryTasks = Array.from({ length: 3 }, (_, index) => combinedTotalScheduler.run(4, async () => {
+    combinedOrdinaryStarted.push(index)
+    combinedActive += 1
+    combinedPeak = Math.max(combinedPeak, combinedActive)
+    await combinedBarrier
+    combinedActive -= 1
+  }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepStrictEqual(combinedHeavyStarted, [0, 1], 'the heavy sub-window should enforce its own limit')
+  assert.deepStrictEqual(combinedOrdinaryStarted, [0, 1], 'ordinary documents should fill unused total OCR slots')
+  assert.strictEqual(combinedPeak, 4, 'the independent heavy limit must not shrink the configured total window')
+  releaseCombined()
+  await Promise.all([...combinedHeavyTasks, ...combinedOrdinaryTasks])
+
   const ownershipScheduler = new SlidingWindowScheduler()
   const ownershipStarted = []
   let releaseOwnedDocument
@@ -113,9 +161,16 @@ async function main() {
   assert.ok(!libraryView.includes('message.loading({\n          content: getOcrProgressText(nextInfo),\n          key: toastKey'), 'Library must not open one persistent toast per document')
   assert.ok(
     ocrIpc.includes('runBoundedDocumentWorkers')
-      && (ocrIpc.match(/globalOcrDocumentWindow\.runForDocument\(/g) || []).length >= 2
+      && ocrIpc.includes('runOcrDocumentInConfiguredWindows')
+      && ocrIpc.includes('globalOcrDocumentWindow.runForDocument(')
       && ocrIpc.includes('getOcrDocumentConcurrency'),
     'automatic and manual OCR should share document ownership and the global window via the bounded worker pool',
+  )
+  assert.ok(
+    ocrIpc.includes('heavyPdfOcrDocumentWindow.run(getOcrHeavyPdfDocumentConcurrency(), runInTotalWindow)')
+      && ocrIpc.includes('documentConcurrency,')
+      && !ocrIpc.includes('HEAVY_PDF_DOCUMENT_CONCURRENCY'),
+    'large PDFs should use a configurable sub-window without shrinking the total OCR window',
   )
   assert.ok(
     batchProcessor.includes('globalOcrDocumentWindow.runForDocument(docId, getOcrDocumentConcurrency()'),

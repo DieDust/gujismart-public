@@ -102,3 +102,4 @@ export class SlidingWindowScheduler {
 }
 
 export const globalOcrDocumentWindow = new SlidingWindowScheduler()
+export const heavyPdfOcrDocumentWindow = new SlidingWindowScheduler()

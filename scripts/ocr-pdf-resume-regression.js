@@ -33,8 +33,13 @@ writeFileSync(databaseStubPath, `
     const key = Array.isArray(params) && params.length > 0
       ? String(params[0])
       : Array.from(settings.keys()).find((item) => text.includes(item))
+    if (key === 'ocr_async_pdf_chunk_concurrency' && process.env.GUJISMART_TEST_OCR_CHUNK_CONCURRENCY) {
+      return { value: process.env.GUJISMART_TEST_OCR_CHUNK_CONCURRENCY }
+    }
     return key && settings.has(key) ? { value: settings.get(key) } : null
   }
+  exports.run = () => ({ changes: 1 })
+  exports.getDataDir = () => ${JSON.stringify(tempRoot)}
 `)
 
 writeFileSync(settingsSecurityStubPath, `
@@ -151,6 +156,105 @@ function installMockAsyncFetch() {
     }
 
     throw new Error(`unexpected fetch: ${method} ${url}`)
+  }
+
+  return uploads
+}
+
+function installIncompleteChunkFetch() {
+  const uploads = []
+  let jobIndex = 0
+
+  global.fetch = async (input, init = {}) => {
+    const url = String(input)
+    const method = String(init.method || 'GET').toUpperCase()
+
+    if (method === 'POST' && url.includes('/api/v2/ocr/jobs')) {
+      const upload = await readUploadedPdf(init.body)
+      const jobId = `incomplete-job-${jobIndex}`
+      jobIndex += 1
+      uploads.push({ jobId, ...upload })
+      return new Response(JSON.stringify({ data: { jobId } }), { status: 200 })
+    }
+
+    if (method === 'GET' && url.includes('/api/v2/ocr/jobs/incomplete-job-')) {
+      const jobId = url.slice(url.lastIndexOf('/') + 1)
+      const upload = uploads.find((item) => item.jobId === jobId)
+      assert.ok(upload, `unknown incomplete job id ${jobId}`)
+      return new Response(JSON.stringify({
+        data: {
+          status: 'completed',
+          completedPages: upload.pageCount,
+          totalPages: upload.pageCount,
+          jsonUrl: `mock://incomplete-result/${jobId}`,
+        },
+      }), { status: 200 })
+    }
+
+    if (method === 'GET' && url.startsWith('mock://incomplete-result/')) {
+      const jobId = url.slice(url.lastIndexOf('/') + 1)
+      const upload = uploads.find((item) => item.jobId === jobId)
+      assert.ok(upload, `unknown incomplete result job id ${jobId}`)
+      const resultCount = jobId === 'incomplete-job-0'
+        ? Math.max(0, upload.pageCount - 1)
+        : upload.pageCount
+      return new Response(JSON.stringify({
+        layoutParsingResults: Array.from({ length: resultCount }, (_, index) => ({
+          markdown: `recovered page ${index + 1}`,
+        })),
+      }), { status: 200 })
+    }
+
+    throw new Error(`unexpected incomplete fetch: ${method} ${url}`)
+  }
+
+  return uploads
+}
+
+function installPersistentMiddleChunkFailureFetch() {
+  const uploads = []
+  let jobIndex = 0
+
+  global.fetch = async (input, init = {}) => {
+    const url = String(input)
+    const method = String(init.method || 'GET').toUpperCase()
+
+    if (method === 'POST' && url.includes('/api/v2/ocr/jobs')) {
+      const upload = await readUploadedPdf(init.body)
+      const jobId = `middle-failure-job-${jobIndex}`
+      jobIndex += 1
+      uploads.push({ jobId, ...upload })
+      return new Response(JSON.stringify({ data: { jobId } }), { status: 200 })
+    }
+
+    if (method === 'GET' && url.includes('/api/v2/ocr/jobs/middle-failure-job-')) {
+      const jobId = url.slice(url.lastIndexOf('/') + 1)
+      const upload = uploads.find((item) => item.jobId === jobId)
+      assert.ok(upload, `unknown middle failure job id ${jobId}`)
+      return new Response(JSON.stringify({
+        data: {
+          status: 'completed',
+          completedPages: upload.pageCount,
+          totalPages: upload.pageCount,
+          jsonUrl: `mock://middle-failure-result/${jobId}`,
+        },
+      }), { status: 200 })
+    }
+
+    if (method === 'GET' && url.startsWith('mock://middle-failure-result/')) {
+      const jobId = url.slice(url.lastIndexOf('/') + 1)
+      const upload = uploads.find((item) => item.jobId === jobId)
+      assert.ok(upload, `unknown middle failure result job id ${jobId}`)
+      const isMiddleChunk = upload.sizes[0]?.width === 301
+      const resultCount = isMiddleChunk ? Math.max(0, upload.pageCount - 1) : upload.pageCount
+      return new Response(JSON.stringify({
+        layoutParsingResults: Array.from({ length: resultCount }, (_, index) => ({
+          markdown: `chunk page ${index + 1}`,
+        })),
+      }), { status: 200 })
+    }
+
+    throw new Error(`unexpected middle failure fetch: ${method} ${url}`)
   }
 
   return uploads
@@ -538,6 +642,65 @@ async function runEmptyTargetScenario(ocr, pdfPath) {
   assert.strictEqual(chunks.length, 0)
 }
 
+async function runIncompleteChunkRetryScenario(ocr, pdfPath) {
+  const uploads = installIncompleteChunkFetch()
+  const chunks = []
+  const progressEvents = []
+  const results = await ocr.recognizePdfAsync(pdfPath, (payload) => {
+    progressEvents.push(payload)
+  }, {
+    model: 'PaddleOCR-VL-1.6',
+    onChunkComplete: (chunk) => chunks.push(chunk),
+  })
+
+  assert.strictEqual(uploads.length, 2, 'an incomplete result should resubmit only the affected chunk')
+  assert.strictEqual(chunks.length, 1, 'an incomplete attempt must not fire the completion callback')
+  assert.strictEqual(results.length, 5)
+  assert.ok(results.every(Boolean))
+  assert.ok(progressEvents.some((payload) => String(payload.errorMessage || '').includes('结果不完整')))
+}
+
+async function runPersistentMiddleChunkFailureScenario(ocr, pdfPath) {
+  const uploads = installPersistentMiddleChunkFailureFetch()
+  const completedChunkStarts = []
+  const previousConcurrency = process.env.GUJISMART_TEST_OCR_CHUNK_CONCURRENCY
+  process.env.GUJISMART_TEST_OCR_CHUNK_CONCURRENCY = '2'
+
+  try {
+    await assert.rejects(
+      () => ocr.recognizePdfAsync(pdfPath, undefined, {
+        model: 'PaddleOCR-VL-1.6',
+        fallbackPageCount: 205,
+        onChunkComplete: (chunk) => {
+          completedChunkStarts.push(chunk.sourcePageIndexes[0])
+        },
+      }),
+      /async_pdf_incomplete_chunk/,
+    )
+  } finally {
+    if (previousConcurrency === undefined) {
+      delete process.env.GUJISMART_TEST_OCR_CHUNK_CONCURRENCY
+    } else {
+      process.env.GUJISMART_TEST_OCR_CHUNK_CONCURRENCY = previousConcurrency
+    }
+  }
+
+  assert.strictEqual(
+    uploads.filter((upload) => upload.sizes[0]?.width === 301).length,
+    3,
+    'the incomplete middle chunk should stop after three attempts',
+  )
+  assert.ok(
+    uploads.some((upload) => upload.sizes[0]?.width === 401 && upload.pageCount === 5),
+    'the final five pages must still upload after the middle chunk fails',
+  )
+  assert.deepStrictEqual(
+    completedChunkStarts.sort((left, right) => left - right),
+    [0, 200],
+    'successful chunks before and after the failure must both reach the persistence callback',
+  )
+}
+
 async function runTokenFailoverChunkResumeScenario(ocr, pdfPath) {
   const { uploads, submissionTokens } = installTokenFailoverFetch()
   const chunks = []
@@ -575,6 +738,8 @@ async function run() {
   await runQpdfChunkingScenario(ocr, largePdfPath)
   await runWholePdfFallbackScenario(ocr, largePdfPath)
   await runWholePdfFallbackWhenLoadFailsScenario(ocr, pdfPath)
+  await runPersistentMiddleChunkFailureScenario(ocr, failoverPdfPath)
+  await runIncompleteChunkRetryScenario(ocr, pdfPath)
   await runTokenFailoverChunkResumeScenario(ocr, failoverPdfPath)
   await runEmptyTargetScenario(ocr, pdfPath)
   console.log('OCR PDF resume regression passed')

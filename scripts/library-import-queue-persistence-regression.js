@@ -63,8 +63,14 @@ const confirmBatchForceRerunOcrBody = sliceBetween(
 const handleRetryDocumentBody = sliceBetween(
   librarySource,
   'const handleRetryDocument = async',
-  'const handleForceRerunDocument =',
+  'const handleRetryFailedPages =',
   'Single document retry handler',
+)
+const handleRetryFailedPagesBody = sliceBetween(
+  librarySource,
+  'const handleRetryFailedPages = async',
+  'const handleForceRerunDocument =',
+  'Failed-page OCR retry handler',
 )
 const handleForceRerunDocumentBody = sliceBetween(
   librarySource,
@@ -308,6 +314,16 @@ assert(
     && !handleRetryDocumentBody.includes('await window.api.getDocumentLight(doc.id)')
     && handleRetryDocumentBody.includes('const storedEngine = parseDocMetadata(doc).ocr_engine'),
   'Single-document retry must enter the OCR queue without blocking status writes or detail reads.',
+)
+assert(
+  sharedTypesSource.includes('retryFailedPagesOnly?: boolean')
+    && librarySource.includes("key: 'retry_failed_ocr_pages', label: '重新 OCR 错页'")
+    && librarySource.includes("if (key === 'retry_failed_ocr_pages')")
+    && runOcrInConfiguredBatchesBody.includes('retryFailedPagesOnly: options?.retryFailedPagesOnly')
+    && handleRetryFailedPagesBody.includes('{ retryFailedPagesOnly: true }')
+    && !handleRetryFailedPagesBody.includes('forceFullRerun: true')
+    && handleRetryFailedPagesBody.includes('已成功页和人工校对内容会保留'),
+  'Documents with incomplete OCR pages should expose a failed-page-only retry that preserves completed and proofed text.',
 )
 assert(
   runOcrInConfiguredBatchesBody.includes("message: 'OCR 入队或处理失败'")

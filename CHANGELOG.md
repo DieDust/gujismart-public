@@ -1,6 +1,100 @@
 # 更新日志 / Changelog
 
-## Unreleased
+## 1.2.24 - 2026-07-30
+
+### 中文
+
+- 恢复 `1.2.0` 之前版本的稳健提交特性：正常时仍按用户设置并发，但所有文献共享同一个服务端任务闸门；一旦返回残缺结果，会临时切换为串行稳健模式完成重试，十分钟后再恢复设置值，避免高并发持续放大错页率。
+
+#### 下载
+
+- `GujiSmart-1.2.24-Setup-x64.exe`
+- `GujiSmart-1.2.24-Portable-x64.exe`
+
+### English
+
+- Restored the reliable submission behavior seen before `1.2.0`: normal work still uses the configured concurrency, but all documents share one live-provider gate. Any incomplete result temporarily switches retries to serial reliability mode, returning to the configured limit after ten minutes instead of letting sustained concurrency amplify failed pages.
+
+#### Downloads
+
+- `GujiSmart-1.2.24-Setup-x64.exe`
+- `GujiSmart-1.2.24-Portable-x64.exe`
+
+## 1.2.23 - 2026-07-30
+
+### 中文
+
+- 修复异步 PDF 并发识别中一个分片失败后其他 worker 停止领取后续分片的问题；单片失败现在只记录该片，其他页继续识别，全部活动分片收尾后再仅补跑真正未成功的页。
+- 文献卡片和右键菜单的 OCR 分组新增“重新 OCR 错页”；只处理失败、待处理或中断页，保留已成功页和人工校对内容，不再需要整本覆盖或逐页重跑。
+
+#### 下载
+
+- `GujiSmart-1.2.23-Setup-x64.exe`
+- `GujiSmart-1.2.23-Portable-x64.exe`
+
+### English
+
+- Fixed asynchronous PDF workers abandoning all later chunks after a single chunk failed. A failed chunk is now recorded independently, remaining pages continue, and recovery starts only after active chunks settle, targeting only pages that did not complete.
+- Added “Retry failed OCR pages” to document cards and context menus. It retries only failed, pending, or interrupted pages while preserving successful OCR and manually proofed text, avoiding full-book or page-by-page reruns.
+
+#### Downloads
+
+- `GujiSmart-1.2.23-Setup-x64.exe`
+- `GujiSmart-1.2.23-Portable-x64.exe`
+
+## 1.2.22 - 2026-07-29
+
+### 中文
+
+- 恢复飞桨异步 PDF 原有的吞吐范围：单本文献分片并发默认 4、最大 8，并在全局设置页提供明确的调整项。
+- 新增“超大 PDF 同时处理数”全局设置，默认 2、范围 1-20；仅限制超过 200 MB 或 1000 页的扫描件，并始终受“批大小”总并发约束。
+- 将超大 PDF 限流改为独立子窗口，不再通过隐藏限制缩小整个 OCR 文档窗口；普通文献可以继续使用批大小中的剩余槽位。
+- OCR 并发设置与 API 配置一样由所有文献项目共享，切换项目不会切换或重置这些参数。
+- 修复异步 PDF 服务少返回整页或整段结果时仍把分片标记为完成的问题；残缺分片现在最多重新提交 3 次，只有页数齐全且没有空结果时才允许保存。
+- 失败页恢复改为原 PDF 定向补跑后再单页兜底，每批最多处理 100 个失败页且恢复 worker 不超过 2；原 PDF 阶段、单页请求和整轮补跑分别设有 3 分钟、75 秒和 6 分钟上限，超时会结算失败页并继续后续文献。
+
+#### 下载
+
+- `GujiSmart-1.2.22-Setup-x64.exe`
+- `GujiSmart-1.2.22-Portable-x64.exe`
+
+### English
+
+- Restored the original Paddle asynchronous PDF throughput range: four chunks per document by default and up to eight, with an explicit global Settings control.
+- Added a global heavy-PDF document concurrency setting, defaulting to two with a range of 1-20. It applies only to scans over 200 MB or 1,000 pages and remains bounded by the total batch size.
+- Moved heavy-PDF throttling into an independent sub-window so it no longer silently shrinks the entire OCR document window; ordinary documents can use the remaining batch slots.
+- OCR concurrency settings are global like API configuration and do not switch or reset with library projects.
+- Fixed incomplete asynchronous PDF responses being marked complete when the service omitted individual pages or a trailing range. Incomplete chunks are now resubmitted up to three times and are persisted only when every expected page has a non-empty result.
+- Changed failed-page recovery to targeted original-PDF ranges followed by single-page fallback, processing up to 100 failed pages per targeted batch with at most two recovery workers. Original-PDF recovery, each page request, and the full recovery round now stop after three minutes, 75 seconds, and six minutes respectively, settle remaining failures, and continue the batch.
+
+#### Downloads
+
+- `GujiSmart-1.2.22-Setup-x64.exe`
+- `GujiSmart-1.2.22-Portable-x64.exe`
+
+## 1.2.21 - 2026-07-29
+
+### 中文
+
+- 修复从设置页切换或新建文献项目时直接卸载未保存表单的问题；项目切换现在沿用统一的保存/放弃确认，OCR、AI、向量等 API 配置继续由所有文献项目共享。
+- 恢复受控的 OCR 吞吐量：异步 PDF 默认同时处理 2 个分块、最多 4 个；超过 200 MB 或 1000 页的大型扫描文献不再把整个队列压成单本文献运行，而是使用最多 2 本的独立限流窗口。
+- 保留 OCR 任务去重、取消释放、服务端繁忙重试、分块结果串行保存和大文件内存保护，避免用无上限并发换取速度。
+
+#### 下载
+
+- `GujiSmart-1.2.21-Setup-x64.exe`
+- `GujiSmart-1.2.21-Portable-x64.exe`
+
+### English
+
+- Fixed project switching and creation silently unmounting unsaved Settings forms. Project changes now use the shared save/discard guard, while OCR, AI, embedding, and other API configuration remains global across library projects.
+- Restored bounded OCR throughput: asynchronous PDFs now process two chunks by default with a maximum of four, and scans over 200 MB or 1,000 pages use a two-document window instead of serializing the entire queue.
+- Preserved OCR task deduplication, cancellation release, remote queue retry, serialized chunk-result saves, and large-file memory guards instead of using unbounded concurrency.
+
+#### Downloads
+
+- `GujiSmart-1.2.21-Setup-x64.exe`
+- `GujiSmart-1.2.21-Portable-x64.exe`
 
 ## 1.2.20 - 2026-07-29
 

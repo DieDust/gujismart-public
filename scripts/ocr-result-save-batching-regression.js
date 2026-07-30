@@ -81,8 +81,8 @@ const retryIncompletePagesWithSinglePageOcrBody = sliceBetween(
 )
 const singlePageRetryCatchBody = sliceBetween(
   retryIncompletePagesWithSinglePageOcrBody,
-  '    } catch (error) {',
-  '    }\n  }\n  return [...resultsByPageId.values()]',
+  '      const result = await runWithOcrRetryTimeout(',
+  '  return [...resultsByPageId.values()]',
   'single-page incomplete OCR retry catch body',
 )
 const resetPagesForFullOcrRerunBody = sliceBetween(
@@ -213,6 +213,8 @@ assert(
 )
 assert(
   ocrIpcSource.includes('const OCR_AUTO_FAILED_PAGE_RETRY_LIMIT')
+    && ocrIpcSource.includes('const OCR_TARGETED_PDF_RETRY_PAGE_LIMIT = 100')
+    && ocrIpcSource.includes('const OCR_TARGETED_PDF_RETRY_MAX_WORKERS = 2')
     && ocrIpcSource.includes('const OCR_ASYNC_PDF_QUALITY_RETRYABLE_PREFIX')
     && ocrIpcSource.includes('const OCR_ORIGINAL_PDF_RETRY_ATTEMPTS = 3')
     && ocrIpcSource.includes('function retryIncompletePagesWithSinglePageOcr')
@@ -220,11 +222,12 @@ assert(
     && ocrIpcSource.includes('function getOriginalPdfRetryPageRangeTargetNums')
     && ocrIpcSource.includes('function getOriginalPdfRetryStrategies')
     && ocrIpcSource.includes('requireFullFileUpload: true')
-    && ocrIpcSource.includes('const originalPdfRetryResults = await retryIncompletePagesWithOriginalPdfOcr(doc, pdfPath, signal, onProgress)')
+    && retryIncompletePagesWithSinglePageOcrBody.includes('retryIncompletePagesWithOriginalPdfOcr(')
+    && retryIncompletePagesWithSinglePageOcrBody.includes("{ targetedOnly: originalPdfRetryMode === 'targeted' }")
     && ocrIpcSource.includes('targetPageNums,')
     && ocrIpcSource.includes('targetPageNums: retryStrategy.targetPageNums')
     && ocrIpcSource.includes('pageRangeChunkSize,')
-    && ocrIpcSource.includes('const maxAttempts = retryOptions.profile === \'guji_print_vertical\' ? OCR_ORIGINAL_PDF_RETRY_ATTEMPTS : 1')
+    && ocrIpcSource.includes('const maxAttempts = options?.targetedOnly')
     && ocrIpcSource.includes('let remainingPages = pages')
     && ocrIpcSource.includes('const retryStrategy = getOriginalPdfRetryStrategies(')
     && ocrIpcSource.includes('pageRangeChunkSize: retryStrategy.pageRangeChunkSize')
@@ -514,10 +517,22 @@ assert(
     && processDocumentOcrBody.includes('异步 PDF OCR 进度停住，正在自动补跑未完成页')
     && processDocumentOcrBody.includes('pageResults = await retryIncompletePagesWithSinglePageOcr(')
     && (processDocumentOcrBody.includes('正在自动补跑未完成页') || processDocumentOcrBody.includes('开始自动补跑'))
-    && processDocumentOcrBody.includes('skipOriginalPdfRetry: pageResultsPersistedInChunks')
+    && processDocumentOcrBody.includes("originalPdfRetryMode: pageResultsPersistedInChunks ? 'targeted' : 'full'")
+    && processDocumentOcrBody.includes("{ originalPdfRetryMode: 'targeted' }")
     && ocrIpcSource.includes('const OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE = 10')
-    && ocrIpcSource.includes('pageRangeChunkSize: pageRangeChunkSize || OCR_ORIGINAL_PDF_RETRY_PAGE_RANGE_CHUNK_SIZE'),
-  'Document OCR should recover stalled async PDF by retrying incomplete pages; skip second full-PDF async when bulk already streamed results.',
+    && ocrIpcSource.includes('pageRangeChunkSize: targetedChunkSize')
+    && ocrIpcSource.includes('maxWorkers: options?.targetedOnly ? OCR_TARGETED_PDF_RETRY_MAX_WORKERS : undefined'),
+  'Document OCR should recover stalled or incomplete async PDF chunks with bounded original-PDF pageRanges rather than another whole-book upload.',
+)
+assert(
+  ocrIpcSource.includes('const OCR_AUTO_RETRY_TOTAL_BUDGET_MS = 6 * 60 * 1000')
+    && ocrIpcSource.includes('const OCR_ORIGINAL_PDF_RETRY_BUDGET_MS = 3 * 60 * 1000')
+    && ocrIpcSource.includes('const OCR_SINGLE_PAGE_RETRY_TIMEOUT_MS = 75 * 1000')
+    && ocrIpcSource.includes('async function runWithOcrRetryTimeout')
+    && retryIncompletePagesWithSinglePageOcrBody.includes('const retryDeadline = Date.now() + OCR_AUTO_RETRY_TOTAL_BUDGET_MS')
+    && retryIncompletePagesWithSinglePageOcrBody.includes('pageTimeoutMs')
+    && retryIncompletePagesWithSinglePageOcrBody.includes('本轮自动补跑已达到 6 分钟上限'),
+  'Automatic failed-page recovery should time out individual pages and settle the round instead of remaining in processing indefinitely.',
 )
 assert(
   ocrIpcSource.includes('function getLikelyGujiPdfTableMisclassification')
@@ -868,6 +883,15 @@ assert(
     && batchOcrBody.indexOf('pauseBackgroundSearchReindex()') < batchOcrBody.indexOf('createRecoverableBatchOcrItems')
     && batchOcrBody.indexOf('resumeBackgroundSearchReindex') > batchOcrBody.indexOf('await Promise.all('),
   'batch OCR should pause background search reindexing before recovery/status writes and resume it after the batch settles.',
+)
+assert(
+  batchOcrBody.includes("const retryFailedPagesOnly = options?.retryFailedPagesOnly === true")
+    && batchOcrBody.includes('const forceFullRerun = !retryFailedPagesOnly && options?.forceFullRerun === true')
+    && batchOcrBody.includes('const needsWork = retryFailedPagesOnly')
+    && batchOcrBody.includes('? hasIncompletePages')
+    && processDocumentOcrBody.includes('const resumeExisting = !forceFullRerun')
+    && processDocumentOcrBody.includes('getPagesNeedingOcr(pages, resumeExisting)'),
+  'Failed-page-only OCR should enqueue only incomplete documents and reuse the resume path without resetting successful pages.',
 )
 assert(
   ocrIpcSource.includes('function createRecoverableBatchOcrItems')

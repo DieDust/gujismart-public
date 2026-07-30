@@ -781,6 +781,7 @@ export interface ImportDocumentOptions {
 export interface BatchOcrOptions {
   engine?: OcrEngine
   forceFullRerun?: boolean
+  retryFailedPagesOnly?: boolean
   concurrency?: number
 }
 

@@ -679,6 +679,17 @@ function shouldShowRetryAction(doc: DocumentItem): boolean {
     && getEffectivePageCount(doc) > 0
 }
 
+function hasOcrFailedPages(doc: DocumentItem): boolean {
+  if (doc.ocr_status !== 'completed') return false
+  const pageCount = getEffectivePageCount(doc)
+  if (pageCount <= 0) return false
+  const completedPages = Math.max(
+    Number(doc.ocr_completed_page_count || 0),
+    Number(doc.text_page_count || 0),
+  )
+  return completedPages < pageCount
+}
+
 function getRetryActionLabel(doc: DocumentItem): string {
   return doc.import_status === 'error' || doc.ocr_status === 'error' ? '重试处理' : '继续 OCR'
 }
@@ -969,6 +980,7 @@ interface DocumentCardContext {
   applyLibraryFilter: (filter: LibraryFilter) => Promise<void>
   toggleTagFilter: (tagId: string) => Promise<void>
   handleRetryDocument: (doc: DocumentItem) => Promise<void>
+  handleRetryFailedPages: (doc: DocumentItem) => Promise<void>
   handleToggleFavorite: (doc: DocumentItem) => Promise<void>
   handleSetReadStatus: (docId: string, readStatus: ReadStatus) => Promise<void>
   handleSetRating: (docId: string, rating: number | null) => Promise<void>
@@ -1788,6 +1800,9 @@ function buildDocumentMoreMenuItems(input: {
       label: 'OCR',
       icon: <ThunderboltOutlined />,
       children: [
+        ...(hasOcrFailedPages(doc)
+          ? [{ key: 'retry_failed_ocr_pages', label: '重新 OCR 错页', icon: <ReloadOutlined /> }]
+          : []),
         ...(shouldShowRetryAction(doc)
           ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
           : []),
@@ -2201,6 +2216,10 @@ function DocumentVirtualRow({
       void context.handleRetryDocument(doc)
       return
     }
+    if (key === 'retry_failed_ocr_pages') {
+      void context.handleRetryFailedPages(doc)
+      return
+    }
     if (String(key).startsWith('rerun_ocr_book:')) {
       void context.handleForceRerunDocument(doc, String(key).replace('rerun_ocr_book:', '') as OcrEngine)
       return
@@ -2449,7 +2468,11 @@ function DocumentVirtualRow({
                 onMouseDown={stopLibraryDocumentActionPropagation}
                 onClick={stopLibraryDocumentActionPropagation}
               >
-              {shouldShowRetryAction(doc) ? (
+              {hasOcrFailedPages(doc) ? (
+                <Tooltip title="重新 OCR 错页">
+                  <Button type="text" size="small" icon={<ReloadOutlined />} onClick={() => void context.handleRetryFailedPages(doc)} />
+                </Tooltip>
+              ) : shouldShowRetryAction(doc) ? (
                 <Tooltip title={getRetryActionLabel(doc)}>
                   <Button type="text" size="small" icon={<ReloadOutlined />} onClick={() => void context.handleRetryDocument(doc)} />
                 </Tooltip>
@@ -5011,6 +5034,7 @@ export default function LibraryView({
       successCount = await window.api.batchOcr(ocrBatch, {
         engine,
         forceFullRerun: options?.forceFullRerun,
+        retryFailedPagesOnly: options?.retryFailedPagesOnly,
         concurrency: documentConcurrency,
       })
       shouldRefreshAfterBatches = true
@@ -6319,6 +6343,48 @@ export default function LibraryView({
     }
   }
 
+  const handleRetryFailedPages = async (doc: DocumentItem) => {
+    if (!hasOcrFailedPages(doc)) {
+      message.info('这篇文献当前没有需要重新 OCR 的错页')
+      await loadDocuments(filter, { silent: true })
+      return
+    }
+
+    const progressInfo = resolveOcrProgressInfo(doc, ocrProgressByDoc[doc.id])
+    if (isDocumentOcrJobActive(doc) || isActiveOcrProgress(progressInfo)) {
+      message.info({ content: '该文献 OCR 正在处理中，请等待完成或先停止上传', key: `retry-failed-pages-${doc.id}`, duration: 4 })
+      return
+    }
+
+    const storedEngine = parseDocMetadata(doc).ocr_engine
+    const retryEngine = isOcrEngine(storedEngine) ? storedEngine : 'paddle'
+    showSharedOcrProgressToast(`正在重新 OCR“${doc.title || '未命名文献'}”的错页…`)
+    message.info({
+      content: '只会重新处理未成功页；已成功页和人工校对内容会保留。',
+      key: `retry-failed-pages-${doc.id}`,
+      duration: 4,
+    })
+    try {
+      const successCount = await runOcrInConfiguredBatches(
+        [doc.id],
+        retryEngine,
+        OCR_ACTIVITY_MESSAGE_KEY,
+        { retryFailedPagesOnly: true },
+      )
+      clearSharedOcrProgressToast({ keepIfActiveDocs: true })
+      if (successCount > 0) {
+        message.success({ content: '错页重新 OCR 完成', key: OCR_RESULT_MESSAGE_KEY, duration: 3 })
+      } else {
+        message.warning({ content: '错页补跑未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })
+      }
+    } catch (error) {
+      console.error(error)
+      clearSharedOcrProgressToast()
+      message.error({ content: `错页补跑失败：${(error as Error)?.message || '未知错误'}`, key: OCR_RESULT_MESSAGE_KEY, duration: 6 })
+      await loadDocuments(filter, { silent: true })
+    }
+  }
+
   const handleForceRerunDocument = async (doc: DocumentItem, engine: OcrEngine) => {
     const hasConfig = await hasOcrEngineConfig(engine)
     if (!hasConfig) {
@@ -7227,6 +7293,7 @@ export default function LibraryView({
     applyLibraryFilter,
     toggleTagFilter,
     handleRetryDocument,
+    handleRetryFailedPages,
     handleToggleFavorite,
     handleSetReadStatus,
     handleSetRating,
@@ -8184,6 +8251,10 @@ export default function LibraryView({
                   void handleRetryDocument(doc)
                   return
                 }
+                if (key === 'retry_failed_ocr_pages') {
+                  void handleRetryFailedPages(doc)
+                  return
+                }
                 if (String(key).startsWith('rerun_ocr_book:')) {
                   void handleForceRerunDocument(doc, String(key).replace('rerun_ocr_book:', '') as OcrEngine)
                   return
@@ -8373,7 +8444,17 @@ export default function LibraryView({
                           onMouseDown={stopLibraryDocumentActionPropagation}
                           onClick={stopLibraryDocumentActionPropagation}
                         >
-                          {shouldShowRetryAction(doc) ? (
+                          {hasOcrFailedPages(doc) ? (
+                            <Tooltip title="重新 OCR 错页">
+                              <Button
+                                type="text"
+                                size="small"
+                                icon={<ReloadOutlined />}
+                                style={{ width: 24, height: 24, padding: 0 }}
+                                onClick={() => void handleRetryFailedPages(doc)}
+                              />
+                            </Tooltip>
+                          ) : shouldShowRetryAction(doc) ? (
                             <Tooltip title={getRetryActionLabel(doc)}>
                               <Button
                                 type="text"

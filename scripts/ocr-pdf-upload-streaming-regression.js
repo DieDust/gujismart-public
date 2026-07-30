@@ -207,11 +207,13 @@ assert(
   'Async PDF OCR should support original-PDF pageRanges chunks without falling back to single-page or qpdf-copied PDFs.',
 )
 assert(
-  ocrSource.includes('const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 1')
-    && ocrSource.includes('const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 1')
+  ocrSource.includes('const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 4')
+    && ocrSource.includes('const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 8')
+    && ocrSource.includes("getNumericSetting('ocr_async_pdf_chunk_concurrency'")
     && ocrSource.includes('const asyncSubmitLimit = createLimiter(MAX_DOC_CONCURRENCY)')
-    && !ocrSource.includes('asyncPdfJobLimit'),
-  'Async PDF OCR should respect the configured document batch concurrency while keeping per-document chunk concurrency conservative.',
+    && ocrSource.includes('const asyncPdfJobLimit = createAdaptiveLimiter')
+    && ocrSource.includes('Date.now() < asyncPdfReliabilityModeUntil ? 1 : getAsyncPdfChunkConcurrency()'),
+  'Async PDF OCR should keep configured per-document concurrency while bounding all live provider jobs with an adaptive global gate.',
 )
 assert(
   ocrSource.includes('const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 240')
@@ -446,17 +448,19 @@ assert(
 assert(
   ocrIpcSource.includes('const HEAVY_PDF_DOC_SIZE_BYTES = 200 * 1024 * 1024')
     && ocrIpcSource.includes('const HEAVY_PDF_DOC_PAGE_COUNT = 1000')
+    && ocrSource.includes("'ocr_heavy_pdf_document_concurrency'")
     && ocrIpcSource.includes('function isHeavyPdfOcrDocument'),
   'OCR IPC should identify very large PDF documents before scheduling batch OCR work',
 )
 assert(
   ocrIpcSource.includes('const heavyPdfDocIds = new Set<string>()')
-    && ocrIpcSource.includes('const slotLimit = heavy ? 1 : documentConcurrency')
-    && ocrIpcSource.includes('globalOcrDocumentWindow.runForDocument(docId, slotLimit, async () => {')
+    && ocrIpcSource.includes('heavyPdfOcrDocumentWindow.run(getOcrHeavyPdfDocumentConcurrency(), runInTotalWindow)')
+    && ocrIpcSource.includes('globalOcrDocumentWindow.runForDocument(')
+    && ocrIpcSource.includes('documentConcurrency,')
     && ocrIpcSource.includes('runBoundedDocumentWorkers')
     && ocrIpcSource.includes('isHeavyPdfOcrDocument')
     && !ocrIpcSource.includes('if (Number(doc.page_count || 0) >= 180) heavyPdfDocIds.add(docId)'),
-  'Only true heavy PDFs (size/page thresholds) serialize; medium multi-hundred-page books keep batch concurrency.',
+  'Heavy PDFs should use a configurable sub-window without shrinking the total OCR document window.',
 )
 assert(
   recognizePdfAsyncBody.includes('let chunkCompleteQueue = Promise.resolve()')
@@ -483,9 +487,26 @@ assert(
   'Async PDF chunk processing should use the serialized completion callback wrapper',
 )
 assert(
-  recognizePdfAsyncBody.includes('const workerCount = getAsyncPdfWorkerCount(plan)')
-    && recognizePdfAsyncBody.includes('Promise.all(Array.from({ length: workerCount }, () => worker()))'),
-  'Async PDF upload and polling workers should remain concurrent while completion saves are serialized',
+  recognizePdfAsyncBody.includes('const workerCount = getAsyncPdfWorkerCount(plan, options?.maxWorkers)')
+    && recognizePdfAsyncBody.includes('Promise.all(Array.from({ length: workerCount }, () => worker()))')
+    && recognizePdfAsyncBody.includes('chunkFailures.push(error)')
+    && recognizePdfAsyncBody.includes('if (chunkFailures.length > 0) throw chunkFailures[0]')
+    && !recognizePdfAsyncBody.includes('if (workerFailure !== null) return'),
+  'Async PDF upload workers should keep processing later chunks after one fails, then wait for all workers before starting recovery.',
+)
+assert(
+  ocrSource.includes('const MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS = 3')
+    && ocrSource.includes("const ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX = '[async_pdf_incomplete_chunk]'")
+    && ocrSource.includes('const ASYNC_PDF_RELIABILITY_MODE_COOLDOWN_MS = 10 * 60 * 1000')
+    && ocrSource.includes('function activateAsyncPdfReliabilityMode')
+    && recognizePdfAsyncBody.includes('normalizedChunkResults = await asyncPdfJobLimit(async () => {')
+    && recognizePdfAsyncBody.includes('const switchedToReliabilityMode = activateAsyncPdfReliabilityMode()')
+    && recognizePdfAsyncBody.includes('已临时切换稳健模式并串行重试当前分片')
+    && recognizePdfAsyncBody.includes('missingResultOffsets')
+    && recognizePdfAsyncBody.includes('resultAttempt >= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS')
+    && recognizePdfAsyncBody.indexOf('missingResultOffsets.length === 0')
+      < recognizePdfAsyncBody.indexOf('await runChunkCompleteCallbackSerially({'),
+  'Incomplete async PDF chunks should switch the shared provider gate to serial reliability mode before resubmission and before completion callbacks can persist missing pages.',
 )
 assert(
   ocrSource.includes('ASYNC_POLL_MIN_INTERVAL_MS')
@@ -564,7 +585,7 @@ assert(
   'Async PDF result normalization should not synchronously map every returned page payload at once',
 )
 assert(
-  recognizePdfAsyncBody.includes('await normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)'),
+  recognizePdfAsyncBody.includes('return normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)'),
   'Async PDF chunk processing should await cancelable chunked result normalization',
 )
 
