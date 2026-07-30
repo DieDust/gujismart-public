@@ -39,7 +39,7 @@ const drainImportQueueBody = sliceBetween(
 const flushOcrStatusBufferBody = sliceBetween(
   librarySource,
   'const flushOcrStatusBuffer = useCallback',
-  'useEffect(() => {\n    // Yield one frame so the shell can paint before the first heavy IPC burst.\n    const timer = window.setTimeout(() => {\n      void loadBaseData()',
+  'useEffect(() => {\n    // Yield one frame so the shell can paint before the first heavy IPC burst.',
   'OCR status UI flush',
 )
 const runOcrInConfiguredBatchesBody = sliceBetween(

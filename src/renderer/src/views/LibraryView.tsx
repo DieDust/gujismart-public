@@ -68,7 +68,7 @@ import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import { getPendingImportDisplayLabels, matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryFolderCounts, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -397,6 +397,14 @@ function applyLibraryStateCacheToFolders(folders: Folder[], cache?: LibraryState
   return folders.map((folder) => ({
     ...folder,
     document_count: Number(cache.folderDocumentCounts[folder.id] ?? folder.document_count ?? 0),
+  }))
+}
+
+function applyLibraryFolderCounts(folders: Folder[], counts?: LibraryFolderCounts | null): Folder[] {
+  if (!counts) return folders
+  return folders.map((folder) => ({
+    ...folder,
+    document_count: Number(counts.folderDocumentCounts[folder.id] || 0),
   }))
 }
 
@@ -2870,26 +2878,38 @@ export default function LibraryView({
     }
   }, [libraryPageSize])
 
-  const loadBaseData = useCallback(async () => {
+  const loadBaseData = useCallback(async (options?: { refreshFolderCounts?: boolean }) => {
     try {
-      const [folderItems, tagItems, stateCache] = await Promise.all([
+      const freshFolderCountsPromise: Promise<LibraryFolderCounts | null> = options?.refreshFolderCounts
+        ? window.api.refreshLibraryFolderCounts().catch((error) => {
+            console.warn('[LibraryView] Failed to refresh live folder counts', error)
+            return null
+          })
+        : Promise.resolve(null)
+      const [folderItems, tagItems, stateCache, freshFolderCounts] = await Promise.all([
         window.api.listFolders(),
         window.api.listTags(),
         window.api.getLibraryStateCache(),
+        freshFolderCountsPromise,
       ])
-      const foldersWithCounts = applyLibraryStateCacheToFolders(folderItems, stateCache)
+      const foldersWithCounts = freshFolderCounts
+        ? applyLibraryFolderCounts(folderItems, freshFolderCounts)
+        : applyLibraryStateCacheToFolders(folderItems, stateCache)
       const tagsWithCounts = applyLibraryStateCacheToTags(tagItems as TagItem[], stateCache)
+      const nextUnfiledDocumentTotal = Number(
+        freshFolderCounts?.unfiledDocumentTotal ?? stateCache.unfiledDocumentTotal ?? 0,
+      )
       baseDataBusyRetryCountRef.current = 0
       setFolders(foldersWithCounts)
       setTags(tagsWithCounts)
-      setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
+      setUnfiledDocumentTotal(nextUnfiledDocumentTotal)
       setSmartViewCounts(stateCache.smartViewCounts)
       patchLibraryWarmCache(currentLibraryScopeKey, {
         documents: documentsRef.current,
         folders: foldersWithCounts,
         tags: tagsWithCounts,
         smartViewCounts: stateCache.smartViewCounts,
-        unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
+        unfiledDocumentTotal: nextUnfiledDocumentTotal,
         listOffset: listOffsetRef.current,
         listHasMore: listHasMoreRef.current,
       })
@@ -3462,10 +3482,19 @@ export default function LibraryView({
 
   useEffect(() => {
     // Yield one frame so the shell can paint before the first heavy IPC burst.
-    const timer = window.setTimeout(() => {
+    const initialTimer = window.setTimeout(() => {
       void loadBaseData()
     }, 0)
-    return () => window.clearTimeout(timer)
+    // Existing large libraries can carry a permanently dirty snapshot from an
+    // older version. Refresh only folder counts after first paint so opening
+    // remains fast while stale counts repair themselves.
+    const liveFolderCountsTimer = window.setTimeout(() => {
+      void loadBaseData({ refreshFolderCounts: true })
+    }, 750)
+    return () => {
+      window.clearTimeout(initialTimer)
+      window.clearTimeout(liveFolderCountsTimer)
+    }
   }, [loadBaseData])
 
   useEffect(() => {
@@ -3864,9 +3893,10 @@ export default function LibraryView({
   }, [filter, loadBaseData, loadDocuments, updateDocumentInList])
 
   useEffect(() => {
-    const handleLibraryRelationsChanged = () => {
+    const handleLibraryRelationsChanged = (event: Event) => {
+      if (event instanceof CustomEvent && event.detail?.source === 'library-folder-counts-refreshed') return
       void Promise.all([
-        loadBaseData(),
+        loadBaseData({ refreshFolderCounts: true }),
         loadDocuments(filter, { silent: true }),
       ])
     }
@@ -4301,7 +4331,7 @@ export default function LibraryView({
       await window.api.addDocumentsToFolder(uniqueDocIds, folderId)
       const folder = folderItems.find((item) => item.id === folderId)
       message.success(`已将 ${uniqueDocIds.length} 篇文献加入文件夹“${folder?.name || '未命名'}”`)
-      await Promise.all([loadDocuments(filter, { silent: true }), loadBaseData()])
+      await Promise.all([loadDocuments(filter, { silent: true }), loadBaseData({ refreshFolderCounts: true })])
       if (!options?.keepSelection) {
         clearSelection()
       }
@@ -4642,7 +4672,7 @@ export default function LibraryView({
       await window.api.addDocumentToFolder(docId, folderId)
       const folder = folders.find((item) => item.id === folderId)
       message.success(`已加入文件夹“${folder?.name || '未命名'}”`)
-      await Promise.all([loadDocuments(filter, { silent: true }), loadBaseData()])
+      await Promise.all([loadDocuments(filter, { silent: true }), loadBaseData({ refreshFolderCounts: true })])
     } catch (error) {
       console.error(error)
       message.error('加入文件夹失败')
@@ -4654,7 +4684,7 @@ export default function LibraryView({
       await window.api.removeDocumentFromFolder(docId, folderId)
       const folder = folders.find((item) => item.id === folderId)
       message.success(`已从文件夹“${folder?.name || '未命名'}”移出`)
-      await Promise.all([loadDocuments(filter, { silent: true }), loadBaseData()])
+      await Promise.all([loadDocuments(filter, { silent: true }), loadBaseData({ refreshFolderCounts: true })])
     } catch (error) {
       console.error(error)
       message.error('移出文件夹失败')
@@ -6656,17 +6686,17 @@ export default function LibraryView({
         before_id: options?.beforeId || null,
         after_id: options?.afterId || null,
       })
-      const stateCache = await window.api.refreshLibraryStateCache()
-      const foldersWithCounts = applyLibraryStateCacheToFolders(nextFolders, stateCache)
+      const folderCounts = await window.api.refreshLibraryFolderCounts()
+      const foldersWithCounts = applyLibraryFolderCounts(nextFolders, folderCounts)
       setFolders(foldersWithCounts)
-      setUnfiledDocumentTotal(Number(stateCache.unfiledDocumentTotal || 0))
-      setSmartViewCounts(stateCache.smartViewCounts)
+      setUnfiledDocumentTotal(Number(folderCounts.unfiledDocumentTotal || 0))
       patchLibraryWarmCache(currentLibraryScopeKey, {
         folders: foldersWithCounts,
-        smartViewCounts: stateCache.smartViewCounts,
-        unfiledDocumentTotal: Number(stateCache.unfiledDocumentTotal || 0),
+        unfiledDocumentTotal: Number(folderCounts.unfiledDocumentTotal || 0),
       })
-      window.dispatchEvent(new Event(LIBRARY_RELATIONS_CHANGED_EVENT))
+      window.dispatchEvent(new CustomEvent(LIBRARY_RELATIONS_CHANGED_EVENT, {
+        detail: { source: 'library-folder-counts-refreshed' },
+      }))
       message.success('文件夹位置已更新')
     } catch (error) {
       message.error(getErrorMessage(error, '移动文件夹失败'))

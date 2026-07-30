@@ -1,4 +1,4 @@
-import { queryAll } from './database'
+import { queryAll, queryAllAsync } from './database'
 import { getActiveLibraryProjectId } from './library-projects'
 
 interface FolderTreeRow {
@@ -49,24 +49,15 @@ export function resolveFolderAndDescendantIds(folderIds: string[], libraryProjec
   return resolved
 }
 
-export function buildCumulativeFolderDocumentCounts(libraryProjectId?: string): Record<string, number> {
-  const projectId = libraryProjectId || getActiveLibraryProjectId()
-  const folders = queryAll<FolderTreeRow>(
-    'SELECT id, parent_id FROM folders WHERE library_project_id = ?',
-    [projectId],
-  )
+function calculateCumulativeFolderDocumentCounts(
+  folders: FolderTreeRow[],
+  folderDocuments: FolderDocumentRow[],
+): Record<string, number> {
   if (folders.length === 0) return {}
 
   const childrenByParent = buildChildrenByParent(folders)
   const directDocIds = new Map<string, Set<string>>()
-  queryAll<FolderDocumentRow>(
-    `SELECT df.folder_id, df.doc_id
-     FROM document_folders df
-     INNER JOIN documents d ON d.id = df.doc_id
-     WHERE COALESCE(d.import_status, '') <> 'deleting'
-       AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`,
-    [projectId],
-  ).forEach((row) => {
+  folderDocuments.forEach((row) => {
     if (!row.folder_id || !row.doc_id) return
     const docs = directDocIds.get(row.folder_id) || new Set<string>()
     docs.add(row.doc_id)
@@ -88,4 +79,37 @@ export function buildCumulativeFolderDocumentCounts(libraryProjectId?: string): 
   }
 
   return Object.fromEntries(folders.map((folder) => [folder.id, collect(folder.id).size]))
+}
+
+function folderDocumentRowsSql(): string {
+  return `SELECT df.folder_id, df.doc_id
+     FROM document_folders df
+     INNER JOIN documents d ON d.id = df.doc_id
+     WHERE COALESCE(d.import_status, '') <> 'deleting'
+       AND EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)`
+}
+
+export function buildCumulativeFolderDocumentCounts(libraryProjectId?: string): Record<string, number> {
+  const projectId = libraryProjectId || getActiveLibraryProjectId()
+  const folders = queryAll<FolderTreeRow>(
+    'SELECT id, parent_id FROM folders WHERE library_project_id = ?',
+    [projectId],
+  )
+  const folderDocuments = queryAll<FolderDocumentRow>(folderDocumentRowsSql(), [projectId])
+  return calculateCumulativeFolderDocumentCounts(folders, folderDocuments)
+}
+
+export async function buildCumulativeFolderDocumentCountsAsync(libraryProjectId?: string): Promise<Record<string, number>> {
+  const projectId = libraryProjectId || getActiveLibraryProjectId()
+  const [folders, folderDocuments] = await Promise.all([
+    queryAllAsync<FolderTreeRow>(
+      'SELECT id, parent_id FROM folders WHERE library_project_id = ?',
+      [projectId],
+    ),
+    queryAllAsync<FolderDocumentRow>(
+      folderDocumentRowsSql(),
+      [projectId],
+    ),
+  ])
+  return calculateCumulativeFolderDocumentCounts(folders, folderDocuments)
 }

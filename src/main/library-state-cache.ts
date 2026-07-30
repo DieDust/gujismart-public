@@ -1,6 +1,6 @@
-import type { LibrarySmartViewCounts, LibraryStateCache } from '../shared/types'
+import type { LibraryFolderCounts, LibrarySmartViewCounts, LibraryStateCache } from '../shared/types'
 import { isLargeLibraryForAutomaticMaintenance, queryAll, queryAllAsync, queryOne, run, runAsync, scheduleDatabaseSave } from './database'
-import { buildCumulativeFolderDocumentCounts } from './folder-scope'
+import { buildCumulativeFolderDocumentCounts, buildCumulativeFolderDocumentCountsAsync } from './folder-scope'
 import { getActiveLibraryProjectId } from './library-projects'
 
 const CACHE_KEY_PREFIX = 'library-sidebar-project-v1'
@@ -11,8 +11,15 @@ const LIBRARY_STATE_CACHE_COLD_START_DELAY_MS = 18_000
 let refreshTimer: ReturnType<typeof setTimeout> | null = null
 let refreshRunning = false
 let refreshPending = false
-const pendingSmartViewCacheWrites = new Map<string, { cacheJson: string; dirty: number; updatedAt: string }>()
-let smartViewCacheWriteRunning = false
+interface DeferredLibraryCachePatch {
+  smartViewCounts?: LibrarySmartViewCounts
+  folderCounts?: LibraryFolderCounts
+  updatedAt: string
+}
+
+const pendingLibraryCachePatches = new Map<string, DeferredLibraryCachePatch>()
+let libraryCachePatchWriteRunning = false
+const folderCountsRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   all: 0,
@@ -338,13 +345,8 @@ async function buildSmartViewCountsAsync(projectId: string): Promise<LibrarySmar
   return normalizeSmartViewCounts(rows[0])
 }
 
-function buildCache(): LibraryStateCache {
-  const projectId = getActiveLibraryProjectId()
-  const smartViewCounts = buildSmartViewCounts(projectId)
-  return {
-    smartViewCounts,
-    unfiledDocumentTotal: count(
-      `SELECT COUNT(*) AS count
+function unfiledDocumentCountSql(): string {
+  return `SELECT COUNT(*) AS count
        FROM documents d
        WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = d.id AND project_scope.project_id = ?)
          AND COALESCE(d.import_status, '') <> 'deleting'
@@ -354,9 +356,15 @@ function buildCache(): LibraryStateCache {
            INNER JOIN folders f_unfiled ON f_unfiled.id = df_unfiled.folder_id
            WHERE df_unfiled.doc_id = d.id
              AND f_unfiled.library_project_id = ?
-         )`,
-      [projectId, projectId],
-    ),
+         )`
+}
+
+function buildCache(): LibraryStateCache {
+  const projectId = getActiveLibraryProjectId()
+  const smartViewCounts = buildSmartViewCounts(projectId)
+  return {
+    smartViewCounts,
+    unfiledDocumentTotal: count(unfiledDocumentCountSql(), [projectId, projectId]),
     folderDocumentCounts: buildFolderCounts(projectId),
     tagDocumentCounts: buildTagCounts(projectId),
     dirty: false,
@@ -390,23 +398,29 @@ export function refreshLibraryStateCache(): LibraryStateCache {
   return cache
 }
 
-function scheduleSmartViewCacheWrite(
-  projectId: string,
-  cacheJson: string,
-  dirty: number,
-  updatedAt: string,
-): void {
-  pendingSmartViewCacheWrites.set(projectId, { cacheJson, dirty, updatedAt })
-  if (smartViewCacheWriteRunning) return
-  smartViewCacheWriteRunning = true
+function startLibraryCachePatchWriter(): void {
+  if (libraryCachePatchWriteRunning || pendingLibraryCachePatches.size === 0) return
+  libraryCachePatchWriteRunning = true
   setImmediate(() => {
     void (async () => {
       try {
-        while (pendingSmartViewCacheWrites.size > 0) {
-          const pending = [...pendingSmartViewCacheWrites.entries()]
-          pendingSmartViewCacheWrites.clear()
-          for (const [pendingProjectId, payload] of pending) {
+        while (pendingLibraryCachePatches.size > 0) {
+          const pending = [...pendingLibraryCachePatches.entries()]
+          pendingLibraryCachePatches.clear()
+          for (const [pendingProjectId, patch] of pending) {
             try {
+              const row = await readCacheRowAsync(pendingProjectId)
+              let cache = emptyCache(true)
+              if (row?.cache_json) {
+                try {
+                  cache = normalizeCache(JSON.parse(row.cache_json), row, row.dirty === 0 ? 'cache' : 'snapshot')
+                } catch {
+                  cache = emptyCache(true)
+                }
+              }
+              const smartViewCounts = patch.smartViewCounts || cache.smartViewCounts
+              const folderDocumentCounts = patch.folderCounts?.folderDocumentCounts || cache.folderDocumentCounts
+              const unfiledDocumentTotal = patch.folderCounts?.unfiledDocumentTotal ?? cache.unfiledDocumentTotal
               await runAsync(
                 `INSERT INTO library_state_cache (cache_key, cache_json, dirty, updated_at)
                  VALUES (?, ?, ?, ?)
@@ -414,63 +428,78 @@ function scheduleSmartViewCacheWrite(
                    cache_json = excluded.cache_json,
                    dirty = excluded.dirty,
                    updated_at = excluded.updated_at`,
-                [cacheKey(pendingProjectId), payload.cacheJson, payload.dirty, payload.updatedAt],
+                [cacheKey(pendingProjectId), JSON.stringify({
+                  version: CACHE_VERSION,
+                  smartViewCounts,
+                  unfiledDocumentTotal,
+                  folderDocumentCounts,
+                  tagDocumentCounts: cache.tagDocumentCounts,
+                  lastCalibratedAt: cache.lastCalibratedAt,
+                }), row?.dirty === 0 ? 0 : 1, patch.updatedAt],
               )
               scheduleDatabaseSave({ minDelayMs: 15_000 })
             } catch (error) {
-              console.warn('[LibraryStateCache] Deferred smart-view snapshot write failed', error)
+              console.warn('[LibraryStateCache] Deferred partial snapshot write failed', error)
             }
           }
         }
       } finally {
-        smartViewCacheWriteRunning = false
-        if (pendingSmartViewCacheWrites.size > 0) {
-          const latest = [...pendingSmartViewCacheWrites.entries()]
-          pendingSmartViewCacheWrites.clear()
-          latest.forEach(([pendingProjectId, payload]) => {
-            scheduleSmartViewCacheWrite(
-              pendingProjectId,
-              payload.cacheJson,
-              payload.dirty,
-              payload.updatedAt,
-            )
-          })
-        }
+        libraryCachePatchWriteRunning = false
+        startLibraryCachePatchWriter()
       }
     })()
   })
 }
 
+function scheduleLibraryCachePatch(projectId: string, patch: DeferredLibraryCachePatch): void {
+  const pending = pendingLibraryCachePatches.get(projectId)
+  pendingLibraryCachePatches.set(projectId, {
+    ...pending,
+    ...patch,
+    updatedAt: patch.updatedAt,
+  })
+  startLibraryCachePatchWriter()
+}
+
+function scheduleSmartViewCacheWrite(projectId: string, smartViewCounts: LibrarySmartViewCounts, updatedAt: string): void {
+  scheduleLibraryCachePatch(projectId, { smartViewCounts, updatedAt })
+}
+
 export async function refreshLibrarySmartViewCounts(): Promise<LibrarySmartViewCounts> {
   const projectId = getActiveLibraryProjectId()
-  const [row, smartViewCounts] = await Promise.all([
-    readCacheRowAsync(projectId),
-    buildSmartViewCountsAsync(projectId),
-  ])
-  let cache = emptyCache(true)
-  if (row?.cache_json) {
-    try {
-      cache = normalizeCache(JSON.parse(row.cache_json), row, row.dirty === 0 ? 'cache' : 'snapshot')
-    } catch {
-      cache = emptyCache(true)
-    }
-  }
-  const updatedAt = new Date().toISOString()
-  const dirty = row?.dirty === 0 ? 0 : 1
-  scheduleSmartViewCacheWrite(
-    projectId,
-    JSON.stringify({
-      version: CACHE_VERSION,
-      smartViewCounts,
-      unfiledDocumentTotal: cache.unfiledDocumentTotal,
-      folderDocumentCounts: cache.folderDocumentCounts,
-      tagDocumentCounts: cache.tagDocumentCounts,
-      lastCalibratedAt: cache.lastCalibratedAt,
-    }),
-    dirty,
-    updatedAt,
-  )
+  const smartViewCounts = await buildSmartViewCountsAsync(projectId)
+  scheduleSmartViewCacheWrite(projectId, smartViewCounts, new Date().toISOString())
   return smartViewCounts
+}
+
+export async function refreshLibraryFolderCounts(projectId = getActiveLibraryProjectId()): Promise<LibraryFolderCounts> {
+  const [folderDocumentCounts, unfiledRows] = await Promise.all([
+    buildCumulativeFolderDocumentCountsAsync(projectId),
+    queryAllAsync<CountRow>(unfiledDocumentCountSql(), [projectId, projectId]),
+  ])
+  const folderCounts: LibraryFolderCounts = {
+    folderDocumentCounts,
+    unfiledDocumentTotal: numberValue(unfiledRows[0]?.count),
+  }
+  scheduleLibraryCachePatch(projectId, { folderCounts, updatedAt: new Date().toISOString() })
+  return folderCounts
+}
+
+export function scheduleLibraryFolderCountsRefresh(projectIds?: string[], delayMs = 750): void {
+  const activeProjectId = getActiveLibraryProjectId()
+  const scopedProjectIds = [...new Set((projectIds?.length ? projectIds : [activeProjectId]).filter(Boolean))]
+  scopedProjectIds.forEach((projectId) => {
+    const currentTimer = folderCountsRefreshTimers.get(projectId)
+    if (currentTimer) clearTimeout(currentTimer)
+    const timer = setTimeout(() => {
+      folderCountsRefreshTimers.delete(projectId)
+      void refreshLibraryFolderCounts(projectId).catch((error) => {
+        console.warn(`[LibraryStateCache] Deferred folder-count refresh failed for project ${projectId}`, error)
+      })
+    }, Math.max(0, delayMs))
+    timer.unref?.()
+    folderCountsRefreshTimers.set(projectId, timer)
+  })
 }
 
 export function markLibraryStateCacheDirty(projectIds?: string[]): LibraryStateCache {

@@ -226,6 +226,11 @@ export type LibrarySmartViewCountKey =
 
 export type LibrarySmartViewCounts = Record<LibrarySmartViewCountKey, number>
 
+export interface LibraryFolderCounts {
+  unfiledDocumentTotal: number
+  folderDocumentCounts: Record<string, number>
+}
+
 /** Vector-index refinement that can AND with folder/tag/all scope. */
 export type LibraryEmbeddingFilter =
   | 'ready'

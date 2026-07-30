@@ -19,7 +19,11 @@ import type {
   LibraryDocumentSortDirection,
   LibraryDocumentSortKey,
 } from '../../shared/types'
-import { getLibraryStateCache, markLibraryStateCacheDirty } from '../library-state-cache'
+import {
+  getLibraryStateCache,
+  markLibraryStateCacheDirty,
+  scheduleLibraryFolderCountsRefresh,
+} from '../library-state-cache'
 import { buildCumulativeFolderDocumentCounts, resolveFolderAndDescendantIds } from '../folder-scope'
 import { allowManagedFileAccessPaths } from '../file-access'
 import { importSelectionService } from '../import-selections'
@@ -51,6 +55,11 @@ const SUPPORTED_FOLDER_IMPORT_EXTENSIONS = new Set([
 
 const DEFAULT_FOLDER_CONTENT_LIMIT = 80
 const MAX_FOLDER_CONTENT_LIMIT = 240
+
+function markFolderRelationsChanged(projectIds?: string[]): void {
+  markLibraryStateCacheDirty(projectIds)
+  scheduleLibraryFolderCountsRefresh(projectIds)
+}
 
 function normalizeFolderName(value: unknown): string {
   return String(value || '').trim()
@@ -264,7 +273,7 @@ function moveFolder(payload: FolderMovePayload): Folder[] {
     reorderFolderSiblings(current.id, nextParentId, payload.before_id, payload.after_id)
   })
   saveDatabase()
-  markLibraryStateCacheDirty()
+  markFolderRelationsChanged()
   return listFoldersWithCounts()
 }
 
@@ -645,7 +654,7 @@ function moveDocumentsToFolder(payload: FolderDocumentMovePayload): BulkAssociat
     run('UPDATE folders SET updated_at = ? WHERE id = ?', [now, targetFolderId])
   })
   saveDatabase()
-  markLibraryStateCacheDirty()
+  markFolderRelationsChanged()
   return { count: uniqueDocIds.length }
 }
 
@@ -717,7 +726,7 @@ export function registerFolderIpc(): void {
       [id, libraryProjectId, name, parentId, null, data.icon || 'folder', data.color || null, sortOrder, now, now]
     )
     saveDatabase()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
 
     return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [id])
   })
@@ -767,7 +776,7 @@ export function registerFolderIpc(): void {
 
     run(`UPDATE folders SET ${sets.join(', ')} WHERE id = ?`, params)
     saveDatabase()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
     return true
   })
 
@@ -804,7 +813,7 @@ export function registerFolderIpc(): void {
     })
     if (!deleted) return false
     scheduleDatabaseSave()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
     return true
   })
 
@@ -818,7 +827,7 @@ export function registerFolderIpc(): void {
     if (!folder) throw new Error('文件夹不属于当前项目')
     run('INSERT OR IGNORE INTO document_folders (doc_id, folder_id) VALUES (?, ?)', [docId, folderId])
     saveDatabase()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
     return true
   })
 
@@ -848,7 +857,7 @@ export function registerFolderIpc(): void {
       }
     })
     saveDatabase()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
     return { count: uniqueDocIds.length }
   }))
 
@@ -857,7 +866,7 @@ export function registerFolderIpc(): void {
     assertDocumentIdsInLibraryProject([docId], libraryProjectId)
     run('DELETE FROM document_folders WHERE doc_id = ? AND folder_id = ?', [docId, folderId])
     saveDatabase()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
     return true
   })
 
@@ -912,7 +921,7 @@ export function registerFolderIpc(): void {
       [id, libraryProjectId, name, normalizedParentId, externalPath, 'folder', null, (Number(maxOrder?.max_order) || 0) + 1, now, now],
     )
     saveDatabase()
-    markLibraryStateCacheDirty()
+    markFolderRelationsChanged()
     return queryOne<Folder>('SELECT * FROM folders WHERE id = ?', [id])
   }))
 

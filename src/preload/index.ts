@@ -127,6 +127,7 @@ import type {
   LibraryAiScope,
   LibraryAiScopePreview,
   LibraryAiSearchResponse,
+  LibraryFolderCounts,
   LibrarySmartViewCounts,
   LibraryStateCache,
   ListDocumentOptions,
@@ -388,6 +389,8 @@ const api = {
     ipcRenderer.invoke('library:refreshStateCache'),
   refreshLibrarySmartViewCounts: (): Promise<LibrarySmartViewCounts> =>
     ipcRenderer.invoke('library:refreshSmartViewCounts'),
+  refreshLibraryFolderCounts: (): Promise<LibraryFolderCounts> =>
+    ipcRenderer.invoke('library:refreshFolderCounts'),
   markLibraryStateCacheDirty: (): Promise<LibraryStateCache> =>
     ipcRenderer.invoke('library:markStateCacheDirty'),
 

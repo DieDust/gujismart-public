@@ -202,6 +202,33 @@ async function run() {
       'new search/vector rows must inherit the document project',
     )
 
+    const [initialSmartCounts, initialFolderCounts] = await Promise.all([
+      modules.libraryState.refreshLibrarySmartViewCounts(),
+      modules.libraryState.refreshLibraryFolderCounts(defaultProject.id),
+    ])
+    assert.strictEqual(initialSmartCounts.all, 1)
+    assert.strictEqual(initialFolderCounts.folderDocumentCounts.legacy_folder, 1)
+    assert.strictEqual(initialFolderCounts.unfiledDocumentTotal, 0)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    let mergedSidebarCache = modules.libraryState.getLibraryStateCache()
+    assert.strictEqual(mergedSidebarCache.smartViewCounts.all, 1)
+    assert.strictEqual(mergedSidebarCache.folderDocumentCounts.legacy_folder, 1)
+
+    database.run("DELETE FROM document_folders WHERE doc_id = 'legacy_doc' AND folder_id = 'legacy_folder'")
+    modules.libraryState.markLibraryStateCacheDirty([defaultProject.id])
+    const removedFolderCounts = await modules.libraryState.refreshLibraryFolderCounts(defaultProject.id)
+    assert.strictEqual(removedFolderCounts.folderDocumentCounts.legacy_folder, 0)
+    assert.strictEqual(removedFolderCounts.unfiledDocumentTotal, 1)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    mergedSidebarCache = modules.libraryState.getLibraryStateCache()
+    assert.strictEqual(mergedSidebarCache.smartViewCounts.all, 1, 'folder refresh must preserve smart-view counts')
+    assert.strictEqual(mergedSidebarCache.folderDocumentCounts.legacy_folder, 0, 'folder refresh must replace stale cached counts')
+    assert.strictEqual(mergedSidebarCache.unfiledDocumentTotal, 1)
+
+    database.run("INSERT INTO document_folders (doc_id, folder_id) VALUES ('legacy_doc', 'legacy_folder')")
+    await modules.libraryState.refreshLibraryFolderCounts(defaultProject.id)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
     const secondProject = modules.projects.createLibraryProject({ name: 'Second project', activate: true })
     database.run(
       `INSERT INTO documents

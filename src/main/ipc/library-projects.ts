@@ -18,7 +18,7 @@ import type {
   RemoveDocumentsFromLibraryProjectResult,
 } from '../../shared/types'
 import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
-import { markLibraryStateCacheDirty } from '../library-state-cache'
+import { markLibraryStateCacheDirty, scheduleLibraryFolderCountsRefresh } from '../library-state-cache'
 import { resumeEmbeddingQueueForActiveProject } from '../embedding-index'
 import { notifySearchContentChanged } from '../semantic-search'
 import { batchProcessor } from '../batch-processor'
@@ -83,7 +83,9 @@ export function registerLibraryProjectIpc(): void {
     'libraryProjects:addDocuments',
     async (_event, documentIds: string[], targetProjectId: string): Promise<AddDocumentsToLibraryProjectResult> => {
       const result = addDocumentsToLibraryProject(documentIds, targetProjectId)
-      markLibraryStateCacheDirty([result.source_project_id, result.target_project_id])
+      const affectedProjects = [result.source_project_id, result.target_project_id]
+      markLibraryStateCacheDirty(affectedProjects)
+      scheduleLibraryFolderCountsRefresh(affectedProjects)
       return result
     },
   )
@@ -94,6 +96,7 @@ export function registerLibraryProjectIpc(): void {
       const affectedProjects = [result.source_project_id]
       if (result.reassigned_to_default > 0) affectedProjects.push(DEFAULT_LIBRARY_PROJECT_ID)
       markLibraryStateCacheDirty(affectedProjects)
+      scheduleLibraryFolderCountsRefresh(affectedProjects)
       if (result.removed > 0) notifySearchContentChanged()
       return result
     },
@@ -102,7 +105,9 @@ export function registerLibraryProjectIpc(): void {
     'libraryProjects:moveDocuments',
     async (_event, documentIds: string[], targetProjectId: string): Promise<MoveDocumentsToLibraryProjectResult> => {
       const result = moveDocumentsToLibraryProject(documentIds, targetProjectId)
-      markLibraryStateCacheDirty([...result.from_project_ids, result.target_project_id])
+      const affectedProjects = [...result.from_project_ids, result.target_project_id]
+      markLibraryStateCacheDirty(affectedProjects)
+      scheduleLibraryFolderCountsRefresh(affectedProjects)
       return result
     },
   )
@@ -110,7 +115,9 @@ export function registerLibraryProjectIpc(): void {
     'libraryProjects:copyDocuments',
     async (_event, documentIds: string[], targetProjectId: string): Promise<CopyDocumentsToLibraryProjectResult> => {
       const result = await copyDocumentsToLibraryProject(documentIds, targetProjectId)
-      markLibraryStateCacheDirty([result.source_project_id, result.target_project_id])
+      const affectedProjects = [result.source_project_id, result.target_project_id]
+      markLibraryStateCacheDirty(affectedProjects)
+      scheduleLibraryFolderCountsRefresh(affectedProjects)
       notifySearchContentChanged()
       return result
     },

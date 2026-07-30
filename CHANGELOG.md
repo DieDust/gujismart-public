@@ -1,5 +1,27 @@
 # 更新日志 / Changelog
 
+## 1.2.25 - 2026-07-30
+
+### 中文
+
+- 修复“文件夹”页与“文献库”侧栏显示不同文献数量的问题；文献库保持缓存首屏，随后只读取实时文件夹计数，旧版本遗留的过期数量也会自动校正。
+- 文件夹归属、导入、删除和跨项目移动现在按项目合并刷新计数；文件夹计数与智能视图并发刷新时采用字段级合并，不再由旧缓存覆盖新数量，也不会为更新文件夹数量而重算 OCR、向量和标签统计。
+
+#### 下载
+
+- `GujiSmart-1.2.25-Setup-x64.exe`
+- `GujiSmart-1.2.25-Portable-x64.exe`
+
+### English
+
+- Fixed document-count mismatches between the Folders page and the Library sidebar. The Library still paints immediately from cache, then refreshes only live folder counts so stale values left by older versions repair themselves automatically.
+- Folder assignment, import, deletion, and cross-project moves now coalesce project-scoped count refreshes. Folder and smart-view refreshes merge cache fields instead of overwriting each other, without recalculating OCR, vector, or tag statistics just to update folder counts.
+
+#### Downloads
+
+- `GujiSmart-1.2.25-Setup-x64.exe`
+- `GujiSmart-1.2.25-Portable-x64.exe`
+
 ## 1.2.24 - 2026-07-30
 
 ### 中文

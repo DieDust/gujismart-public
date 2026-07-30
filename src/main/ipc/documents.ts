@@ -42,7 +42,11 @@ import {
 } from '../pdf-assets'
 import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex } from '../semantic-search'
 import { syncDocumentMetadataTags } from '../metadata-tags'
-import { markLibraryStateCacheDirty, markLibraryStateCacheDirtyAsync } from '../library-state-cache'
+import {
+  markLibraryStateCacheDirty,
+  markLibraryStateCacheDirtyAsync,
+  scheduleLibraryFolderCountsRefresh,
+} from '../library-state-cache'
 import { applyManualLiteraturePageAnchor, recomputeLiteraturePageMap, resetLiteraturePageMap } from '../literature-page-map'
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
@@ -781,7 +785,9 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
             message: '正在准备后台删除',
           })
           try {
-            await markLibraryStateCacheDirtyAsync(await getDocumentLibraryProjectIds(docIds))
+            const affectedProjectIds = await getDocumentLibraryProjectIds(docIds)
+            await markLibraryStateCacheDirtyAsync(affectedProjectIds)
+            scheduleLibraryFolderCountsRefresh(affectedProjectIds)
           } catch (cacheError) {
             console.warn('[Documents] Failed to mark project caches dirty before background delete', cacheError)
           }
@@ -4927,6 +4933,7 @@ export function registerDocumentIpc(): void {
     }
     scheduleDatabaseSave()
     markLibraryStateCacheDirty()
+    scheduleLibraryFolderCountsRefresh()
     const settledGrantIds = [...new Set(results
       .map((result) => result.sourceGrantId)
       .filter((grantId): grantId is string => Boolean(grantId)))]
