@@ -12,6 +12,7 @@
 - 从已连接的 PDF 仓库导入时会保留来源路径；OCR 后自动清理软件内 PDF 时会立即切换到仓库原文，继续提供原图预览与校对能力，无需手动重新连接。
 - 旧版本中误标为“仅文本”的文献会按文件哈希与大小在仓库索引中自愈链接，同时修复空索引路径被误当作当前目录的问题。
 - 修复外部仓库 PDF 已显示连接但预览生成失败的问题；运行时会恢复读取授权，静默自动恢复仅在真实失败时提示用户。
+- 修复 175% 等高显示缩放与窄窗口组合下，图标密度标签分组被弹性压缩、导致分组边界与内部标签重叠的问题。
 
 #### 下载
 
@@ -28,6 +29,7 @@
 - Imports from a connected PDF repository now retain their source paths. When the managed PDF is removed after OCR, the document switches immediately to the repository original and keeps image preview and proofreading available without manual relinking.
 - Documents incorrectly left as text-only by older versions can self-heal against the repository index using file hashes and sizes. Empty index paths are no longer mistaken for the current directory.
 - Fixed external repository PDFs reporting a valid link while preview generation failed. Runtime read authorization is restored as needed, and silent automatic recovery now notifies users only on genuine failures.
+- Fixed icon-density tab groups being flex-compressed under combinations such as 175% display scaling and a narrow window, which could make group boundaries overlap their tabs.
 
 #### Downloads
 

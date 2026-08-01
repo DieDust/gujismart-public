@@ -156,6 +156,19 @@ async function run() {
           const groups = Array.from(strip.querySelectorAll('[data-layout-group]'))
           groups.forEach((group) => {
             const groupRect = group.getBoundingClientRect()
+            const groupStyle = window.getComputedStyle(group)
+            if (
+              strip.dataset.appTabDensity === 'icon'
+              && !group.classList.contains('is-collapsed')
+              && Number.parseFloat(groupStyle.flexGrow) !== 0
+            ) {
+              overlaps.push({
+                type: 'icon-group-flex-growth',
+                group: group.dataset.layoutGroup,
+                flexGrow: groupStyle.flexGrow,
+                flexBasis: groupStyle.flexBasis,
+              })
+            }
             const children = Array.from(group.querySelectorAll(':scope > [data-layout-item]'))
               .filter((element) => element.getClientRects().length > 0)
             children.forEach((element) => {
