@@ -155,6 +155,9 @@ async function run() {
        VALUES ('legacy_page', 'legacy_doc', 1, ?, 'preserved OCR text', 'completed', ?)`,
       [join(legacyStorageRoot, 'page-1.png'), timestamp],
     )
+    database.run(
+      "UPDATE documents SET page_count = 1, ocr_status = 'completed' WHERE id = 'legacy_doc'",
+    )
     writeFileSync(join(legacyStorageRoot, 'page-1.png'), 'source-page-image')
     database.run(
       `INSERT INTO embedding_index_status
@@ -207,8 +210,15 @@ async function run() {
       modules.libraryState.refreshLibraryFolderCounts(defaultProject.id),
     ])
     assert.strictEqual(initialSmartCounts.all, 1)
+    assert.strictEqual(initialSmartCounts.ocrNeedsRepair, 0)
     assert.strictEqual(initialFolderCounts.folderDocumentCounts.legacy_folder, 1)
     assert.strictEqual(initialFolderCounts.unfiledDocumentTotal, 0)
+    database.run("UPDATE pages SET ocr_status = 'error' WHERE id = 'legacy_page'")
+    const repairSmartCounts = await modules.libraryState.refreshLibrarySmartViewCounts()
+    assert.strictEqual(repairSmartCounts.ocrNeedsRepair, 1, 'completed documents with a failed OCR page should need repair')
+    database.run("UPDATE pages SET ocr_status = 'completed' WHERE id = 'legacy_page'")
+    const repairedSmartCounts = await modules.libraryState.refreshLibrarySmartViewCounts()
+    assert.strictEqual(repairedSmartCounts.ocrNeedsRepair, 0, 'repairing the failed page should clear the smart-view count')
     await new Promise((resolve) => setTimeout(resolve, 150))
     let mergedSidebarCache = modules.libraryState.getLibraryStateCache()
     assert.strictEqual(mergedSidebarCache.smartViewCounts.all, 1)

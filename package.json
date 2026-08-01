@@ -186,6 +186,7 @@
     "zustand": "^5.0.3"
   },
   "build": {
+    "electronDist": "node_modules/electron/dist",
     "appId": "com.gujismart.app",
     "productName": "文献管理",
     "electronLanguages": [

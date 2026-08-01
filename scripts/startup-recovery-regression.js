@@ -1,6 +1,6 @@
 const assert = require('assert')
 const { app } = require('electron')
-const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } = require('fs')
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } = require('fs')
 const { tmpdir } = require('os')
 const { join } = require('path')
 const { buildSync } = require('esbuild')
@@ -705,6 +705,158 @@ async function run() {
     assert.strictEqual(existsSync(asyncPdfPath), false)
     assert.strictEqual(existsSync(asyncPagePath), false)
     assert.strictEqual(readFileSync(asyncRepositoryPath, 'utf8'), '%PDF-1.4\nrepository async\n')
+
+    database.run(
+      'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+      ['pdf_repository_paths', JSON.stringify([join(tempRoot, 'repository')])],
+    )
+    const retainedPdfId = 'managed_pdf_retained_repository_link'
+    const retainedPdfDir = join(storageRoot, retainedPdfId)
+    const retainedManagedPdfPath = join(retainedPdfDir, 'source.pdf')
+    const retainedPagePath = join(retainedPdfDir, 'page.jpg')
+    const retainedRepositoryPath = join(tempRoot, 'repository', 'retained-source.pdf')
+    mkdirSync(retainedPdfDir, { recursive: true })
+    writeFileSync(retainedRepositoryPath, '%PDF-1.4\nrepository retained source\n')
+    writeFileSync(retainedManagedPdfPath, readFileSync(retainedRepositoryPath))
+    writeFileSync(retainedPagePath, 'managed retained page')
+    const retainedFingerprint = pdfAssets.getPdfFingerprint(retainedRepositoryPath)
+    const retainedSourceMetadata = pdfAssets.capturePdfRepositorySourceMetadata(
+      retainedRepositoryPath,
+      retainedFingerprint,
+    )
+    assert.strictEqual(retainedSourceMetadata.pdf_repository_source_path, realpathSync(retainedRepositoryPath))
+    insertDocument(database, retainedPdfId, {
+      filePath: retainedManagedPdfPath,
+      ocrStatus: 'completed',
+      importStatus: 'processed',
+      metadata: JSON.stringify({
+        ...retainedSourceMetadata,
+        pdf_sha256: retainedFingerprint.sha256,
+        pdf_size_bytes: retainedFingerprint.sizeBytes,
+        pdf_asset_state: 'available',
+      }),
+    })
+    insertPage(database, 'managed_page_retained', retainedPdfId, 1, 'completed', retainedPagePath)
+    assert.strictEqual((await pdfAssets.cleanupPdfAssetsAsync(retainedPdfId)).cleaned, true)
+    assert.strictEqual(existsSync(retainedManagedPdfPath), false)
+    assert.strictEqual(existsSync(retainedPagePath), false)
+    assert.strictEqual(readFileSync(retainedRepositoryPath, 'utf8'), '%PDF-1.4\nrepository retained source\n')
+    const retainedDoc = database.queryOne('SELECT file_path, metadata FROM documents WHERE id = ?', [retainedPdfId])
+    const retainedMetadata = JSON.parse(retainedDoc.metadata)
+    assert.strictEqual(retainedDoc.file_path, realpathSync(retainedRepositoryPath))
+    assert.strictEqual(retainedMetadata.pdf_asset_state, 'available')
+    assert.strictEqual(retainedMetadata.pdf_asset_storage, 'linked')
+    assert.strictEqual(retainedMetadata.pdf_linked_path, realpathSync(retainedRepositoryPath))
+    assert.strictEqual(
+      database.queryOne('SELECT image_path FROM pages WHERE id = ?', ['managed_page_retained']).image_path,
+      null,
+    )
+
+    const hashOnlyPdfId = 'managed_pdf_retained_by_hash_only'
+    const hashOnlyPdfDir = join(storageRoot, hashOnlyPdfId)
+    const hashOnlyManagedPath = join(hashOnlyPdfDir, 'source.pdf')
+    const hashOnlyRepositoryPath = join(tempRoot, 'repository', 'hash-only-source.pdf')
+    mkdirSync(hashOnlyPdfDir, { recursive: true })
+    writeFileSync(hashOnlyRepositoryPath, '%PDF-1.4\nrepository hash-only source\n')
+    writeFileSync(hashOnlyManagedPath, readFileSync(hashOnlyRepositoryPath))
+    const hashOnlyFingerprint = pdfAssets.getPdfFingerprint(hashOnlyRepositoryPath)
+    insertDocument(database, hashOnlyPdfId, {
+      filePath: hashOnlyManagedPath,
+      ocrStatus: 'completed',
+      importStatus: 'processed',
+      metadata: JSON.stringify({
+        pdf_sha256: hashOnlyFingerprint.sha256,
+        pdf_size_bytes: hashOnlyFingerprint.sizeBytes,
+        pdf_asset_state: 'available',
+      }),
+    })
+    assert.strictEqual((await pdfAssets.cleanupPdfAssetsAsync(hashOnlyPdfId)).cleaned, true)
+    const hashOnlyDoc = database.queryOne('SELECT file_path, metadata FROM documents WHERE id = ?', [hashOnlyPdfId])
+    assert.strictEqual(hashOnlyDoc.file_path, realpathSync(hashOnlyRepositoryPath))
+    assert.strictEqual(JSON.parse(hashOnlyDoc.metadata).pdf_asset_state, 'available')
+    assert.strictEqual(existsSync(hashOnlyManagedPath), false)
+
+    const missingFingerprintPdfId = 'managed_pdf_retained_after_fingerprint_backfill'
+    const missingFingerprintPdfDir = join(storageRoot, missingFingerprintPdfId)
+    const missingFingerprintManagedPath = join(missingFingerprintPdfDir, 'source.pdf')
+    const missingFingerprintRepositoryPath = join(tempRoot, 'repository', 'missing-fingerprint-source.pdf')
+    mkdirSync(missingFingerprintPdfDir, { recursive: true })
+    writeFileSync(missingFingerprintRepositoryPath, '%PDF-1.4\nrepository missing fingerprint source\n')
+    writeFileSync(missingFingerprintManagedPath, readFileSync(missingFingerprintRepositoryPath))
+    insertDocument(database, missingFingerprintPdfId, {
+      filePath: missingFingerprintManagedPath,
+      ocrStatus: 'completed',
+      importStatus: 'processed',
+      metadata: JSON.stringify({ pdf_asset_state: 'available' }),
+    })
+    assert.strictEqual(pdfAssets.cleanupPdfAssets(missingFingerprintPdfId).cleaned, true)
+    const missingFingerprintDoc = database.queryOne(
+      'SELECT file_path, metadata FROM documents WHERE id = ?',
+      [missingFingerprintPdfId],
+    )
+    assert.strictEqual(missingFingerprintDoc.file_path, realpathSync(missingFingerprintRepositoryPath))
+    assert.strictEqual(JSON.parse(missingFingerprintDoc.metadata).pdf_asset_state, 'available')
+    assert.strictEqual(existsSync(missingFingerprintManagedPath), false)
+
+    const indexedTextOnlyPdfId = 'text_only_pdf_auto_reconnects_from_index'
+    const indexedTextOnlyRepositoryPath = join(tempRoot, 'repository', 'indexed-text-only-source.pdf')
+    writeFileSync(indexedTextOnlyRepositoryPath, '%PDF-1.4\nindexed text-only source\n')
+    const indexedTextOnlyFingerprint = pdfAssets.getPdfFingerprint(indexedTextOnlyRepositoryPath)
+    database.run(
+      `INSERT OR REPLACE INTO pdf_repository_index
+       (path, sha256, size_bytes, mtime_ms, indexed_at) VALUES (?, ?, ?, ?, ?)`,
+      [
+        indexedTextOnlyRepositoryPath,
+        indexedTextOnlyFingerprint.sha256,
+        indexedTextOnlyFingerprint.sizeBytes,
+        indexedTextOnlyFingerprint.mtimeMs,
+        new Date().toISOString(),
+      ],
+    )
+    insertDocument(database, indexedTextOnlyPdfId, {
+      ocrStatus: 'completed',
+      importStatus: 'processed',
+      metadata: JSON.stringify({
+        pdf_sha256: indexedTextOnlyFingerprint.sha256,
+        pdf_size_bytes: indexedTextOnlyFingerprint.sizeBytes,
+        pdf_asset_state: 'text_only',
+      }),
+    })
+    assert.strictEqual(
+      await pdfAssets.reconnectIndexedPdfRepositoryLinkForDocumentAsync(indexedTextOnlyPdfId),
+      true,
+    )
+    const indexedTextOnlyDoc = database.queryOne(
+      'SELECT file_path, metadata FROM documents WHERE id = ?',
+      [indexedTextOnlyPdfId],
+    )
+    assert.strictEqual(indexedTextOnlyDoc.file_path, realpathSync(indexedTextOnlyRepositoryPath))
+    assert.strictEqual(JSON.parse(indexedTextOnlyDoc.metadata).pdf_asset_state, 'available')
+    assert.strictEqual(JSON.parse(indexedTextOnlyDoc.metadata).pdf_asset_storage, 'linked')
+
+    const existingLinkedPdfId = 'external_pdf_link_survives_cleanup'
+    insertDocument(database, existingLinkedPdfId, {
+      filePath: retainedRepositoryPath,
+      ocrStatus: 'completed',
+      importStatus: 'processed',
+      metadata: JSON.stringify({
+        pdf_sha256: retainedFingerprint.sha256,
+        pdf_asset_state: 'available',
+        pdf_asset_storage: 'linked',
+        pdf_linked_path: retainedRepositoryPath,
+        restored_storage_mode: 'link',
+      }),
+    })
+    assert.strictEqual(pdfAssets.cleanupPdfAssets(existingLinkedPdfId).cleaned, true)
+    const existingLinkedDoc = database.queryOne('SELECT file_path, metadata FROM documents WHERE id = ?', [existingLinkedPdfId])
+    assert.strictEqual(existingLinkedDoc.file_path, retainedRepositoryPath)
+    assert.strictEqual(JSON.parse(existingLinkedDoc.metadata).pdf_asset_storage, 'linked')
+    assert.strictEqual(readFileSync(retainedRepositoryPath, 'utf8'), '%PDF-1.4\nrepository retained source\n')
+    assert.deepStrictEqual(
+      pdfAssets.capturePdfRepositorySourceMetadata(externalProtectedFile, pdfAssets.getPdfFingerprint(externalProtectedFile)),
+      {},
+      'a PDF outside configured repository roots must not become a retained link',
+    )
 
     const legacyPdfId = 'managed_pdf_legacy'
     const legacyPdfDir = join(storageRoot, legacyPdfId)

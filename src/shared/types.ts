@@ -210,6 +210,7 @@ export type LibrarySmartViewCountKey =
   | 'all'
   | 'missingMetadata'
   | 'unrecognized'
+  | 'ocrNeedsRepair'
   | 'suspiciousTitle'
   | 'unknownType'
   | 'favorite'
@@ -787,6 +788,7 @@ export interface BatchOcrOptions {
   engine?: OcrEngine
   forceFullRerun?: boolean
   retryFailedPagesOnly?: boolean
+  visionProfileId?: string
   concurrency?: number
 }
 
@@ -1403,6 +1405,7 @@ export interface ListDocumentOptions {
   docType?: string
   ocrStatus?: string
   ocrIncomplete?: boolean
+  ocrNeedsRepair?: boolean
   importStatus?: string
   folderId?: string
   folderIds?: string[]
@@ -1457,6 +1460,7 @@ export type LibraryFilterType =
   | 'docType'
   | 'ocrStatus'
   | 'ocrIncomplete'
+  | 'ocrNeedsRepair'
   | 'importStatus'
   | 'favorite'
   | 'readStatus'

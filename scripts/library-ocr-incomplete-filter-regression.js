@@ -17,6 +17,7 @@ const root = path.join(__dirname, '..')
 const databaseSource = fs.readFileSync(path.join(root, 'src', 'main', 'database.ts'), 'utf8')
 const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
 const libraryCacheSource = fs.readFileSync(path.join(root, 'src', 'main', 'library-state-cache.ts'), 'utf8')
+const ocrFiltersSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr-library-filters.ts'), 'utf8')
 const libraryViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
 
 assert(
@@ -27,12 +28,12 @@ assert(
 const incompleteFilterBlock = sliceBetween(
   documentsSource,
   'if (options?.ocrIncomplete) {',
-  '} else if (options?.ocrStatus) {',
+  '} else if (options?.ocrNeedsRepair) {',
   'ocrIncomplete list filter',
 )
 
 assert(
-  incompleteFilterBlock.includes("COALESCE(d.ocr_status, '') <> 'completed'")
+  incompleteFilterBlock.includes('buildOcrIncompleteCondition()')
     && !incompleteFilterBlock.includes('FROM pages p_any')
     && !incompleteFilterBlock.includes('FROM pages p_incomplete'),
   'ocrIncomplete filter should use document-level OCR status so large libraries do not scan page rows on every list query.',
@@ -41,6 +42,28 @@ assert(
 assert(
   !/SELECT\s+COUNT\(\*\)\s+FROM\s+pages\s+p_(done|text)/i.test(incompleteFilterBlock),
   'ocrIncomplete filter should not count completed/text pages per candidate document; it becomes too expensive at page size 100.',
+)
+
+const repairFilterBlock = sliceBetween(
+  documentsSource,
+  '} else if (options?.ocrNeedsRepair) {',
+  '} else if (options?.ocrStatus) {',
+  'ocrNeedsRepair list filter',
+)
+
+assert(
+  repairFilterBlock.includes('buildOcrNeedsRepairCondition()'),
+  'ocrNeedsRepair list filtering should share the exact condition used by sidebar counts.',
+)
+
+assert(
+  ocrFiltersSource.includes("COALESCE(p_ocr_repair.ocr_status, '') <> 'completed'")
+    && ocrFiltersSource.includes('p_ocr_repair.doc_id = ${documentAlias}.id')
+    && ocrFiltersSource.includes('p_ocr_repair_any.doc_id = ${documentAlias}.id')
+    && !ocrFiltersSource.includes('ocr_text')
+    && !ocrFiltersSource.includes('ocr_result')
+    && !ocrFiltersSource.includes('proofed_text'),
+  'ocrNeedsRepair should use the indexed page status relation and must never scan OCR text bodies.',
 )
 
 const attachPageStatsBlock = sliceBetween(
@@ -74,6 +97,7 @@ const sidebarCacheBlock = sliceBetween(
 
 assert(
   sidebarCacheBlock.includes('CASE WHEN ${buildOcrIncompleteCondition()} THEN 1 ELSE 0 END')
+    && sidebarCacheBlock.includes('CASE WHEN ${buildOcrNeedsRepairCondition()} THEN 1 ELSE 0 END')
     && sidebarCacheBlock.includes('FROM library_project_documents project_scope')
     && sidebarCacheBlock.includes('WHERE project_scope.project_id = ?')
     && !sidebarCacheBlock.includes("COALESCE(d.ocr_status, 'pending') <> 'completed' OR COALESCE(d.page_count, 0) = 0"),

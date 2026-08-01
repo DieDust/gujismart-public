@@ -1,7 +1,7 @@
 import { createHash } from 'crypto'
 import { nativeImage } from 'electron'
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs'
-import { copyFile, mkdir, open, readdir, rm, stat, writeFile } from 'fs/promises'
+import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
+import { copyFile, lstat, mkdir, open, readdir, realpath, rm, stat, writeFile } from 'fs/promises'
 import { basename, dirname, extname, join, normalize } from 'path'
 import { getDataDir, queryAll, queryOne, resolveManagedStoragePath, run, scheduleDatabaseSave } from './database'
 import { hydratePagePayloadRows, preparePagePayloadUpdate } from './page-payload-store'
@@ -652,6 +652,105 @@ function isPathInsideAny(filePath: string, dirPaths: string[]): boolean {
   return dirPaths.some((dirPath) => isPathInsideDirectory(filePath, dirPath))
 }
 
+function resolveCanonicalRepositoryPdfPath(filePath: string): string | null {
+  const candidate = normalize(String(filePath || '').trim())
+  if (!candidate || extname(candidate).toLowerCase() !== '.pdf') return null
+  try {
+    const sourceInfo = lstatSync(candidate)
+    if (sourceInfo.isSymbolicLink() || !sourceInfo.isFile()) return null
+    const canonicalPath = normalize(realpathSync(candidate))
+    for (const repositoryPath of readRepositoryPaths()) {
+      try {
+        const repositoryInfo = lstatSync(repositoryPath)
+        if (repositoryInfo.isSymbolicLink() || !repositoryInfo.isDirectory()) continue
+        const canonicalRepository = normalize(realpathSync(repositoryPath))
+        if (isPathInsideDirectory(canonicalPath, canonicalRepository)) return canonicalPath
+      } catch {
+        // A disconnected repository is not a valid long-term source right now.
+      }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+async function resolveCanonicalRepositoryPdfPathAsync(filePath: string): Promise<string | null> {
+  const candidate = normalize(String(filePath || '').trim())
+  if (!candidate || extname(candidate).toLowerCase() !== '.pdf') return null
+  try {
+    const sourceInfo = await lstat(candidate)
+    if (sourceInfo.isSymbolicLink() || !sourceInfo.isFile()) return null
+    const canonicalPath = normalize(await realpath(candidate))
+    for (const repositoryPath of readRepositoryPaths()) {
+      try {
+        const repositoryInfo = await lstat(repositoryPath)
+        if (repositoryInfo.isSymbolicLink() || !repositoryInfo.isDirectory()) continue
+        const canonicalRepository = normalize(await realpath(repositoryPath))
+        if (isPathInsideDirectory(canonicalPath, canonicalRepository)) return canonicalPath
+      } catch {
+        // A disconnected repository is not a valid long-term source right now.
+      }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function buildRepositorySourceMetadata(
+  sourcePath: string,
+  fingerprint: PdfFingerprint,
+): DocumentMetadataResult {
+  return {
+    pdf_repository_source_path: sourcePath,
+    pdf_repository_source_sha256: fingerprint.sha256,
+    pdf_repository_source_size_bytes: fingerprint.sizeBytes,
+    pdf_repository_source_mtime_ms: fingerprint.mtimeMs,
+    pdf_repository_source_recorded_at: new Date().toISOString(),
+  }
+}
+
+export function capturePdfRepositorySourceMetadata(
+  sourcePath: string,
+  fingerprint: PdfFingerprint,
+): DocumentMetadataResult {
+  const canonicalPath = resolveCanonicalRepositoryPdfPath(sourcePath)
+  if (!canonicalPath || !fingerprint.sha256) return {}
+  try {
+    const sourceInfo = statSync(canonicalPath)
+    if (sourceInfo.size !== fingerprint.sizeBytes || Math.abs(sourceInfo.mtimeMs - fingerprint.mtimeMs) >= 1) return {}
+    rememberPdfRepositoryIndexHit(canonicalPath, fingerprint.sha256, sourceInfo.size, sourceInfo.mtimeMs)
+    return buildRepositorySourceMetadata(canonicalPath, {
+      sha256: fingerprint.sha256,
+      sizeBytes: sourceInfo.size,
+      mtimeMs: sourceInfo.mtimeMs,
+    })
+  } catch {
+    return {}
+  }
+}
+
+export async function capturePdfRepositorySourceMetadataAsync(
+  sourcePath: string,
+  fingerprint: PdfFingerprint,
+): Promise<DocumentMetadataResult> {
+  const canonicalPath = await resolveCanonicalRepositoryPdfPathAsync(sourcePath)
+  if (!canonicalPath || !fingerprint.sha256) return {}
+  try {
+    const sourceInfo = await stat(canonicalPath)
+    if (sourceInfo.size !== fingerprint.sizeBytes || Math.abs(sourceInfo.mtimeMs - fingerprint.mtimeMs) >= 1) return {}
+    rememberPdfRepositoryIndexHit(canonicalPath, fingerprint.sha256, sourceInfo.size, sourceInfo.mtimeMs)
+    return buildRepositorySourceMetadata(canonicalPath, {
+      sha256: fingerprint.sha256,
+      sizeBytes: sourceInfo.size,
+      mtimeMs: sourceInfo.mtimeMs,
+    })
+  } catch {
+    return {}
+  }
+}
+
 function existingRepositoryRowsForTargets(targetHashes: Set<string>): RepositoryIndexRow[] {
   if (targetHashes.size === 0) return []
   return queryAll<RepositoryIndexRow>('SELECT * FROM pdf_repository_index')
@@ -958,9 +1057,110 @@ function isLinkedExternalPdfAsset(metadata: DocumentMetadataResult, filePath?: s
   const storage = String(metadata.pdf_asset_storage || metadata.restored_storage_mode || '').trim().toLowerCase()
   if (storage === 'linked' || storage === 'link') return true
   const linkedPath = String(metadata.pdf_linked_path || '').trim()
-  const current = normalize(String(filePath || '').trim())
+  const rawCurrent = String(filePath || '').trim()
+  const current = rawCurrent ? normalize(rawCurrent) : ''
   if (linkedPath && current && normalize(linkedPath) === current) return true
   return false
+}
+
+function getRetainedPdfExpectedHash(metadata: DocumentMetadataResult): string {
+  return String(metadata.pdf_repository_source_sha256 || metadata.pdf_sha256 || '').trim()
+}
+
+function getRetainedPdfExpectedSize(metadata: DocumentMetadataResult): number {
+  return Number(
+    metadata.pdf_repository_source_size_bytes
+      || metadata.pdf_size_bytes
+      || metadata.pdf_original_size_bytes
+      || 0,
+  )
+}
+
+function resolveRetainedPdfLink(metadata: DocumentMetadataResult, filePath?: string | null): string | null {
+  const rawCurrentPath = String(filePath || '').trim()
+  const currentPath = rawCurrentPath ? normalize(rawCurrentPath) : ''
+  if (isLinkedExternalPdfAsset(metadata, currentPath) && currentPath && existsSync(currentPath)) {
+    return currentPath
+  }
+
+  const expectedHash = getRetainedPdfExpectedHash(metadata)
+  const expectedSize = getRetainedPdfExpectedSize(metadata)
+  const recordedPath = String(metadata.pdf_repository_source_path || '').trim()
+  const canonicalPath = resolveCanonicalRepositoryPdfPath(recordedPath)
+  if (canonicalPath) {
+    try {
+      const sourceInfo = statSync(canonicalPath)
+      const expectedMtime = Number(metadata.pdf_repository_source_mtime_ms || 0)
+      if (expectedHash
+        && (expectedSize <= 0 || sourceInfo.size === expectedSize)
+        && (expectedMtime <= 0 || Math.abs(sourceInfo.mtimeMs - expectedMtime) < 1)) {
+        rememberPdfRepositoryIndexHit(canonicalPath, expectedHash, sourceInfo.size, sourceInfo.mtimeMs)
+        return canonicalPath
+      }
+    } catch {
+      // Fall through to a hash lookup when the recorded source disappeared or changed.
+    }
+  }
+
+  if (!expectedHash) return null
+  const warehouseMatch = resolveWarehousePdfPathByHash(
+    expectedHash,
+    expectedSize > 0 ? expectedSize : undefined,
+  )
+  return warehouseMatch ? resolveCanonicalRepositoryPdfPath(warehouseMatch) : null
+}
+
+async function resolveRetainedPdfLinkAsync(
+  metadata: DocumentMetadataResult,
+  filePath?: string | null,
+): Promise<string | null> {
+  const rawCurrentPath = String(filePath || '').trim()
+  const currentPath = rawCurrentPath ? normalize(rawCurrentPath) : ''
+  if (isLinkedExternalPdfAsset(metadata, currentPath) && currentPath && await pathExists(currentPath)) {
+    return currentPath
+  }
+
+  const expectedHash = getRetainedPdfExpectedHash(metadata)
+  const expectedSize = getRetainedPdfExpectedSize(metadata)
+  const recordedPath = String(metadata.pdf_repository_source_path || '').trim()
+  const canonicalPath = await resolveCanonicalRepositoryPdfPathAsync(recordedPath)
+  if (canonicalPath) {
+    try {
+      const sourceInfo = await stat(canonicalPath)
+      const expectedMtime = Number(metadata.pdf_repository_source_mtime_ms || 0)
+      if (expectedHash
+        && (expectedSize <= 0 || sourceInfo.size === expectedSize)
+        && (expectedMtime <= 0 || Math.abs(sourceInfo.mtimeMs - expectedMtime) < 1)) {
+        rememberPdfRepositoryIndexHit(canonicalPath, expectedHash, sourceInfo.size, sourceInfo.mtimeMs)
+        return canonicalPath
+      }
+    } catch {
+      // Fall through to a hash lookup when the recorded source disappeared or changed.
+    }
+  }
+
+  if (!expectedHash) return null
+  const warehouseMatch = await resolveWarehousePdfPathByHashAsync(
+    expectedHash,
+    expectedSize > 0 ? expectedSize : undefined,
+  )
+  return warehouseMatch ? resolveCanonicalRepositoryPdfPathAsync(warehouseMatch) : null
+}
+
+function persistPdfAssetCleanupState(docId: string, retainedLink: string | null, preservedImageCount: number): void {
+  const cleanedAt = new Date().toISOString()
+  run('UPDATE documents SET file_path = ?, thumb_path = NULL, updated_at = ? WHERE id = ?', [retainedLink, cleanedAt, docId])
+  updateMetadata(docId, {
+    pdf_asset_state: (retainedLink ? 'available' : 'text_only') as PdfAssetState,
+    pdf_asset_deleted_at: retainedLink ? null : cleanedAt,
+    pdf_managed_assets_deleted_at: cleanedAt,
+    pdf_asset_storage: retainedLink ? 'linked' : null,
+    pdf_linked_path: retainedLink,
+    restored_storage_mode: retainedLink ? 'link' : null,
+    restored_source_name: retainedLink ? basename(retainedLink) : null,
+    pdf_repository_linked_after_cleanup_at: retainedLink ? cleanedAt : null,
+    preserved_content_image_count: preservedImageCount,
+  })
 }
 
 export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
@@ -969,7 +1169,7 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
 
   let bytesFreed = 0
   const preservedImageCount = materializeContentImageAssets(docId)
-  const metadata = parseMetadata(doc.metadata)
+  let metadata = parseMetadata(doc.metadata)
   const filePath = String(doc.file_path || '').trim()
   const linkedExternal = isLinkedExternalPdfAsset(metadata, filePath)
 
@@ -983,13 +1183,14 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
     && authorizeManagedPdfAssetDeletion(docId, filePath)
   ) {
     const fingerprint = getPdfFingerprint(filePath)
-    updateMetadata(docId, {
+    metadata = updateMetadata(docId, {
       pdf_sha256: fingerprint.sha256,
       pdf_size_bytes: fingerprint.sizeBytes,
       pdf_page_count: doc.page_count || undefined,
       original_file_name: basename(filePath),
     })
   }
+  const retainedLink = resolveRetainedPdfLink(metadata, filePath)
 
   const pathsToDelete = new Set<string>()
   const addPath = (value?: string | null) => {
@@ -1020,15 +1221,7 @@ export function cleanupPdfAssets(docId: string): PdfAssetCleanupResult {
   }
 
   run('UPDATE pages SET image_path = NULL WHERE doc_id = ?', [docId])
-  run('UPDATE documents SET file_path = NULL, thumb_path = NULL, updated_at = ? WHERE id = ?', [new Date().toISOString(), docId])
-  updateMetadata(docId, {
-    pdf_asset_state: 'text_only' as PdfAssetState,
-    pdf_asset_deleted_at: new Date().toISOString(),
-    pdf_asset_storage: null,
-    pdf_linked_path: null,
-    restored_storage_mode: null,
-    preserved_content_image_count: preservedImageCount,
-  })
+  persistPdfAssetCleanupState(docId, retainedLink, preservedImageCount)
   scheduleDatabaseSave()
   return { cleaned: true, bytesFreed }
 }
@@ -1039,7 +1232,7 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
 
   let bytesFreed = 0
   const preservedImageCount = await materializeContentImageAssetsAsync(docId)
-  const metadata = parseMetadata(doc.metadata)
+  let metadata = parseMetadata(doc.metadata)
   const filePath = String(doc.file_path || '').trim()
   const linkedExternal = isLinkedExternalPdfAsset(metadata, filePath)
 
@@ -1052,13 +1245,14 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
     && authorizeManagedPdfAssetDeletion(docId, filePath)
   ) {
     const fingerprint = await getPdfFingerprintAsync(filePath)
-    updateMetadata(docId, {
+    metadata = updateMetadata(docId, {
       pdf_sha256: fingerprint.sha256,
       pdf_size_bytes: fingerprint.sizeBytes,
       pdf_page_count: doc.page_count || undefined,
       original_file_name: basename(filePath),
     })
   }
+  const retainedLink = await resolveRetainedPdfLinkAsync(metadata, filePath)
 
   const pathsToDelete = new Set<string>()
   const addPath = async (value?: string | null) => {
@@ -1090,15 +1284,7 @@ export async function cleanupPdfAssetsAsync(docId: string): Promise<PdfAssetClea
   }
 
   run('UPDATE pages SET image_path = NULL WHERE doc_id = ?', [docId])
-  run('UPDATE documents SET file_path = NULL, thumb_path = NULL, updated_at = ? WHERE id = ?', [new Date().toISOString(), docId])
-  updateMetadata(docId, {
-    pdf_asset_state: 'text_only' as PdfAssetState,
-    pdf_asset_deleted_at: new Date().toISOString(),
-    pdf_asset_storage: null,
-    pdf_linked_path: null,
-    restored_storage_mode: null,
-    preserved_content_image_count: preservedImageCount,
-  })
+  persistPdfAssetCleanupState(docId, retainedLink, preservedImageCount)
   scheduleDatabaseSave()
   return { cleaned: true, bytesFreed }
 }
@@ -1179,28 +1365,86 @@ function isPdfRestoreLinkOnlyEnabled(options?: PdfAssetRestoreOptions): boolean 
   return String(row?.value || '').trim() === 'true'
 }
 
-function lookupPdfRepositoryPathByHash(targetHash: string): string | null {
+function lookupPdfRepositoryPathByHash(targetHash: string, expectedSizeBytes?: number): string | null {
   const hash = String(targetHash || '').trim()
   if (!hash) return null
-  const match = queryOne<{ path: string }>(
-    'SELECT path FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1',
+  const match = queryOne<Pick<RepositoryIndexRow, 'path' | 'size_bytes' | 'mtime_ms'>>(
+    'SELECT path, size_bytes, mtime_ms FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1',
     [hash],
   )
-  const filePath = normalize(String(match?.path || '').trim())
-  if (!filePath || !existsSync(filePath)) return null
-  return filePath
+  const rawPath = String(match?.path || '').trim()
+  if (!rawPath) return null
+  const canonicalPath = resolveCanonicalRepositoryPdfPath(rawPath)
+  if (!canonicalPath) return null
+  try {
+    const sourceInfo = statSync(canonicalPath)
+    const sizeHint = Number(expectedSizeBytes || 0)
+    if ((sizeHint > 0 && sourceInfo.size !== sizeHint)
+      || Number(match?.size_bytes || 0) !== sourceInfo.size
+      || Math.abs(Number(match?.mtime_ms || 0) - sourceInfo.mtimeMs) >= 1) return null
+    return canonicalPath
+  } catch {
+    return null
+  }
 }
 
-async function lookupPdfRepositoryPathByHashAsync(targetHash: string): Promise<string | null> {
+async function lookupPdfRepositoryPathByHashAsync(targetHash: string, expectedSizeBytes?: number): Promise<string | null> {
   const hash = String(targetHash || '').trim()
   if (!hash) return null
-  const match = queryOne<{ path: string }>(
-    'SELECT path FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1',
+  const match = queryOne<Pick<RepositoryIndexRow, 'path' | 'size_bytes' | 'mtime_ms'>>(
+    'SELECT path, size_bytes, mtime_ms FROM pdf_repository_index WHERE sha256 = ? ORDER BY indexed_at DESC LIMIT 1',
     [hash],
   )
-  const filePath = normalize(String(match?.path || '').trim())
-  if (!filePath || !(await pathExists(filePath))) return null
-  return filePath
+  const rawPath = String(match?.path || '').trim()
+  if (!rawPath) return null
+  const canonicalPath = await resolveCanonicalRepositoryPdfPathAsync(rawPath)
+  if (!canonicalPath) return null
+  try {
+    const sourceInfo = await stat(canonicalPath)
+    const sizeHint = Number(expectedSizeBytes || 0)
+    if ((sizeHint > 0 && sourceInfo.size !== sizeHint)
+      || Number(match?.size_bytes || 0) !== sourceInfo.size
+      || Math.abs(Number(match?.mtime_ms || 0) - sourceInfo.mtimeMs) >= 1) return null
+    return canonicalPath
+  } catch {
+    return null
+  }
+}
+
+export async function reconnectIndexedPdfRepositoryLinkForDocumentAsync(docId: string): Promise<boolean> {
+  const doc = queryOne<Pick<DocumentRow, 'file_path' | 'metadata'>>(
+    'SELECT file_path, metadata FROM documents WHERE id = ?',
+    [docId],
+  )
+  if (!doc) return false
+  const currentPath = String(doc.file_path || '').trim()
+  if (currentPath && extname(currentPath).toLowerCase() === '.pdf' && await pathExists(currentPath)) return false
+
+  const metadata = parseMetadata(doc.metadata)
+  if (String(metadata.pdf_asset_state || '').trim() !== 'text_only') return false
+  const expectedHash = getRetainedPdfExpectedHash(metadata)
+  if (!expectedHash) return false
+  const expectedSize = getRetainedPdfExpectedSize(metadata)
+  const retainedLink = await lookupPdfRepositoryPathByHashAsync(
+    expectedHash,
+    expectedSize > 0 ? expectedSize : undefined,
+  )
+  if (!retainedLink) return false
+
+  const linkedAt = new Date().toISOString()
+  run('UPDATE documents SET file_path = ?, updated_at = ? WHERE id = ?', [retainedLink, linkedAt, docId])
+  updateMetadata(docId, {
+    pdf_asset_state: 'available' as PdfAssetState,
+    pdf_asset_deleted_at: null,
+    pdf_asset_storage: 'linked',
+    pdf_linked_path: retainedLink,
+    restored_storage_mode: 'link',
+    restored_source_name: basename(retainedLink),
+    pdf_repository_linked_after_cleanup_at: linkedAt,
+    pdf_repository_auto_reconnected_at: linkedAt,
+  })
+  scheduleDatabaseSave()
+  return true
 }
 
 /**
@@ -1370,13 +1614,13 @@ async function findPdfInRepositoriesByHashAsync(targetHash: string, expectedSize
  * Never runs a full warehouse reindex here — that path freezes the app under AV.
  */
 function resolveWarehousePdfPathByHash(targetHash: string, expectedSizeBytes?: number): string | null {
-  const matchPath = lookupPdfRepositoryPathByHash(targetHash)
+  const matchPath = lookupPdfRepositoryPathByHash(targetHash, expectedSizeBytes)
   if (matchPath) return matchPath
   return findPdfInRepositoriesByHash(targetHash, expectedSizeBytes)
 }
 
 async function resolveWarehousePdfPathByHashAsync(targetHash: string, expectedSizeBytes?: number): Promise<string | null> {
-  const matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash)
+  const matchPath = await lookupPdfRepositoryPathByHashAsync(targetHash, expectedSizeBytes)
   if (matchPath) return matchPath
   return findPdfInRepositoriesByHashAsync(targetHash, expectedSizeBytes)
 }
@@ -1476,6 +1720,13 @@ export function restorePdfAssetForDocument(
     trustedFromIndex = true
   }
 
+  const repositorySourceStats = statSync(sourcePath)
+  Object.assign(metadata, capturePdfRepositorySourceMetadata(sourcePath, sourceFingerprint || {
+    sha256: targetHash,
+    sizeBytes: repositorySourceStats.size,
+    mtimeMs: repositorySourceStats.mtimeMs,
+  }))
+
   if (linkOnly) {
     return persistLinkedPdfRestore(docId, sourcePath, metadata, {
       trustedFromIndex,
@@ -1574,6 +1825,13 @@ export async function restorePdfAssetForDocumentAsync(
     sourcePath = matchPath
     trustedFromIndex = true
   }
+
+  const repositorySourceStats = await stat(sourcePath)
+  Object.assign(metadata, await capturePdfRepositorySourceMetadataAsync(sourcePath, sourceFingerprint || {
+    sha256: targetHash,
+    sizeBytes: repositorySourceStats.size,
+    mtimeMs: repositorySourceStats.mtimeMs,
+  }))
 
   if (linkOnly) {
     // Index match already encodes sha256; skip re-hash for speed when fingerprint already on metadata.

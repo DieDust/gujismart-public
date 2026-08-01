@@ -4144,9 +4144,13 @@ export default function DocumentView({
         const base = linked
           ? 'PDF 已链接补回（未复制到软件目录）'
           : 'PDF 原图已补回'
-        message.success(pageReady
-          ? `${base}，当前页预览已恢复`
-          : `${base}；当前页预览生成失败，可手动重新选择 PDF 或重新打开文献`)
+        if (!options?.quietFailure && pageReady) {
+          message.success(`${base}，当前页预览已恢复`)
+        } else if (!pageReady) {
+          message.warning(options?.quietFailure
+            ? '已连接 PDF 原件，但当前页预览生成失败；请重新打开文献，或手动选择原件'
+            : `${base}；当前页预览生成失败，可手动重新选择 PDF 或重新打开文献`)
+        }
         return true
       }
       if (!options?.quietFailure) {

@@ -78,6 +78,7 @@ try {
   expectThrow(() => assertAllowedLocalFilePath(outsideFile), /授权访问范围/)
   allowFileAccessPath(outsideFile)
   assert.strictEqual(assertAllowedLocalFilePath(outsideFile), fs.realpathSync(outsideFile))
+  assert.strictEqual(assertAllowedLocalResourceUrl(toLocalResourceUrl(outsideFile)), fs.realpathSync(outsideFile))
 
   const unsafeDataDir = path.join(tempRoot, 'unsafe-data')
   const unsafeStorageTarget = path.join(tempRoot, 'unsafe-storage-target')

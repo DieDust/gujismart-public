@@ -77,6 +77,20 @@ assert(
   !fileBranch.includes('getPdfFingerprint(destPath)'),
   'PDF import should reuse the source hash after copying instead of hashing the stored copy again',
 )
+assert(
+  importHandler.includes('pdfRepositorySourceMetadata = await capturePdfRepositorySourceMetadataAsync(filePath, pdfFingerprint)')
+    && importHandler.includes('...pdfRepositorySourceMetadata,'),
+  'PDF import should retain a verified source link when the dragged file belongs to a configured repository',
+)
+assert(
+  pdfAssetsSource.includes('function resolveCanonicalRepositoryPdfPath(')
+    && pdfAssetsSource.includes('function resolveCanonicalRepositoryPdfPathAsync(')
+    && pdfAssetsSource.includes('pdf_repository_source_sha256')
+    && pdfAssetsSource.includes('resolveWarehousePdfPathByHash(')
+    && pdfAssetsSource.includes('resolveWarehousePdfPathByHashAsync(')
+    && pdfAssetsSource.includes("pdf_asset_storage: retainedLink ? 'linked' : null"),
+  'PDF cleanup should retain recorded repository sources and recover legacy documents by hash without deleting the external original',
+)
 const globalDuplicateHashLookup = importHandler.indexOf("json_extract(metadata, '$.pdf_sha256') = ?")
 assert(
   importHandler.indexOf('pdfFingerprint = await getPdfFingerprintAsync(filePath') < globalDuplicateHashLookup

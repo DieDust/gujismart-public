@@ -317,13 +317,26 @@ assert(
 )
 assert(
   sharedTypesSource.includes('retryFailedPagesOnly?: boolean')
-    && librarySource.includes("key: 'retry_failed_ocr_pages', label: '重新 OCR 错页'")
-    && librarySource.includes("if (key === 'retry_failed_ocr_pages')")
+    && librarySource.includes("'retry_failed_ocr_pages',")
+    && librarySource.includes("parseOcrMenuSelection(String(key), 'retry_failed_ocr_pages')")
+    && librarySource.includes("label: '飞桨（默认）'")
+    && librarySource.includes("label: '大模型'")
+    && librarySource.includes('onTitleClick: (info: MenuTitleInfo) =>')
+    && librarySource.includes('vision_profile:${encodeURIComponent(profile.id)}')
     && runOcrInConfiguredBatchesBody.includes('retryFailedPagesOnly: options?.retryFailedPagesOnly')
-    && handleRetryFailedPagesBody.includes('{ retryFailedPagesOnly: true }')
+    && runOcrInConfiguredBatchesBody.includes('visionProfileId: options?.visionProfileId')
+    && handleRetryFailedPagesBody.includes('{ retryFailedPagesOnly: true, visionProfileId }')
     && !handleRetryFailedPagesBody.includes('forceFullRerun: true')
+    && handleRetryFailedPagesBody.includes('await hasOcrEngineConfig(retryEngine, visionProfileId)')
     && handleRetryFailedPagesBody.includes('已成功页和人工校对内容会保留'),
-  'Documents with incomplete OCR pages should expose a failed-page-only retry that preserves completed and proofed text.',
+  'Failed-page OCR should use hierarchical Paddle/profile menus while preserving completed and proofed text.',
+)
+assert(
+  librarySource.includes("buildOcrEngineSubmenu('ocr_failed', '只重跑所选错页'")
+    && librarySource.includes("parseOcrMenuSelection(String(key), 'ocr_failed')")
+    && librarySource.includes('visionProfileId: failedPageSelection.visionProfileId')
+    && handleBatchOcrBody.includes('retryFailedPagesOnly: options?.retryFailedPagesOnly'),
+  'Batch OCR should expose hierarchical failed-page actions and preserve profile selection through queue submission.',
 )
 assert(
   runOcrInConfiguredBatchesBody.includes("message: 'OCR 入队或处理失败'")
@@ -332,7 +345,7 @@ assert(
   'OCR queue submission failures should leave a visible terminal state instead of stale queued progress.',
 )
 assert(
-  handleForceRerunDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true })')
+  handleForceRerunDocumentBody.includes('const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true, visionProfileId })')
     && !handleForceRerunDocumentBody.includes("message.warning({ content: '重新 OCR 未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })\n      }\n      await loadDocuments(filter, { silent: true })"),
   'Single document full OCR rerun success path should not await an extra list reload after runOcrInConfiguredBatches.',
 )

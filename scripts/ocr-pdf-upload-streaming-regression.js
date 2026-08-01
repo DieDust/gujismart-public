@@ -89,6 +89,18 @@ const normalizeAsyncPdfChunkResultsBody = sliceBetween(
   'export async function recognizePdfAsync',
   'async PDF result normalization',
 )
+const shouldUseAsyncPdfOcrBody = sliceBetween(
+  ocrSource,
+  'export function shouldUseAsyncPdfOcr',
+  'interface PdfChunk',
+  'async PDF path eligibility',
+)
+const batchOcrHandlerBody = sliceBetween(
+  ocrIpcSource,
+  "ipcMain.handle('documents:batchOcr'",
+  "ipcMain.handle('pages:rerunOcr'",
+  'batch OCR IPC handler',
+)
 const processDocumentOcrBody = sliceBetween(
   ocrIpcSource,
   'async function processDocumentOcr',
@@ -111,6 +123,19 @@ const batchPostProcessPdfResultsBatchedBody = sliceBetween(
 assert(
   ocrSource.includes('openAsBlob'),
   'OCR PDF upload should import fs.openAsBlob for low-memory file uploads',
+)
+assert(
+  shouldUseAsyncPdfOcrBody.includes('statSync(filePath).isFile()')
+    && shouldUseAsyncPdfOcrBody.includes('catch {')
+    && !shouldUseAsyncPdfOcrBody.includes('if (!existsSync(filePath)) return false'),
+  'Async PDF OCR must reject directories and other non-file paths before any read attempt.',
+)
+assert(
+  ocrIpcSource.includes("(error as NodeJS.ErrnoException)?.code === 'EISDIR'")
+    && ocrIpcSource.includes('OCR 资源路径指向文件夹，无法读取')
+    && batchOcrHandlerBody.includes('Batch worker failed without stopping remaining documents')
+    && batchOcrHandlerBody.includes("updateDocumentStatus(docId, 'error', 'error', errorMessage)"),
+  'A directory path should produce a readable per-document OCR error without rejecting the remaining batch.',
 )
 assert(
   uploadBlobHelper.includes('openAsBlob(filePath, { type: \'application/pdf\' })'),

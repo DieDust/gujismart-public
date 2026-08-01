@@ -53,6 +53,7 @@ import {
   message
 } from 'antd'
 import type { MenuProps } from 'antd'
+import type { MenuTitleInfo } from 'rc-menu/lib/interface'
 import { List } from 'react-window'
 import { getPdfFileInfo, renderPdfFilePageToImage } from '../utils/pdf'
 import { ensurePdfPageImagesForOcr as ensureOcrPageImages } from '../utils/ocrPageImages'
@@ -68,7 +69,7 @@ import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
 import { getErrorMessage } from '@shared/errors'
 import { getPendingImportDisplayLabels, matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
-import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryFolderCounts, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
+import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryFolderCounts, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, LlmProviderProfile, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
 import { IMPORT_STATUS_MAP, METADATA_STATUS_MAP, OCR_STATUS_MAP, READ_STATUS_MAP } from '@shared/types'
 import { HISTORY_DOC_TYPE_ICON_MAP, normalizeHistoryDocType } from '@shared/history-citation'
 import { DEFAULT_TRANSLATION_STYLE } from '@shared/translation-cache'
@@ -80,6 +81,8 @@ const LIBRARY_SORT_STORAGE_KEY = 'gujismart.library.sort.v1'
 const LIBRARY_PAGE_SIZE_STORAGE_KEY = 'gujismart.library.pageSize.v1'
 const LIBRARY_IMPORT_QUEUE_STORAGE_KEY = 'gujismart.library.importQueue.v1'
 const LIBRARY_SMART_VIEW_VISIBLE_KEY = 'gujismart.library.smartView.visible.v1'
+const LIBRARY_SMART_VIEW_CATALOG_VERSION_KEY = 'gujismart.library.smartView.catalogVersion'
+const LIBRARY_SMART_VIEW_CATALOG_VERSION = 2
 const DEFAULT_LIBRARY_PAGE_SIZE = 10
 const LIBRARY_PAGE_SIZE_OPTIONS = [10, 50, 100] as const
 const LIST_ROW_MIN_HEIGHT = 96
@@ -151,6 +154,7 @@ const EMPTY_SMART_VIEW_COUNTS: Record<SmartViewCountKey, number> = {
   all: 0,
   missingMetadata: 0,
   unrecognized: 0,
+  ocrNeedsRepair: 0,
   suspiciousTitle: 0,
   unknownType: 0,
   favorite: 0,
@@ -178,6 +182,7 @@ const SMART_VIEW_CATALOG: Array<{
   { key: 'all', countKey: 'all', label: '全部文献', filter: { type: 'all' }, locked: true },
   { key: 'missing-metadata', countKey: 'missingMetadata', label: '缺元数据', filter: { type: 'healthMissingMetadata' } },
   { key: 'unrecognized', countKey: 'unrecognized', label: 'OCR 未完成', filter: { type: 'ocrIncomplete' } },
+  { key: 'ocr-needs-repair', countKey: 'ocrNeedsRepair', label: 'OCR 待修复', filter: { type: 'ocrNeedsRepair' } },
   { key: 'suspicious-title', countKey: 'suspiciousTitle', label: '题名疑似导入名', filter: { type: 'healthSuspiciousTitle' } },
   { key: 'unknown-type', countKey: 'unknownType', label: '待分类', filter: { type: 'healthUnknownType' } },
   { key: 'favorite', countKey: 'favorite', label: '星标', filter: { type: 'favorite' } },
@@ -198,11 +203,20 @@ const DEFAULT_SMART_VIEW_VISIBLE_KEYS = SMART_VIEW_CATALOG.map((item) => item.ke
 function loadSmartViewVisibleKeys(): string[] {
   try {
     const raw = window.localStorage.getItem(LIBRARY_SMART_VIEW_VISIBLE_KEY)
-    if (!raw) return [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+    if (!raw) {
+      window.localStorage.setItem(LIBRARY_SMART_VIEW_CATALOG_VERSION_KEY, String(LIBRARY_SMART_VIEW_CATALOG_VERSION))
+      return [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
+    }
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return [...DEFAULT_SMART_VIEW_VISIBLE_KEYS]
     const allowed = new Set(SMART_VIEW_CATALOG.map((item) => item.key))
     const keys = parsed.map((item) => String(item || '')).filter((key) => allowed.has(key))
+    const storedCatalogVersion = Number(window.localStorage.getItem(LIBRARY_SMART_VIEW_CATALOG_VERSION_KEY) || 1)
+    if (storedCatalogVersion < 2 && !keys.includes('ocr-needs-repair')) {
+      keys.push('ocr-needs-repair')
+      window.localStorage.setItem(LIBRARY_SMART_VIEW_VISIBLE_KEY, JSON.stringify(keys))
+    }
+    window.localStorage.setItem(LIBRARY_SMART_VIEW_CATALOG_VERSION_KEY, String(LIBRARY_SMART_VIEW_CATALOG_VERSION))
     // Always keep locked items.
     for (const item of SMART_VIEW_CATALOG) {
       if (item.locked && !keys.includes(item.key)) keys.unshift(item.key)
@@ -974,6 +988,8 @@ interface DocumentCardContext {
   folders: FolderItem[]
   tags: TagItem[]
   sortedSidebarTags: TagItem[]
+  visionOcrProfiles: LlmProviderProfile[]
+  activeVisionOcrProfileId: string
   ocrProgressByDoc: Record<string, OcrProgressInfo>
   bookTranslationProgressByDoc: Record<string, BookTranslationProgressInfo>
   embeddingProgressByDoc: Record<string, EmbeddingProgressInfo>
@@ -988,12 +1004,12 @@ interface DocumentCardContext {
   applyLibraryFilter: (filter: LibraryFilter) => Promise<void>
   toggleTagFilter: (tagId: string) => Promise<void>
   handleRetryDocument: (doc: DocumentItem) => Promise<void>
-  handleRetryFailedPages: (doc: DocumentItem) => Promise<void>
+  handleRetryFailedPages: (doc: DocumentItem, engine?: OcrEngine, visionProfileId?: string) => Promise<void>
   handleToggleFavorite: (doc: DocumentItem) => Promise<void>
   handleSetReadStatus: (docId: string, readStatus: ReadStatus) => Promise<void>
   handleSetRating: (docId: string, rating: number | null) => Promise<void>
   handleTaggingChange: (docId: string, nextChecked: string[]) => Promise<void>
-  handleForceRerunDocument: (doc: DocumentItem, engine: OcrEngine) => Promise<void>
+  handleForceRerunDocument: (doc: DocumentItem, engine: OcrEngine, visionProfileId?: string) => Promise<void>
   handleCancelOcr: (docId: string, event?: MouseEvent<HTMLElement>) => Promise<void>
   handleCancelEmbedding: (docId: string, event?: MouseEvent<HTMLElement>) => Promise<void>
   handleQuickAddTagToDocument: (docId: string, tagName: string) => Promise<void>
@@ -1693,8 +1709,80 @@ function renderDocumentHealthTags(doc: DocumentItem) {
   ))
 }
 
+interface OcrMenuSelection {
+  engine: OcrEngine
+  visionProfileId?: string
+}
+
+function buildOcrEngineSubmenu(
+  key: string,
+  label: string,
+  visionProfiles: LlmProviderProfile[],
+  activeVisionProfileId: string,
+  icon?: JSX.Element,
+  onDefaultSelect?: (selection: OcrMenuSelection) => void,
+): NonNullable<MenuProps['items']>[number] {
+  const activeProfile = visionProfiles.find((profile) => profile.id === activeVisionProfileId)
+  const otherProfiles = visionProfiles.filter((profile) => profile.id !== activeVisionProfileId)
+  const profileItems: NonNullable<MenuProps['items']> = otherProfiles.map((profile) => ({
+    key: `${key}:vision_profile:${encodeURIComponent(profile.id)}`,
+    label: `${profile.name || profile.provider || '大模型'} · ${profile.model}`,
+    disabled: profile.connectionTest?.verified !== true,
+  }))
+  return {
+    key,
+    label,
+    icon,
+    onTitleClick: (info: MenuTitleInfo) => {
+      info.domEvent.stopPropagation()
+      onDefaultSelect?.({ engine: 'paddle' })
+    },
+    children: [
+      { key: `${key}:paddle`, label: '飞桨（默认）' },
+      {
+        key: `${key}:vision_model`,
+        label: '大模型',
+        onTitleClick: (info: MenuTitleInfo) => {
+          info.domEvent.stopPropagation()
+          onDefaultSelect?.({ engine: 'vision_model' })
+        },
+        children: [
+          {
+            key: `${key}:vision_default`,
+            label: activeProfile
+              ? `默认 · ${activeProfile.name || activeProfile.provider || '大模型'} · ${activeProfile.model}`
+              : '默认大模型',
+          },
+          ...(profileItems.length > 0 ? [{ type: 'divider' as const }, ...profileItems] : []),
+        ],
+      },
+    ],
+  }
+}
+
+function parseOcrMenuSelection(key: string, prefix: string): OcrMenuSelection | null {
+  if (key === `${prefix}:paddle`) return { engine: 'paddle' }
+  if (key === `${prefix}:vision_model` || key === `${prefix}:vision_default`) {
+    return { engine: 'vision_model' }
+  }
+  const profilePrefix = `${prefix}:vision_profile:`
+  if (!key.startsWith(profilePrefix)) return null
+  try {
+    return {
+      engine: 'vision_model',
+      visionProfileId: decodeURIComponent(key.slice(profilePrefix.length)),
+    }
+  } catch {
+    return null
+  }
+}
+
 /** Grouped batch actions — short top level, submenus expand to the right (Ant Design children). */
-function buildBatchMenuItems(): MenuProps['items'] {
+function buildBatchMenuItems(
+  visionProfiles: LlmProviderProfile[],
+  activeVisionProfileId: string,
+  onDefaultSelect: (action: 'ocr' | 'ocr_failed' | 'ocr_force', selection: OcrMenuSelection) => void,
+): MenuProps['items'] {
   return [
     { key: 'import', label: '批量入库', icon: <InboxOutlined /> },
     { key: 'select_all', label: '全选已加载', icon: <CheckSquareOutlined /> },
@@ -1704,11 +1792,10 @@ function buildBatchMenuItems(): MenuProps['items'] {
       label: 'OCR 识别',
       icon: <ThunderboltOutlined />,
       children: [
-        { key: 'ocr:paddle', label: '批量 OCR · 飞桨' },
-        { key: 'ocr:vision_model', label: '批量 OCR · 大模型' },
+        buildOcrEngineSubmenu('ocr', '批量 OCR', visionProfiles, activeVisionProfileId, undefined, (selection) => onDefaultSelect('ocr', selection)),
+        buildOcrEngineSubmenu('ocr_failed', '只重跑所选错页', visionProfiles, activeVisionProfileId, undefined, (selection) => onDefaultSelect('ocr_failed', selection)),
         { type: 'divider' },
-        { key: 'ocr_force:paddle', label: '重新 OCR · 飞桨覆盖' },
-        { key: 'ocr_force:vision_model', label: '重新 OCR · 大模型覆盖' },
+        buildOcrEngineSubmenu('ocr_force', '重新 OCR 覆盖', visionProfiles, activeVisionProfileId, undefined, (selection) => onDefaultSelect('ocr_force', selection)),
         { key: 'retry_failed', label: '重试失败文献' },
       ],
     },
@@ -1783,8 +1870,11 @@ function buildDocumentMoreMenuItems(input: {
   docFolderIds: string[]
   docFolderNames: string[]
   pdfAssetState: 'available' | 'text_only' | 'unknown'
+  visionProfiles: LlmProviderProfile[]
+  activeVisionProfileId: string
+  onOcrDefaultSelect: (action: 'retry_failed_ocr_pages' | 'rerun_ocr_book', selection: OcrMenuSelection) => void
 }): MenuProps['items'] {
-  const { doc, availableFolders, docFolderIds, docFolderNames, pdfAssetState } = input
+  const { doc, availableFolders, docFolderIds, docFolderNames, pdfAssetState, visionProfiles, activeVisionProfileId, onOcrDefaultSelect } = input
   const readMenuItems: MenuProps['items'] = (Object.keys(READ_STATUS_MAP) as ReadStatus[]).map((status) => ({
     key: status,
     label: READ_STATUS_MAP[status].text,
@@ -1809,13 +1899,26 @@ function buildDocumentMoreMenuItems(input: {
       icon: <ThunderboltOutlined />,
       children: [
         ...(hasOcrFailedPages(doc)
-          ? [{ key: 'retry_failed_ocr_pages', label: '重新 OCR 错页', icon: <ReloadOutlined /> }]
+          ? [buildOcrEngineSubmenu(
+              'retry_failed_ocr_pages',
+              '重新 OCR 错页',
+              visionProfiles,
+              activeVisionProfileId,
+              <ReloadOutlined />,
+              (selection) => onOcrDefaultSelect('retry_failed_ocr_pages', selection),
+            )]
           : []),
         ...(shouldShowRetryAction(doc)
           ? [{ key: 'retry', label: getRetryActionLabel(doc), icon: <ReloadOutlined /> }]
           : []),
-        { key: 'rerun_ocr_book:paddle', label: '重新 OCR · 飞桨覆盖' },
-        { key: 'rerun_ocr_book:vision_model', label: '重新 OCR · 大模型覆盖' },
+        buildOcrEngineSubmenu(
+          'rerun_ocr_book',
+          '重新 OCR 覆盖',
+          visionProfiles,
+          activeVisionProfileId,
+          undefined,
+          (selection) => onOcrDefaultSelect('rerun_ocr_book', selection),
+        ),
       ],
     },
     {
@@ -2030,6 +2133,7 @@ function getFilterTitle(filter: LibraryFilter, folders: FolderItem[], tags: TagI
   else if (filter.type === 'readStatus') parts.push(READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '阅读状态')
   else if (filter.type === 'metadataStatus') parts.push(METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '元数据状态')
   else if (filter.type === 'ocrIncomplete') parts.push('OCR 未完成')
+  else if (filter.type === 'ocrNeedsRepair') parts.push('OCR 待修复')
   else if (filter.type === 'ocrStatus') parts.push(filter.value === 'pending' ? 'OCR 未完成' : getStatusMeta(OCR_STATUS_MAP, filter.value).text)
   else if (filter.type === 'proofStatus') parts.push(filter.value === 'completed' ? '已校对' : '未校对')
   else if (filter.type === 'metadataPending') parts.push('未确认元数据')
@@ -2078,6 +2182,7 @@ function getFilterChipLabel(filter: LibraryFilter, folders: FolderItem[], tags: 
   if (filter.type === 'readStatus') parts.push(`阅读 / ${READ_STATUS_MAP[(filter.value as ReadStatus) || 'unread']?.text || '未读'}`)
   if (filter.type === 'metadataStatus') parts.push(`元数据 / ${METADATA_STATUS_MAP[(filter.value as MetadataStatus) || 'review']?.text || '待确认'}`)
   if (filter.type === 'ocrIncomplete') parts.push('OCR / 未完成')
+  if (filter.type === 'ocrNeedsRepair') parts.push('OCR / 待修复')
   if (filter.type === 'ocrStatus') parts.push(`OCR / ${filter.value === 'pending' ? '未完成' : getStatusMeta(OCR_STATUS_MAP, filter.value).text}`)
   if (filter.type === 'proofStatus') parts.push(filter.value === 'completed' ? '已校对' : '未校对')
   if (filter.type === 'metadataPending') parts.push('未确认元数据')
@@ -2208,6 +2313,15 @@ function DocumentVirtualRow({
     docFolderIds,
     docFolderNames,
     pdfAssetState,
+    visionProfiles: context.visionOcrProfiles,
+    activeVisionProfileId: context.activeVisionOcrProfileId,
+    onOcrDefaultSelect: (action, selection) => {
+      if (action === 'retry_failed_ocr_pages') {
+        void context.handleRetryFailedPages(doc, selection.engine)
+      } else {
+        void context.handleForceRerunDocument(doc, selection.engine)
+      }
+    },
   })
 
   const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
@@ -2224,12 +2338,14 @@ function DocumentVirtualRow({
       void context.handleRetryDocument(doc)
       return
     }
-    if (key === 'retry_failed_ocr_pages') {
-      void context.handleRetryFailedPages(doc)
+    const failedPageSelection = parseOcrMenuSelection(String(key), 'retry_failed_ocr_pages')
+    if (failedPageSelection) {
+      void context.handleRetryFailedPages(doc, failedPageSelection.engine, failedPageSelection.visionProfileId)
       return
     }
-    if (String(key).startsWith('rerun_ocr_book:')) {
-      void context.handleForceRerunDocument(doc, String(key).replace('rerun_ocr_book:', '') as OcrEngine)
+    const forceSelection = parseOcrMenuSelection(String(key), 'rerun_ocr_book')
+    if (forceSelection) {
+      void context.handleForceRerunDocument(doc, forceSelection.engine, forceSelection.visionProfileId)
       return
     }
     if (key === 'ai_extract') {
@@ -2573,6 +2689,8 @@ export default function LibraryView({
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list')
   const [gridRenderLimit, setGridRenderLimit] = useState(GRID_CARD_INITIAL_RENDER_COUNT)
   const [tags, setTags] = useState<TagItem[]>([])
+  const [visionOcrProfiles, setVisionOcrProfiles] = useState<LlmProviderProfile[]>([])
+  const [activeVisionOcrProfileId, setActiveVisionOcrProfileId] = useState('')
   const [batchMode, setBatchMode] = useState(false)
   const [showSynthesisModal, setShowSynthesisModal] = useState(false)
   const [metadataEditorVisible, setMetadataEditorVisible] = useState(false)
@@ -2931,6 +3049,22 @@ export default function LibraryView({
     }
   }, [currentLibraryScopeKey, setFolders])
 
+  const loadVisionOcrProfiles = useCallback(async () => {
+    try {
+      const state = await window.api.listVisionOcrProviderProfiles()
+      setVisionOcrProfiles((state.profiles || []).filter((profile) => (
+        Boolean(profile.id && profile.baseUrl && profile.model)
+      )))
+      setActiveVisionOcrProfileId(String(state.activeId || ''))
+    } catch (error) {
+      console.warn('[LibraryView] Failed to load vision OCR profiles', error)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadVisionOcrProfiles()
+  }, [loadVisionOcrProfiles])
+
   const loadSmartViewCounts = useCallback(async (options?: { refresh?: boolean; manual?: boolean }) => {
     if (options?.manual) setSmartViewRefreshing(true)
     try {
@@ -3035,6 +3169,7 @@ export default function LibraryView({
 
     if (activeFilter.type === 'docType' && activeFilter.value) options.docType = activeFilter.value
     if (activeFilter.type === 'ocrIncomplete') options.ocrIncomplete = true
+    if (activeFilter.type === 'ocrNeedsRepair') options.ocrNeedsRepair = true
     if (activeFilter.type === 'ocrStatus' && activeFilter.value) options.ocrStatus = activeFilter.value
     if (activeFilter.type === 'importStatus' && activeFilter.value) options.importStatus = activeFilter.value
 
@@ -5065,6 +5200,7 @@ export default function LibraryView({
         engine,
         forceFullRerun: options?.forceFullRerun,
         retryFailedPagesOnly: options?.retryFailedPagesOnly,
+        visionProfileId: options?.visionProfileId,
         concurrency: documentConcurrency,
       })
       shouldRefreshAfterBatches = true
@@ -5974,7 +6110,7 @@ export default function LibraryView({
     }
   }
 
-  const hasOcrEngineConfig = async (engine: OcrEngine): Promise<boolean> => {
+  const hasOcrEngineConfig = async (engine: OcrEngine, visionProfileId?: string): Promise<boolean> => {
     if (engine === 'local_paddle') {
       const status = await window.api.getLocalPaddleOcrStatus()
       return status.installed
@@ -5986,6 +6122,11 @@ export default function LibraryView({
         window.api.checkVisionOcrConfig(),
       ])
       return paddleReady && visionReady
+    }
+    if (visionProfileId) {
+      return visionOcrProfiles.some((profile) => (
+        profile.id === visionProfileId && profile.connectionTest?.verified === true
+      ))
     }
     return window.api.checkVisionOcrConfig()
   }
@@ -6209,11 +6350,15 @@ export default function LibraryView({
     const skippedCount = sourceIds.length - targetIds.length
 
     if (targetIds.length === 0) {
-      message.info(options?.forceFullRerun ? '请先选择需要重新 OCR 的文献' : '当前没有需要 OCR 识别的文献')
+      message.info(options?.forceFullRerun
+        ? '请先选择需要重新 OCR 的文献'
+        : options?.retryFailedPagesOnly
+          ? '当前没有需要重新 OCR 的错页'
+          : '当前没有需要 OCR 识别的文献')
       return
     }
 
-    const hasConfig = await hasOcrEngineConfig(engine)
+    const hasConfig = await hasOcrEngineConfig(engine, options?.visionProfileId)
     if (!hasConfig) {
       message.warning(engine === 'local_paddle'
         ? '请先在设置页下载本地 OCR 模型。'
@@ -6228,16 +6373,22 @@ export default function LibraryView({
     showSharedOcrProgressToast(
       options?.forceFullRerun
         ? `正在用${getOcrEngineLabel(engine)}重新 OCR ${targetIds.length} 篇文献…`
+        : options?.retryFailedPagesOnly
+          ? `正在用${getOcrEngineLabel(engine)}重跑 ${targetIds.length} 篇文献的错页…`
         : `正在用${getOcrEngineLabel(engine)}批量识别 ${targetIds.length} 篇文献${skippedCount > 0 ? `，已跳过 ${skippedCount} 篇已完成文献` : ''}…`,
     )
     try {
       const successCount = await runOcrInConfiguredBatches(targetIds, engine, OCR_ACTIVITY_MESSAGE_KEY, {
         forceFullRerun: options?.forceFullRerun,
+        retryFailedPagesOnly: options?.retryFailedPagesOnly,
+        visionProfileId: options?.visionProfileId,
       })
       clearSharedOcrProgressToast({ keepIfActiveDocs: true })
       message.success({
         content: options?.forceFullRerun
           ? `${getOcrEngineLabel(engine)}重新 OCR 完成，成功处理 ${successCount} 篇文献`
+          : options?.retryFailedPagesOnly
+            ? `${getOcrEngineLabel(engine)}错页补跑完成，成功处理 ${successCount} 篇文献`
           : `${getOcrEngineLabel(engine)}批量识别完成，成功处理 ${successCount} 篇文献${skippedCount > 0 ? `，跳过 ${skippedCount} 篇已完成文献` : ''}`,
         key: OCR_RESULT_MESSAGE_KEY,
         duration: 4,
@@ -6250,7 +6401,7 @@ export default function LibraryView({
     }
   }
 
-  const confirmBatchForceRerunOcr = (engine: OcrEngine) => {
+  const confirmBatchForceRerunOcr = (engine: OcrEngine, visionProfileId?: string) => {
     const targetCount = batchMode && selectedIds.length > 0 ? selectedIds.length : documents.length
     if (targetCount === 0) {
       message.info('请先选择需要重新 OCR 的文献')
@@ -6262,7 +6413,7 @@ export default function LibraryView({
       key: 'batch-ocr-rerun-start',
       duration: 4,
     })
-    void handleBatchOcr(engine, { forceFullRerun: true })
+    void handleBatchOcr(engine, { forceFullRerun: true, visionProfileId })
   }
 
   const handleBatchMetadataExtract = async () => {
@@ -6373,7 +6524,7 @@ export default function LibraryView({
     }
   }
 
-  const handleRetryFailedPages = async (doc: DocumentItem) => {
+  const handleRetryFailedPages = async (doc: DocumentItem, engine?: OcrEngine, visionProfileId?: string) => {
     if (!hasOcrFailedPages(doc)) {
       message.info('这篇文献当前没有需要重新 OCR 的错页')
       await loadDocuments(filter, { silent: true })
@@ -6387,7 +6538,14 @@ export default function LibraryView({
     }
 
     const storedEngine = parseDocMetadata(doc).ocr_engine
-    const retryEngine = isOcrEngine(storedEngine) ? storedEngine : 'paddle'
+    const retryEngine = engine || (isOcrEngine(storedEngine) ? storedEngine : 'paddle')
+    const hasConfig = await hasOcrEngineConfig(retryEngine, visionProfileId)
+    if (!hasConfig) {
+      message.warning(retryEngine === 'vision_model'
+        ? '请先在设置页配置视觉模型 OCR 的端点、API Key 和模型 ID。'
+        : '请先在设置页配置 PaddleOCR API Token。')
+      return
+    }
     showSharedOcrProgressToast(`正在重新 OCR“${doc.title || '未命名文献'}”的错页…`)
     message.info({
       content: '只会重新处理未成功页；已成功页和人工校对内容会保留。',
@@ -6399,7 +6557,7 @@ export default function LibraryView({
         [doc.id],
         retryEngine,
         OCR_ACTIVITY_MESSAGE_KEY,
-        { retryFailedPagesOnly: true },
+        { retryFailedPagesOnly: true, visionProfileId },
       )
       clearSharedOcrProgressToast({ keepIfActiveDocs: true })
       if (successCount > 0) {
@@ -6415,8 +6573,8 @@ export default function LibraryView({
     }
   }
 
-  const handleForceRerunDocument = async (doc: DocumentItem, engine: OcrEngine) => {
-    const hasConfig = await hasOcrEngineConfig(engine)
+  const handleForceRerunDocument = async (doc: DocumentItem, engine: OcrEngine, visionProfileId?: string) => {
+    const hasConfig = await hasOcrEngineConfig(engine, visionProfileId)
     if (!hasConfig) {
       message.warning(engine === 'local_paddle'
         ? '请先在设置页下载本地 OCR 模型。'
@@ -6430,7 +6588,7 @@ export default function LibraryView({
 
     showSharedOcrProgressToast(`正在用${getOcrEngineLabel(engine)}重新 OCR“${doc.title || '未命名文献'}”…`)
     try {
-      const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true })
+      const successCount = await runOcrInConfiguredBatches([doc.id], engine, OCR_ACTIVITY_MESSAGE_KEY, { forceFullRerun: true, visionProfileId })
       clearSharedOcrProgressToast({ keepIfActiveDocs: true })
       if (successCount > 0) {
         message.success({ content: '整本文献已重新 OCR', key: OCR_RESULT_MESSAGE_KEY, duration: 3 })
@@ -6759,7 +6917,19 @@ export default function LibraryView({
     })
   }
 
-  const batchMenuItems: MenuProps['items'] = buildBatchMenuItems()
+  const batchMenuItems: MenuProps['items'] = buildBatchMenuItems(
+    visionOcrProfiles,
+    activeVisionOcrProfileId,
+    (action, selection) => {
+      if (action === 'ocr') {
+        void handleBatchOcr(selection.engine)
+      } else if (action === 'ocr_failed') {
+        void handleBatchOcr(selection.engine, { retryFailedPagesOnly: true })
+      } else {
+        confirmBatchForceRerunOcr(selection.engine)
+      }
+    },
+  )
   const targetLibraryProjects = libraryProjects.filter((project) => project.id !== activeLibraryProjectId)
 
   const openProjectTransfer = (documentIds: string[], operation: 'link' | 'move' | 'copy' = 'link'): void => {
@@ -6849,8 +7019,24 @@ export default function LibraryView({
 
   const handleBatchMenu: MenuProps['onClick'] = ({ key }) => {
     if (key === 'import') void handleBatchImport()
-    if (String(key).startsWith('ocr:')) void handleBatchOcr(String(key).replace('ocr:', '') as OcrEngine)
-    if (String(key).startsWith('ocr_force:')) confirmBatchForceRerunOcr(String(key).replace('ocr_force:', '') as OcrEngine)
+    const ocrSelection = parseOcrMenuSelection(String(key), 'ocr')
+    if (ocrSelection) {
+      void handleBatchOcr(ocrSelection.engine, { visionProfileId: ocrSelection.visionProfileId })
+      return
+    }
+    const failedPageSelection = parseOcrMenuSelection(String(key), 'ocr_failed')
+    if (failedPageSelection) {
+      void handleBatchOcr(failedPageSelection.engine, {
+        retryFailedPagesOnly: true,
+        visionProfileId: failedPageSelection.visionProfileId,
+      })
+      return
+    }
+    const forceSelection = parseOcrMenuSelection(String(key), 'ocr_force')
+    if (forceSelection) {
+      confirmBatchForceRerunOcr(forceSelection.engine, forceSelection.visionProfileId)
+      return
+    }
     if (key === 'metadata_extract') void handleBatchMetadataExtract()
     if (key === 'vectorize') {
       if (selectedIds.length === 0) {
@@ -7309,6 +7495,8 @@ export default function LibraryView({
     folders,
     tags,
     sortedSidebarTags,
+    visionOcrProfiles,
+    activeVisionOcrProfileId,
     ocrProgressByDoc,
     bookTranslationProgressByDoc,
     embeddingProgressByDoc,
@@ -7347,6 +7535,7 @@ export default function LibraryView({
     setTaggingDocId,
     setTaggingChecked,
   }), [
+    activeVisionOcrProfileId,
     applyLibraryFilter,
     batchMode,
     bookTranslationProgressByDoc,
@@ -7381,6 +7570,7 @@ export default function LibraryView({
     tags,
     toggleTagFilter,
     viewMode,
+    visionOcrProfiles,
   ])
 
   return (
@@ -8265,6 +8455,15 @@ export default function LibraryView({
                 docFolderIds,
                 docFolderNames,
                 pdfAssetState,
+                visionProfiles: visionOcrProfiles,
+                activeVisionProfileId: activeVisionOcrProfileId,
+                onOcrDefaultSelect: (action, selection) => {
+                  if (action === 'retry_failed_ocr_pages') {
+                    void handleRetryFailedPages(doc, selection.engine)
+                  } else {
+                    void handleForceRerunDocument(doc, selection.engine)
+                  }
+                },
               })
 
               const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
@@ -8281,12 +8480,14 @@ export default function LibraryView({
                   void handleRetryDocument(doc)
                   return
                 }
-                if (key === 'retry_failed_ocr_pages') {
-                  void handleRetryFailedPages(doc)
+                const failedPageSelection = parseOcrMenuSelection(String(key), 'retry_failed_ocr_pages')
+                if (failedPageSelection) {
+                  void handleRetryFailedPages(doc, failedPageSelection.engine, failedPageSelection.visionProfileId)
                   return
                 }
-                if (String(key).startsWith('rerun_ocr_book:')) {
-                  void handleForceRerunDocument(doc, String(key).replace('rerun_ocr_book:', '') as OcrEngine)
+                const forceSelection = parseOcrMenuSelection(String(key), 'rerun_ocr_book')
+                if (forceSelection) {
+                  void handleForceRerunDocument(doc, forceSelection.engine, forceSelection.visionProfileId)
                   return
                 }
                 if (key === 'ai_extract') {

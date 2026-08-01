@@ -5,6 +5,7 @@
  */
 const fs = require('fs')
 const path = require('path')
+const { version: appVersion } = require('../package.json')
 
 let docx
 try {
@@ -31,7 +32,7 @@ const root = path.join(__dirname, '..')
 const docsDir = path.join(root, 'docs')
 const mdPath = path.join(docsDir, '文献管理-图文使用教程.md')
 const outPath = path.join(docsDir, '文献管理-图文使用教程.docx')
-const outPathAlt = path.join(docsDir, '文献管理-图文使用教程-1.1.10.docx')
+const outPathAlt = path.join(docsDir, `文献管理-图文使用教程-${appVersion}.docx`)
 
 const md = fs.readFileSync(mdPath, 'utf8').replace(/\r\n/g, '\n')
 const lines = md.split('\n')

@@ -2,9 +2,10 @@ import type { LibraryFolderCounts, LibrarySmartViewCounts, LibraryStateCache } f
 import { isLargeLibraryForAutomaticMaintenance, queryAll, queryAllAsync, queryOne, run, runAsync, scheduleDatabaseSave } from './database'
 import { buildCumulativeFolderDocumentCounts, buildCumulativeFolderDocumentCountsAsync } from './folder-scope'
 import { getActiveLibraryProjectId } from './library-projects'
+import { buildOcrIncompleteCondition, buildOcrNeedsRepairCondition } from './ocr-library-filters'
 
 const CACHE_KEY_PREFIX = 'library-sidebar-project-v1'
-const CACHE_VERSION = 'library-sidebar-v6-project-scoped'
+const CACHE_VERSION = 'library-sidebar-v7-project-scoped'
 // Keep first paint free: dirty-cache rebuild is expensive COUNT work on large libraries.
 const LIBRARY_STATE_CACHE_REFRESH_DELAY_MS = 12_000
 const LIBRARY_STATE_CACHE_COLD_START_DELAY_MS = 18_000
@@ -25,6 +26,7 @@ const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   all: 0,
   missingMetadata: 0,
   unrecognized: 0,
+  ocrNeedsRepair: 0,
   suspiciousTitle: 0,
   unknownType: 0,
   favorite: 0,
@@ -59,6 +61,7 @@ interface SmartViewCountRow {
   all_count?: number | null
   missing_metadata_count?: number | null
   unrecognized_count?: number | null
+  ocr_needs_repair_count?: number | null
   suspicious_title_count?: number | null
   unknown_type_count?: number | null
   favorite_count?: number | null
@@ -97,6 +100,7 @@ function parseCounts(value: unknown): LibrarySmartViewCounts {
     all: numberValue(source.all),
     missingMetadata: numberValue(source.missingMetadata),
     unrecognized: numberValue(source.unrecognized),
+    ocrNeedsRepair: numberValue(source.ocrNeedsRepair),
     suspiciousTitle: numberValue(source.suspiciousTitle),
     unknownType: numberValue(source.unknownType),
     favorite: numberValue(source.favorite),
@@ -242,12 +246,6 @@ function buildMissingMetadataCondition(keys: string[]): string {
   return `TRIM(COALESCE(${checks}, '')) = ''`
 }
 
-function buildOcrIncompleteCondition(): string {
-  // Sidebar counts must stay document-level. Page-content correlated scans freeze
-  // large libraries during startup and after bulk import.
-  return `COALESCE(d.ocr_status, '') <> 'completed'`
-}
-
 function buildMissingMetadataFilter(): string {
   const authorExpression = `(
     TRIM(COALESCE(d.author, '')) = ''
@@ -295,6 +293,7 @@ function smartViewCountSql(): string {
        COUNT(*) AS all_count,
        COALESCE(SUM(CASE WHEN ${buildMissingMetadataFilter()} THEN 1 ELSE 0 END), 0) AS missing_metadata_count,
        COALESCE(SUM(CASE WHEN ${buildOcrIncompleteCondition()} THEN 1 ELSE 0 END), 0) AS unrecognized_count,
+       COALESCE(SUM(CASE WHEN ${buildOcrNeedsRepairCondition()} THEN 1 ELSE 0 END), 0) AS ocr_needs_repair_count,
        COALESCE(SUM(CASE WHEN ${suspiciousTitleFilter()} THEN 1 ELSE 0 END), 0) AS suspicious_title_count,
        COALESCE(SUM(CASE WHEN ${unknownTypeFilter()} THEN 1 ELSE 0 END), 0) AS unknown_type_count,
        COALESCE(SUM(CASE WHEN d.is_favorite = 1 THEN 1 ELSE 0 END), 0) AS favorite_count,
@@ -320,6 +319,7 @@ function normalizeSmartViewCounts(row?: SmartViewCountRow | null): LibrarySmartV
     all: numberValue(row?.all_count),
     missingMetadata: numberValue(row?.missing_metadata_count),
     unrecognized: numberValue(row?.unrecognized_count),
+    ocrNeedsRepair: numberValue(row?.ocr_needs_repair_count),
     suspiciousTitle: numberValue(row?.suspicious_title_count),
     unknownType: numberValue(row?.unknown_type_count),
     favorite: numberValue(row?.favorite_count),

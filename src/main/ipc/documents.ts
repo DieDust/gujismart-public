@@ -6,7 +6,7 @@ import { nativeImage } from 'electron'
 import { nanoid } from 'nanoid'
 import { basename, dirname, extname, join } from 'path'
 import { posix as posixPath } from 'path'
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, realpathSync, statSync, writeFileSync } from 'fs'
 import { copyFile, readFile, readdir, rm, stat, writeFile } from 'fs/promises'
 import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
@@ -32,11 +32,13 @@ import {
   annotatePdfMetadata,
   cleanupCompletedPdfAssetsAsync,
   cleanupPdfAssetsAsync,
+  capturePdfRepositorySourceMetadataAsync,
   copyFileWithFingerprintAsync,
   getFileFingerprint,
   getPdfFingerprintAsync,
   getPdfRepositoryStatus,
   indexPdfRepositoriesAsync,
+  reconnectIndexedPdfRepositoryLinkForDocumentAsync,
   removePdfRepositoryById,
   restorePdfAssetForDocumentAsync,
 } from '../pdf-assets'
@@ -51,6 +53,7 @@ import { applyManualLiteraturePageAnchor, recomputeLiteraturePageMap, resetLiter
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
 import { inspectManagedDeleteTarget, type ManagedDeleteKind } from '../managed-path-boundary'
+import { buildOcrIncompleteCondition, buildOcrNeedsRepairCondition } from '../ocr-library-filters'
 import { FileCapabilityError, fileCapabilityService } from '../file-capabilities'
 import { cancelLegacyImportQueueTasks, registerLegacyImportQueueState } from '../task-import-compat'
 import { attachCanonicalPageContent } from '../canonical-content'
@@ -3222,7 +3225,9 @@ function buildDocumentListQuery(options?: ListDocumentOptions, forCount = false)
   if (options?.ocrIncomplete) {
     // Document-level status is maintained by OCR completion paths and is far cheaper
     // than correlated page-content scans across the whole library.
-    conditions.push(`COALESCE(d.ocr_status, '') <> 'completed'`)
+    conditions.push(buildOcrIncompleteCondition())
+  } else if (options?.ocrNeedsRepair) {
+    conditions.push(buildOcrNeedsRepairCondition())
   } else if (options?.ocrStatus) {
     conditions.push('d.ocr_status = ?')
     params.push(options.ocrStatus)
@@ -3613,6 +3618,39 @@ function isReadableSourcePdf(doc: Pick<Document, 'id' | 'file_path'>): boolean {
   return extname(filePath).toLowerCase() === '.pdf' && isReadableLocalAssetPath(filePath)
 }
 
+function pathsReferToSameFile(leftPath: string, rightPath: string): boolean {
+  try {
+    const left = realpathSync(leftPath)
+    const right = realpathSync(rightPath)
+    return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+  } catch {
+    return false
+  }
+}
+
+function allowTrustedLinkedPdfAccessForRead(
+  doc: Pick<Document, 'id' | 'file_path'>,
+  metadata: Record<string, unknown>,
+): void {
+  if (String(metadata.pdf_asset_storage || '').trim() !== 'linked') return
+  const filePath = resolveManagedStoragePath(String(doc.file_path || '').trim(), doc.id)
+  const linkedPath = String(metadata.pdf_linked_path || '').trim()
+  if (!filePath
+    || !linkedPath
+    || extname(filePath).toLowerCase() !== '.pdf'
+    || !isReadableLocalAssetPath(filePath)
+    || !pathsReferToSameFile(filePath, linkedPath)) return
+  allowFileAccessPath(filePath)
+}
+
+function allowRestoredPdfAccess(result: PdfAssetRestoreResult): PdfAssetRestoreResult {
+  const filePath = String(result.path || '').trim()
+  if (result.restored && extname(filePath).toLowerCase() === '.pdf' && isReadableLocalAssetPath(filePath)) {
+    allowFileAccessPath(filePath)
+  }
+  return result
+}
+
 function hasReadablePageImageForDocument(docId: string, imagePageCount: number): boolean {
   if (imagePageCount <= 0) return false
   const rows = queryAll<{ image_path: string | null }>(
@@ -3692,6 +3730,7 @@ function normalizeDocumentSourceAssetsForRead<T extends { image_path?: string | 
     }
   }
   const metadata = parseDocumentMetadata(doc.metadata)
+  allowTrustedLinkedPdfAccessForRead(doc, metadata)
   const hasPdfFingerprint = !!(metadata.pdf_sha256 || metadata.pdf_size_bytes || metadata.pdf_page_count || metadata.pdf_stored_size_bytes)
   const explicitState = String(metadata.pdf_asset_state || '').trim()
   const state: VerifiedPdfAssetState = isReadableSourcePdf(doc) || readableImagePageCount > 0
@@ -4502,6 +4541,7 @@ export function registerDocumentIpc(): void {
         let copiedPdf = null
         let pdfFingerprint = null
         let pdfDuplicateChecked = false
+        let pdfRepositorySourceMetadata: JsonRecord = {}
 
         if (isPdfFile) {
           const sourceStats = await stat(filePath)
@@ -4741,6 +4781,7 @@ export function registerDocumentIpc(): void {
               mtimeMs: copiedPdf.sourceFingerprint.mtimeMs,
             }
           }
+          pdfRepositorySourceMetadata = await capturePdfRepositorySourceMetadataAsync(filePath, pdfFingerprint)
           if (!pdfDuplicateChecked) {
             pdfDuplicateChecked = true
             const existing = queryOne<ExistingPdfImportRow>(
@@ -4827,6 +4868,7 @@ export function registerDocumentIpc(): void {
               storedPdfFingerprint || pdfFingerprint,
               importPdfCompression!,
             ),
+            ...pdfRepositorySourceMetadata,
             pdf_asset_state: 'available',
             imported_at: now,
           }
@@ -4993,7 +5035,7 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:get', async (_event, id: string): Promise<DocumentDetail | null> => {
-    const doc = queryOne<Document>(
+    let doc = queryOne<Document>(
       `SELECT * FROM documents
        WHERE id = ?
          AND EXISTS (
@@ -5004,6 +5046,9 @@ export function registerDocumentIpc(): void {
       [id, getActiveLibraryProjectId()],
     )
     if (!doc) return null
+    if (await reconnectIndexedPdfRepositoryLinkForDocumentAsync(id)) {
+      doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [id]) || doc
+    }
 
     recordDocumentOpenedInBackground(id)
     await ensureDeferredPdfPageRecordsReadyForRead(doc)
@@ -5038,7 +5083,7 @@ export function registerDocumentIpc(): void {
   })
 
   ipcMain.handle('documents:getLight', async (_event, id: string): Promise<DocumentLightDetail | null> => {
-    const doc = queryOne<Document>(
+    let doc = queryOne<Document>(
       `SELECT * FROM documents
        WHERE id = ?
          AND EXISTS (
@@ -5049,6 +5094,9 @@ export function registerDocumentIpc(): void {
       [id, getActiveLibraryProjectId()],
     )
     if (!doc) return null
+    if (await reconnectIndexedPdfRepositoryLinkForDocumentAsync(id)) {
+      doc = queryOne<Document>('SELECT * FROM documents WHERE id = ?', [id]) || doc
+    }
 
     recordDocumentOpenedInBackground(id)
     await ensureDeferredPdfPageRecordsReadyForRead(doc)
@@ -6055,7 +6103,7 @@ export function registerDocumentIpc(): void {
   ipcMain.handle(
     'pdfRepository:restoreForDocument',
     async (_event, docId: string, options?: PdfAssetRestoreOptions): Promise<PdfAssetRestoreResult> => {
-      return restorePdfAssetForDocumentAsync(docId, undefined, undefined, options)
+      return allowRestoredPdfAccess(await restorePdfAssetForDocumentAsync(docId, undefined, undefined, options))
     },
   )
 
@@ -6076,7 +6124,7 @@ export function registerDocumentIpc(): void {
         consumeMode: 'once',
       })
       const manualPath = await fileCapabilityService.consumeFile(event.sender.id, grants[0].grantId, 'pdf-restore')
-      return restorePdfAssetForDocumentAsync(docId, manualPath, undefined, options)
+      return allowRestoredPdfAccess(await restorePdfAssetForDocumentAsync(docId, manualPath, undefined, options))
     },
   )
 

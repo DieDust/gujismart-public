@@ -208,6 +208,7 @@ interface ActiveOcrTask {
 interface OcrProcessOptions {
   signal?: AbortSignal
   pageConcurrency?: number
+  visionProfileId?: string
 }
 
 interface SavePageOcrResultsOptions {
@@ -532,6 +533,7 @@ async function runDocumentOcrWithWallTimeout(
   forceFullRerun: boolean,
   controller: AbortController,
   pageCount = 0,
+  visionProfileId?: string,
 ): Promise<{ success: boolean; errorMessage?: string; timedOut?: boolean }> {
   const timeoutMs = getDocumentOcrWallTimeoutMs(pageCount)
   timedOutOcrDocIds.delete(docId)
@@ -539,6 +541,7 @@ async function runDocumentOcrWithWallTimeout(
   if (timeoutMs <= 0) {
     return processDocumentOcr(event, docId, totalDocs, getCompleted, engine, forceFullRerun, {
       signal: controller.signal,
+      visionProfileId,
     })
   }
 
@@ -570,6 +573,7 @@ async function runDocumentOcrWithWallTimeout(
   try {
     const work = processDocumentOcr(event, docId, totalDocs, getCompleted, engine, forceFullRerun, {
       signal: controller.signal,
+      visionProfileId,
     })
     const result = await Promise.race([
       work.then((value) => ({ ...value, timedOut: false as const })),
@@ -990,6 +994,9 @@ function formatDurationMs(value: number): string {
 function formatOcrError(error: unknown): string {
   if (isOcrAbortError(error)) return OCR_CANCELED_MESSAGE
   const message = (error as Error)?.message || String(error || '')
+  if ((error as NodeJS.ErrnoException)?.code === 'EISDIR' || message.includes('EISDIR')) {
+    return 'OCR 资源路径指向文件夹，无法读取。请重新关联原 PDF，或重新生成该文献的页图后再试。'
+  }
   if (message.includes(OCR_LAYOUT_QUALITY_REJECTED_PREFIX)) {
     return message.replace(OCR_LAYOUT_QUALITY_REJECTED_PREFIX, '').trim()
   }
@@ -6294,7 +6301,7 @@ async function processDocumentOcr(
         )
       }
     } else if (engine === 'vision_model') {
-      if (!hasVisionOcrConfig()) {
+      if (!hasVisionOcrConfig(processOptions.visionProfileId)) {
         throw new Error('未配置视觉模型 OCR，请先到设置页填写端点、API Key 和模型 ID。')
       }
       if (pages.length === 0) {
@@ -6341,7 +6348,7 @@ async function processDocumentOcr(
           errorMessage: payload.error,
           message: `大模型 OCR ${actionText}：${combinedPages}/${totalPages} 页${activeNote}${sizeNote}${elapsedNote}`,
         })
-      })
+      }, processOptions.visionProfileId)
     } else if (engine === 'paddle' && asyncPdfRouteRisk?.preferPageImage && pdfPath && pagesForOcr.length > 0) {
       const expectedPdfPageCount = getExpectedPdfPageCount(doc, pages)
       if (!hasSequentialPageRecords(pages, expectedPdfPageCount)) {
@@ -7638,33 +7645,55 @@ export function registerOcrIpc(): void {
 
           await runOcrDocumentInConfiguredWindows(docId, documentConcurrency, heavy, async () => {
             const pageCount = Number(doc?.page_count || 0) || 0
-            const result = await runDocumentOcrWithWallTimeout(
-              event,
-              docId,
-              Math.max(queuedDocIds.length, 1),
-              () => completedCount,
-              options?.engine,
-              forceFullRerunByDocId.get(docId) || false,
-              controller,
-              pageCount,
-            )
-            completedCount += 1
-            if (result.success) successCount += 1
-            if (result.success || result.errorMessage !== OCR_CANCELED_MESSAGE || !ocrRuntimeShuttingDown) {
+            try {
+              const result = await runDocumentOcrWithWallTimeout(
+                event,
+                docId,
+                Math.max(queuedDocIds.length, 1),
+                () => completedCount,
+                options?.engine,
+                forceFullRerunByDocId.get(docId) || false,
+                controller,
+                pageCount,
+                options?.visionProfileId,
+              )
+              completedCount += 1
+              if (result.success) successCount += 1
+              if (result.success || result.errorMessage !== OCR_CANCELED_MESSAGE || !ocrRuntimeShuttingDown) {
+                await updateRecoverableBatchOcrItem(
+                  recoverableQueueItemIdsByDocId,
+                  docId,
+                  result.success ? 'completed' : 'failed',
+                  result.success ? undefined : result.errorMessage || OCR_CANCELED_MESSAGE,
+                )
+              }
+              if (!result.success && result.errorMessage && result.errorMessage !== OCR_CANCELED_MESSAGE) {
+                emitOcrStatus(event, {
+                  docId,
+                  status: queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [docId])?.ocr_status || 'error',
+                  progress: completedCount / Math.max(queuedDocIds.length, 1),
+                  errorMessage: result.errorMessage,
+                })
+              }
+            } catch (error) {
+              completedCount += 1
+              const errorMessage = formatOcrError(error)
+              updateDocumentStatus(docId, 'error', 'error', errorMessage)
               await updateRecoverableBatchOcrItem(
                 recoverableQueueItemIdsByDocId,
                 docId,
-                result.success ? 'completed' : 'failed',
-                result.success ? undefined : result.errorMessage || OCR_CANCELED_MESSAGE,
+                'failed',
+                errorMessage,
               )
-            }
-            if (!result.success && result.errorMessage && result.errorMessage !== OCR_CANCELED_MESSAGE) {
               emitOcrStatus(event, {
                 docId,
-                status: queryOne<{ ocr_status: string }>('SELECT ocr_status FROM documents WHERE id = ?', [docId])?.ocr_status || 'error',
+                status: 'error',
+                phase: 'error',
                 progress: completedCount / Math.max(queuedDocIds.length, 1),
-                errorMessage: result.errorMessage,
+                errorMessage,
+                message: errorMessage,
               })
+              console.error(`[OCR] Batch worker failed without stopping remaining documents: ${docId}`, error)
             }
           }, activeTask.done)
         } finally {

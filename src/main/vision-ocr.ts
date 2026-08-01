@@ -3,10 +3,10 @@ import { mkdir, readFile, stat, writeFile } from 'fs/promises'
 import { basename, extname, join } from 'path'
 import { getDataDir, queryOne } from './database'
 import { getResponseErrorMessage, isAbortError } from '../shared/errors'
-import type { OcrRecognizeLayoutBlock, OcrRecognizeResult } from '../shared/types'
+import type { LlmProviderProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult } from '../shared/types'
 import { isProtectedSettingKey } from './protected-settings'
 import { readProtectedSetting } from './settings-security'
-import { isCurrentVisionOcrConnectionVerified } from './vision-ocr-verification'
+import { getVisionOcrConnectionState, isCurrentVisionOcrConnectionVerified } from './vision-ocr-verification'
 
 type JsonRecord = Record<string, unknown>
 
@@ -150,7 +150,37 @@ function assertVisionTargetSupported(baseUrl: string, model: string): void {
   )
 }
 
-export function hasVisionOcrConfig(): boolean {
+function getStoredVisionOcrProfile(profileId: string): LlmProviderProfile | null {
+  try {
+    const parsed = JSON.parse(getSetting('vision_ocr_provider_profiles') || '[]') as unknown
+    if (!Array.isArray(parsed)) return null
+    const candidate = parsed.find((item) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return false
+      return String((item as JsonRecord).id || '').trim() === profileId
+    }) as JsonRecord | undefined
+    if (!candidate) return null
+    const profile: LlmProviderProfile = {
+      id: String(candidate.id || '').trim(),
+      name: String(candidate.name || candidate.provider || '').trim(),
+      provider: String(candidate.provider || candidate.name || '').trim(),
+      baseUrl: String(candidate.baseUrl || '').trim().replace(/\/+$/, ''),
+      model: String(candidate.model || '').trim(),
+    }
+    return profile.id && profile.baseUrl && profile.model ? profile : null
+  } catch {
+    return null
+  }
+}
+
+export function hasVisionOcrConfig(profileId?: string): boolean {
+  if (String(profileId || '').trim()) {
+    try {
+      getVisionOcrSettings(profileId)
+      return true
+    } catch {
+      return false
+    }
+  }
   const useLlmConfig = getSetting('vision_ocr_use_llm_config') !== 'false'
   const visionBaseUrl = getSetting('vision_ocr_base_url') || 'https://ark.cn-beijing.volces.com/api/v3'
   const visionModel = getSetting('vision_ocr_model')
@@ -166,7 +196,37 @@ export function hasVisionOcrConfig(): boolean {
   return configured && isCurrentVisionOcrConnectionVerified()
 }
 
-function getVisionOcrSettings(): VisionOcrSettings {
+function getVisionOcrSettings(profileId?: string): VisionOcrSettings {
+  const requestedProfileId = String(profileId || '').trim()
+  if (requestedProfileId) {
+    const activeProfileId = getSetting('vision_ocr_active_provider_id') || getSetting('vision_ocr_provider')
+    const storedProfile = getStoredVisionOcrProfile(requestedProfileId)
+    const selectedProfile = storedProfile || (requestedProfileId === activeProfileId
+      ? {
+          id: requestedProfileId,
+          name: getSetting('vision_ocr_provider'),
+          provider: getSetting('vision_ocr_provider'),
+          baseUrl: getSetting('vision_ocr_base_url'),
+          model: getSetting('vision_ocr_model'),
+        }
+      : null)
+    if (!selectedProfile) throw new Error('未找到所选的大模型 OCR 配置，请刷新文献库后重试。')
+    const selectedApiKey = readProtectedSetting(`vision_ocr_profile:${requestedProfileId}`)
+      || (requestedProfileId === activeProfileId ? readProtectedSetting('vision_ocr_api_key') : '')
+    if (!selectedApiKey || !selectedProfile.baseUrl || !selectedProfile.model) {
+      throw new Error('所选的大模型 OCR 配置不完整，请先在设置页补全并测试连接。')
+    }
+    if (!getVisionOcrConnectionState(
+      requestedProfileId,
+      selectedProfile.baseUrl,
+      selectedProfile.model,
+      selectedApiKey,
+    ).verified) {
+      throw new Error('所选的大模型 OCR 配置尚未通过连接测试，请先在设置页测试成功。')
+    }
+    assertVisionTargetSupported(selectedProfile.baseUrl, selectedProfile.model)
+    return buildVisionOcrSettings(selectedApiKey, selectedProfile.baseUrl, selectedProfile.model)
+  }
   if (!isCurrentVisionOcrConnectionVerified()) {
     throw new Error('当前 AI OCR 配置尚未通过连接测试，请先在设置中测试成功后再使用。')
   }
@@ -185,6 +245,14 @@ function getVisionOcrSettings(): VisionOcrSettings {
     ? llmBaseUrl
     : visionBaseUrl || 'https://ark.cn-beijing.volces.com/api/v3'
   const model = shouldUseLlmConfig ? llmModel : visionModel
+  if (!apiKey || !model) {
+    throw new Error('未配置视觉模型 OCR。请在设置页填写视觉模型配置，或开启“跟随 AI 配置”。')
+  }
+  assertVisionTargetSupported(baseUrl, model)
+  return buildVisionOcrSettings(apiKey, baseUrl, model)
+}
+
+function buildVisionOcrSettings(apiKey: string, baseUrl: string, model: string): VisionOcrSettings {
   const configuredConcurrency = Number(getSetting('vision_ocr_concurrency') || 1)
   const rawTimeoutSeconds = getSetting('vision_ocr_timeout_seconds')
   const timeoutSeconds = !rawTimeoutSeconds || rawTimeoutSeconds === '180'
@@ -192,10 +260,6 @@ function getVisionOcrSettings(): VisionOcrSettings {
     : Number(rawTimeoutSeconds)
   const maxImageSide = Number(getSetting('vision_ocr_max_image_side') || 3200)
   const jpegQuality = Number(getSetting('vision_ocr_jpeg_quality') || 82)
-  if (!apiKey || !model) {
-    throw new Error('未配置视觉模型 OCR。请在设置页填写视觉模型配置，或开启“跟随 AI 配置”。')
-  }
-  assertVisionTargetSupported(baseUrl, model)
   return {
     apiKey,
     baseUrl: baseUrl.replace(/\/+$/, ''),
@@ -1119,8 +1183,9 @@ export async function recognizePagesWithVisionModel(
   pages: VisionSourcePage[],
   docType?: string | null,
   onProgress?: (payload: VisionOcrProgressPayload) => void,
+  profileId?: string,
 ): Promise<VisionOcrPageResult[]> {
-  const settings = getVisionOcrSettings()
+  const settings = getVisionOcrSettings(profileId)
   const limit = createLimiter(settings.concurrency)
   let completedPages = 0
   let activePages = 0

@@ -1,11 +1,17 @@
 # 更新日志 / Changelog
 
-## 1.2.25 - 2026-07-30
+## 1.2.25 - 2026-08-01
 
 ### 中文
 
 - 修复“文件夹”页与“文献库”侧栏显示不同文献数量的问题；文献库保持缓存首屏，随后只读取实时文件夹计数，旧版本遗留的过期数量也会自动校正。
 - 文件夹归属、导入、删除和跨项目移动现在按项目合并刷新计数；文件夹计数与智能视图并发刷新时采用字段级合并，不再由旧缓存覆盖新数量，也不会为更新文件夹数量而重算 OCR、向量和标签统计。
+- 新增“OCR 待修复”智能视图与实时数量，集中显示存在失败、等待或中断页的文献，便于批量处理错页。
+- 文献卡片与右键菜单中的“重新 OCR 错页”和“重新 OCR 整本”现支持多级选择飞桨、大模型以及已配置的具体视觉模型；直接点击仍采用默认方案。
+- 单本文献 OCR 失败不再中断后续文献，队列会继续运行并保留失败页供定向补跑。
+- 从已连接的 PDF 仓库导入时会保留来源路径；OCR 后自动清理软件内 PDF 时会立即切换到仓库原文，继续提供原图预览与校对能力，无需手动重新连接。
+- 旧版本中误标为“仅文本”的文献会按文件哈希与大小在仓库索引中自愈链接，同时修复空索引路径被误当作当前目录的问题。
+- 修复外部仓库 PDF 已显示连接但预览生成失败的问题；运行时会恢复读取授权，静默自动恢复仅在真实失败时提示用户。
 
 #### 下载
 
@@ -16,6 +22,12 @@
 
 - Fixed document-count mismatches between the Folders page and the Library sidebar. The Library still paints immediately from cache, then refreshes only live folder counts so stale values left by older versions repair themselves automatically.
 - Folder assignment, import, deletion, and cross-project moves now coalesce project-scoped count refreshes. Folder and smart-view refreshes merge cache fields instead of overwriting each other, without recalculating OCR, vector, or tag statistics just to update folder counts.
+- Added an “OCR repair needed” Smart View with a live count, collecting documents that contain failed, pending, or interrupted pages for batch recovery.
+- “Retry failed OCR pages” and “Rerun OCR for the full document” on document cards and context menus now provide nested choices for Paddle, vision models, and each configured vision profile; direct activation still uses the default route.
+- An OCR failure in one document no longer stops later documents. The queue continues and preserves failed pages for targeted recovery.
+- Imports from a connected PDF repository now retain their source paths. When the managed PDF is removed after OCR, the document switches immediately to the repository original and keeps image preview and proofreading available without manual relinking.
+- Documents incorrectly left as text-only by older versions can self-heal against the repository index using file hashes and sizes. Empty index paths are no longer mistaken for the current directory.
+- Fixed external repository PDFs reporting a valid link while preview generation failed. Runtime read authorization is restored as needed, and silent automatic recovery now notifies users only on genuine failures.
 
 #### Downloads
 

@@ -2866,7 +2866,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                 <Text strong style={{ color: 'var(--gs-text-primary)' }}>OCR 完成后自动删除 PDF 原图</Text>
                 <br />
                 <Text type="secondary" style={{ fontSize: 13 }}>
-                  只删除软件数据目录（storage）内的 PDF 副本和页图；绝不删除 PDF 原件仓库、NAS 或「仅登记路径」指向的外部源文件。
+                  只删除软件数据目录（storage）内的 PDF 副本和页图；若文件从已绑定的原件仓库导入，清理后会自动切换为外部链接。绝不删除仓库、NAS 或外置硬盘中的源文件。
                 </Text>
               </div>
               <Switch checked={autoDeletePdfAssets} onChange={(checked) => { setAutoDeletePdfAssets(checked); markSettingsDirty() }} />
@@ -2955,7 +2955,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
               showIcon
               style={{ marginBottom: 16 }}
               message="PDF 原件仓库只会被读取；补回时默认复制进软件目录"
-              description="可以添加 NAS、移动硬盘、网盘同步目录等。一键补回会先查索引，找不到时只按该文献指纹做定向匹配（不会每次全盘重算哈希，避免卡死）。大批量新文件可点「立即扫描」提前建索引。若安装了杀软，请把软件数据目录与原件仓库加入白名单。开启「仅登记路径」后补回不复制大文件，但依赖外盘/NAS 可访问。"
+              description="可以添加 NAS、移动硬盘、网盘同步目录等。从这些目录导入 PDF 时，软件仍先复制到本地完成 OCR；清理本地原图后会保留仓库链接，校对和重新 OCR 按需读取外部原件。一键补回会先查索引，找不到时只按该文献指纹做定向匹配。大批量新文件可点「立即扫描」提前建索引。"
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, paddingBottom: 16, borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
               <div style={{ minWidth: 0, paddingRight: 12 }}>

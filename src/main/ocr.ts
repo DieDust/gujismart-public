@@ -4140,7 +4140,11 @@ export async function recognizePages(
 
 export function shouldUseAsyncPdfOcr(filePath?: string | null, pageCount = 0): boolean {
   if (!filePath || extname(filePath).toLowerCase() !== '.pdf') return false
-  if (!existsSync(filePath)) return false
+  try {
+    if (!statSync(filePath).isFile()) return false
+  } catch {
+    return false
+  }
   if (pageCount > 0 && pageCount < ASYNC_PDF_PAGE_THRESHOLD) return false
   return true
 }
