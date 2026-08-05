@@ -21,6 +21,16 @@ import type {
   OcrTableCellV1,
   OcrTableV1,
 } from './types'
+import {
+  getLayoutBlockSearchText,
+  getLosslessLayoutTableRows,
+  getManualBlockId,
+  getManualLayoutBlockKind,
+  getManualLayoutSignatureSnapshot,
+  isManualLayoutBlock,
+  projectLayoutBlocksToPageText,
+  type ManualLayoutBlockMeta,
+} from './manual-layout'
 
 type JsonRecord = Record<string, unknown>
 
@@ -139,18 +149,7 @@ function normalizeLabel(value: unknown): string {
 }
 
 function getBlockText(block: JsonRecord): string {
-  const rows = getTableRows(block)
-  if (rows.length > 0) return rows.map((row) => row.join('\t')).join('\n')
-  return normalizeText(firstText(block, [
-    'words',
-    'word',
-    'text',
-    'block_content',
-    'content',
-    'transcription',
-    'raw_words',
-    'raw_text',
-  ]))
+  return getLayoutBlockSearchText(block)
 }
 
 function point(value: unknown): { x: number; y: number } | null {
@@ -230,19 +229,56 @@ function normalizeBbox(bbox: OcrBoundingBox | undefined, width: number, height: 
   }
 }
 
-function getSourceBlocks(result: JsonRecord): JsonRecord[] {
+interface SourceBlockSelection {
+  blocks: JsonRecord[]
+  explicitlyClearsManualLayout: boolean
+  source: 'layout_result' | 'words_result' | 'other'
+}
+
+function resultIrHasManualBlocks(result: JsonRecord): boolean {
+  if (!isRecord(result.gujismart_ir) || !isRecord(result.gujismart_ir.page)) return false
+  const page = result.gujismart_ir.page
+  return [...asRecords(page.blocks), ...asRecords(page.discardedBlocks)]
+    .some((block) => typeof block.manualBlockId === 'string' || getManualBlockId(block) !== undefined)
+}
+
+function getSourceBlockSelection(result: JsonRecord): SourceBlockSelection {
+  const layoutBlocks = asRecords(result.layout_result)
+  if (layoutBlocks.length > 0) {
+    return { blocks: layoutBlocks, explicitlyClearsManualLayout: false, source: 'layout_result' }
+  }
+  if (
+    Array.isArray(result.layout_result)
+    && result.layout_result.length === 0
+    && resultIrHasManualBlocks(result)
+  ) {
+    return { blocks: [], explicitlyClearsManualLayout: true, source: 'layout_result' }
+  }
+
   const directCandidates = [
-    result.layout_result,
     result.layout_blocks,
     result.parsing_res_list,
     isRecord(result.prunedResult) ? result.prunedResult.parsing_res_list : null,
     isRecord(result.layout_det_res) ? result.layout_det_res.boxes : null,
     result.boxes,
-    result.words_result,
   ]
   for (const candidate of directCandidates) {
     const records = asRecords(candidate)
-    if (records.length > 0) return records
+    if (records.length > 0) {
+      return { blocks: records, explicitlyClearsManualLayout: false, source: 'other' }
+    }
+  }
+
+  const wordBlocks = asRecords(result.words_result)
+  if (wordBlocks.length > 0) {
+    return { blocks: wordBlocks, explicitlyClearsManualLayout: false, source: 'words_result' }
+  }
+  if (
+    Array.isArray(result.words_result)
+    && result.words_result.length === 0
+    && resultIrHasManualBlocks(result)
+  ) {
+    return { blocks: [], explicitlyClearsManualLayout: true, source: 'words_result' }
   }
 
   const overall = isRecord(result.overall_ocr_res) ? result.overall_ocr_res : null
@@ -257,12 +293,20 @@ function getSourceBlocks(result: JsonRecord): JsonRecord[] {
           ? result.rec_polys
           : []
   const scores = Array.isArray(overall?.rec_scores) ? overall.rec_scores : Array.isArray(result.rec_scores) ? result.rec_scores : []
-  return texts.map((text, index) => ({
-    words: String(text || ''),
-    label: 'text',
-    location: boxes[index],
-    score: scores[index],
-  }))
+  return {
+    blocks: texts.map((text, index) => ({
+      words: String(text || ''),
+      label: 'text',
+      location: boxes[index],
+      score: scores[index],
+    })),
+    explicitlyClearsManualLayout: false,
+    source: 'other',
+  }
+}
+
+function getSourceBlocks(result: JsonRecord): JsonRecord[] {
+  return getSourceBlockSelection(result).blocks
 }
 
 function semanticTypeForLabel(labelValue: unknown, text: string): OcrIrSemanticType {
@@ -315,6 +359,39 @@ function parseOrientationSource(value: unknown): OcrIrOrientationSource | null {
   return null
 }
 
+interface ManualOrientationState {
+  orientation: OcrIrOrientation
+  declaredSource: OcrIrOrientationSource | null
+  sourceOrientation: OcrIrOrientation
+  sourceOrientationSource: OcrIrOrientationSource | null
+  isManual: boolean
+}
+
+function getManualOrientationState(block: JsonRecord): ManualOrientationState {
+  const orientation = parseOrientation(firstValue(block, [
+    'orientation',
+    'text_orientation',
+    'text_direction',
+    'writing_mode',
+    'writing_direction',
+  ]))
+  const declaredSource = parseOrientationSource(block.orientation_source)
+  const sourceOrientation = parseOrientation(block.source_orientation)
+  const sourceOrientationSource = parseOrientationSource(block.source_orientation_source)
+  const isValid = orientation !== 'unknown'
+  const isManualOverride = declaredSource === 'manual' && isValid
+  const isDirectManualOrientation = getManualBlockId(block) !== undefined
+    && isValid
+    && sourceOrientationSource === null
+  return {
+    orientation,
+    declaredSource,
+    sourceOrientation,
+    sourceOrientationSource,
+    isManual: isManualOverride || isDirectManualOrientation,
+  }
+}
+
 function inferOrientation(block: JsonRecord, bbox: OcrBoundingBox | undefined): OrientationInference {
   const explicit = parseOrientation(firstValue(block, [
     'orientation',
@@ -332,6 +409,8 @@ function inferOrientation(block: JsonRecord, bbox: OcrBoundingBox | undefined): 
 }
 
 function getTableRows(block: JsonRecord): string[][] {
+  const manualRows = getManualBlockId(block) ? getLosslessLayoutTableRows(block) : undefined
+  if (manualRows !== undefined) return manualRows
   const raw = firstValue(block, ['rows', 'table_rows', 'tableRows'])
   if (!Array.isArray(raw)) return []
   return raw
@@ -384,6 +463,18 @@ function getFormula(block: JsonRecord, type: OcrIrSemanticType): OcrFormulaV1 | 
 
 function getAssetPath(block: JsonRecord): string {
   return firstText(block, ['image_asset_path', 'asset_path', 'image_path', 'crop_path', 'src'])
+}
+
+function getManualImageCrop(block: JsonRecord): ManualLayoutBlockMeta['image_crop'] | undefined {
+  const crop = block.image_crop
+  if (!isRecord(crop)) return undefined
+  const sourcePageId = firstText(crop, ['source_page_id'])
+  const left = finiteNumber(crop.left)
+  const top = finiteNumber(crop.top)
+  const width = finiteNumber(crop.width)
+  const height = finiteNumber(crop.height)
+  if (!sourcePageId || left === null || top === null || width === null || height === null) return undefined
+  return { source_page_id: sourcePageId, left, top, width, height }
 }
 
 function splitLines(text: string): string[] {
@@ -721,11 +812,14 @@ function buildBlock(
   preferBlockOrder: boolean,
 ): OcrBlockV1 {
   const text = getBlockText(block)
+  const manualBlockId = getManualBlockId(block)
+  const manualBlockKind = manualBlockId ? getManualLayoutBlockKind(block) : undefined
   const rawText = normalizeText(firstValue(block, ['raw_words', 'raw_text']))
   const label = firstValue(block, ['label', 'block_label', 'type', 'block_type', 'category'])
   const type = semanticTypeForLabel(label, text)
   const bbox = getBlockBbox(block)
   const orientationInference = inferOrientation(block, bbox)
+  const manualOrientationState = getManualOrientationState(block)
   const persistedSourceOrientation = parseOrientation(block.source_orientation)
   const sourceOrientation = persistedSourceOrientation !== 'unknown'
     ? persistedSourceOrientation
@@ -807,7 +901,7 @@ function buildBlock(
     })
   }
   return {
-    id: `p${pageIndex}-block-${sourceIndex + 1}`,
+    id: manualBlockId || `p${pageIndex}-block-${sourceIndex + 1}`,
     type,
     text,
     rawText: rawText || undefined,
@@ -815,7 +909,13 @@ function buildBlock(
     normalizedBbox: normalizeBbox(bbox, width, height),
     confidence: confidence ?? undefined,
     orientation: orientationInference.orientation,
-    orientationSource: parseOrientationSource(block.orientation_source) || orientationInference.source,
+    orientationSource: manualBlockId
+      ? manualOrientationState.isManual
+        ? 'manual'
+        : manualOrientationState.declaredSource && manualOrientationState.declaredSource !== 'manual'
+          ? manualOrientationState.declaredSource
+          : sourceOrientationSource
+      : parseOrientationSource(block.orientation_source) || orientationInference.source,
     sourceOrientation,
     sourceOrientationSource,
     readingOrder: sourceReadingOrder ?? sourceIndex,
@@ -827,6 +927,13 @@ function buildBlock(
     table: type === 'table' ? getTable(block, width, height) : undefined,
     formula: getFormula(block, type),
     assetId,
+    manualBlockId,
+    manualBlockKind,
+    segmentationSource: manualBlockId ? 'manual' : undefined,
+    caption: manualBlockId ? firstText(block, ['caption']) || undefined : undefined,
+    altText: manualBlockId ? firstText(block, ['alt_text', 'altText']) || undefined : undefined,
+    imageAssetPath: manualBlockId ? assetPath || undefined : undefined,
+    imageCrop: manualBlockId ? getManualImageCrop(block) : undefined,
     source,
     processing,
   }
@@ -904,6 +1011,7 @@ function applyReadingOrientation(
   blocks.forEach((block) => {
     if (!READING_FLOW_ORIENTATION_TYPES.has(block.type) || !block.text.trim()) return
     if (block.orientationSource === 'manual') return
+    if (block.manualBlockId && block.orientation === orientation) return
     if (block.orientation !== orientation) {
       block.processing.push({
         stage: source === 'document_consensus' ? 'document_postprocess' : 'page_postprocess',
@@ -1121,11 +1229,11 @@ function blockToRecognizeLayoutBlock(page: OcrPageV1, block: OcrBlockV1): OcrRec
   return {
     words: blockTextForReading(block),
     raw_words: block.rawText,
-    label: block.type,
+    label: block.manualBlockKind || block.type,
     location: block.bbox,
     normalized_location: block.normalizedBbox,
     confidence: block.confidence,
-    reading_order: block.readingOrder,
+    reading_order: block.manualBlockId ? block.sourceReadingOrder ?? block.readingOrder : block.readingOrder,
     source_reading_order: block.sourceReadingOrder,
     reading_order_source: block.readingOrderSource,
     manual_reading_order: block.manualReadingOrder,
@@ -1140,6 +1248,12 @@ function blockToRecognizeLayoutBlock(page: OcrPageV1, block: OcrBlockV1): OcrRec
     markdown: block.table?.markdown,
     latex: block.formula?.latex,
     image_path: page.assets.find((asset) => asset.id === block.assetId)?.path,
+    manual_block_id: block.manualBlockId,
+    segmentation_source: block.segmentationSource,
+    caption: block.caption,
+    alt_text: block.altText,
+    image_asset_path: block.imageAssetPath,
+    image_crop: block.imageCrop,
     ir_block_id: block.id,
     parent_ir_block_id: block.parentBlockId,
     child_ir_block_ids: block.childBlockIds,
@@ -1229,6 +1343,64 @@ export function shouldAcceptOcrRegionText(previousText: string, nextText: string
   return true
 }
 
+function blocksForOcrRoundTrip(page: OcrPageV1): OcrBlockV1[] {
+  const manualDiscardedBlocks = page.discardedBlocks.filter((block) => block.manualBlockId)
+  return [...page.blocks, ...manualDiscardedBlocks].sort(compareBlocks)
+}
+
+interface OcrRoundTripProjection {
+  layoutBlocks: OcrRecognizeLayoutBlock[]
+  hasManualLayout: boolean
+}
+
+function prepareOcrRoundTripProjection(page: OcrPageV1): OcrRoundTripProjection {
+  const blocks = blocksForOcrRoundTrip(page)
+  return {
+    layoutBlocks: blocks.map((block) => blockToRecognizeLayoutBlock(page, block)),
+    hasManualLayout: blocks.some((block) => block.manualBlockId),
+  }
+}
+
+function manualLayoutSignature(blocks: readonly JsonRecord[]): string {
+  const entries = blocks
+    .map((block) => {
+      const snapshot = getManualLayoutSignatureSnapshot(block)
+      if (!snapshot) return null
+      const orientationState = getManualOrientationState(block)
+      return {
+        ...snapshot,
+        orientation: orientationState.isManual
+          ? orientationState.orientation
+          : orientationState.sourceOrientationSource && orientationState.sourceOrientationSource !== 'ocr'
+            ? null
+            : orientationState.orientation === 'unknown' ? null : orientationState.orientation,
+      }
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+    .sort((left, right) => String(left.id).localeCompare(String(right.id)))
+  return JSON.stringify(entries)
+}
+
+function manualLayoutIrSignature(envelope: OcrPageIrEnvelopeV1): string {
+  const manualBlocks = [...envelope.page.blocks, ...envelope.page.discardedBlocks]
+    .filter((block) => block.manualBlockId)
+  return manualLayoutSignature(
+    manualBlocks
+      .map((block) => blockToRecognizeLayoutBlock(envelope.page, block)),
+  )
+}
+
+function manualLayoutSourceChanged(
+  result: OcrRecognizeResult,
+  sourceBlocks: JsonRecord[],
+  explicitlyClearsManualLayout: boolean,
+): boolean {
+  if (sourceBlocks.length === 0 && !explicitlyClearsManualLayout) return false
+  const existing = getOcrPageIr(result)
+  if (!existing) return false
+  return manualLayoutSignature(sourceBlocks) !== manualLayoutIrSignature(existing)
+}
+
 export function applyOcrRegionTextReplacement(
   resultValue: unknown,
   replacement: OcrRegionTextReplacement,
@@ -1258,8 +1430,18 @@ export function applyOcrRegionTextReplacement(
   return { result, updated: true }
 }
 
-export function deriveOcrTextFromIr(value: OcrPageIrEnvelopeV1 | OcrPageV1, includeDiscarded = false): string {
-  const page = 'page' in value ? value.page : value
+function deriveOcrTextFromPreparedProjection(
+  page: OcrPageV1,
+  includeDiscarded: boolean,
+  projection: OcrRoundTripProjection,
+): string {
+  if (projection.hasManualLayout) {
+    if (!includeDiscarded) return projectLayoutBlocksToPageText(projection.layoutBlocks)
+    const allBlocks = [...page.blocks, ...page.discardedBlocks].sort(compareBlocks)
+    return projectLayoutBlocksToPageText(
+      allBlocks.map((block) => blockToRecognizeLayoutBlock(page, block)),
+    )
+  }
   const bodyText = deriveOcrReadingBlocksFromIr(page)
     .map((block) => String(block.words || block.text || '').trim())
     .filter(Boolean)
@@ -1271,20 +1453,47 @@ export function deriveOcrTextFromIr(value: OcrPageIrEnvelopeV1 | OcrPageV1, incl
   return [...bodyText, ...discardedText].join('\n\n')
 }
 
+export function deriveOcrTextFromIr(value: OcrPageIrEnvelopeV1 | OcrPageV1, includeDiscarded = false): string {
+  const page = 'page' in value ? value.page : value
+  return deriveOcrTextFromPreparedProjection(
+    page,
+    includeDiscarded,
+    prepareOcrRoundTripProjection(page),
+  )
+}
+
 export function deriveOcrWordsResultFromIr(value: OcrPageIrEnvelopeV1 | OcrPageV1): OcrRecognizeLayoutBlock[] {
   const page = 'page' in value ? value.page : value
-  return page.blocks.map((block) => blockToRecognizeLayoutBlock(page, block))
+  return prepareOcrRoundTripProjection(page).layoutBlocks
 }
 
 export function ensureOcrResultIr(resultValue: unknown, options: BuildOcrIrOptions = {}): OcrRecognizeResult {
   const parsed = parseMaybeJson(resultValue)
   const result: OcrRecognizeResult = isRecord(parsed) ? { ...parsed } : {}
-  const envelope = buildOcrPageIr(result, options)
-  const text = deriveOcrTextFromIr(envelope)
+  const sourceSelection = getSourceBlockSelection(result)
+  const sourceBlocks = sourceSelection.blocks
+  const manualLayoutChanged = manualLayoutSourceChanged(
+    result,
+    sourceBlocks,
+    sourceSelection.explicitlyClearsManualLayout,
+  )
+  const envelope = buildOcrPageIr(result, {
+    ...options,
+    forceRebuild: options.forceRebuild || manualLayoutChanged,
+  })
+  const projection = prepareOcrRoundTripProjection(envelope.page)
+  const text = deriveOcrTextFromPreparedProjection(envelope.page, false, projection)
+  const wordsResult = projection.layoutBlocks
+  const replaceExistingContent = projection.hasManualLayout
+    || sourceSelection.explicitlyClearsManualLayout
+    || manualLayoutChanged
+  const syncCanonicalLayout = sourceSelection.source === 'words_result'
+    && sourceBlocks.some(isManualLayoutBlock)
   return {
     ...result,
-    text: text || normalizeText(result.text),
-    words_result: text ? deriveOcrWordsResultFromIr(envelope) : result.words_result,
+    ...(syncCanonicalLayout ? { layout_result: wordsResult } : {}),
+    text: replaceExistingContent ? text : text || normalizeText(result.text),
+    words_result: replaceExistingContent || text ? wordsResult : result.words_result,
     gujismart_ir: envelope,
     ir_text: text,
     normalization: {

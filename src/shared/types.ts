@@ -2,6 +2,7 @@ import type { AiResponseEnvelope } from './ai-response-envelope'
 import type { BackupIntegrityReport } from './backup-integrity'
 import type { ConfigValidationReport } from './config-validation'
 import type { DocumentPipelineDiagnostics } from './document-pipeline-diagnostics'
+import type { ManualLayoutBlockKind, ManualLayoutBlockMeta } from './manual-layout'
 import type { OcrRunMetadata } from './ocr-run-metadata'
 import type { SearchIndexHealthDiagnostics } from './search-index-health'
 
@@ -839,8 +840,18 @@ export interface OcrRecognizeLayoutBlock {
   block_label?: string
   type?: string
   location?: unknown
+  manual_block_id?: string
+  segmentation_source?: string
+  reading_order?: number
+  orientation?: 'horizontal' | 'vertical' | (string & {})
+  caption?: string
+  alt_text?: string
+  image_asset_path?: string
+  image_crop?: ManualLayoutBlockMeta['image_crop']
   [key: string]: unknown
 }
+
+export type ManualOcrRecognizeLayoutBlock = OcrRecognizeLayoutBlock & ManualLayoutBlockMeta
 
 export type OcrIrSemanticType =
   | 'document_title'
@@ -1003,6 +1014,13 @@ export interface OcrBlockV1 {
   table?: OcrTableV1
   formula?: OcrFormulaV1
   assetId?: string
+  manualBlockId?: string
+  manualBlockKind?: ManualLayoutBlockKind
+  segmentationSource?: 'manual'
+  caption?: string
+  altText?: string
+  imageAssetPath?: string
+  imageCrop?: ManualLayoutBlockMeta['image_crop']
   source: OcrIrSource
   processing: OcrProcessingEvent[]
 }
