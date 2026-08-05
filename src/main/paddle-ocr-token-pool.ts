@@ -129,9 +129,17 @@ function isQuotaExhaustionMessage(message: string): boolean {
   return /(?:quota|credit|balance).*(?:exhaust|insufficient|exceed)|(?:daily|page).*(?:quota|limit).*(?:exceed|reach)|(?:额度|配额|余额|次数|页数).*(?:不足|耗尽|用完|超出|上限)|超出.*(?:解析|页面|单日).*(?:页数|上限|额度)|单日.*(?:页|额度)|当日.*额度|今日.*额度|日限额|已达.*(?:解析|页数).*上限/i.test(message)
 }
 
+/**
+ * The hosted async API uses code 10010 / HTTP 400 when its shared submission
+ * queue is full. This is provider backpressure, not a failure of any Token.
+ */
+function isProviderQueueBusyMessage(message: string): boolean {
+  return /(?:任务)?提交队列已满|任务队列已满|submission\s+queue|queue\s*(?:is\s*)?full|queue\s+capacity|\b10010\b/i.test(message)
+}
+
 /** Provider throttling — short cool-down only; token still has daily quota. */
 function isRateLimitMessage(message: string): boolean {
-  return /请求频率|频率过高|请求过快|限流|rate.?limit|too many requests|throttl|稍后重试|请稍后再试|try again later|并发.*过高/i.test(message)
+  return /请求频率|频率过高|请求过快|限流|rate.?limit|too many requests|throttl|并发.*过高/i.test(message)
 }
 
 function isInvalidTokenMessage(message: string): boolean {
@@ -216,6 +224,11 @@ function hydrateRuntimeState(): void {
           : raw.status === 'rate_limited'
             ? 'rate_limited'
             : 'quota_exhausted'
+      if (isProviderQueueBusyMessage(message)) {
+        // Older builds treated "queue full, retry later" as Token throttling.
+        // Drop that false Token block immediately after upgrading.
+        return
+      }
       if (status === 'quota_exhausted' && isRateLimitMessage(message)) {
         // Drop the false daily ban so the token can be used again immediately after upgrade.
         return
@@ -286,8 +299,11 @@ function preferNextActiveToken(excludedIds: ReadonlySet<string> = new Set()): vo
 
 export function isPaddleOcrTokenFailure(error: unknown): boolean {
   const status = failureStatus(error)
-  if (status === 403 || status === 429) return true
+  const code = Number((error as { code?: unknown })?.code || 0)
   const message = failureMessage(error)
+  if (isProviderQueueBusyMessage(message)) return false
+  if (code === 10010) return false
+  if (status === 403 || status === 429) return true
   return isQuotaExhaustionMessage(message) || isRateLimitMessage(message) || isInvalidTokenMessage(message)
 }
 

@@ -56,14 +56,27 @@ assert(
   'ocrNeedsRepair list filtering should share the exact condition used by sidebar counts.',
 )
 
+const pageContentStatusBlock = sliceBetween(
+  ocrFiltersSource,
+  'export function buildPageContentAvailableConditionStatusOnly',
+  'export function buildPageNeedsOcrRepairCondition',
+  'lightweight OCR page content predicate',
+)
+
 assert(
-  ocrFiltersSource.includes("COALESCE(p_ocr_repair.ocr_status, '') <> 'completed'")
+  ocrFiltersSource.includes("COALESCE(${documentAlias}.ocr_status, '') IN ('completed', 'error')")
+    && ocrFiltersSource.includes("buildPageNeedsOcrRepairCondition('p_ocr_repair')")
     && ocrFiltersSource.includes('p_ocr_repair.doc_id = ${documentAlias}.id')
     && ocrFiltersSource.includes('p_ocr_repair_any.doc_id = ${documentAlias}.id')
-    && !ocrFiltersSource.includes('ocr_text')
-    && !ocrFiltersSource.includes('ocr_result')
-    && !ocrFiltersSource.includes('proofed_text'),
-  'ocrNeedsRepair should use the indexed page status relation and must never scan OCR text bodies.',
+    && ocrFiltersSource.includes('p_ocr_repair_none.doc_id = ${documentAlias}.id')
+    && ocrFiltersSource.indexOf('p_ocr_repair_any.doc_id = ${documentAlias}.id')
+      < ocrFiltersSource.indexOf("LOWER(${documentAlias}.error_message) LIKE '%ocr%'")
+    && pageContentStatusBlock.includes("COALESCE(${pageAlias}.ocr_text, '') <> ''")
+    && pageContentStatusBlock.includes("COALESCE(${pageAlias}.proofed_text, '') <> ''")
+    && pageContentStatusBlock.includes("COALESCE(${pageAlias}.ocr_result_ref, '') <> ''")
+    && !pageContentStatusBlock.includes('TRIM(')
+    && !pageContentStatusBlock.includes("LIKE '%\"error\"%'"),
+  'ocrNeedsRepair should ignore stale page status when usable OCR text/refs exist, without parsing large OCR JSON bodies.',
 )
 
 const attachPageStatsBlock = sliceBetween(
@@ -116,20 +129,17 @@ const ocrNormalizationBlock = sliceBetween(
   'function scheduleDocumentHealthReportRefresh',
   'bounded OCR status normalization',
 )
-const statusOnlyContentBlock = sliceBetween(
-  documentsSource,
-  'function buildPageContentAvailableConditionStatusOnly',
-  'function buildDocumentOcrCompleteCondition',
-  'status-only OCR content predicate',
-)
-
 assert(
-  ocrNormalizationBlock.includes('const candidates = documents.filter')
+  ocrNormalizationBlock.includes('const candidates = options?.inspectOcrRepairPages')
+    && ocrNormalizationBlock.includes(': documents.filter')
     && ocrNormalizationBlock.includes('getDocumentListOcrPageSummaries(candidates.map')
+    && ocrNormalizationBlock.includes('inspectOcrRepairPages')
+    && documentsSource.includes('OCR待修复')
     && ocrNormalizationBlock.includes('if (candidates.length === 0) return documents')
     && documentsSource.includes('WHERE doc_id IN (${placeholders})')
     && documentsSource.includes('buildPageContentAvailableConditionStatusOnly')
-    && !statusOnlyContentBlock.includes('TRIM('),
+    && documentsSource.includes('SUM(CASE WHEN ${contentOk} THEN 1 ELSE 0 END) as completed')
+    && documentsSource.includes("SUM(CASE WHEN ocr_status = 'error' AND NOT (${contentOk}) THEN 1 ELSE 0 END) as failed"),
   'document list may repair inconsistent OCR status only for bounded current-page candidates, without full-library/body normalization.',
 )
 
@@ -142,6 +152,14 @@ assert(
     && libraryViewSource.includes('shouldShowDocumentReviewMessage')
     && libraryViewSource.includes('OCR 已保存：${data.errorMessage}'),
   'Library cards should show completed OCR page-level issues as short review warnings instead of clearing them or rendering failure banners.',
+)
+
+assert(
+  documentsSource.includes('inspectOcrRepairPages: options?.ocrNeedsRepair === true')
+    && documentsSource.includes('failedPageNums')
+    && documentsSource.includes('pendingPageNums')
+    && documentsSource.includes('summary.pending > 0'),
+  'OCR repair list responses should inspect page-level pending rows and expose their page numbers instead of showing an unexplained card.',
 )
 
 console.log('Library OCR incomplete filter regression passed.')

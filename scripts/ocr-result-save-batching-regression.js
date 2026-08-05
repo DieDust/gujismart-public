@@ -254,7 +254,7 @@ assert(
     && ocrIpcSource.includes('hasOldBookRouteHints(doc)')
     && processDocumentOcrBody.includes('await retryIncompletePagesWithSinglePageOcr(')
     && processDocumentOcrBody.includes('await savePageOcrResultsBatchedDeferred(retryResults')
-    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('settleIncompleteOcrPagesAsReviewFailures(docId)'),
+    && processDocumentOcrBody.indexOf('await retryIncompletePagesWithSinglePageOcr(') < processDocumentOcrBody.indexOf('resetTransientOcrPagesForContinuation(docId)'),
   'Document OCR should automatically retry failed or incomplete PDF pages with original-PDF pageRanges, then continue to single-page image OCR for pages that still failed.',
 )
 assert(
@@ -266,18 +266,22 @@ assert(
     && ocrIpcSource.includes('function formatOcrFailedPageNumberList')
     && ocrIpcSource.includes('function listDocumentOcrFailedPageNums')
     && ocrIpcSource.includes('OCR完成，第 ${pageList} 页 OCR 未成功')
-    && ocrIpcSource.includes('function settleIncompleteOcrPagesAsReviewFailures')
+    && ocrIpcSource.includes('stats.completed > 0')
+    && ocrIpcSource.includes('function resetTransientOcrPagesForContinuation')
+    && ocrIpcSource.includes('function resetLegacySyntheticOcrFailures')
+    && ocrIpcSource.includes("COALESCE(ocr_result, '') LIKE '%\"error\":\"第 % 页 OCR 未成功\"%'")
+    && processDocumentOcrBody.includes('if (!forceFullRerun) resetLegacySyntheticOcrFailures(docId)')
+    && !ocrIpcSource.includes('function settleIncompleteOcrPagesAsReviewFailures')
     && ocrIpcSource.includes('return isOcrPageSummaryComplete(stats)')
     && ocrIpcSource.includes('const settledWithReviewPages = hasOcrReviewPages(stats)')
     && ocrIpcSource.includes('const nextStatus = completed || settledWithReviewPages')
     && ocrIpcSource.includes('const reviewMessage = settledWithReviewPages ? (errorMessage || getDocumentOcrReviewMessage(docId)) : null')
-    && processDocumentOcrBody.includes('settleIncompleteOcrPagesAsReviewFailures(docId)')
+    && processDocumentOcrBody.includes('未处理页不会被记为失败')
+    && processDocumentOcrBody.includes('本轮 OCR 没有成功保存任何页面')
     && processDocumentOcrBody.includes('const hasFinalReviewPageFailure = hasOcrReviewPages(persistedPageSummary) || persistedPageSummary.failed > 0')
     && processDocumentOcrBody.includes('updateDocumentStatusFromPages(docId, reviewMessage)')
-    && !processDocumentOcrBody.includes('const hasPendingPageFailure = persistedPageSummary.pending > 0')
-    && !processDocumentOcrBody.includes('const hasFinalPendingPageFailure = persistedPageSummary.pending > 0')
-    && !processDocumentOcrBody.includes('const hasPageFailure = persistedPageSummary.failed > 0 || persistedPageSummary.pending > 0'),
-  'Document OCR should settle incomplete pages as short review warnings listing failed page nums and complete/入库 without whole-book failure.',
+    && processDocumentOcrBody.includes('剩余 ${settledSummary.pending} 页待继续'),
+  'Only genuine partial-success books may complete with review warnings; untouched pending pages and all-failed books must remain resumable failures.',
 )
 assert(
   ocrIpcSource.includes('function getPreferredGujiServiceText')
@@ -359,10 +363,10 @@ assert(
     && ocrIpcSource.indexOf('if (isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText)') < ocrIpcSource.indexOf('const storageResultBase = gujiOptions')
     && reprocessDocumentOcrStructureBody.includes('const rawFeijiangReferenceText = getRawFeijiangReferenceText(result)')
     && reprocessDocumentOcrStructureBody.includes('isFeijiangReferenceRecoveredResult(result) && rawFeijiangReferenceText')
-    && reprocessDocumentOcrStructureBody.includes('const structureResults = pagesWithResults.map')
+    && reprocessDocumentOcrStructureBody.includes('const structureResults: OcrResultRecord[] = []')
     && reprocessDocumentOcrStructureBody.includes('preserveRawGujiReferenceText(result as OcrRecognizeResult, rawFeijiangReferenceText, { page, generatedAt })')
     && reprocessDocumentOcrStructureBody.includes('? preserveRawGujiReferenceText(nextResultBase, preferredGujiText, { page, generatedAt })')
-    && !ocrIpcSource.includes('E:\\\\Download\\\\edge')
+    && !/[A-Za-z]:\\\\[^'"\r\n]+/.test(ocrIpcSource)
     && !hasLikelyHardcodedPrivateDocId(ocrIpcSource)
     && postProcessPdfOcrResultsBatchedBody.includes('const feijiangReference = ocrOptions.profile === \'guji_print_vertical\'')
     && postProcessPdfOcrResultsBatchedBody.includes('recoverGujiPageFromFeijiangReference(item.page, feijiangReference, ocrOptions, signal)')
@@ -531,8 +535,20 @@ assert(
     && ocrIpcSource.includes('async function runWithOcrRetryTimeout')
     && retryIncompletePagesWithSinglePageOcrBody.includes('const retryDeadline = Date.now() + OCR_AUTO_RETRY_TOTAL_BUDGET_MS')
     && retryIncompletePagesWithSinglePageOcrBody.includes('pageTimeoutMs')
-    && retryIncompletePagesWithSinglePageOcrBody.includes('本轮自动补跑已达到 6 分钟上限'),
-  'Automatic failed-page recovery should time out individual pages and settle the round instead of remaining in processing indefinitely.',
+    && retryIncompletePagesWithSinglePageOcrBody.includes('本轮自动补跑已达到 6 分钟上限')
+    && retryIncompletePagesWithSinglePageOcrBody.includes('不会记为 OCR 失败')
+    && retryIncompletePagesWithSinglePageOcrBody.includes("UPDATE pages SET ocr_status = 'pending'")
+    && !retryIncompletePagesWithSinglePageOcrBody.includes('for (const skippedPage of pages.slice(pageIndex))'),
+  'Automatic failed-page recovery should time out without turning every unattempted remainder page into a synthetic OCR failure.',
+)
+assert(
+  ocrCoreSource.includes('function isSystemicPageRecognitionFailure')
+    && ocrCoreSource.includes('let systemicFailure: Error | null = null')
+    && ocrCoreSource.includes('if (systemicFailure) throw systemicFailure')
+    && ocrCoreSource.includes('systemicFailure = failure')
+    && ocrCoreSource.includes('throw failure')
+    && riskyPageImageOcrBody.includes('if (isSystemicPageRecognitionFailure(error)) throw error'),
+  'A provider/token/network outage must trip a document-level circuit breaker instead of recording the same systemic failure against every remaining page.',
 )
 assert(
   ocrIpcSource.includes('function getLikelyGujiPdfTableMisclassification')
@@ -916,6 +932,29 @@ assert(
     && autoCleanupPdfAssetsIfEnabledBody.includes('activeAutoCleanupPdfAssetJobs.add(job)')
     && !autoCleanupPdfAssetsIfEnabledBody.includes('cleanupPdfAssets(docId)'),
   'Automatic PDF asset cleanup after OCR should be queued asynchronously instead of blocking the OCR completion path.',
+)
+assert(
+  reprocessDocumentOcrStructureBody.includes('await buildOcrDocumentV1Async(')
+    && reprocessDocumentOcrStructureBody.includes('chunkSize: OCR_DOCUMENT_STRUCTURE_BUILD_CHUNK_SIZE')
+    && reprocessDocumentOcrStructureBody.includes('offset += OCR_DOCUMENT_STRUCTURE_SAVE_CHUNK_SIZE')
+    && reprocessDocumentOcrStructureBody.includes('yieldControl: yieldToEventLoop')
+    && reprocessDocumentOcrStructureBody.includes("phase: 'write'")
+    && !reprocessDocumentOcrStructureBody.includes('buildOcrDocumentV1('),
+  'Large-book OCR structure finalization should use the feature-equivalent cooperative builder and yield between save batches.',
+)
+assert(
+  processDocumentOcrBody.includes('await recomputeLiteraturePageMapAsync(docId')
+    && processDocumentOcrBody.includes('updateDocumentStatusFromPages(docId, reviewMessage, { recomputePageMap: false })')
+    && processDocumentOcrBody.includes("message: 'OCR 已识别完成，正在整理整书结构'")
+    && processDocumentOcrBody.includes("phase: 'saving'"),
+  'OCR completion should report cooperative structure/page-map finalization without immediately repeating the synchronous full-book page-map rebuild.',
+)
+assert(
+  ocrIpcSource.includes('const OCR_LARGE_DOCUMENT_FINALIZE_PAGE_THRESHOLD = 300')
+    && ocrIpcSource.includes('async function runWithLargeDocumentFinalizeSlot')
+    && processDocumentOcrBody.includes('await runWithLargeDocumentFinalizeSlot(')
+    && processDocumentOcrBody.includes("message: 'OCR 已识别完成，正在等待整理整书结构'"),
+  'Simultaneously completed large books should serialize only their memory-heavy finalization stage while keeping the configured OCR recognition concurrency intact.',
 )
 
 console.log('OCR result save batching regression passed.')

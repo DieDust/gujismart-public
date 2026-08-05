@@ -95,8 +95,17 @@ assertIncludes(libraryCache, 'clearTimeout(refreshTimer)', 'sidebar cache refres
 assertIncludes(libraryCache, 'buildOcrIncompleteCondition()', 'sidebar OCR incomplete counts should stay document-level')
 assertIncludes(libraryCache, 'buildOcrNeedsRepairCondition()', 'sidebar should count OCR repair documents with the shared condition')
 assertIncludes(libraryCache, 'ocr_needs_repair_count', 'sidebar cache should expose the OCR repair count')
-assertIncludes(ocrLibraryFilters, "COALESCE(p_ocr_repair.ocr_status, '') <> 'completed'", 'OCR repair count should use indexed page statuses')
-assertNotIncludes(ocrLibraryFilters, 'ocr_text', 'OCR repair count must not scan OCR text')
+assertIncludes(
+  ocrLibraryFilters,
+  "buildPageNeedsOcrRepairCondition('p_ocr_repair')",
+  'OCR repair count should use the shared content-aware page predicate',
+)
+assertIncludes(
+  ocrLibraryFilters,
+  "COALESCE(${pageAlias}.ocr_text, '') <> ''",
+  'OCR repair count should recognize preserved inline OCR text',
+)
+assertNotIncludes(ocrLibraryFilters, 'json_extract', 'OCR repair count must not parse inline OCR JSON')
 assertIncludes(libraryCache, 'buildCumulativeFolderDocumentCounts(projectId)', 'library state cache should persist project-scoped cumulative folder counts')
 assertIncludes(libraryCache, "source: 'snapshot'", 'dirty sidebar cache should return the last persisted snapshot instead of recalculating')
 assertIncludes(libraryCache, 'LIBRARY_STATE_CACHE_COLD_START_DELAY_MS', 'missing sidebar cache should schedule a deferred rebuild instead of blocking the read path')

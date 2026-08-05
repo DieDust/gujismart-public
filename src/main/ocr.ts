@@ -165,14 +165,17 @@ const DEFAULT_OCR_CONCURRENCY = 6
 const MAX_OCR_CONCURRENCY = 32
 const DEFAULT_DOC_CONCURRENCY = 3
 export const MAX_DOC_CONCURRENCY = 20
-const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 4
+const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 2
 const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 8
 const DEFAULT_HEAVY_PDF_DOCUMENT_CONCURRENCY = 2
 const MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS = 3
 const ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX = '[async_pdf_incomplete_chunk]'
 const ASYNC_PDF_RELIABILITY_MODE_COOLDOWN_MS = 10 * 60 * 1000
 const MAX_RETRY_ATTEMPTS = 4
-const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 240
+const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 60
+const ASYNC_OCR_QUEUE_BUSY_MAX_WAIT_MS = 30 * 60 * 1000
+const ASYNC_PDF_SUBMIT_MIN_INTERVAL_MS = 750
+const ASYNC_PDF_RELIABILITY_SUBMIT_MIN_INTERVAL_MS = 5000
 const DEFAULT_OCR_UPLOAD_TIMEOUT_SECONDS = 3600
 const MAX_OCR_UPLOAD_TIMEOUT_SECONDS = 86400
 const DEFAULT_OCR_MAX_IMAGE_SIDE = 2200
@@ -196,6 +199,9 @@ const ASYNC_RESULT_FILE_NOT_READY_PREFIX = '[async_result_file_not_ready]'
 const ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'
 const ASYNC_RESULT_READY_GRACE_MS = 3 * 60 * 1000
 const ASYNC_RESULT_DOWNLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
+// A server job may legitimately process for a long time, but consecutive
+// status-query failures must not pin a document until the app is restarted.
+const ASYNC_STATUS_QUERY_STALLED_TIMEOUT_MS = 90 * 1000
 const ASYNC_JOB_STALLED_TIMEOUT_MS = 10 * 60 * 1000
 const ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS = 3 * 60 * 1000
 const ASYNC_PDF_STALLED_PAGE_RANGE_CHUNK_SIZE = 10
@@ -381,9 +387,13 @@ function createAdaptiveLimiter(getConcurrency: () => number) {
   }
 }
 
-const asyncSubmitLimit = createLimiter(MAX_DOC_CONCURRENCY)
 const asyncPollLimit = createLimiter(16)
 let asyncPdfReliabilityModeUntil = 0
+let asyncPdfNextSubmitAt = 0
+// Serialize only the short job-creation stage. Accepted jobs may still process
+// concurrently under asyncPdfJobLimit, but large batches cannot burst 20 POSTs
+// into the provider queue at once.
+const asyncSubmitLimit = createAdaptiveLimiter(() => 1)
 const asyncPdfJobLimit = createAdaptiveLimiter(() => (
   Date.now() < asyncPdfReliabilityModeUntil ? 1 : getAsyncPdfChunkConcurrency()
 ))
@@ -472,6 +482,15 @@ function activateAsyncPdfReliabilityMode(): boolean {
   return !wasActive
 }
 
+async function waitForAsyncPdfSubmitPacing(signal?: AbortSignal): Promise<void> {
+  const intervalMs = Date.now() < asyncPdfReliabilityModeUntil
+    ? ASYNC_PDF_RELIABILITY_SUBMIT_MIN_INTERVAL_MS
+    : ASYNC_PDF_SUBMIT_MIN_INTERVAL_MS
+  const waitMs = Math.max(0, asyncPdfNextSubmitAt - Date.now())
+  if (waitMs > 0) await sleep(waitMs, signal)
+  asyncPdfNextSubmitAt = Date.now() + intervalMs
+}
+
 function normalizeAsyncOcrModel(model: unknown): AsyncOcrModel {
   const value = String(model || '').trim()
   if (/^PaddleOCR-VL(?:-|$)/i.test(value) || /^PP-Structure/i.test(value)) return value
@@ -557,8 +576,8 @@ function isAsyncOcrQueueBusyError(error: Error & { status?: number; code?: numbe
   const message = String(error.message || '').toLowerCase()
   return (
     String(error.code || '') === '10010'
-    || /queue|busy|submission queue|capacity/.test(message)
-    || /队列|排队|繁忙|稍后|限流|频繁|并发|提交队列已满/.test(message)
+    || /submission\s+queue|queue\s*(?:is\s*)?full|queue\s+capacity/.test(message)
+    || /(?:任务)?提交队列已满|任务队列已满/.test(message)
   )
 }
 
@@ -4050,6 +4069,14 @@ export async function recognizeImage(base64Image: string, options: SyncRecogniti
   throw lastError || new Error('OCR 失败')
 }
 
+export function isSystemicPageRecognitionFailure(error: unknown): boolean {
+  if (isOcrAbortError(error)) return true
+  const failure = error as Error & { status?: number; code?: number | string }
+  if (isPaddleOcrTokenFailure(failure) || isRetryableNetworkFailure(failure)) return true
+  const message = String(failure?.message || error || '').toLowerCase()
+  return /api token|api key|unauthori[sz]ed|forbidden|quota|rate limit|endpoint|service unavailable|gateway|令牌|额度|限流|鉴权|接口地址|服务不可用/.test(message)
+}
+
 export async function recognizePages(
   pages: OcrPageRecord[],
   options?: PageOcrOptions,
@@ -4061,6 +4088,7 @@ export async function recognizePages(
   const limit = createLimiter(Math.min(pageConcurrency, getOcrConcurrency()))
   const totalPages = pages.length
   let completedPages = 0
+  let systemicFailure: Error | null = null
 
   const reportProgress = (page: OcrPageRecord, status: 'completed' | 'error', error?: string, result?: OcrResultPayload | null, text?: string) => {
     completedPages += 1
@@ -4079,6 +4107,7 @@ export async function recognizePages(
   return Promise.all(
     pages.map((page) => limit(async (): Promise<OcrPageResult> => {
       throwIfAborted(runtimeOptions.signal)
+      if (systemicFailure) throw systemicFailure
       if (!page.image_path) {
         const error = `第 ${page.page_num || ''} 页缺少图像路径`
         reportProgress(page, 'error', error)
@@ -4124,7 +4153,12 @@ export async function recognizePages(
         }
       } catch (error) {
         if (isOcrAbortError(error)) throw error
-        const message = (error as Error).message
+        const failure = error instanceof Error ? error : new Error(String(error || 'OCR 失败'))
+        if (isSystemicPageRecognitionFailure(failure)) {
+          systemicFailure = failure
+          throw failure
+        }
+        const message = failure.message
         reportProgress(page, 'error', message)
         return {
           pageId: page.id,
@@ -4147,6 +4181,11 @@ export function shouldUseAsyncPdfOcr(filePath?: string | null, pageCount = 0): b
   }
   if (pageCount > 0 && pageCount < ASYNC_PDF_PAGE_THRESHOLD) return false
   return true
+}
+
+function isRecoverableAsyncChunkJobError(error: unknown): boolean {
+  const message = String((error as Error)?.message || error || '')
+  return isAsyncJobStalledError(error) || message.includes(ASYNC_RESULT_FILE_NOT_READY_PREFIX)
 }
 
 interface PdfChunk {
@@ -4932,6 +4971,7 @@ async function submitAsyncPdfJob(
   return asyncSubmitLimit(async () => {
     let attempt = 0
     let lastError: Error | null = null
+    let queueBusyStartedAt = 0
     throwIfAborted(signal)
     const fileBlob = await createPdfUploadBlob(filePath)
     let maxAttempts = MAX_RETRY_ATTEMPTS
@@ -4940,6 +4980,7 @@ async function submitAsyncPdfJob(
     while (attempt < maxAttempts) {
       throwIfAborted(signal)
       try {
+        await waitForAsyncPdfSubmitPacing(signal)
         const formData = new FormData()
         formData.append('model', model)
         if (submitOptions.pageRanges) {
@@ -4990,25 +5031,34 @@ async function submitAsyncPdfJob(
         attempt += 1
         const queueBusy = isAsyncOcrQueueBusyError(failure)
         if (queueBusy) {
+          queueBusyStartedAt = queueBusyStartedAt || Date.now()
           maxAttempts = Math.max(maxAttempts, ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS)
+          activateAsyncPdfReliabilityMode()
+          if (Date.now() - queueBusyStartedAt >= ASYNC_OCR_QUEUE_BUSY_MAX_WAIT_MS) break
+        } else {
+          queueBusyStartedAt = 0
         }
         if (attempt >= maxAttempts || !isRetryableNetworkFailure(failure)) {
           break
         }
         const waitMs = queueBusy
-          ? Math.min(60000, 15000 * attempt)
+          ? Math.min(60000, 5000 * 2 ** Math.min(4, attempt - 1))
           : String(failure.code || '') === '10010'
           ? Math.min(60000, 5000 * 2 ** (attempt - 1))
           : Math.min(20000, 1200 * 2 ** (attempt - 1))
         if (queueBusy) {
-          onQueueBusy?.({ attempt, waitMs, errorMessage: failure.message || 'PaddleOCR submission queue is full' })
+          onQueueBusy?.({
+            attempt,
+            waitMs,
+            errorMessage: `飞桨服务端任务提交队列已满，${Math.ceil(waitMs / 1000)} 秒后重试（不会切换 Token）`,
+          })
         }
         await sleep(waitMs, signal)
       }
     }
 
     throw lastError || new Error('异步 OCR 提交失败')
-  })
+  }, signal)
 }
 
 async function queryAsyncPdfJob(jobId: string, lease: PaddleOcrTokenLease, signal?: AbortSignal): Promise<AsyncJobStatusPayload> {
@@ -5044,6 +5094,7 @@ async function waitForAsyncPdfResult(jobId: string, lease: PaddleOcrTokenLease, 
   let allPagesCompletedAt = 0
   let lastProgressAt = Date.now()
   let lastProgressSignature = ''
+  let statusQueryFailureStartedAt = 0
   let pollCount = 0
   while (true) {
     throwIfAborted(signal)
@@ -5056,8 +5107,9 @@ async function waitForAsyncPdfResult(jobId: string, lease: PaddleOcrTokenLease, 
       const failure = error as Error & { status?: number; code?: number | string }
       if (isPaddleOcrTokenFailure(failure)) throw failure
       if (!isRetryableNetworkFailure(failure)) throw failure
-      const waitingMs = Date.now() - lastProgressAt
-      if (waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS) {
+      statusQueryFailureStartedAt = statusQueryFailureStartedAt || Date.now()
+      const waitingMs = Date.now() - statusQueryFailureStartedAt
+      if (waitingMs > ASYNC_STATUS_QUERY_STALLED_TIMEOUT_MS) {
         throw new Error(`${ASYNC_JOB_STALLED_PREFIX} PaddleOCR 状态查询长时间没有进展：${failure.message || '服务端未返回处理状态'}。软件会自动改用原 PDF 分段补跑未完成页。`)
       }
       onProgress?.({
@@ -5078,6 +5130,7 @@ async function waitForAsyncPdfResult(jobId: string, lease: PaddleOcrTokenLease, 
       continue
     }
 
+    statusQueryFailureStartedAt = 0
     const state = String(statusPayload.status || statusPayload.state || '').toLowerCase()
     const jsonUrl = getJsonUrl(statusPayload)
     const completedPages = getCompletedPages(statusPayload)
@@ -5483,7 +5536,8 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
       })
       let normalizedChunkResults: Array<OcrResultPayload | null> = []
       for (let resultAttempt = 1; resultAttempt <= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS; resultAttempt += 1) {
-        normalizedChunkResults = await asyncPdfJobLimit(async () => {
+        try {
+          normalizedChunkResults = await asyncPdfJobLimit(async () => {
           const excludedTokenIds = new Set<string>()
           let jsonUrl = ''
           while (!jsonUrl) {
@@ -5547,8 +5601,35 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
           }
           throwIfAborted(signal)
           const pagePayloads = await fetchAsyncPdfJsonLines(jsonUrl, model, signal)
-          return normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)
-        }, signal)
+            return normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)
+          }, signal)
+        } catch (error) {
+          const shouldSwitchWholePdfToChunks = chunk.fallbackWholePdf && !plan.requireFullFileUpload
+          if (
+            !isRecoverableAsyncChunkJobError(error)
+            || shouldSwitchWholePdfToChunks
+            || resultAttempt >= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS
+          ) {
+            throw error
+          }
+          const switchedToReliabilityMode = activateAsyncPdfReliabilityMode()
+          completedByChunk[chunkIndex] = 0
+          onProgress?.({
+            status: 'queued',
+            state: 'queued',
+            errorMessage: switchedToReliabilityMode
+              ? `当前分片与服务端暂时失联，已切换稳健模式并自动重新提交第 ${chunkStartPage}-${chunkEndPage} 页（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`
+              : `当前分片与服务端暂时失联，正在自动重新提交第 ${chunkStartPage}-${chunkEndPage} 页（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`,
+            chunkIndex: chunkIndex + 1,
+            totalChunks,
+            chunkStartPage,
+            chunkEndPage,
+            completedPages: Math.min(getCompletedPagesAcrossChunks(), totalPages),
+            totalPages,
+            progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
+          })
+          continue
+        }
         const expectedResultCount = chunk.sourcePageIndexes.length || chunk.uploadPageCount || chunk.pageCount
         const missingResultOffsets = Array.from({ length: expectedResultCount }, (_, index) => index)
           .filter((index) => !normalizedChunkResults[index])

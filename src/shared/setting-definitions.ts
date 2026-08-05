@@ -6,7 +6,7 @@ const definitions: Record<string, SettingDefinition> = {
   vision_ocr_api_key: { key: 'vision_ocr_api_key', type: 'secret', sensitivity: 'protected', rendererVisible: false },
   theme: { key: 'theme', type: 'string', sensitivity: 'public', rendererVisible: true, defaultValue: 'light' },
   batch_size: { key: 'batch_size', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '5', min: 1, max: 100 },
-  ocr_async_pdf_chunk_concurrency: { key: 'ocr_async_pdf_chunk_concurrency', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '4', min: 1, max: 8 },
+  ocr_async_pdf_chunk_concurrency: { key: 'ocr_async_pdf_chunk_concurrency', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '2', min: 1, max: 8 },
   ocr_heavy_pdf_document_concurrency: { key: 'ocr_heavy_pdf_document_concurrency', type: 'integer', sensitivity: 'public', rendererVisible: true, defaultValue: '2', min: 1, max: 20 },
   /**
    * Wall-clock minutes for a single document OCR run. When exceeded, that book is

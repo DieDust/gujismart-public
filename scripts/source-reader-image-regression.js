@@ -162,6 +162,7 @@ assertIncludes(pdfUtil, 'applyCjkTextRenderFallback(page, viewport, ctx, canvas.
 assertIncludes(ocrPageImages, "const progressLabel = engineLabel ? `${engineLabel}所需本地页图缓存` : '本地页图缓存'", 'page image cache repair should use an explicit local-cache progress label')
 assertIncludes(ocrPageImages, '正在生成${progressLabel}', 'page image repair progress should clearly describe local cache generation')
 assertIncludes(ocrPageImages, '本地渲染并发 ${prepConcurrency}', 'page image repair progress should distinguish local rendering concurrency from OCR document concurrency')
+assertIncludes(ocrPageImages, 'documentTitle ? `《${documentTitle.slice(0, 60)}》`', 'page image repair progress should identify the document currently generating cache')
 
 assertIncludes(documentsIpc, 'function isReadableLocalAssetPath', 'document list should verify local source assets before showing source availability')
 assertIncludes(documentsIpc, 'fileStat.isFile() && fileStat.size > 0', 'document source state should not treat empty or non-file page-image cache paths as readable')

@@ -38,6 +38,20 @@ export interface BuildOcrIrOptions {
   forceRebuild?: boolean
 }
 
+export type OcrDocumentBuildPhase = 'pages' | 'orientation' | 'margins' | 'tables' | 'continuity'
+
+export interface BuildOcrDocumentAsyncOptions {
+  /** Maximum number of pages handled before control is returned to the host event loop. */
+  chunkSize?: number
+  /** Host-specific yield implementation. Electron main passes setImmediate here. */
+  yieldControl?: () => Promise<void>
+  onProgress?: (progress: {
+    phase: OcrDocumentBuildPhase
+    completed: number
+    total: number
+  }) => void
+}
+
 export interface OcrRegionRerecognitionCandidate {
   blockId: string
   bbox: OcrBoundingBox
@@ -1468,6 +1482,214 @@ export function buildOcrDocumentV1(pageValues: unknown[], options: Omit<BuildOcr
     orientationConfidence: orientation.confidence,
     pages,
     paragraphs: markCrossPageContinuity(pages),
+    quality: combineQuality(pages.map((page) => page.quality)),
+  }
+}
+
+function getDocumentBuildChunkSize(value: unknown): number {
+  const parsed = Math.floor(Number(value) || 0)
+  return Math.max(1, Math.min(32, parsed || 4))
+}
+
+async function yieldDocumentBuild(
+  options: BuildOcrDocumentAsyncOptions,
+  phase: OcrDocumentBuildPhase,
+  completed: number,
+  total: number,
+): Promise<void> {
+  options.onProgress?.({ phase, completed, total })
+  if (options.yieldControl) {
+    await options.yieldControl()
+    return
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+async function applyDocumentReadingOrientationAsync(
+  pages: OcrPageV1[],
+  options: BuildOcrDocumentAsyncOptions,
+  chunkSize: number,
+): Promise<OrientationConsensus> {
+  const blocks: OcrBlockV1[] = []
+  for (let index = 0; index < pages.length; index += chunkSize) {
+    const end = Math.min(pages.length, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      blocks.push(...pages[pageIndex].blocks)
+    }
+    await yieldDocumentBuild(options, 'orientation', end, pages.length)
+  }
+
+  const consensus = orientationConsensus(blocks)
+  if (consensus.orientation === 'unknown') return consensus
+  for (let index = 0; index < pages.length; index += chunkSize) {
+    const end = Math.min(pages.length, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      const page = pages[pageIndex]
+      applyReadingOrientation(page.blocks, consensus.orientation, 'document_consensus')
+      page.orientation = consensus.orientation
+      page.orientationSource = 'document_consensus'
+      rebuildPageReadingFlow(page)
+    }
+    await yieldDocumentBuild(options, 'orientation', end, pages.length)
+  }
+  return consensus
+}
+
+async function suppressRepeatedMarginalBlocksAsync(
+  pages: OcrPageV1[],
+  options: BuildOcrDocumentAsyncOptions,
+  chunkSize: number,
+): Promise<void> {
+  if (pages.length < 3) return
+  const occurrences = new Map<string, Array<{ page: OcrPageV1; block: OcrBlockV1; edge: 'top' | 'bottom' }>>()
+  for (let index = 0; index < pages.length; index += chunkSize) {
+    const end = Math.min(pages.length, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      const page = pages[pageIndex]
+      page.blocks.forEach((block) => {
+        if (!block.normalizedBbox || !block.text || block.text.length > 100) return
+        const edge = block.normalizedBbox.top <= 130
+          ? 'top'
+          : block.normalizedBbox.top + block.normalizedBbox.height >= 870
+            ? 'bottom'
+            : null
+        if (!edge) return
+        const key = normalizedRepeatedText(block.text)
+        if (key.length < 2) return
+        const list = occurrences.get(`${edge}:${key}`) || []
+        list.push({ page, block, edge })
+        occurrences.set(`${edge}:${key}`, list)
+      })
+    }
+    await yieldDocumentBuild(options, 'margins', end, pages.length)
+  }
+
+  const threshold = Math.max(3, Math.ceil(pages.length * 0.4))
+  const repeatedEntries = [...occurrences.values()]
+  for (let index = 0; index < repeatedEntries.length; index += chunkSize) {
+    const end = Math.min(repeatedEntries.length, index + chunkSize)
+    for (let entryIndex = index; entryIndex < end; entryIndex += 1) {
+      const items = repeatedEntries[entryIndex]
+      if (new Set(items.map((item) => item.page.pageIndex)).size < threshold) continue
+      items.forEach(({ page, block, edge }) => {
+        page.blocks = page.blocks.filter((candidate) => candidate.id !== block.id)
+        block.type = edge === 'top' ? 'page_header' : 'page_footer'
+        block.processing.push({
+          stage: 'document_postprocess',
+          action: 'move_repeated_margin_to_discarded',
+          reason: `repeated_${edge}_margin`,
+        })
+        if (!page.discardedBlocks.some((candidate) => candidate.id === block.id)) page.discardedBlocks.push(block)
+      })
+    }
+    await yieldDocumentBuild(options, 'margins', Math.min(pages.length, end), pages.length)
+  }
+
+  for (let index = 0; index < pages.length; index += chunkSize) {
+    const end = Math.min(pages.length, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      const page = pages[pageIndex]
+      page.paragraphs = rebuildOcrParagraphs(page.blocks, page.pageIndex)
+      page.quality = buildQualityReport(page.blocks, page.discardedBlocks)
+    }
+    await yieldDocumentBuild(options, 'margins', end, pages.length)
+  }
+}
+
+async function markCrossPageTablesAsync(
+  pages: OcrPageV1[],
+  options: BuildOcrDocumentAsyncOptions,
+  chunkSize: number,
+): Promise<void> {
+  const total = Math.max(0, pages.length - 1)
+  for (let index = 0; index < total; index += chunkSize) {
+    const end = Math.min(total, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      const currentTable = [...pages[pageIndex].blocks].reverse().find((block) => block.type === 'table' && block.table)
+      const nextTable = pages[pageIndex + 1].blocks.find((block) => block.type === 'table' && block.table)
+      if (!currentTable?.table || !nextTable?.table) continue
+      const currentColumns = Math.max(
+        0,
+        ...currentTable.table.rows.map((row) => row.length),
+        ...currentTable.table.cells.map((cell) => cell.column + cell.columnSpan),
+      )
+      const nextColumns = Math.max(
+        0,
+        ...nextTable.table.rows.map((row) => row.length),
+        ...nextTable.table.cells.map((cell) => cell.column + cell.columnSpan),
+      )
+      if (currentColumns === 0 || nextColumns === 0 || currentColumns !== nextColumns) continue
+      if (currentTable.normalizedBbox && currentTable.normalizedBbox.top + currentTable.normalizedBbox.height < 760) continue
+      if (nextTable.normalizedBbox && nextTable.normalizedBbox.top > 240) continue
+      currentTable.table.continuesToNextPage = true
+      nextTable.table.continuesFromPreviousPage = true
+      currentTable.processing.push({ stage: 'document_postprocess', action: 'mark_cross_page_table' })
+      nextTable.processing.push({ stage: 'document_postprocess', action: 'mark_cross_page_table' })
+    }
+    await yieldDocumentBuild(options, 'tables', end, total)
+  }
+}
+
+async function markCrossPageContinuityAsync(
+  pages: OcrPageV1[],
+  options: BuildOcrDocumentAsyncOptions,
+  chunkSize: number,
+): Promise<OcrParagraphV1[]> {
+  const all: OcrParagraphV1[] = []
+  for (let index = 0; index < pages.length; index += chunkSize) {
+    const end = Math.min(pages.length, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      const page = pages[pageIndex]
+      const first = page.paragraphs.find((paragraph) => paragraph.type === 'paragraph')
+      const previousPage = pages[pageIndex - 1]
+      const previous = previousPage
+        ? [...previousPage.paragraphs].reverse().find((paragraph) => paragraph.type === 'paragraph')
+        : undefined
+      if (first && previous && previousPage && crossPageContinuationScore(previousPage, previous, page, first) >= 4) {
+        const groupId = previous.continuationGroupId || `paragraph-flow-${previousPage.pageIndex}-${previous.readingOrder}`
+        previous.continuesToNextPage = true
+        previous.continuationGroupId = groupId
+        first.continuesFromPreviousPage = true
+        first.continuationGroupId = groupId
+      }
+      all.push(...page.paragraphs)
+    }
+    await yieldDocumentBuild(options, 'continuity', end, pages.length)
+  }
+  return all
+}
+
+/**
+ * Feature-equivalent document IR builder that cooperatively yields between small page groups.
+ * Use this for large books on the Electron main process so Windows does not flag the UI as hung.
+ */
+export async function buildOcrDocumentV1Async(
+  pageValues: unknown[],
+  options: Omit<BuildOcrIrOptions, 'pageIndex'> = {},
+  asyncOptions: BuildOcrDocumentAsyncOptions = {},
+): Promise<OcrDocumentV1> {
+  const chunkSize = getDocumentBuildChunkSize(asyncOptions.chunkSize)
+  const pages: OcrPageV1[] = []
+  for (let index = 0; index < pageValues.length; index += chunkSize) {
+    const end = Math.min(pageValues.length, index + chunkSize)
+    for (let pageIndex = index; pageIndex < end; pageIndex += 1) {
+      pages.push(buildOcrPageIr(pageValues[pageIndex], { ...options, pageIndex: pageIndex + 1 }).page)
+    }
+    await yieldDocumentBuild(asyncOptions, 'pages', end, pageValues.length)
+  }
+  pages.sort((left, right) => left.pageIndex - right.pageIndex)
+  const orientation = await applyDocumentReadingOrientationAsync(pages, asyncOptions, chunkSize)
+  await suppressRepeatedMarginalBlocksAsync(pages, asyncOptions, chunkSize)
+  await markCrossPageTablesAsync(pages, asyncOptions, chunkSize)
+  const paragraphs = await markCrossPageContinuityAsync(pages, asyncOptions, chunkSize)
+  return {
+    schemaVersion: OCR_IR_SCHEMA_VERSION,
+    generator: 'GujiSmart',
+    pipelineVersion: OCR_IR_PIPELINE_VERSION,
+    orientation: orientation.orientation,
+    orientationConfidence: orientation.confidence,
+    pages,
+    paragraphs,
     quality: combineQuality(pages.map((page) => page.quality)),
   }
 }

@@ -25,6 +25,11 @@ async function main() {
   )
 
   const scheduler = new SlidingWindowScheduler()
+  assert.deepStrictEqual(
+    scheduler.getSnapshot(),
+    { activeCount: 0, queuedCount: 0, documentTailCount: 0 },
+    'scheduler should expose an empty queue snapshot before work starts',
+  )
   const releases = []
   const started = []
   let active = 0
@@ -148,6 +153,14 @@ async function main() {
     ]),
     'OCR：2 篇处理中，2 篇等待',
   )
+  assert.strictEqual(
+    buildOcrActivitySummary([
+      { status: 'processing', title: '甲书' },
+      { status: 'processing', title: '乙书' },
+      { status: 'queued', title: '丙书' },
+    ]),
+    'OCR：2 篇处理中，1 篇等待 · 正在处理 《甲书》、《乙书》',
+  )
 
   const libraryView = fs.readFileSync(path.join(root, 'src/renderer/src/views/LibraryView.tsx'), 'utf8')
   const ocrIpc = fs.readFileSync(path.join(root, 'src/main/ipc/ocr.ts'), 'utf8')
@@ -157,7 +170,10 @@ async function main() {
     ocrIpc.indexOf("ipcMain.handle('pages:rerunOcr'"),
   )
   assert.ok(libraryView.includes("const OCR_ACTIVITY_MESSAGE_KEY = 'ocr-activity'"), 'Library should use one aggregate OCR message key')
-  assert.ok(libraryView.includes('buildOcrActivitySummary(Object.values(nextProgressByDoc))'), 'Library should aggregate document progress')
+  assert.ok(
+    libraryView.includes('buildLibraryOcrActivitySummary(Object.values(nextProgressByDoc), documentsRef.current)'),
+    'Library should aggregate document progress with active document titles',
+  )
   assert.ok(!libraryView.includes('message.loading({\n          content: getOcrProgressText(nextInfo),\n          key: toastKey'), 'Library must not open one persistent toast per document')
   assert.ok(
     ocrIpc.includes('runBoundedDocumentWorkers')
@@ -165,6 +181,12 @@ async function main() {
       && ocrIpc.includes('globalOcrDocumentWindow.runForDocument(')
       && ocrIpc.includes('getOcrDocumentConcurrency'),
     'automatic and manual OCR should share document ownership and the global window via the bounded worker pool',
+  )
+  assert.ok(
+    ocrIpc.includes('getOcrQueueWaitMessage')
+      && ocrIpc.includes('任务可能位于其他项目或筛选结果中')
+      && ocrIpc.includes('releaseAbortedOcrRuntimeSlots'),
+    'queued OCR cards should explain the shared wait state and release already-aborted runtime slots',
   )
   assert.ok(
     ocrIpc.includes('heavyPdfOcrDocumentWindow.run(getOcrHeavyPdfDocumentConcurrency(), runInTotalWindow)')
@@ -221,8 +243,35 @@ async function main() {
     !manualBatchHandler.includes('transactionAsync(() => undefined')
       && ocrIpc.includes('async function updateRecoverableBatchOcrItem(')
       && ocrIpc.includes("await updateRecoverableBatchOcrItem(recoverableQueueItemIdsByDocId, docId, 'processing')")
-      && ocrIpc.includes('OCR_QUEUE_WRITER_MAX_WAIT_MS = 5 * 60 * 1000'),
-    'OCR queue persistence and recovery state transitions must keep the async writer lock through their actual writes',
+      && ocrIpc.includes('OCR_QUEUE_WRITER_MAX_WAIT_MS = 5 * 60 * 1000')
+      && ocrIpc.includes('OCR_QUEUE_STATUS_MAX_WAIT_MS = 5 * 1000')
+      && ocrIpc.includes('maxWaitMs: OCR_QUEUE_STATUS_MAX_WAIT_MS')
+      && ocrIpc.includes('Deferred recoverable queue status update'),
+    'Initial queue persistence may wait for SQLite, but per-book recovery bookkeeping must fail open after a short wait',
+  )
+  assert.ok(
+    ocrIpc.includes('onWorkerError?: (item: T, index: number, error: unknown)')
+      && ocrIpc.includes('Bounded worker failed at item')
+      && ocrIpc.includes('await onWorkerError?.(items[index], index, error)')
+      && manualBatchHandler.includes('已跳过并继续后续文献'),
+    'One unexpected document failure must be reported and skipped without terminating the remaining worker queue',
+  )
+  assert.ok(
+    ocrIpc.includes('const completedAtProcessStart = completedBefore')
+      && ocrIpc.includes('const madeForwardProgress = pageSummary.completed > completedAtProcessStart')
+      && ocrIpc.includes('if (pageSummary.total > 0 && madeForwardProgress)')
+      && ocrIpc.includes("UPDATE pages SET ocr_status = 'pending' WHERE doc_id = ? AND ocr_status IN ('queued', 'processing')")
+      && !ocrIpc.includes("ocr_status IN ('error', 'queued', 'processing')"),
+    'A hard retry failure must expose the real error while preserving genuine failed-page evidence and resetting only transient claims',
+  )
+  assert.ok(
+    manualBatchHandler.indexOf('await runOcrDocumentInConfiguredWindows(docId, documentConcurrency, heavy, async () => {')
+      < manualBatchHandler.indexOf('activeOcrTasks.set(docId, activeTask)')
+      && manualBatchHandler.indexOf('activeOcrTasks.set(docId, activeTask)')
+        < manualBatchHandler.indexOf("status: 'processing'")
+      && manualBatchHandler.indexOf("status: 'queued'")
+        < manualBatchHandler.indexOf('await runOcrDocumentInConfiguredWindows(docId, documentConcurrency, heavy, async () => {'),
+    'New manual retry calls must remain visibly queued until the shared OCR window starts them, without preempting active books',
   )
   assert.ok(
     manualBatchHandler.includes('queuedOcrDocIds.delete(docId)')

@@ -232,21 +232,22 @@ assert(
   'Async PDF OCR should support original-PDF pageRanges chunks without falling back to single-page or qpdf-copied PDFs.',
 )
 assert(
-  ocrSource.includes('const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 4')
+  ocrSource.includes('const DEFAULT_ASYNC_PDF_CHUNK_CONCURRENCY = 2')
     && ocrSource.includes('const MAX_ASYNC_PDF_CHUNK_CONCURRENCY = 8')
     && ocrSource.includes("getNumericSetting('ocr_async_pdf_chunk_concurrency'")
-    && ocrSource.includes('const asyncSubmitLimit = createLimiter(MAX_DOC_CONCURRENCY)')
+    && ocrSource.includes('const asyncSubmitLimit = createAdaptiveLimiter(() => 1)')
+    && ocrSource.includes('waitForAsyncPdfSubmitPacing')
     && ocrSource.includes('const asyncPdfJobLimit = createAdaptiveLimiter')
     && ocrSource.includes('Date.now() < asyncPdfReliabilityModeUntil ? 1 : getAsyncPdfChunkConcurrency()'),
   'Async PDF OCR should keep configured per-document concurrency while bounding all live provider jobs with an adaptive global gate.',
 )
 assert(
-  ocrSource.includes('const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 240')
+  ocrSource.includes('const ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS = 60')
     && ocrSource.includes('function isAsyncOcrQueueBusyError')
     && ocrSource.includes('提交队列已满')
     && submitAsyncPdfJobBody.includes('const queueBusy = isAsyncOcrQueueBusyError(failure)')
     && submitAsyncPdfJobBody.includes('maxAttempts = Math.max(maxAttempts, ASYNC_OCR_QUEUE_BUSY_RETRY_ATTEMPTS)')
-    && submitAsyncPdfJobBody.includes('? Math.min(60000, 15000 * attempt)')
+    && submitAsyncPdfJobBody.includes('? Math.min(60000, 5000 * 2 ** Math.min(4, attempt - 1))')
     && ocrSource.includes('if (isAsyncOcrQueueBusyError(failure)) return false'),
   'Async PDF OCR should wait and retry when PaddleOCR reports a full submission queue instead of marking documents failed.',
 )
@@ -524,9 +525,12 @@ assert(
     && ocrSource.includes("const ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX = '[async_pdf_incomplete_chunk]'")
     && ocrSource.includes('const ASYNC_PDF_RELIABILITY_MODE_COOLDOWN_MS = 10 * 60 * 1000')
     && ocrSource.includes('function activateAsyncPdfReliabilityMode')
+    && ocrSource.includes('function isRecoverableAsyncChunkJobError')
     && recognizePdfAsyncBody.includes('normalizedChunkResults = await asyncPdfJobLimit(async () => {')
     && recognizePdfAsyncBody.includes('const switchedToReliabilityMode = activateAsyncPdfReliabilityMode()')
     && recognizePdfAsyncBody.includes('已临时切换稳健模式并串行重试当前分片')
+    && recognizePdfAsyncBody.includes('当前分片与服务端暂时失联')
+    && recognizePdfAsyncBody.includes('continue')
     && recognizePdfAsyncBody.includes('missingResultOffsets')
     && recognizePdfAsyncBody.includes('resultAttempt >= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS')
     && recognizePdfAsyncBody.indexOf('missingResultOffsets.length === 0')
@@ -554,9 +558,10 @@ assert(
     && waitForAsyncPdfResultBody.includes('statusPayload = await queryAsyncPdfJob(jobId, lease, signal)')
     && waitForAsyncPdfResultBody.includes('retryingStatusQuery: true')
     && waitForAsyncPdfResultBody.includes('statusQueryError: failure.message')
-    && waitForAsyncPdfResultBody.includes('waitingMs > ASYNC_JOB_STALLED_TIMEOUT_MS')
+    && ocrSource.includes('const ASYNC_STATUS_QUERY_STALLED_TIMEOUT_MS = 90 * 1000')
+    && waitForAsyncPdfResultBody.includes('waitingMs > ASYNC_STATUS_QUERY_STALLED_TIMEOUT_MS')
     && waitForAsyncPdfResultBody.includes('await sleep(getAsyncPollDelayMs({'),
-  'Async PDF polling should retry transient status-query failures and fail recoverably after a real no-progress stall.',
+  'Async PDF polling should retry transient status-query failures, then automatically resubmit only the affected chunk after a bounded outage.',
 )
 assert(
   ocrSource.includes("const ASYNC_JOB_STALLED_PREFIX = '[async_job_stalled]'")
@@ -575,6 +580,7 @@ assert(
   ocrIpcSource.includes('function formatDurationMs')
     && ocrIpcSource.includes('const statusQueryRetryMessage = payload.retryingStatusQuery')
     && ocrIpcSource.includes('正在重新查询处理进度')
+    && ocrIpcSource.includes("phase: payload.retryingStatusQuery || isAwaitingAsyncResult")
     && ocrIpcSource.includes('message: fallbackRetryMessage || statusQueryRetryMessage || waitingResultFileMessage || uploadModeMessage || asyncProgressMessage || (isWaitingForServerQueue'),
   'OCR IPC progress should surface status-query retries with elapsed time instead of leaving documents at a silent 0% wait.',
 )

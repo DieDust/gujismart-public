@@ -53,7 +53,11 @@ import { applyManualLiteraturePageAnchor, recomputeLiteraturePageMap, resetLiter
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
 import { resolveFolderAndDescendantIds } from '../folder-scope'
 import { inspectManagedDeleteTarget, type ManagedDeleteKind } from '../managed-path-boundary'
-import { buildOcrIncompleteCondition, buildOcrNeedsRepairCondition } from '../ocr-library-filters'
+import {
+  buildOcrIncompleteCondition,
+  buildOcrNeedsRepairCondition,
+  buildPageContentAvailableConditionStatusOnly,
+} from '../ocr-library-filters'
 import { FileCapabilityError, fileCapabilityService } from '../file-capabilities'
 import { cancelLegacyImportQueueTasks, registerLegacyImportQueueState } from '../task-import-compat'
 import { attachCanonicalPageContent } from '../canonical-content'
@@ -3097,22 +3101,6 @@ function buildPageContentAvailableCondition(alias = 'p'): string {
   )`
 }
 
-/**
- * List/open-path only: avoid TRIM/JSON parsing over OCR payload bodies.
- * Direct non-empty checks preserve legacy inline text without scanning every
- * character, while ref/status columns cover externalized payloads.
- */
-function buildPageContentAvailableConditionStatusOnly(alias = 'p'): string {
-  return `(
-    COALESCE(${alias}.ocr_status, '') = 'completed'
-    OR COALESCE(${alias}.proofed_text, '') <> ''
-    OR COALESCE(${alias}.ocr_text, '') <> ''
-    OR COALESCE(${alias}.proofed_text_ref, '') <> ''
-    OR COALESCE(${alias}.ocr_text_ref, '') <> ''
-    OR COALESCE(${alias}.ocr_result_ref, '') <> ''
-  )`
-}
-
 function buildDocumentOcrCompleteCondition(alias = 'd'): string {
   const pageCount = `COALESCE(${alias}.page_count, 0)`
   return `(
@@ -3817,7 +3805,10 @@ function resolveListPdfAssetInfo(
   }
 }
 
-function attachDocumentRelations(documents: DocumentListItem[]): DocumentListItem[] {
+function attachDocumentRelations(
+  documents: DocumentListItem[],
+  options?: { inspectOcrRepairPages?: boolean },
+): DocumentListItem[] {
   if (documents.length === 0) return documents
   const documentsWithStats = attachPageStatsForDocuments(documents)
   const docIds = documentsWithStats.map((doc) => doc.id).filter(Boolean)
@@ -3853,7 +3844,7 @@ function attachDocumentRelations(documents: DocumentListItem[]): DocumentListIte
     foldersByDoc.set(row.doc_id, rows)
   })
 
-  const normalizedDocuments = normalizeCompletedOcrDocuments(documentsWithStats)
+  const normalizedDocuments = normalizeCompletedOcrDocuments(documentsWithStats, options)
 
   return normalizedDocuments.map((doc) => {
     const tags = tagsByDoc.get(doc.id) || []
@@ -3902,7 +3893,9 @@ function listDocumentPage(options?: ListDocumentOptions): DocumentListPage {
     const { sql, params } = buildDocumentListQuery(normalizedOptions)
     const countQuery = buildDocumentListQuery(normalizedOptions, true)
     const rawItems = queryAll<DocumentListItem>(sql, params)
-    const items = attachDocumentRelations(rawItems)
+    const items = attachDocumentRelations(rawItems, {
+      inspectOcrRepairPages: options?.ocrNeedsRepair === true,
+    })
     const totalRow = queryOne<{ total: number }>(countQuery.sql, countQuery.params)
     const elapsedMs = Date.now() - startedAt
     if (elapsedMs >= 200) {
@@ -4182,6 +4175,8 @@ interface DocumentListOcrPageSummary {
   completed: number
   failed: number
   pending: number
+  failedPageNums: number[]
+  pendingPageNums: number[]
 }
 
 function getDocumentListOcrPageSummaries(docIds: string[]): Map<string, DocumentListOcrPageSummary> {
@@ -4193,8 +4188,8 @@ function getDocumentListOcrPageSummaries(docIds: string[]): Map<string, Document
       `SELECT
          doc_id,
          COUNT(*) as total,
-         SUM(CASE WHEN COALESCE(ocr_status, '') <> 'error' AND ${contentOk} THEN 1 ELSE 0 END) as completed,
-         SUM(CASE WHEN ocr_status = 'error' THEN 1 ELSE 0 END) as failed,
+         SUM(CASE WHEN ${contentOk} THEN 1 ELSE 0 END) as completed,
+         SUM(CASE WHEN ocr_status = 'error' AND NOT (${contentOk}) THEN 1 ELSE 0 END) as failed,
          SUM(CASE WHEN COALESCE(ocr_status, '') <> 'error' AND NOT (${contentOk}) THEN 1 ELSE 0 END) as pending
        FROM pages
        WHERE doc_id IN (${placeholders})
@@ -4208,7 +4203,24 @@ function getDocumentListOcrPageSummaries(docIds: string[]): Map<string, Document
         completed: Number(row.completed || 0),
         failed: Number(row.failed || 0),
         pending: Number(row.pending || 0),
+        failedPageNums: [],
+        pendingPageNums: [],
       })
+    })
+    queryAll<{ doc_id: string; page_num: number | null; ocr_status: string | null }>(
+      `SELECT doc_id, page_num, ocr_status
+       FROM pages
+       WHERE doc_id IN (${placeholders})
+         AND NOT (${contentOk})
+       ORDER BY doc_id, page_num`,
+      chunkIds,
+    ).forEach((row) => {
+      const pageNum = Math.floor(Number(row.page_num || 0))
+      if (!Number.isFinite(pageNum) || pageNum <= 0) return
+      const summary = summaries.get(row.doc_id)
+      if (!summary) return
+      if (String(row.ocr_status || '') === 'error') summary.failedPageNums.push(pageNum)
+      else summary.pendingPageNums.push(pageNum)
     })
   })
   return summaries
@@ -4248,41 +4260,38 @@ function formatDocumentListFailedPageNumberList(pageNums: Array<number | null | 
   return parts.join('、')
 }
 
-function listDocumentListOcrFailedPageNums(docId: string): number[] {
-  const rows = queryAll<{ page_num: number | null }>(
-    `SELECT page_num
-     FROM pages
-     WHERE doc_id = ? AND ocr_status = 'error'
-     ORDER BY page_num`,
-    [docId],
-  )
-  return rows
-    .map((row) => Math.floor(Number(row.page_num || 0)))
-    .filter((value) => Number.isFinite(value) && value > 0)
-}
-
-function getDocumentListOcrReviewMessage(doc: DocumentListItem): string {
+function getDocumentListOcrReviewMessage(doc: DocumentListItem, summary: DocumentListOcrPageSummary): string {
   const existingMessage = String(doc.error_message || '').trim()
   // Keep already-short notices written by OCR completion path.
-  if (/^OCR完成[，,]/.test(existingMessage) && /OCR 未成功/.test(existingMessage)) {
+  if (/^OCR待修复[：，,]/.test(existingMessage)) {
     return existingMessage
   }
-  const pageList = formatDocumentListFailedPageNumberList(listDocumentListOcrFailedPageNums(doc.id))
-  if (pageList) return `OCR完成，第 ${pageList} 页 OCR 未成功`
-  return existingMessage
-    ? `OCR完成，部分页面 OCR 未成功`
-    : 'OCR完成，部分页面 OCR 未成功'
+  const failedPageList = formatDocumentListFailedPageNumberList(summary.failedPageNums)
+  const pendingPageList = formatDocumentListFailedPageNumberList(summary.pendingPageNums)
+  const details: string[] = []
+  if (failedPageList) details.push(`第 ${failedPageList} 页 OCR 未成功`)
+  else if (summary.failed > 0) details.push(`${summary.failed} 页 OCR 未成功`)
+  if (pendingPageList) details.push(`第 ${pendingPageList} 页尚未识别`)
+  else if (summary.pending > 0) details.push(`${summary.pending} 页尚未识别`)
+  return details.length > 0
+    ? `OCR待修复：${details.join('；')}`
+    : existingMessage || 'OCR待修复：部分页面没有可用识别内容'
 }
 
-function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): DocumentListItem[] {
+function normalizeCompletedOcrDocuments(
+  documents: DocumentListItem[],
+  options?: { inspectOcrRepairPages?: boolean },
+): DocumentListItem[] {
   // Keep the common completed path free of page-table work. Only inconsistent
   // rows on the current (bounded) list page need a compact status/ref summary;
   // OCR payloads are not trimmed/parsed and filesystem paths are never probed.
-  const candidates = documents.filter((doc) => (
-    doc.ocr_status !== 'completed'
-    || doc.import_status !== 'processed'
-    || !!doc.error_message
-  ))
+  const candidates = options?.inspectOcrRepairPages
+    ? documents
+    : documents.filter((doc) => (
+        doc.ocr_status !== 'completed'
+        || doc.import_status !== 'processed'
+        || !!doc.error_message
+      ))
   if (candidates.length === 0) return documents
 
   const summaries = getDocumentListOcrPageSummaries(candidates.map((doc) => doc.id))
@@ -4320,12 +4329,20 @@ function normalizeCompletedOcrDocuments(documents: DocumentListItem[]): Document
     }
 
     if (isDocumentListOcrSettledWithReviewPages(withPageStats, summary)) {
-      const reviewMessage = getDocumentListOcrReviewMessage(withPageStats)
+      const reviewMessage = getDocumentListOcrReviewMessage(withPageStats, summary)
       reviewMessagesByDocId.set(doc.id, reviewMessage)
       return {
         ...withPageStats,
         ocr_status: 'completed',
         import_status: 'processed',
+        error_message: reviewMessage,
+      }
+    }
+
+    if (options?.inspectOcrRepairPages && (summary.failed > 0 || summary.pending > 0)) {
+      const reviewMessage = getDocumentListOcrReviewMessage(withPageStats, summary)
+      return {
+        ...withPageStats,
         error_message: reviewMessage,
       }
     }
@@ -4998,7 +5015,9 @@ export function registerDocumentIpc(): void {
 
   ipcMain.handle('documents:list', async (_event, options?: ListDocumentOptions): Promise<DocumentListItem[]> => {
     const { sql, params } = buildDocumentListQuery(options)
-    return attachDocumentRelations(queryAll<DocumentListItem>(sql, params))
+    return attachDocumentRelations(queryAll<DocumentListItem>(sql, params), {
+      inspectOcrRepairPages: options?.ocrNeedsRepair === true,
+    })
   })
 
   ipcMain.handle('documents:listPage', async (_event, options?: ListDocumentOptions): Promise<DocumentListPage> => {

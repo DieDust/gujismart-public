@@ -7,6 +7,12 @@ import type { LlmProviderProfile, OcrRecognizeLayoutBlock, OcrRecognizeResult } 
 import { isProtectedSettingKey } from './protected-settings'
 import { readProtectedSetting } from './settings-security'
 import { getVisionOcrConnectionState, isCurrentVisionOcrConnectionVerified } from './vision-ocr-verification'
+import {
+  getVisionMessageOutput,
+  isUnsupportedVisionRequestField,
+  normalizeVisionFallbackText,
+  shouldDisableVisionThinking,
+} from '../shared/vision-ocr-response'
 
 type JsonRecord = Record<string, unknown>
 
@@ -72,11 +78,14 @@ interface VisionSourcePage {
 
 interface VisionAttemptLog extends JsonRecord {
   useJsonMode: boolean
+  disableThinking: boolean
   status: number
   statusText: string
   requestId: string | null
   finishReason: unknown
   usage: unknown
+  contentLength: number
+  reasoningContentLength: number
   rawPreview: string
 }
 
@@ -84,6 +93,7 @@ interface VisionChatResponse extends JsonRecord {
   choices?: Array<{
     message?: {
       content?: unknown
+      reasoning_content?: unknown
     }
     finish_reason?: unknown
   }>
@@ -681,7 +691,7 @@ function buildVisionOcrPrompt(pageNum: number, docType?: string | null): string 
     '如果是报纸版面，按从右到左、同栏从上到下完整转录。每篇新闻、广告、栏目都应有 title block；正文必须进入紧随其后的 text block。不要把整版合成一段摘要。',
     '你是古籍、报纸和历史文献的视觉 OCR 与版面整理助手。',
     '请直接观察图片，不要只做普通 OCR。需要理解版面顺序、小字夹注、栏位、标题和目录线索。',
-    '只返回严格 JSON，不要 Markdown，不要解释。',
+    '不要输出思考过程或分析步骤，直接返回最终结果。只返回严格 JSON，不要 Markdown，不要解释。',
     'JSON 格式：{"text":"","layout_blocks":[{"words":"","label":"title|text|note|toc|table|caption|header_footer","rows":[[""]],"cells":[{"row":0,"col":0,"text":""}],"reading_order":0,"column_index":0,"orientation":"horizontal|vertical","location":{"left":0,"top":0,"width":0,"height":0},"confidence":0.0}],"toc_candidates":[{"title":"","level":1,"pageNum":1,"confidence":0.0}],"warnings":[]}',
     `当前为校对模式原始第 ${pageNum} 页。toc_candidates.pageNum 必须使用这个原始页码或图中明确出现的页码。`,
     '必须保留 layout_blocks。每个 block 应尽量包含 location 坐标，并在 text 字段中给出适合阅读和检索的完整正文。',
@@ -701,7 +711,7 @@ async function callVisionModelAttempt(page: VisionSourcePage, settings: VisionOc
   const imagePayload = await imagePathToDataUrl(page.image_path, settings)
   const imageUrl = imagePayload.dataUrl
   const promptText = promptOverride || buildVisionOcrPrompt(Number(page.page_num || 0), docType)
-  const requestBody = {
+  const requestBody: JsonRecord = {
     model: settings.model,
     messages: [
       {
@@ -715,7 +725,12 @@ async function callVisionModelAttempt(page: VisionSourcePage, settings: VisionOc
     temperature: 0.1,
     max_tokens: 12000,
   }
-  const sendRequest = async (useJsonMode: boolean) => {
+  const buildRequestBody = (useJsonMode: boolean, disableThinking: boolean): JsonRecord => ({
+    ...requestBody,
+    ...(disableThinking ? { thinking: { type: 'disabled' } } : {}),
+    ...(useJsonMode ? { response_format: { type: 'json_object' } } : {}),
+  })
+  const sendRequest = async (useJsonMode: boolean, disableThinking: boolean) => {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), settings.timeoutMs)
     try {
@@ -725,7 +740,7 @@ async function callVisionModelAttempt(page: VisionSourcePage, settings: VisionOc
           'Content-Type': 'application/json',
           Authorization: `Bearer ${settings.apiKey}`,
         },
-        body: JSON.stringify(useJsonMode ? { ...requestBody, response_format: { type: 'json_object' } } : requestBody),
+        body: JSON.stringify(buildRequestBody(useJsonMode, disableThinking)),
         signal: controller.signal,
       })
     } catch (error: unknown) {
@@ -738,34 +753,55 @@ async function callVisionModelAttempt(page: VisionSourcePage, settings: VisionOc
     }
   }
   const attempts: VisionAttemptLog[] = []
-  let usedJsonMode = true
-  let response = await sendRequest(true)
-  let responseText = await response.text().catch(() => '')
-  let data = parseResponseJson(responseText)
-  attempts.push({
-    useJsonMode: true,
-    status: response.status,
-    statusText: response.statusText,
-    requestId: response.headers.get('x-request-id') || response.headers.get('x-tt-logid') || response.headers.get('x-tt-trace-id') || null,
-    finishReason: data?.choices?.[0]?.finish_reason || null,
-    usage: data?.usage || null,
-    rawPreview: responseText.slice(0, 12000),
-  })
-  const errorMessage = getResponseErrorMessage(data, response.statusText || '')
-  if (!response.ok && /response_format|json_object|not supported|not valid/i.test(errorMessage)) {
-    usedJsonMode = false
-    response = await sendRequest(false)
+  let usedJsonMode = mode !== 'fallback_text'
+  let disabledThinking = shouldDisableVisionThinking(settings.baseUrl, settings.model)
+  let response!: Response
+  let responseText = ''
+  let data: VisionChatResponse = {}
+  let content = ''
+  let reasoningContent = ''
+  const executeRequest = async (): Promise<void> => {
+    response = await sendRequest(usedJsonMode, disabledThinking)
     responseText = await response.text().catch(() => '')
     data = parseResponseJson(responseText)
+    const output = getVisionMessageOutput(data)
+    content = output.content
+    reasoningContent = output.reasoningContent
     attempts.push({
-      useJsonMode: false,
+      useJsonMode: usedJsonMode,
+      disableThinking: disabledThinking,
       status: response.status,
       statusText: response.statusText,
       requestId: response.headers.get('x-request-id') || response.headers.get('x-tt-logid') || response.headers.get('x-tt-trace-id') || null,
       finishReason: data?.choices?.[0]?.finish_reason || null,
       usage: data?.usage || null,
+      contentLength: content.length,
+      reasoningContentLength: reasoningContent.length,
       rawPreview: responseText.slice(0, 12000),
     })
+  }
+  await executeRequest()
+  for (let fallbackCount = 0; fallbackCount < 2; fallbackCount += 1) {
+    const requestError = getResponseErrorMessage(data, response.statusText || '')
+    if ((!response.ok || data.error) && disabledThinking && isUnsupportedVisionRequestField(requestError, 'thinking')) {
+      disabledThinking = false
+      await executeRequest()
+      continue
+    }
+    if ((!response.ok || data.error) && usedJsonMode && isUnsupportedVisionRequestField(requestError, 'response_format')) {
+      usedJsonMode = false
+      await executeRequest()
+      continue
+    }
+    if (response.ok && !data.error && !content && usedJsonMode) {
+      // Some thinking models consume their entire output budget in reasoning_content
+      // and never emit a final JSON object. Retry once without JSON mode; the final
+      // fallback plan then accepts faithful plain OCR text instead of parsing ''.
+      usedJsonMode = false
+      await executeRequest()
+      continue
+    }
+    break
   }
   if (!response.ok || data.error) {
     const rawErrorMessage = getResponseErrorMessage(data, response.statusText || '')
@@ -792,12 +828,11 @@ async function callVisionModelAttempt(page: VisionSourcePage, settings: VisionOc
       baseTextLength: String(page.ocr_text || '').length,
       baseTextPreview: String(page.ocr_text || '').slice(0, 6000),
       promptText,
-      requestBodyPreview: redactDataUrl(JSON.stringify({ ...requestBody, response_format: usedJsonMode ? { type: 'json_object' } : undefined }, null, 2)).slice(0, 30000),
+      requestBodyPreview: redactDataUrl(JSON.stringify(buildRequestBody(usedJsonMode, disabledThinking), null, 2)).slice(0, 30000),
       attempts,
     })
     throw new Error(`视觉模型 OCR 请求失败：${friendlyErrorMessage}${logPath ? `；诊断日志：${logPath}` : ''}`)
   }
-  const content = rawPrimitiveText(data.choices?.[0]?.message?.content)
   const finishReason = data.choices?.[0]?.finish_reason || null
   const diagnosticBase = {
     createdAt: new Date().toISOString(),
@@ -816,23 +851,50 @@ async function callVisionModelAttempt(page: VisionSourcePage, settings: VisionOc
     baseTextLength: String(page.ocr_text || '').length,
     baseTextPreview: String(page.ocr_text || '').slice(0, 6000),
     promptText,
-    requestBodyPreview: redactDataUrl(JSON.stringify({ ...requestBody, response_format: usedJsonMode ? { type: 'json_object' } : undefined }, null, 2)).slice(0, 30000),
+    requestBodyPreview: redactDataUrl(JSON.stringify(buildRequestBody(usedJsonMode, disabledThinking), null, 2)).slice(0, 30000),
     attempts,
     finishReason,
     usage: data?.usage || null,
     finalContentPreview: String(content || '').slice(0, 30000),
+    reasoningContentLength: reasoningContent.length,
+    reasoningContentPreview: reasoningContent.slice(0, 3000),
   }
-  let parsed: JsonRecord
-  try {
-    parsed = parseModelJson(content)
-  } catch (error) {
+  if (!content) {
+    const errorMessage = reasoningContent
+      ? '视觉模型只返回了思考过程，未返回最终 OCR 内容。软件已自动关闭深度思考并尝试非 JSON 降级，但模型仍未给出可保存结果。'
+      : '视觉模型返回成功状态，但最终 OCR 内容为空。'
     const logPath = await writeVisionDiagnosticLog({
       ...diagnosticBase,
       ok: false,
-      errorStage: 'parse_json',
-      errorMessage: (error as Error)?.message || String(error),
+      errorStage: 'empty_final_content',
+      errorMessage,
     })
-    throw new Error(`${(error as Error)?.message || String(error)}${logPath ? `；诊断日志：${logPath}` : ''}`)
+    throw new Error(`${errorMessage}${logPath ? `；诊断日志：${logPath}` : ''}`)
+  }
+  let parsed: JsonRecord
+  if (mode === 'fallback_text') {
+    try {
+      parsed = parseModelJson(content)
+    } catch {
+      const fallbackText = normalizeVisionFallbackText(content)
+      if (!fallbackText) throw new Error('视觉模型纯文本降级结果为空')
+      parsed = {
+        text: fallbackText,
+        warnings: ['视觉模型结构化 JSON 输出失败，本页已使用纯文本 OCR 降级结果。'],
+      }
+    }
+  } else {
+    try {
+      parsed = parseModelJson(content)
+    } catch (error) {
+      const logPath = await writeVisionDiagnosticLog({
+        ...diagnosticBase,
+        ok: false,
+        errorStage: 'parse_json',
+        errorMessage: (error as Error)?.message || String(error),
+      })
+      throw new Error(`${(error as Error)?.message || String(error)}${logPath ? `；诊断日志：${logPath}` : ''}`)
+    }
   }
   let normalized: VisionOcrResult
   try {
@@ -871,16 +933,15 @@ function sleep(ms: number): Promise<void> {
 
 function isRetryableVisionError(error: unknown): boolean {
   const message = String((error as Error)?.message || error || '')
-  return /5\d\d|429|internal error|unexpected internal|temporar|timeout|timed out|overload|rate limit|ECONN|fetch/i.test(message)
+  return /5\d\d|429|internal error|unexpected internal|temporar|timeout|timed out|overload|rate limit|ECONN|fetch|只返回了思考过程|最终 OCR 内容为空|empty final content/i.test(message)
 }
 
 function buildVisionOcrFallbackPrompt(pageNum: number): string {
   return [
-    'Return strict JSON only.',
-    'OCR this image as completely as possible. Do not summarize. Do not use ellipsis for skipped visible text.',
+    'Return only the final OCR transcription as plain text. Do not return JSON, Markdown fences, analysis, or reasoning.',
+    'Start immediately with the transcribed page text. OCR this image as completely as possible. Do not summarize. Do not use ellipsis for skipped visible text.',
     'For a newspaper, read columns from right to left and each column from top to bottom.',
     'Use one dominant orientation for normal body text; vertical historical text reads right to left.',
-    'Use this schema: {"text":"","layout_blocks":[{"words":"","label":"text|title|table","rows":[[""]],"cells":[],"reading_order":0,"column_index":0,"orientation":"horizontal|vertical"}],"toc_candidates":[],"warnings":[]}.',
     `The original proofing page number is ${pageNum}.`,
   ].join('\n')
 }
@@ -963,7 +1024,7 @@ function filterVisionStructureAgainstBaseText(refined: VisionOcrResult, baseText
 function buildVisionRefinePrompt(pageNum: number, baseText: string): string {
   const titleCandidates = extractTitleCandidatesFromBaseText(baseText).slice(0, 80)
   return [
-    'Return strict JSON only.',
+    'Do not output analysis or reasoning. Return the final strict JSON object immediately.',
     'You are doing hybrid OCR correction. Compare the page image with base_text and return a corrected full text plus layout structure.',
     'You may fix OCR mistakes, missing characters, wrong line breaks, table rows/columns, headings, notes, and toc anchors.',
     'Do not summarize, translate, modernize wording, invent invisible content, or change the meaning. If unclear, use □ or [疑字].',
@@ -981,7 +1042,7 @@ function buildVisionRefinePrompt(pageNum: number, baseText: string): string {
 
 function buildVisionOcrNewspaperFullTextPrompt(pageNum: number): string {
   return [
-    'Return strict JSON only.',
+    'Do not output analysis or reasoning. Return the final strict JSON object immediately.',
     'This is a historical newspaper page. Your top priority is COMPLETE TEXT TRANSCRIPTION, not summarization.',
     'Read from right to left by columns, and from top to bottom within each column.',
     'Transcribe every visible title, advertisement, notice, news item, and commentary. Do not output only the headings.',

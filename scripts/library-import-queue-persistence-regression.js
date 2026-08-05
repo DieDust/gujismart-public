@@ -327,9 +327,14 @@ assert(
     && runOcrInConfiguredBatchesBody.includes('visionProfileId: options?.visionProfileId')
     && handleRetryFailedPagesBody.includes('{ retryFailedPagesOnly: true, visionProfileId }')
     && !handleRetryFailedPagesBody.includes('forceFullRerun: true')
+    && handleRetryFailedPagesBody.includes("const retryEngine = engine || 'paddle'")
+    && !handleRetryFailedPagesBody.includes('const storedEngine = parseDocMetadata(doc).ocr_engine')
+    && librarySource.includes("if (doc.ocr_status !== 'completed' && doc.ocr_status !== 'error') return false")
     && handleRetryFailedPagesBody.includes('await hasOcrEngineConfig(retryEngine, visionProfileId)')
+    && librarySource.includes('handleRetryFailedPages(doc, selection.engine, selection.visionProfileId)')
+    && librarySource.includes('handleForceRerunDocument(doc, selection.engine, selection.visionProfileId)')
     && handleRetryFailedPagesBody.includes('已成功页和人工校对内容会保留'),
-  'Failed-page OCR should use hierarchical Paddle/profile menus while preserving completed and proofed text.',
+  'Failed-page OCR direct click should default to Paddle while explicit profile menus preserve their selected model and proofed text.',
 )
 assert(
   librarySource.includes("buildOcrEngineSubmenu('ocr_failed', '只重跑所选错页'")

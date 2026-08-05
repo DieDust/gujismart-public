@@ -702,7 +702,7 @@ function shouldShowRetryAction(doc: DocumentItem): boolean {
 }
 
 function hasOcrFailedPages(doc: DocumentItem): boolean {
-  if (doc.ocr_status !== 'completed') return false
+  if (doc.ocr_status !== 'completed' && doc.ocr_status !== 'error') return false
   const pageCount = getEffectivePageCount(doc)
   if (pageCount <= 0) return false
   const completedPages = Math.max(
@@ -846,6 +846,14 @@ interface OcrProgressInfo {
   errorMessage?: string
   canceled?: boolean
   updatedAt: number
+}
+
+function buildLibraryOcrActivitySummary(items: OcrProgressInfo[], documents: DocumentItem[]): string | null {
+  const titleByDocId = new Map(documents.map((doc) => [doc.id, doc.title || '未命名文献']))
+  return buildOcrActivitySummary(items.map((item) => ({
+    ...item,
+    title: titleByDocId.get(item.docId),
+  })))
 }
 
 interface BookTranslationProgressInfo {
@@ -2317,9 +2325,9 @@ function DocumentVirtualRow({
     activeVisionProfileId: context.activeVisionOcrProfileId,
     onOcrDefaultSelect: (action, selection) => {
       if (action === 'retry_failed_ocr_pages') {
-        void context.handleRetryFailedPages(doc, selection.engine)
+        void context.handleRetryFailedPages(doc, selection.engine, selection.visionProfileId)
       } else {
-        void context.handleForceRerunDocument(doc, selection.engine)
+        void context.handleForceRerunDocument(doc, selection.engine, selection.visionProfileId)
       }
     },
   })
@@ -3599,7 +3607,7 @@ export default function LibraryView({
       }
     }
 
-    const activitySummary = buildOcrActivitySummary(Object.values(nextProgressByDoc))
+    const activitySummary = buildLibraryOcrActivitySummary(Object.values(nextProgressByDoc), documentsRef.current)
     const mergedOcrToast = mergeOcrToastContent(activitySummary, ocrBatchProgressTextRef.current)
     if (mergedOcrToast) {
       activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
@@ -5091,7 +5099,7 @@ export default function LibraryView({
 
   const showSharedOcrProgressToast = (content: string) => {
     ocrBatchProgressTextRef.current = content
-    const activitySummary = buildOcrActivitySummary(Object.values(ocrProgressByDocRef.current))
+    const activitySummary = buildLibraryOcrActivitySummary(Object.values(ocrProgressByDocRef.current), documentsRef.current)
     const merged = mergeOcrToastContent(activitySummary, content) || content
     activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
     message.loading({ content: merged, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
@@ -5100,7 +5108,7 @@ export default function LibraryView({
   const clearSharedOcrProgressToast = (options?: { keepIfActiveDocs?: boolean }) => {
     ocrBatchProgressTextRef.current = null
     if (options?.keepIfActiveDocs) {
-      const activitySummary = buildOcrActivitySummary(Object.values(ocrProgressByDocRef.current))
+      const activitySummary = buildLibraryOcrActivitySummary(Object.values(ocrProgressByDocRef.current), documentsRef.current)
       if (activitySummary) {
         activeOcrToastKeysRef.current.add(OCR_ACTIVITY_MESSAGE_KEY)
         message.loading({ content: activitySummary, key: OCR_ACTIVITY_MESSAGE_KEY, duration: 0 })
@@ -6537,8 +6545,9 @@ export default function LibraryView({
       return
     }
 
-    const storedEngine = parseDocMetadata(doc).ocr_engine
-    const retryEngine = engine || (isOcrEngine(storedEngine) ? storedEngine : 'paddle')
+    // A direct click on “重新 OCR 错页” is deliberately Paddle. Vision/local/hybrid
+    // are explicit submenu choices and must never be inherited from an older run.
+    const retryEngine = engine || 'paddle'
     const hasConfig = await hasOcrEngineConfig(retryEngine, visionProfileId)
     if (!hasConfig) {
       message.warning(retryEngine === 'vision_model'
@@ -6565,6 +6574,8 @@ export default function LibraryView({
       } else {
         message.warning({ content: '错页补跑未完成，请查看失败原因后再试', key: OCR_RESULT_MESSAGE_KEY, duration: 5 })
       }
+      await loadDocuments(filter, { silent: true, reset: true })
+      scheduleSmartViewCountsRefresh(0)
     } catch (error) {
       console.error(error)
       clearSharedOcrProgressToast()
@@ -8459,9 +8470,9 @@ export default function LibraryView({
                 activeVisionProfileId: activeVisionOcrProfileId,
                 onOcrDefaultSelect: (action, selection) => {
                   if (action === 'retry_failed_ocr_pages') {
-                    void handleRetryFailedPages(doc, selection.engine)
+                    void handleRetryFailedPages(doc, selection.engine, selection.visionProfileId)
                   } else {
-                    void handleForceRerunDocument(doc, selection.engine)
+                    void handleForceRerunDocument(doc, selection.engine, selection.visionProfileId)
                   }
                 },
               })

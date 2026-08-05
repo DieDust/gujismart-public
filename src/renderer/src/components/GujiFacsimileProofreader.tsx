@@ -20,6 +20,13 @@ import { getErrorMessage } from '@shared/errors'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import OpenCC from 'opencc-js'
 import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
+import FacsimileTableEditor from './FacsimileTableEditor'
+import {
+  buildFacsimileTableCells,
+  getFacsimileTableMergesFromCells,
+  normalizeFacsimileTableRows,
+  type FacsimileTableMerge,
+} from '../utils/facsimileTableEditing'
 import { renderOcrInlineText } from '../utils/ocrInlineRender'
 import {
   getOcrBlockRect,
@@ -40,6 +47,11 @@ import type { Document, DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResul
 
 type ProofDisplayScript = 'original' | 'simplified' | 'traditional'
 type BlockRect = { left: number; top: number; width: number; height: number }
+type BlockResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw'
+type LayoutPointerInteraction =
+  | { kind: 'create'; start: { x: number; y: number }; current: { x: number; y: number } }
+  | { kind: 'move'; sourceIndex: number; start: { x: number; y: number }; startRect: BlockRect }
+  | { kind: 'resize'; sourceIndex: number; handle: BlockResizeHandle; start: { x: number; y: number }; startRect: BlockRect }
 type JsonRecord = Record<string, unknown>
 type FacsimileOcrResult = OcrRecognizeResult & JsonRecord
 type LayoutBlock = OcrRecognizeLayoutBlock & JsonRecord & {
@@ -108,6 +120,7 @@ type FacsimileBlockRenderLayout = {
   labelName: string
   isImage: boolean
   tableRows: string[][]
+  tableMerges: FacsimileTableMerge[]
   orientation: 'vertical' | 'horizontal'
   originalText: string
   shouldRenderTable: boolean
@@ -457,6 +470,15 @@ function tableRowsToPlainText(rows: string[][]): string {
   return rows.map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join('')).filter(Boolean).join('\n')
 }
 
+function getBlockTableCells(block: unknown): unknown[] {
+  const value = firstRecordValue(block, ['cells', 'table_cells', 'tableCells'])
+  return Array.isArray(value) ? value : []
+}
+
+function getBlockTableMerges(block: unknown, rows: string[][]): FacsimileTableMerge[] {
+  return getFacsimileTableMergesFromCells(getBlockTableCells(block), rows.length, rows[0]?.length || 1)
+}
+
 function tableRowsToVerticalColumnText(rows: string[][]): string {
   const columnCount = Math.max(1, ...rows.map((row) => row.length))
   if (rows.length <= 4 && columnCount >= 4) {
@@ -514,7 +536,8 @@ function isLikelyVerticalPseudoTableBlock(block: unknown): boolean {
 }
 
 function shouldRenderAsTableBlock(block: unknown, pageVerticalMode = false): boolean {
-  return isRenderableTableBlock(block) && !(pageVerticalMode && isLikelyVerticalPseudoTableBlock(block))
+  const manuallyEdited = String(readRecordValue(block, 'segmentation_source') || '').toLowerCase() === 'manual'
+  return isRenderableTableBlock(block) && (manuallyEdited || !(pageVerticalMode && isLikelyVerticalPseudoTableBlock(block)))
 }
 
 function getBlockImagePath(block: unknown): string {
@@ -1555,7 +1578,13 @@ function renderFormattedText(text: string, keyword: string, highlight: boolean, 
   return nodes
 }
 
-function renderFacsimileTable(rows: string[][], keyword: string, highlight: boolean, activeHitOrdinal = -1) {
+function renderFacsimileTable(
+  rows: string[][],
+  merges: FacsimileTableMerge[],
+  keyword: string,
+  highlight: boolean,
+  activeHitOrdinal = -1,
+) {
   let cellHitCursor = 0
   return (
     <table style={{ width: '100%', height: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
@@ -1563,6 +1592,11 @@ function renderFacsimileTable(rows: string[][], keyword: string, highlight: bool
         {rows.map((row, rowIndex) => (
           <tr key={rowIndex}>
             {row.map((cell, cellIndex) => {
+              const merge = merges.find((item) => (
+                rowIndex >= item.row && rowIndex < item.row + item.rowSpan
+                && cellIndex >= item.col && cellIndex < item.col + item.colSpan
+              ))
+              if (merge && (merge.row !== rowIndex || merge.col !== cellIndex)) return null
               const normalizedCell = normalizeSearchText(cell)
               const normalizedKeyword = normalizeSearchText(keyword)
               let cellHitCount = 0
@@ -1580,7 +1614,7 @@ function renderFacsimileTable(rows: string[][], keyword: string, highlight: bool
                 : -1
               cellHitCursor += cellHitCount
               return (
-                <td key={cellIndex} style={{ border: '1px solid rgba(64,48,32,0.28)', padding: 2, verticalAlign: 'top', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal', lineHeight: 1.18, overflow: 'hidden' }}>
+                <td key={cellIndex} rowSpan={merge?.rowSpan} colSpan={merge?.colSpan} style={{ border: '1px solid rgba(64,48,32,0.28)', padding: 2, verticalAlign: 'top', wordBreak: 'break-word', overflowWrap: 'anywhere', whiteSpace: 'normal', lineHeight: 1.18, overflow: 'hidden' }}>
                   {renderFormattedText(cell, keyword, highlight && cellHitCount > 0, activeCellOrdinal)}
                 </td>
               )
@@ -1598,6 +1632,73 @@ function getScaledRect(rect: BlockRect, bounds: { width: number; height: number;
 
 function clampZoom(value: number): number {
   return Math.round(clamp(value, FACSIMILE_MIN_ZOOM, FACSIMILE_MAX_ZOOM) * 100) / 100
+}
+
+const BLOCK_RESIZE_HANDLES: Array<{ handle: BlockResizeHandle; left: number; top: number; cursor: CSSProperties['cursor'] }> = [
+  { handle: 'nw', left: 0, top: 0, cursor: 'nwse-resize' },
+  { handle: 'n', left: 50, top: 0, cursor: 'ns-resize' },
+  { handle: 'ne', left: 100, top: 0, cursor: 'nesw-resize' },
+  { handle: 'e', left: 100, top: 50, cursor: 'ew-resize' },
+  { handle: 'se', left: 100, top: 100, cursor: 'nwse-resize' },
+  { handle: 's', left: 50, top: 100, cursor: 'ns-resize' },
+  { handle: 'sw', left: 0, top: 100, cursor: 'nesw-resize' },
+  { handle: 'w', left: 0, top: 50, cursor: 'ew-resize' },
+]
+
+function rectFromPointerPoints(start: { x: number; y: number }, current: { x: number; y: number }): BlockRect {
+  return {
+    left: Math.min(start.x, current.x),
+    top: Math.min(start.y, current.y),
+    width: Math.abs(current.x - start.x),
+    height: Math.abs(current.y - start.y),
+  }
+}
+
+function clampBlockRect(rect: BlockRect, bounds: { width: number; height: number; offsetLeft: number; offsetTop: number }): BlockRect {
+  const minWidth = Math.max(8, bounds.width * 0.008)
+  const minHeight = Math.max(8, bounds.height * 0.008)
+  const maxRight = bounds.offsetLeft + bounds.width
+  const maxBottom = bounds.offsetTop + bounds.height
+  const left = clamp(rect.left, bounds.offsetLeft, Math.max(bounds.offsetLeft, maxRight - minWidth))
+  const top = clamp(rect.top, bounds.offsetTop, Math.max(bounds.offsetTop, maxBottom - minHeight))
+  return {
+    left,
+    top,
+    width: clamp(rect.width, minWidth, Math.max(minWidth, maxRight - left)),
+    height: clamp(rect.height, minHeight, Math.max(minHeight, maxBottom - top)),
+  }
+}
+
+function resizeBlockRect(
+  startRect: BlockRect,
+  handle: BlockResizeHandle,
+  deltaX: number,
+  deltaY: number,
+  bounds: { width: number; height: number; offsetLeft: number; offsetTop: number },
+): BlockRect {
+  let left = startRect.left
+  let top = startRect.top
+  let right = startRect.left + startRect.width
+  let bottom = startRect.top + startRect.height
+  if (handle.includes('w')) left += deltaX
+  if (handle.includes('e')) right += deltaX
+  if (handle.includes('n')) top += deltaY
+  if (handle.includes('s')) bottom += deltaY
+  const minWidth = Math.max(8, bounds.width * 0.008)
+  const minHeight = Math.max(8, bounds.height * 0.008)
+  if (right - left < minWidth) {
+    if (handle.includes('w')) left = right - minWidth
+    else right = left + minWidth
+  }
+  if (bottom - top < minHeight) {
+    if (handle.includes('n')) top = bottom - minHeight
+    else bottom = top + minHeight
+  }
+  left = clamp(left, bounds.offsetLeft, bounds.offsetLeft + bounds.width - minWidth)
+  top = clamp(top, bounds.offsetTop, bounds.offsetTop + bounds.height - minHeight)
+  right = clamp(right, left + minWidth, bounds.offsetLeft + bounds.width)
+  bottom = clamp(bottom, top + minHeight, bounds.offsetTop + bounds.height)
+  return { left, top, width: right - left, height: bottom - top }
 }
 
 function shouldIgnoreCanvasDrag(target: EventTarget | null): boolean {
@@ -1618,7 +1719,9 @@ function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofSta
   const normalizedBlocks = blocks.map((block, index) => {
     const { __rect, __synthetic, __sourceIndex, ...rest } = block
     const orientation = inferPageAwareOrientation(block, pageVerticalMode)
-    const pseudoTable = pageVerticalMode && isLikelyVerticalPseudoTableBlock(block)
+    const pseudoTable = pageVerticalMode
+      && String(block.segmentation_source || '').toLowerCase() !== 'manual'
+      && isLikelyVerticalPseudoTableBlock(block)
     const words = pseudoTable ? getPseudoTableText(block) : getBlockText(block)
     return {
       ...rest,
@@ -1764,11 +1867,17 @@ export default function GujiFacsimileProofreader({
   const fitWidthRef = useRef(true)
   const pageRotationRef = useRef(0)
   const dragStartRef = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
+  const blocksRef = useRef<LayoutBlock[]>([])
+  const layoutInteractionRef = useRef<LayoutPointerInteraction | null>(null)
   const [blocks, setBlocks] = useState<LayoutBlock[]>([])
   const [history, setHistory] = useState<LayoutBlock[][]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [editingIndex, setEditingIndex] = useState(-1)
   const [editValue, setEditValue] = useState('')
+  const [tableDraftRows, setTableDraftRows] = useState<string[][]>([['']])
+  const [tableDraftMerges, setTableDraftMerges] = useState<FacsimileTableMerge[]>([])
+  const [layoutEditMode, setLayoutEditMode] = useState(false)
+  const [draftCreateRect, setDraftCreateRect] = useState<BlockRect | null>(null)
   const [showRules, setShowRules] = useState(loadPersistedShowRules)
   const [fontScale, setFontScale] = useState(loadPersistedFontScale)
   const [pageZoom, setPageZoom] = useState(1)
@@ -1817,12 +1926,21 @@ export default function GujiFacsimileProofreader({
   useEffect(() => {
     const nextBlocks = splitStackedVerticalBlocks(splitWideVerticalBlocks(normalizePageOrientations(normalizeBlocks(ocrResult), effectivePreferVerticalLayout)))
     setBlocks(nextBlocks)
+    blocksRef.current = nextBlocks
     setHistory([nextBlocks.map((block) => ({ ...block }))])
     setHistoryIndex(0)
     setEditingIndex(-1)
     setEditValue('')
+    setTableDraftRows([['']])
+    setTableDraftMerges([])
+    setDraftCreateRect(null)
+    layoutInteractionRef.current = null
     translationRequestKeyRef.current = ''
   }, [effectivePreferVerticalLayout, ocrResult, pageId])
+
+  useEffect(() => {
+    blocksRef.current = blocks
+  }, [blocks])
 
   useEffect(() => {
     setIsPanning(false)
@@ -2046,6 +2164,7 @@ export default function GujiFacsimileProofreader({
     const isTable = shouldRenderAsTableBlock(block, pageVerticalMode)
     const isImage = isImageLabel(label)
     const tableRows = isTable ? getBlockTableRows(block) : []
+    const tableMerges = isTable ? getBlockTableMerges(block, tableRows) : []
     const orientation = isTable ? 'horizontal' : inferPageAwareOrientation(block, pageVerticalMode)
     const originalText = !isTable && isLikelyVerticalPseudoTableBlock(block) ? getPseudoTableText(block) : getBlockText(block)
     const shouldRenderTable = isTable
@@ -2077,6 +2196,7 @@ export default function GujiFacsimileProofreader({
       labelName,
       isImage,
       tableRows,
+      tableMerges,
       orientation,
       originalText,
       shouldRenderTable,
@@ -2155,10 +2275,13 @@ export default function GujiFacsimileProofreader({
       __sourceIndex: getBlockSourceIndex(block, index),
     }))
     setBlocks(normalizedBlocks)
+    blocksRef.current = normalizedBlocks
     pushHistory(normalizedBlocks)
     persistBlocks(normalizedBlocks)
     setEditingIndex(-1)
     setEditValue('')
+    setTableDraftRows([['']])
+    setTableDraftMerges([])
     if (typeof nextActiveIndex === 'number') onSelectBox?.(nextActiveIndex)
   }, [effectivePreferVerticalLayout, onSelectBox, persistBlocks, pushHistory])
 
@@ -2167,18 +2290,63 @@ export default function GujiFacsimileProofreader({
     const nextBlocks = history[historyIndex - 1].map((block) => ({ ...block }))
     setHistoryIndex(historyIndex - 1)
     setBlocks(nextBlocks)
+    blocksRef.current = nextBlocks
     persistBlocks(nextBlocks)
     setEditingIndex(-1)
     setEditValue('')
+    setTableDraftRows([['']])
+    setTableDraftMerges([])
   }, [canUndo, history, historyIndex, persistBlocks])
+
+  const beginEditBlock = useCallback((sourceIndex: number) => {
+    const target = blocks.find((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
+    if (!target || isImageLabel(getLabel(target))) return
+    setImageUnderlayMode('on')
+    setShowRules(true)
+    setEditingIndex(sourceIndex)
+    setEditValue(getBlockText(target))
+    if (isRenderableTableBlock(target)) {
+      const rows = normalizeFacsimileTableRows(getBlockTableRows(target))
+      setTableDraftRows(rows)
+      setTableDraftMerges(getBlockTableMerges(target, rows))
+    } else {
+      setTableDraftRows([['']])
+      setTableDraftMerges([])
+    }
+    onSelectBox?.(sourceIndex)
+  }, [blocks, onSelectBox])
 
   const handleSaveBlock = useCallback(() => {
     if (editingIndex < 0) return
-    const nextBlocks = blocks.map((block, index) => getBlockSourceIndex(block, index) === editingIndex
-      ? { ...block, words: editValue, rows: undefined, table_rows: undefined, tableRows: undefined, cells: undefined, table_cells: undefined, tableCells: undefined, html: undefined, table_html: undefined, tableHtml: undefined, markdown: undefined, md: undefined }
-      : block)
+    const nextBlocks = blocks.map((block, index) => {
+      if (getBlockSourceIndex(block, index) !== editingIndex) return block
+      if (isRenderableTableBlock(block)) {
+        const rows = normalizeFacsimileTableRows(tableDraftRows)
+        const cells = buildFacsimileTableCells(rows, tableDraftMerges)
+        return {
+          ...block,
+          words: tableRowsToPlainText(rows),
+          label: 'table',
+          type: block.type === 'text' ? 'table' : block.type,
+          block_type: block.block_type === 'text' ? 'table' : block.block_type,
+          rows,
+          table_rows: rows,
+          tableRows: rows,
+          cells,
+          table_cells: cells,
+          tableCells: cells,
+          html: undefined,
+          table_html: undefined,
+          tableHtml: undefined,
+          markdown: undefined,
+          md: undefined,
+          segmentation_source: 'manual',
+        }
+      }
+      return { ...block, words: editValue, rows: undefined, table_rows: undefined, tableRows: undefined, cells: undefined, table_cells: undefined, tableCells: undefined, html: undefined, table_html: undefined, tableHtml: undefined, markdown: undefined, md: undefined, segmentation_source: 'manual' }
+    })
     commitBlocks(nextBlocks, editingIndex)
-  }, [blocks, commitBlocks, editValue, editingIndex])
+  }, [blocks, commitBlocks, editValue, editingIndex, tableDraftMerges, tableDraftRows])
 
   const handleDeleteBlock = useCallback((sourceIndex: number) => {
     const target = blocks.find((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
@@ -2237,6 +2405,143 @@ export default function GujiFacsimileProofreader({
     })
     commitBlocks(nextBlocks, sourceIndex)
   }, [blocks, commitBlocks, effectivePreferVerticalLayout])
+
+  const getPointerCoordinate = useCallback((clientX: number, clientY: number) => {
+    const page = pageRef.current
+    if (!page) return null
+    const rect = page.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return null
+    return {
+      x: bounds.offsetLeft + clamp((clientX - rect.left) / rect.width, 0, 1) * bounds.width,
+      y: bounds.offsetTop + clamp((clientY - rect.top) / rect.height, 0, 1) * bounds.height,
+    }
+  }, [bounds.height, bounds.offsetLeft, bounds.offsetTop, bounds.width])
+
+  const startBlockInteraction = useCallback((
+    event: ReactMouseEvent,
+    sourceIndex: number,
+    rect: BlockRect,
+    handle?: BlockResizeHandle,
+  ) => {
+    if (!layoutEditMode || event.button !== 0) return
+    const point = getPointerCoordinate(event.clientX, event.clientY)
+    if (!point) return
+    event.preventDefault()
+    event.stopPropagation()
+    onSelectBox?.(sourceIndex)
+    layoutInteractionRef.current = handle
+      ? { kind: 'resize', sourceIndex, handle, start: point, startRect: { ...rect } }
+      : { kind: 'move', sourceIndex, start: point, startRect: { ...rect } }
+  }, [getPointerCoordinate, layoutEditMode, onSelectBox])
+
+  const handlePageLayoutMouseDown = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!layoutEditMode || event.button !== 0) return
+    if (event.target instanceof HTMLElement && event.target.closest('[data-guji-block-index],button,input,textarea')) return
+    const point = getPointerCoordinate(event.clientX, event.clientY)
+    if (!point) return
+    event.preventDefault()
+    event.stopPropagation()
+    layoutInteractionRef.current = { kind: 'create', start: point, current: point }
+    setDraftCreateRect({ left: point.x, top: point.y, width: 0, height: 0 })
+    onSelectBox?.(-1)
+  }, [getPointerCoordinate, layoutEditMode, onSelectBox])
+
+  const toggleLayoutEditMode = useCallback(() => {
+    setLayoutEditMode((current) => {
+      const next = !current
+      if (next) {
+        setImageUnderlayMode('on')
+        setShowRules(true)
+        setTranslationOpen(false)
+        setEditingIndex(-1)
+        setEditValue('')
+        pageRotationRef.current = 0
+        setPageRotation(0)
+      } else {
+        layoutInteractionRef.current = null
+        setDraftCreateRect(null)
+      }
+      return next
+    })
+  }, [setTranslationOpen])
+
+  useEffect(() => {
+    if (!layoutEditMode) return undefined
+    const handleMove = (event: MouseEvent) => {
+      const interaction = layoutInteractionRef.current
+      if (!interaction) return
+      const point = getPointerCoordinate(event.clientX, event.clientY)
+      if (!point) return
+      if (interaction.kind === 'create') {
+        interaction.current = point
+        setDraftCreateRect(clampBlockRect(rectFromPointerPoints(interaction.start, point), bounds))
+        return
+      }
+      const deltaX = point.x - interaction.start.x
+      const deltaY = point.y - interaction.start.y
+      const nextRect = interaction.kind === 'move'
+        ? clampBlockRect({
+            ...interaction.startRect,
+            left: interaction.startRect.left + deltaX,
+            top: interaction.startRect.top + deltaY,
+          }, bounds)
+        : resizeBlockRect(interaction.startRect, interaction.handle, deltaX, deltaY, bounds)
+      setBlocks((current) => {
+        const next = current.map((block, index) => getBlockSourceIndex(block, index) === interaction.sourceIndex
+          ? {
+              ...block,
+              location: { left: nextRect.left, top: nextRect.top, width: nextRect.width, height: nextRect.height },
+              __rect: nextRect,
+              __synthetic: false,
+              segmentation_source: 'manual',
+            }
+          : block)
+        blocksRef.current = next
+        return next
+      })
+    }
+    const handleUp = () => {
+      const interaction = layoutInteractionRef.current
+      if (!interaction) return
+      layoutInteractionRef.current = null
+      if (interaction.kind === 'create') {
+        const rect = clampBlockRect(rectFromPointerPoints(interaction.start, interaction.current), bounds)
+        setDraftCreateRect(null)
+        if (rect.width < bounds.width * 0.012 || rect.height < bounds.height * 0.012) return
+        const sourceIndex = blocksRef.current.reduce((max, block, index) => Math.max(max, getBlockSourceIndex(block, index)), -1) + 1
+        const orientation = pageVerticalMode ? 'vertical' : 'horizontal'
+        const nextBlock: LayoutBlock = {
+          words: '',
+          label: 'text',
+          type: 'text',
+          reading_order: blocksRef.current.length,
+          orientation,
+          orientation_source: 'manual',
+          source_orientation: orientation,
+          source_orientation_source: 'manual',
+          segmentation_source: 'manual',
+          location: rect,
+          __rect: rect,
+          __synthetic: false,
+          __sourceIndex: sourceIndex,
+        }
+        const nextBlocks = [...blocksRef.current, nextBlock]
+        commitBlocks(nextBlocks, sourceIndex)
+        setEditingIndex(sourceIndex)
+        setEditValue('')
+        setTableDraftRows([['']])
+        setTableDraftMerges([])
+        return
+      }
+      commitBlocks(blocksRef.current, interaction.sourceIndex)
+    }
+    document.addEventListener('mousemove', handleMove)
+    document.addEventListener('mouseup', handleUp)
+    return () => {
+      document.removeEventListener('mousemove', handleMove)
+      document.removeEventListener('mouseup', handleUp)
+    }
+  }, [bounds, commitBlocks, getPointerCoordinate, layoutEditMode, pageVerticalMode])
 
   useEffect(() => {
     if (editingIndex >= 0 && !editingBlock) {
@@ -2462,7 +2767,7 @@ export default function GujiFacsimileProofreader({
     </div>
   )
 
-  if (blocks.length === 0) return <Empty description="当前页面没有可还原的 OCR 版面" />
+  if (blocks.length === 0 && !pageImageSrc) return <Empty description="当前页面没有可还原的 OCR 版面或底图" />
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 8, position: 'relative' }}>
@@ -2499,7 +2804,7 @@ export default function GujiFacsimileProofreader({
             <Button size="small" icon={<PlusOutlined />} disabled={fontScale >= FACSIMILE_FONT_SCALE_MAX} onClick={() => setFontScale((value) => normalizeFontScale(value + FACSIMILE_FONT_SCALE_STEP))} />
           </Space>
           <Switch size="small" checked={fitWidth} onChange={setFitWidth} checkedChildren="适宽" unCheckedChildren="缩放" />
-          <Button size="small" icon={<RotateRightOutlined />} onClick={rotatePage}>
+          <Button size="small" icon={<RotateRightOutlined />} disabled={layoutEditMode} onClick={rotatePage}>
             旋转
           </Button>
           <Space size={6}>
@@ -2543,6 +2848,10 @@ export default function GujiFacsimileProofreader({
           <Popover trigger="click" placement="bottomLeft" title="显示设置" content={displaySettingsContent}>
             <Button size="small" icon={<SettingOutlined />}>显示设置</Button>
           </Popover>
+          <Button size="small" type={layoutEditMode ? 'primary' : 'default'} icon={<EditOutlined />} onClick={toggleLayoutEditMode}>
+            {layoutEditMode ? '完成版式编辑' : '编辑版式'}
+          </Button>
+          {layoutEditMode ? <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>空白处拖拽新建文本框；拖动框移动，拖动蓝色控制点缩放</span> : null}
         </Space>
         <Button size="small" icon={<UndoOutlined />} disabled={!canUndo} onClick={handleUndo}>撤销</Button>
       </div>
@@ -2553,10 +2862,10 @@ export default function GujiFacsimileProofreader({
         onKeyUp={captureSelection}
         onWheel={handleCanvasWheel}
         onMouseDown={handleCanvasMouseDown}
-        style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#d4dbea', borderRadius: 6, padding: 18, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', cursor: isPanning ? 'grabbing' : 'grab', userSelect: isPanning ? 'none' : undefined }}
+        style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#d4dbea', borderRadius: 6, padding: 18, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', cursor: layoutEditMode ? 'default' : isPanning ? 'grabbing' : 'grab', userSelect: isPanning || layoutEditMode ? 'none' : undefined }}
       >
         <div ref={pageFrameRef} style={{ width: `${visualFrameWidth}px`, height: `${visualFrameHeight}px`, position: 'relative', flexShrink: 0 }}>
-        <div ref={pageRef} style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden' }}>
+        <div ref={pageRef} onMouseDown={handlePageLayoutMouseDown} style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden', cursor: layoutEditMode ? 'crosshair' : undefined }}>
           {showImageUnderlay ? (
             <img
               src={pageImageSrc}
@@ -2568,14 +2877,30 @@ export default function GujiFacsimileProofreader({
                 width: '100%',
                 height: '100%',
                 objectFit: 'fill',
-                opacity: Math.max(0.08, 0.28 - imageUnderlayBlur * 0.0016),
-                filter: `blur(${(imageUnderlayBlur / 28).toFixed(2)}px) saturate(${Math.max(0.35, 0.9 - imageUnderlayBlur * 0.004).toFixed(2)}) contrast(${Math.max(0.55, 0.95 - imageUnderlayBlur * 0.003).toFixed(2)})`,
+                opacity: layoutEditMode ? 0.72 : Math.max(0.08, 0.28 - imageUnderlayBlur * 0.0016),
+                filter: layoutEditMode ? 'none' : `blur(${(imageUnderlayBlur / 28).toFixed(2)}px) saturate(${Math.max(0.35, 0.9 - imageUnderlayBlur * 0.004).toFixed(2)}) contrast(${Math.max(0.55, 0.95 - imageUnderlayBlur * 0.003).toFixed(2)})`,
                 pointerEvents: 'none',
                 userSelect: 'none',
               }}
             />
           ) : null}
           <div style={{ position: 'absolute', inset: '1.2%', border: showImageUnderlay ? '1px solid rgba(45,33,21,0.35)' : '1px solid #2d2115', pointerEvents: 'none' }} />
+          {draftCreateRect ? (
+            <div
+              style={{
+                position: 'absolute',
+                left: `${((draftCreateRect.left - bounds.offsetLeft) / bounds.width) * 100}%`,
+                top: `${((draftCreateRect.top - bounds.offsetTop) / bounds.height) * 100}%`,
+                width: `${(draftCreateRect.width / bounds.width) * 100}%`,
+                height: `${(draftCreateRect.height / bounds.height) * 100}%`,
+                border: '2px dashed #1677ff',
+                background: 'rgba(22,119,255,0.12)',
+                boxSizing: 'border-box',
+                zIndex: 120,
+                pointerEvents: 'none',
+              }}
+            />
+          ) : null}
           {translationStatusText ? (
             <div
               style={{
@@ -2633,6 +2958,7 @@ export default function GujiFacsimileProofreader({
               labelName,
               isImage,
               tableRows,
+              tableMerges,
               orientation,
               originalText,
               shouldRenderTable,
@@ -2738,7 +3064,7 @@ export default function GujiFacsimileProofreader({
                         }}
                       />
                     ) : null}
-                    {!isEditing ? <Button size="small" icon={<EditOutlined />} title="编辑文字" aria-label="编辑文字" onClick={(event) => { event.stopPropagation(); setEditingIndex(sourceIndex); setEditValue(originalText); onSelectBox?.(sourceIndex) }} /> : null}
+                    {!isEditing ? <Button size="small" icon={<EditOutlined />} title={shouldRenderTable ? '编辑表格' : '编辑文字'} aria-label={shouldRenderTable ? '编辑表格' : '编辑文字'} onClick={(event) => { event.stopPropagation(); beginEditBlock(sourceIndex) }} /> : null}
                     {!isEditing ? (
                       <Button
                         size="small"
@@ -2761,13 +3087,9 @@ export default function GujiFacsimileProofreader({
                     {
                       key: 'edit',
                       icon: <EditOutlined />,
-                      label: '编辑文字',
+                      label: shouldRenderTable ? '编辑表格' : '编辑文字',
                       disabled: isEditing || isImage,
-                      onClick: () => {
-                        setEditingIndex(sourceIndex)
-                        setEditValue(originalText)
-                        onSelectBox?.(sourceIndex)
-                      },
+                      onClick: () => beginEditBlock(sourceIndex),
                     },
                     {
                       key: 'copy',
@@ -2797,9 +3119,10 @@ export default function GujiFacsimileProofreader({
               <div
                 data-guji-block-index={sourceIndex}
                 onClick={(event) => { event.stopPropagation(); onSelectBox?.(sourceIndex) }}
-                onDoubleClick={(event) => { event.stopPropagation(); setEditingIndex(sourceIndex); setEditValue(originalText); onSelectBox?.(sourceIndex) }}
+                onDoubleClick={(event) => { event.stopPropagation(); beginEditBlock(sourceIndex) }}
                 onContextMenu={() => onSelectBox?.(sourceIndex)}
-                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: 'text', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: 'text' }}
+                onMouseDown={(event) => startBlockInteraction(event, sourceIndex, rect)}
+                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, border: layoutEditMode ? (isActive ? '2px solid #1677ff' : '1px dashed rgba(22,119,255,0.72)') : ruleBorder.border, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : layoutEditMode ? 'rgba(255,255,255,0.18)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: layoutEditMode ? 'move' : 'text', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: layoutEditMode ? 'none' : 'text' }}
               >
                 {false ? (
                   <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 4, background: 'rgba(255,253,247,0.98)', borderRadius: 3 }}>
@@ -2813,7 +3136,7 @@ export default function GujiFacsimileProofreader({
                   <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} rect={rect} bounds={cropBounds} />
                 ) : shouldRenderTable ? (
                   <div style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize, lineHeight: 1.18, fontFamily: FONT_FAMILY }}>
-                    {renderFacsimileTable(tableRows, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
+                    {renderFacsimileTable(tableRows, tableMerges, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
                   </div>
                 ) : (
                   <div style={{ width: '100%', height: '100%', writingMode: orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb', textOrientation: orientation === 'vertical' ? 'mixed' : undefined, whiteSpace: textWhiteSpace, wordBreak: textWordBreak, overflowWrap: textOverflowWrap, lineHeight: blockLineHeight, fontSize, fontWeight: getBlockFontWeight(label, layoutProfile), letterSpacing: 0, textAlign: isTitleLabel(label) ? 'center' : 'start', textIndent: orientation === 'horizontal' && isBodyTextLabel(label) ? '2em' : undefined }}>
@@ -2823,6 +3146,27 @@ export default function GujiFacsimileProofreader({
                 {shouldShowOverflowHint ? (
                   <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 14, pointerEvents: 'none', background: 'linear-gradient(to bottom, rgba(255,253,247,0), rgba(255,253,247,0.92))' }} />
                 ) : null}
+                {layoutEditMode && isActive ? BLOCK_RESIZE_HANDLES.map((item) => (
+                  <span
+                    key={item.handle}
+                    role="presentation"
+                    onMouseDown={(event) => startBlockInteraction(event, sourceIndex, rect, item.handle)}
+                    style={{
+                      position: 'absolute',
+                      left: `${item.left}%`,
+                      top: `${item.top}%`,
+                      width: 10,
+                      height: 10,
+                      transform: 'translate(-50%, -50%)',
+                      borderRadius: 2,
+                      border: '1px solid #fff',
+                      background: '#1677ff',
+                      boxShadow: '0 1px 4px rgba(0,0,0,0.35)',
+                      cursor: item.cursor,
+                      zIndex: 130,
+                    }}
+                  />
+                )) : null}
               </div>
               </Dropdown>
               </Fragment>
@@ -2918,7 +3262,7 @@ export default function GujiFacsimileProofreader({
             top: 48,
             right: 14,
             zIndex: 80,
-            width: 'min(460px, calc(100% - 28px))',
+            width: isRenderableTableBlock(editingBlock) ? 'min(820px, calc(100% - 28px))' : 'min(460px, calc(100% - 28px))',
             maxHeight: 'calc(100% - 70px)',
             display: 'flex',
             flexDirection: 'column',
@@ -2940,6 +3284,7 @@ export default function GujiFacsimileProofreader({
             <Space size={6}>
               <Button
                 size="small"
+                disabled={isRenderableTableBlock(editingBlock)}
                 onClick={() => handleToggleBlockOrientation(editingIndex)}
               >
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
@@ -2947,35 +3292,46 @@ export default function GujiFacsimileProofreader({
                   <RotateRightOutlined style={{ fontSize: 12 }} />
                 </span>
               </Button>
-              <Button size="small" onClick={() => { setEditingIndex(-1); setEditValue('') }}>取消</Button>
+              <Button size="small" onClick={() => { setEditingIndex(-1); setEditValue(''); setTableDraftRows([['']]); setTableDraftMerges([]) }}>取消</Button>
             </Space>
           </div>
           <div style={{ padding: 14, minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <Input.TextArea
-              value={editValue}
-              onChange={(event) => setEditValue(event.target.value)}
-              autoSize={false}
-              autoFocus
-              onKeyDown={(event) => {
-                if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                  event.preventDefault()
-                  handleSaveBlock()
-                }
-              }}
-              style={{
-                width: '100%',
-                height: 'min(46vh, 360px)',
-                minHeight: 180,
-                resize: 'vertical',
-                fontFamily: FONT_FAMILY,
-                fontSize: 16,
-                lineHeight: 1.7,
-                writingMode: 'horizontal-tb',
-                whiteSpace: 'pre-wrap',
-              }}
-            />
+            {isRenderableTableBlock(editingBlock) ? (
+              <FacsimileTableEditor
+                rows={tableDraftRows}
+                merges={tableDraftMerges}
+                onChange={(value) => {
+                  setTableDraftRows(value.rows)
+                  setTableDraftMerges(value.merges)
+                }}
+              />
+            ) : (
+              <Input.TextArea
+                value={editValue}
+                onChange={(event) => setEditValue(event.target.value)}
+                autoSize={false}
+                autoFocus
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                    event.preventDefault()
+                    handleSaveBlock()
+                  }
+                }}
+                style={{
+                  width: '100%',
+                  height: 'min(46vh, 360px)',
+                  minHeight: 180,
+                  resize: 'vertical',
+                  fontFamily: FONT_FAMILY,
+                  fontSize: 16,
+                  lineHeight: 1.7,
+                  writingMode: 'horizontal-tb',
+                  whiteSpace: 'pre-wrap',
+                }}
+              />
+            )}
             <Space size={8} style={{ justifyContent: 'flex-end', flexShrink: 0 }}>
-              <Button onClick={() => { setEditingIndex(-1); setEditValue('') }}>取消</Button>
+              <Button onClick={() => { setEditingIndex(-1); setEditValue(''); setTableDraftRows([['']]); setTableDraftMerges([]) }}>取消</Button>
               <Button type="primary" icon={<SaveOutlined />} onClick={handleSaveBlock}>保存</Button>
             </Space>
           </div>

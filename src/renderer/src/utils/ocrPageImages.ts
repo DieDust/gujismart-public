@@ -171,17 +171,22 @@ export async function ensurePdfPageImagesForOcr(
   const fileIndex = Math.max(0, Number(options.fileIndex || 0))
   const prepConcurrency = Math.min(VISION_PAGE_IMAGE_PREP_MAX_CONCURRENCY, Math.max(1, missingPageNums.length))
   const cachedPageNums: number[] = []
+  const documentTitle = String(detail?.title || '').trim()
+  const progressPrefixParts = [
+    totalFiles > 1 ? `第 ${fileIndex + 1}/${totalFiles} 篇` : '',
+    documentTitle ? `《${documentTitle.slice(0, 60)}》` : '',
+  ].filter(Boolean)
+  const progressPrefix = progressPrefixParts.length > 0 ? `${progressPrefixParts.join('，')}，` : ''
 
   await runLimited(missingPageNums, prepConcurrency, async (pageNum) => {
-    const prefix = totalFiles > 1 ? `第 ${fileIndex + 1}/${totalFiles} 篇，` : ''
     const progress = `${cachedPageNums.length}/${missingPageNums.length}`
-    const content = `正在生成${progressLabel}：${prefix}${progress} 页（需生成 ${missingPageNums.length}/${pageCount} 页，本地渲染并发 ${prepConcurrency}）`
+    const content = `正在生成${progressLabel}：${progressPrefix}${progress} 页（需生成 ${missingPageNums.length}/${pageCount} 页，本地渲染并发 ${prepConcurrency}）`
     options.onProgress?.(content, options.messageKey)
     const pageImage = await renderPdfFilePageToImage(resolvedPdf.filePath, pageNum)
     const imagePath = await window.api.cachePageImage(docId, pageNum, pageImage.dataUrl)
     cachedPageNums.push(pageNum)
     await options.onPageCached?.(pageNum, imagePath, pageImage.dataUrl)
-    const nextContent = `正在生成${progressLabel}：${prefix}${cachedPageNums.length}/${missingPageNums.length} 页（需生成 ${missingPageNums.length}/${pageCount} 页，本地渲染并发 ${prepConcurrency}）`
+    const nextContent = `正在生成${progressLabel}：${progressPrefix}${cachedPageNums.length}/${missingPageNums.length} 页（需生成 ${missingPageNums.length}/${pageCount} 页，本地渲染并发 ${prepConcurrency}）`
     options.onProgress?.(nextContent, options.messageKey)
   })
 

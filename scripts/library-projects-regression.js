@@ -214,9 +214,16 @@ async function run() {
     assert.strictEqual(initialFolderCounts.folderDocumentCounts.legacy_folder, 1)
     assert.strictEqual(initialFolderCounts.unfiledDocumentTotal, 0)
     database.run("UPDATE pages SET ocr_status = 'error' WHERE id = 'legacy_page'")
+    const staleStatusSmartCounts = await modules.libraryState.refreshLibrarySmartViewCounts()
+    assert.strictEqual(
+      staleStatusSmartCounts.ocrNeedsRepair,
+      0,
+      'pages with preserved OCR text must not need repair solely because their status is stale',
+    )
+    database.run("UPDATE pages SET ocr_text = '' WHERE id = 'legacy_page'")
     const repairSmartCounts = await modules.libraryState.refreshLibrarySmartViewCounts()
-    assert.strictEqual(repairSmartCounts.ocrNeedsRepair, 1, 'completed documents with a failed OCR page should need repair')
-    database.run("UPDATE pages SET ocr_status = 'completed' WHERE id = 'legacy_page'")
+    assert.strictEqual(repairSmartCounts.ocrNeedsRepair, 1, 'failed OCR pages without usable text should need repair')
+    database.run("UPDATE pages SET ocr_text = 'preserved OCR text', ocr_status = 'completed' WHERE id = 'legacy_page'")
     const repairedSmartCounts = await modules.libraryState.refreshLibrarySmartViewCounts()
     assert.strictEqual(repairedSmartCounts.ocrNeedsRepair, 0, 'repairing the failed page should clear the smart-view count')
     await new Promise((resolve) => setTimeout(resolve, 150))

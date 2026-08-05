@@ -738,7 +738,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         form.setFieldsValue({
           paddleocr_api_key: '',
           ocr_async_model: settings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : settings.ocr_async_model || 'PaddleOCR-VL-1.6',
-          ocr_async_pdf_chunk_concurrency: settings.ocr_async_pdf_chunk_concurrency || '4',
+          ocr_async_pdf_chunk_concurrency: settings.ocr_async_pdf_chunk_concurrency || '2',
           ocr_heavy_pdf_document_concurrency: settings.ocr_heavy_pdf_document_concurrency || '2',
           ocr_upload_timeout_seconds: settings.ocr_upload_timeout_seconds || '3600',
           ocr_document_timeout_minutes: settings.ocr_document_timeout_minutes || '45',
@@ -2578,7 +2578,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
             <Input suffix={<Button type="text" size="small" loading={paddleOcrModelsLoading} onClick={() => void fetchPaddleOcrModelOptions()}>拉取</Button>} />
           </AutoComplete>
         </Form.Item>
-        <Form.Item label="单本 PDF 分片并发数" name="ocr_async_pdf_chunk_concurrency" extra="每本文献同时上传和等待的 PDF 分片数；默认 4，服务端限流时可调低。">
+        <Form.Item label="单本 PDF 分片并发数" name="ocr_async_pdf_chunk_concurrency" extra="每本文献同时处理的 PDF 分片上限；默认 2。遇到飞桨“任务提交队列已满”时会自动临时串行退避，恢复后回到此设置。">
           <InputNumber min={1} max={8} style={{ width: '100%' }} />
         </Form.Item>
         <Form.Item label="超大 PDF 同时处理数" name="ocr_heavy_pdf_document_concurrency" extra="仅限制超过 200 MB 或 1000 页的扫描件；同时仍受“批大小”总上限约束。">

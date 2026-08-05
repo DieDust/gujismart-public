@@ -18,6 +18,14 @@ export class SlidingWindowScheduler {
   private readonly queue: Array<QueuedTask<unknown>> = []
   private readonly documentTails = new Map<string, Promise<void>>()
 
+  getSnapshot(): { activeCount: number; queuedCount: number; documentTailCount: number } {
+    return {
+      activeCount: this.activeCount,
+      queuedCount: this.queue.length,
+      documentTailCount: this.documentTails.size,
+    }
+  }
+
   run<T>(limit: number, task: () => Promise<T>): Promise<T> {
     const taskLimit = normalizeLimit(limit)
     return new Promise<T>((resolve, reject) => {

@@ -178,6 +178,27 @@ async function run() {
     }))
     assert(!pendingPage.items.some((item) => item.id === docId), `Completed document leaked into pending filter: ${JSON.stringify(pendingPage)}`)
 
+    const repairPageAfterReconcile = await win.evaluate(async () => window.api.listDocumentsPage({
+      search: 'library ocr status reconcile',
+      searchFields: ['title'],
+      ocrNeedsRepair: true,
+      limit: 10,
+      offset: 0,
+    }))
+    assert(
+      !repairPageAfterReconcile.items.some((item) => item.id === docId),
+      `Document with usable OCR text leaked into OCR repair filter: ${JSON.stringify(repairPageAfterReconcile)}`,
+    )
+    assert(
+      repairPageAfterReconcile.total === 0,
+      `Document with usable OCR text inflated OCR repair count: ${JSON.stringify(repairPageAfterReconcile)}`,
+    )
+    const countsAfterReconcile = await win.evaluate(async () => window.api.refreshLibrarySmartViewCounts())
+    assert(
+      Number(countsAfterReconcile.ocrNeedsRepair || 0) === 0,
+      `Sidebar OCR repair count retained a repaired document: ${JSON.stringify(countsAfterReconcile)}`,
+    )
+
     const completedFilterPage = await win.evaluate(async () => window.api.listDocumentsPage({
       search: 'library ocr status reconcile',
       searchFields: ['title'],
@@ -197,6 +218,36 @@ async function run() {
     const reviewDocId = reviewImportResults[0].id
     const reviewDetail = await win.evaluate(async (id) => window.api.getDocument(id), reviewDocId)
     assert(reviewDetail?.pages?.length === 3, `Expected review imported pages, saw ${JSON.stringify(reviewDetail)}`)
+    const reviewPendingPage = reviewDetail.pages.find((page) => page.page_num === 3)
+    assert(reviewPendingPage, 'Expected page 3 to exist for pending-page repair simulation')
+    const pendingPageSaved = await win.evaluate(async (page) => window.api.updatePage(page.id, {
+      ocr_text: '',
+      ocr_result: null,
+      proofed_text: '',
+      ocr_status: 'pending',
+    }), reviewPendingPage)
+    assert(pendingPageSaved, 'Failed to simulate a pending OCR page')
+    const pendingDocumentSaved = await win.evaluate(async (id) => window.api.updateDocument(id, {
+      ocr_status: 'completed',
+      import_status: 'processed',
+      error_message: null,
+    }), reviewDocId)
+    assert(pendingDocumentSaved, 'Failed to simulate completed document with a pending OCR page')
+    const pendingRepairPage = await win.evaluate(async () => window.api.listDocumentsPage({
+      search: 'library ocr review reconcile',
+      searchFields: ['title'],
+      ocrNeedsRepair: true,
+      limit: 10,
+      offset: 0,
+    }))
+    const pendingRepairListed = pendingRepairPage.items.find((item) => item.id === reviewDocId)
+    assert(pendingRepairListed, `Pending OCR page was missing from OCR repair filter: ${JSON.stringify(pendingRepairPage)}`)
+    assert(
+      String(pendingRepairListed.error_message || '').includes('OCR待修复')
+        && String(pendingRepairListed.error_message || '').includes('3')
+        && Number(pendingRepairListed.text_page_count) === 2,
+      `Pending OCR page should expose a repair message and page-derived counts: ${JSON.stringify(pendingRepairListed)}`,
+    )
     const reviewPagePatchResults = await win.evaluate(async (pages) => {
       const results = []
       for (const page of pages) {
@@ -234,7 +285,7 @@ async function run() {
     assert(reviewListed.ocr_status === 'completed', `Expected review document to normalize to completed, saw ${JSON.stringify(reviewListed)}`)
     assert(reviewListed.import_status === 'processed', `Expected review document to normalize to processed, saw ${JSON.stringify(reviewListed)}`)
     assert(
-      String(reviewListed.error_message || '').includes('OCR完成')
+      String(reviewListed.error_message || '').includes('OCR待修复')
         && String(reviewListed.error_message || '').includes('OCR 未成功')
         && String(reviewListed.error_message || '').includes('3'),
       `Expected short review warning listing failed page nums, saw ${JSON.stringify(reviewListed)}`,
@@ -244,9 +295,57 @@ async function run() {
     assert(reviewPersistedDetail?.ocr_status === 'completed', `Expected review normalized status persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
     assert(reviewPersistedDetail?.import_status === 'processed', `Expected review normalized import status persisted, saw ${JSON.stringify(reviewPersistedDetail)}`)
     assert(
-      String(reviewPersistedDetail?.error_message || '').includes('OCR完成')
+      String(reviewPersistedDetail?.error_message || '').includes('OCR待修复')
         && String(reviewPersistedDetail?.error_message || '').includes('OCR 未成功'),
       `Expected short review warning persisted, saw ${JSON.stringify(reviewPersistedDetail)}`,
+    )
+
+    const reviewRepairPage = await win.evaluate(async () => window.api.listDocumentsPage({
+      search: 'library ocr review reconcile',
+      searchFields: ['title'],
+      ocrNeedsRepair: true,
+      limit: 10,
+      offset: 0,
+    }))
+    assert(
+      reviewRepairPage.items.some((item) => item.id === reviewDocId),
+      `Genuine failed page was missing from OCR repair filter: ${JSON.stringify(reviewRepairPage)}`,
+    )
+    const countsWithGenuineFailure = await win.evaluate(async () => window.api.refreshLibrarySmartViewCounts())
+    assert(
+      Number(countsWithGenuineFailure.ocrNeedsRepair || 0) === 1,
+      `Sidebar OCR repair count missed the genuine failed document: ${JSON.stringify(countsWithGenuineFailure)}`,
+    )
+
+    const repairedReviewPage = reviewDetail.pages.find((page) => page.page_num === 3)
+    assert(repairedReviewPage, 'Expected page 3 to exist for stale-error repair simulation')
+    const repairedPageSaved = await win.evaluate(async (page) => window.api.updatePage(page.id, {
+      ocr_text: 'repaired review page text',
+      ocr_result: { text: 'repaired review page text' },
+      ocr_status: 'error',
+    }), repairedReviewPage)
+    assert(repairedPageSaved, 'Failed to simulate a repaired page with a stale error status')
+    const staleReviewDocumentSaved = await win.evaluate(async (id) => window.api.updateDocument(id, {
+      ocr_status: 'completed',
+      import_status: 'processed',
+      error_message: 'stale OCR review message',
+    }), reviewDocId)
+    assert(staleReviewDocumentSaved, 'Failed to simulate stale document review message')
+    const repairPageAfterStaleError = await win.evaluate(async () => window.api.listDocumentsPage({
+      search: 'library ocr review reconcile',
+      searchFields: ['title'],
+      ocrNeedsRepair: true,
+      limit: 10,
+      offset: 0,
+    }))
+    assert(
+      !repairPageAfterStaleError.items.some((item) => item.id === reviewDocId),
+      `Repaired page with stale error status leaked into OCR repair filter: ${JSON.stringify(repairPageAfterStaleError)}`,
+    )
+    const countsAfterStaleErrorRepair = await win.evaluate(async () => window.api.refreshLibrarySmartViewCounts())
+    assert(
+      Number(countsAfterStaleErrorRepair.ocrNeedsRepair || 0) === 0,
+      `Sidebar OCR repair count retained stale error rows with usable text: ${JSON.stringify(countsAfterStaleErrorRepair)}`,
     )
 
     console.log('Library OCR status reconcile regression passed.')

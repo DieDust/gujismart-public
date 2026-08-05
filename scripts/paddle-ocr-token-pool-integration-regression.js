@@ -76,6 +76,12 @@ async function run() {
     const first = modules.pool.acquirePaddleOcrToken()
     assert.strictEqual(first.token, secrets[0], 'the primary token should remain sticky until it fails')
 
+    // Provider queue backpressure is shared by the service, not a Token failure.
+    const queueBusyError = Object.assign(new Error('Async OCR submit failed, status 400: 任务提交队列已满，请稍后重试'), { status: 400, code: 10010 })
+    assert.strictEqual(modules.pool.isPaddleOcrTokenFailure(queueBusyError), false, 'queue-full responses must not fail over or cool down a Token')
+    modules.pool.markPaddleOcrTokenFailure(first, queueBusyError)
+    assert.strictEqual(modules.pool.getPaddleOcrTokenPoolState().entries.find((entry) => entry.id === first.id)?.status, 'active', 'queue backpressure must leave the active Token usable')
+
     // Rate-limit 429 must NOT be treated as "今日额度已用完".
     const rateLimitError = Object.assign(new Error(`OCR 接口请求失败，状态码 429：请求频率过高，请稍后重试`), { status: 429 })
     modules.pool.markPaddleOcrTokenFailure(first, rateLimitError)

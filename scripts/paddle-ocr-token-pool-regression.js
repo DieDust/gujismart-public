@@ -21,6 +21,8 @@ assert.ok(!pool.includes('token: entry.token'), 'token plaintext must never be p
 assert.ok(pool.includes('status === 403 || status === 429'), '403 and official daily-quota 429 responses must trigger token failover')
 assert.ok(pool.includes('isQuotaExhaustionMessage') && pool.includes("'quota_exhausted'"), 'runtime state must distinguish invalid and quota-exhausted tokens')
 assert.ok(pool.includes('isRateLimitMessage') && pool.includes("'rate_limited'"), 'rate-limit 429 must not be labeled as daily quota exhaustion')
+assert.ok(pool.includes('isProviderQueueBusyMessage'), 'provider queue backpressure must have a separate classifier')
+assert.ok(pool.includes('if (isProviderQueueBusyMessage(message)) return false'), 'queue-full responses must never fail over or cool down a Token')
 assert.ok(pool.includes('请求频率过高') || pool.includes('RATE_LIMIT_COOLDOWN_MS'), 'rate-limit cool-down should be short-lived')
 assert.ok(pool.includes('nextDailyQuotaReset()'), 'quota-exhausted tokens must remain skipped until the next daily reset')
 assert.ok(pool.includes('persistRuntimeState') && pool.includes('hydrateRuntimeState'), 'quota exhaustion must survive app restarts without retrying the same token today')

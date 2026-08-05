@@ -23,6 +23,32 @@ interface PageLabelRow {
   proofed_text?: string | null
 }
 
+export interface LiteraturePageMapStats {
+  updated: number
+  inferred: number
+  ocr: number
+  fallback: number
+  manual: number
+}
+
+export interface RecomputeLiteraturePageMapAsyncOptions {
+  chunkSize?: number
+  yieldControl?: () => Promise<void>
+  onProgress?: (progress: {
+    phase: 'load' | 'resolve' | 'write'
+    completed: number
+    total: number
+  }) => void
+}
+
+const EMPTY_PAGE_MAP_STATS: LiteraturePageMapStats = {
+  updated: 0,
+  inferred: 0,
+  ocr: 0,
+  fallback: 0,
+  manual: 0,
+}
+
 function isManualSource(value: unknown): boolean {
   return String(value || '').trim() === 'manual'
 }
@@ -102,6 +128,112 @@ export function recomputeLiteraturePageMap(docId: string): {
       )
     }
   })
+
+  scheduleDatabaseSave({ minDelayMs: 400 })
+  return { updated: rows.length, inferred, ocr, fallback, manual }
+}
+
+function getAsyncPageMapChunkSize(value: unknown): number {
+  const parsed = Math.floor(Number(value) || 0)
+  return Math.max(4, Math.min(64, parsed || 16))
+}
+
+async function yieldPageMapWork(
+  options: RecomputeLiteraturePageMapAsyncOptions,
+  phase: 'load' | 'resolve' | 'write',
+  completed: number,
+  total: number,
+): Promise<void> {
+  options.onProgress?.({ phase, completed, total })
+  if (options.yieldControl) {
+    await options.yieldControl()
+    return
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+/**
+ * Large-book variant used by OCR completion. It keeps the same mapping rules while
+ * yielding between payload hydration, label extraction, and small write transactions.
+ */
+export async function recomputeLiteraturePageMapAsync(
+  docId: string,
+  options: RecomputeLiteraturePageMapAsyncOptions = {},
+): Promise<LiteraturePageMapStats> {
+  const id = String(docId || '').trim()
+  if (!id) return { ...EMPTY_PAGE_MAP_STATS }
+
+  const rawRows = queryAll<PageLabelRow>(
+    `SELECT id, page_num, ocr_result, ocr_result_ref, ocr_text, proofed_text,
+            literature_page_num, literature_page_source
+     FROM pages
+     WHERE doc_id = ?
+     ORDER BY page_num ASC`,
+    [id],
+  )
+  if (rawRows.length === 0) return { ...EMPTY_PAGE_MAP_STATS }
+
+  const chunkSize = getAsyncPageMapChunkSize(options.chunkSize)
+  const rows: PageLabelRow[] = []
+  for (let index = 0; index < rawRows.length; index += chunkSize) {
+    const end = Math.min(rawRows.length, index + chunkSize)
+    rows.push(...hydratePagePayloadRows(rawRows.slice(index, end)) as PageLabelRow[])
+    await yieldPageMapWork(options, 'load', end, rawRows.length)
+  }
+
+  const pageInputs: Array<{
+    physicalPageNum: number
+    ocrLabel: ReturnType<typeof extractPrintedPageFromOcrResult>
+    manualLabel: number | null
+  }> = []
+  for (let index = 0; index < rows.length; index += chunkSize) {
+    const end = Math.min(rows.length, index + chunkSize)
+    for (let rowIndex = index; rowIndex < end; rowIndex += 1) {
+      const row = rows[rowIndex]
+      const physicalPageNum = Number(row.page_num || 0)
+      const manualLabel = isManualSource(row.literature_page_source)
+        && Number(row.literature_page_num || 0) > 0
+        ? Math.floor(Number(row.literature_page_num))
+        : null
+      const fromResult = extractPrintedPageFromOcrResult(row.ocr_result)
+      const ocrLabel = fromResult || extractPrintedPageFromPlainText(String(row.proofed_text || row.ocr_text || ''))
+      pageInputs.push({ physicalPageNum, ocrLabel, manualLabel })
+    }
+    await yieldPageMapWork(options, 'resolve', end, rows.length)
+  }
+
+  const resolved = resolveLiteraturePageNumbers(pageInputs)
+  const byPhysical = new Map(resolved.map((item) => [item.physicalPageNum, item]))
+  let inferred = 0
+  let ocr = 0
+  let fallback = 0
+  let manual = 0
+
+  for (let index = 0; index < rows.length; index += chunkSize) {
+    const end = Math.min(rows.length, index + chunkSize)
+    transaction(() => {
+      for (let rowIndex = index; rowIndex < end; rowIndex += 1) {
+        const row = rows[rowIndex]
+        const physical = Number(row.page_num || 0)
+        const item = byPhysical.get(physical)
+        if (!item) continue
+        const source = item.source as LiteraturePageSource
+        if (source === 'inferred') inferred += 1
+        else if (source === 'ocr') ocr += 1
+        else if (source === 'manual') manual += 1
+        else fallback += 1
+        run(
+          `UPDATE pages
+           SET literature_page_num = ?,
+               literature_page_source = ?,
+               ocr_page_label = ?
+           WHERE id = ?`,
+          [item.literaturePageNum, source, item.ocrLabel, row.id],
+        )
+      }
+    })
+    await yieldPageMapWork(options, 'write', end, rows.length)
+  }
 
   scheduleDatabaseSave({ minDelayMs: 400 })
   return { updated: rows.length, inferred, ocr, fallback, manual }

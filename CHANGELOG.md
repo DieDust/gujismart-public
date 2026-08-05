@@ -1,5 +1,79 @@
 # 更新日志 / Changelog
 
+## 1.2.28 - 2026-08-05
+
+### 中文
+
+- 修复已有 OCR 正文但页面状态字段仍为 `error/pending` 时，文献继续错误出现在“OCR 待修复”列表的问题。文献库列表、左侧智能视图数量和 OCR 状态汇总现在统一依据实际可用 OCR 文本/外部化文本引用判断；真正没有 OCR 内容的失败页仍会保留，方便继续补跑。
+- 增加陈旧 OCR 状态回归测试，打开列表或刷新智能视图后会自动清理可修复的旧状态与错误提示。
+- 优化飞桨异步 OCR 的提交节奏：默认分片并发调整为 2，保留设置页中的并发上限；正常情况下仍可并行，服务端队列已满时自动进入临时串行退避，恢复后再回到用户设置。
+- 修复“任务提交队列已满”被误显示为 Token 限流的问题。队列满属于飞桨服务端共享背压，不会再错误切换 Token 或把 Token 冷却。
+- 队列满重试改为有界指数退避，并在界面明确显示“不会切换 Token”；升级后会自动清理旧版本遗留的队列满假限流状态。
+- 修复“OCR 待修复”列表中的文献没有显示具体异常的问题：该筛选现在只对当前已加载页精确核对页级状态，显示失败页或尚未识别页的页码，并恢复“重新 OCR 错页”入口；普通文献库列表仍保持轻量加载。
+- OCR 排队提示现在会显示全局正在处理和排队的文献数量，并提示任务可能位于其他项目或筛选结果中；已经取消但尚未释放的运行槽位会在新任务入队前自动清理。
+
+#### 下载
+
+- `GujiSmart-1.2.28-Setup-x64.exe`
+- `GujiSmart-1.2.28-Portable-x64.exe`
+
+### English
+
+- Fixed documents that still appeared in “OCR repair needed” after their OCR text had already been repaired while the page status remained stale (`error`/`pending`). The Library list, Smart View count, and OCR summaries now share one content-aware check for usable OCR text or externalized text references; genuine failed pages with no OCR content remain available for retry.
+- Added regression coverage for stale OCR statuses, including automatic cleanup of stale status and error messages when the list or Smart View is refreshed.
+- Smoothed PaddleOCR async submission: the default per-document chunk concurrency is now 2 while the Settings limit remains available; normal jobs still run in parallel, but a full provider queue temporarily switches to serialized backoff and later returns to the user setting.
+- Fixed “submission queue is full” being reported as Token rate limiting. Provider-wide backpressure no longer fails over or cools down an otherwise valid Token.
+- Queue retries now use bounded exponential backoff with an explicit “Token will not be switched” message, and stale false queue-limit blocks from older builds are cleared on upgrade.
+- Fixed unexplained entries in “OCR repair needed”: only the currently loaded page is inspected for exact page-level state, failed or unrecognized page ranges are displayed, and the failed-page retry action is restored while the normal Library list remains lightweight.
+- OCR queue messages now show global active/queued counts and explain that work may belong to another project or hidden filter; aborted runtime slots are released before a new enqueue attempt.
+
+#### Downloads
+
+- `GujiSmart-1.2.28-Setup-x64.exe`
+- `GujiSmart-1.2.28-Portable-x64.exe`
+
+## 1.2.27 - 2026-08-04
+
+### 中文
+
+- 校对模式新增可视化版式编辑：进入“编辑版式”后自动显示清晰底图，可在底图空白处拖拽新建文本框，拖动已有框移动位置，并通过八个边缘/角点控制柄调整宽高；删除、文字编辑与横竖排切换继续沿用原有保存链路。
+- OCR 识别出的表格现在可以直接在表格视图中修改单元格、插入/删除行列、合并选区和拆分单元格，保存后同步更新版式、正文和校对内容，不需要编辑表格代码。
+- 修复视觉 OCR 在部分豆包 Seed 模型上只返回 reasoning_content、最终 content 为空导致 JSON 解析失败的问题：自动关闭深度思考，兼容重试 JSON/纯文本输出，并保留明确诊断日志。
+
+### English
+
+- Added visual layout editing to proofing mode: entering “Edit layout” automatically shows a clear page underlay, supports drawing new text boxes, moving existing boxes, and resizing them from eight edge/corner handles. Existing delete, text editing, and orientation switching continue to use the same persistence path.
+- Recognized tables can now be edited directly in a visual grid: cell text, row/column insertion and deletion, rectangular merge, and cell splitting are supported without editing table JSON or Markdown.
+- Fixed visual OCR failures on some Doubao Seed models that returned only `reasoning_content` with an empty final `content`. The client now disables thinking, retries JSON/plain-text responses compatibly, and records an explicit diagnostic when no final answer is returned.
+
+## 1.2.26 - 2026-08-04
+
+### 中文
+
+- 修复大批量 OCR 中“未处理页被批量登记为失败页”的严重问题：补跑预算或服务查询中断后，尚未实际识别的页面会保留为待继续；整本零成功页不再显示为 OCR 完成。再次补跑时还会自动恢复旧版本生成的“第 N 页 OCR 未成功”占位错误，不触碰真实错页或已有正文。
+- 为飞桨单页与古籍安全页图路线增加系统故障熔断。Token、网络、限流或服务端故障只会暂停当前文献并保留未处理页，不再把同一个接口错误复制到后续几百页。
+- 异步 PDF 状态查询连续失联超过 90 秒时，会在稳健串行模式下自动重新提交当前分片；整本任务停滞则切换为原 PDF 分段处理，已保存分片不重跑，也不再要求用户重启软件才能继续。
+- 多次点击错页补跑时，新任务会保持“排队”直到共享 OCR 槽位真正可用，不再提前显示处理中或影响已经运行的文献；单本文献异常也不会中断后续队列。
+- 修复错页补跑成功后仍停留在“OCR 待修复”列表的问题；页面事实优先于旧的文献错误提示，成功补跑后会立即刷新列表与智能视图数量。大型文献的整书结构与页码整理继续采用分块、让出事件循环的方式，降低保存末尾失去响应的概率。
+
+#### 下载
+
+- `GujiSmart-1.2.26-Setup-x64.exe`
+- `GujiSmart-1.2.26-Portable-x64.exe`
+
+### English
+
+- Fixed a severe bulk-OCR issue where pages that were never actually processed could be recorded as failed. Pages left after a recovery budget or status-query interruption now remain resumable, and a book with zero successful pages can no longer be reported as OCR-complete. Retrying also repairs the exact legacy “page N OCR unsuccessful” placeholders without touching genuine page failures or existing text.
+- Added a document-level circuit breaker for Paddle single-page OCR and the safer facsimile page-image route. Token, network, rate-limit, and provider outages pause the document while preserving untouched pages instead of copying one systemic error across hundreds of pages.
+- When asynchronous PDF status queries remain unreachable for more than 90 seconds, only the affected chunk is automatically resubmitted under serialized reliability mode. A stalled whole-document job switches to original-PDF page-range chunks, preserving chunks already saved and removing the need to restart the app.
+- New failed-page retry requests remain queued until a shared OCR slot actually starts them, instead of appearing active early or disturbing running documents. An unexpected failure in one document no longer terminates the remaining queue.
+- Fixed successfully repaired documents remaining in the “OCR repair needed” view. Current page states now override stale document-level error text, and both the list and Smart View counts refresh immediately. Large-document structure and page-number finalization continue in cooperative chunks to reduce end-of-task UI stalls.
+
+#### Downloads
+
+- `GujiSmart-1.2.26-Setup-x64.exe`
+- `GujiSmart-1.2.26-Portable-x64.exe`
+
 ## 1.2.25 - 2026-08-01
 
 ### 中文
