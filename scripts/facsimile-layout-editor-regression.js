@@ -488,4 +488,628 @@ assert.ok(proofreader.includes("segmentation_source: 'manual'"), 'manual text, t
 assert.ok(proofreader.includes('<FacsimileTableEditor'), 'recognized tables must use the visual grid editor instead of raw table code')
 assert.ok(proofreader.includes("String(block.segmentation_source || '').toLowerCase() !== 'manual'"), 'manual tables must not be converted back into pseudo text tables on vertical pages')
 
+const tableEditorPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.tsx')
+const tableEditorCssPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.css')
+const tableEditor = fs.readFileSync(tableEditorPath, 'utf8')
+assert.ok(fs.existsSync(tableEditorCssPath), 'the Excel-style table editor must have theme-aware component styles')
+const tableEditorCss = fs.readFileSync(tableEditorCssPath, 'utf8')
+
+const transpiledTableEditor = ts.transpileModule(tableEditor, {
+  compilerOptions: {
+    module: ts.ModuleKind.CommonJS,
+    target: ts.ScriptTarget.ES2022,
+    jsx: ts.JsxEmit.ReactJSX,
+    esModuleInterop: true,
+  },
+}).outputText
+const tableEditorModule = { exports: {} }
+const tableEditorRequire = (request) => {
+  if (request === 'react') return {}
+  if (request === 'react/jsx-runtime') return { Fragment: Symbol('Fragment'), jsx: () => null, jsxs: () => null }
+  if (request === 'antd') return { Button: () => null, Tooltip: () => null, message: {}, theme: {} }
+  if (request === '../utils/facsimileTableEditing') return helperModule.exports
+  if (request === './FacsimileTableEditor.css') return {}
+  throw new Error(`Unexpected FacsimileTableEditor dependency: ${request}`)
+}
+new Function('exports', 'module', 'require', transpiledTableEditor)(
+  tableEditorModule.exports,
+  tableEditorModule,
+  tableEditorRequire,
+)
+const {
+  applyFacsimileTableClipboardCommand,
+  applyFacsimileTableSelectionCommand,
+  applyFacsimileTableStructureCommand,
+  attachFacsimileTableContextMenuEscapeListener,
+  attachFacsimileTableResizeListeners,
+  buildFacsimileTableCellMergeLookup,
+  clampFacsimileTableContextMenuPosition,
+  createFacsimileTableCellContextSelection,
+  createFacsimileTableHeaderContextSelection,
+  createFacsimileTableThemeStyle,
+  expandFacsimileTableSelectionForMerges,
+  getFacsimileTableEditorKeyIntent,
+  getFacsimileTableCommandAvailability,
+  reconcileFacsimileTableEditorIdentity,
+  reduceFacsimileTableHistory,
+  resolveFacsimileTableCellContextSelection,
+  serializeFacsimileTableSelectionForClipboard,
+  serializeFacsimileTableSelectionAsTsv,
+} = tableEditorModule.exports
+
+for (const [name, value] of Object.entries({
+  applyFacsimileTableClipboardCommand,
+  applyFacsimileTableSelectionCommand,
+  applyFacsimileTableStructureCommand,
+  attachFacsimileTableContextMenuEscapeListener,
+  attachFacsimileTableResizeListeners,
+  buildFacsimileTableCellMergeLookup,
+  clampFacsimileTableContextMenuPosition,
+  createFacsimileTableCellContextSelection,
+  createFacsimileTableHeaderContextSelection,
+  createFacsimileTableThemeStyle,
+  expandFacsimileTableSelectionForMerges,
+  getFacsimileTableEditorKeyIntent,
+  getFacsimileTableCommandAvailability,
+  reconcileFacsimileTableEditorIdentity,
+  reduceFacsimileTableHistory,
+  resolveFacsimileTableCellContextSelection,
+  serializeFacsimileTableSelectionForClipboard,
+  serializeFacsimileTableSelectionAsTsv,
+})) {
+  assert.strictEqual(typeof value, 'function', `${name} must be an executable pure editor helper`)
+}
+
+const closureSelection = expandFacsimileTableSelectionForMerges(
+  { startRow: 1, endRow: 2, startCol: 2, endCol: 2 },
+  [
+    { row: 0, col: 2, rowSpan: 2, colSpan: 2 },
+    { row: 2, col: 3, rowSpan: 2, colSpan: 2 },
+  ],
+  5,
+  6,
+)
+assert.deepStrictEqual(
+  closureSelection,
+  { startRow: 0, endRow: 3, startCol: 2, endCol: 4 },
+  'merge-aware selection must recursively expand until every intersecting merged range is fully selected',
+)
+
+const mergeClearRows = [
+  ['anchor', 'covered-a', 'keep'],
+  ['covered-b', 'covered-c', 'keep'],
+  ['keep', 'keep', 'keep'],
+]
+const mergeClear = applyFacsimileTableSelectionCommand(
+  mergeClearRows,
+  [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }],
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+  'clear',
+)
+assert.deepStrictEqual(
+  mergeClear.selection,
+  { startRow: 0, endRow: 1, startCol: 0, endCol: 1 },
+  'clicking one merged anchor must target the complete merged range',
+)
+assert.deepStrictEqual(mergeClear.rows.slice(0, 2).map((row) => row.slice(0, 2)), [['', ''], ['', '']])
+assert.deepStrictEqual(mergeClear.merges, [], 'Delete on a merged cell must clear and remove the complete merge')
+assert.deepStrictEqual(mergeClearRows[0], ['anchor', 'covered-a', 'keep'], 'selection commands must not mutate caller-owned rows')
+const mergeAcrossExisting = applyFacsimileTableSelectionCommand(
+  [['a', '', 'c'], ['', '', 'f']],
+  [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }],
+  { startRow: 1, endRow: 1, startCol: 1, endCol: 2 },
+  'merge',
+)
+assert.deepStrictEqual(
+  mergeAcrossExisting.selection,
+  { startRow: 0, endRow: 1, startCol: 0, endCol: 2 },
+  'a partial drag through a merge must expand the command selection to the full old merge',
+)
+assert.deepStrictEqual(
+  mergeAcrossExisting.merges,
+  [{ row: 0, col: 0, rowSpan: 2, colSpan: 3 }],
+  'merge command must not rebuild an intersected merge as a smaller rectangle',
+)
+
+assert.deepStrictEqual(
+  createFacsimileTableHeaderContextSelection('row', 10, 20, 5),
+  { startRow: 10, endRow: 10, startCol: 0, endCol: 4 },
+  'right-clicking row 10 must replace stale selection with row 10',
+)
+assert.deepStrictEqual(
+  createFacsimileTableHeaderContextSelection('column', 3, 20, 5),
+  { startRow: 0, endRow: 19, startCol: 3, endCol: 3 },
+  'right-clicking a column header must select the complete current column',
+)
+assert.deepStrictEqual(
+  createFacsimileTableCellContextSelection(
+    { row: 1, col: 1 },
+    { startRow: 0, endRow: 2, startCol: 0, endCol: 2 },
+    [],
+    4,
+    4,
+  ),
+  { startRow: 0, endRow: 2, startCol: 0, endCol: 2 },
+  'right-clicking inside an existing multi-cell selection must preserve it for context commands',
+)
+const columnContextResolution = resolveFacsimileTableCellContextSelection(
+  { row: 2, col: 1 },
+  { startRow: 0, endRow: 3, startCol: 1, endCol: 1 },
+  'column',
+  [],
+  4,
+  3,
+)
+assert.strictEqual(columnContextResolution.mode, 'column', 'right-clicking a cell inside a whole-column selection must retain column mode')
+assert.strictEqual(
+  applyFacsimileTableStructureCommand(
+    [['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i'], ['j', 'k', 'l']],
+    [],
+    columnContextResolution.selection,
+    columnContextResolution.mode,
+    'delete-row',
+  ).changed,
+  false,
+  'a cell context menu opened inside a column selection must still reject row deletion',
+)
+assert.strictEqual(
+  applyFacsimileTableStructureCommand(
+    [['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i'], ['j', 'k', 'l']],
+    [],
+    columnContextResolution.selection,
+    columnContextResolution.mode,
+    'delete-column',
+  ).rows[0].length,
+  2,
+  'the retained column mode must still allow deletion on its own axis',
+)
+const rowContextResolution = resolveFacsimileTableCellContextSelection(
+  { row: 1, col: 2 },
+  { startRow: 1, endRow: 1, startCol: 0, endCol: 2 },
+  'row',
+  [],
+  4,
+  3,
+)
+assert.strictEqual(rowContextResolution.mode, 'row', 'right-clicking a cell inside a whole-row selection must retain row mode')
+assert.strictEqual(
+  applyFacsimileTableStructureCommand(
+    [['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i'], ['j', 'k', 'l']],
+    [],
+    rowContextResolution.selection,
+    rowContextResolution.mode,
+    'delete-column',
+  ).changed,
+  false,
+  'a cell context menu opened inside a row selection must still reject column deletion',
+)
+assert.strictEqual(
+  applyFacsimileTableStructureCommand(
+    [['a', 'b', 'c'], ['d', 'e', 'f'], ['g', 'h', 'i'], ['j', 'k', 'l']],
+    [],
+    rowContextResolution.selection,
+    rowContextResolution.mode,
+    'delete-row',
+  ).rows.length,
+  3,
+  'the retained row mode must still allow deletion on its own axis',
+)
+const outsideContextResolution = resolveFacsimileTableCellContextSelection(
+  { row: 0, col: 0 },
+  { startRow: 0, endRow: 3, startCol: 1, endCol: 1 },
+  'column',
+  [],
+  4,
+  3,
+)
+assert.strictEqual(outsideContextResolution.mode, 'cell', 'right-clicking outside the effective selection must switch to ordinary cell mode')
+assert.deepStrictEqual(outsideContextResolution.selection, { startRow: 0, endRow: 0, startCol: 0, endCol: 0 })
+
+const historyA = {
+  rows: [['A']],
+  merges: [],
+  rowHeights: [40],
+  columnWidths: [120],
+}
+const historyB = {
+  rows: [['B']],
+  merges: [],
+  rowHeights: [52],
+  columnWidths: [160],
+}
+const committedHistory = reduceFacsimileTableHistory(
+  { past: [], present: historyA, future: [] },
+  { type: 'commit', snapshot: historyB },
+)
+assert.strictEqual(committedHistory.past.length, 1)
+assert.deepStrictEqual(committedHistory.present, historyB)
+const undoneHistory = reduceFacsimileTableHistory(committedHistory, { type: 'undo' })
+assert.deepStrictEqual(undoneHistory.present, historyA, 'undo must restore rows, merges, row heights, and column widths together')
+assert.deepStrictEqual(undoneHistory.future, [historyB])
+const redoneHistory = reduceFacsimileTableHistory(undoneHistory, { type: 'redo' })
+assert.deepStrictEqual(redoneHistory.present, historyB, 'redo must restore the complete table snapshot')
+
+const identityChanged = reconcileFacsimileTableEditorIdentity(
+  'page-1:block-A',
+  'page-1:block-B',
+  JSON.stringify([[['A']], []]),
+  JSON.stringify([[['A']], []]),
+  committedHistory,
+  historyA,
+)
+assert.strictEqual(identityChanged.kind, 'identity-change')
+assert.deepStrictEqual(identityChanged.history.past, [], 'switching to a different block must clear undo history even when table content matches')
+assert.deepStrictEqual(identityChanged.history.future, [], 'switching block identity must clear redo history')
+const sameIdentityEcho = reconcileFacsimileTableEditorIdentity(
+  'page-1:block-A',
+  'page-1:block-A',
+  JSON.stringify([[['B']], []]),
+  JSON.stringify([[['B']], []]),
+  committedHistory,
+  historyB,
+)
+assert.strictEqual(sameIdentityEcho.kind, 'emitted-echo')
+assert.strictEqual(sameIdentityEcho.history, committedHistory, 'a same-block onChange echo must preserve the existing undo stack')
+
+assert.strictEqual(
+  getFacsimileTableEditorKeyIntent({ key: 'Enter', isComposing: true }, false),
+  'ignore-composition',
+  'a native composing Enter must not commit a Chinese IME candidate as a cell edit',
+)
+assert.strictEqual(
+  getFacsimileTableEditorKeyIntent({ key: 'Enter' }, true),
+  'ignore-composition',
+  'the composition session ref must protect candidate selection even when the browser key event omits isComposing',
+)
+assert.strictEqual(
+  getFacsimileTableEditorKeyIntent({ key: 'Enter' }, false),
+  'commit-next-row',
+  'ordinary Enter must commit and move to the next row',
+)
+
+const axisRows = Array.from({ length: 12 }, (_, row) => [`${row}:0`, `${row}:1`])
+const rowTenSelection = { startRow: 10, endRow: 10, startCol: 0, endCol: 1 }
+assert.deepStrictEqual(
+  applyFacsimileTableStructureCommand(axisRows, [], rowTenSelection, 'row', 'delete-column').rows,
+  axisRows,
+  'row-header mode must reject column deletion in the dispatcher',
+)
+assert.deepStrictEqual(
+  applyFacsimileTableStructureCommand(axisRows, [], rowTenSelection, 'row', 'insert-column-right').rows,
+  axisRows,
+  'row-header mode must reject column insertion in the dispatcher',
+)
+assert.strictEqual(
+  applyFacsimileTableStructureCommand(axisRows, [], rowTenSelection, 'row', 'delete-row').rows.length,
+  11,
+  'row-header mode must allow deletion on its own axis',
+)
+const columnSelection = { startRow: 0, endRow: 11, startCol: 1, endCol: 1 }
+assert.deepStrictEqual(
+  applyFacsimileTableStructureCommand(axisRows, [], columnSelection, 'column', 'delete-row').rows,
+  axisRows,
+  'column-header mode must reject row deletion in the dispatcher',
+)
+assert.deepStrictEqual(
+  applyFacsimileTableStructureCommand(axisRows, [], columnSelection, 'column', 'insert-row-below').rows,
+  axisRows,
+  'column-header mode must reject row insertion in the dispatcher',
+)
+assert.strictEqual(
+  applyFacsimileTableStructureCommand(axisRows, [], columnSelection, 'column', 'delete-column').rows[0].length,
+  1,
+  'column-header mode must allow deletion on its own axis',
+)
+
+const clipboardCommand = applyFacsimileTableClipboardCommand(
+  [['base', ''], ['', '']],
+  [],
+  { startRow: 1, endRow: 1, startCol: 1, endCol: 1 },
+  { html: '<table><tr><td colspan="2">A</td></tr></table>' },
+)
+assert.strictEqual(clipboardCommand.source, 'html')
+assert.strictEqual(clipboardCommand.truncated, false)
+assert.deepStrictEqual(
+  clipboardCommand.merges,
+  [{ row: 1, col: 1, rowSpan: 1, colSpan: 2 }],
+  'clipboard commands must preserve and offset HTML merge metadata',
+)
+const truncatedClipboardCommand = applyFacsimileTableClipboardCommand(
+  [['base']],
+  [],
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+  { html: '<table><tr><td rowspan="999999999999999999" colspan="999999999999999999">A</td></tr></table>' },
+)
+assert.strictEqual(truncatedClipboardCommand.truncated, true, 'clipboard command must propagate parser and paste budget truncation')
+
+const hiddenMergeRows = [
+  ['ANCHOR', 'HIDDEN-A'],
+  ['HIDDEN-B', 'HIDDEN-C'],
+]
+const hiddenMerge = [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }]
+assert.strictEqual(
+  serializeFacsimileTableSelectionAsTsv(
+    hiddenMergeRows,
+    hiddenMerge,
+    { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+  ),
+  'ANCHOR\t\r\n\t',
+  'copying a merged range must serialize covered cells as empty instead of leaking hidden OCR values',
+)
+const losslessClipboard = serializeFacsimileTableSelectionForClipboard(
+  [['甲\n乙\t内', '丙']],
+  [],
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 1 },
+)
+assert.strictEqual(losslessClipboard.text, '甲\n乙\t内\t丙', 'plain TSV fallback must remain available for non-HTML targets')
+assert.deepStrictEqual(
+  parseFacsimileTableClipboardData({ html: losslessClipboard.html, text: losslessClipboard.text }).rows,
+  [['甲\n乙\t内', '丙']],
+  'structured HTML copy must preserve newlines and literal tabs inside cells on roundtrip',
+)
+const mergedClipboard = serializeFacsimileTableSelectionForClipboard(
+  hiddenMergeRows,
+  hiddenMerge,
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+)
+assert.ok(mergedClipboard.html.includes('rowspan="2"') && mergedClipboard.html.includes('colspan="2"'))
+assert.ok(!mergedClipboard.html.includes('HIDDEN-A') && !mergedClipboard.html.includes('HIDDEN-B'), 'structured copy must skip covered cells and their stale OCR values')
+const mergedClipboardRoundtrip = parseFacsimileTableClipboardData(mergedClipboard)
+assert.deepStrictEqual(mergedClipboardRoundtrip.rows, [['ANCHOR', ''], ['', '']])
+assert.deepStrictEqual(mergedClipboardRoundtrip.merges, hiddenMerge, 'structured copy/paste must retain rowspan and colspan metadata')
+const singleValueOverMerge = applyFacsimileTableClipboardCommand(
+  hiddenMergeRows,
+  hiddenMerge,
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+  { text: 'NEW' },
+)
+assert.deepStrictEqual(singleValueOverMerge.rows, [['NEW', ''], ['', '']], 'a small paste must clear the rest of the effective merge closure')
+assert.deepStrictEqual(singleValueOverMerge.merges, [], 'pasting a single value over a merge must remove the old merge')
+const newMergeOverOldMerge = applyFacsimileTableClipboardCommand(
+  hiddenMergeRows,
+  hiddenMerge,
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+  { html: '<table><tr><td colspan="2">NEW-MERGE</td></tr></table>' },
+)
+assert.deepStrictEqual(newMergeOverOldMerge.rows, [['NEW-MERGE', ''], ['', '']])
+assert.deepStrictEqual(
+  newMergeOverOldMerge.merges,
+  [{ row: 0, col: 0, rowSpan: 1, colSpan: 2 }],
+  'a pasted HTML merge must replace the old merge without exposing covered values outside the new range',
+)
+const partialFootprintRows = [
+  ['KEEP-00', 'START', 'TARGET', 'CLEAR-03', 'KEEP-04'],
+  ['KEEP-10', 'TARGET', 'ANCHOR', 'HIDDEN-A', 'KEEP-14'],
+  ['KEEP-20', 'CLEAR-21', 'HIDDEN-B', 'HIDDEN-C', 'KEEP-24'],
+  ['KEEP-30', 'KEEP-31', 'KEEP-32', 'KEEP-33', 'KEEP-34'],
+]
+const partialFootprintPaste = applyFacsimileTableClipboardCommand(
+  partialFootprintRows,
+  [{ row: 1, col: 2, rowSpan: 2, colSpan: 2 }],
+  { startRow: 0, endRow: 0, startCol: 1, endCol: 1 },
+  { text: 'N00\tN01\nN10\tN11' },
+)
+assert.deepStrictEqual(partialFootprintPaste.merges, [], 'a paste footprint touching a merge edge must remove the complete old merge')
+assert.deepStrictEqual(
+  partialFootprintPaste.rows.slice(0, 3).map((row) => row.slice(1, 4)),
+  [['N00', 'N01', ''], ['N10', 'N11', ''], ['', '', '']],
+  'the union of selection, actual paste footprint, and merge closure must be cleared before writing new cells',
+)
+assert.strictEqual(partialFootprintPaste.rows[0][0], 'KEEP-00')
+assert.strictEqual(partialFootprintPaste.rows[3][3], 'KEEP-33')
+
+const normalAvailability = getFacsimileTableCommandAvailability(
+  [['a', 'b'], ['c', 'd']],
+  [],
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+)
+assert.deepStrictEqual(normalAvailability, {
+  insertRow: true,
+  insertColumn: true,
+  deleteRow: true,
+  deleteColumn: true,
+  merge: false,
+  split: false,
+  clear: true,
+})
+const rowModeAvailability = getFacsimileTableCommandAvailability(
+  [['a', 'b'], ['c', 'd']],
+  [],
+  { startRow: 1, endRow: 1, startCol: 0, endCol: 1 },
+  'row',
+)
+assert.strictEqual(rowModeAvailability.insertColumn, false)
+assert.strictEqual(rowModeAvailability.deleteColumn, false, 'row-header context menus must disable the opposite column axis')
+const columnModeAvailability = getFacsimileTableCommandAvailability(
+  [['a', 'b'], ['c', 'd']],
+  [],
+  { startRow: 0, endRow: 1, startCol: 1, endCol: 1 },
+  'column',
+)
+assert.strictEqual(columnModeAvailability.insertRow, false)
+assert.strictEqual(columnModeAvailability.deleteRow, false, 'column-header context menus must disable the opposite row axis')
+const maxColumnsRows = [Array.from({ length: FACSIMILE_TABLE_MAX_COLUMNS }, () => '')]
+assert.strictEqual(
+  getFacsimileTableCommandAvailability(maxColumnsRows, [], { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }).insertColumn,
+  false,
+  'column insertion must be disabled at the structural safety limit',
+)
+assert.deepStrictEqual(
+  applyFacsimileTableStructureCommand(
+    maxColumnsRows,
+    [],
+    { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+    'cell',
+    'insert-column-right',
+  ).rows,
+  maxColumnsRows,
+  'the dispatcher must enforce table budgets even if a disabled menu command is invoked directly',
+)
+const mergedAvailability = getFacsimileTableCommandAvailability(
+  [['a', ''], ['', '']],
+  [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }],
+  { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+)
+assert.strictEqual(mergedAvailability.merge, false, 'an already merged range must not offer a redundant merge command')
+assert.strictEqual(mergedAvailability.split, true, 'an effective selection containing a merge must offer split')
+
+const mergeLookup = buildFacsimileTableCellMergeLookup(
+  [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }],
+  2,
+  2,
+)
+assert.strictEqual(mergeLookup.size, 4, 'the render path must pre-index every cell of a merge once')
+assert.deepStrictEqual(mergeLookup.get('1:1'), { row: 0, col: 0, rowSpan: 2, colSpan: 2 })
+const denseMerges = Array.from({ length: 100 }, (_, row) => (
+  Array.from({ length: 100 }, (_, index) => ({ row, col: index * 2, rowSpan: 1, colSpan: 2 }))
+)).flat()
+const denseLookupStartedAt = process.hrtime.bigint()
+const denseLookup = buildFacsimileTableCellMergeLookup(denseMerges, 100, 200, true)
+const denseLookupElapsedMs = Number(process.hrtime.bigint() - denseLookupStartedAt) / 1_000_000
+assert.strictEqual(denseLookup.size, 20_000)
+assert.ok(denseLookupElapsedMs < 1_000, `indexing 10,000 normalized merges took an unexpected ${denseLookupElapsedMs.toFixed(1)}ms`)
+
+assert.deepStrictEqual(
+  clampFacsimileTableContextMenuPosition(999, 999, 800, 600, 216, 328),
+  { left: 576, top: 264 },
+  'context menu coordinates must stay inside the viewport',
+)
+
+{
+  const listeners = new Map()
+  const removed = []
+  let releases = 0
+  let finished = 0
+  const target = {
+    addEventListener(type, listener) { listeners.set(type, listener) },
+    removeEventListener(type, listener) { removed.push([type, listener]) },
+    hasPointerCapture() { return true },
+    releasePointerCapture() { releases += 1 },
+  }
+  const cleanup = attachFacsimileTableResizeListeners(target, 7, () => {}, () => { finished += 1 })
+  assert.deepStrictEqual(
+    [...listeners.keys()].sort(),
+    ['lostpointercapture', 'pointercancel', 'pointermove', 'pointerup'],
+    'resize must register every normal, cancellation, and lost-capture cleanup path',
+  )
+  listeners.get('pointercancel')({})
+  assert.strictEqual(removed.length, 4, 'finishing resize must remove every registered listener')
+  assert.strictEqual(releases, 1)
+  assert.strictEqual(finished, 1)
+  cleanup()
+  assert.strictEqual(removed.length, 4, 'resize cleanup must be idempotent')
+  assert.strictEqual(finished, 1)
+}
+
+{
+  const listeners = new Map()
+  const removed = []
+  let escapeCloses = 0
+  let prevented = 0
+  const target = {
+    addEventListener(type, listener) { listeners.set(type, listener) },
+    removeEventListener(type, listener) { removed.push([type, listener]); if (listeners.get(type) === listener) listeners.delete(type) },
+  }
+  const cleanup = attachFacsimileTableContextMenuEscapeListener(target, () => { escapeCloses += 1 })
+  assert.deepStrictEqual([...listeners.keys()], ['keydown'], 'an open context menu must register one Escape listener')
+  listeners.get('keydown')({ key: 'Enter', preventDefault() { prevented += 1 } })
+  assert.strictEqual(escapeCloses, 0)
+  listeners.get('keydown')({ key: 'Escape', preventDefault() { prevented += 1 } })
+  assert.strictEqual(escapeCloses, 1, 'Escape must deterministically close the context menu')
+  assert.strictEqual(prevented, 1)
+  assert.strictEqual(removed.length, 1, 'Escape must clean its listener exactly once')
+  cleanup()
+  assert.strictEqual(removed.length, 1, 'context menu Escape cleanup must be idempotent for unmount')
+
+  const first = attachFacsimileTableContextMenuEscapeListener(target, () => { escapeCloses += 1 })
+  first()
+  const second = attachFacsimileTableContextMenuEscapeListener(target, () => { escapeCloses += 1 })
+  assert.strictEqual(listeners.size, 1, 'reopening the menu after cleanup must not leak an old keydown listener')
+  second()
+  assert.strictEqual(listeners.size, 0)
+}
+
+const darkThemeStyle = createFacsimileTableThemeStyle({
+  colorBgContainer: '#141414',
+  colorBgElevated: '#1f1f1f',
+  colorBgLayout: '#000000',
+  colorText: '#f0f0f0',
+  colorTextSecondary: '#bfbfbf',
+  colorBorderSecondary: '#303030',
+  colorPrimaryBg: '#111a2c',
+  colorPrimaryBgHover: '#112545',
+  colorPrimary: '#1668dc',
+  colorPrimaryBorder: '#15325b',
+  boxShadowSecondary: '0 6px 16px #0008',
+  colorTextDisabled: '#5c5c5c',
+})
+assert.strictEqual(darkThemeStyle['--table-bg'], '#141414')
+assert.strictEqual(darkThemeStyle['--table-text'], '#f0f0f0')
+assert.strictEqual(darkThemeStyle['--table-secondary'], '#bfbfbf')
+assert.strictEqual(darkThemeStyle['--table-menu-bg'], '#1f1f1f')
+assert.strictEqual(darkThemeStyle['--table-menu-hover'], '#112545')
+
+assert.ok(tableEditor.includes('role="grid"'), 'the table editor must expose a single focusable ARIA grid root')
+assert.ok(tableEditor.includes('role="row"') && tableEditor.includes('role="gridcell"'), 'rows and cells must expose ARIA grid semantics')
+assert.ok(tableEditor.includes('facsimile-table-row-header'), 'the grid must render clickable row number headers')
+assert.ok(tableEditor.includes('facsimile-table-column-header'), 'the grid must render clickable column letter headers')
+assert.ok(tableEditor.includes('onPointerDown={handleCellPointerDown}'), 'pointer down must start rectangular cell selection')
+assert.ok(tableEditor.includes('onPointerEnter={() => handleCellPointerEnter'), 'pointer drag must extend a rectangular selection')
+assert.ok(!tableEditor.includes('<Input.TextArea'), 'ordinary cells must be display elements instead of one textarea per cell')
+assert.strictEqual((tableEditor.match(/<textarea\b/g) || []).length, 1, 'the component source must define exactly one reusable active cell editor')
+assert.ok(tableEditor.includes('editingCell &&'), 'the active cell editor must only mount while a single cell is being edited')
+assert.ok(tableEditor.includes('const rawSelection = getFacsimileTableSelection(anchor, focus)'))
+assert.ok(tableEditor.includes('expandFacsimileTableSelectionWithLookup(rawSelection'), 'rendering and commands must share one indexed merge-aware effective selection')
+assert.ok(tableEditor.includes('const mergeLookup = useMemo('), 'the render path must memoize its cell-to-merge index')
+assert.ok(tableEditor.includes('const commandAvailability = useMemo('), 'command availability must be memoized from the normalized table snapshot')
+
+assert.ok(tableEditor.includes("event.clipboardData.getData('text/html')"), 'paste must read HTML clipboard data')
+assert.ok(tableEditor.includes("event.clipboardData.getData('text/plain')"), 'paste must read plain text clipboard data')
+assert.ok(tableEditor.includes("event.clipboardData.setData('text/html'"), 'copy must publish structured HTML alongside TSV fallback')
+assert.ok(tableEditor.includes('parseFacsimileTableClipboardData'), 'paste must use the detailed Task 2 clipboard parser')
+assert.ok(tableEditor.includes('parsed.merges'), 'paste must preserve HTML clipboard merge metadata')
+assert.ok(tableEditor.includes('parsed.truncated') && tableEditor.includes('pasted.truncated'), 'clipboard budget truncation must produce a visible UI path')
+
+for (const key of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab', 'Enter', 'Delete', 'Backspace', 'F2', 'Escape']) {
+  assert.ok(tableEditor.includes(`'${key}'`), `the grid keyboard handler must support ${key}`)
+}
+assert.ok(tableEditor.includes('event.ctrlKey || event.metaKey'), 'the grid must recognize platform undo/redo shortcuts')
+assert.ok(tableEditor.includes('undo') && tableEditor.includes('redo'), 'the grid must keep local undo and redo history')
+assert.ok(tableEditor.includes('onDoubleClick'), 'double click must enter cell editing')
+assert.ok(tableEditor.includes('isPrintableKey'), 'typing a printable key must start overwrite editing')
+assert.ok(tableEditor.includes('onCompositionStart') && tableEditor.includes('onCompositionEnd'), 'the active editor must track Chinese IME composition sessions')
+assert.ok(proofreader.includes('editorKey='), 'the proofreader must provide a stable block identity to isolate editor state')
+
+assert.ok(tableEditor.includes('onContextMenu={handleContextMenu}'), 'the editor must expose a selection-aware context menu')
+assert.ok(tableEditor.includes('onContextMenu={(event) => handleRowHeaderContextMenu'), 'row headers must replace stale selection before opening the context menu')
+assert.ok(tableEditor.includes('onContextMenu={(event) => handleColumnHeaderContextMenu'), 'column headers must replace stale selection before opening the context menu')
+assert.ok(tableEditor.includes('resolveFacsimileTableCellContextSelection('), 'cell context menus must preserve row or column mode when opened inside that selection')
+assert.ok(tableEditor.includes('onScroll={() => closeContextMenu()}'), 'scrolling the grid must close the context menu and clean its Escape listener')
+for (const action of ['上方插入行', '下方插入行', '左侧插入列', '右侧插入列', '删除行', '删除列', '合并选区', '拆分单元格', '清空选区']) {
+  assert.ok(tableEditor.includes(action), `the table context controls must retain ${action}`)
+}
+assert.ok(tableEditor.includes('facsimile-table-row-resize-handle'), 'row headers must expose resize handles')
+assert.ok(tableEditor.includes('facsimile-table-column-resize-handle'), 'column headers must expose resize handles')
+assert.ok(tableEditor.includes('setPointerCapture'), 'resize and drag interactions must reliably capture pointer movement')
+assert.ok(tableEditor.includes('resizeCleanupRef'), 'resize cleanup must survive event-handler rerenders and component unmount')
+assert.ok(tableEditor.includes('contextMenuEscapeCleanupRef'), 'context menu Escape cleanup must survive rerenders and unmount')
+assert.ok(tableEditor.includes("gridRef.current?.focus({ preventScroll: true })"), 'opening the context menu must keep keyboard focus on a deterministic Escape target')
+
+assert.ok(tableEditor.includes('theme.useToken()'), 'the component must read the active Ant Design theme token set')
+assert.ok(tableEditor.includes('createFacsimileTableThemeStyle(token)'), 'real Ant tokens must be connected to the grid CSS variables')
+assert.ok(tableEditor.includes('style={tableThemeStyle}'), 'the grid root must receive its local theme variables inline')
+assert.ok(!tableEditorCss.includes('--gs-') && !tableEditorCss.includes('--ant-'), 'component styles must not depend on undefined global theme variables')
+assert.ok(tableEditorCss.includes('var(--table-bg,'), 'component theme variables must provide an explicit light fallback')
+assert.ok(tableEditorCss.includes('overflow: auto'), 'narrow table editors must scroll instead of clipping columns')
+assert.ok(!/background(?:-color)?\s*:\s*#fff(?:fff)?\b/i.test(tableEditorCss), 'table cells must not force a hard-coded white background')
+assert.ok(!/background(?:-color)?\s*:\s*['"]?#fff(?:fff)?\b/i.test(tableEditor), 'the component must not force a hard-coded white background')
+
+const toolbarStart = tableEditor.indexOf('className="facsimile-table-toolbar"')
+const toolbarEnd = tableEditor.indexOf('className="facsimile-table-help"')
+const toolbarSource = tableEditor.slice(toolbarStart, toolbarEnd)
+assert.ok(toolbarSource.includes('撤销') && toolbarSource.includes('重做'), 'the compact toolbar must expose undo and redo controls')
+for (const action of ['上方插入行', '下方插入行', '左侧插入列', '右侧插入列', '删除行', '删除列', '合并选区', '拆分单元格', '清空选区']) {
+  assert.ok(!toolbarSource.includes(action), `the compact toolbar must leave ${action} in the context menu`)
+}
+
 console.log('Facsimile layout editor regression passed.')

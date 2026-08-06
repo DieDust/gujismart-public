@@ -3298,6 +3298,11 @@ export default function GujiFacsimileProofreader({
           <div style={{ padding: 14, minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
             {isRenderableTableBlock(editingBlock) ? (
               <FacsimileTableEditor
+                editorKey={String(
+                  editingBlock.manual_block_id
+                  || editingBlock.ir_block_id
+                  || `${pageId}:block:${editingIndex}`
+                )}
                 rows={tableDraftRows}
                 merges={tableDraftMerges}
                 onChange={(value) => {

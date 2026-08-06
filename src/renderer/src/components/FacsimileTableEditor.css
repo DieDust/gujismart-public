@@ -1,0 +1,242 @@
+.facsimile-table-editor {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--table-text, #1f1f1f);
+}
+
+.facsimile-table-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.facsimile-table-status {
+  min-width: 0;
+  margin-left: 4px;
+  color: var(--table-secondary, #595959);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.facsimile-table-help {
+  color: var(--table-secondary, #595959);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.facsimile-table-grid-shell {
+  max-height: min(54vh, 520px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--table-grid, #d9d9d9);
+  border-radius: 7px;
+  background: var(--table-bg, #f7f7f7);
+}
+
+.facsimile-table-grid {
+  width: max-content;
+  min-width: 100%;
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+  color: var(--table-text, #1f1f1f);
+  background: var(--table-bg, #f7f7f7);
+  outline: none;
+}
+
+.facsimile-table-grid:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--table-focus, #4096ff);
+}
+
+.facsimile-table-row-number-column {
+  width: 48px;
+}
+
+.facsimile-table-corner,
+.facsimile-table-column-heading,
+.facsimile-table-row-heading {
+  position: sticky;
+  padding: 0;
+  color: var(--table-text, #1f1f1f);
+  background: var(--table-header, #f0f0f0);
+  border-right: 1px solid var(--table-grid, #d9d9d9);
+  border-bottom: 1px solid var(--table-grid, #d9d9d9);
+  user-select: none;
+}
+
+.facsimile-table-corner {
+  top: 0;
+  left: 0;
+  z-index: 5;
+}
+
+.facsimile-table-column-heading {
+  top: 0;
+  z-index: 3;
+  height: 30px;
+}
+
+.facsimile-table-row-heading {
+  left: 0;
+  z-index: 2;
+  min-width: 48px;
+}
+
+.facsimile-table-column-header,
+.facsimile-table-row-header {
+  width: 100%;
+  height: 100%;
+  min-height: 30px;
+  padding: 3px 8px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: default;
+}
+
+.facsimile-table-column-header:focus-visible,
+.facsimile-table-row-header:focus-visible {
+  outline: 2px solid var(--table-focus, #4096ff);
+  outline-offset: -2px;
+}
+
+.facsimile-table-column-resize-handle,
+.facsimile-table-row-resize-handle {
+  position: absolute;
+  z-index: 6;
+  touch-action: none;
+}
+
+.facsimile-table-column-resize-handle {
+  top: 0;
+  right: -3px;
+  width: 7px;
+  height: 100%;
+  cursor: col-resize;
+}
+
+.facsimile-table-row-resize-handle {
+  right: 0;
+  bottom: -3px;
+  width: 100%;
+  height: 7px;
+  cursor: row-resize;
+}
+
+.facsimile-table-column-resize-handle:hover,
+.facsimile-table-row-resize-handle:hover {
+  background: var(--table-active, #1677ff);
+}
+
+.facsimile-table-cell {
+  position: relative;
+  min-width: 48px;
+  padding: 0;
+  vertical-align: top;
+  color: var(--table-text, #1f1f1f);
+  background: var(--table-bg, #f7f7f7);
+  border-right: 1px solid var(--table-grid, #d9d9d9);
+  border-bottom: 1px solid var(--table-grid, #d9d9d9);
+  cursor: cell;
+  overflow: hidden;
+}
+
+.facsimile-table-cell.is-selected {
+  background: var(--table-selection, #e6f4ff);
+}
+
+.facsimile-table-cell.is-merged {
+  background-image: linear-gradient(
+    135deg,
+    transparent 0,
+    transparent calc(100% - 8px),
+    var(--table-active, #1677ff) calc(100% - 8px)
+  );
+}
+
+.facsimile-table-cell.is-active::after {
+  position: absolute;
+  inset: -1px;
+  z-index: 2;
+  border: 2px solid var(--table-active, #1677ff);
+  pointer-events: none;
+  content: '';
+}
+
+.facsimile-table-cell-display {
+  min-height: 100%;
+  padding: 8px 9px;
+  color: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: none;
+}
+
+.facsimile-table-active-editor {
+  position: absolute;
+  inset: 2px;
+  z-index: 4;
+  box-sizing: border-box;
+  width: calc(100% - 4px);
+  height: calc(100% - 4px);
+  min-height: 34px;
+  padding: 6px 7px;
+  resize: none;
+  color: var(--table-text, #1f1f1f);
+  background: var(--table-bg, #f7f7f7);
+  border: 1px solid var(--table-active, #1677ff);
+  border-radius: 2px;
+  outline: 0;
+  box-shadow: 0 0 0 2px var(--table-focus, #4096ff);
+  font: inherit;
+  line-height: 1.5;
+}
+
+.facsimile-table-context-menu {
+  position: fixed;
+  z-index: 1400;
+  display: grid;
+  width: 208px;
+  padding: 5px;
+  color: var(--table-text, #1f1f1f);
+  background: var(--table-menu-bg, #f7f7f7);
+  border: 1px solid var(--table-grid, #d9d9d9);
+  border-radius: 8px;
+  box-shadow: var(--table-shadow, 0 10px 32px rgb(0 0 0 / 18%));
+}
+
+.facsimile-table-context-menu button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: var(--table-menu-bg, #f7f7f7);
+  text-align: left;
+  cursor: pointer;
+}
+
+.facsimile-table-context-menu button:hover:not(:disabled),
+.facsimile-table-context-menu button:focus-visible {
+  background: var(--table-menu-hover, #e8e8e8);
+  outline: 2px solid var(--table-focus, #4096ff);
+  outline-offset: -2px;
+}
+
+.facsimile-table-context-menu button:disabled {
+  color: var(--table-disabled, #8c8c8c);
+  cursor: not-allowed;
+}
+
+.facsimile-table-context-divider {
+  height: 1px;
+  margin: 4px 5px;
+  background: var(--table-grid, #d9d9d9);
+}
