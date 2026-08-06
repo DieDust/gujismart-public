@@ -4,6 +4,7 @@ export type ManualLayoutDraftBlock = Record<string, unknown>
 export type ManualLayoutSaveState = 'clean' | 'dirty' | 'saving' | 'failed'
 
 export interface ManualLayoutDraftState {
+  draftIdentity: string
   pageId: string
   blocks: ManualLayoutDraftBlock[]
   activeBlockId: string | null
@@ -24,7 +25,7 @@ export type ManualLayoutDraftAction =
   | { type: 'server-ack'; pageId?: string; revision: number; blocks: ManualLayoutDraftBlock[] }
   | { type: 'server-echo'; pageId: string; blocks: ManualLayoutDraftBlock[] }
   | { type: 'retry' }
-  | { type: 'page-changed'; pageId: string; blocks: ManualLayoutDraftBlock[] }
+  | { type: 'page-changed'; pageId: string; draftIdentity: string; blocks: ManualLayoutDraftBlock[]; restoredState?: ManualLayoutDraftState | null }
 
 export type ManualLayoutSaveSchedule =
   | { kind: 'none' }
@@ -37,17 +38,99 @@ type ManualLayoutSave = (
   revision: number,
 ) => void | Promise<void>
 
+export interface ManualLayoutDraftStorage {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+  removeItem(key: string): void
+}
+
 interface UseManualLayoutDraftOptions {
+  draftIdentity: string
   pageId: string
   blocks: ManualLayoutDraftBlock[]
   save: ManualLayoutSave
   debounceMs?: number
+  storage?: ManualLayoutDraftStorage | null
 }
+
+interface StoredManualLayoutDraft {
+  version: 1
+  draftIdentity: string
+  pageId: string
+  blocks: ManualLayoutDraftBlock[]
+  activeBlockId: string | null
+  revision: number
+  acknowledgedRevision: number
+  saveState: Exclude<ManualLayoutSaveState, 'clean'>
+  updatedAt: number
+}
+
+export type PendingManualLayoutPageAction = 'same-page' | 'apply-target' | 'confirm-target' | 'wait-for-save'
+
+const MANUAL_LAYOUT_DRAFT_STORAGE_PREFIX = 'gujismart.manual-layout-draft.v1:'
 
 let manualBlockSequence = 0
 
 function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+export function getManualLayoutDraftStorageKey(draftIdentity: string): string {
+  return `${MANUAL_LAYOUT_DRAFT_STORAGE_PREFIX}${encodeURIComponent(draftIdentity.trim())}`
+}
+
+export function getPendingManualLayoutPageAction(
+  draftIdentity: string,
+  draftPageId: string,
+  targetIdentity: string,
+  targetPageId: string,
+  saveState: ManualLayoutSaveState,
+  pendingTargetIdentity: string,
+): PendingManualLayoutPageAction {
+  if (draftIdentity === targetIdentity && draftPageId === targetPageId) return 'same-page'
+  if (saveState === 'clean') return 'apply-target'
+  return pendingTargetIdentity === targetIdentity ? 'wait-for-save' : 'confirm-target'
+}
+
+function getBrowserDraftStorage(): ManualLayoutDraftStorage | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage
+  } catch {
+    return null
+  }
+}
+
+function readStoredManualLayoutDraft(
+  storage: ManualLayoutDraftStorage,
+  draftIdentity: string,
+): StoredManualLayoutDraft | null {
+  const normalizedIdentity = draftIdentity.trim()
+  if (!normalizedIdentity) return null
+  try {
+    const raw = storage.getItem(getManualLayoutDraftStorageKey(normalizedIdentity))
+    if (!raw) return null
+    const value: unknown = JSON.parse(raw)
+    if (!isRecord(value)
+      || value.version !== 1
+      || value.draftIdentity !== normalizedIdentity
+      || typeof value.pageId !== 'string'
+      || !Array.isArray(value.blocks)
+      || !value.blocks.every(isRecord)
+      || (value.activeBlockId !== null && typeof value.activeBlockId !== 'string')
+      || !Number.isInteger(value.revision)
+      || !Number.isInteger(value.acknowledgedRevision)
+      || typeof value.updatedAt !== 'number'
+      || !['dirty', 'saving', 'failed'].includes(String(value.saveState))) {
+      return null
+    }
+    return value as unknown as StoredManualLayoutDraft
+  } catch {
+    return null
+  }
 }
 
 function createLocalDraftId(pageId: string, block: ManualLayoutDraftBlock, index: number): string {
@@ -147,11 +230,71 @@ function mergeAcknowledgedBlocks(
   })
 }
 
+export function persistManualLayoutDraftSnapshot(
+  storage: ManualLayoutDraftStorage | null,
+  state: ManualLayoutDraftState,
+): boolean {
+  const draftIdentity = state.draftIdentity.trim()
+  if (!storage || !draftIdentity) return false
+  const key = getManualLayoutDraftStorageKey(draftIdentity)
+  try {
+    const existing = readStoredManualLayoutDraft(storage, draftIdentity)
+    if (state.saveState === 'clean') {
+      if (!existing || existing.revision <= state.acknowledgedRevision) storage.removeItem(key)
+      return true
+    }
+    if (existing && existing.revision > state.revision) return true
+    const stored: StoredManualLayoutDraft = {
+      version: 1,
+      draftIdentity,
+      pageId: state.pageId,
+      blocks: state.blocks,
+      activeBlockId: state.activeBlockId,
+      revision: state.revision,
+      acknowledgedRevision: state.acknowledgedRevision,
+      saveState: state.saveState,
+      updatedAt: Date.now(),
+    }
+    storage.setItem(key, JSON.stringify(stored))
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function restoreManualLayoutDraftSnapshot(
+  storage: ManualLayoutDraftStorage | null,
+  draftIdentity: string,
+  pageId: string,
+  serverBlocks: readonly ManualLayoutDraftBlock[],
+): ManualLayoutDraftState | null {
+  if (!storage) return null
+  const stored = readStoredManualLayoutDraft(storage, draftIdentity)
+  if (!stored || stored.pageId !== pageId || stored.revision <= stored.acknowledgedRevision) return null
+  const blocks = mergeAcknowledgedBlocks(pageId, prepareBlocks(pageId, stored.blocks), serverBlocks)
+  const activeBlockId = stored.activeBlockId && blocks.some((block, index) => (
+    getManualLayoutDraftBlockId(pageId, block, index) === stored.activeBlockId
+  ))
+    ? stored.activeBlockId
+    : null
+  return {
+    draftIdentity: draftIdentity.trim(),
+    pageId,
+    blocks,
+    activeBlockId,
+    revision: Math.max(1, stored.revision),
+    acknowledgedRevision: Math.max(0, Math.min(stored.acknowledgedRevision, stored.revision - 1)),
+    saveState: stored.saveState === 'failed' ? 'failed' : 'dirty',
+  }
+}
+
 export function createManualLayoutDraft(
   pageId: string,
   blocks: readonly ManualLayoutDraftBlock[],
+  draftIdentity = pageId,
 ): ManualLayoutDraftState {
   return {
+    draftIdentity,
     pageId,
     blocks: prepareBlocks(pageId, blocks),
     activeBlockId: null,
@@ -267,7 +410,7 @@ export function reduceManualLayoutDraft(
     case 'retry':
       return state.saveState === 'failed' ? { ...state, saveState: 'dirty' } : state
     case 'page-changed':
-      return createManualLayoutDraft(action.pageId, action.blocks)
+      return action.restoredState || createManualLayoutDraft(action.pageId, action.blocks, action.draftIdentity)
     default:
       return state
   }
@@ -298,15 +441,21 @@ export async function continueManualLayoutSaveAfterSettlement(
 }
 
 export function useManualLayoutDraft({
+  draftIdentity,
   pageId,
   blocks,
   save,
   debounceMs = 450,
+  storage,
 }: UseManualLayoutDraftOptions) {
+  const storageRef = useRef<ManualLayoutDraftStorage | null>(
+    storage === undefined ? getBrowserDraftStorage() : storage,
+  )
   const [state, reducerDispatch] = useReducer(
     reduceManualLayoutDraft,
     undefined,
-    () => createManualLayoutDraft(pageId, blocks),
+    () => restoreManualLayoutDraftSnapshot(storageRef.current, draftIdentity, pageId, blocks)
+      || createManualLayoutDraft(pageId, blocks, draftIdentity),
   )
   const stateRef = useRef(state)
   const saveRef = useRef(save)
@@ -344,6 +493,7 @@ export function useManualLayoutDraft({
       }
     }
     stateRef.current = reduceManualLayoutDraft(current, stableAction)
+    persistManualLayoutDraftSnapshot(storageRef.current, stateRef.current)
     if (mountedRef.current) reducerDispatch(stableAction)
   }, [])
 
@@ -422,6 +572,7 @@ export function useManualLayoutDraft({
     return () => {
       mountedRef.current = false
       clearSaveTimer()
+      if (stateRef.current.saveState !== 'clean') void saveRunnerRef.current()
     }
   }, [clearSaveTimer])
 
@@ -447,9 +598,21 @@ export function useManualLayoutDraft({
   const receiveServerEcho = useCallback((echoPageId: string, nextBlocks: ManualLayoutDraftBlock[]) => {
     dispatch({ type: 'server-echo', pageId: echoPageId, blocks: nextBlocks })
   }, [dispatch])
-  const changePage = useCallback((nextPageId: string, nextBlocks: ManualLayoutDraftBlock[]) => {
+  const changePage = useCallback((nextPageId: string, nextDraftIdentity: string, nextBlocks: ManualLayoutDraftBlock[]) => {
     clearSaveTimer()
-    dispatch({ type: 'page-changed', pageId: nextPageId, blocks: nextBlocks })
+    const restoredState = restoreManualLayoutDraftSnapshot(
+      storageRef.current,
+      nextDraftIdentity,
+      nextPageId,
+      nextBlocks,
+    )
+    dispatch({
+      type: 'page-changed',
+      pageId: nextPageId,
+      draftIdentity: nextDraftIdentity,
+      blocks: nextBlocks,
+      restoredState,
+    })
   }, [clearSaveTimer, dispatch])
   const retry = useCallback(() => {
     dispatch({ type: 'retry' })

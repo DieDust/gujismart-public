@@ -30,9 +30,11 @@ import {
 import { renderOcrInlineText } from '../utils/ocrInlineRender'
 import {
   ensureManualLayoutBlockIdentity,
+  getPendingManualLayoutPageAction,
   getManualLayoutDraftBlockId,
   useManualLayoutDraft,
 } from '../hooks/useManualLayoutDraft'
+import { getManualLayoutUnderlayImageStyle } from '../utils/manualLayoutUnderlay'
 import {
   getOcrBlockRect,
   getOcrCoordinateExtent,
@@ -158,6 +160,7 @@ type FacsimileTranslationRenderLayout = {
 }
 
 interface GujiFacsimileProofreaderProps {
+  draftIdentity: string
   pageId: string
   ocrResult: unknown
   pageImageSrc?: string
@@ -1839,6 +1842,7 @@ export function isFacsimileProofCandidate(doc: Partial<Document> | null | undefi
 }
 
 export default function GujiFacsimileProofreader({
+  draftIdentity,
   pageId,
   ocrResult,
   pageImageSrc = '',
@@ -1874,7 +1878,7 @@ export default function GujiFacsimileProofreader({
   const wheelZoomCommitTimerRef = useRef<number | null>(null)
   const pageRecenterFrameRef = useRef<number | null>(null)
   const translationRequestKeyRef = useRef('')
-  const pendingPageChangeRef = useRef('')
+  const pendingDraftIdentityRef = useRef('')
   const historyPageRef = useRef('')
   const proofreaderMountedRef = useRef(true)
   const pageZoomRef = useRef(1)
@@ -1942,6 +1946,7 @@ export default function GujiFacsimileProofreader({
     ))
   }, [buildCurrentPageOcrPayload, onSave, pageId])
   const manualLayoutDraft = useManualLayoutDraft({
+    draftIdentity,
     pageId,
     blocks: incomingBlocks,
     save: persistManualLayoutDraft,
@@ -1981,13 +1986,22 @@ export default function GujiFacsimileProofreader({
     }
   }, [onTranslateCurrentPage, pageSourceText, translationLoading, translationText])
   useEffect(() => {
-    if (manualLayoutDraft.state.pageId === pageId) {
+    const pageAction = getPendingManualLayoutPageAction(
+      manualLayoutDraft.state.draftIdentity,
+      manualLayoutDraft.state.pageId,
+      draftIdentity,
+      pageId,
+      manualLayoutDraft.state.saveState,
+      pendingDraftIdentityRef.current,
+    )
+    if (pageAction === 'same-page') {
+      pendingDraftIdentityRef.current = ''
       manualLayoutDraft.receiveServerEcho(pageId, incomingBlocks)
       return
     }
     const applyPageChange = () => {
       if (!proofreaderMountedRef.current) return
-      manualLayoutDraft.changePage(pageId, incomingBlocks)
+      manualLayoutDraft.changePage(pageId, draftIdentity, incomingBlocks)
       blocksRef.current = incomingBlocks
       setHistory([incomingBlocks.map((block) => ({ ...block }))])
       setHistoryIndex(0)
@@ -1999,14 +2013,14 @@ export default function GujiFacsimileProofreader({
       setAltShowsClearUnderlay(false)
       layoutInteractionRef.current = null
       translationRequestKeyRef.current = ''
-      pendingPageChangeRef.current = ''
+      pendingDraftIdentityRef.current = ''
     }
-    if (manualLayoutDraft.state.saveState === 'clean') {
+    if (pageAction === 'apply-target') {
       applyPageChange()
       return
     }
-    if (pendingPageChangeRef.current === pageId) return
-    pendingPageChangeRef.current = pageId
+    if (pageAction === 'wait-for-save') return
+    pendingDraftIdentityRef.current = draftIdentity
     const confirmation = Modal.confirm({
       title: '当前页还有未保存的版式修改',
       content: '可以先保存旧页面再切换；如果直接切换，未保存的修改将被丢弃。',
@@ -2016,24 +2030,21 @@ export default function GujiFacsimileProofreader({
       onOk: applyPageChange,
       onCancel: async () => {
         const saved = await manualLayoutDraft.flush()
-        if (saved) {
-          applyPageChange()
-          return
-        }
-        pendingPageChangeRef.current = ''
-        if (proofreaderMountedRef.current) message.error('版式保存失败，旧页面草稿已保留，请重试')
+        if (!saved && proofreaderMountedRef.current) message.error('版式保存失败，旧页面草稿已保留，请重试')
       },
     })
     return () => {
       confirmation.destroy()
-      if (pendingPageChangeRef.current === pageId) pendingPageChangeRef.current = ''
     }
   }, [
+    draftIdentity,
     incomingBlocks,
     manualLayoutDraft.changePage,
     manualLayoutDraft.flush,
     manualLayoutDraft.receiveServerEcho,
+    manualLayoutDraft.state.draftIdentity,
     manualLayoutDraft.state.pageId,
+    manualLayoutDraft.state.saveState,
     pageId,
   ])
 
@@ -2223,7 +2234,11 @@ export default function GujiFacsimileProofreader({
   const pageVerticalMode = useMemo(() => effectivePreferVerticalLayout || isVerticalPage(pageBlocks), [effectivePreferVerticalLayout, pageBlocks])
   const autoImageUnderlay = useMemo(() => shouldUseImageUnderlay(pageBlocks, pageVerticalMode), [pageBlocks, pageVerticalMode])
   const showImageUnderlay = !!pageImageSrc && (imageUnderlayMode === 'on' || (imageUnderlayMode === 'auto' && autoImageUnderlay))
-  const renderedImageUnderlayBlur = altShowsClearUnderlay ? 0 : imageUnderlayBlur
+  const imageUnderlayImageStyle = useMemo(() => getManualLayoutUnderlayImageStyle({
+    layoutEditMode,
+    altShowsClearUnderlay,
+    blur: imageUnderlayBlur,
+  }), [altShowsClearUnderlay, imageUnderlayBlur, layoutEditMode])
   const bounds = useMemo(() => getLayoutBounds(pageBlocks, effectiveCoordinateSourceSize), [effectiveCoordinateSourceSize, pageBlocks])
   const pageAspect = bounds.width / Math.max(1, bounds.height)
   const fitPageWidth = useMemo(() => {
@@ -3203,8 +3218,7 @@ export default function GujiFacsimileProofreader({
                 width: '100%',
                 height: '100%',
                 objectFit: 'fill',
-                opacity: layoutEditMode ? 0.52 : Math.max(0.08, 0.28 - imageUnderlayBlur * 0.0016),
-                filter: `blur(${(renderedImageUnderlayBlur / 28).toFixed(2)}px) saturate(${Math.max(0.35, 0.9 - renderedImageUnderlayBlur * 0.004).toFixed(2)}) contrast(${Math.max(0.55, 0.95 - renderedImageUnderlayBlur * 0.003).toFixed(2)})`,
+                ...imageUnderlayImageStyle,
                 pointerEvents: 'none',
                 userSelect: 'none',
               }}

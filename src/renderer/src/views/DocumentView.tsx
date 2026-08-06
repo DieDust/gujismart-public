@@ -6602,6 +6602,7 @@ export default function DocumentView({
               </div>
             ) : facsimileOcrResultObj && proofViewMode === 'facsimile' ? (
               <GujiFacsimileProofreader
+                draftIdentity={`${doc?.library_project_id || 'unknown-project'}/${doc?.id || documentId}/${currentPage?.id || 'unknown-page'}`}
                 ocrResult={facsimileOcrResultObj}
                 pageId={currentPage?.id || ''}
                 pageImageSrc={imageDataUrl}
