@@ -123,6 +123,8 @@ import type {
   DocumentListPage,
   DocumentPage,
   DocumentReadingWindow,
+  ManualPageInsertRequest,
+  ManualPageInsertResult,
   DocumentUpdatePayload,
   EbookManifest,
   EbookTextSection,
@@ -6362,6 +6364,121 @@ export function registerDocumentIpc(): void {
     notifySearchContentChanged()
     scheduleDatabaseSave()
     return true
+  })
+
+  ipcMain.handle('pages:insertManual', async (_event, request: ManualPageInsertRequest): Promise<ManualPageInsertResult> => {
+    const documentId = String(request?.documentId || '').trim()
+    if (!documentId) throw new Error('缺少文献 ID')
+    const position = request?.position === 'before' || request?.position === 'after' ? request.position : null
+    if (!position) throw new Error('插入位置无效')
+
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentInLibraryProject(documentId, libraryProjectId)
+
+    let insertedPageId = ''
+    let pageCount = 0
+    const now = new Date().toISOString()
+
+    transaction(() => {
+      const document = queryOne<{ id: string; page_count: number | null }>(
+        'SELECT id, page_count FROM documents WHERE id = ?',
+        [documentId],
+      )
+      if (!document) throw new Error('文献不存在')
+
+      const pages = queryAll<Pick<DocumentPage, 'id' | 'page_num' | 'ocr_result' | 'created_at'>>(
+        `SELECT id, page_num, ocr_result, created_at
+         FROM pages
+         WHERE doc_id = ?
+         ORDER BY CASE WHEN page_num IS NULL THEN 1 ELSE 0 END, page_num ASC, created_at ASC, id ASC`,
+        [documentId],
+      )
+      if (pages.length === 0) throw new Error('文献没有可插入的页面')
+
+      const requestedAnchorId = String(request?.anchorPageId || '').trim()
+      const requestedAnchorIndex = requestedAnchorId
+        ? pages.findIndex((page) => String(page.id) === requestedAnchorId)
+        : -1
+      const anchorIndex = requestedAnchorIndex >= 0
+        ? requestedAnchorIndex
+        : position === 'before' ? 0 : pages.length - 1
+      const insertionIndex = position === 'before' ? anchorIndex : anchorIndex + 1
+      const safeInsertionIndex = Math.max(0, Math.min(pages.length, insertionIndex))
+
+      const positiveNumber = (value: unknown): number | null => {
+        const numeric = Number(value)
+        return Number.isFinite(numeric) && numeric > 0 ? numeric : null
+      }
+      const findPageDimensions = (): { width: number; height: number; orientation: 'vertical' | 'horizontal' } => {
+        const candidates = pages
+          .map((page, index) => ({ page, distance: Math.abs(index - anchorIndex) }))
+          .sort((left, right) => left.distance - right.distance)
+        for (const candidate of candidates) {
+          const parsed = parseJsonRecord(candidate.page.ocr_result)
+          const width = positiveNumber(
+            getRecordValue(parsed, 'page_width')
+              ?? getRecordValue(parsed, 'image_width')
+              ?? getRecordValue(parsed, 'source_image_width')
+              ?? getRecordValue(parsed, 'width'),
+          )
+          const height = positiveNumber(
+            getRecordValue(parsed, 'page_height')
+              ?? getRecordValue(parsed, 'image_height')
+              ?? getRecordValue(parsed, 'source_image_height')
+              ?? getRecordValue(parsed, 'height'),
+          )
+          if (!width || !height) continue
+          const rawOrientation = getRecordValue(parsed, 'orientation')
+            ?? getRecordValue(parsed, 'page_orientation')
+            ?? getRecordValue(parsed, 'layout_orientation')
+          const orientation: 'vertical' | 'horizontal' = rawOrientation === 'vertical' || rawOrientation === 'horizontal'
+            ? rawOrientation
+            : height >= width ? 'vertical' : 'horizontal'
+          return { width, height, orientation }
+        }
+        return { width: 1000, height: 1400, orientation: 'vertical' }
+      }
+
+      const dimensions = findPageDimensions()
+      const temporaryOffset = Math.max(
+        1_000_000,
+        pages.reduce((max, page) => Math.max(max, Number(page.page_num || 0)), 0) + pages.length + 1,
+      )
+      run('UPDATE pages SET page_num = COALESCE(page_num, 0) + ? WHERE doc_id = ?', [temporaryOffset, documentId])
+
+      const newPageId = nanoid()
+      insertedPageId = newPageId
+      const blankOcrResult = JSON.stringify({
+        source_type: 'manual_blank_page',
+        page_width: dimensions.width,
+        page_height: dimensions.height,
+        orientation: dimensions.orientation,
+        layout_result: [],
+      })
+      run(
+        `INSERT INTO pages (
+          id, doc_id, page_num, image_path, ocr_text, ocr_result, proofed_text,
+          ocr_status, proof_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [newPageId, documentId, safeInsertionIndex + 1, null, '', blankOcrResult, null, 'completed', 'pending', now],
+      )
+
+      pages.forEach((page, index) => {
+        const nextPageNum = index < safeInsertionIndex ? index + 1 : index + 2
+        run('UPDATE pages SET page_num = ? WHERE id = ? AND doc_id = ?', [nextPageNum, page.id, documentId])
+      })
+      pageCount = pages.length + 1
+      run('UPDATE documents SET page_count = ?, updated_at = ? WHERE id = ?', [pageCount, now, documentId])
+      syncDocumentProofStatus(documentId)
+    })
+
+    const inserted = queryOne<DocumentPage>('SELECT * FROM pages WHERE id = ?', [insertedPageId])
+    if (!inserted) throw new Error('人工空白页插入后无法读取页面')
+    inserted.__full = true
+    markSearchIndexStaleForDocuments([documentId])
+    notifySearchContentChanged()
+    scheduleDatabaseSave()
+    return { inserted: hydratePagePayloadRow(inserted), pageCount }
   })
 
   ipcMain.handle(

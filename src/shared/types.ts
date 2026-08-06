@@ -1977,6 +1977,17 @@ export interface PageUpdatePayload extends Partial<Pick<Page,
   ocr_result?: unknown
 }
 
+export interface ManualPageInsertRequest {
+  documentId: string
+  anchorPageId?: string
+  position: 'before' | 'after'
+}
+
+export interface ManualPageInsertResult {
+  inserted: DocumentPage
+  pageCount: number
+}
+
 export interface DocumentPage extends Page {
   has_ocr_text?: boolean
   needs_layout_attention?: boolean

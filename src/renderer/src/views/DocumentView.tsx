@@ -55,7 +55,7 @@ import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { toLocalResourceUrl } from '../utils/localResource'
 import { isDocumentPagePayloadHydrated, retainDocumentPagePayloadWindow } from '../utils/documentPageRetention'
 import { findFirstSearchHitAtOrAfterPage, findSearchOccurrenceContainer, findSearchOccurrenceIndexNearChar } from '../utils/readerSearchNavigation'
-import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, ExportPageNumberMode, LlmProviderProfile, LlmProviderProfileState, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHit, SearchHitLocator, SearchSessionState, StableReaderLocator, TranslationGlossaryScope, TranslationMode, TranslationUnitV1, VectorSearchHit } from '@shared/types'
+import type { DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentLightDetail, DocumentPage, DocumentUpdatePayload, ExportPageNumberMode, LlmProviderProfile, LlmProviderProfileState, ManualPageInsertRequest, OcrEngine, OcrRecognizeLayoutBlock, OcrRecognizeResult, OpenDocumentTarget, PageOcrVersion, PageTranslationCacheItem, PageTranslationProgressEvent, PageUpdatePayload, ReaderState, ReaderStateSavePayload, ReaderTranslationOptions, ReaderTranslationPayload, ReaderTranslationPriority, ResearchProject, SearchHit, SearchHitLocator, SearchSessionState, StableReaderLocator, TranslationGlossaryScope, TranslationMode, TranslationUnitV1, VectorSearchHit } from '@shared/types'
 
 const { Title, Text } = Typography
 const AiPanel = lazy(() => import('../components/AiPanel'))
@@ -1378,6 +1378,7 @@ export default function DocumentView({
   const [doc, setDoc] = useState<DocumentViewDocument | null>(null)
   const [loading, setLoading] = useState(true)
   const [ocrProcessing, setOcrProcessing] = useState(false)
+  const [manualPageInsertionLoading, setManualPageInsertionLoading] = useState(false)
   const [extracting, setExtracting] = useState(false)
   const [restoringPdf, setRestoringPdf] = useState(false)
   const [exportingDocument, setExportingDocument] = useState(false)
@@ -4501,6 +4502,35 @@ export default function DocumentView({
     setPageInput(String(nextPage))
   }, [currentPageIndex, pageCount])
 
+  const handleInsertManualPage = useCallback(async (position: ManualPageInsertRequest['position']) => {
+    const targetPageId = currentPage?.id
+    if (!documentId || !targetPageId || manualPageInsertionLoading) return
+    setManualPageInsertionLoading(true)
+    try {
+      const result = await window.api.insertManualPage({
+        documentId,
+        anchorPageId: targetPageId,
+        position,
+      })
+      pageImageCacheRef.current.delete(targetPageId)
+      pageImageCacheRef.current.delete(result.inserted.id)
+      setImageDataUrl('')
+      setNextImageDataUrl('')
+      setImageViewerResetToken((value) => value + 1)
+      setActiveBoxIndex(-1)
+      setSwitchToRegion(false)
+      const refreshed = await refreshDocumentKeepPage(result.inserted.id)
+      if (!refreshed) throw new Error('插入后无法刷新文献页面')
+      setPageInput(String(result.inserted.page_num))
+      message.success(position === 'before' ? '已在当前页前插入空白页' : '已在当前页后插入空白页')
+    } catch (error: unknown) {
+      console.error('Failed to insert manual blank page', error)
+      message.error(`插入空白页失败：${getErrorMessage(error, '未知错误')}`)
+    } finally {
+      setManualPageInsertionLoading(false)
+    }
+  }, [currentPage?.id, documentId, manualPageInsertionLoading, refreshDocumentKeepPage])
+
   const getReaderSearchInput = useCallback(() => {
     return containerRef.current?.querySelector<HTMLInputElement>('input[data-reader-search-input="true"]')
       || document.querySelector<HTMLInputElement>('.document-view input[data-reader-search-input="true"]')
@@ -6276,6 +6306,24 @@ export default function DocumentView({
                 <Button size="small" onClick={() => jumpToPage(pageInput)}>
                   跳转
                 </Button>
+                <Dropdown
+                  trigger={['click']}
+                  placement="bottomRight"
+                  disabled={manualPageInsertionLoading || !currentPage?.id}
+                  menu={{
+                    items: [
+                      { key: 'before', label: '在当前页前插入空白页' },
+                      { key: 'after', label: '在当前页后插入空白页' },
+                    ],
+                    onClick: ({ key }) => {
+                      if (key === 'before' || key === 'after') void handleInsertManualPage(key)
+                    },
+                  }}
+                >
+                  <Button size="small" icon={<PlusOutlined />} loading={manualPageInsertionLoading}>
+                    插入空白页
+                  </Button>
+                </Dropdown>
                 <Button size="small" disabled={currentPageIndex === pageCount - 1} onClick={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCount)) }}>
                   下一页
                 </Button>

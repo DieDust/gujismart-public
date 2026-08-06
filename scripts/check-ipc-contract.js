@@ -187,6 +187,13 @@ const missingRequiredManualImageChannels = requiredManualImageChannels.filter((c
   !invokeChannels.some((item) => item.channel === channel)
   || !mainHandlers.some((item) => item.channel === channel)
 ))
+const requiredManualPageApis = ['insertManualPage']
+const missingRequiredManualPageApis = requiredManualPageApis.filter((name) => !apiProps.has(name))
+const requiredManualPageChannels = ['pages:insertManual']
+const missingRequiredManualPageChannels = requiredManualPageChannels.filter((channel) => (
+  !invokeChannels.some((item) => item.channel === channel)
+  || !mainHandlers.some((item) => item.channel === channel)
+))
 
 const mainChannels = new Set(mainHandlers.map((item) => item.channel))
 const preloadChannels = new Set(invokeChannels.map((item) => item.channel))
@@ -211,6 +218,8 @@ failIfAny('Main ipcMain.handle channels not exposed through preload:', unusedMai
 failIfAny('Renderer optional probes for required window.api members:', optionalProbes, (item) => `${item.name} at ${formatLocation(item)}`)
 failIfAny('Required manual image preload APIs are missing:', missingRequiredManualImageApis, (name) => name)
 failIfAny('Required manual image IPC channels are incomplete:', missingRequiredManualImageChannels, (channel) => channel)
+failIfAny('Required manual page preload APIs are missing:', missingRequiredManualPageApis, (name) => name)
+failIfAny('Required manual page IPC channels are incomplete:', missingRequiredManualPageChannels, (channel) => channel)
 
 if (failed) {
   process.exit(1)

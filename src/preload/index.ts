@@ -109,6 +109,8 @@ import type {
   DocumentMetadataResult,
   DocumentPage,
   DocumentReadingWindow,
+  ManualPageInsertRequest,
+  ManualPageInsertResult,
   AddDocumentsToLibraryProjectResult,
   CopyDocumentsToLibraryProjectResult,
   CreateLibraryProjectPayload,
@@ -463,6 +465,8 @@ const api = {
 
   updatePage: (pageId: string, data: PageUpdatePayload): Promise<boolean> =>
     ipcRenderer.invoke('pages:update', pageId, data),
+  insertManualPage: (request: ManualPageInsertRequest): Promise<ManualPageInsertResult> =>
+    ipcRenderer.invoke('pages:insertManual', request),
   cropManualPageImage: (request: ManualPageImageCropRequest): Promise<ManualPageImageAsset> =>
     ipcRenderer.invoke('pages:cropManualImage', request),
   selectManualBlockImage: (pageId: string): Promise<ManualPageImageAsset | null> =>
