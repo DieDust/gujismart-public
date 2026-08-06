@@ -1,5 +1,5 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactNode, type WheelEvent } from 'react'
-import { Button, Dropdown, Empty, Input, InputNumber, Modal, Popover, Segmented, Slider, Space, Switch, Tag, message } from 'antd'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from 'react'
+import { Button, Dropdown, Empty, InputNumber, Modal, Popover, Segmented, Slider, Space, Switch, Tag, message } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   CheckOutlined,
@@ -12,7 +12,6 @@ import {
   PlusOutlined,
   RotateRightOutlined,
   ReloadOutlined,
-  SaveOutlined,
   SettingOutlined,
   UndoOutlined,
 } from '@ant-design/icons'
@@ -20,7 +19,8 @@ import { getErrorMessage } from '@shared/errors'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import OpenCC from 'opencc-js'
 import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
-import FacsimileTableEditor from './FacsimileTableEditor'
+import ManualBlockInspector from './ManualBlockInspector'
+import ManualLayoutToolbar from './ManualLayoutToolbar'
 import {
   buildFacsimileTableCells,
   getFacsimileTableMergesFromCells,
@@ -35,6 +35,22 @@ import {
   useManualLayoutDraft,
 } from '../hooks/useManualLayoutDraft'
 import { getManualLayoutUnderlayImageStyle } from '../utils/manualLayoutUnderlay'
+import {
+  applyManualLayoutBlockConversion,
+  clampManualLayoutBlockRect,
+  commitManualLayoutGeometryPreview,
+  createManualLayoutGeometryPreview,
+  getManualLayoutBlockConversionWarning,
+  moveManualLayoutBlockRect,
+  normalizeManualLayoutBlockRect,
+  reduceManualLayoutTool,
+  resizeManualLayoutBlockRect,
+  rollbackManualLayoutGeometryPreview,
+  updateManualLayoutGeometryPreview,
+  type ManualLayoutGeometryPreview,
+  type ManualLayoutResizeHandle,
+  type ManualLayoutTool,
+} from '../utils/manualLayoutBlockEditing'
 import {
   getOcrBlockRect,
   getOcrCoordinateExtent,
@@ -51,14 +67,33 @@ import {
   getCanonicalTranslationBlockText,
 } from '@shared/translation-source'
 import type { Document, DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResult, PageUpdatePayload, TranslationMode, TranslationUnitV1 } from '@shared/types'
+import type { ManualLayoutBlockKind } from '@shared/manual-layout'
+import './ManualLayoutEditor.css'
 
 type ProofDisplayScript = 'original' | 'simplified' | 'traditional'
 type BlockRect = { left: number; top: number; width: number; height: number }
-type BlockResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw'
 type LayoutPointerInteraction =
-  | { kind: 'create'; start: { x: number; y: number }; current: { x: number; y: number } }
-  | { kind: 'move'; blockId: string; sourceIndex: number; start: { x: number; y: number }; startRect: BlockRect }
-  | { kind: 'resize'; blockId: string; sourceIndex: number; handle: BlockResizeHandle; start: { x: number; y: number }; startRect: BlockRect }
+  | { kind: 'create'; pointerId: number; captureTarget: HTMLElement; tool: ManualLayoutTool; start: { x: number; y: number }; current: { x: number; y: number } }
+  | {
+      kind: 'move' | 'resize'
+      pointerId: number
+      captureTarget: HTMLElement
+      blockId: string
+      baselineBlockId: string
+      sourceIndex: number
+      handle?: ManualLayoutResizeHandle
+      start: { x: number; y: number }
+      startRect: BlockRect
+      preview: ManualLayoutGeometryPreview<LayoutBlock>
+      changed: boolean
+    }
+
+function releaseCapturedLayoutPointer(interaction: LayoutPointerInteraction | null): void {
+  if (!interaction) return
+  if (interaction.captureTarget.hasPointerCapture(interaction.pointerId)) {
+    interaction.captureTarget.releasePointerCapture(interaction.pointerId)
+  }
+}
 type JsonRecord = Record<string, unknown>
 type FacsimileOcrResult = OcrRecognizeResult & JsonRecord
 type LayoutBlock = OcrRecognizeLayoutBlock & JsonRecord & {
@@ -228,6 +263,7 @@ const LABEL_COLORS: Record<string, string> = {
   abstract: '#6f5a46',
   reference: '#6f5a46',
   table: '#5a4634',
+  image: '#3b6d8c',
   header: '#8a7662',
   footer: '#8a7662',
   number: '#8a7662',
@@ -243,6 +279,7 @@ const LABEL_NAMES: Record<string, string> = {
   abstract: '摘要',
   reference: '参考',
   table: '表格',
+  image: '图片',
   header: '页眉',
   footer: '页脚',
   number: '页码',
@@ -470,8 +507,8 @@ function isNaturallyHorizontalLabel(label: string): boolean {
 }
 
 function isImageLabel(label: string): boolean {
-  return /^(?:image|figure|picture|chart|diagram|photo|illustration)$/i.test(label)
-    || /图片|图像|插图|示意图|图表|照片/.test(label)
+  return /^(?:image|figure|picture|chart|diagram|photo|illustration|seal|stamp)$/i.test(label)
+    || /图片|图像|插图|示意图|图表|照片|印章|藏书印/.test(label)
 }
 
 function isRenderableTableBlock(block: unknown): boolean {
@@ -1648,7 +1685,7 @@ function clampZoom(value: number): number {
   return Math.round(clamp(value, FACSIMILE_MIN_ZOOM, FACSIMILE_MAX_ZOOM) * 100) / 100
 }
 
-const BLOCK_RESIZE_HANDLES: Array<{ handle: BlockResizeHandle; left: number; top: number; cursor: CSSProperties['cursor'] }> = [
+const BLOCK_RESIZE_HANDLES: Array<{ handle: ManualLayoutResizeHandle; left: number; top: number; cursor: CSSProperties['cursor'] }> = [
   { handle: 'nw', left: 0, top: 0, cursor: 'nwse-resize' },
   { handle: 'n', left: 50, top: 0, cursor: 'ns-resize' },
   { handle: 'ne', left: 100, top: 0, cursor: 'nesw-resize' },
@@ -1666,53 +1703,6 @@ function rectFromPointerPoints(start: { x: number; y: number }, current: { x: nu
     width: Math.abs(current.x - start.x),
     height: Math.abs(current.y - start.y),
   }
-}
-
-function clampBlockRect(rect: BlockRect, bounds: { width: number; height: number; offsetLeft: number; offsetTop: number }): BlockRect {
-  const minWidth = Math.max(8, bounds.width * 0.008)
-  const minHeight = Math.max(8, bounds.height * 0.008)
-  const maxRight = bounds.offsetLeft + bounds.width
-  const maxBottom = bounds.offsetTop + bounds.height
-  const left = clamp(rect.left, bounds.offsetLeft, Math.max(bounds.offsetLeft, maxRight - minWidth))
-  const top = clamp(rect.top, bounds.offsetTop, Math.max(bounds.offsetTop, maxBottom - minHeight))
-  return {
-    left,
-    top,
-    width: clamp(rect.width, minWidth, Math.max(minWidth, maxRight - left)),
-    height: clamp(rect.height, minHeight, Math.max(minHeight, maxBottom - top)),
-  }
-}
-
-function resizeBlockRect(
-  startRect: BlockRect,
-  handle: BlockResizeHandle,
-  deltaX: number,
-  deltaY: number,
-  bounds: { width: number; height: number; offsetLeft: number; offsetTop: number },
-): BlockRect {
-  let left = startRect.left
-  let top = startRect.top
-  let right = startRect.left + startRect.width
-  let bottom = startRect.top + startRect.height
-  if (handle.includes('w')) left += deltaX
-  if (handle.includes('e')) right += deltaX
-  if (handle.includes('n')) top += deltaY
-  if (handle.includes('s')) bottom += deltaY
-  const minWidth = Math.max(8, bounds.width * 0.008)
-  const minHeight = Math.max(8, bounds.height * 0.008)
-  if (right - left < minWidth) {
-    if (handle.includes('w')) left = right - minWidth
-    else right = left + minWidth
-  }
-  if (bottom - top < minHeight) {
-    if (handle.includes('n')) top = bottom - minHeight
-    else bottom = top + minHeight
-  }
-  left = clamp(left, bounds.offsetLeft, bounds.offsetLeft + bounds.width - minWidth)
-  top = clamp(top, bounds.offsetTop, bounds.offsetTop + bounds.height - minHeight)
-  right = clamp(right, left + minWidth, bounds.offsetLeft + bounds.width)
-  bottom = clamp(bottom, top + minHeight, bounds.offsetTop + bounds.height)
-  return { left, top, width: right - left, height: bottom - top }
 }
 
 function shouldIgnoreCanvasDrag(target: EventTarget | null): boolean {
@@ -1887,15 +1877,15 @@ export default function GujiFacsimileProofreader({
   const dragStartRef = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
   const blocksRef = useRef<LayoutBlock[]>([])
   const layoutInteractionRef = useRef<LayoutPointerInteraction | null>(null)
-  const editingBaselineRef = useRef<{ blockId: string; block: LayoutBlock } | null>(null)
   const [history, setHistory] = useState<LayoutBlock[][]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
-  const [editValue, setEditValue] = useState('')
   const [tableDraftRows, setTableDraftRows] = useState<string[][]>([['']])
   const [tableDraftMerges, setTableDraftMerges] = useState<FacsimileTableMerge[]>([])
   const [layoutEditMode, setLayoutEditMode] = useState(false)
+  const [manualLayoutTool, setManualLayoutTool] = useState<ManualLayoutTool>('select')
   const [altShowsClearUnderlay, setAltShowsClearUnderlay] = useState(false)
   const [draftCreateRect, setDraftCreateRect] = useState<BlockRect | null>(null)
+  const [pendingCreateRect, setPendingCreateRect] = useState<BlockRect | null>(null)
   const [showRules, setShowRules] = useState(loadPersistedShowRules)
   const [fontScale, setFontScale] = useState(loadPersistedFontScale)
   const [pageZoom, setPageZoom] = useState(1)
@@ -2005,12 +1995,13 @@ export default function GujiFacsimileProofreader({
       blocksRef.current = incomingBlocks
       setHistory([incomingBlocks.map((block) => ({ ...block }))])
       setHistoryIndex(0)
-      setEditValue('')
       setTableDraftRows([['']])
       setTableDraftMerges([])
-      editingBaselineRef.current = null
       setDraftCreateRect(null)
+      setPendingCreateRect(null)
+      setManualLayoutTool('select')
       setAltShowsClearUnderlay(false)
+      releaseCapturedLayoutPointer(layoutInteractionRef.current)
       layoutInteractionRef.current = null
       translationRequestKeyRef.current = ''
       pendingDraftIdentityRef.current = ''
@@ -2168,8 +2159,10 @@ export default function GujiFacsimileProofreader({
 
   useEffect(() => {
     if (!layoutEditingLocked) return
+    releaseCapturedLayoutPointer(layoutInteractionRef.current)
     layoutInteractionRef.current = null
     setDraftCreateRect(null)
+    setPendingCreateRect(null)
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
   }, [layoutEditingLocked])
 
@@ -2187,6 +2180,8 @@ export default function GujiFacsimileProofreader({
     proofreaderMountedRef.current = true
     return () => {
       proofreaderMountedRef.current = false
+      releaseCapturedLayoutPointer(layoutInteractionRef.current)
+      layoutInteractionRef.current = null
       if (wheelAnchorFrameRef.current != null) window.cancelAnimationFrame(wheelAnchorFrameRef.current)
       if (wheelZoomCommitTimerRef.current != null) window.clearTimeout(wheelZoomCommitTimerRef.current)
       if (pageRecenterFrameRef.current != null) window.cancelAnimationFrame(pageRecenterFrameRef.current)
@@ -2422,70 +2417,29 @@ export default function GujiFacsimileProofreader({
       ? null
       : blocks.find((block, index) => getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) === editingBlockId) || null
   ), [blocks, editingBlockId, manualLayoutDraft.state.pageId])
-  const editingSourceIndex = useMemo(() => {
-    if (!editingBlockId) return -1
-    const index = blocks.findIndex((block, blockIndex) => (
-      getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, blockIndex) === editingBlockId
-    ))
-    return index < 0 ? -1 : getBlockSourceIndex(blocks[index], index)
-  }, [blocks, editingBlockId, manualLayoutDraft.state.pageId])
-  const editingBlockLabel = editingBlock ? (LABEL_NAMES[getLabel(editingBlock)] || getLabel(editingBlock)) : ''
+  useEffect(() => {
+    if (!editingBlock || !editingBlockId) return
+    if (isRenderableTableBlock(editingBlock)) {
+      const nextRows = normalizeFacsimileTableRows(getBlockTableRows(editingBlock))
+      setTableDraftRows(nextRows)
+      setTableDraftMerges(getBlockTableMerges(editingBlock, nextRows))
+    } else {
+      setTableDraftRows([['']])
+      setTableDraftMerges([])
+    }
+  }, [editingBlockId])
 
   const resetBlockEditor = useCallback(() => {
-    editingBaselineRef.current = null
     manualLayoutDraft.setActiveBlockId(null)
-    setEditValue('')
     setTableDraftRows([['']])
     setTableDraftMerges([])
   }, [manualLayoutDraft.setActiveBlockId])
 
-  const cancelBlockEditor = useCallback(() => {
-    if (layoutEditingLocked) return
-    const baseline = editingBaselineRef.current
-    editingBaselineRef.current = null
-    if (baseline) {
-      let restored = false
-      const nextBlocks = blocksRef.current.map((block, index) => {
-        const currentId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index)
-        const currentLocalId = String(block.__manualDraftId || '')
-        const baselineLocalId = String(baseline.block.__manualDraftId || '')
-        if (currentId !== baseline.blockId && currentLocalId !== baseline.blockId && (!baselineLocalId || currentLocalId !== baselineLocalId)) {
-          return block
-        }
-        restored = true
-        return { ...baseline.block }
-      })
-      if (restored) {
-        blocksRef.current = nextBlocks
-        manualLayoutDraft.replaceBlocks(nextBlocks, null)
-      } else {
-        manualLayoutDraft.setActiveBlockId(null)
-      }
-    } else {
-      manualLayoutDraft.setActiveBlockId(null)
-    }
-    setEditValue('')
-    setTableDraftRows([['']])
-    setTableDraftMerges([])
-  }, [layoutEditingLocked, manualLayoutDraft.replaceBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId])
-
   const stageTextBlockChange = useCallback((value: string) => {
     if (layoutEditingLocked) return
-    setEditValue(value)
     if (!editingBlockId) return
     manualLayoutDraft.updateBlock(editingBlockId, {
       words: value,
-      rows: undefined,
-      table_rows: undefined,
-      tableRows: undefined,
-      cells: undefined,
-      table_cells: undefined,
-      tableCells: undefined,
-      html: undefined,
-      table_html: undefined,
-      tableHtml: undefined,
-      markdown: undefined,
-      md: undefined,
     })
   }, [editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
 
@@ -2515,6 +2469,51 @@ export default function GujiFacsimileProofreader({
     })
   }, [editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
 
+  const applyInspectorTypeChange = useCallback((nextKind: ManualLayoutBlockKind, confirmed: boolean) => {
+    if (!editingBlock || !editingBlockId || layoutEditingLocked) return
+    const conversion = applyManualLayoutBlockConversion(editingBlock, nextKind, confirmed)
+    if (conversion.blocked) return
+    let convertedBlock = conversion.block as LayoutBlock
+    if (nextKind === 'table') {
+      const rows = getBlockTableRows(convertedBlock).length > 0
+        ? normalizeFacsimileTableRows(getBlockTableRows(convertedBlock))
+        : [[getBlockText(editingBlock)]]
+      const merges = getBlockTableMerges(convertedBlock, rows)
+      const cells = buildFacsimileTableCells(rows, merges)
+      convertedBlock = {
+        ...convertedBlock,
+        rows,
+        table_rows: rows,
+        tableRows: rows,
+        cells,
+        table_cells: cells,
+        tableCells: cells,
+        words: tableRowsToPlainText(rows),
+      }
+      setTableDraftRows(rows)
+      setTableDraftMerges(merges)
+    } else if ((nextKind === 'image' || nextKind === 'seal') && !String(convertedBlock.caption || '').trim()) {
+      convertedBlock = { ...convertedBlock, caption: getBlockText(editingBlock), alt_text: String(convertedBlock.alt_text || '') }
+    }
+    manualLayoutDraft.updateBlock(editingBlockId, convertedBlock)
+  }, [editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
+
+  const handleInspectorTypeChange = useCallback((nextKind: ManualLayoutBlockKind) => {
+    if (!editingBlock || !editingBlockId || layoutEditingLocked || getLabel(editingBlock) === nextKind) return
+    const warning = getManualLayoutBlockConversionWarning(editingBlock, nextKind)
+    if (!warning) {
+      applyInspectorTypeChange(nextKind, true)
+      return
+    }
+    Modal.confirm({
+      title: `切换为${LABEL_NAMES[nextKind] || nextKind}？`,
+      content: warning,
+      okText: '保留数据并切换',
+      cancelText: '取消',
+      onOk: () => applyInspectorTypeChange(nextKind, true),
+    })
+  }, [applyInspectorTypeChange, editingBlock, editingBlockId, layoutEditingLocked])
+
   const pushHistory = useCallback((nextBlocks: LayoutBlock[]) => {
     setHistory((previous) => {
       const base = previous.slice(0, historyIndex + 1)
@@ -2526,7 +2525,7 @@ export default function GujiFacsimileProofreader({
 
   const commitBlocks = useCallback((
     nextBlocks: LayoutBlock[],
-    options: { activeBlockId?: string | null; selectedSourceIndex?: number; closeEditor?: boolean } = {},
+    options: { activeBlockId?: string | null; selectedSourceIndex?: number } = {},
   ) => {
     if (layoutEditingLocked) return
     const nextPageVerticalMode = effectivePreferVerticalLayout || isVerticalPage(nextBlocks)
@@ -2540,13 +2539,29 @@ export default function GujiFacsimileProofreader({
     blocksRef.current = normalizedBlocks
     pushHistory(normalizedBlocks)
     manualLayoutDraft.replaceBlocks(normalizedBlocks, options.activeBlockId)
-    if (options.closeEditor !== false) {
-      setEditValue('')
-      setTableDraftRows([['']])
-      setTableDraftMerges([])
-    }
     if (typeof options.selectedSourceIndex === 'number') onSelectBox?.(options.selectedSourceIndex)
   }, [effectivePreferVerticalLayout, layoutEditingLocked, manualLayoutDraft.replaceBlocks, onSelectBox, pushHistory])
+
+  const handleInspectorChange = useCallback((changes: Record<string, unknown>) => {
+    if (!editingBlockId || !editingBlock || layoutEditingLocked) return
+    if (Object.keys(changes).length === 1 && typeof changes.words === 'string') {
+      stageTextBlockChange(changes.words)
+      return
+    }
+    if (typeof changes.reading_order === 'number') {
+      const currentIndex = blocks.findIndex((block, index) => (
+        getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) === editingBlockId
+      ))
+      if (currentIndex < 0) return
+      const targetIndex = clamp(Math.floor(changes.reading_order), 0, Math.max(0, blocks.length - 1))
+      const nextBlocks = [...blocks]
+      const [targetBlock] = nextBlocks.splice(currentIndex, 1)
+      nextBlocks.splice(targetIndex, 0, targetBlock)
+      commitBlocks(nextBlocks, { activeBlockId: editingBlockId })
+      return
+    }
+    manualLayoutDraft.updateBlock(editingBlockId, changes)
+  }, [blocks, commitBlocks, editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.state.pageId, manualLayoutDraft.updateBlock, stageTextBlockChange])
 
   const handleUndo = useCallback(() => {
     if (!canUndo || layoutEditingLocked) return
@@ -2554,7 +2569,6 @@ export default function GujiFacsimileProofreader({
     setHistoryIndex(historyIndex - 1)
     blocksRef.current = nextBlocks
     manualLayoutDraft.replaceBlocks(nextBlocks, null)
-    setEditValue('')
     setTableDraftRows([['']])
     setTableDraftMerges([])
   }, [canUndo, history, historyIndex, layoutEditingLocked, manualLayoutDraft.replaceBlocks])
@@ -2567,9 +2581,7 @@ export default function GujiFacsimileProofreader({
     setImageUnderlayMode('on')
     setShowRules(true)
     const targetBlockId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, target, targetIndex)
-    editingBaselineRef.current = { blockId: targetBlockId, block: { ...target } }
     manualLayoutDraft.setActiveBlockId(targetBlockId)
-    setEditValue(getBlockText(target))
     if (isRenderableTableBlock(target)) {
       const rows = normalizeFacsimileTableRows(getBlockTableRows(target))
       setTableDraftRows(rows)
@@ -2581,43 +2593,15 @@ export default function GujiFacsimileProofreader({
     onSelectBox?.(sourceIndex)
   }, [blocks, layoutEditingLocked, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
 
-  const handleSaveBlock = useCallback(() => {
-    if (!editingBlockId || layoutEditingLocked) return
-    const nextBlocks = blocks.map((block, index) => {
-      if (getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) !== editingBlockId) return block
-      let nextBlock: LayoutBlock
-      if (isRenderableTableBlock(block)) {
-        const rows = normalizeFacsimileTableRows(tableDraftRows)
-        const cells = buildFacsimileTableCells(rows, tableDraftMerges)
-        nextBlock = {
-          ...block,
-          words: tableRowsToPlainText(rows),
-          label: 'table',
-          type: block.type === 'text' ? 'table' : block.type,
-          block_type: block.block_type === 'text' ? 'table' : block.block_type,
-          rows,
-          table_rows: rows,
-          tableRows: rows,
-          cells,
-          table_cells: cells,
-          tableCells: cells,
-          html: undefined,
-          table_html: undefined,
-          tableHtml: undefined,
-          markdown: undefined,
-          md: undefined,
-          segmentation_source: 'manual',
-        }
-      } else {
-        nextBlock = { ...block, words: editValue, rows: undefined, table_rows: undefined, tableRows: undefined, cells: undefined, table_cells: undefined, tableCells: undefined, html: undefined, table_html: undefined, tableHtml: undefined, markdown: undefined, md: undefined, segmentation_source: 'manual' }
-      }
-      const identifiedBlock = ensureManualLayoutBlockIdentity(manualLayoutDraft.state.pageId, nextBlock, index, true) as LayoutBlock
-      return identifiedBlock
-    })
-    commitBlocks(nextBlocks, { activeBlockId: null, selectedSourceIndex: editingSourceIndex })
-    editingBaselineRef.current = null
-    message.success('版式修改已加入保存队列')
-  }, [blocks, commitBlocks, editValue, editingBlockId, editingSourceIndex, layoutEditingLocked, manualLayoutDraft.state.pageId, tableDraftMerges, tableDraftRows])
+  const selectLayoutBlock = useCallback((sourceIndex: number, fallbackBlockId: string) => {
+    onSelectBox?.(sourceIndex)
+    if (!layoutEditMode) return
+    const currentIndex = blocksRef.current.findIndex((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
+    const currentBlockId = currentIndex >= 0
+      ? getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, blocksRef.current[currentIndex], currentIndex)
+      : fallbackBlockId
+    manualLayoutDraft.setActiveBlockId(currentBlockId)
+  }, [layoutEditMode, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
 
   const handleDeleteBlock = useCallback((blockId: string) => {
     if (layoutEditingLocked) return
@@ -2696,56 +2680,236 @@ export default function GujiFacsimileProofreader({
     }
   }, [bounds.height, bounds.offsetLeft, bounds.offsetTop, bounds.width])
 
+  const geometryBounds = useMemo(() => ({
+    left: bounds.offsetLeft,
+    top: bounds.offsetTop,
+    width: bounds.width,
+    height: bounds.height,
+  }), [bounds.height, bounds.offsetLeft, bounds.offsetTop, bounds.width])
+  const geometryMinimum = useMemo(() => ({
+    width: Math.max(8, bounds.width * 0.008),
+    height: Math.max(8, bounds.height * 0.008),
+  }), [bounds.height, bounds.width])
+
+  const createTypedManualBlock = useCallback((kind: ManualLayoutBlockKind, sourceRect: BlockRect) => {
+    if (layoutEditingLocked) return
+    const rect = clampManualLayoutBlockRect(normalizeManualLayoutBlockRect(sourceRect), geometryBounds, geometryMinimum)
+    const sourceIndex = blocksRef.current.reduce((maximum, block, index) => (
+      Math.max(maximum, getBlockSourceIndex(block, index))
+    ), -1) + 1
+    const orientation = pageVerticalMode ? 'vertical' : 'horizontal'
+    const tableRows = kind === 'table' ? [['']] : undefined
+    const tableCells = tableRows ? buildFacsimileTableCells(tableRows, []) : undefined
+    const nextBlock = ensureManualLayoutBlockIdentity(manualLayoutDraft.state.pageId, {
+      words: '',
+      label: kind,
+      type: kind,
+      block_type: kind,
+      reading_order: blocksRef.current.length,
+      orientation,
+      orientation_source: 'manual',
+      source_orientation: orientation,
+      source_orientation_source: 'manual',
+      segmentation_source: 'manual',
+      location: rect,
+      rows: tableRows,
+      table_rows: tableRows,
+      tableRows,
+      cells: tableCells,
+      table_cells: tableCells,
+      tableCells,
+      caption: kind === 'image' || kind === 'seal' ? '' : undefined,
+      alt_text: kind === 'image' || kind === 'seal' ? '' : undefined,
+      __rect: rect,
+      __synthetic: false,
+      __sourceIndex: sourceIndex,
+    }, blocksRef.current.length, true) as LayoutBlock
+    const nextBlocks = [...blocksRef.current, nextBlock]
+    blocksRef.current = nextBlocks
+    pushHistory(nextBlocks)
+    manualLayoutDraft.createBlock(nextBlock)
+    setTableDraftRows(tableRows || [['']])
+    setTableDraftMerges([])
+    setPendingCreateRect(null)
+    setManualLayoutTool((current) => reduceManualLayoutTool(current, { type: 'created' }))
+    onSelectBox?.(sourceIndex)
+  }, [geometryBounds, geometryMinimum, layoutEditingLocked, manualLayoutDraft.createBlock, manualLayoutDraft.state.pageId, onSelectBox, pageVerticalMode, pushHistory])
+
   const startBlockInteraction = useCallback((
-    event: ReactMouseEvent,
+    event: ReactPointerEvent<HTMLElement>,
     sourceIndex: number,
     rect: BlockRect,
-    handle?: BlockResizeHandle,
+    handle?: ManualLayoutResizeHandle,
   ) => {
     if (!layoutEditMode || layoutEditingLocked || event.button !== 0) return
     const point = getPointerCoordinate(event.clientX, event.clientY)
     if (!point) return
     const targetIndex = blocksRef.current.findIndex((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
     if (targetIndex < 0) return
-    const previousBlockId = getManualLayoutDraftBlockId(
-      manualLayoutDraft.state.pageId,
-      blocksRef.current[targetIndex],
-      targetIndex,
-    )
+    event.preventDefault()
+    event.stopPropagation()
+    setPendingCreateRect(null)
+    const baselineBlocks = blocksRef.current
+    const baselineBlock = baselineBlocks[targetIndex]
+    const baselineBlockId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, baselineBlock, targetIndex)
+    if (manualLayoutTool !== 'select') {
+      manualLayoutDraft.setActiveBlockId(baselineBlockId)
+      onSelectBox?.(sourceIndex)
+      return
+    }
     const identifiedBlock = ensureManualLayoutBlockIdentity(
       manualLayoutDraft.state.pageId,
-      blocksRef.current[targetIndex],
+      baselineBlock,
       targetIndex,
       true,
     ) as LayoutBlock
     const nextBlockId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, identifiedBlock, targetIndex)
-    if (identifiedBlock !== blocksRef.current[targetIndex]) {
-      const nextBlocks = blocksRef.current.map((block, index) => index === targetIndex ? identifiedBlock : block)
-      blocksRef.current = nextBlocks
-      manualLayoutDraft.previewBlocks(nextBlocks)
-    }
-    if (editingBlockId === previousBlockId && editingBlockId !== nextBlockId) {
-      manualLayoutDraft.setActiveBlockId(nextBlockId)
-    }
-    event.preventDefault()
-    event.stopPropagation()
+    const nextBlocks = baselineBlocks.map((block, index) => index === targetIndex ? identifiedBlock : block)
+    blocksRef.current = nextBlocks
+    manualLayoutDraft.previewBlocks(nextBlocks)
+    manualLayoutDraft.setActiveBlockId(nextBlockId)
     onSelectBox?.(sourceIndex)
-    layoutInteractionRef.current = handle
-      ? { kind: 'resize', blockId: nextBlockId, sourceIndex, handle, start: point, startRect: { ...rect } }
-      : { kind: 'move', blockId: nextBlockId, sourceIndex, start: point, startRect: { ...rect } }
-  }, [editingBlockId, getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
+    const captureTarget = event.currentTarget
+    captureTarget.setPointerCapture(event.pointerId)
+    layoutInteractionRef.current = {
+      kind: handle ? 'resize' : 'move',
+      pointerId: event.pointerId,
+      captureTarget,
+      blockId: nextBlockId,
+      baselineBlockId,
+      sourceIndex,
+      handle,
+      start: point,
+      startRect: { ...rect },
+      preview: createManualLayoutGeometryPreview(nextBlocks, nextBlockId, baselineBlocks),
+      changed: false,
+    }
+  }, [getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, manualLayoutTool, onSelectBox])
 
-  const handlePageLayoutMouseDown = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+  const handlePageLayoutPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (!layoutEditMode || layoutEditingLocked || event.button !== 0) return
-    if (event.target instanceof HTMLElement && event.target.closest('[data-guji-block-index],button,input,textarea')) return
+    if (event.target instanceof HTMLElement && event.target.closest('[data-guji-block-index],button,input,textarea,[data-manual-layout-type-picker]')) return
     const point = getPointerCoordinate(event.clientX, event.clientY)
     if (!point) return
     event.preventDefault()
     event.stopPropagation()
-    layoutInteractionRef.current = { kind: 'create', start: point, current: point }
+    setPendingCreateRect(null)
+    manualLayoutDraft.setActiveBlockId(null)
+    const captureTarget = event.currentTarget
+    captureTarget.setPointerCapture(event.pointerId)
+    layoutInteractionRef.current = {
+      kind: 'create',
+      pointerId: event.pointerId,
+      captureTarget,
+      tool: manualLayoutTool,
+      start: point,
+      current: point,
+    }
     setDraftCreateRect({ left: point.x, top: point.y, width: 0, height: 0 })
     onSelectBox?.(-1)
-  }, [getPointerCoordinate, layoutEditMode, layoutEditingLocked, onSelectBox])
+  }, [getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.setActiveBlockId, manualLayoutTool, onSelectBox])
+
+  const cancelLayoutInteraction = useCallback(() => {
+    const interaction = layoutInteractionRef.current
+    if (!interaction) {
+      setDraftCreateRect(null)
+      setPendingCreateRect(null)
+      return
+    }
+    layoutInteractionRef.current = null
+    releaseCapturedLayoutPointer(interaction)
+    setDraftCreateRect(null)
+    if (interaction.kind === 'create') return
+    const restoredBlocks = rollbackManualLayoutGeometryPreview(interaction.preview) as LayoutBlock[]
+    blocksRef.current = restoredBlocks
+    manualLayoutDraft.previewBlocks(restoredBlocks)
+    manualLayoutDraft.setActiveBlockId(interaction.baselineBlockId)
+  }, [manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId])
+
+  const handlePageLayoutPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const interaction = layoutInteractionRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
+    const point = getPointerCoordinate(event.clientX, event.clientY)
+    if (!point) return
+    event.preventDefault()
+    event.stopPropagation()
+    if (interaction.kind === 'create') {
+      interaction.current = point
+      setDraftCreateRect(clampManualLayoutBlockRect(
+        rectFromPointerPoints(interaction.start, point),
+        geometryBounds,
+        geometryMinimum,
+      ))
+      return
+    }
+    const deltaX = point.x - interaction.start.x
+    const deltaY = point.y - interaction.start.y
+    const nextRect = interaction.kind === 'move'
+      ? moveManualLayoutBlockRect(interaction.startRect, deltaX, deltaY, geometryBounds, geometryMinimum)
+      : resizeManualLayoutBlockRect(
+          interaction.startRect,
+          interaction.handle || 'se',
+          deltaX,
+          deltaY,
+          geometryBounds,
+          geometryMinimum,
+        )
+    interaction.preview = updateManualLayoutGeometryPreview(interaction.preview, nextRect)
+    interaction.changed = interaction.changed || Math.abs(deltaX) > 0.01 || Math.abs(deltaY) > 0.01
+    const nextBlocks = interaction.preview.blocks as LayoutBlock[]
+    blocksRef.current = nextBlocks
+    manualLayoutDraft.previewBlocks(nextBlocks)
+  }, [geometryBounds, geometryMinimum, getPointerCoordinate, manualLayoutDraft.previewBlocks])
+
+  const handlePageLayoutPointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const interaction = layoutInteractionRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
+    event.preventDefault()
+    event.stopPropagation()
+    layoutInteractionRef.current = null
+    releaseCapturedLayoutPointer(interaction)
+    if (interaction.kind === 'create') {
+      const rect = clampManualLayoutBlockRect(
+        rectFromPointerPoints(interaction.start, interaction.current),
+        geometryBounds,
+        geometryMinimum,
+      )
+      setDraftCreateRect(null)
+      if (rect.width < bounds.width * 0.012 || rect.height < bounds.height * 0.012) return
+      if (interaction.tool === 'select') {
+        setPendingCreateRect(rect)
+        return
+      }
+      createTypedManualBlock(interaction.tool, rect)
+      return
+    }
+    if (!interaction.changed) {
+      const restoredBlocks = rollbackManualLayoutGeometryPreview(interaction.preview) as LayoutBlock[]
+      blocksRef.current = restoredBlocks
+      manualLayoutDraft.previewBlocks(restoredBlocks)
+      manualLayoutDraft.setActiveBlockId(interaction.baselineBlockId)
+      return
+    }
+    const committedBlocks = commitManualLayoutGeometryPreview(interaction.preview) as LayoutBlock[]
+    blocksRef.current = committedBlocks
+    commitBlocks(committedBlocks, {
+      activeBlockId: interaction.blockId,
+      selectedSourceIndex: interaction.sourceIndex,
+    })
+  }, [bounds.height, bounds.width, commitBlocks, createTypedManualBlock, geometryBounds, geometryMinimum, manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId])
+
+  const handlePageLayoutPointerCancel = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const interaction = layoutInteractionRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
+    event.preventDefault()
+    cancelLayoutInteraction()
+  }, [cancelLayoutInteraction])
+
+  const handlePageLayoutLostPointerCapture = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const interaction = layoutInteractionRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
+    cancelLayoutInteraction()
+  }, [cancelLayoutInteraction])
 
   const toggleLayoutEditMode = useCallback(() => {
     if (layoutEditingLocked) return
@@ -2755,18 +2919,22 @@ export default function GujiFacsimileProofreader({
       setTranslationOpen(false)
       pageRotationRef.current = 0
       setPageRotation(0)
+      setManualLayoutTool('select')
+      setPendingCreateRect(null)
       setLayoutEditMode(true)
       return
     }
     const finishEditing = () => {
       if (!proofreaderMountedRef.current) return
+      releaseCapturedLayoutPointer(layoutInteractionRef.current)
       layoutInteractionRef.current = null
       setDraftCreateRect(null)
+      setPendingCreateRect(null)
+      setManualLayoutTool('select')
       setAltShowsClearUnderlay(false)
       setLayoutEditMode(false)
     }
     const saveAndFinish = async () => {
-      if (editingBlock) handleSaveBlock()
       const saved = await manualLayoutDraft.flush()
       if (saved) {
         finishEditing()
@@ -2775,7 +2943,7 @@ export default function GujiFacsimileProofreader({
       if (proofreaderMountedRef.current) message.error('版式保存失败，草稿仍保留在当前页面')
       throw new Error('Manual layout save failed')
     }
-    if (manualLayoutDraft.state.saveState === 'clean' && !editingBlock) {
+    if (manualLayoutDraft.state.saveState === 'clean') {
       finishEditing()
       return
     }
@@ -2788,111 +2956,34 @@ export default function GujiFacsimileProofreader({
       cancelText: '继续编辑',
       onOk: saveAndFinish,
     })
-  }, [editingBlock, handleSaveBlock, layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush, manualLayoutDraft.state.saveState, setTranslationOpen])
-
-  useEffect(() => {
-    if (!layoutEditMode || layoutEditingLocked) return undefined
-    const handleMove = (event: MouseEvent) => {
-      const interaction = layoutInteractionRef.current
-      if (!interaction) return
-      const point = getPointerCoordinate(event.clientX, event.clientY)
-      if (!point) return
-      if (interaction.kind === 'create') {
-        interaction.current = point
-        setDraftCreateRect(clampBlockRect(rectFromPointerPoints(interaction.start, point), bounds))
-        return
-      }
-      const deltaX = point.x - interaction.start.x
-      const deltaY = point.y - interaction.start.y
-      const nextRect = interaction.kind === 'move'
-        ? clampBlockRect({
-            ...interaction.startRect,
-            left: interaction.startRect.left + deltaX,
-            top: interaction.startRect.top + deltaY,
-          }, bounds)
-        : resizeBlockRect(interaction.startRect, interaction.handle, deltaX, deltaY, bounds)
-      const next = blocksRef.current.map((block, index) => (
-        getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) === interaction.blockId
-          ? {
-              ...block,
-              location: { left: nextRect.left, top: nextRect.top, width: nextRect.width, height: nextRect.height },
-              __rect: nextRect,
-              __synthetic: false,
-              segmentation_source: 'manual',
-            }
-          : block
-      )) as LayoutBlock[]
-      blocksRef.current = next
-      manualLayoutDraft.previewBlocks(next)
-    }
-    const handleUp = () => {
-      const interaction = layoutInteractionRef.current
-      if (!interaction) return
-      layoutInteractionRef.current = null
-      if (interaction.kind === 'create') {
-        const rect = clampBlockRect(rectFromPointerPoints(interaction.start, interaction.current), bounds)
-        setDraftCreateRect(null)
-        if (rect.width < bounds.width * 0.012 || rect.height < bounds.height * 0.012) return
-        const sourceIndex = blocksRef.current.reduce((max, block, index) => Math.max(max, getBlockSourceIndex(block, index)), -1) + 1
-        const orientation = pageVerticalMode ? 'vertical' : 'horizontal'
-        const nextBlock = ensureManualLayoutBlockIdentity(manualLayoutDraft.state.pageId, {
-          words: '',
-          label: 'text',
-          type: 'text',
-          reading_order: blocksRef.current.length,
-          orientation,
-          orientation_source: 'manual',
-          source_orientation: orientation,
-          source_orientation_source: 'manual',
-          segmentation_source: 'manual',
-          location: rect,
-          __rect: rect,
-          __synthetic: false,
-          __sourceIndex: sourceIndex,
-        }, blocksRef.current.length, true) as LayoutBlock
-        const nextBlocks = [...blocksRef.current, nextBlock]
-        blocksRef.current = nextBlocks
-        pushHistory(nextBlocks)
-        const nextBlockId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, nextBlock, blocksRef.current.length - 1)
-        editingBaselineRef.current = { blockId: nextBlockId, block: { ...nextBlock } }
-        manualLayoutDraft.createBlock(nextBlock)
-        setEditValue('')
-        setTableDraftRows([['']])
-        setTableDraftMerges([])
-        onSelectBox?.(sourceIndex)
-        return
-      }
-      commitBlocks(blocksRef.current, { selectedSourceIndex: interaction.sourceIndex, closeEditor: false })
-    }
-    document.addEventListener('mousemove', handleMove)
-    document.addEventListener('mouseup', handleUp)
-    return () => {
-      document.removeEventListener('mousemove', handleMove)
-      document.removeEventListener('mouseup', handleUp)
-    }
-  }, [bounds, commitBlocks, getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.createBlock, manualLayoutDraft.previewBlocks, manualLayoutDraft.state.pageId, onSelectBox, pageVerticalMode, pushHistory])
+  }, [layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush, manualLayoutDraft.state.saveState, setTranslationOpen])
 
   useEffect(() => {
     if (editingBlockId && !editingBlock) {
-      editingBaselineRef.current = null
       manualLayoutDraft.setActiveBlockId(null)
-      setEditValue('')
     }
   }, [editingBlock, editingBlockId, manualLayoutDraft.setActiveBlockId])
 
   useEffect(() => {
     if (!layoutEditMode || layoutEditingLocked) return undefined
     const handleSaveShortcut = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        const targetIsEditor = event.target instanceof HTMLElement && !!event.target.closest('input,textarea,[role="gridcell"]')
+        if (!layoutInteractionRef.current && !pendingCreateRect && manualLayoutTool === 'select' && targetIsEditor) return
+        event.preventDefault()
+        cancelLayoutInteraction()
+        setManualLayoutTool((current) => reduceManualLayoutTool(current, { type: 'escape' }))
+        return
+      }
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
       event.preventDefault()
-      if (editingBlock) handleSaveBlock()
       void manualLayoutDraft.flush().then((saved) => {
         if (!saved && proofreaderMountedRef.current) message.error('版式保存失败，草稿已保留')
       })
     }
     window.addEventListener('keydown', handleSaveShortcut, true)
     return () => window.removeEventListener('keydown', handleSaveShortcut, true)
-  }, [editingBlock, handleSaveBlock, layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush])
+  }, [cancelLayoutInteraction, layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush, manualLayoutTool, pendingCreateRect])
 
   const citationPageNum = useMemo(() => {
     const literature = Number(literaturePageNum || 0)
@@ -3227,8 +3318,21 @@ export default function GujiFacsimileProofreader({
         <Button size="small" icon={<UndoOutlined />} disabled={!canUndo || layoutEditingLocked} onClick={handleUndo}>撤销</Button>
       </div>
 
+      {layoutEditMode ? (
+        <ManualLayoutToolbar
+          tool={manualLayoutTool}
+          disabled={layoutEditingLocked}
+          onToolChange={(tool) => {
+            cancelLayoutInteraction()
+            setPendingCreateRect(null)
+            setManualLayoutTool(tool)
+          }}
+        />
+      ) : null}
+      <div className={`manual-layout-editor-workspace${layoutEditMode ? ' is-editing' : ''}`}>
       <div
         ref={rootRef}
+        className="manual-layout-editor-canvas"
         onMouseUp={captureSelection}
         onKeyUp={captureSelection}
         onWheel={handleCanvasWheel}
@@ -3236,7 +3340,16 @@ export default function GujiFacsimileProofreader({
         style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#d4dbea', borderRadius: 6, padding: 18, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', cursor: layoutEditMode ? 'default' : isPanning ? 'grabbing' : 'grab', userSelect: isPanning || layoutEditMode ? 'none' : undefined }}
       >
         <div ref={pageFrameRef} style={{ width: `${visualFrameWidth}px`, height: `${visualFrameHeight}px`, position: 'relative', flexShrink: 0 }}>
-        <div ref={pageRef} aria-busy={layoutEditingLocked} onMouseDown={handlePageLayoutMouseDown} style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden', cursor: layoutEditingLocked ? 'wait' : layoutEditMode ? 'crosshair' : undefined, pointerEvents: layoutEditingLocked ? 'none' : undefined }}>
+        <div
+          ref={pageRef}
+          aria-busy={layoutEditingLocked}
+          onPointerDown={handlePageLayoutPointerDown}
+          onPointerMove={handlePageLayoutPointerMove}
+          onPointerUp={handlePageLayoutPointerUp}
+          onPointerCancel={handlePageLayoutPointerCancel}
+          onLostPointerCapture={handlePageLayoutLostPointerCapture}
+          style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden', cursor: layoutEditingLocked ? 'wait' : layoutEditMode ? 'crosshair' : undefined, pointerEvents: layoutEditingLocked ? 'none' : undefined, touchAction: layoutEditMode ? 'none' : undefined }}
+        >
           {showImageUnderlay ? (
             <img
               src={pageImageSrc}
@@ -3270,6 +3383,44 @@ export default function GujiFacsimileProofreader({
                 pointerEvents: 'none',
               }}
             />
+          ) : null}
+          {pendingCreateRect ? (
+            <div
+              data-manual-layout-type-picker="true"
+              style={{
+                position: 'absolute',
+                left: `${clamp(((pendingCreateRect.left - bounds.offsetLeft) / bounds.width) * 100, 1, 66)}%`,
+                top: `${clamp(((pendingCreateRect.top + pendingCreateRect.height - bounds.offsetTop) / bounds.height) * 100 + 0.8, 1, 88)}%`,
+                zIndex: 150,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                padding: 5,
+                borderRadius: 7,
+                background: 'rgba(20, 20, 20, 0.94)',
+                boxShadow: '0 10px 26px rgba(0,0,0,0.3)',
+              }}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              {(['text', 'note', 'table', 'image'] as const).map((kind) => (
+                <Button key={kind} size="small" type={kind === 'text' ? 'primary' : 'default'} onClick={() => createTypedManualBlock(kind, pendingCreateRect)}>
+                  {LABEL_NAMES[kind] || kind}
+                </Button>
+              ))}
+              <Dropdown
+                trigger={['click']}
+                menu={{
+                  items: (['title', 'paragraph_title', 'abstract', 'reference', 'header', 'footer', 'number', 'seal'] as const).map((kind) => ({
+                    key: kind,
+                    label: LABEL_NAMES[kind] || kind,
+                    onClick: () => createTypedManualBlock(kind, pendingCreateRect),
+                  })),
+                }}
+              >
+                <Button size="small">更多</Button>
+              </Dropdown>
+              <Button size="small" type="text" style={{ color: '#fff' }} onClick={() => setPendingCreateRect(null)}>取消</Button>
+            </div>
           ) : null}
           {translationStatusText ? (
             <div
@@ -3342,7 +3493,7 @@ export default function GujiFacsimileProofreader({
             } = layout
             const shouldUseOverlayTranslation = translationOpen && translatedSourceIndexes.has(sourceIndex) && !isImage
             const hasOverflow = fittedLayout.overflow
-            const isActive = sourceIndex === activeBoxIndex
+            const isActive = editingBlockId === blockId || sourceIndex === activeBoxIndex
             const keywordMatch = !!normalizedSearchKeyword && normalizedSearchableText.includes(normalizedSearchKeyword)
             const isEditing = editingBlockId === blockId
             const ruleBorder = shouldRenderTable ? { border: showRules ? '1px solid rgba(64,48,32,0.34)' : undefined } : getBlockBorderStyle(orientation, showRules)
@@ -3369,7 +3520,7 @@ export default function GujiFacsimileProofreader({
 
             return (
               <Fragment key={`${sourceIndex}-${block.reading_order ?? sourceIndex}`}>
-                {isActive || isEditing ? (
+                {!layoutEditMode && (isActive || isEditing) ? (
                   <div
                     style={{
                       position: 'absolute',
@@ -3489,21 +3640,13 @@ export default function GujiFacsimileProofreader({
               >
               <div
                 data-guji-block-index={sourceIndex}
-                onClick={(event) => { event.stopPropagation(); onSelectBox?.(sourceIndex) }}
+                onClick={(event) => { event.stopPropagation(); selectLayoutBlock(sourceIndex, blockId) }}
                 onDoubleClick={(event) => { event.stopPropagation(); beginEditBlock(sourceIndex) }}
-                onContextMenu={() => onSelectBox?.(sourceIndex)}
-                onMouseDown={(event) => startBlockInteraction(event, sourceIndex, rect)}
+                onContextMenu={() => selectLayoutBlock(sourceIndex, blockId)}
+                onPointerDown={(event) => startBlockInteraction(event, sourceIndex, rect)}
                 style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, border: layoutEditMode ? (isActive ? '2px solid #1677ff' : '1px dashed rgba(22,119,255,0.72)') : ruleBorder.border, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : layoutEditMode ? 'rgba(255,255,255,0.18)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: layoutEditMode ? 'move' : 'text', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: layoutEditMode ? 'none' : 'text' }}
               >
-                {false ? (
-                  <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 4, background: 'rgba(255,253,247,0.98)', borderRadius: 3 }}>
-                    <Input.TextArea value={editValue} onChange={(event) => setEditValue(event.target.value)} autoSize={false} style={{ flex: 1, height: '100%', resize: 'none', fontFamily: FONT_FAMILY, fontSize: Math.max(10, Math.min(fontSize, 32)), lineHeight: 1.5, writingMode: shouldRenderTable ? 'horizontal-tb' : orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb' }} onClick={(event) => event.stopPropagation()} />
-                    <Space size={4} style={{ justifyContent: 'flex-end', padding: '0 2px 2px' }}>
-                      <Button size="small" onClick={(event) => { event.stopPropagation(); cancelBlockEditor() }}>取消</Button>
-                      <Button size="small" type="primary" icon={<SaveOutlined />} onClick={(event) => { event.stopPropagation(); handleSaveBlock() }}>保存</Button>
-                    </Space>
-                  </div>
-                ) : shouldHideBlockContent ? null : isImage ? (
+                {shouldHideBlockContent ? null : isImage ? (
                   <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} rect={rect} bounds={cropBounds} />
                 ) : shouldRenderTable ? (
                   <div style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize, lineHeight: 1.18, fontFamily: FONT_FAMILY }}>
@@ -3521,7 +3664,7 @@ export default function GujiFacsimileProofreader({
                   <span
                     key={item.handle}
                     role="presentation"
-                    onMouseDown={(event) => startBlockInteraction(event, sourceIndex, rect, item.handle)}
+                    onPointerDown={(event) => startBlockInteraction(event, sourceIndex, rect, item.handle)}
                     style={{
                       position: 'absolute',
                       left: `${item.left}%`,
@@ -3622,94 +3765,21 @@ export default function GujiFacsimileProofreader({
         </div>
         </div>
       </div>
-      {editingBlock ? (
-        <div
-          aria-disabled={layoutEditingLocked}
-          onMouseDown={(event) => event.stopPropagation()}
-          onMouseUp={(event) => event.stopPropagation()}
-          onClick={(event) => event.stopPropagation()}
-          onWheel={(event) => event.stopPropagation()}
-          style={{
-            position: 'absolute',
-            top: 48,
-            right: 14,
-            zIndex: 80,
-            width: isRenderableTableBlock(editingBlock) ? 'min(820px, calc(100% - 28px))' : 'min(460px, calc(100% - 28px))',
-            maxHeight: 'calc(100% - 70px)',
-            display: 'flex',
-            flexDirection: 'column',
-            background: '#fffdf7',
-            border: '1px solid rgba(45, 33, 21, 0.2)',
-            borderRadius: 8,
-            boxShadow: '0 18px 48px rgba(16, 12, 8, 0.28)',
-            overflow: 'hidden',
-            pointerEvents: layoutEditingLocked ? 'none' : undefined,
-            opacity: layoutEditingLocked ? 0.68 : 1,
-          }}
-        >
-          <div style={{ padding: '12px 14px 10px', borderBottom: '1px solid rgba(45, 33, 21, 0.12)', display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
-            <div style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <Tag color={LABEL_COLORS[getLabel(editingBlock)] || LABEL_COLORS.text} style={{ marginInlineEnd: 0 }}>{editingBlockLabel}</Tag>
-              <Tag color="blue" style={{ marginInlineEnd: 0 }}>#{editingSourceIndex + 1}</Tag>
-              <Tag color={editingBlock.orientation === 'vertical' ? 'purple' : 'geekblue'} style={{ marginInlineEnd: 0 }}>
-                {editingBlock.orientation === 'vertical' ? '竖排' : '横排'}
-              </Tag>
-            </div>
-            <Space size={6}>
-              <Button
-                size="small"
-                disabled={isRenderableTableBlock(editingBlock)}
-                onClick={() => editingBlockId && handleToggleBlockOrientation(editingBlockId)}
-              >
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                  <span>{editingBlock.orientation === 'vertical' ? '改横排' : '改竖排'}</span>
-                  <RotateRightOutlined style={{ fontSize: 12 }} />
-                </span>
-              </Button>
-              <Button size="small" onClick={cancelBlockEditor}>取消</Button>
-            </Space>
-          </div>
-          <div style={{ padding: 14, minHeight: 0, flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {isRenderableTableBlock(editingBlock) ? (
-              <FacsimileTableEditor
-                editorKey={editingBlockId || getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, editingBlock, Math.max(0, editingSourceIndex))}
-                rows={tableDraftRows}
-                merges={tableDraftMerges}
-                onChange={(value) => stageTableBlockChange(value.rows, value.merges)}
-              />
-            ) : (
-              <Input.TextArea
-                disabled={layoutEditingLocked}
-                value={editValue}
-                onChange={(event) => stageTextBlockChange(event.target.value)}
-                autoSize={false}
-                autoFocus
-                onKeyDown={(event) => {
-                  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                    event.preventDefault()
-                    handleSaveBlock()
-                  }
-                }}
-                style={{
-                  width: '100%',
-                  height: 'min(46vh, 360px)',
-                  minHeight: 180,
-                  resize: 'vertical',
-                  fontFamily: FONT_FAMILY,
-                  fontSize: 16,
-                  lineHeight: 1.7,
-                  writingMode: 'horizontal-tb',
-                  whiteSpace: 'pre-wrap',
-                }}
-              />
-            )}
-            <Space size={8} style={{ justifyContent: 'flex-end', flexShrink: 0 }}>
-              <Button onClick={cancelBlockEditor}>取消</Button>
-              <Button type="primary" icon={<SaveOutlined />} onClick={handleSaveBlock}>保存</Button>
-            </Space>
-          </div>
-        </div>
+      {layoutEditMode ? (
+        <ManualBlockInspector
+          blockId={editingBlockId}
+          block={editingBlock}
+          disabled={layoutEditingLocked}
+          tableRows={tableDraftRows}
+          tableMerges={tableDraftMerges}
+          onChange={handleInspectorChange}
+          onTableChange={(value) => stageTableBlockChange(value.rows, value.merges)}
+          onTypeChange={handleInspectorTypeChange}
+          onDelete={() => editingBlockId && handleDeleteBlock(editingBlockId)}
+          onDeselect={resetBlockEditor}
+        />
       ) : null}
+      </div>
     </div>
   )
 }

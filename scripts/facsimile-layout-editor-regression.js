@@ -56,6 +56,18 @@ if (underlayHelperSource) {
   new Function('exports', 'module', 'require', underlayHelperTranspiled)(underlayHelperModule.exports, underlayHelperModule, require)
 }
 
+const blockEditingHelperPath = path.join(root, 'src/renderer/src/utils/manualLayoutBlockEditing.ts')
+assert.ok(fs.existsSync(blockEditingHelperPath), 'typed manual blocks must expose a pure interaction helper')
+const blockEditingHelperSource = fs.readFileSync(blockEditingHelperPath, 'utf8')
+const blockEditingHelperModule = { exports: {} }
+const blockEditingTranspiled = ts.transpileModule(blockEditingHelperSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.CommonJS,
+    target: ts.ScriptTarget.ES2022,
+  },
+}).outputText
+new Function('exports', 'module', 'require', blockEditingTranspiled)(blockEditingHelperModule.exports, blockEditingHelperModule, require)
+
 const {
   buildFacsimileTableCells,
   clearFacsimileTableSelection,
@@ -111,6 +123,22 @@ const {
 
 const { saveTextEditorPage } = textEditorSavingModule.exports
 const { getManualLayoutUnderlayImageStyle } = underlayHelperModule.exports
+const {
+  MANUAL_LAYOUT_BLOCK_KINDS,
+  MANUAL_LAYOUT_MORE_KINDS,
+  MANUAL_LAYOUT_QUICK_KINDS,
+  applyManualLayoutBlockConversion,
+  clampManualLayoutBlockRect,
+  commitManualLayoutGeometryPreview,
+  createManualLayoutGeometryPreview,
+  getManualLayoutBlockConversionWarning,
+  moveManualLayoutBlockRect,
+  normalizeManualLayoutBlockRect,
+  reduceManualLayoutTool,
+  resizeManualLayoutBlockRect,
+  rollbackManualLayoutGeometryPreview,
+  updateManualLayoutGeometryPreview,
+} = blockEditingHelperModule.exports
 
 assert.strictEqual(typeof createManualLayoutDraft, 'function', 'manual layout drafts must expose a testable state factory')
 assert.strictEqual(typeof reduceManualLayoutDraft, 'function', 'manual layout drafts must expose a pure reducer')
@@ -1081,11 +1109,11 @@ assert.deepStrictEqual(
 assert.deepStrictEqual(normalizeFacsimileTableColumnWidths([], -3), [], 'invalid metadata lengths must safely normalize to an empty list')
 
 const proofreader = fs.readFileSync(path.join(root, 'src/renderer/src/components/GujiFacsimileProofreader.tsx'), 'utf8')
-assert.ok(proofreader.includes('onMouseDown={handlePageLayoutMouseDown}'), 'blank page dragging must create a manual text box')
+assert.ok(proofreader.includes('onPointerDown={handlePageLayoutPointerDown}'), 'blank page dragging must create a typed manual box')
 assert.ok(proofreader.includes('BLOCK_RESIZE_HANDLES.map'), 'the active text box must expose edge and corner resize handles')
 assert.ok(proofreader.includes("setImageUnderlayMode('on')"), 'entering manual editing must automatically enable the page image underlay')
 assert.ok(proofreader.includes("segmentation_source: 'manual'"), 'manual text, table, and geometry edits must be marked as manual data')
-assert.ok(proofreader.includes('<FacsimileTableEditor'), 'recognized tables must use the visual grid editor instead of raw table code')
+assert.ok(proofreader.includes('<ManualBlockInspector'), 'recognized tables must reach the visual grid through the docked inspector')
 assert.ok(proofreader.includes("String(block.segmentation_source || '').toLowerCase() !== 'manual'"), 'manual tables must not be converted back into pseudo text tables on vertical pages')
 assert.ok(proofreader.includes('useManualLayoutDraft({'), 'the proofreader must keep page edits in the revisioned local draft')
 assert.ok(proofreader.includes('await Promise.resolve(onSave('), 'both synchronous saves and rejected async saves must use one awaited contract')
@@ -1093,8 +1121,8 @@ assert.ok(proofreader.includes('manualLayoutDraft.createBlock(nextBlock)'), 'a n
 assert.ok(proofreader.includes('manualLayoutDraft.receiveServerEcho(pageId, incomingBlocks)'), 'same-page parent echoes must reconcile through the draft reducer')
 assert.ok(proofreader.includes('manualLayoutDraft.setActiveBlockId(targetBlockId)'), 'the editor selection must use stable block identity rather than an array index')
 assert.ok(proofreader.includes('manualLayoutDraft.updateBlock(editingBlockId,'), 'text and table editor changes must enter the revisioned draft before debounce')
-assert.ok(proofreader.includes('editingBaselineRef.current = { blockId: targetBlockId'), 'opening an existing block must retain a cancel baseline')
-assert.ok(proofreader.includes('onClick={cancelBlockEditor}'), 'cancel must restore the editor baseline instead of accepting live draft edits')
+assert.ok(proofreader.includes('block={editingBlock}'), 'opening an existing block must keep the stable selected draft in the docked inspector')
+assert.ok(proofreader.includes('onDeselect={resetBlockEditor}'), 'closing the docked inspector must clear selection without discarding the revisioned draft')
 assert.ok(!proofreader.includes('setEditingIndex('), 'server echoes must not clear an index-based editor selection')
 assert.ok(proofreader.includes("? '保存失败'"), 'the draft save failure must be visible in the toolbar')
 assert.ok(proofreader.includes('onClick={manualLayoutDraft.retry}'), 'failed drafts must expose a retry control')
@@ -1724,7 +1752,7 @@ assert.ok(tableEditor.includes('undo') && tableEditor.includes('redo'), 'the gri
 assert.ok(tableEditor.includes('onDoubleClick'), 'double click must enter cell editing')
 assert.ok(tableEditor.includes('isPrintableKey'), 'typing a printable key must start overwrite editing')
 assert.ok(tableEditor.includes('onCompositionStart') && tableEditor.includes('onCompositionEnd'), 'the active editor must track Chinese IME composition sessions')
-assert.ok(proofreader.includes('editorKey='), 'the proofreader must provide a stable block identity to isolate editor state')
+assert.ok(proofreader.includes('blockId={editingBlockId}'), 'the proofreader must pass stable block identity into the docked inspector')
 
 assert.ok(tableEditor.includes('onContextMenu={handleContextMenu}'), 'the editor must expose a selection-aware context menu')
 assert.ok(tableEditor.includes('onContextMenu={(event) => handleRowHeaderContextMenu'), 'row headers must replace stale selection before opening the context menu')
@@ -1756,6 +1784,94 @@ const toolbarSource = tableEditor.slice(toolbarStart, toolbarEnd)
 assert.ok(toolbarSource.includes('撤销') && toolbarSource.includes('重做'), 'the compact toolbar must expose undo and redo controls')
 for (const action of ['上方插入行', '下方插入行', '左侧插入列', '右侧插入列', '删除行', '删除列', '合并选区', '拆分单元格', '清空选区']) {
   assert.ok(!toolbarSource.includes(action), `the compact toolbar must leave ${action} in the context menu`)
+}
+
+assert.deepStrictEqual(
+  [...MANUAL_LAYOUT_BLOCK_KINDS].sort(),
+  ['abstract', 'footer', 'header', 'image', 'note', 'number', 'paragraph_title', 'reference', 'seal', 'table', 'text', 'title'].sort(),
+  'the manual toolbox must use the complete shared canonical block-kind set',
+)
+assert.deepStrictEqual(MANUAL_LAYOUT_QUICK_KINDS, ['text', 'note', 'table', 'image'])
+assert.deepStrictEqual(MANUAL_LAYOUT_MORE_KINDS, ['title', 'paragraph_title', 'abstract', 'reference', 'header', 'footer', 'number', 'seal'])
+assert.strictEqual(reduceManualLayoutTool('note', { type: 'created' }), 'note', 'a draw tool must remain active for repeated creation')
+assert.strictEqual(reduceManualLayoutTool('image', { type: 'escape' }), 'select', 'Escape must return every draw tool to selection')
+assert.strictEqual(reduceManualLayoutTool('select', { type: 'choose-kind', kind: 'table' }), 'table')
+
+const editingBounds = { left: 0, top: 0, width: 1000, height: 800 }
+assert.deepStrictEqual(
+  normalizeManualLayoutBlockRect({ left: 80, top: 90, width: -60, height: -50 }),
+  { left: 20, top: 40, width: 60, height: 50 },
+  'reverse drag rectangles must normalize before creation',
+)
+assert.deepStrictEqual(
+  clampManualLayoutBlockRect({ left: -20, top: 790, width: 5, height: 5 }, editingBounds, { width: 20, height: 16 }),
+  { left: 0, top: 784, width: 20, height: 16 },
+  'creation and resize must clamp to the page and enforce minimum dimensions',
+)
+assert.deepStrictEqual(
+  moveManualLayoutBlockRect({ left: 900, top: 700, width: 100, height: 100 }, 80, 80, editingBounds, { width: 20, height: 16 }),
+  { left: 900, top: 700, width: 100, height: 100 },
+  'moving a block must preserve its size while clamping it inside the page',
+)
+for (const handle of ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']) {
+  const resized = resizeManualLayoutBlockRect(
+    { left: 300, top: 250, width: 200, height: 120 },
+    handle,
+    25,
+    20,
+    editingBounds,
+    { width: 20, height: 16 },
+  )
+  assert.ok(resized.width >= 20 && resized.height >= 16, `${handle} resize must preserve minimum size`)
+  assert.ok(resized.left >= 0 && resized.top >= 0 && resized.left + resized.width <= 1000 && resized.top + resized.height <= 800, `${handle} resize must stay inside page bounds`)
+}
+
+const previewBlocks = [
+  { manual_block_id: 'm1', label: 'text', location: { left: 10, top: 20, width: 100, height: 80 } },
+  { manual_block_id: 'm2', label: 'note', location: { left: 300, top: 20, width: 100, height: 80 } },
+]
+const geometryPreview = createManualLayoutGeometryPreview(previewBlocks, 'm1')
+const previewUpdated = updateManualLayoutGeometryPreview(geometryPreview, { left: 30, top: 40, width: 120, height: 90 })
+assert.deepStrictEqual(previewUpdated.blocks[0].location, { left: 30, top: 40, width: 120, height: 90 })
+assert.strictEqual(previewUpdated.blocks[1], previewBlocks[1], 'preview updates must leave unrelated blocks referentially stable')
+assert.deepStrictEqual(commitManualLayoutGeometryPreview(previewUpdated), previewUpdated.blocks, 'pointerup must commit the latest preview exactly once')
+assert.deepStrictEqual(rollbackManualLayoutGeometryPreview(previewUpdated), previewBlocks, 'Escape/pointercancel must restore the interaction baseline')
+
+const tableConversionSource = { manual_block_id: 'table-1', label: 'table', rows: [['A']], cells: [{ row: 0, col: 0, text: 'A' }] }
+assert.ok(getManualLayoutBlockConversionWarning(tableConversionSource, 'text'), 'structured-to-text conversion must require a warning')
+assert.strictEqual(applyManualLayoutBlockConversion(tableConversionSource, 'text', false).blocked, true, 'unconfirmed structured conversion must be blocked')
+const confirmedTableConversion = applyManualLayoutBlockConversion(tableConversionSource, 'text', true)
+assert.strictEqual(confirmedTableConversion.block.label, 'text')
+assert.deepStrictEqual(confirmedTableConversion.block.manual_preserved_table.rows, [['A']], 'confirmed conversion must preserve table metadata for lossless reversal')
+assert.strictEqual(confirmedTableConversion.block.rows, undefined, 'inactive table rows must not keep rendering after conversion to text')
+assert.deepStrictEqual(
+  applyManualLayoutBlockConversion(confirmedTableConversion.block, 'table', true).block.rows,
+  [['A']],
+  'switching back to table must restore the preserved structure',
+)
+const imageConversionSource = { manual_block_id: 'image-1', label: 'image', image_asset_path: 'managed/image.png', caption: '图一' }
+assert.ok(getManualLayoutBlockConversionWarning(imageConversionSource, 'note'), 'image-to-text conversion must require a warning')
+assert.strictEqual(applyManualLayoutBlockConversion(imageConversionSource, 'note', true).block.image_asset_path, 'managed/image.png', 'confirmed image conversion must preserve managed asset metadata')
+
+const manualToolbarPath = path.join(root, 'src/renderer/src/components/ManualLayoutToolbar.tsx')
+const manualInspectorPath = path.join(root, 'src/renderer/src/components/ManualBlockInspector.tsx')
+assert.ok(fs.existsSync(manualToolbarPath), 'edit mode must have a compact typed block toolbar')
+assert.ok(fs.existsSync(manualInspectorPath), 'edit mode must have a docked stable-ID inspector')
+const manualToolbarSource = fs.readFileSync(manualToolbarPath, 'utf8')
+const manualInspectorSource = fs.readFileSync(manualInspectorPath, 'utf8')
+assert.ok(manualToolbarSource.includes('MANUAL_LAYOUT_QUICK_KINDS') && manualToolbarSource.includes('MANUAL_LAYOUT_MORE_KINDS'), 'toolbar UI must be driven by the canonical quick/more kind lists')
+assert.ok(manualToolbarSource.includes("tool === 'select'"), 'toolbar must expose an explicit selection tool')
+assert.ok(manualInspectorSource.includes('blockId'), 'inspector identity must be a stable block ID rather than an array index')
+assert.ok(manualInspectorSource.includes('<FacsimileTableEditor'), 'table blocks must reuse the Excel-style editor')
+assert.ok(manualInspectorSource.includes('editorKey={blockId}'), 'table editor state must be isolated by stable block ID')
+assert.ok(manualInspectorSource.includes('重新裁剪') && manualInspectorSource.includes('替换图片'), 'image-like inspectors must expose honest follow-up entry points')
+assert.ok(manualInspectorSource.includes('未选择区块'), 'the docked inspector must remain mounted and guide the user without a selection')
+assert.ok(proofreader.includes('<ManualLayoutToolbar'), 'the proofreader must mount the typed toolbar in edit mode')
+assert.ok(proofreader.includes('<ManualBlockInspector'), 'the proofreader must mount the inspector throughout edit mode')
+assert.ok(proofreader.includes('setPointerCapture'), 'block move/resize/draw must use pointer capture')
+assert.ok(proofreader.includes('onPointerCancel'), 'pointer cancellation must roll back a geometry preview')
+for (const handle of ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']) {
+  assert.ok(proofreader.includes(`handle: '${handle}'`), `the selected block must expose the ${handle} resize handle`)
 }
 
 runAsyncDraftChecks()

@@ -1,0 +1,21 @@
+.manual-layout-editor-workspace {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  gap: 8px;
+}
+
+.manual-layout-editor-canvas {
+  min-width: 0;
+}
+
+@media (max-width: 780px) {
+  .manual-layout-editor-workspace.is-editing {
+    flex-direction: column;
+  }
+
+  .manual-layout-editor-workspace.is-editing .manual-layout-editor-canvas {
+    min-height: 52%;
+  }
+}
