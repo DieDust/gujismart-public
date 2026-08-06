@@ -6,6 +6,14 @@
   color: var(--table-text, #1f1f1f);
 }
 
+.facsimile-table-editor.is-disabled {
+  opacity: 0.72;
+}
+
+.facsimile-table-editor.is-disabled .facsimile-table-grid {
+  cursor: not-allowed;
+}
+
 .facsimile-table-toolbar {
   flex: 0 0 auto;
   display: flex;

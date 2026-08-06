@@ -52,6 +52,7 @@ type Props = {
   editorKey: string
   rows: string[][]
   merges: FacsimileTableMerge[]
+  disabled?: boolean
   onChange: (value: FacsimileTableEditorValue) => void
 }
 
@@ -63,6 +64,25 @@ export type TableSnapshot = {
 }
 
 export type SelectionMode = 'cell' | 'row' | 'column'
+export type FacsimileTableInteractionKind =
+  | 'pointer'
+  | 'keyboard'
+  | 'paste'
+  | 'copy'
+  | 'cut'
+  | 'mutation'
+  | 'context-menu'
+  | 'toolbar'
+  | 'resize'
+  | 'textarea'
+
+export function canHandleFacsimileTableInteraction(
+  disabled: boolean,
+  _kind: FacsimileTableInteractionKind,
+): boolean {
+  return !disabled
+}
+
 type TableAction =
   | 'insert-row-above'
   | 'insert-row-below'
@@ -906,7 +926,7 @@ function selectedIndexes(start: number, end: number): number[] {
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, offset) => start + offset)
 }
 
-export default function FacsimileTableEditor({ editorKey, rows, merges, onChange }: Props) {
+export default function FacsimileTableEditor({ editorKey, rows, merges, disabled = false, onChange }: Props) {
   const { token } = theme.useToken()
   const tableThemeStyle = useMemo(() => createFacsimileTableThemeStyle(token), [token])
   const normalizedPropRows = useMemo(() => normalizeFacsimileTableRows(rows), [rows])
@@ -929,6 +949,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   const gridRef = useRef<HTMLTableElement>(null)
   const editorRef = useRef<HTMLTextAreaElement>(null)
   const mountedRef = useRef(true)
+  const disabledRef = useRef(disabled)
   const resizeCleanupRef = useRef<(() => void) | null>(null)
   const contextMenuEscapeCleanupRef = useRef<(() => void) | null>(null)
   const draggingSelectionRef = useRef(false)
@@ -947,6 +968,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   tableStateRef.current = tableState
   onChangeRef.current = onChange
   focusRef.current = focus
+  disabledRef.current = disabled
 
   const rowCount = tableState.rows.length
   const colCount = tableState.rows[0]?.length || 1
@@ -990,6 +1012,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const applySnapshot = (candidate: TableSnapshot, options: { record?: boolean; emit?: boolean } = {}) => {
+    if (!canHandleFacsimileTableInteraction(disabled, 'mutation')) return false
     const previous = tableStateRef.current
     const next = normalizeSnapshot(candidate)
     if (snapshotSignature(previous) === snapshotSignature(next)) return false
@@ -1007,6 +1030,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const focusGrid = () => {
+    if (disabled) return
     window.requestAnimationFrame(() => gridRef.current?.focus({ preventScroll: true }))
   }
 
@@ -1018,6 +1042,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const selectPoint = (point: FacsimileTablePoint, extend = false) => {
+    if (disabled) return
     const safePoint = clampPoint(point, rowCount, colCount)
     const targetMerge = findFacsimileTableMerge(tableStateRef.current.merges, safePoint.row, safePoint.col)
     const target = targetMerge ? { row: targetMerge.row, col: targetMerge.col } : safePoint
@@ -1099,6 +1124,19 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }, [editingCell])
 
   useEffect(() => {
+    if (!disabled) return
+    draggingSelectionRef.current = false
+    resizeCleanupRef.current?.()
+    resizeCleanupRef.current = null
+    closeContextMenu()
+    compositionRef.current = false
+    editingCellRef.current = null
+    setEditingCell(null)
+    editValueRef.current = ''
+    setEditValue('')
+  }, [disabled])
+
+  useEffect(() => {
     if (!contextMenu) return
     const close = () => closeContextMenu()
     window.addEventListener('pointerdown', close)
@@ -1112,6 +1150,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }, [contextMenu])
 
   const startEditing = (point: FacsimileTablePoint, replacement?: string) => {
+    if (disabled) return
     const safePoint = clampPoint(point, rowCount, colCount)
     const merge = findFacsimileTableMerge(tableStateRef.current.merges, safePoint.row, safePoint.col)
     const target = merge ? { row: merge.row, col: merge.col } : safePoint
@@ -1126,6 +1165,11 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const finishEditing = (move?: 'next-column' | 'previous-column' | 'next-row' | 'previous-row') => {
+    if (disabled) {
+      editingCellRef.current = null
+      setEditingCell(null)
+      return
+    }
     const target = editingCellRef.current
     if (!target) return
     editingCellRef.current = null
@@ -1149,6 +1193,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
     extend: boolean,
     origin = activeCell,
   ) => {
+    if (disabled) return
     const current = tableStateRef.current
     const currentMerge = findFacsimileTableMerge(current.merges, origin.row, origin.col)
     let row = origin.row
@@ -1177,6 +1222,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const undo = () => {
+    if (disabled) return
     const current = tableStateRef.current
     const history = reduceFacsimileTableHistory({
       past: undoStackRef.current,
@@ -1192,6 +1238,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const redo = () => {
+    if (disabled) return
     const current = tableStateRef.current
     const history = reduceFacsimileTableHistory({
       past: undoStackRef.current,
@@ -1207,6 +1254,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const applyStructureAction = (action: FacsimileTableStructureAction) => {
+    if (disabled) return
     const current = tableStateRef.current
     const result = applyFacsimileTableStructureCommand(
       current.rows,
@@ -1250,6 +1298,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const applySelectionCommand = (command: 'clear' | 'merge' | 'split') => {
+    if (disabled) return
     const current = tableStateRef.current
     const result = applyFacsimileTableSelectionCommand(current.rows, current.merges, selection, command)
     applySnapshot({ ...current, ...result })
@@ -1264,6 +1313,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const performAction = (action: TableAction) => {
+    if (disabled) return
     closeContextMenu()
     if (
       action === 'insert-row-above'
@@ -1280,6 +1330,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleCellPointerDown = (event: ReactPointerEvent<HTMLTableCellElement>) => {
+    if (disabled) return
     if (event.button !== 0) return
     const row = Number(event.currentTarget.dataset.tableRow)
     const col = Number(event.currentTarget.dataset.tableCol)
@@ -1295,12 +1346,14 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleCellPointerEnter = (point: FacsimileTablePoint) => {
+    if (disabled) return
     if (!draggingSelectionRef.current) return
     setFocus(clampPoint(point, rowCount, colCount))
     setSelectionMode('cell')
   }
 
   const selectWholeRow = (event: ReactPointerEvent<HTMLButtonElement>, row: number) => {
+    if (disabled) return
     if (event.button !== 0) return
     event.preventDefault()
     const anchorRow = event.shiftKey && selectionMode === 'row' ? axisAnchorRef.current : row
@@ -1313,6 +1366,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const selectWholeColumn = (event: ReactPointerEvent<HTMLButtonElement>, col: number) => {
+    if (disabled) return
     if (event.button !== 0) return
     event.preventDefault()
     const anchorCol = event.shiftKey && selectionMode === 'column' ? axisAnchorRef.current : col
@@ -1329,6 +1383,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
     axis: 'row' | 'column',
     index: number,
   ) => {
+    if (disabled) return
     if (event.button !== 0) return
     event.preventDefault()
     event.stopPropagation()
@@ -1341,7 +1396,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
     const startSize = axis === 'row' ? before.rowHeights[index] : before.columnWidths[index]
     handle.setPointerCapture(pointerId)
     const handleMove = (rawEvent: unknown) => {
-      if (!mountedRef.current || !(rawEvent instanceof PointerEvent)) return
+      if (!mountedRef.current || disabledRef.current || !(rawEvent instanceof PointerEvent)) return
       const moveEvent = rawEvent
       const distance = (axis === 'row' ? moveEvent.clientY : moveEvent.clientX) - startCoordinate
       const current = tableStateRef.current
@@ -1381,6 +1436,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const resetSize = (axis: 'row' | 'column', index: number) => {
+    if (disabled) return
     const current = tableStateRef.current
     if (axis === 'row') {
       const rowHeights = [...current.rowHeights]
@@ -1394,14 +1450,20 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleColumnResizePointerDown = (event: ReactPointerEvent<HTMLSpanElement>, col: number) => {
+    if (disabled) return
     startResize(event, 'column', col)
   }
 
   const handleRowResizePointerDown = (event: ReactPointerEvent<HTMLSpanElement>, row: number) => {
+    if (disabled) return
     startResize(event, 'row', row)
   }
 
   const handlePaste = (event: ReactClipboardEvent<HTMLTableElement>) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     if (event.target instanceof HTMLTextAreaElement) return
     const html = event.clipboardData.getData('text/html')
     const text = event.clipboardData.getData('text/plain')
@@ -1425,6 +1487,10 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleCopy = (event: ReactClipboardEvent<HTMLTableElement>) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     if (event.target instanceof HTMLTextAreaElement) return
     event.preventDefault()
     const clipboard = serializeFacsimileTableSelectionForClipboard(
@@ -1437,7 +1503,26 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
     event.clipboardData.setData('text/html', clipboard.html)
   }
 
+  const handleCut = (event: ReactClipboardEvent<HTMLTableElement>) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
+    if (event.target instanceof HTMLTextAreaElement) return
+    event.preventDefault()
+    const clipboard = serializeFacsimileTableSelectionForClipboard(
+      tableState.rows,
+      tableState.merges,
+      selection,
+      true,
+    )
+    event.clipboardData.setData('text/plain', clipboard.text)
+    event.clipboardData.setData('text/html', clipboard.html)
+    performAction('clear')
+  }
+
   const openContextMenu = (clientX: number, clientY: number) => {
+    if (disabled) return
     closeContextMenu()
     gridRef.current?.focus({ preventScroll: true })
     const menuWidth = 216
@@ -1461,12 +1546,17 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const setContextSelection = (next: FacsimileTableSelection, mode: SelectionMode) => {
+    if (disabled) return
     setAnchor({ row: next.startRow, col: next.startCol })
     setFocus({ row: next.endRow, col: next.endCol })
     setSelectionMode(mode)
   }
 
   const handleContextMenu = (event: ReactMouseEvent<HTMLTableElement>) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     event.preventDefault()
     openContextMenu(event.clientX, event.clientY)
   }
@@ -1475,6 +1565,10 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
     event: ReactMouseEvent<HTMLTableCellElement>,
     point: FacsimileTablePoint,
   ) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     event.preventDefault()
     event.stopPropagation()
     const resolution = resolveFacsimileTableCellContextSelection(
@@ -1490,6 +1584,10 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleRowHeaderContextMenu = (event: ReactMouseEvent<HTMLButtonElement>, row: number) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     event.preventDefault()
     event.stopPropagation()
     axisAnchorRef.current = row
@@ -1498,6 +1596,10 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleColumnHeaderContextMenu = (event: ReactMouseEvent<HTMLButtonElement>, col: number) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     event.preventDefault()
     event.stopPropagation()
     axisAnchorRef.current = col
@@ -1506,6 +1608,10 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleGridKeyDown = (event: ReactKeyboardEvent<HTMLTableElement>) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     if (event.target instanceof HTMLTextAreaElement) return
     if ((event.ctrlKey || event.metaKey) && !event.altKey) {
       const key = event.key.toLowerCase()
@@ -1550,6 +1656,10 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (disabled) {
+      event.preventDefault()
+      return
+    }
     event.stopPropagation()
     const intent = getFacsimileTableEditorKeyIntent({
       key: event.key,
@@ -1571,13 +1681,13 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
   }
 
   return (
-    <div className="facsimile-table-editor" style={tableThemeStyle}>
+    <div className={`facsimile-table-editor${disabled ? ' is-disabled' : ''}`} aria-disabled={disabled} style={tableThemeStyle}>
       <div className="facsimile-table-toolbar" role="toolbar" aria-label="表格编辑历史">
         <Tooltip title="撤销上一步表格编辑（Ctrl+Z）">
           <Button
             size="small"
             aria-label="撤销表格编辑"
-            disabled={undoStackRef.current.length === 0}
+            disabled={disabled || undoStackRef.current.length === 0}
             onClick={undo}
           >
             撤销
@@ -1587,7 +1697,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
           <Button
             size="small"
             aria-label="重做表格编辑"
-            disabled={redoStackRef.current.length === 0}
+            disabled={disabled || redoStackRef.current.length === 0}
             onClick={redo}
           >
             重做
@@ -1605,12 +1715,14 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
           aria-label="版式表格编辑器"
           aria-rowcount={rowCount}
           aria-colcount={colCount}
-          tabIndex={0}
+          tabIndex={disabled ? -1 : 0}
+          aria-disabled={disabled}
           className="facsimile-table-grid"
           style={tableThemeStyle}
           onKeyDown={handleGridKeyDown}
           onPaste={handlePaste}
           onCopy={handleCopy}
+          onCut={handleCut}
           onContextMenu={handleContextMenu}
         >
           <colgroup>
@@ -1625,6 +1737,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
                   <button
                     type="button"
                     tabIndex={-1}
+                    disabled={disabled}
                     className="facsimile-table-column-header"
                     aria-label={`选择第 ${columnLabel(col)} 列`}
                     onPointerDown={(event) => selectWholeColumn(event, col)}
@@ -1637,6 +1750,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
                     role="separator"
                     aria-label={`调整第 ${columnLabel(col)} 列宽度`}
                     aria-orientation="vertical"
+                    aria-disabled={disabled}
                     onPointerDown={(event) => handleColumnResizePointerDown(event, col)}
                     onDoubleClick={(event) => {
                       event.stopPropagation()
@@ -1654,6 +1768,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
                   <button
                     type="button"
                     tabIndex={-1}
+                    disabled={disabled}
                     className="facsimile-table-row-header"
                     aria-label={`选择第 ${rowIndex + 1} 行`}
                     onPointerDown={(event) => selectWholeRow(event, rowIndex)}
@@ -1666,6 +1781,7 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
                     role="separator"
                     aria-label={`调整第 ${rowIndex + 1} 行高度`}
                     aria-orientation="horizontal"
+                    aria-disabled={disabled}
                     onPointerDown={(event) => handleRowResizePointerDown(event, rowIndex)}
                     onDoubleClick={(event) => {
                       event.stopPropagation()
@@ -1709,14 +1825,23 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
                           ref={editorRef}
                           className="facsimile-table-active-editor"
                           aria-label={`编辑第 ${rowIndex + 1} 行第 ${columnLabel(colIndex)} 列`}
+                          disabled={disabled}
+                          tabIndex={disabled ? -1 : 0}
                           value={editValue}
                           onPointerDown={(event) => event.stopPropagation()}
                           onChange={(event) => {
+                            if (disabled) return
                             editValueRef.current = event.target.value
                             setEditValue(event.target.value)
                           }}
-                          onCompositionStart={() => { compositionRef.current = true }}
-                          onCompositionEnd={() => { compositionRef.current = false }}
+                          onCompositionStart={() => {
+                            if (disabled) return
+                            compositionRef.current = true
+                          }}
+                          onCompositionEnd={() => {
+                            if (disabled) return
+                            compositionRef.current = false
+                          }}
                           onKeyDown={handleEditorKeyDown}
                           onBlur={() => finishEditing()}
                         />
@@ -1749,16 +1874,16 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, onChange
             if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) closeContextMenu()
           }}
         >
-          <button type="button" role="menuitem" disabled={!commandAvailability.insertRow} onClick={() => performAction('insert-row-above')}>上方插入行</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.insertRow} onClick={() => performAction('insert-row-below')}>下方插入行</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.insertColumn} onClick={() => performAction('insert-column-left')}>左侧插入列</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.insertColumn} onClick={() => performAction('insert-column-right')}>右侧插入列</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.insertRow} onClick={() => performAction('insert-row-above')}>上方插入行</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.insertRow} onClick={() => performAction('insert-row-below')}>下方插入行</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.insertColumn} onClick={() => performAction('insert-column-left')}>左侧插入列</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.insertColumn} onClick={() => performAction('insert-column-right')}>右侧插入列</button>
           <div className="facsimile-table-context-divider" role="separator" />
-          <button type="button" role="menuitem" disabled={!commandAvailability.deleteRow} onClick={() => performAction('delete-row')}>删除行</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.deleteColumn} onClick={() => performAction('delete-column')}>删除列</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.merge} onClick={() => performAction('merge')}>合并选区</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.split} onClick={() => performAction('split')}>拆分单元格</button>
-          <button type="button" role="menuitem" disabled={!commandAvailability.clear} onClick={() => performAction('clear')}>清空选区</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.deleteRow} onClick={() => performAction('delete-row')}>删除行</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.deleteColumn} onClick={() => performAction('delete-column')}>删除列</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.merge} onClick={() => performAction('merge')}>合并选区</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.split} onClick={() => performAction('split')}>拆分单元格</button>
+          <button type="button" role="menuitem" disabled={disabled || !commandAvailability.clear} onClick={() => performAction('clear')}>清空选区</button>
         </div>
       ) : null}
     </div>

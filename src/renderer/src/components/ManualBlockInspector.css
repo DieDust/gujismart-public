@@ -95,12 +95,6 @@
   overflow: auto;
 }
 
-.manual-block-inspector-disabled-cover {
-  position: absolute;
-  inset: 0;
-  cursor: wait;
-}
-
 .manual-block-inspector-image {
   display: flex;
   flex-direction: column;

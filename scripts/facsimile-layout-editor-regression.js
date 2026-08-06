@@ -132,6 +132,7 @@ const {
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
   getManualLayoutBlockConversionWarning,
+  getManualLayoutBlockVisualState,
   moveManualLayoutBlockRect,
   normalizeManualLayoutBlockRect,
   reduceManualLayoutTool,
@@ -1197,6 +1198,7 @@ const {
   attachFacsimileTableContextMenuEscapeListener,
   attachFacsimileTableResizeListeners,
   buildFacsimileTableCellMergeLookup,
+  canHandleFacsimileTableInteraction,
   clampFacsimileTableContextMenuPosition,
   createFacsimileTableCellContextSelection,
   createFacsimileTableHeaderContextSelection,
@@ -1218,6 +1220,7 @@ for (const [name, value] of Object.entries({
   attachFacsimileTableContextMenuEscapeListener,
   attachFacsimileTableResizeListeners,
   buildFacsimileTableCellMergeLookup,
+  canHandleFacsimileTableInteraction,
   clampFacsimileTableContextMenuPosition,
   createFacsimileTableCellContextSelection,
   createFacsimileTableHeaderContextSelection,
@@ -1232,6 +1235,11 @@ for (const [name, value] of Object.entries({
   serializeFacsimileTableSelectionAsTsv,
 })) {
   assert.strictEqual(typeof value, 'function', `${name} must be an executable pure editor helper`)
+}
+
+for (const interaction of ['pointer', 'keyboard', 'paste', 'copy', 'cut', 'mutation', 'context-menu', 'toolbar', 'resize', 'textarea']) {
+  assert.strictEqual(canHandleFacsimileTableInteraction(false, interaction), true, `${interaction} must remain enabled by default`)
+  assert.strictEqual(canHandleFacsimileTableInteraction(true, interaction), false, `${interaction} must be rejected by the executable disabled dispatcher`)
 }
 
 const closureSelection = expandFacsimileTableSelectionForMerges(
@@ -1849,6 +1857,25 @@ assert.deepStrictEqual(
   [['A']],
   'switching back to table must restore the preserved structure',
 )
+const manuallyEditedText = { ...confirmedTableConversion.block, words: '人工改写后的正文' }
+const restoredTableAfterTextEdit = applyManualLayoutBlockConversion(manuallyEditedText, 'table', true).block
+assert.deepStrictEqual(restoredTableAfterTextEdit.rows, [['A']], 'switching back to table must restore the original structured table')
+assert.deepStrictEqual(restoredTableAfterTextEdit.manual_preserved_text, {
+  text: '人工改写后的正文',
+  source: 'manual-type-conversion',
+  version: 1,
+}, 'switching back to table must archive the latest manually edited text independently')
+const restoredEditedText = applyManualLayoutBlockConversion(restoredTableAfterTextEdit, 'text', true).block
+assert.strictEqual(restoredEditedText.words, '人工改写后的正文', 'returning to text must restore the latest manual text instead of the table projection')
+const editedAgain = { ...restoredEditedText, words: '第二次人工改写' }
+const secondTableRoundtrip = applyManualLayoutBlockConversion(editedAgain, 'table', true).block
+assert.strictEqual(secondTableRoundtrip.manual_preserved_text.text, '第二次人工改写')
+assert.strictEqual(secondTableRoundtrip.manual_preserved_text.version, 2, 'each new text archive must advance its explicit version')
+assert.strictEqual(applyManualLayoutBlockConversion(secondTableRoundtrip, 'text', true).block.words, '第二次人工改写')
+const emptyTextRoundtrip = applyManualLayoutBlockConversion({ ...restoredEditedText, words: '' }, 'table', true).block
+assert.strictEqual(emptyTextRoundtrip.manual_preserved_text.text, '', 'an intentional empty manual text must remain distinguishable from no archive')
+assert.strictEqual(applyManualLayoutBlockConversion(emptyTextRoundtrip, 'text', true).block.words, '', 'an intentional empty text must survive a complete table roundtrip')
+assert.match(getManualLayoutBlockConversionWarning(manuallyEditedText, 'table'), /独立保留|归档/, 'the confirmation must accurately explain where current manual text is retained')
 const imageConversionSource = { manual_block_id: 'image-1', label: 'image', image_asset_path: 'managed/image.png', caption: '图一' }
 assert.ok(getManualLayoutBlockConversionWarning(imageConversionSource, 'note'), 'image-to-text conversion must require a warning')
 assert.strictEqual(applyManualLayoutBlockConversion(imageConversionSource, 'note', true).block.image_asset_path, 'managed/image.png', 'confirmed image conversion must preserve managed asset metadata')
@@ -1873,6 +1900,58 @@ assert.ok(proofreader.includes('onPointerCancel'), 'pointer cancellation must ro
 for (const handle of ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']) {
   assert.ok(proofreader.includes(`handle: '${handle}'`), `the selected block must expose the ${handle} resize handle`)
 }
+
+assert.deepStrictEqual(
+  getManualLayoutBlockVisualState('block-a', 'block-b', 4, 4),
+  { editingActive: false, parentHighlighted: true },
+  'a parent search/highlight hit must not become the editing-active block',
+)
+assert.deepStrictEqual(
+  getManualLayoutBlockVisualState('block-a', 'block-a', 4, 9),
+  { editingActive: true, parentHighlighted: false },
+  'stable block identity alone must control editing handles and inspector selection',
+)
+assert.ok(proofreader.includes('layoutEditMode && isEditingActive ? BLOCK_RESIZE_HANDLES.map'), 'resize handles must render only for stable editing selection')
+assert.ok(proofreader.includes("cursor: layoutEditMode ? (isEditingActive ? 'move' : 'pointer')"), 'move cursor must belong only to the stable editing-active block')
+assert.ok(!proofreader.includes('layoutEditMode && isActive ? BLOCK_RESIZE_HANDLES.map'), 'parent highlight must never create a second resize-handle set')
+
+assert.ok(tableEditor.includes('disabled?: boolean'), 'the Excel-style editor must expose an optional disabled contract')
+assert.ok(tableEditor.includes('disabled = false'), 'the disabled contract must preserve compatibility by default')
+assert.ok(tableEditor.includes('aria-disabled={disabled}'))
+assert.ok(tableEditor.includes('tabIndex={disabled ? -1 : 0}'), 'a disabled table grid must leave the keyboard focus order')
+assert.ok(tableEditor.includes('onCut={handleCut}'), 'cut must have an explicit guarded path')
+for (const handler of [
+  'handleCellPointerDown',
+  'handleCellPointerEnter',
+  'handleColumnResizePointerDown',
+  'handleRowResizePointerDown',
+  'handlePaste',
+  'handleCut',
+  'handleContextMenu',
+  'handleCellContextMenu',
+  'handleRowHeaderContextMenu',
+  'handleColumnHeaderContextMenu',
+  'handleGridKeyDown',
+  'handleEditorKeyDown',
+]) {
+  const start = tableEditor.indexOf(`const ${handler}`)
+  assert.ok(start >= 0, `${handler} must exist`)
+  assert.ok(tableEditor.slice(start, start + 700).includes('disabled'), `${handler} must explicitly reject disabled interactions`)
+}
+assert.ok(tableEditor.includes('if (disabled) return') && tableEditor.includes('if (disabled) {'), 'central state mutations and event handlers must reject disabled mode')
+assert.ok(tableEditor.includes('disabled={disabled}'), 'internal native/Ant controls must receive their real disabled state')
+assert.ok(manualInspectorSource.includes('disabled={disabled}'), 'discardPending must reach the actual table editor instead of a visual overlay')
+assert.ok(!manualInspectorSource.includes('manual-block-inspector-disabled-cover'), 'the inspector must not fake table disabling with an overlay')
+const tableEditorCallers = fs.readdirSync(path.join(root, 'src/renderer/src'), { recursive: true })
+  .filter((entry) => typeof entry === 'string' && entry.endsWith('.tsx'))
+  .map((entry) => path.join(root, 'src/renderer/src', entry))
+  .filter((sourcePath) => sourcePath !== tableEditorPath && fs.readFileSync(sourcePath, 'utf8').includes('<FacsimileTableEditor'))
+  .sort()
+assert.deepStrictEqual(
+  tableEditorCallers.map((sourcePath) => path.relative(root, sourcePath).replace(/\\/g, '/')),
+  ['src/renderer/src/components/ManualBlockInspector.tsx'],
+  'every FacsimileTableEditor call site must be explicit and the sole current caller must forward disabled state',
+)
 
 runAsyncDraftChecks()
   .then(() => console.log('Facsimile layout editor regression passed.'))

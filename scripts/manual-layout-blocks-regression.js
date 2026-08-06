@@ -68,6 +68,27 @@ try {
     '表格投影必须保留空单元格所在的行列边界',
   )
   assert.strictEqual(
+    projectLayoutBlocksToPageText([{
+      manual_block_id: 'roundtrip-table',
+      label: 'table',
+      rows: [['表', '格']],
+      words: '表格',
+      manual_preserved_text: { text: '人工正文', source: 'manual-type-conversion', version: 2 },
+    }]),
+    '表\t格',
+    '表格活动态不得把归档人工文本重复投影到阅读、检索或导出文本',
+  )
+  assert.strictEqual(
+    projectLayoutBlocksToPageText([{
+      manual_block_id: 'roundtrip-text',
+      label: 'text',
+      words: '人工正文',
+      manual_preserved_table: { rows: [['表', '格']] },
+    }]),
+    '人工正文',
+    '正文活动态不得把归档表格 metadata 当成活动内容',
+  )
+  assert.strictEqual(
     projectLayoutBlocksToPageText([
       { words: '无序一' },
       { words: '第二', reading_order: 2 },

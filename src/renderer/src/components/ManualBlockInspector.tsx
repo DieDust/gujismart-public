@@ -171,9 +171,9 @@ export default function ManualBlockInspector({
                 editorKey={blockId}
                 rows={tableRows}
                 merges={tableMerges}
+                disabled={disabled}
                 onChange={(value) => onTableChange({ rows: value.rows, merges: value.merges })}
               />
-              {disabled ? <div className="manual-block-inspector-disabled-cover" /> : null}
             </div>
           ) : null}
 

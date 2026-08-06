@@ -41,6 +41,7 @@ import {
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
   getManualLayoutBlockConversionWarning,
+  getManualLayoutBlockVisualState,
   moveManualLayoutBlockRect,
   normalizeManualLayoutBlockRect,
   reduceManualLayoutTool,
@@ -3493,15 +3494,23 @@ export default function GujiFacsimileProofreader({
             } = layout
             const shouldUseOverlayTranslation = translationOpen && translatedSourceIndexes.has(sourceIndex) && !isImage
             const hasOverflow = fittedLayout.overflow
-            const isActive = editingBlockId === blockId || sourceIndex === activeBoxIndex
+            const { editingActive: isEditingActive, parentHighlighted } = getManualLayoutBlockVisualState(
+              blockId,
+              editingBlockId,
+              sourceIndex,
+              activeBoxIndex,
+            )
+            const isActive = isEditingActive || parentHighlighted
             const keywordMatch = !!normalizedSearchKeyword && normalizedSearchableText.includes(normalizedSearchKeyword)
-            const isEditing = editingBlockId === blockId
+            const isEditing = isEditingActive
             const ruleBorder = shouldRenderTable ? { border: showRules ? '1px solid rgba(64,48,32,0.34)' : undefined } : getBlockBorderStyle(orientation, showRules)
             const shouldShowOverflowHint = hasOverflow && isActive && !isEditing && !isImage
             const shouldHideBlockContent = shouldUseOverlayTranslation && !isImage
             const overflowInset = shouldShowOverflowHint ? 'inset 0 -16px 14px -14px rgba(180, 92, 20, 0.82)' : undefined
-            const blockBoxShadow = isActive
+            const blockBoxShadow = isEditingActive
               ? ['inset 0 0 0 2px #1677ff', overflowInset].filter(Boolean).join(', ')
+              : parentHighlighted
+                ? ['inset 0 0 0 2px #52c41a', overflowInset].filter(Boolean).join(', ')
               : keywordMatch
                 ? ['inset 0 0 0 2px #d48806', overflowInset].filter(Boolean).join(', ')
                 : overflowInset
@@ -3644,23 +3653,23 @@ export default function GujiFacsimileProofreader({
                 onDoubleClick={(event) => { event.stopPropagation(); beginEditBlock(sourceIndex) }}
                 onContextMenu={() => selectLayoutBlock(sourceIndex, blockId)}
                 onPointerDown={(event) => startBlockInteraction(event, sourceIndex, rect)}
-                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, border: layoutEditMode ? (isActive ? '2px solid #1677ff' : '1px dashed rgba(22,119,255,0.72)') : ruleBorder.border, boxShadow: blockBoxShadow || undefined, background: isActive ? 'rgba(22,119,255,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : layoutEditMode ? 'rgba(255,255,255,0.18)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: layoutEditMode ? 'move' : 'text', overflow: 'hidden', padding, zIndex: isActive ? 10 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: layoutEditMode ? 'none' : 'text' }}
+                style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, border: layoutEditMode ? (isEditingActive ? '2px solid #1677ff' : parentHighlighted ? '1px solid #52c41a' : '1px dashed rgba(22,119,255,0.72)') : ruleBorder.border, boxShadow: blockBoxShadow || undefined, background: isEditingActive ? 'rgba(22,119,255,0.08)' : parentHighlighted ? 'rgba(82,196,26,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : layoutEditMode ? 'rgba(255,255,255,0.18)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: layoutEditMode ? (isEditingActive ? 'move' : 'pointer') : 'text', overflow: 'hidden', padding, zIndex: isEditingActive ? 10 : parentHighlighted ? 9 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: layoutEditMode ? 'none' : 'text' }}
               >
                 {shouldHideBlockContent ? null : isImage ? (
                   <FacsimileImageBlock assetPath={getBlockImagePath(block)} pageImageSrc={pageImageSrc} rect={rect} bounds={cropBounds} />
                 ) : shouldRenderTable ? (
                   <div style={{ width: '100%', height: '100%', overflow: 'hidden', fontSize, lineHeight: 1.18, fontFamily: FONT_FAMILY }}>
-                    {renderFacsimileTable(tableRows, tableMerges, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
+                    {renderFacsimileTable(tableRows, tableMerges, searchKeyword, keywordMatch, parentHighlighted ? activeSearchHitOrdinal : -1)}
                   </div>
                 ) : (
                   <div style={{ width: '100%', height: '100%', writingMode: orientation === 'vertical' ? 'vertical-rl' : 'horizontal-tb', textOrientation: orientation === 'vertical' ? 'mixed' : undefined, whiteSpace: textWhiteSpace, wordBreak: textWordBreak, overflowWrap: textOverflowWrap, lineHeight: blockLineHeight, fontSize, fontWeight: getBlockFontWeight(label, layoutProfile), letterSpacing: 0, textAlign: isTitleLabel(label) ? 'center' : 'start', textIndent: orientation === 'horizontal' && isBodyTextLabel(label) ? '2em' : undefined }}>
-                    {renderFormattedText(fittedDisplayText, searchKeyword, keywordMatch, isActive ? activeSearchHitOrdinal : -1)}
+                    {renderFormattedText(fittedDisplayText, searchKeyword, keywordMatch, parentHighlighted ? activeSearchHitOrdinal : -1)}
                   </div>
                 )}
                 {shouldShowOverflowHint ? (
                   <div style={{ position: 'absolute', left: 0, right: 0, bottom: 0, height: 14, pointerEvents: 'none', background: 'linear-gradient(to bottom, rgba(255,253,247,0), rgba(255,253,247,0.92))' }} />
                 ) : null}
-                {layoutEditMode && isActive ? BLOCK_RESIZE_HANDLES.map((item) => (
+                {layoutEditMode && isEditingActive ? BLOCK_RESIZE_HANDLES.map((item) => (
                   <span
                     key={item.handle}
                     role="presentation"

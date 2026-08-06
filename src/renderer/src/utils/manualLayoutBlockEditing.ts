@@ -88,6 +88,18 @@ export function reduceManualLayoutTool(
   return current
 }
 
+export function getManualLayoutBlockVisualState(
+  blockId: string,
+  activeBlockId: string | null,
+  sourceIndex: number,
+  highlightedSourceIndex: number,
+): { editingActive: boolean; parentHighlighted: boolean } {
+  return {
+    editingActive: Boolean(activeBlockId) && blockId === activeBlockId,
+    parentHighlighted: sourceIndex === highlightedSourceIndex,
+  }
+}
+
 export function normalizeManualLayoutBlockRect(rect: ManualLayoutRect): ManualLayoutRect {
   const rawLeft = finite(rect.left)
   const rawTop = finite(rect.top)
@@ -235,9 +247,9 @@ export function getManualLayoutBlockConversionWarning(
   const currentCategory = kindCategory(currentKind)
   const nextCategory = kindCategory(nextKind)
   if (currentCategory === nextCategory) return null
-  if (currentCategory === 'table') return '切换类型后会隐藏表格网格，但表格结构会保留，可随时切回表格。'
+  if (currentCategory === 'table') return '切换类型后会隐藏表格网格；表格结构会独立归档。若此前编辑过正文，将优先恢复最近一次人工正文。'
   if (currentCategory === 'image') return '切换类型后会隐藏图片预览，但图片资源与裁剪信息会保留，可随时切回图片或印章。'
-  if (nextCategory === 'table') return '切换为表格会启用网格编辑；原文字会保留。'
+  if (nextCategory === 'table') return '切换为表格会启用网格编辑；当前人工文字会独立归档，切回正文时恢复，不会混入表格内容。'
   return '切换为图片或印章后，原文字会作为说明保留，不会被删除。'
 }
 
@@ -260,8 +272,25 @@ export function applyManualLayoutBlockConversion<T extends ManualLayoutEditableB
   if (currentCategory === 'table' && nextCategory !== 'table') {
     nextBlock.manual_preserved_table = snapshotTableStructure(block)
     for (const key of TABLE_STRUCTURE_KEYS) nextBlock[key] = undefined
+    if (nextCategory === 'text'
+      && isRecord(block.manual_preserved_text)
+      && typeof block.manual_preserved_text.text === 'string') {
+      nextBlock.words = block.manual_preserved_text.text
+    }
   } else if (nextCategory === 'table' && currentCategory !== 'table' && isRecord(block.manual_preserved_table)) {
     Object.assign(nextBlock, block.manual_preserved_table)
+  }
+  if (currentCategory === 'text' && nextCategory === 'table') {
+    const previousVersion = isRecord(block.manual_preserved_text)
+      && typeof block.manual_preserved_text.version === 'number'
+      && Number.isFinite(block.manual_preserved_text.version)
+      ? Math.max(0, Math.floor(block.manual_preserved_text.version))
+      : 0
+    nextBlock.manual_preserved_text = {
+      text: typeof block.words === 'string' ? block.words : '',
+      source: 'manual-type-conversion',
+      version: previousVersion + 1,
+    }
   }
   return { blocked: false, warning, block: nextBlock as T }
 }
