@@ -10,6 +10,12 @@ import { PDFDocument, rgb, StandardFonts, type PDFImage, type PDFPage, type PDFF
 import * as fontkit from '@pdf-lib/fontkit'
 import { isTocLabel, looksLikeTocText, parseTocEntries, type TocFormattedEntry } from '../shared/toc-format'
 import { deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
+import {
+  getLayoutBlockSearchText,
+  getManualLayoutSearchSegments,
+  getManualLayoutStructuredBlocks,
+  projectLayoutBlocksToPageText,
+} from '../shared/manual-layout'
 import { hydratePagePayloadRows } from './page-payload-store'
 import { attachCanonicalPageContent } from './canonical-content'
 import { writeAtomicExport } from './atomic-export-writer'
@@ -70,6 +76,13 @@ interface LayoutBlock {
   image_asset_path?: string
   asset_path?: string
   image_path?: string
+  manual_block_id?: string
+  caption?: string
+  alt_text?: string
+  image_crop?: JsonRecord
+  merges?: unknown[]
+  rowHeights?: number[]
+  columnWidths?: number[]
   tableRows?: string[][]
   location?: {
     left: number
@@ -349,6 +362,12 @@ function metadataText(metadata: JsonRecord, key: string, fallback = ''): string 
 }
 
 function getPageText(page: ExportPage): string {
+  const parsed = parseMaybeJson<OcrResultPayload>(page.ocr_result, {})
+  const layoutResult = asLayoutBlocks(parsed.layout_result)
+  if (getManualLayoutSearchSegments(layoutResult).length > 0) {
+    const projected = projectLayoutBlocksToPageText(layoutResult).trim()
+    if (projected) return projected
+  }
   const canonicalText = String(page.canonical_content?.text || '').trim()
   if (canonicalText) return canonicalText
   const proofedText = String(page.proofed_text || '').trim()
@@ -620,6 +639,7 @@ function getRawBlockWords(block: OcrLayoutBlockPayload): string {
 }
 
 function getBlockWords(block: OcrLayoutBlockPayload): string {
+  if (block.manual_block_id) return getLayoutBlockSearchText(block)
   const text = normalizeOcrInlineText(getRawBlockWords(block))
   if (text) return text
   const rows = getBlockTableRows(block)
@@ -669,6 +689,17 @@ function getBlockRect(block: OcrLayoutBlockPayload): LayoutBlock['location'] | u
     }
   }
   return undefined
+}
+
+function getBlockImageCrop(block: LayoutBlock): LayoutBlock['location'] | undefined {
+  const crop = block.image_crop
+  if (!isJsonRecord(crop)) return undefined
+  const left = Number(crop.left)
+  const top = Number(crop.top)
+  const width = Number(crop.width)
+  const height = Number(crop.height)
+  if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return undefined
+  return { left, top, width, height }
 }
 
 function isImageLabel(label: string): boolean {
@@ -852,6 +883,7 @@ function getSortedLayoutBlocks(page: ExportPage): LayoutBlock[] {
       const location = getBlockRect(block)
 
       return {
+        ...block,
         words: getBlockWords(block),
         displayWords: getRawBlockWords(block),
         label,
@@ -865,6 +897,13 @@ function getSortedLayoutBlocks(page: ExportPage): LayoutBlock[] {
         image_asset_path: valueText(block.image_asset_path),
         asset_path: valueText(block.asset_path),
         image_path: valueText(block.image_path),
+        manual_block_id: valueText(block.manual_block_id),
+        caption: valueText(block.caption),
+        alt_text: valueText(block.alt_text),
+        image_crop: isJsonRecord(block.image_crop) ? block.image_crop : undefined,
+        merges: Array.isArray(block.merges) ? block.merges : undefined,
+        rowHeights: Array.isArray(block.rowHeights) ? block.rowHeights.map(Number).filter(Number.isFinite) : undefined,
+        columnWidths: Array.isArray(block.columnWidths) ? block.columnWidths.map(Number).filter(Number.isFinite) : undefined,
         tableRows: getBlockTableRows(block),
         location,
       } as LayoutBlock
@@ -1489,10 +1528,15 @@ function getLayoutPdfHtml(title: string, pages: ExportPage[], options: ExportOpt
 
       if (isImage) {
         const assetDataUrl = imagePathToDataUrl(getBlockImagePath(block))
+        const crop = getBlockImageCrop(block) || block.location
+        const cropLeft = crop ? ((crop.left - bounds.offsetLeft) / Math.max(1, bounds.width)) * 100 : left
+        const cropTop = crop ? ((crop.top - bounds.offsetTop) / Math.max(1, bounds.height)) * 100 : top
+        const cropWidth = crop ? (crop.width / Math.max(1, bounds.width)) * 100 : width
+        const cropHeight = crop ? (crop.height / Math.max(1, bounds.height)) * 100 : height
         const imageHtml = assetDataUrl
           ? `<img class="facsimile-image-asset" src="${assetDataUrl}" alt="" />`
-          : pageImageDataUrl
-            ? `<img class="facsimile-image-crop" src="${pageImageDataUrl}" alt="" style="left:${(-left / Math.max(width, 0.0001) * 100).toFixed(5)}%;top:${(-top / Math.max(height, 0.0001) * 100).toFixed(5)}%;width:${(10000 / Math.max(width, 0.0001)).toFixed(5)}%;height:${(10000 / Math.max(height, 0.0001)).toFixed(5)}%;" />`
+            : pageImageDataUrl
+            ? `<img class="facsimile-image-crop" src="${pageImageDataUrl}" alt="" style="left:${(-cropLeft / Math.max(cropWidth, 0.0001) * 100).toFixed(5)}%;top:${(-cropTop / Math.max(cropHeight, 0.0001) * 100).toFixed(5)}%;width:${(10000 / Math.max(cropWidth, 0.0001)).toFixed(5)}%;height:${(10000 / Math.max(cropHeight, 0.0001)).toFixed(5)}%;" />`
             : ''
         return `<div class="facsimile-block facsimile-image-block" style="${blockStyle}">${imageHtml}</div>`
       }
@@ -2459,7 +2503,9 @@ function buildPaddleJsonExport(
       const layoutResult = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
       const wordsResult = Array.isArray(parsed?.words_result) ? parsed.words_result : []
       const recTexts = layoutResult.length > 0
-        ? layoutResult.map((block) => String(block.words || ''))
+        ? layoutResult.map((block) => block.manual_block_id
+          ? getLayoutBlockSearchText(block)
+          : String(block.words || ''))
         : wordsResult.map((item) => String(item.words || ''))
       const recBoxes = layoutResult
         .filter((block) => block?.location)
@@ -2481,6 +2527,7 @@ function buildPaddleJsonExport(
         rec_texts: recTexts,
         rec_boxes: recBoxes,
         ocr_result: parsed,
+        manual_layout_blocks: getManualLayoutStructuredBlocks(layoutResult),
       }
     }),
   }, null, 2)

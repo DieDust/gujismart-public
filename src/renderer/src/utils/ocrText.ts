@@ -1,4 +1,12 @@
 import { isTocLabel, looksLikeTocText, parseTocEntries, type TocFormattedEntry } from '@shared/toc-format'
+import {
+  getLayoutBlockSearchText,
+  getLosslessLayoutTableRows,
+  getManualBlockId,
+  getManualLayoutSignatureSnapshot,
+  isManualLayoutBlock,
+  type ManualLayoutBlockMeta,
+} from '@shared/manual-layout'
 import type { DocumentPage, OcrRecognizeLayoutBlock, OcrRecognizeResult } from '@shared/types'
 
 type JsonRecord = Record<string, unknown>
@@ -350,8 +358,10 @@ export type ReadablePageElement = {
   rows?: string[][]
   tocEntries?: TocFormattedEntry[]
   label?: string
+  blockId?: string
   rect?: Rect
   imagePath?: string
+  imageCrop?: ManualLayoutBlockMeta['image_crop']
   charStart: number
   charEnd: number
 }
@@ -409,10 +419,12 @@ function getBlockTableMarkup(block: unknown): string {
 }
 
 function getBlockText(block: unknown): string {
+  if (isManualLayoutBlock(block)) return getLayoutBlockSearchText(block)
   return getOcrBlockText(block)
 }
 
 function getBlockDisplayText(block: unknown): string {
+  if (isManualLayoutBlock(block)) return getLayoutBlockSearchText(block)
   return getPreferredOcrBlockText(block) || getRawOcrBlockText(block) || getOcrBlockText(block)
 }
 
@@ -1582,6 +1594,7 @@ function pushReadableTextElement(
   cursor: { value: number },
   displayText?: string,
   rect?: { left: number; top: number; width: number; height: number } | null,
+  blockId?: string,
 ) {
   const normalized = text.trim()
   if (!normalized) return
@@ -1592,6 +1605,7 @@ function pushReadableTextElement(
     text: normalized,
     displayText: normalizedDisplayText && normalizeOcrInlineText(normalizedDisplayText) === normalized ? normalizedDisplayText : undefined,
     label,
+    blockId,
     rect: rect || undefined,
     charStart,
     charEnd: charStart + normalized.length,
@@ -1605,6 +1619,7 @@ function pushTocElement(
   label: string,
   cursor: { value: number },
   rect?: { left: number; top: number; width: number; height: number } | null,
+  blockId?: string,
 ): boolean {
   if (!looksLikeTocText(text, label)) return false
   const entries = parseTocEntries(text)
@@ -1620,6 +1635,7 @@ function pushTocElement(
     text: normalizedText,
     tocEntries: entries,
     label: label || 'toc',
+    blockId,
     rect: rect || undefined,
     charStart,
     charEnd: charStart + normalizedText.length,
@@ -1636,6 +1652,7 @@ function pushParagraphWithResolvedType(
   cursor: { value: number },
   displayParagraph?: string,
   rect?: { left: number; top: number; width: number; height: number } | null,
+  blockId?: string,
 ) {
   const normalized = paragraph.trim()
   if (!normalized) return
@@ -1644,17 +1661,17 @@ function pushParagraphWithResolvedType(
 
   const inlineSplit = splitInlineHeadingParagraph(normalized)
   if (inlineSplit && !usableDisplay) {
-    pushReadableTextElement(elements, inlineSplit.heading, 'heading', label, cursor, undefined, rect)
-    pushReadableTextElement(elements, inlineSplit.body, 'paragraph', label, cursor, undefined, rect)
+    pushReadableTextElement(elements, inlineSplit.heading, 'heading', label, cursor, undefined, rect, blockId)
+    pushReadableTextElement(elements, inlineSplit.body, 'paragraph', label, cursor, undefined, rect, blockId)
     return
   }
 
   if (type === 'heading') {
-    pushReadableTextElement(elements, normalized, isLongHeadingCandidate(normalized) ? 'paragraph' : 'heading', label, cursor, usableDisplay, rect)
+    pushReadableTextElement(elements, normalized, isLongHeadingCandidate(normalized) ? 'paragraph' : 'heading', label, cursor, usableDisplay, rect, blockId)
     return
   }
 
-  pushReadableTextElement(elements, normalized, isStructuralLine(normalized) ? 'heading' : 'paragraph', label, cursor, usableDisplay, rect)
+  pushReadableTextElement(elements, normalized, isStructuralLine(normalized) ? 'heading' : 'paragraph', label, cursor, usableDisplay, rect, blockId)
 }
 
 function pushTextElements(
@@ -1665,13 +1682,14 @@ function pushTextElements(
   cursor: { value: number },
   displayText?: string,
   rect?: { left: number; top: number; width: number; height: number } | null,
+  blockId?: string,
 ) {
   const paragraphs = normalizeOcrTextForReading(text).split(/\n{2,}/).map((item) => item.trim()).filter(Boolean)
   const displayParagraphs = displayText
     ? normalizeOcrTextForReading(displayText).split(/\n{2,}/).map((item) => item.trim()).filter(Boolean)
     : []
   for (let index = 0; index < paragraphs.length; index += 1) {
-    pushParagraphWithResolvedType(elements, paragraphs[index], type, label, cursor, displayParagraphs[index], rect)
+    pushParagraphWithResolvedType(elements, paragraphs[index], type, label, cursor, displayParagraphs[index], rect, blockId)
   }
 }
 
@@ -1683,6 +1701,7 @@ function pushVerticalTextElements(
   cursor: { value: number },
   displayText?: string,
   rect?: { left: number; top: number; width: number; height: number } | null,
+  blockId?: string,
 ) {
   const lines = String(text || '')
     .replace(/\r/g, '\n')
@@ -1694,20 +1713,20 @@ function pushVerticalTextElements(
 
   const firstLine = lines[0]
   if (lines.length > 1 && (type === 'heading' || isStructuralLine(firstLine) || isClassicalReaderHeadingLine(firstLine))) {
-    pushReadableTextElement(elements, firstLine, 'heading', label, cursor, undefined, rect)
+    pushReadableTextElement(elements, firstLine, 'heading', label, cursor, undefined, rect, blockId)
     const body = normalizeOcrTextForReading(lines.slice(1).join('\n'))
-    if (body) pushPlainTextElements(elements, body, 'paragraph', label, cursor, rect)
+    if (body) pushPlainTextElements(elements, body, 'paragraph', label, cursor, rect, blockId)
     return
   }
 
   if (lines.length === 1) {
     const displayLine = displayText ? normalizeOcrTextForReading(displayText).split(/\n{2,}/).map((item) => item.trim()).filter(Boolean)[0] : undefined
-    pushParagraphWithResolvedType(elements, lines[0], type, label, cursor, displayLine, rect)
+    pushParagraphWithResolvedType(elements, lines[0], type, label, cursor, displayLine, rect, blockId)
     return
   }
 
   const body = normalizeOcrTextForReading(lines.join('\n'))
-  if (body) pushPlainTextElements(elements, body, type, label, cursor, rect)
+  if (body) pushPlainTextElements(elements, body, type, label, cursor, rect, blockId)
 }
 
 function pushPlainTextElements(
@@ -1717,6 +1736,7 @@ function pushPlainTextElements(
   label: string,
   cursor: { value: number },
   rect?: { left: number; top: number; width: number; height: number } | null,
+  blockId?: string,
 ) {
   const paragraphs = String(text || '')
     .replace(/\r/g, '\n')
@@ -1726,7 +1746,7 @@ function pushPlainTextElements(
   for (const paragraph of paragraphs) {
     const normalized = paragraph.replace(/\n+/g, ' ').replace(/[ \t]+/g, ' ').trim()
     if (!normalized) continue
-    pushParagraphWithResolvedType(elements, normalized, type, label, cursor, undefined, rect)
+    pushParagraphWithResolvedType(elements, normalized, type, label, cursor, undefined, rect, blockId)
   }
 }
 
@@ -1911,6 +1931,8 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
     const textFlowLayoutBlocks = getTextFlowOcrBlocks({ ...page, ocr_result: { layout_result: layoutBlocks } })
     for (const block of inferReadableMultiColumnBlocks(textFlowLayoutBlocks)) {
       const label = getBlockLabel(block)
+      const blockId = getManualBlockId(block)
+      const manualSnapshot = getManualLayoutSignatureSnapshot(block)
       const rawText = getBlockText(block)
       const displayText = getBlockDisplayText(block)
       const imageRect = getBlockRect(block)
@@ -1919,10 +1941,12 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
         const imagePath = String(block?.image_asset_path || block?.asset_path || block?.image_path || '').trim()
         elements.push({
           type: 'image',
-          text: rawText || label || 'image',
+          text: manualSnapshot?.caption || manualSnapshot?.altText || rawText || label || 'image',
           label: label || 'image',
+          blockId,
           rect: imageRect,
           imagePath: imagePath || undefined,
+          imageCrop: manualSnapshot?.imageCrop,
           charStart,
           charEnd: charStart,
         })
@@ -1930,8 +1954,8 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
         continue
       }
       if (isDecorativeLayoutBlock(block, rawText)) continue
-      if (rawText && pushTocElement(elements, rawText, label, cursor, imageRect)) continue
-      const rows = getBlockTableRows(block)
+      if (rawText && pushTocElement(elements, rawText, label, cursor, imageRect, blockId)) continue
+      const rows = getLosslessLayoutTableRows(block) || getBlockTableRows(block)
       if (rows.length > 0) {
         const text = tableRowsToText(rows)
         const charStart = cursor.value
@@ -1940,6 +1964,7 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
           text,
           rows,
           label: label || 'layout_table',
+          blockId,
           rect: imageRect || undefined,
           charStart,
           charEnd: charStart + text.length,
@@ -1960,6 +1985,7 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
                 text,
                 rows: tableRows,
                 label: label || 'layout_table',
+                blockId,
                 rect: imageRect || undefined,
                 charStart,
                 charEnd: charStart + text.length,
@@ -1969,16 +1995,16 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
             }
           }
           const partType = getLayoutBlockType(block, part.value)
-          pushTextElements(elements, part.value, partType === 'table' ? 'paragraph' : partType, label, cursor)
+          pushTextElements(elements, part.value, partType === 'table' ? 'paragraph' : partType, label, cursor, undefined, imageRect, blockId)
         }
         continue
       }
       if (!rawText) continue
       const blockType = getLayoutBlockType(block, rawText)
       if (isVerticalTextLabel(label)) {
-        pushVerticalTextElements(elements, rawText, blockType === 'table' ? 'paragraph' : blockType, label, cursor, displayText, imageRect)
+        pushVerticalTextElements(elements, rawText, blockType === 'table' ? 'paragraph' : blockType, label, cursor, displayText, imageRect, blockId)
       } else {
-        pushTextElements(elements, rawText, blockType === 'table' ? 'paragraph' : blockType, label, cursor, displayText, imageRect)
+        pushTextElements(elements, rawText, blockType === 'table' ? 'paragraph' : blockType, label, cursor, displayText, imageRect, blockId)
       }
     }
     if (elements.length > 0) return elements
@@ -1987,9 +2013,10 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
   if (shouldPreferOcrBlocksForReading(page, blocks)) {
     for (const block of blocks) {
       const label = getBlockLabel(block)
+      const blockId = getManualBlockId(block)
       const blockRect = getBlockRect(block)
       if (isTableBlock(block)) {
-        const rows = getBlockTableRows(block)
+        const rows = getLosslessLayoutTableRows(block) || getBlockTableRows(block)
         const text = rows.length > 0 ? tableRowsToText(rows) : normalizeOcrTextForReading(getBlockText(block))
         if (!text) continue
         const charStart = cursor.value
@@ -1998,6 +2025,7 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
           text,
           rows: rows.length > 0 ? rows : undefined,
           label,
+          blockId,
           rect: blockRect || undefined,
           charStart,
           charEnd: charStart + text.length,
@@ -2008,11 +2036,11 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
       const text = getBlockText(block)
       const displayText = getBlockDisplayText(block)
       if (!text) continue
-      if (pushTocElement(elements, text, label, cursor, blockRect)) continue
+      if (pushTocElement(elements, text, label, cursor, blockRect, blockId)) continue
       if (isVerticalTextLabel(label)) {
-        pushVerticalTextElements(elements, text, isHeadingBlock(block, text) ? 'heading' : 'paragraph', label, cursor, displayText, blockRect)
+        pushVerticalTextElements(elements, text, isHeadingBlock(block, text) ? 'heading' : 'paragraph', label, cursor, displayText, blockRect, blockId)
       } else {
-        pushTextElements(elements, text, isHeadingBlock(block, text) ? 'heading' : 'paragraph', label, cursor, displayText, blockRect)
+        pushTextElements(elements, text, isHeadingBlock(block, text) ? 'heading' : 'paragraph', label, cursor, displayText, blockRect, blockId)
       }
     }
     if (elements.length > 0) return elements

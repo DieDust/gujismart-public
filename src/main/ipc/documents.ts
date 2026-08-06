@@ -90,6 +90,7 @@ import {
 import { shouldTranslatePageText } from '../../shared/translation-text'
 import { getCanonicalPageTranslationSourceText } from '../../shared/translation-source'
 import { deriveOcrTextFromIr, ensureOcrResultIr, getOcrPageIr } from '../../shared/ocr-ir'
+import { getLayoutBlockSearchText, isManualLayoutBlock, projectLayoutBlocksToPageText } from '../../shared/manual-layout'
 import { allowFileAccessPath, allowManagedFileAccessPath, assertAllowedLocalFilePath } from '../file-access'
 import { documentPipelineDiagnosticsFromImportProgress } from '../../shared/document-pipeline-diagnostics'
 import { statusEnvelopeFromImportProgress } from '../../shared/status-envelope'
@@ -2122,9 +2123,11 @@ function normalizePaddleVlParsingBlocks(blocks: unknown[]): ImportedOcrBlock[] {
   return blocks.map((block, index): ImportedOcrBlock => {
     const record = isJsonRecord(block) ? block : {}
     const words = String(record.words || record.block_content || record.text || getStructuredOcrBlockText(record) || '').trim()
+    const manual = isManualLayoutBlock(record)
+    const projected = manual ? getLayoutBlockSearchText(record) : words
     return {
       ...record,
-      words,
+      words: projected,
       label: record.label || record.block_label || record.type || 'text',
       location: record.location || record.block_bbox || record.bbox || record.points,
       reading_order: Number.isFinite(Number(record.reading_order))
@@ -2134,7 +2137,7 @@ function normalizePaddleVlParsingBlocks(blocks: unknown[]): ImportedOcrBlock[] {
           : index,
       block_order: Number.isFinite(Number(record.block_order)) ? Number(record.block_order) : undefined,
     }
-  }).filter((block) => Boolean(block.words))
+  }).filter((block) => Boolean(block.words) || isManualLayoutBlock(block))
 }
 
 function normalizeImportedOcrPayload(payload: unknown): NormalizedImportedOcrPayload {
@@ -2144,6 +2147,25 @@ function normalizeImportedOcrPayload(payload: unknown): NormalizedImportedOcrPay
 
   const prunedResult = isJsonRecord(payload.prunedResult) ? payload.prunedResult : {}
   const markdown = isJsonRecord(payload.markdown) ? payload.markdown : {}
+  const exportedManualBlocks = Array.isArray(payload.manual_layout_blocks)
+    ? payload.manual_layout_blocks
+    : []
+  if (exportedManualBlocks.length > 0 && !Array.isArray(payload.layout_result)) {
+    const layoutResult = normalizePaddleVlParsingBlocks(exportedManualBlocks)
+    const text = String(
+      payload.ocr_text
+      || payload.proofed_text
+      || projectLayoutBlocksToPageText(layoutResult),
+    ).trim()
+    return {
+      ocrResult: {
+        ...payload,
+        layout_result: layoutResult,
+        words_result: ensureWordsResult(layoutResult, text),
+      },
+      text,
+    }
+  }
   const vlParsingBlocks = Array.isArray(payload.parsing_res_list)
     ? payload.parsing_res_list
     : Array.isArray(prunedResult.parsing_res_list)
@@ -6341,7 +6363,10 @@ export function registerDocumentIpc(): void {
       })
       normalizedData.ocr_result = normalizedResult
       if (!('ocr_text' in normalizedData) && normalizedResult.gujismart_ir) {
-        normalizedData.ocr_text = deriveOcrTextFromIr(normalizedResult.gujismart_ir)
+        const manualLayout = Array.isArray(normalizedResult.layout_result) ? normalizedResult.layout_result : []
+        normalizedData.ocr_text = manualLayout.some((block) => isManualLayoutBlock(block))
+          ? projectLayoutBlocksToPageText(manualLayout)
+          : deriveOcrTextFromIr(normalizedResult.gujismart_ir)
       }
     }
 

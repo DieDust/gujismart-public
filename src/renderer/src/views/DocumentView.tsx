@@ -50,6 +50,7 @@ import {
 import { getCanonicalPageTranslationSourceText } from '@shared/translation-source'
 import { shouldTranslatePageText } from '@shared/translation-text'
 import { getOrBuildOcrPageIr, getOcrPageIr, getOcrRegionRerecognitionCandidates } from '@shared/ocr-ir'
+import { getManualBlockId, parseManualLayoutLocationKey } from '@shared/manual-layout'
 import { DEFAULT_HIGHLIGHT_COLOR } from '../utils/highlightColors'
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { toLocalResourceUrl } from '../utils/localResource'
@@ -882,6 +883,16 @@ function findBoxForLocator(page: DocumentViewPage | undefined, locator: SearchHi
   const parsed = parseMaybeJson(page?.ocr_result)
   const orderedBoxes = getOrderedOcrBlocks({ ...(page || {}), ocr_result: parsed }) as FacsimileLayoutBlock[]
   const textFlowBoxes = getTextFlowOcrBlocks({ ...(page || {}), ocr_result: parsed }) as FacsimileLayoutBlock[]
+  const manualLocation = parseManualLayoutLocationKey(locator.locationKey)
+  const targetManualBlockId = locator.blockId || manualLocation?.blockId
+  if (targetManualBlockId) {
+    const manualIndex = orderedBoxes.findIndex((block) => getManualBlockId(block) === targetManualBlockId)
+    if (manualIndex >= 0) {
+      const block = orderedBoxes[manualIndex]
+      const point = getBoxSortPoint(block)
+      return { boxIndex: manualIndex, boxTop: point.top, boxLeft: point.left, boxOccurrenceIndex: 0 }
+    }
+  }
   if (!Array.isArray(textFlowBoxes) || textFlowBoxes.length === 0) {
     return { boxIndex: -1, boxTop: Number.MAX_SAFE_INTEGER, boxLeft: Number.MAX_SAFE_INTEGER, boxOccurrenceIndex: -1 }
   }

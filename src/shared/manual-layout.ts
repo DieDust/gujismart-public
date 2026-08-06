@@ -50,6 +50,79 @@ export interface ManualLayoutSignatureSnapshot {
   imageCrop?: ManualLayoutBlockMeta['image_crop']
 }
 
+export interface LayoutBlockSearchSegment {
+  blockId?: string
+  kind?: ManualLayoutBlockKind
+  text: string
+  location?: ManualLayoutBlockMeta['location']
+  readingOrder: number | null
+  source: 'manual' | 'ocr'
+}
+
+export const MANUAL_LAYOUT_LOCATION_KEY_PREFIX = 'manual-block:'
+
+export function createManualLayoutLocationKey(
+  blockId: string,
+  location?: ManualLayoutBlockMeta['location'],
+): string {
+  const id = String(blockId || '').trim()
+  if (!id) return ''
+  if (!location) return `${MANUAL_LAYOUT_LOCATION_KEY_PREFIX}${encodeURIComponent(id)}`
+  const coordinates = [location.left, location.top, location.width, location.height]
+  if (!coordinates.every(Number.isFinite)) return `${MANUAL_LAYOUT_LOCATION_KEY_PREFIX}${encodeURIComponent(id)}`
+  return `${MANUAL_LAYOUT_LOCATION_KEY_PREFIX}${encodeURIComponent(id)}:${coordinates.join(',')}`
+}
+
+export function parseManualLayoutLocationKey(value: unknown): {
+  blockId: string
+  location?: ManualLayoutBlockMeta['location']
+} | null {
+  const source = String(value || '').trim()
+  if (!source.startsWith(MANUAL_LAYOUT_LOCATION_KEY_PREFIX)) return null
+  const body = source.slice(MANUAL_LAYOUT_LOCATION_KEY_PREFIX.length)
+  const separator = body.indexOf(':')
+  const encodedId = separator >= 0 ? body.slice(0, separator) : body
+  let blockId = ''
+  try {
+    blockId = decodeURIComponent(encodedId).trim()
+  } catch {
+    return null
+  }
+  if (!blockId) return null
+  if (separator < 0) return { blockId }
+  const coordinates = body.slice(separator + 1).split(',').map(Number)
+  if (coordinates.length !== 4 || !coordinates.every(Number.isFinite)) return { blockId }
+  const [left, top, width, height] = coordinates
+  if (width <= 0 || height <= 0) return { blockId }
+  return { blockId, location: { left, top, width, height } }
+}
+
+export interface ManualLayoutStructuredBlock extends LayoutBlockRecord {
+  manual_block_id: string
+  segmentation_source: 'manual'
+  label: ManualLayoutBlockKind
+  location?: ManualLayoutBlockMeta['location']
+  reading_order?: number
+  orientation?: 'horizontal' | 'vertical'
+  words?: string
+  rows?: string[][]
+  cells?: unknown[]
+  merges?: unknown[]
+  rowHeights?: number[]
+  columnWidths?: number[]
+  caption?: string
+  alt_text?: string
+  image_asset_path?: string
+  image_asset_width?: number
+  image_asset_height?: number
+  image_asset_reference?: {
+    path: string
+    width?: number
+    height?: number
+  }
+  image_crop?: ManualLayoutBlockMeta['image_crop']
+}
+
 export type ManualLayoutBlockIdentity = LayoutBlockRecord & {
   manual_block_id: string
 }
@@ -192,6 +265,29 @@ function signatureImageCrop(value: unknown): ManualLayoutBlockMeta['image_crop']
   return { source_page_id: value.source_page_id, ...location }
 }
 
+function finiteNumberArray(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const values = value.map(Number)
+  return values.every((item) => Number.isFinite(item) && item > 0) ? values : undefined
+}
+
+function cloneUnknownArray(value: unknown): unknown[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.map((item) => isRecord(item) ? { ...item } : item)
+}
+
+function sortedLayoutBlocks(blocks: readonly unknown[]): Array<{ block: LayoutBlockRecord; index: number; order: number | null }> {
+  return blocks
+    .map((block, index) => ({ block: isRecord(block) ? block : {}, index, order: isRecord(block) ? readingOrder(block) : null }))
+    .sort((left, right) => {
+      if (left.order !== null || right.order !== null) {
+        const orderDelta = (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER)
+        if (orderDelta !== 0) return orderDelta
+      }
+      return left.index - right.index
+    })
+}
+
 export function getManualBlockId(value: unknown): string | undefined {
   if (!isRecord(value)) return undefined
   if (typeof value.manual_block_id !== 'string') return undefined
@@ -237,20 +333,104 @@ export function getLayoutBlockSearchText(value: unknown): string {
   return firstText(value, LEGACY_TEXT_FIELDS)
 }
 
+export function getLayoutBlockSearchSegments(
+  blocks: readonly unknown[] | null | undefined,
+): LayoutBlockSearchSegment[] {
+  if (!Array.isArray(blocks)) return []
+  return sortedLayoutBlocks(blocks)
+    .map(({ block, order }): LayoutBlockSearchSegment | null => {
+      const text = getLayoutBlockSearchText(block)
+      if (!/\S/.test(text)) return null
+      const blockId = getManualBlockId(block)
+      return {
+        ...(blockId ? { blockId } : {}),
+        kind: getManualLayoutBlockKind(block),
+        text,
+        location: signatureLocation(block.location),
+        readingOrder: order,
+        source: blockId ? 'manual' : 'ocr',
+      }
+    })
+    .filter((segment): segment is LayoutBlockSearchSegment => segment !== null)
+}
+
+export function getManualLayoutSearchSegments(
+  blocks: readonly unknown[] | null | undefined,
+): Array<LayoutBlockSearchSegment & { blockId: string; source: 'manual' }> {
+  return getLayoutBlockSearchSegments(blocks).filter(
+    (segment): segment is LayoutBlockSearchSegment & { blockId: string; source: 'manual' } => (
+      segment.source === 'manual' && typeof segment.blockId === 'string'
+    ),
+  )
+}
+
+export function getManualLayoutStructuredBlocks(
+  blocks: readonly unknown[] | null | undefined,
+): ManualLayoutStructuredBlock[] {
+  if (!Array.isArray(blocks)) return []
+  return sortedLayoutBlocks(blocks).flatMap(({ block, order }) => {
+    const manualBlockId = getManualBlockId(block)
+    const kind = getManualLayoutBlockKind(block)
+    if (!manualBlockId || !kind) return []
+    const location = signatureLocation(block.location)
+    const rows = getLosslessLayoutTableRows(block)
+    const imageAssetPath = firstText(block, ['image_asset_path']) || undefined
+    const imageAssetWidth = Number(block.image_asset_width)
+    const imageAssetHeight = Number(block.image_asset_height)
+    const structured: ManualLayoutStructuredBlock = {
+      manual_block_id: manualBlockId,
+      segmentation_source: 'manual',
+      label: kind,
+      ...(location ? { location } : {}),
+      ...(order !== null ? { reading_order: order } : {}),
+      ...(block.orientation === 'horizontal' || block.orientation === 'vertical'
+        ? { orientation: block.orientation }
+        : {}),
+    }
+    const text = normalizeText(block.words)
+    if (text && kind !== 'image' && kind !== 'seal') structured.words = text
+    if (rows !== undefined) {
+      structured.rows = rows
+      const cells = cloneUnknownArray(block.cells ?? block.table_cells ?? block.tableCells)
+      structured.cells = cells || rows.flatMap((row, rowIndex) => row.map((cell, columnIndex) => ({
+        row: rowIndex,
+        column: columnIndex,
+        rowSpan: 1,
+        columnSpan: 1,
+        text: cell,
+      })))
+    }
+    const merges = cloneUnknownArray(block.merges)
+    if (merges) structured.merges = merges
+    const rowHeights = finiteNumberArray(block.rowHeights ?? block.row_heights)
+    if (rowHeights) structured.rowHeights = rowHeights
+    const columnWidths = finiteNumberArray(block.columnWidths ?? block.column_widths)
+    if (columnWidths) structured.columnWidths = columnWidths
+    const caption = firstText(block, ['caption']) || undefined
+    if (caption) structured.caption = caption
+    const altText = firstText(block, ['alt_text', 'altText']) || undefined
+    if (altText) structured.alt_text = altText
+    if (imageAssetPath) {
+      structured.image_asset_path = imageAssetPath
+      if (Number.isFinite(imageAssetWidth) && imageAssetWidth > 0) structured.image_asset_width = imageAssetWidth
+      if (Number.isFinite(imageAssetHeight) && imageAssetHeight > 0) structured.image_asset_height = imageAssetHeight
+      structured.image_asset_reference = {
+        path: imageAssetPath,
+        ...(Number.isFinite(imageAssetWidth) && imageAssetWidth > 0 ? { width: imageAssetWidth } : {}),
+        ...(Number.isFinite(imageAssetHeight) && imageAssetHeight > 0 ? { height: imageAssetHeight } : {}),
+      }
+    }
+    const imageCrop = signatureImageCrop(block.image_crop)
+    if (imageCrop) structured.image_crop = imageCrop
+    return [structured]
+  })
+}
+
 export function projectLayoutBlocksToPageText(
   blocks: readonly unknown[] | null | undefined,
 ): string {
   if (!Array.isArray(blocks)) return ''
-  return blocks
-    .map((block, index) => ({ block, index, order: isRecord(block) ? readingOrder(block) : null }))
-    .sort((left, right) => {
-      if (left.order !== null || right.order !== null) {
-        const orderDelta = (left.order ?? Number.MAX_SAFE_INTEGER) - (right.order ?? Number.MAX_SAFE_INTEGER)
-        if (orderDelta !== 0) return orderDelta
-      }
-      return left.index - right.index
-    })
-    .map(({ block }) => getLayoutBlockSearchText(block))
-    .filter((text) => /\S/.test(text))
+  return getLayoutBlockSearchSegments(blocks)
+    .map((segment) => segment.text)
     .join('\n')
 }

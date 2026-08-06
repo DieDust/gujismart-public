@@ -4,6 +4,12 @@ import { parentPort } from 'worker_threads'
 import { getErrorMessage } from '../shared/errors'
 import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
 import {
+  createManualLayoutLocationKey,
+  getLayoutBlockSearchSegments,
+  getManualLayoutSearchSegments,
+  projectLayoutBlocksToPageText,
+} from '../shared/manual-layout'
+import {
   BACKGROUND_REINDEX_DELETE_BATCH_SIZE,
   BACKGROUND_REINDEX_PAGE_BATCH_SIZE,
   BACKGROUND_REINDEX_NGRAM_WRITE_BATCH_SIZE,
@@ -501,6 +507,12 @@ function getHydratedPageTextField(page: SearchPageRow, field: 'proofed_text' | '
 }
 
 function getIndexablePageText(sqlite: NativeDatabase, page: SearchPageRow): string {
+  const pageWithManualLayout = pageHasLazyOcrResult(page) ? loadPageOcrResultForSearch(sqlite, page) : page
+  const manualPayload = parseMaybeJson<OcrResultPayload>(pageWithManualLayout.ocr_result)
+  const manualLayoutBlocks = Array.isArray(manualPayload?.layout_result) ? manualPayload.layout_result : []
+  if (getManualLayoutSearchSegments(manualLayoutBlocks).length > 0) {
+    return projectLayoutBlocksToPageText(manualLayoutBlocks)
+  }
   const proofed = String(getHydratedPageTextField(page, 'proofed_text') || '').trim()
   if (proofed) return proofed
 
@@ -716,6 +728,38 @@ function parseSegmentMeta(sqlite: NativeDatabase, page: SearchPageRow): { source
 }
 
 function buildSearchIndexSegmentDrafts(sqlite: NativeDatabase, docId: string, page: SearchPageRow, index: number): SearchIndexSegmentDraft[] {
+  const pageWithOcrResult = pageHasLazyOcrResult(page) ? loadPageOcrResultForSearch(sqlite, page) : page
+  const parsed = parseMaybeJson<OcrResultPayload>(pageWithOcrResult.ocr_result)
+  const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
+  const manualSegments = getManualLayoutSearchSegments(layoutBlocks)
+  if (manualSegments.length > 0) {
+    const meta = parseSegmentMeta(sqlite, pageWithOcrResult)
+    const pageId = String(page.id || '')
+    const pageNum = Number(page.page_num || index + 1)
+    return getLayoutBlockSearchSegments(layoutBlocks).flatMap((segment, segmentIndex) => (
+      splitSearchIndexText(segment.text).map((part) => {
+        const normalized = normalizeSearchTextWithOffsetMap(part.text)
+        const segmentKey = segment.blockId ? encodeURIComponent(segment.blockId) : `ocr-${segmentIndex}`
+        const locationKey = segment.blockId
+          ? createManualLayoutLocationKey(segment.blockId, segment.location)
+          : null
+        return {
+          segmentId: `${docId}:${page.id || index}:manual-layout:${segmentKey}:${part.partIndex}`,
+          pageId,
+          pageNum,
+          sourceKind: segment.source === 'manual' ? 'manual-layout' : meta.sourceKind,
+          href: locationKey,
+          title: meta.title || `第 ${page.page_num || index + 1} 页`,
+          ordinal: index * 1000 + segmentIndex + part.partIndex / 1000,
+          sourceStart: part.originalStart,
+          text: part.text,
+          normalizedText: normalized.text,
+          offsetMap: normalized.offsets,
+          textHash: hashText(`${docId}:${page.id}:${segment.blockId || segmentIndex}:${part.originalStart}:${normalized.text}:${locationKey || ''}`),
+        }
+      })
+    ))
+  }
   const text = getIndexablePageText(sqlite, page).trim()
   if (!text) return []
   const meta = parseSegmentMeta(sqlite, page)

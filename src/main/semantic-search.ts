@@ -3,6 +3,13 @@ import { nanoid } from 'nanoid'
 import { buildAiContextForDocuments, runAiTask } from './ai'
 import { createHash } from 'crypto'
 import { deriveOcrReadingBlocksFromIr, deriveOcrTextFromIr, getOrBuildOcrPageIr } from '../shared/ocr-ir'
+import {
+  createManualLayoutLocationKey,
+  getLayoutBlockSearchSegments,
+  getManualLayoutSearchSegments,
+  parseManualLayoutLocationKey,
+  projectLayoutBlocksToPageText,
+} from '../shared/manual-layout'
 import { buildSearchIndexHealthDiagnostics } from '../shared/search-index-health'
 import { stableLocatorFromLegacySearchLocator } from '../shared/stable-reader-locator'
 import { resolveCanonicalPageContent } from './canonical-content'
@@ -938,6 +945,12 @@ function getHydratedPageTextField(page: SearchPageRow, field: 'proofed_text' | '
 }
 
 function getIndexablePageText(page: SearchPageRow): string {
+  const pageWithManualLayout = pageHasLazyOcrResult(page) ? loadPageOcrResultForSearch(page) : page
+  const manualPayload = parseMaybeJson<OcrResultPayload>(pageWithManualLayout.ocr_result)
+  const manualLayoutBlocks = Array.isArray(manualPayload?.layout_result) ? manualPayload.layout_result : []
+  if (getManualLayoutSearchSegments(manualLayoutBlocks).length > 0) {
+    return projectLayoutBlocksToPageText(manualLayoutBlocks)
+  }
   const proofed = String(getHydratedPageTextField(page, 'proofed_text') || '').trim()
   if (proofed) return proofed
 
@@ -1452,6 +1465,38 @@ function splitSearchIndexText(text: string): SearchIndexTextPart[] {
 }
 
 function buildSearchIndexSegmentDrafts(docId: string, page: SearchPageRow, index: number): SearchIndexSegmentDraft[] {
+  const pageWithOcrResult = pageHasLazyOcrResult(page) ? loadPageOcrResultForSearch(page) : page
+  const parsed = parseMaybeJson<OcrResultPayload>(pageWithOcrResult.ocr_result)
+  const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
+  const manualSegments = getManualLayoutSearchSegments(layoutBlocks)
+  if (manualSegments.length > 0) {
+    const meta = parseSegmentMeta(pageWithOcrResult)
+    const pageId = String(page.id || '')
+    const pageNum = Number(page.page_num || index + 1)
+    return getLayoutBlockSearchSegments(layoutBlocks).flatMap((segment, segmentIndex) => (
+      splitSearchIndexText(segment.text).map((part) => {
+        const normalized = normalizeSearchTextWithOffsetMap(part.text)
+        const segmentKey = segment.blockId ? encodeURIComponent(segment.blockId) : `ocr-${segmentIndex}`
+        const locationKey = segment.blockId
+          ? createManualLayoutLocationKey(segment.blockId, segment.location)
+          : null
+        return {
+          segmentId: `${docId}:${page.id || index}:manual-layout:${segmentKey}:${part.partIndex}`,
+          pageId,
+          pageNum,
+          sourceKind: segment.source === 'manual' ? 'manual-layout' : meta.sourceKind,
+          href: locationKey,
+          title: meta.title || `第 ${page.page_num || index + 1} 页`,
+          ordinal: index * 1000 + segmentIndex + part.partIndex / 1000,
+          sourceStart: part.originalStart,
+          text: part.text,
+          normalizedText: normalized.text,
+          offsetMap: normalized.offsets,
+          textHash: hashText(`${docId}:${page.id}:${segment.blockId || segmentIndex}:${part.originalStart}:${normalized.text}:${locationKey || ''}`),
+        }
+      })
+    ))
+  }
   const text = getIndexablePageText(page).trim()
   if (!text) return []
   const meta = parseSegmentMeta(page)
@@ -3084,17 +3129,23 @@ function createSearchHit(
     }
     : normalizedRangeToOriginal(row, hit)
   const sourceStart = getSegmentSourceStart(row)
+  const manualLocation = row.source_kind === 'manual-layout'
+    ? parseManualLayoutLocationKey(row.href)
+    : null
   const locator: SearchHitLocator = {
     docId: row.doc_id,
     segmentId: row.segment_id,
     sourceType: row.source_kind || 'page',
-    blockId: row.source_kind === 'translation' ? row.segment_id.split(':')[2] || null : null,
+    blockId: row.source_kind === 'translation'
+      ? row.segment_id.split(':')[2] || null
+      : manualLocation?.blockId || null,
     translationUnitId: row.source_kind === 'translation' ? row.segment_id.split(':')[1] || null : null,
     translationSource: row.source_kind === 'translation',
     pageId: row.page_id || null,
     pageNum,
     pageIndex,
-    href: row.href || null,
+    href: manualLocation ? null : row.href || null,
+    locationKey: manualLocation ? row.href || undefined : undefined,
     segmentOrdinal: Number(row.ordinal || 0),
     charStart: sourceStart + originalRange.start,
     charEnd: sourceStart + originalRange.end,
@@ -3104,7 +3155,11 @@ function createSearchHit(
     queryTerm: queryTerm || hit.term,
     occurrenceIndex,
   }
-  const stableLocator = stableLocatorFromLegacySearchLocator(locator, getCanonicalLocatorContext(locator))
+  const locatorContext = getCanonicalLocatorContext(locator)
+  const stableLocator = stableLocatorFromLegacySearchLocator(
+    locator.blockId ? { ...locator, charStart: 0, charEnd: 0 } : locator,
+    locatorContext,
+  )
   return {
     id: `${row.segment_id}:${occurrenceIndex}:${hit.index}`,
     locator,
