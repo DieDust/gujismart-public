@@ -15,6 +15,21 @@ const transpiled = ts.transpileModule(helperSource, {
 const helperModule = { exports: {} }
 new Function('exports', 'module', 'require', transpiled)(helperModule.exports, helperModule, require)
 
+const draftHelperPath = path.join(root, 'src/renderer/src/hooks/useManualLayoutDraft.ts')
+const draftHelperSource = fs.existsSync(draftHelperPath) ? fs.readFileSync(draftHelperPath, 'utf8') : ''
+const draftHelperModule = { exports: {} }
+if (draftHelperSource) {
+  const draftTranspiled = ts.transpileModule(draftHelperSource, {
+    compilerOptions: {
+      esModuleInterop: true,
+      jsx: ts.JsxEmit.ReactJSX,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  new Function('exports', 'module', 'require', draftTranspiled)(draftHelperModule.exports, draftHelperModule, require)
+}
+
 const {
   buildFacsimileTableCells,
   clearFacsimileTableSelection,
@@ -45,6 +60,93 @@ const {
   pasteFacsimileTableRange,
   splitFacsimileTableCell,
 } = helperModule.exports
+
+const {
+  createManualLayoutDraft,
+  ensureManualLayoutBlockIdentity,
+  getManualLayoutDraftBlockId,
+  getManualLayoutSaveSchedule,
+  reduceManualLayoutDraft,
+} = draftHelperModule.exports
+
+assert.strictEqual(typeof createManualLayoutDraft, 'function', 'manual layout drafts must expose a testable state factory')
+assert.strictEqual(typeof reduceManualLayoutDraft, 'function', 'manual layout drafts must expose a pure reducer')
+
+{
+  const pageId = 'page-a'
+  const original = ensureManualLayoutBlockIdentity(pageId, { ir_block_id: 'ocr-1', words: '\u7532' }, 0)
+  const reorderedLegacy = ensureManualLayoutBlockIdentity(pageId, { ir_block_id: 'ocr-1', words: '\u7532' }, 9)
+  assert.strictEqual(
+    getManualLayoutDraftBlockId(pageId, original, 0),
+    getManualLayoutDraftBlockId(pageId, reorderedLegacy, 9),
+    'a unique legacy IR identity must survive server-side reordering',
+  )
+  const state = createManualLayoutDraft(pageId, [original])
+  const createdBlock = ensureManualLayoutBlockIdentity(pageId, { words: '', label: 'text' }, 1, true)
+  const createdBlockId = getManualLayoutDraftBlockId(pageId, createdBlock, 1)
+  const created = reduceManualLayoutDraft(state, { type: 'create', block: createdBlock })
+  const echoed = reduceManualLayoutDraft(created, { type: 'server-ack', revision: 0, blocks: [original] })
+  assert.strictEqual(echoed.activeBlockId, createdBlockId, 'an old server echo must not close the newly-created block inspector')
+  assert.strictEqual(echoed.blocks.length, 2, 'an old server echo must not erase a newly-created local block')
+  assert.strictEqual(echoed.revision, 1)
+  assert.strictEqual(echoed.acknowledgedRevision, 0)
+  assert.strictEqual(echoed.saveState, 'dirty')
+
+  const saving = reduceManualLayoutDraft(created, { type: 'save-started', revision: created.revision })
+  const currentAck = reduceManualLayoutDraft(saving, {
+    type: 'server-ack',
+    revision: created.revision,
+    blocks: created.blocks.map((block) => ({ ...block, server_normalized: true })),
+  })
+  assert.strictEqual(currentAck.acknowledgedRevision, created.revision, 'only the matching revision may become acknowledged')
+  assert.strictEqual(currentAck.saveState, 'clean')
+  assert.strictEqual(currentAck.activeBlockId, createdBlockId, 'a current acknowledgement must preserve the active inspector')
+  assert.ok(currentAck.blocks.some((block) => block.manual_block_id === createdBlock.manual_block_id))
+
+  const updated = reduceManualLayoutDraft(currentAck, {
+    type: 'update',
+    blockId: createdBlockId,
+    changes: { words: '\u4e59' },
+  })
+  assert.strictEqual(updated.blocks.find((block) => block.manual_block_id === createdBlock.manual_block_id).words, '\u4e59', 'updates must target the stable block ID')
+  assert.strictEqual(updated.saveState, 'dirty')
+
+  const staleAck = reduceManualLayoutDraft(updated, {
+    type: 'server-ack',
+    revision: currentAck.revision,
+    blocks: currentAck.blocks,
+  })
+  assert.strictEqual(staleAck.blocks.find((block) => block.manual_block_id === createdBlock.manual_block_id).words, '\u4e59', 'stale acknowledgements must not roll back newer edits')
+  assert.strictEqual(staleAck.saveState, 'dirty')
+
+  const failed = reduceManualLayoutDraft(updated, { type: 'save-failed', revision: updated.revision })
+  assert.strictEqual(failed.saveState, 'failed', 'failed saves must retain an explicit retryable state')
+  assert.deepStrictEqual(failed.blocks, updated.blocks, 'failed saves must retain the local draft')
+  const retrying = reduceManualLayoutDraft(failed, { type: 'retry' })
+  assert.strictEqual(retrying.saveState, 'dirty', 'retry must return a failed draft to the save queue')
+  assert.deepStrictEqual(getManualLayoutSaveSchedule(retrying, false), { kind: 'debounce', revision: retrying.revision })
+  assert.deepStrictEqual(getManualLayoutSaveSchedule(retrying, true), { kind: 'flush', revision: retrying.revision }, 'Ctrl+S must bypass debounce')
+  assert.deepStrictEqual(getManualLayoutSaveSchedule(reduceManualLayoutDraft(retrying, { type: 'save-started', revision: retrying.revision }), false), { kind: 'none' }, 'a revision already in flight must not be scheduled twice')
+
+  const rapidFirst = reduceManualLayoutDraft(state, { type: 'update', blockId: getManualLayoutDraftBlockId(pageId, original, 0), changes: { words: '1' } })
+  const rapidSecond = reduceManualLayoutDraft(rapidFirst, { type: 'update', blockId: getManualLayoutDraftBlockId(pageId, original, 0), changes: { words: '2' } })
+  assert.strictEqual(rapidSecond.revision, rapidFirst.revision + 1, 'rapid edits must create a monotonically newer debounce revision')
+  assert.deepStrictEqual(getManualLayoutSaveSchedule(rapidSecond, false), { kind: 'debounce', revision: rapidSecond.revision })
+
+  const deleted = reduceManualLayoutDraft(updated, { type: 'delete', blockId: createdBlockId })
+  assert.strictEqual(deleted.activeBlockId, null, 'deleting the active block must close its inspector')
+  assert.strictEqual(deleted.blocks.length, 1)
+
+  const samePageEcho = reduceManualLayoutDraft(updated, { type: 'server-echo', pageId, blocks: [original] })
+  assert.strictEqual(samePageEcho.activeBlockId, createdBlockId, 'same-page echoes must not clear selection')
+  assert.strictEqual(samePageEcho.blocks.length, 2, 'same-page echoes must merge without dropping dirty local blocks')
+
+  const changedPage = reduceManualLayoutDraft(currentAck, { type: 'page-changed', pageId: 'page-b', blocks: [] })
+  assert.strictEqual(changedPage.pageId, 'page-b')
+  assert.deepStrictEqual(changedPage.blocks, [], 'a confirmed page identity change must load even an empty page')
+  assert.strictEqual(changedPage.activeBlockId, null)
+  assert.strictEqual(changedPage.saveState, 'clean')
+}
 
 assert.deepStrictEqual(
   parseFacsimileTableClipboard('\u7532\t\u4e59\n\u4e19\t\u4e01'),
@@ -487,6 +589,33 @@ assert.ok(proofreader.includes("setImageUnderlayMode('on')"), 'entering manual e
 assert.ok(proofreader.includes("segmentation_source: 'manual'"), 'manual text, table, and geometry edits must be marked as manual data')
 assert.ok(proofreader.includes('<FacsimileTableEditor'), 'recognized tables must use the visual grid editor instead of raw table code')
 assert.ok(proofreader.includes("String(block.segmentation_source || '').toLowerCase() !== 'manual'"), 'manual tables must not be converted back into pseudo text tables on vertical pages')
+assert.ok(proofreader.includes('useManualLayoutDraft({'), 'the proofreader must keep page edits in the revisioned local draft')
+assert.ok(proofreader.includes('await Promise.resolve(onSave('), 'both synchronous saves and rejected async saves must use one awaited contract')
+assert.ok(proofreader.includes('manualLayoutDraft.createBlock(nextBlock)'), 'a new stable block must enter the draft before its debounced save')
+assert.ok(proofreader.includes('manualLayoutDraft.receiveServerEcho(pageId, incomingBlocks)'), 'same-page parent echoes must reconcile through the draft reducer')
+assert.ok(proofreader.includes('manualLayoutDraft.setActiveBlockId(targetBlockId)'), 'the editor selection must use stable block identity rather than an array index')
+assert.ok(proofreader.includes('manualLayoutDraft.updateBlock(editingBlockId,'), 'text and table editor changes must enter the revisioned draft before debounce')
+assert.ok(proofreader.includes('editingBaselineRef.current = { blockId: targetBlockId'), 'opening an existing block must retain a cancel baseline')
+assert.ok(proofreader.includes('onClick={cancelBlockEditor}'), 'cancel must restore the editor baseline instead of accepting live draft edits')
+assert.ok(!proofreader.includes('setEditingIndex('), 'server echoes must not clear an index-based editor selection')
+assert.ok(proofreader.includes("? '保存失败'"), 'the draft save failure must be visible in the toolbar')
+assert.ok(proofreader.includes('onClick={manualLayoutDraft.retry}'), 'failed drafts must expose a retry control')
+assert.ok(proofreader.includes("event.key.toLowerCase() !== 's'"), 'Ctrl+S must flush the current draft without waiting for debounce')
+assert.ok(proofreader.includes("event.key === 'Alt'"), 'Alt must temporarily reveal the clear underlay even while an input is focused')
+assert.ok(proofreader.includes('const renderedImageUnderlayBlur = altShowsClearUnderlay ? 0 : imageUnderlayBlur'), 'Alt preview must not mutate the stored blur slider value')
+assert.ok(!proofreader.includes("filter: layoutEditMode ? 'none'"), 'layout editing must retain the configured underlay blur')
+assert.ok(proofreader.includes('return stored == null ? 65'), 'a user without a stored blur preference must receive the 65 recommendation')
+assert.ok(proofreader.includes("title: '当前页还有未保存的版式修改'"), 'page identity changes must confirm before discarding an unsaved draft')
+assert.ok(proofreader.includes("title: '保存版式修改后退出？'"), 'leaving layout mode must protect dirty and failed drafts')
+assert.ok(proofreader.includes('const { __rect, __synthetic, __sourceIndex, __manualDraftId, ...rest } = block'), 'renderer-only draft IDs must not leak into persisted OCR payloads')
+assert.ok(proofreader.includes('if (!words && !isImage && !isManualBlock) return null'), 'an empty newly-created manual block must survive the parent save echo')
+
+const documentView = fs.readFileSync(path.join(root, 'src/renderer/src/views/DocumentView.tsx'), 'utf8')
+assert.ok(documentView.includes('const handleSavePage = async (pageId: string, data: PageUpdatePayload): Promise<boolean>'), 'the shared page save path must report its real success outcome without rejecting legacy fire-and-forget callers')
+assert.ok(documentView.includes("if (!saved) throw new Error('Facsimile page save failed')"), 'the facsimile-only adapter must convert a swallowed database failure into a rejected draft save')
+assert.ok(documentView.includes('onSave={handleSaveFacsimilePage}'), 'the revisioned facsimile draft must receive the failure-propagating adapter')
+assert.ok(documentView.includes('onSave={handleSavePage}'), 'the legacy text editor must retain the non-rejecting save callback contract')
+assert.ok(documentView.includes('if (!saved) return'), 'proof status actions must not display success after a failed page write')
 
 const tableEditorPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.tsx')
 const tableEditorCssPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.css')

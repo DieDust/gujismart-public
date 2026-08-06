@@ -3967,7 +3967,7 @@ export default function DocumentView({
     await loadDocument()
   }
 
-  const handleSavePage = async (pageId: string, data: PageUpdatePayload) => {
+  const handleSavePage = async (pageId: string, data: PageUpdatePayload): Promise<boolean> => {
     try {
       await window.api.updatePage(pageId, data)
       if (data.ocr_result !== undefined || data.ocr_text !== undefined || data.proofed_text !== undefined) {
@@ -4027,10 +4027,17 @@ export default function DocumentView({
           pages: nextPages,
         }
       })
+      return true
     } catch (error) {
       console.error(error)
       message.error('保存失败')
+      return false
     }
+  }
+
+  const handleSaveFacsimilePage = async (pageId: string, data: PageUpdatePayload): Promise<void> => {
+    const saved = await handleSavePage(pageId, data)
+    if (!saved) throw new Error('Facsimile page save failed')
   }
 
   const handleResetPage = async (pageId: string) => {
@@ -4550,13 +4557,15 @@ export default function DocumentView({
     if (!currentPage?.id) return
     try {
       if (currentPageProofStatus === 'completed') {
-        await handleSavePage(currentPage.id, { proof_status: 'pending' })
+        const saved = await handleSavePage(currentPage.id, { proof_status: 'pending' })
+        if (!saved) return
         message.success('已取消本页校对完成')
       } else {
-        await handleSavePage(currentPage.id, {
+        const saved = await handleSavePage(currentPage.id, {
           proof_status: 'completed',
           proofed_text: currentPage.proofed_text || currentPage.ocr_text || '',
         })
+        if (!saved) return
         message.success('已标记本页校对完成')
       }
     } catch (error) {
@@ -6633,7 +6642,7 @@ export default function DocumentView({
                     { priority: 'current', force: true },
                   )
                 }}
-                onSave={handleSavePage}
+                onSave={handleSaveFacsimilePage}
                 onSelectBox={setActiveBoxIndex}
                 onTextSelectionChange={setSelectedTextForAi}
               />
