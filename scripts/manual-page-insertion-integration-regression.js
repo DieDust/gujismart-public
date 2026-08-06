@@ -4,6 +4,14 @@ const path = require('path')
 const { buildSync } = require('esbuild')
 
 const root = path.resolve(__dirname, '..')
+const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
+const insertionHandlerStart = documentViewSource.indexOf('const handleInsertManualPage = useCallback')
+const insertionHandlerEnd = documentViewSource.indexOf('const getReaderSearchInput', insertionHandlerStart)
+assert.ok(insertionHandlerStart >= 0 && insertionHandlerEnd > insertionHandlerStart, 'DocumentView must expose the manual page insertion handler')
+const insertionHandlerSource = documentViewSource.slice(insertionHandlerStart, insertionHandlerEnd)
+assert.ok(insertionHandlerSource.includes('pageRangeInFlightRef.current.clear()'), 'manual page insertion must clear in-flight page windows')
+assert.ok(insertionHandlerSource.includes('pageRangeRequestRef.current += 1'), 'manual page insertion must invalidate stale page windows')
+assert.ok(insertionHandlerSource.includes('searchPagesRequestIdRef.current += 1'), 'manual page insertion must invalidate stale search page windows')
 const tempRoot = fs.mkdtempSync(path.join(__dirname, '.tmp-manual-page-insertion-'))
 const tempDataDir = path.join(tempRoot, 'data')
 const bundlePath = path.join(tempRoot, 'manual-page-insertion-bundle.cjs')
@@ -68,7 +76,18 @@ buildSync({
   logLevel: 'silent',
 })
 
-function buildStoredOcrResult(pageWidth, pageHeight, orientation) {
+function buildStoredOcrResult(pageWidth, pageHeight, orientation, nestedDimensions = false) {
+  if (nestedDimensions) {
+    return JSON.stringify({
+      source_type: 'fixture',
+      guji_processing: {
+        source_image_width: pageWidth,
+        source_image_height: pageHeight,
+        orientation,
+      },
+      layout_result: [],
+    })
+  }
   return JSON.stringify({
     source_type: 'fixture',
     page_width: pageWidth,
@@ -78,7 +97,7 @@ function buildStoredOcrResult(pageWidth, pageHeight, orientation) {
   })
 }
 
-function insertFixtureDocument(database, docId, pageCount = 3) {
+function insertFixtureDocument(database, docId, pageCount = 3, options = {}) {
   const createdAt = '2026-01-01T00:00:00.000Z'
   database.run(
     `INSERT INTO documents (
@@ -99,7 +118,12 @@ function insertFixtureDocument(database, docId, pageCount = 3) {
         pageNum,
         null,
         `Fixture page ${pageNum}`,
-        buildStoredOcrResult(1200 + pageNum * 100, 1800 + pageNum * 100, pageNum === 2 ? 'vertical' : 'horizontal'),
+        buildStoredOcrResult(
+          1200 + pageNum * 100,
+          1800 + pageNum * 100,
+          pageNum === 2 ? 'vertical' : 'horizontal',
+          options.nestedDimensions === true,
+        ),
         null,
         createdAt,
       ],
@@ -112,6 +136,73 @@ function getPageRows(database, docId) {
     'SELECT id, page_num, image_path, ocr_status, proof_status, ocr_result FROM pages WHERE doc_id = ? ORDER BY page_num',
     [docId],
   )
+}
+
+function insertPageStateFixtures(database, docId, pageId, pageNum) {
+  const timestamp = '2026-01-01T00:00:00.000Z'
+  database.run(
+    `INSERT INTO page_ocr_versions (id, doc_id, page_id, page_num, engine, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'paddle', ?, ?)`,
+    [`${docId}_ocr_version`, docId, pageId, pageNum, timestamp, timestamp],
+  )
+  database.run(
+    `INSERT INTO page_ai_layout_cache (id, doc_id, page_id, page_num, mode, source_hash, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'fixture', 'fixture-layout-hash', ?, ?)`,
+    [`${docId}_layout_cache`, docId, pageId, pageNum, timestamp, timestamp],
+  )
+  database.run(
+    `INSERT INTO page_translation_cache (id, doc_id, page_id, page_num, source_hash, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'fixture-translation-hash', ?, ?)`,
+    [`${docId}_translation_cache`, docId, pageId, pageNum, timestamp, timestamp],
+  )
+  database.run(
+    `INSERT INTO page_translation_units (id, doc_id, page_id, page_num, unit_id, block_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [`${docId}_translation_unit`, docId, pageId, pageNum, `${docId}_unit`, `${docId}_block`, timestamp, timestamp],
+  )
+  database.run(
+    `INSERT INTO embedding_chunks (segment_id, doc_id, page_id, page_num, model_id, dim, content_hash, embedding, updated_at)
+     VALUES (?, ?, ?, ?, 'fixture-model', 1, 'fixture-embedding-hash', ?, ?)`,
+    [`${docId}_embedding_segment`, docId, pageId, pageNum, Buffer.from([0]), timestamp],
+  )
+  database.run(
+    `INSERT INTO search_index_segments (segment_id, doc_id, page_id, page_num, text, normalized_text, updated_at)
+     VALUES (?, ?, ?, ?, 'fixture search text', 'fixture search text', ?)`,
+    [`${docId}_search_segment`, docId, pageId, pageNum, timestamp],
+  )
+  database.run(
+    `INSERT INTO research_evidence (
+      id, identity_hash, doc_id, page_id, page_num, locator_json, quote, source_hash,
+      content_version, verification_status, created_at
+    ) VALUES (?, ?, ?, ?, ?, '{}', 'fixture evidence', 'fixture-evidence-hash', 'fixture-v1', 'verified', ?)`,
+    [`${docId}_evidence`, `${docId}_evidence_identity`, docId, pageId, pageNum, timestamp],
+  )
+  database.run(
+    `INSERT INTO research_evidence (
+      id, identity_hash, doc_id, page_id, page_num, locator_json, quote, source_hash,
+      content_version, verification_status, created_at
+    ) VALUES (?, ?, ?, NULL, ?, '{}', 'legacy fixture evidence', 'legacy-evidence-hash', 'fixture-v1', 'verified', ?)`,
+    [`${docId}_legacy_evidence`, `${docId}_legacy_evidence_identity`, docId, pageNum, timestamp],
+  )
+}
+
+function assertPageStateFixturePageNums(database, docId, expectedPageNum) {
+  const tables = [
+    'page_ocr_versions',
+    'page_ai_layout_cache',
+    'page_translation_cache',
+    'page_translation_units',
+    'embedding_chunks',
+    'search_index_segments',
+    'research_evidence',
+  ]
+  for (const table of tables) {
+    const row = database.queryOne(
+      `SELECT page_num FROM ${table} WHERE doc_id = ?${table === 'research_evidence' ? ' AND page_id IS NOT NULL' : ''}`,
+      [docId],
+    )
+    assert.strictEqual(row?.page_num, expectedPageNum, `${table} page_num must follow pages.page_num`)
+  }
 }
 
 async function run() {
@@ -148,6 +239,35 @@ async function run() {
     assert.strictEqual(beforeOcrResult.page_width, 1400)
     assert.strictEqual(beforeOcrResult.page_height, 2000)
     assert.strictEqual(beforeOcrResult.orientation, 'vertical')
+
+    const nestedDocId = 'manual_insert_nested_dimensions'
+    insertFixtureDocument(database, nestedDocId, 3, { nestedDimensions: true })
+    const nestedResult = await invoke('pages:insertManual', {
+      documentId: nestedDocId,
+      anchorPageId: `${nestedDocId}_page_2`,
+      position: 'before',
+    })
+    const nestedOcrResult = JSON.parse(nestedResult.inserted.ocr_result)
+    assert.strictEqual(nestedOcrResult.page_width, 1400)
+    assert.strictEqual(nestedOcrResult.page_height, 2000)
+    assert.strictEqual(nestedOcrResult.orientation, 'vertical')
+    assert.notStrictEqual(nestedOcrResult.page_width, 1000)
+    assert.notStrictEqual(nestedOcrResult.page_height, 1400)
+
+    const stateDocId = 'manual_insert_page_state'
+    insertFixtureDocument(database, stateDocId)
+    insertPageStateFixtures(database, stateDocId, `${stateDocId}_page_2`, 2)
+    const stateResult = await invoke('pages:insertManual', {
+      documentId: stateDocId,
+      anchorPageId: `${stateDocId}_page_1`,
+      position: 'after',
+    })
+    assert.strictEqual(stateResult.inserted.page_num, 2)
+    assertPageStateFixturePageNums(database, stateDocId, 3)
+    assert.strictEqual(
+      database.queryOne('SELECT verification_status FROM research_evidence WHERE doc_id = ? AND page_id IS NULL', [stateDocId]).verification_status,
+      'stale',
+    )
 
     const afterDocId = 'manual_insert_after'
     insertFixtureDocument(database, afterDocId)

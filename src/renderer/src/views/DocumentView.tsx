@@ -4505,6 +4505,9 @@ export default function DocumentView({
   const handleInsertManualPage = useCallback(async (position: ManualPageInsertRequest['position']) => {
     const targetPageId = currentPage?.id
     if (!documentId || !targetPageId || manualPageInsertionLoading) return
+    pageRangeInFlightRef.current.clear()
+    pageRangeRequestRef.current += 1
+    searchPagesRequestIdRef.current += 1
     setManualPageInsertionLoading(true)
     try {
       const result = await window.api.insertManualPage({
@@ -4512,6 +4515,9 @@ export default function DocumentView({
         anchorPageId: targetPageId,
         position,
       })
+      pageRangeInFlightRef.current.clear()
+      pageRangeRequestRef.current += 1
+      searchPagesRequestIdRef.current += 1
       pageImageCacheRef.current.delete(targetPageId)
       pageImageCacheRef.current.delete(result.inserted.id)
       setImageDataUrl('')
@@ -4521,6 +4527,9 @@ export default function DocumentView({
       setSwitchToRegion(false)
       const refreshed = await refreshDocumentKeepPage(result.inserted.id)
       if (!refreshed) throw new Error('插入后无法刷新文献页面')
+      pageRangeInFlightRef.current.clear()
+      pageRangeRequestRef.current += 1
+      searchPagesRequestIdRef.current += 1
       setPageInput(String(result.inserted.page_num))
       message.success(position === 'before' ? '已在当前页前插入空白页' : '已在当前页后插入空白页')
     } catch (error: unknown) {

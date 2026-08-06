@@ -6430,22 +6430,25 @@ export function registerDocumentIpc(): void {
           .sort((left, right) => left.distance - right.distance)
         for (const candidate of candidates) {
           const parsed = parseJsonRecord(candidate.page.ocr_result)
-          const width = positiveNumber(
-            getRecordValue(parsed, 'page_width')
-              ?? getRecordValue(parsed, 'image_width')
-              ?? getRecordValue(parsed, 'source_image_width')
-              ?? getRecordValue(parsed, 'width'),
-          )
-          const height = positiveNumber(
-            getRecordValue(parsed, 'page_height')
-              ?? getRecordValue(parsed, 'image_height')
-              ?? getRecordValue(parsed, 'source_image_height')
-              ?? getRecordValue(parsed, 'height'),
-          )
+          const nestedProcessing = getRecordValue(parsed, 'guji_processing')
+          const dimensionSources = [parsed, nestedProcessing]
+          const readDimension = (keys: readonly string[]): number | null => {
+            for (const source of dimensionSources) {
+              for (const key of keys) {
+                const value = positiveNumber(getRecordValue(source, key))
+                if (value) return value
+              }
+            }
+            return null
+          }
+          const width = readDimension(['page_width', 'image_width', 'source_image_width', 'width'])
+          const height = readDimension(['page_height', 'image_height', 'source_image_height', 'height'])
           if (!width || !height) continue
-          const rawOrientation = getRecordValue(parsed, 'orientation')
-            ?? getRecordValue(parsed, 'page_orientation')
-            ?? getRecordValue(parsed, 'layout_orientation')
+          const rawOrientation = dimensionSources
+            .map((source) => getRecordValue(source, 'orientation')
+              ?? getRecordValue(source, 'page_orientation')
+              ?? getRecordValue(source, 'layout_orientation'))
+            .find((value) => value === 'vertical' || value === 'horizontal')
           const orientation: 'vertical' | 'horizontal' = rawOrientation === 'vertical' || rawOrientation === 'horizontal'
             ? rawOrientation
             : height >= width ? 'vertical' : 'horizontal'
@@ -6482,6 +6485,52 @@ export function registerDocumentIpc(): void {
         const nextPageNum = index < safeInsertionIndex ? index + 1 : index + 2
         run('UPDATE pages SET page_num = ? WHERE id = ? AND doc_id = ?', [nextPageNum, page.id, documentId])
       })
+
+      // Keep every page_id-backed cache aligned in the same transaction. Tables that
+      // only retain a legacy page_num are deliberately marked stale/rebuildable below;
+      // guessing their new page number would silently move user evidence to the wrong page.
+      const pageNumberTables = [
+        'page_ocr_versions',
+        'ocr_artifact_versions',
+        'page_ai_layout_cache',
+        'page_translation_cache',
+        'page_translation_units',
+        'embedding_chunks',
+        'search_index_segments',
+        'search_index_segments_staging',
+        'research_evidence',
+      ] as const
+      for (const table of pageNumberTables) {
+        run(
+          `UPDATE ${table}
+           SET page_num = (SELECT p.page_num FROM pages p WHERE p.id = ${table}.page_id)
+           WHERE doc_id = ? AND page_id IS NOT NULL`,
+          [documentId],
+        )
+      }
+      run(
+        `UPDATE research_evidence
+         SET verification_status = 'stale'
+         WHERE doc_id = ? AND page_id IS NULL AND page_num IS NOT NULL`,
+        [documentId],
+      )
+      run(
+        `UPDATE research_notes
+         SET source_hash = '', updated_at = ?
+         WHERE doc_id = ? AND page_num IS NOT NULL`,
+        [now, documentId],
+      )
+      run(
+        `UPDATE ai_research_records
+         SET source_hash = '', status = 'pending', updated_at = ?
+         WHERE doc_id = ? AND page_num IS NOT NULL`,
+        [now, documentId],
+      )
+      // Auto-generated TOC rows only retain a legacy page number, so discard
+      // them atomically and let the existing TOC rebuild path recreate them.
+      // Manual TOC rows are preserved for explicit user review rather than
+      // silently guessing their new physical page.
+      markDocumentTocDirty(documentId)
       pageCount = pages.length + 1
       run('UPDATE documents SET page_count = ?, updated_at = ? WHERE id = ?', [pageCount, now, documentId])
       syncDocumentProofStatus(documentId)
