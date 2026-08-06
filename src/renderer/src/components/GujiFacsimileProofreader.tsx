@@ -22,11 +22,8 @@ import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/o
 import ManualBlockInspector from './ManualBlockInspector'
 import ManualLayoutToolbar from './ManualLayoutToolbar'
 import {
-  getFacsimileTableMergesFromCells,
   normalizeFacsimileTableColumnWidths,
-  normalizeFacsimileTableMerges,
   normalizeFacsimileTableRowHeights,
-  normalizeFacsimileTableRows,
   type FacsimileTableMerge,
 } from '../utils/facsimileTableEditing'
 import { renderOcrInlineText } from '../utils/ocrInlineRender'
@@ -39,10 +36,12 @@ import {
 import { getManualLayoutUnderlayImageStyle } from '../utils/manualLayoutUnderlay'
 import {
   applyManualLayoutBlockConversion,
+  applyManualLayoutTableEditorValue,
   clampManualLayoutBlockRect,
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
   createManualLayoutPointerFrameScheduler,
+  createManualLayoutTableSnapshot,
   getManualLayoutBlockConversionWarning,
   getManualLayoutBlockVisualState,
   getManualLayoutEditEntryPreparation,
@@ -527,48 +526,8 @@ function isRenderableTableBlock(block: unknown): boolean {
   return isTableBlock(block) && getBlockTableRows(block).length > 0
 }
 
-function getEditableBlockTableRows(block: unknown, fallbackText = ''): string[][] {
-  const directRows = firstRecordValue(block, ['rows', 'table_rows', 'tableRows'])
-  if (Array.isArray(directRows)) return normalizeFacsimileTableRows(directRows)
-  const extractedRows = getBlockTableRows(block)
-  return extractedRows.length > 0
-    ? normalizeFacsimileTableRows(extractedRows)
-    : [[fallbackText]]
-}
-
 function tableRowsToPlainText(rows: string[][]): string {
   return rows.map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join('')).filter(Boolean).join('\n')
-}
-
-function getBlockTableCells(block: unknown): unknown[] {
-  const value = firstRecordValue(block, ['cells', 'table_cells', 'tableCells'])
-  return Array.isArray(value) ? value : []
-}
-
-function getBlockTableMerges(block: unknown, rows: string[][]): FacsimileTableMerge[] {
-  const direct = firstRecordValue(block, ['merges', 'table_merges', 'tableMerges'])
-  if (Array.isArray(direct)) {
-    return normalizeFacsimileTableMerges(
-      direct as FacsimileTableMerge[],
-      rows.length,
-      rows[0]?.length || 1,
-    )
-  }
-  return getFacsimileTableMergesFromCells(getBlockTableCells(block), rows.length, rows[0]?.length || 1)
-}
-
-function getBlockTableRowHeights(block: unknown, rows: string[][]): number[] {
-  return normalizeFacsimileTableRowHeights(
-    firstRecordValue(block, ['rowHeights', 'row_heights', 'rowSizes', 'row_sizes']),
-    rows.length,
-  )
-}
-
-function getBlockTableColumnWidths(block: unknown, rows: string[][]): number[] {
-  return normalizeFacsimileTableColumnWidths(
-    firstRecordValue(block, ['columnWidths', 'column_widths', 'colSizes', 'col_sizes']),
-    rows[0]?.length || 1,
-  )
 }
 
 function tableRowsToVerticalColumnText(rows: string[][]): string {
@@ -2398,8 +2357,9 @@ export default function GujiFacsimileProofreader({
     const labelName = LABEL_NAMES[label] || label
     const isTable = shouldRenderAsTableBlock(block, pageVerticalMode)
     const isImage = isImageLabel(label)
-    const tableRows = isTable ? getBlockTableRows(block) : []
-    const tableMerges = isTable ? getBlockTableMerges(block, tableRows) : []
+    const tableSnapshot = isTable ? createManualLayoutTableSnapshot(block) : null
+    const tableRows = tableSnapshot?.rows || []
+    const tableMerges = tableSnapshot?.merges || []
     const orientation = isTable ? 'horizontal' : inferPageAwareOrientation(block, pageVerticalMode)
     const originalText = !isTable && isLikelyVerticalPseudoTableBlock(block) ? getPseudoTableText(block) : getBlockText(block)
     const shouldRenderTable = isTable
@@ -2491,11 +2451,11 @@ export default function GujiFacsimileProofreader({
   useEffect(() => {
     if (!editingBlock || !editingBlockId) return
     if (isTableBlock(editingBlock)) {
-      const nextRows = getEditableBlockTableRows(editingBlock)
-      setTableDraftRows(nextRows)
-      setTableDraftMerges(getBlockTableMerges(editingBlock, nextRows))
-      setTableDraftRowHeights(getBlockTableRowHeights(editingBlock, nextRows))
-      setTableDraftColumnWidths(getBlockTableColumnWidths(editingBlock, nextRows))
+      const snapshot = createManualLayoutTableSnapshot(editingBlock)
+      setTableDraftRows(snapshot.rows)
+      setTableDraftMerges(snapshot.merges)
+      setTableDraftRowHeights(snapshot.rowHeights)
+      setTableDraftColumnWidths(snapshot.columnWidths)
     } else {
       setTableDraftRows([['']])
       setTableDraftMerges([])
@@ -2527,44 +2487,19 @@ export default function GujiFacsimileProofreader({
     columnWidths: number[],
   ) => {
     if (layoutEditingLocked) return
-    const normalizedRows = normalizeFacsimileTableRows(rows)
-    const normalizedMerges = normalizeFacsimileTableMerges(merges, normalizedRows.length, normalizedRows[0]?.length || 1)
-    const normalizedRowHeights = normalizeFacsimileTableRowHeights(rowHeights, normalizedRows.length)
-    const normalizedColumnWidths = normalizeFacsimileTableColumnWidths(columnWidths, normalizedRows[0]?.length || 1)
-    setTableDraftRows(normalizedRows)
-    setTableDraftMerges(normalizedMerges)
-    setTableDraftRowHeights(normalizedRowHeights)
-    setTableDraftColumnWidths(normalizedColumnWidths)
-    if (!editingBlockId || !editingBlock) return
-    manualLayoutDraft.updateBlock(editingBlockId, {
-      words: tableRowsToPlainText(normalizedRows),
-      label: 'table',
-      type: 'table',
-      block_type: 'table',
-      rows: normalizedRows,
-      merges: normalizedMerges,
-      rowHeights: normalizedRowHeights,
-      columnWidths: normalizedColumnWidths,
-      manual_preserved_table: undefined,
-      table_rows: undefined,
-      tableRows: undefined,
-      cells: undefined,
-      table_cells: undefined,
-      tableCells: undefined,
-      table_merges: undefined,
-      tableMerges: undefined,
-      row_heights: undefined,
-      rowSizes: undefined,
-      row_sizes: undefined,
-      column_widths: undefined,
-      colSizes: undefined,
-      col_sizes: undefined,
-      html: undefined,
-      table_html: undefined,
-      tableHtml: undefined,
-      markdown: undefined,
-      md: undefined,
+    const stagedBlock = applyManualLayoutTableEditorValue(editingBlock || {}, {
+      rows,
+      merges,
+      rowHeights,
+      columnWidths,
     })
+    const snapshot = createManualLayoutTableSnapshot(stagedBlock)
+    setTableDraftRows(snapshot.rows)
+    setTableDraftMerges(snapshot.merges)
+    setTableDraftRowHeights(snapshot.rowHeights)
+    setTableDraftColumnWidths(snapshot.columnWidths)
+    if (!editingBlockId || !editingBlock) return
+    manualLayoutDraft.updateBlock(editingBlockId, stagedBlock)
   }, [editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
 
   const applyInspectorTypeChange = useCallback((nextKind: ManualLayoutBlockKind, confirmed: boolean) => {
@@ -2573,22 +2508,19 @@ export default function GujiFacsimileProofreader({
     if (conversion.blocked) return
     let convertedBlock = conversion.block as LayoutBlock
     if (nextKind === 'table') {
-      const rows = getEditableBlockTableRows(convertedBlock, getBlockText(editingBlock))
-      const merges = getBlockTableMerges(convertedBlock, rows)
-      const rowHeights = getBlockTableRowHeights(convertedBlock, rows)
-      const columnWidths = getBlockTableColumnWidths(convertedBlock, rows)
+      const snapshot = createManualLayoutTableSnapshot(convertedBlock, getBlockText(editingBlock))
       convertedBlock = {
         ...convertedBlock,
-        rows,
-        merges,
-        rowHeights,
-        columnWidths,
-        words: tableRowsToPlainText(rows),
+        rows: snapshot.rows,
+        merges: snapshot.merges,
+        rowHeights: snapshot.rowHeights,
+        columnWidths: snapshot.columnWidths,
+        words: tableRowsToPlainText(snapshot.rows),
       }
-      setTableDraftRows(rows)
-      setTableDraftMerges(merges)
-      setTableDraftRowHeights(rowHeights)
-      setTableDraftColumnWidths(columnWidths)
+      setTableDraftRows(snapshot.rows)
+      setTableDraftMerges(snapshot.merges)
+      setTableDraftRowHeights(snapshot.rowHeights)
+      setTableDraftColumnWidths(snapshot.columnWidths)
     } else if ((nextKind === 'image' || nextKind === 'seal') && !String(convertedBlock.caption || '').trim()) {
       convertedBlock = { ...convertedBlock, caption: getBlockText(editingBlock), alt_text: String(convertedBlock.alt_text || '') }
     }
@@ -2694,11 +2626,11 @@ export default function GujiFacsimileProofreader({
     const targetBlockId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, target, targetIndex)
     manualLayoutDraft.setActiveBlockId(targetBlockId)
     if (isTableBlock(target)) {
-      const rows = getEditableBlockTableRows(target)
-      setTableDraftRows(rows)
-      setTableDraftMerges(getBlockTableMerges(target, rows))
-      setTableDraftRowHeights(getBlockTableRowHeights(target, rows))
-      setTableDraftColumnWidths(getBlockTableColumnWidths(target, rows))
+      const snapshot = createManualLayoutTableSnapshot(target)
+      setTableDraftRows(snapshot.rows)
+      setTableDraftMerges(snapshot.merges)
+      setTableDraftRowHeights(snapshot.rowHeights)
+      setTableDraftColumnWidths(snapshot.columnWidths)
     } else {
       setTableDraftRows([['']])
       setTableDraftMerges([])

@@ -314,10 +314,12 @@ export interface ManualLayoutTableSnapshot {
   columnWidths: number[]
 }
 
-function firstArrayValue(block: ManualLayoutEditableBlock, keys: readonly string[]): unknown[] {
+export type ManualLayoutTableEditorValue = Omit<ManualLayoutTableSnapshot, 'version'>
+
+function firstNonEmptyArrayValue(block: ManualLayoutEditableBlock, keys: readonly string[]): unknown[] {
   for (const key of keys) {
     const value = block[key]
-    if (Array.isArray(value)) return value
+    if (Array.isArray(value) && value.length > 0) return value
   }
   return []
 }
@@ -379,11 +381,14 @@ function rowsFromMarkup(block: ManualLayoutEditableBlock): string[][] {
     .map((line) => line.replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim()))
 }
 
-function normalizeTableRows(block: ManualLayoutEditableBlock): string[][] {
-  const directRows = firstArrayValue(block, ['rows', 'table_rows', 'tableRows'])
+function normalizeTableRows(block: ManualLayoutEditableBlock, fallbackText = ''): string[][] {
+  const canonicalRows = Array.isArray(block.rows) && block.rows.length > 0 ? block.rows : []
+  const directRows = canonicalRows.length > 0
+    ? canonicalRows
+    : firstNonEmptyArrayValue(block, ['table_rows', 'tableRows'])
   const rawRows = directRows.length > 0
     ? directRows
-    : rowsFromCells(firstArrayValue(block, ['cells', 'table_cells', 'tableCells']))
+    : rowsFromCells(firstNonEmptyArrayValue(block, ['cells', 'table_cells', 'tableCells']))
   const sourceRows = (rawRows.length > 0 ? rawRows : rowsFromMarkup(block)).slice(0, FACSIMILE_TABLE_MAX_ROWS)
   const rows = Array.from({ length: sourceRows.length }, (_, rowIndex) => {
     const rawRow = sourceRows[rowIndex]
@@ -402,7 +407,7 @@ function normalizeTableRows(block: ManualLayoutEditableBlock): string[][] {
             : String(value)
     ))
   })
-  if (rows.length === 0) return [['']]
+  if (rows.length === 0) return [[fallbackText]]
   const columnCount = Math.max(1, ...rows.map((row) => row.length))
   return rows.map((row) => Array.from({ length: columnCount }, (_, col) => row[col] || ''))
 }
@@ -410,13 +415,17 @@ function normalizeTableRows(block: ManualLayoutEditableBlock): string[][] {
 function normalizeTableMerges(block: ManualLayoutEditableBlock, rows: string[][]): ManualLayoutTableMerge[] {
   const rowCount = rows.length
   const colCount = rows[0]?.length || 1
-  const directMerges = firstArrayValue(block, ['merges', 'table_merges', 'tableMerges'])
-  const legacyCells = firstArrayValue(block, ['cells', 'table_cells', 'tableCells'])
-  const source = directMerges.length > 0
-    ? directMerges
-    : legacyCells.length > 0
-      ? legacyCells
-      : tableFromHtml(block).merges
+  const canonicalRowsActive = Array.isArray(block.rows) && block.rows.length > 0
+  const canonicalMerges = Array.isArray(block.merges) ? block.merges : null
+  const legacyMerges = firstNonEmptyArrayValue(block, ['table_merges', 'tableMerges'])
+  const legacyCells = firstNonEmptyArrayValue(block, ['cells', 'table_cells', 'tableCells'])
+  const source = canonicalRowsActive
+    ? canonicalMerges || (legacyMerges.length > 0 ? legacyMerges : legacyCells)
+    : legacyMerges.length > 0
+      ? legacyMerges
+      : legacyCells.length > 0
+        ? legacyCells
+        : tableFromHtml(block).merges
   const candidates = source.slice(0, FACSIMILE_TABLE_MAX_ROWS * FACSIMILE_TABLE_MAX_COLUMNS).flatMap((rawMerge) => {
     if (!isRecord(rawMerge)) return []
     const row = cellInteger(rawMerge, ['row', 'row_index', 'rowIndex'])
@@ -452,8 +461,12 @@ function normalizeTableSizes(
   keys: readonly string[],
   count: number,
   fallback: number,
+  canonicalRowsActive: boolean,
 ): number[] {
-  const source = firstArrayValue(block, keys)
+  const canonicalValue = block[keys[0]]
+  const source = canonicalRowsActive && Array.isArray(canonicalValue)
+    ? canonicalValue
+    : firstNonEmptyArrayValue(block, keys)
   return Array.from({ length: count }, (_, index) => {
     const value = source[index]
     const size = Number(value)
@@ -461,8 +474,12 @@ function normalizeTableSizes(
   })
 }
 
-export function createManualLayoutTableSnapshot(block: ManualLayoutEditableBlock): ManualLayoutTableSnapshot {
-  const rows = normalizeTableRows(block)
+export function createManualLayoutTableSnapshot(
+  block: ManualLayoutEditableBlock,
+  fallbackText = '',
+): ManualLayoutTableSnapshot {
+  const rows = normalizeTableRows(block, fallbackText)
+  const canonicalRowsActive = Array.isArray(block.rows) && block.rows.length > 0
   return {
     version: 1,
     rows,
@@ -472,14 +489,49 @@ export function createManualLayoutTableSnapshot(block: ManualLayoutEditableBlock
       ['rowHeights', 'row_heights', 'rowSizes', 'row_sizes'],
       rows.length,
       FACSIMILE_TABLE_DEFAULT_ROW_HEIGHT,
+      canonicalRowsActive,
     ),
     columnWidths: normalizeTableSizes(
       block,
       ['columnWidths', 'column_widths', 'colSizes', 'col_sizes'],
       rows[0]?.length || 1,
       FACSIMILE_TABLE_DEFAULT_COLUMN_WIDTH,
+      canonicalRowsActive,
     ),
   }
+}
+
+function manualLayoutTableRowsToPlainText(rows: string[][]): string {
+  return rows
+    .map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join(''))
+    .filter(Boolean)
+    .join('\n')
+}
+
+export function applyManualLayoutTableEditorValue<T extends ManualLayoutEditableBlock>(
+  block: T,
+  value: ManualLayoutTableEditorValue,
+): T {
+  const snapshot = createManualLayoutTableSnapshot({
+    rows: value.rows,
+    merges: value.merges,
+    rowHeights: value.rowHeights,
+    columnWidths: value.columnWidths,
+  })
+  const nextBlock: ManualLayoutEditableBlock = { ...block }
+  for (const key of TABLE_STRUCTURE_KEYS) nextBlock[key] = undefined
+  Object.assign(nextBlock, {
+    label: 'table',
+    type: 'table',
+    block_type: 'table',
+    words: manualLayoutTableRowsToPlainText(snapshot.rows),
+    rows: snapshot.rows,
+    merges: snapshot.merges,
+    rowHeights: snapshot.rowHeights,
+    columnWidths: snapshot.columnWidths,
+    manual_preserved_table: undefined,
+  })
+  return nextBlock as T
 }
 
 function kindCategory(kind: ManualLayoutBlockKind): ManualLayoutBlockCategory {

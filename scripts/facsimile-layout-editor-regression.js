@@ -137,6 +137,7 @@ const {
   MANUAL_LAYOUT_MORE_KINDS,
   MANUAL_LAYOUT_QUICK_KINDS,
   applyManualLayoutBlockConversion,
+  applyManualLayoutTableEditorValue,
   clampManualLayoutBlockRect,
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
@@ -2008,6 +2009,7 @@ assert.deepStrictEqual(commitManualLayoutGeometryPreview(previewUpdated), previe
 assert.deepStrictEqual(rollbackManualLayoutGeometryPreview(previewUpdated), previewBlocks, 'Escape/pointercancel must restore the interaction baseline')
 
 assert.strictEqual(typeof createManualLayoutTableSnapshot, 'function', 'table conversion must expose one canonical snapshot normalizer')
+assert.strictEqual(typeof applyManualLayoutTableEditorValue, 'function', 'table edits must expose one canonical save transition')
 const tableConversionSource = {
   manual_block_id: 'table-1',
   label: 'table',
@@ -2048,6 +2050,68 @@ assert.ok(
 assert.ok(
   !helperSource.includes("from './manualLayoutBlockEditing'"),
   'the canonical clipboard parser must remain below manual block editing in the dependency graph',
+)
+const htmlOnlyTableBlock = {
+  label: 'table',
+  table_html: '<table><tr><td rowspan="2" colspan="2">Alpha&amp;Beta<br>Gamma&nbsp;&lt;delta&gt;</td><td>尾</td></tr><tr><td>次</td></tr></table>',
+  table_rows: [],
+  table_merges: [],
+}
+for (const sourceBlock of [
+  htmlOnlyTableBlock,
+  { ...htmlOnlyTableBlock, rows: [], merges: [] },
+  { ...htmlOnlyTableBlock, rows: [], merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 3 }] },
+]) {
+  const openSnapshot = createManualLayoutTableSnapshot(sourceBlock)
+  assert.deepStrictEqual(openSnapshot.rows, [["Alpha&Beta\nGamma <delta>", '', '尾'], ['', '', '次']])
+  assert.deepStrictEqual(openSnapshot.merges, [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }])
+  const editedSnapshot = {
+    ...openSnapshot,
+    rows: openSnapshot.rows.map((row) => [...row]),
+    rowHeights: [52, 68],
+    columnWidths: [132, 144, 156],
+  }
+  editedSnapshot.rows[0][0] = '人工修订'
+  const savedBlock = applyManualLayoutTableEditorValue(sourceBlock, editedSnapshot)
+  assert.strictEqual(sourceBlock.table_html.includes('<table>'), true, 'opening and editing must not mutate legacy archives before save')
+  for (const legacyKey of ['html', 'table_html', 'tableHtml', 'table_rows', 'tableRows', 'table_merges', 'tableMerges']) {
+    assert.strictEqual(savedBlock[legacyKey], undefined, `canonical save must clear legacy ${legacyKey}`)
+  }
+  assert.deepStrictEqual(
+    createManualLayoutTableSnapshot(savedBlock),
+    { ...editedSnapshot, version: 1 },
+    'HTML-only open, edit, canonical save, and reopen must preserve cells, merges, and custom sizes',
+  )
+}
+assert.deepStrictEqual(createManualLayoutTableSnapshot({
+  label: 'table',
+  rows: [['canonical']],
+  merges: [],
+  rowHeights: [],
+  columnWidths: [],
+  table_html: '<table><tr><td colspan="2">stale</td><td>markup</td></tr></table>',
+}), {
+  version: 1,
+  rows: [['canonical']],
+  merges: [],
+  rowHeights: [40],
+  columnWidths: [120],
+}, 'a non-empty canonical active table must remain authoritative over stale legacy markup and aliases')
+const tableEditorInitializationStart = proofreader.indexOf('useEffect(() => {\n    if (!editingBlock || !editingBlockId) return')
+const tableEditorInitializationEnd = proofreader.indexOf('const resetBlockEditor', tableEditorInitializationStart)
+const tableEditorInitialization = proofreader.slice(tableEditorInitializationStart, tableEditorInitializationEnd)
+assert.ok(tableEditorInitialization.includes('createManualLayoutTableSnapshot(editingBlock)'), 'Inspector initialization must consume the canonical table snapshot')
+assert.ok(!proofreader.includes('function getEditableBlockTableRows('), 'the proofreader must not retain a weaker parallel editable-table extractor')
+assert.ok(!proofreader.includes('function getBlockTableMerges('), 'rendering and editing must not retain a separate weak merge extractor')
+assert.ok(
+  proofreader.includes('const tableSnapshot = isTable ? createManualLayoutTableSnapshot(block) : null'),
+  'the proofreader table display must open the same canonical snapshot as the Inspector',
+)
+const stageTableChangeStart = proofreader.indexOf('const stageTableBlockChange = useCallback((')
+const stageTableChangeEnd = proofreader.indexOf('const applyInspectorTypeChange', stageTableChangeStart)
+assert.ok(
+  proofreader.slice(stageTableChangeStart, stageTableChangeEnd).includes('applyManualLayoutTableEditorValue('),
+  'table staging must use the same canonical save transition as the pure roundtrip regression',
 )
 assert.ok(getManualLayoutBlockConversionWarning(tableConversionSource, 'text'), 'structured-to-text conversion must require a warning')
 assert.strictEqual(applyManualLayoutBlockConversion(tableConversionSource, 'text', false).blocked, true, 'unconfirmed structured conversion must be blocked')
@@ -2130,7 +2194,11 @@ assert.ok(pointerUpSource.indexOf('.flush()') < pointerUpSource.indexOf('commitB
 const stageTableStart = proofreader.indexOf('const stageTableBlockChange = useCallback(')
 const stageTableEnd = proofreader.indexOf('const applyInspectorTypeChange', stageTableStart)
 const stageTableSource = proofreader.slice(stageTableStart, stageTableEnd)
-assert.ok(stageTableSource.includes('merges: normalizedMerges') && stageTableSource.includes('rowHeights: normalizedRowHeights') && stageTableSource.includes('columnWidths: normalizedColumnWidths'), 'table edits must persist one canonical structure including visual sizes')
+assert.ok(
+  stageTableSource.includes('applyManualLayoutTableEditorValue(')
+    && stageTableSource.includes('createManualLayoutTableSnapshot(stagedBlock)'),
+  'table edits must persist cells, merges, and visual sizes through the canonical save transition',
+)
 assert.ok(!stageTableSource.includes('table_rows: normalizedRows') && !stageTableSource.includes('tableCells: cells'), 'table edits must not fan canonical data back out into legacy aliases')
 for (const handle of ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']) {
   assert.ok(proofreader.includes(`handle: '${handle}'`), `the selected block must expose the ${handle} resize handle`)
