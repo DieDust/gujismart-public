@@ -390,6 +390,7 @@ export function reduceManualLayoutDraft(
   action: ManualLayoutDraftAction,
 ): ManualLayoutDraftState {
   if (state.discardPending && isManualLayoutContentMutationAction(action)) return state
+  if (state.discardPending && (action.type === 'server-echo' || action.type === 'page-changed')) return state
   switch (action.type) {
     case 'create': {
       const block = ensureManualLayoutBlockIdentity(state.pageId, action.block, state.blocks.length, true)
@@ -570,6 +571,18 @@ export function createManualLayoutDiscardCompensationSnapshot(
     pageId: state.pageId,
     blocks: state.baselineBlocks.map((block) => ({ ...block })),
     revision: state.revision + 1,
+  }
+}
+
+export function getManualLayoutDiscardCompensationSnapshot(
+  state: ManualLayoutDraftState,
+): ManualLayoutDiscardCompensationSnapshot {
+  if (!state.discardPending) return createManualLayoutDiscardCompensationSnapshot(state)
+  return {
+    draftIdentity: state.draftIdentity,
+    pageId: state.pageId,
+    blocks: state.baselineBlocks.map((block) => ({ ...block })),
+    revision: state.revision,
   }
 }
 
@@ -880,14 +893,7 @@ export function useManualLayoutDraft({
   const runDiscardCompensation = useCallback(async (): Promise<boolean> => {
     clearSaveTimer()
     const discardedState = stateRef.current
-    const compensationSnapshot = discardedState.discardPending
-      ? {
-          draftIdentity: discardedState.draftIdentity,
-          pageId: discardedState.pageId,
-          blocks: discardedState.baselineBlocks.map((block) => ({ ...block })),
-          revision: discardedState.revision,
-        }
-      : createManualLayoutDiscardCompensationSnapshot(discardedState)
+    const compensationSnapshot = getManualLayoutDiscardCompensationSnapshot(discardedState)
     const supersededSave = inFlightRef.current
     saveEpochRef.current += 1
     inFlightRef.current = null

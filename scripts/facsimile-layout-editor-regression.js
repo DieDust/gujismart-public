@@ -96,6 +96,7 @@ const {
   ensureManualLayoutBlockIdentity,
   finalizeManualLayoutDraftOnUnmount,
   getPendingManualLayoutPageAction,
+  getManualLayoutDiscardCompensationSnapshot,
   getManualLayoutDraftBlockId,
   getManualLayoutDraftStorageKey,
   getManualLayoutSaveSchedule,
@@ -125,6 +126,7 @@ assert.strictEqual(typeof shouldPersistManualLayoutDraftAction, 'function', 'pre
 assert.strictEqual(typeof isManualLayoutSaveEpochCurrent, 'function', 'late save responses must be guarded by an explicit runtime epoch')
 assert.strictEqual(typeof isManualLayoutContentMutationAction, 'function', 'discard compensation must expose the content-mutation guard')
 assert.strictEqual(typeof createManualLayoutDiscardCompensationSnapshot, 'function', 'discard compensation must capture one immutable baseline snapshot')
+assert.strictEqual(typeof getManualLayoutDiscardCompensationSnapshot, 'function', 'discard retry must expose the exact fixed snapshot used by the hook')
 assert.strictEqual(typeof runManualLayoutDiscardCompensation, 'function', 'discard compensation must expose the serialized old-write barrier')
 assert.strictEqual(typeof createManualLayoutDiscardQueue, 'function', 'repeated discard targets must share one serialized operation')
 
@@ -181,6 +183,45 @@ async function runAsyncDraftChecks() {
   const discardPendingState = reduceManualLayoutDraft(discardState, { type: 'discard-pending', revision: fixedCompensation.revision })
   assert.strictEqual(discardPendingState.discardPending, true)
   assert.strictEqual(discardPendingState.blocks[0].words, 'server-baseline')
+  const abandonedSamePageEcho = reduceManualLayoutDraft(discardPendingState, {
+    type: 'server-echo',
+    pageId: 'page-race',
+    blocks: [{ ...discardBaseline, words: 'abandoned-edit-that-landed' }],
+  })
+  assert.strictEqual(abandonedSamePageEcho, discardPendingState, 'a same-page echo from the superseded save must leave every pending compensation field untouched')
+  assert.deepStrictEqual({
+    blocks: abandonedSamePageEcho.blocks,
+    baselineBlocks: abandonedSamePageEcho.baselineBlocks,
+    revision: abandonedSamePageEcho.revision,
+    acknowledgedRevision: abandonedSamePageEcho.acknowledgedRevision,
+    saveState: abandonedSamePageEcho.saveState,
+    activeBlockId: abandonedSamePageEcho.activeBlockId,
+    discardPending: abandonedSamePageEcho.discardPending,
+  }, {
+    blocks: discardPendingState.blocks,
+    baselineBlocks: discardPendingState.baselineBlocks,
+    revision: discardPendingState.revision,
+    acknowledgedRevision: discardPendingState.acknowledgedRevision,
+    saveState: discardPendingState.saveState,
+    activeBlockId: discardPendingState.activeBlockId,
+    discardPending: discardPendingState.discardPending,
+  })
+  const blockedIdentityChange = reduceManualLayoutDraft(discardPendingState, {
+    type: 'page-changed',
+    pageId: 'page-unauthorized',
+    draftIdentity: 'project/document/page-unauthorized',
+    blocks: [{ words: 'unauthorized-target' }],
+  })
+  assert.strictEqual(blockedIdentityChange, discardPendingState, 'only a target applied after successful compensation may change draft identity')
+  const retryCompensation = getManualLayoutDiscardCompensationSnapshot(abandonedSamePageEcho)
+  let baselineAfterIgnoredEcho = null
+  assert.strictEqual(await runManualLayoutDiscardCompensation(
+    Promise.resolve(true),
+    retryCompensation,
+    (snapshot) => { baselineAfterIgnoredEcho = snapshot },
+  ), true)
+  assert.strictEqual(baselineAfterIgnoredEcho.blocks[0].words, 'server-baseline', 'retrying after an ignored echo must still write the fixed baseline')
+  assert.strictEqual(baselineAfterIgnoredEcho.revision, fixedCompensation.revision, 'retrying a pending discard must reuse its fixed revision')
   const interruptedValues = new Map()
   const interruptedStorage = {
     getItem: (key) => interruptedValues.get(key) ?? null,
@@ -1077,7 +1118,7 @@ assert.ok(proofreader.includes('const layoutEditingLocked = manualLayoutDraft.st
 assert.ok(proofreader.includes("pointerEvents: layoutEditingLocked ? 'none'"), 'the layout canvas and inspector must block pointer mutations during discard compensation')
 assert.ok(proofreader.includes('disabled={layoutEditingLocked}'), 'focused text editing controls must be disabled while discard compensation is pending')
 assert.ok(draftHelperSource.includes('if (current.discardPending && isManualLayoutContentMutationAction(action)) return'), 'the hook boundary must reject every content mutation while discard compensation is pending')
-assert.ok(draftHelperSource.includes('const compensationSnapshot = discardedState.discardPending'), 'a failed compensation retry must reuse its fixed revision instead of bypassing the baseline write')
+assert.ok(draftHelperSource.includes('const compensationSnapshot = getManualLayoutDiscardCompensationSnapshot(discardedState)'), 'a failed compensation retry must reuse its fixed revision instead of bypassing the baseline write')
 assert.ok(draftHelperSource.includes('discardQueueRef.current = createManualLayoutDiscardQueue('), 'all repeated discard requests must pass through one persistent serialized queue')
 
 const documentView = fs.readFileSync(path.join(root, 'src/renderer/src/views/DocumentView.tsx'), 'utf8')
