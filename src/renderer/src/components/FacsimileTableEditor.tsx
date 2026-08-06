@@ -1846,7 +1846,7 @@ export default function FacsimileTableEditor({
                         size="small"
                         tabIndex={-1}
                         disabled={!quickInsertColumnAvailable}
-                        className="facsimile-table-quick-insert facsimile-table-quick-insert-column"
+                        className={`facsimile-table-quick-insert facsimile-table-quick-insert-column${col === colCount - 1 ? ' is-edge' : ''}`}
                         icon={<PlusOutlined />}
                         aria-label={`在第 ${columnLabel(col)} 列右侧插入一列`}
                         onPointerDown={(event) => {
@@ -1900,7 +1900,7 @@ export default function FacsimileTableEditor({
                         size="small"
                         tabIndex={-1}
                         disabled={!quickInsertRowAvailable}
-                        className="facsimile-table-quick-insert facsimile-table-quick-insert-row"
+                        className={`facsimile-table-quick-insert facsimile-table-quick-insert-row${rowIndex === rowCount - 1 ? ' is-edge' : ''}`}
                         icon={<PlusOutlined />}
                         aria-label={`在第 ${rowIndex + 1} 行下方插入一行`}
                         onPointerDown={(event) => {

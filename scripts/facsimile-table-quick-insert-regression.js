@@ -34,6 +34,9 @@ assert.match(cssSource, /opacity:\s*0[;\n]/, 'quick insert controls must stay hi
 assert.match(cssSource, /pointer-events:\s*none/, 'hidden quick insert controls must not block table editing')
 assert.match(cssSource, /\.facsimile-table-column-heading:hover[\s\S]*opacity:\s*1/, 'column control must appear on column-header hover')
 assert.match(cssSource, /\.facsimile-table-row-heading:hover[\s\S]*opacity:\s*1/, 'row control must appear on row-header hover')
+assert.match(cssSource, /\.facsimile-table-column-heading:hover\s*\{[\s\S]*z-index:\s*10/, 'hovered column heading must rise above adjacent headings')
+assert.match(cssSource, /\.facsimile-table-row-heading:hover\s*\{[\s\S]*z-index:\s*10/, 'hovered row heading must rise above adjacent headings')
+assert.match(editorSource, /is-edge/, 'edge quick insert controls must avoid clipping at the last row or column')
 
 const rows = [['A', 'B'], ['C', 'D']]
 const merges = [{ row: 0, col: 0, rowSpan: 1, colSpan: 2 }]

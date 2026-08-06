@@ -96,6 +96,14 @@
   min-width: 48px;
 }
 
+.facsimile-table-column-heading:hover {
+  z-index: 10;
+}
+
+.facsimile-table-row-heading:hover {
+  z-index: 10;
+}
+
 .facsimile-table-quick-insert {
   position: absolute;
   z-index: 8;
@@ -133,6 +141,17 @@
   transform: translate(50%, -50%) scale(1);
 }
 
+.facsimile-table-quick-insert-column.is-edge {
+  right: 4px;
+  transform: translate(0, -50%) scale(0.82);
+}
+
+.facsimile-table-column-heading:hover .facsimile-table-quick-insert-column.is-edge,
+.facsimile-table-quick-insert-column.is-edge:hover,
+.facsimile-table-quick-insert-column.is-edge:focus-visible {
+  transform: translate(0, -50%) scale(1);
+}
+
 .facsimile-table-quick-insert-row {
   right: 2px;
   bottom: 2px;
@@ -143,6 +162,17 @@
 .facsimile-table-quick-insert-row:hover,
 .facsimile-table-quick-insert-row:focus-visible {
   transform: translateY(50%) scale(1);
+}
+
+.facsimile-table-quick-insert-row.is-edge {
+  bottom: 4px;
+  transform: translateY(0) scale(0.82);
+}
+
+.facsimile-table-row-heading:hover .facsimile-table-quick-insert-row.is-edge,
+.facsimile-table-quick-insert-row.is-edge:hover,
+.facsimile-table-quick-insert-row.is-edge:focus-visible {
+  transform: translateY(0) scale(1);
 }
 
 .facsimile-table-quick-insert.ant-btn[disabled] {
