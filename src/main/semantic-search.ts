@@ -3157,10 +3157,9 @@ function createSearchHit(
     occurrenceIndex,
   }
   const locatorContext = getCanonicalLocatorContext(locator)
-  const stableLocator = stableLocatorFromLegacySearchLocator(
-    locator.blockId ? { ...locator, charStart: 0, charEnd: 0 } : locator,
-    locatorContext,
-  )
+  const stableLocator = locator.blockId
+    ? stableLocatorFromLegacySearchLocator({ ...locator, charStart: 0, charEnd: 0 }, locatorContext)
+    : stableLocatorFromLegacySearchLocator(locator, getCanonicalLocatorContext(locator))
   return {
     id: `${row.segment_id}:${occurrenceIndex}:${hit.index}`,
     locator,
