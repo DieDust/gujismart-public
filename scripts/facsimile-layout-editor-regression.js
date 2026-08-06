@@ -66,7 +66,15 @@ const blockEditingTranspiled = ts.transpileModule(blockEditingHelperSource, {
     target: ts.ScriptTarget.ES2022,
   },
 }).outputText
-new Function('exports', 'module', 'require', blockEditingTranspiled)(blockEditingHelperModule.exports, blockEditingHelperModule, require)
+const blockEditingRequire = (request) => {
+  if (request === './facsimileTableEditing') return helperModule.exports
+  return require(request)
+}
+new Function('exports', 'module', 'require', blockEditingTranspiled)(
+  blockEditingHelperModule.exports,
+  blockEditingHelperModule,
+  blockEditingRequire,
+)
 
 const {
   buildFacsimileTableCells,
@@ -1236,12 +1244,14 @@ const {
   clampFacsimileTableContextMenuPosition,
   createFacsimileTableCellContextSelection,
   createFacsimileTableHeaderContextSelection,
+  createFacsimileTableSnapshot,
   createFacsimileTableThemeStyle,
   expandFacsimileTableSelectionForMerges,
   getFacsimileTableEditorKeyIntent,
   getFacsimileTableCommandAvailability,
   reconcileFacsimileTableEditorIdentity,
   reduceFacsimileTableHistory,
+  resolveFacsimileTableResize,
   resolveFacsimileTableCellContextSelection,
   serializeFacsimileTableSelectionForClipboard,
   serializeFacsimileTableSelectionAsTsv,
@@ -1258,18 +1268,29 @@ for (const [name, value] of Object.entries({
   clampFacsimileTableContextMenuPosition,
   createFacsimileTableCellContextSelection,
   createFacsimileTableHeaderContextSelection,
+  createFacsimileTableSnapshot,
   createFacsimileTableThemeStyle,
   expandFacsimileTableSelectionForMerges,
   getFacsimileTableEditorKeyIntent,
   getFacsimileTableCommandAvailability,
   reconcileFacsimileTableEditorIdentity,
   reduceFacsimileTableHistory,
+  resolveFacsimileTableResize,
   resolveFacsimileTableCellContextSelection,
   serializeFacsimileTableSelectionForClipboard,
   serializeFacsimileTableSelectionAsTsv,
 })) {
   assert.strictEqual(typeof value, 'function', `${name} must be an executable pure editor helper`)
 }
+const resizeImplementationStart = tableEditor.indexOf('const startResize = (')
+const resizeImplementationEnd = tableEditor.indexOf('const resetSize = (', resizeImplementationStart)
+const resizeImplementation = tableEditor.slice(resizeImplementationStart, resizeImplementationEnd)
+assert.ok(resizeImplementation.includes('resolveFacsimileTableResize('), 'resize completion must pass through the tested commit/cancel resolver')
+assert.strictEqual(
+  resizeImplementation.match(/emitSnapshot\(/g)?.length,
+  1,
+  'the pointerup integration must expose exactly one outward snapshot emission site',
+)
 
 for (const interaction of ['pointer', 'keyboard', 'paste', 'copy', 'cut', 'mutation', 'context-menu', 'toolbar', 'resize', 'textarea']) {
   assert.strictEqual(canHandleFacsimileTableInteraction(false, interaction), true, `${interaction} must remain enabled by default`)
@@ -1692,17 +1713,56 @@ assert.deepStrictEqual(
 )
 
 {
+  const beforeResize = createFacsimileTableSnapshot(
+    [['A', 'B']],
+    [],
+    [40],
+    [120, 120],
+  )
+  const draggedResize = createFacsimileTableSnapshot(
+    beforeResize.rows,
+    beforeResize.merges,
+    [64],
+    [120, 168],
+  )
+  const committedResize = resolveFacsimileTableResize(beforeResize, draggedResize, 'commit', false)
+  assert.strictEqual(committedResize.shouldCommit, true, 'a changed pointerup resize must produce one outward commit')
+  assert.deepStrictEqual(committedResize.snapshot.rowHeights, [64])
+  assert.deepStrictEqual(committedResize.snapshot.columnWidths, [120, 168])
+  const reopenedResize = createFacsimileTableSnapshot(
+    committedResize.snapshot.rows,
+    committedResize.snapshot.merges,
+    committedResize.snapshot.rowHeights,
+    committedResize.snapshot.columnWidths,
+  )
+  assert.deepStrictEqual(reopenedResize, committedResize.snapshot, 'persisted resize dimensions must survive editor reopen normalization')
+  assert.strictEqual(
+    resolveFacsimileTableResize(beforeResize, beforeResize, 'commit', false).shouldCommit,
+    false,
+    'pointerup without a size change must not emit a duplicate snapshot',
+  )
+  assert.deepStrictEqual(
+    resolveFacsimileTableResize(beforeResize, draggedResize, 'cancel', false),
+    { snapshot: beforeResize, shouldCommit: false },
+    'pointercancel and lost capture must roll back the local preview without submitting it',
+  )
+  assert.deepStrictEqual(
+    resolveFacsimileTableResize(beforeResize, draggedResize, 'commit', true),
+    { snapshot: beforeResize, shouldCommit: false },
+    'becoming disabled during a resize must roll back instead of submitting',
+  )
+
   const listeners = new Map()
   const removed = []
   let releases = 0
-  let finished = 0
+  const outcomes = []
   const target = {
     addEventListener(type, listener) { listeners.set(type, listener) },
     removeEventListener(type, listener) { removed.push([type, listener]) },
     hasPointerCapture() { return true },
     releasePointerCapture() { releases += 1 },
   }
-  const cleanup = attachFacsimileTableResizeListeners(target, 7, () => {}, () => { finished += 1 })
+  const cleanup = attachFacsimileTableResizeListeners(target, 7, () => {}, (outcome) => { outcomes.push(outcome) })
   assert.deepStrictEqual(
     [...listeners.keys()].sort(),
     ['lostpointercapture', 'pointercancel', 'pointermove', 'pointerup'],
@@ -1711,10 +1771,34 @@ assert.deepStrictEqual(
   listeners.get('pointercancel')({})
   assert.strictEqual(removed.length, 4, 'finishing resize must remove every registered listener')
   assert.strictEqual(releases, 1)
-  assert.strictEqual(finished, 1)
+  assert.deepStrictEqual(outcomes, ['cancel'], 'pointercancel must never be mistaken for a committed resize')
   cleanup()
   assert.strictEqual(removed.length, 4, 'resize cleanup must be idempotent')
-  assert.strictEqual(finished, 1)
+  assert.deepStrictEqual(outcomes, ['cancel'])
+
+  const lostListeners = new Map()
+  const lostOutcomes = []
+  attachFacsimileTableResizeListeners({
+    addEventListener(type, listener) { lostListeners.set(type, listener) },
+    removeEventListener() {},
+    hasPointerCapture() { return false },
+    releasePointerCapture() { throw new Error('no capture should be released') },
+  }, 9, () => {}, (outcome) => { lostOutcomes.push(outcome) })
+  lostListeners.get('lostpointercapture')({})
+  assert.deepStrictEqual(lostOutcomes, ['cancel'], 'lost pointer capture must cancel without submitting the resize')
+
+  const commitListeners = new Map()
+  const commitOutcomes = []
+  const commitCleanup = attachFacsimileTableResizeListeners({
+    addEventListener(type, listener) { commitListeners.set(type, listener) },
+    removeEventListener() {},
+    hasPointerCapture() { return false },
+    releasePointerCapture() { throw new Error('no capture should be released') },
+  }, 8, () => {}, (outcome) => { commitOutcomes.push(outcome) })
+  commitListeners.get('pointerup')({})
+  commitListeners.get('lostpointercapture')({})
+  commitCleanup()
+  assert.deepStrictEqual(commitOutcomes, ['commit'], 'pointerup must commit exactly once despite later cleanup signals')
 }
 
 {
@@ -1945,14 +2029,26 @@ assert.deepStrictEqual(createManualLayoutTableSnapshot(tableConversionSource), {
 }, 'alias-rich active tables must normalize to one bounded canonical archive')
 assert.deepStrictEqual(createManualLayoutTableSnapshot({
   label: 'table',
-  table_html: '<table><tr><td rowspan="2">甲</td><td>乙</td></tr><tr><td>丙</td></tr></table>',
+  table_html: '<table><tr><td rowspan="2" colspan="2">Alpha&amp;Beta<br>Gamma&nbsp;&lt;delta&gt;</td><td>&quot;quoted&quot; &apos;single&apos;</td></tr><tr><td>tail</td></tr></table>',
 }), {
   version: 1,
-  rows: [['甲', '乙'], ['', '丙']],
-  merges: [{ row: 0, col: 0, rowSpan: 2, colSpan: 1 }],
+  rows: [["Alpha&Beta\nGamma <delta>", '', '"quoted" \'single\''], ['', '', 'tail']],
+  merges: [{ row: 0, col: 0, rowSpan: 2, colSpan: 2 }],
   rowHeights: [40, 40],
-  columnWidths: [120, 120],
-}, 'legacy HTML-only archives must remain readable and normalize row spans without retaining markup aliases')
+  columnWidths: [120, 120, 120],
+}, 'legacy HTML-only archives must decode entities and line breaks while preserving row and column spans')
+assert.ok(
+  blockEditingHelperSource.includes('parseFacsimileTableClipboardData'),
+  'legacy block archives must reuse the canonical table HTML parser',
+)
+assert.ok(
+  !blockEditingHelperSource.includes("replace(/<[^>]+>/g, '')"),
+  'legacy HTML archives must not lose structured text through regex tag stripping',
+)
+assert.ok(
+  !helperSource.includes("from './manualLayoutBlockEditing'"),
+  'the canonical clipboard parser must remain below manual block editing in the dependency graph',
+)
 assert.ok(getManualLayoutBlockConversionWarning(tableConversionSource, 'text'), 'structured-to-text conversion must require a warning')
 assert.strictEqual(applyManualLayoutBlockConversion(tableConversionSource, 'text', false).blocked, true, 'unconfirmed structured conversion must be blocked')
 const confirmedTableConversion = applyManualLayoutBlockConversion(tableConversionSource, 'text', true)

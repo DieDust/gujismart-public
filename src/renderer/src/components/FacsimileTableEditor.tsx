@@ -194,6 +194,13 @@ export type FacsimileTableResizeTarget = {
   releasePointerCapture: (pointerId: number) => void
 }
 
+export type FacsimileTableResizeOutcome = 'commit' | 'cancel'
+
+export type FacsimileTableResizeResolution = {
+  snapshot: TableSnapshot
+  shouldCommit: boolean
+}
+
 export type FacsimileTableKeyboardTarget = {
   addEventListener: (type: 'keydown', listener: (event: unknown) => void) => void
   removeEventListener: (type: 'keydown', listener: (event: unknown) => void) => void
@@ -211,7 +218,7 @@ function cloneSnapshot(snapshot: TableSnapshot): TableSnapshot {
   }
 }
 
-function createSnapshot(
+export function createFacsimileTableSnapshot(
   rows: unknown,
   merges: FacsimileTableMerge[],
   rowHeights: unknown = [],
@@ -238,6 +245,23 @@ function normalizeSnapshot(snapshot: TableSnapshot): TableSnapshot {
 
 function snapshotSignature(snapshot: TableSnapshot): string {
   return JSON.stringify([snapshot.rows, snapshot.merges, snapshot.rowHeights, snapshot.columnWidths])
+}
+
+export function resolveFacsimileTableResize(
+  before: TableSnapshot,
+  after: TableSnapshot,
+  outcome: FacsimileTableResizeOutcome,
+  disabled: boolean,
+): FacsimileTableResizeResolution {
+  const baseline = normalizeSnapshot(before)
+  if (outcome !== 'commit' || disabled) {
+    return { snapshot: baseline, shouldCommit: false }
+  }
+  const next = normalizeSnapshot(after)
+  return {
+    snapshot: next,
+    shouldCommit: snapshotSignature(baseline) !== snapshotSignature(next),
+  }
 }
 
 function selectionsIntersect(left: FacsimileTableSelection, right: FacsimileTableSelection): boolean {
@@ -822,23 +846,26 @@ export function attachFacsimileTableResizeListeners(
   target: FacsimileTableResizeTarget,
   pointerId: number,
   onMove: FacsimileTableResizeListener,
-  onFinish: () => void,
+  onFinish: (outcome: FacsimileTableResizeOutcome) => void,
 ): () => void {
   let cleaned = false
-  const cleanup = () => {
+  const finish = (outcome: FacsimileTableResizeOutcome) => {
     if (cleaned) return
     cleaned = true
     target.removeEventListener('pointermove', onMove)
-    target.removeEventListener('pointerup', cleanup)
-    target.removeEventListener('pointercancel', cleanup)
-    target.removeEventListener('lostpointercapture', cleanup)
+    target.removeEventListener('pointerup', handlePointerUp)
+    target.removeEventListener('pointercancel', handleCancel)
+    target.removeEventListener('lostpointercapture', handleCancel)
     if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId)
-    onFinish()
+    onFinish(outcome)
   }
+  const handlePointerUp = () => finish('commit')
+  const handleCancel = () => finish('cancel')
+  const cleanup = () => finish('cancel')
   target.addEventListener('pointermove', onMove)
-  target.addEventListener('pointerup', cleanup)
-  target.addEventListener('pointercancel', cleanup)
-  target.addEventListener('lostpointercapture', cleanup)
+  target.addEventListener('pointerup', handlePointerUp)
+  target.addEventListener('pointercancel', handleCancel)
+  target.addEventListener('lostpointercapture', handleCancel)
   return cleanup
 }
 
@@ -968,7 +995,7 @@ export default function FacsimileTableEditor({
     }),
     [normalizedPropColumnWidths, normalizedPropMerges, normalizedPropRowHeights, normalizedPropRows],
   )
-  const [tableState, setTableState] = useState<TableSnapshot>(() => createSnapshot(rows, merges, rowHeights, columnWidths))
+  const [tableState, setTableState] = useState<TableSnapshot>(() => createFacsimileTableSnapshot(rows, merges, rowHeights, columnWidths))
   const tableStateRef = useRef(tableState)
   const onChangeRef = useRef(onChange)
   const editorKeyRef = useRef(editorKey)
@@ -1087,7 +1114,7 @@ export default function FacsimileTableEditor({
     const previous = tableStateRef.current
     const identityChanged = editorKeyRef.current !== editorKey
     const next = identityChanged
-      ? createSnapshot(normalizedPropRows, normalizedPropMerges, normalizedPropRowHeights, normalizedPropColumnWidths)
+      ? createFacsimileTableSnapshot(normalizedPropRows, normalizedPropMerges, normalizedPropRowHeights, normalizedPropColumnWidths)
       : normalizeSnapshot({
           rows: normalizedPropRows,
           merges: normalizedPropMerges,
@@ -1453,16 +1480,21 @@ export default function FacsimileTableEditor({
       releasePointerCapture: (id) => handle.releasePointerCapture(id),
     }
     let cleanup: () => void = () => undefined
-    cleanup = attachFacsimileTableResizeListeners(resizeTarget, pointerId, handleMove, () => {
+    cleanup = attachFacsimileTableResizeListeners(resizeTarget, pointerId, handleMove, (outcome) => {
       if (resizeCleanupRef.current === cleanup) resizeCleanupRef.current = null
       const after = tableStateRef.current
+      const resolution = resolveFacsimileTableResize(before, after, outcome, disabledRef.current)
+      tableStateRef.current = resolution.snapshot
+      if (mountedRef.current) setTableState(resolution.snapshot)
+      if (!resolution.shouldCommit) return
       const baseHistory = {
         past: undoStackRef.current,
         present: before,
         future: redoStackRef.current,
       }
-      const history = reduceFacsimileTableHistory(baseHistory, { type: 'commit', snapshot: after })
+      const history = reduceFacsimileTableHistory(baseHistory, { type: 'commit', snapshot: resolution.snapshot })
       if (history !== baseHistory) updateHistoryRefs(history)
+      emitSnapshot(resolution.snapshot, before)
     })
     resizeCleanupRef.current = cleanup
   }

@@ -1,4 +1,11 @@
 import type { ManualLayoutBlockKind } from '@shared/manual-layout'
+import {
+  FACSIMILE_TABLE_DEFAULT_COLUMN_WIDTH,
+  FACSIMILE_TABLE_DEFAULT_ROW_HEIGHT,
+  FACSIMILE_TABLE_MAX_COLUMNS,
+  FACSIMILE_TABLE_MAX_ROWS,
+  parseFacsimileTableClipboardData,
+} from './facsimileTableEditing'
 
 export type ManualLayoutTool = 'select' | ManualLayoutBlockKind
 export type ManualLayoutResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw'
@@ -307,11 +314,6 @@ export interface ManualLayoutTableSnapshot {
   columnWidths: number[]
 }
 
-const MANUAL_LAYOUT_TABLE_MAX_ROWS = 2_000
-const MANUAL_LAYOUT_TABLE_MAX_COLUMNS = 256
-const MANUAL_LAYOUT_TABLE_DEFAULT_ROW_HEIGHT = 40
-const MANUAL_LAYOUT_TABLE_DEFAULT_COLUMN_WIDTH = 120
-
 function firstArrayValue(block: ManualLayoutEditableBlock, keys: readonly string[]): unknown[] {
   for (const key of keys) {
     const value = block[key]
@@ -349,49 +351,21 @@ function rowsFromCells(cells: unknown[]): string[][] {
   const rows: string[][] = []
   for (const rawCell of cells) {
     if (!isRecord(rawCell)) continue
-    const row = Math.min(MANUAL_LAYOUT_TABLE_MAX_ROWS - 1, cellInteger(rawCell, ['row', 'row_index', 'rowIndex']))
-    const col = Math.min(MANUAL_LAYOUT_TABLE_MAX_COLUMNS - 1, cellInteger(rawCell, ['col', 'col_index', 'colIndex']))
+    const row = Math.min(FACSIMILE_TABLE_MAX_ROWS - 1, cellInteger(rawCell, ['row', 'row_index', 'rowIndex']))
+    const col = Math.min(FACSIMILE_TABLE_MAX_COLUMNS - 1, cellInteger(rawCell, ['col', 'col_index', 'colIndex']))
     if (!rows[row]) rows[row] = []
     rows[row][col] = cellText(rawCell)
   }
   return rows
 }
 
-function parsePositiveSpan(attributes: string, name: 'rowspan' | 'colspan'): number {
-  const match = attributes.match(new RegExp(`\\b${name}\\s*=\\s*["']?(\\d+)`, 'i'))
-  const maximum = name === 'rowspan' ? MANUAL_LAYOUT_TABLE_MAX_ROWS : MANUAL_LAYOUT_TABLE_MAX_COLUMNS
-  return match ? Math.min(maximum, Math.max(1, Math.floor(Number(match[1])))) : 1
-}
-
 function tableFromHtml(block: ManualLayoutEditableBlock): { rows: string[][]; merges: ManualLayoutTableMerge[] } {
   const html = firstStringValue(block, ['html', 'table_html', 'tableHtml'])
   if (!html) return { rows: [], merges: [] }
-  const rows: string[][] = []
-  const merges: ManualLayoutTableMerge[] = []
-  const occupied = new Set<string>()
-  const rawRows = Array.from(html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)).slice(0, MANUAL_LAYOUT_TABLE_MAX_ROWS)
-  rawRows.forEach((rowMatch, row) => {
-    const cells = Array.from(rowMatch[1].matchAll(/<(?:td|th)\b([^>]*)>([\s\S]*?)<\/(?:td|th)>/gi))
-      .slice(0, MANUAL_LAYOUT_TABLE_MAX_COLUMNS)
-    if (cells.length === 0) return
-    if (!rows[row]) rows[row] = []
-    let col = 0
-    for (const cellMatch of cells) {
-      while (occupied.has(`${row}:${col}`)) col += 1
-      if (col >= MANUAL_LAYOUT_TABLE_MAX_COLUMNS) break
-      const rowSpan = Math.min(MANUAL_LAYOUT_TABLE_MAX_ROWS - row, parsePositiveSpan(cellMatch[1], 'rowspan'))
-      const colSpan = Math.min(MANUAL_LAYOUT_TABLE_MAX_COLUMNS - col, parsePositiveSpan(cellMatch[1], 'colspan'))
-      rows[row][col] = cellMatch[2].replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').trim()
-      for (let coveredRow = row; coveredRow < row + rowSpan; coveredRow += 1) {
-        for (let coveredCol = col; coveredCol < col + colSpan; coveredCol += 1) {
-          if (coveredRow !== row || coveredCol !== col) occupied.add(`${coveredRow}:${coveredCol}`)
-        }
-      }
-      if (rowSpan > 1 || colSpan > 1) merges.push({ row, col, rowSpan, colSpan })
-      col += colSpan
-    }
-  })
-  return { rows, merges }
+  const parsed = parseFacsimileTableClipboardData({ html })
+  return parsed.source === 'html'
+    ? { rows: parsed.rows, merges: parsed.merges }
+    : { rows: [], merges: [] }
 }
 
 function rowsFromMarkup(block: ManualLayoutEditableBlock): string[][] {
@@ -410,7 +384,7 @@ function normalizeTableRows(block: ManualLayoutEditableBlock): string[][] {
   const rawRows = directRows.length > 0
     ? directRows
     : rowsFromCells(firstArrayValue(block, ['cells', 'table_cells', 'tableCells']))
-  const sourceRows = (rawRows.length > 0 ? rawRows : rowsFromMarkup(block)).slice(0, MANUAL_LAYOUT_TABLE_MAX_ROWS)
+  const sourceRows = (rawRows.length > 0 ? rawRows : rowsFromMarkup(block)).slice(0, FACSIMILE_TABLE_MAX_ROWS)
   const rows = Array.from({ length: sourceRows.length }, (_, rowIndex) => {
     const rawRow = sourceRows[rowIndex]
     const rowValues = Array.isArray(rawRow)
@@ -418,7 +392,7 @@ function normalizeTableRows(block: ManualLayoutEditableBlock): string[][] {
       : isRecord(rawRow) && Array.isArray(rawRow.cells)
         ? rawRow.cells
         : []
-    return rowValues.slice(0, MANUAL_LAYOUT_TABLE_MAX_COLUMNS).map((value) => (
+    return rowValues.slice(0, FACSIMILE_TABLE_MAX_COLUMNS).map((value) => (
       isRecord(value)
         ? cellText(value)
         : typeof value === 'string'
@@ -443,7 +417,7 @@ function normalizeTableMerges(block: ManualLayoutEditableBlock, rows: string[][]
     : legacyCells.length > 0
       ? legacyCells
       : tableFromHtml(block).merges
-  const candidates = source.slice(0, MANUAL_LAYOUT_TABLE_MAX_ROWS * MANUAL_LAYOUT_TABLE_MAX_COLUMNS).flatMap((rawMerge) => {
+  const candidates = source.slice(0, FACSIMILE_TABLE_MAX_ROWS * FACSIMILE_TABLE_MAX_COLUMNS).flatMap((rawMerge) => {
     if (!isRecord(rawMerge)) return []
     const row = cellInteger(rawMerge, ['row', 'row_index', 'rowIndex'])
     const col = cellInteger(rawMerge, ['col', 'col_index', 'colIndex'])
@@ -497,13 +471,13 @@ export function createManualLayoutTableSnapshot(block: ManualLayoutEditableBlock
       block,
       ['rowHeights', 'row_heights', 'rowSizes', 'row_sizes'],
       rows.length,
-      MANUAL_LAYOUT_TABLE_DEFAULT_ROW_HEIGHT,
+      FACSIMILE_TABLE_DEFAULT_ROW_HEIGHT,
     ),
     columnWidths: normalizeTableSizes(
       block,
       ['columnWidths', 'column_widths', 'colSizes', 'col_sizes'],
       rows[0]?.length || 1,
-      MANUAL_LAYOUT_TABLE_DEFAULT_COLUMN_WIDTH,
+      FACSIMILE_TABLE_DEFAULT_COLUMN_WIDTH,
     ),
   }
 }
