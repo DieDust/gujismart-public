@@ -15,6 +15,8 @@ import type {
   ManualPageImageAsset,
   ManualPageImageCrop,
 } from '../shared/types'
+import { isStableManualLayoutBlockId } from '../shared/manual-layout'
+export { isStableManualLayoutBlockId } from '../shared/manual-layout'
 import { getPdfJsNodeDocumentOptions } from './pdfjs-assets'
 
 export type ManualPageAssetErrorCode =
@@ -46,6 +48,88 @@ export interface ManualPagePixelCrop {
   y: number
   width: number
   height: number
+}
+
+export interface ManualPageDecodedImage {
+  isEmpty: () => boolean
+  getSize: () => ManualPageImageSize
+}
+
+export function assertDecodedManualPageImage(image: ManualPageDecodedImage): ManualPageImageSize {
+  if (!image || image.isEmpty()) throw new ManualPageAssetError('decode-failed', '图片解码失败')
+  const size = image.getSize()
+  const width = Math.round(finitePositive(size?.width))
+  const height = Math.round(finitePositive(size?.height))
+  if (!width || !height || width * height > MAX_CROP_PIXELS) {
+    throw new ManualPageAssetError('decode-failed', '图片尺寸无效或过大')
+  }
+  return { width, height }
+}
+
+export interface ManualPageAssetCommitOperations {
+  writeTemp: (tempPath: string, bytes: Uint8Array) => void
+  getTempSize: (tempPath: string) => number
+  renameTemp: (tempPath: string, targetPath: string) => void
+  removeTemp: (tempPath: string) => void
+}
+
+export function commitManualPageAssetFile(input: {
+  tempPath: string
+  targetPath: string
+  pngBytes: Uint8Array
+  operations: ManualPageAssetCommitOperations
+}): void {
+  try {
+    input.operations.writeTemp(input.tempPath, input.pngBytes)
+    if (input.operations.getTempSize(input.tempPath) <= 0) {
+      throw new ManualPageAssetError('write-failed', '临时资源写入失败')
+    }
+    input.operations.renameTemp(input.tempPath, input.targetPath)
+  } catch (error) {
+    try {
+      input.operations.removeTemp(input.tempPath)
+    } catch {
+      // Cleanup is best effort; the previous committed target is never removed here.
+    }
+    if (error instanceof ManualPageAssetError) throw error
+    throw new ManualPageAssetError('write-failed', String((error as Error)?.message || error || '资源写入失败'))
+  }
+}
+
+export interface ManualPageAssetOwnershipInput {
+  pageId: string
+  docId: string
+  activeProjectId: string
+  ownsDocument: (docId: string, projectId: string) => boolean
+}
+
+export function assertManualPageAssetOwnership(input: ManualPageAssetOwnershipInput): void {
+  const pageId = String(input?.pageId || '').trim()
+  const docId = String(input?.docId || '').trim()
+  const projectId = String(input?.activeProjectId || '').trim()
+  if (!pageId || !docId || !projectId || pageId.length > 220 || docId.length > 180 || projectId.length > 220) {
+    throw new ManualPageAssetError('invalid-request', '页面或项目标识无效')
+  }
+  if (!input.ownsDocument(docId, projectId)) {
+    throw new ManualPageAssetError('invalid-request', '页面不属于当前项目')
+  }
+}
+
+export function assertStableManualPageBlockId(pageId: string, blockId: string): string {
+  const normalized = String(blockId || '').trim()
+  if (!isStableManualLayoutBlockId(pageId, normalized)) {
+    throw new ManualPageAssetError('invalid-request', 'blockId 不是当前页面的稳定人工区块 ID')
+  }
+  return normalized
+}
+
+export async function selectManualPageAssetOnly<T>(input: {
+  selectSource: () => Promise<string | null>
+  copySource: (sourcePath: string) => Promise<T>
+}): Promise<T | null> {
+  const sourcePath = await input.selectSource()
+  if (!sourcePath) return null
+  return input.copySource(sourcePath)
 }
 
 type PdfJsPage = {
@@ -319,22 +403,18 @@ export function atomicWriteManualPageAsset(
   const safeTargetPath = prepareManagedAssetTarget(targetPath, documentRoot)
   const targetDir = dirname(safeTargetPath)
   const tempPath = join(targetDir, `.${randomUUID()}.tmp`)
-  try {
-    writeFileSync(tempPath, pngBytes, { flag: 'wx' })
-    if (!existsSync(tempPath) || statSync(tempPath).size <= 0) {
-      throw new ManualPageAssetError('write-failed', '临时资源写入失败')
-    }
-    renameSync(tempPath, safeTargetPath)
-    return { assetPath: safeTargetPath, width: 0, height: 0 }
-  } catch (error) {
-    try {
-      rmSync(tempPath, { force: true })
-    } catch {
-      // Best-effort cleanup; never remove the previous committed asset.
-    }
-    if (error instanceof ManualPageAssetError) throw error
-    throw new ManualPageAssetError('write-failed', String((error as Error)?.message || error || '资源写入失败'))
-  }
+  commitManualPageAssetFile({
+    tempPath,
+    targetPath: safeTargetPath,
+    pngBytes,
+    operations: {
+      writeTemp: (path, bytes) => writeFileSync(path, bytes, { flag: 'wx' }),
+      getTempSize: (path) => existsSync(path) ? statSync(path).size : 0,
+      renameTemp: (source, target) => renameSync(source, target),
+      removeTemp: (path) => rmSync(path, { force: true }),
+    },
+  })
+  return { assetPath: safeTargetPath, width: 0, height: 0 }
 }
 
 export async function renderManualPdfPageToPng(

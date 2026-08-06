@@ -19,6 +19,20 @@ const draftHelperPath = path.join(root, 'src/renderer/src/hooks/useManualLayoutD
 const draftHelperSource = fs.existsSync(draftHelperPath) ? fs.readFileSync(draftHelperPath, 'utf8') : ''
 const draftHelperModule = { exports: {} }
 if (draftHelperSource) {
+  const sharedManualLayoutPath = path.join(root, 'src/shared/manual-layout.ts')
+  const sharedManualLayoutSource = fs.readFileSync(sharedManualLayoutPath, 'utf8')
+  const sharedManualLayoutModule = { exports: {} }
+  const sharedManualLayoutTranspiled = ts.transpileModule(sharedManualLayoutSource, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  new Function('exports', 'module', 'require', sharedManualLayoutTranspiled)(
+    sharedManualLayoutModule.exports,
+    sharedManualLayoutModule,
+    require,
+  )
   const draftTranspiled = ts.transpileModule(draftHelperSource, {
     compilerOptions: {
       esModuleInterop: true,
@@ -27,7 +41,11 @@ if (draftHelperSource) {
       target: ts.ScriptTarget.ES2022,
     },
   }).outputText
-  new Function('exports', 'module', 'require', draftTranspiled)(draftHelperModule.exports, draftHelperModule, require)
+  const draftRequire = (request) => {
+    if (request === '@shared/manual-layout') return sharedManualLayoutModule.exports
+    return require(request)
+  }
+  new Function('exports', 'module', 'require', draftTranspiled)(draftHelperModule.exports, draftHelperModule, draftRequire)
 }
 
 const textEditorSavingPath = path.join(root, 'src/renderer/src/utils/textEditorSaving.ts')

@@ -13,23 +13,33 @@ const source = fs.readFileSync(sourcePath, 'utf8')
 const preloadSource = fs.readFileSync(path.join(root, 'src', 'preload', 'index.ts'), 'utf8')
 const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'documents.ts'), 'utf8')
 const inspectorSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'ManualBlockInspector.tsx'), 'utf8')
+const rendererHelperPath = path.join(root, 'src', 'renderer', 'src', 'utils', 'manualImageAssetEditing.ts')
 assert.match(source, /validateManualPageImageCrop/, 'crop validation helper must be exported')
 assert.match(source, /buildManualPageAssetPath/, 'managed asset path helper must be exported')
 assert.match(source, /realpath/i, 'external source resolution must canonicalize real paths')
 assert.match(source, /rename|renameSync/, 'asset replacement must be atomic')
+assert.match(source, /assertManualPageAssetOwnership/, 'page ownership must have an executable dependency-injected guard')
+assert.match(source, /isStableManualLayoutBlockId/, 'asset service must reject non-manual block IDs')
+assert.match(source, /selectManualPageAssetOnly/, 'dialog cancellation must have an executable asset-only transition')
 assert.match(preloadSource, /cropManualPageImage:[\s\S]*pages:cropManualImage/, 'crop API must be exposed through preload')
 assert.match(preloadSource, /selectManualBlockImage:[\s\S]*pages:selectManualImage/, 'replacement API must be exposed through preload')
-assert.match(documentsSource, /assertDocumentInLibraryProject\(rawPage\.doc_id, getActiveLibraryProjectId\(\)\)/, 'page ownership must be checked against the active project')
-assert.match(documentsSource, /findOwnedManualPageImageBlock/, 'crop must validate block ownership')
-assert.match(documentsSource, /preparePagePayloadUpdate[\s\S]*runAsync[\s\S]*rmSync\(assetPath/, 'new crop must be persisted before failures can remove only the new asset')
+assert.match(documentsSource, /assertManualPageAssetOwnership\([\s\S]*getActiveLibraryProjectId\(\)/, 'page ownership must be checked against the active project')
+assert.doesNotMatch(documentsSource, /findOwnedManualPageImageBlock/, 'asset-only IPC must not inspect persisted layout blocks')
+const cropHandlerStart = documentsSource.indexOf('async function cropManualPageImageAsset')
+const cropHandlerEnd = documentsSource.indexOf('async function selectManualPageImageAsset', cropHandlerStart)
+assert.ok(cropHandlerStart >= 0 && cropHandlerEnd > cropHandlerStart, 'crop asset-only handler must exist')
+const cropHandlerSource = documentsSource.slice(cropHandlerStart, cropHandlerEnd)
+assert.doesNotMatch(cropHandlerSource, /ocr_result|layout_result|preparePagePayloadUpdate|runAsync|UPDATE pages/, 'crop IPC must never rewrite the page OCR payload')
 assert.match(documentsSource, /resolveRepositoryImageSource\(selectedPath, getPdfRepositoryPaths\(\)\)/, 'replacement selection must remain inside configured repository roots')
 assert.match(inspectorSource, /window\.api\.cropManualPageImage/, 'inspector must invoke the required crop API directly')
 assert.match(inspectorSource, /window\.api\.selectManualBlockImage/, 'inspector must invoke the required replacement API directly')
 assert.doesNotMatch(inspectorSource, /cropManualPageImage\?\.|selectManualBlockImage\?\./, 'manual image APIs must not be optional probes')
 assert.match(inspectorSource, /setImageError[\s\S]*finally[\s\S]*setImageAction\(null\)/, 'failed image actions must stay retryable without clearing the block')
+assert.ok(fs.existsSync(rendererHelperPath), 'renderer asset metadata transition helper must exist')
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-manual-page-assets-'))
 const bundlePath = path.join(tempRoot, 'manual-page-assets.cjs')
+async function run() {
 try {
   buildSync({
     entryPoints: [sourcePath],
@@ -41,6 +51,29 @@ try {
     logLevel: 'silent',
   })
   const api = require(bundlePath)
+  assert.doesNotThrow(() => api.assertManualPageAssetOwnership({
+    pageId: 'page-1',
+    docId: 'doc-1',
+    activeProjectId: 'project-a',
+    ownsDocument: (_docId, projectId) => projectId === 'project-a',
+  }))
+  assert.throws(() => api.assertManualPageAssetOwnership({
+    pageId: 'page-1',
+    docId: 'doc-1',
+    activeProjectId: 'project-b',
+    ownsDocument: (_docId, projectId) => projectId === 'project-a',
+  }))
+  const unsavedBlockId = 'manual-page-1-550e8400-e29b-41d4-a716-446655440000'
+  assert.strictEqual(api.isStableManualLayoutBlockId('page-1', unsavedBlockId), true, 'new unsaved manual blocks must be accepted')
+  for (const rejectedId of ['page-1:ir:block-1', 'page-1:draft:0', 'legacy-image', '../manual-page-1-bad']) {
+    assert.strictEqual(api.isStableManualLayoutBlockId('page-1', rejectedId), false, `${rejectedId} must be rejected`)
+  }
+  assert.throws(() => api.assertDecodedManualPageImage({ isEmpty: () => true, getSize: () => ({ width: 1, height: 1 }) }))
+  assert.throws(() => api.assertDecodedManualPageImage({ isEmpty: () => false, getSize: () => ({ width: 0, height: 1 }) }))
+  assert.deepStrictEqual(
+    api.assertDecodedManualPageImage({ isEmpty: () => false, getSize: () => ({ width: 100, height: 80 }) }),
+    { width: 100, height: 80 },
+  )
   const valid = api.validateManualPageImageCrop(
     { left: 10, top: 12, width: 40, height: 30 },
     { width: 100, height: 80 },
@@ -130,8 +163,71 @@ try {
   const selectedAssetPath = api.buildManualPageSelectedAssetPath(dataDir, 'doc-1', 'page-1', 5)
   api.atomicWriteManualPageAsset(selectedAssetPath, syntheticPng, managedRoot)
   assert.deepStrictEqual(fs.readFileSync(selectedAssetPath), syntheticPng, 'selected repository image bytes must be copied into managed storage')
+
+  const commitState = { tempExists: false, target: 'old-target', cleanupCalls: 0 }
+  assert.throws(() => api.commitManualPageAssetFile({
+    tempPath: 'asset.tmp',
+    targetPath: 'asset.png',
+    pngBytes: syntheticPng,
+    operations: {
+      writeTemp: () => { commitState.tempExists = true },
+      getTempSize: () => syntheticPng.length,
+      renameTemp: () => { throw new Error('simulated rename failure') },
+      removeTemp: () => { commitState.tempExists = false; commitState.cleanupCalls += 1 },
+    },
+  }))
+  assert.strictEqual(commitState.tempExists, false, 'failed commit must clean the temporary file')
+  assert.strictEqual(commitState.target, 'old-target', 'failed commit must not alter the previous target')
+  assert.strictEqual(commitState.cleanupCalls, 1)
+
+  let copiedSelection = false
+  const cancelledSelection = await api.selectManualPageAssetOnly({
+    selectSource: async () => null,
+    copySource: async () => { copiedSelection = true; return { assetPath: 'unexpected', width: 1, height: 1 } },
+  })
+  assert.strictEqual(cancelledSelection, null)
+  assert.strictEqual(copiedSelection, false, 'dialog cancellation must not create a managed asset')
+
+  const rendererSource = fs.readFileSync(rendererHelperPath, 'utf8')
+  const rendererTranspiled = require('typescript').transpileModule(rendererSource, {
+    compilerOptions: { module: require('typescript').ModuleKind.CommonJS, target: require('typescript').ScriptTarget.ES2022 },
+  }).outputText
+  const rendererModule = { exports: {} }
+  new Function('exports', 'module', 'require', rendererTranspiled)(rendererModule.exports, rendererModule, require)
+  const previousMetadata = {
+    image_asset_path: 'old.png',
+    image_asset_width: 10,
+    image_asset_height: 12,
+    image_crop: { source_page_id: 'page-1', left: 1, top: 2, width: 3, height: 4 },
+  }
+  assert.strictEqual(rendererModule.exports.createManualImageAssetUpdate({ status: 'cancelled', previous: previousMetadata }), null)
+  assert.strictEqual(rendererModule.exports.createManualImageAssetUpdate({ status: 'failed', previous: previousMetadata }), null)
+  const successUpdate = rendererModule.exports.createManualImageAssetUpdate({
+    status: 'success',
+    previous: previousMetadata,
+    pageId: 'page-1',
+    blockId: unsavedBlockId,
+    asset: { assetPath: 'new.png', width: 50, height: 60 },
+    crop: { left: 5, top: 6, width: 7, height: 8 },
+  })
+  assert.deepStrictEqual(successUpdate, {
+    manual_block_id: unsavedBlockId,
+    segmentation_source: 'manual',
+    image_asset_path: 'new.png',
+    asset_path: 'new.png',
+    image_path: 'new.png',
+    image_asset_width: 50,
+    image_asset_height: 60,
+    image_crop: { source_page_id: 'page-1', left: 5, top: 6, width: 7, height: 8 },
+  })
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
 }
+}
 
-console.log('Manual page assets regression passed')
+run().then(() => {
+  console.log('Manual page assets regression passed')
+}).catch((error) => {
+  console.error(error)
+  process.exitCode = 1
+})

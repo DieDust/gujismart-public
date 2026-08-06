@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
+import { createManualLayoutBlockId as createSharedManualLayoutBlockId } from '@shared/manual-layout'
 
 export type ManualLayoutDraftBlock = Record<string, unknown>
 export type ManualLayoutSaveState = 'clean' | 'dirty' | 'saving' | 'failed'
@@ -76,7 +77,6 @@ export type PendingManualLayoutPageAction = 'same-page' | 'apply-target' | 'conf
 const MANUAL_LAYOUT_DRAFT_STORAGE_PREFIX = 'gujismart.manual-layout-draft.v1:'
 const manualLayoutDraftStorageCache = new WeakMap<object, Map<string, StoredManualLayoutDraft | null>>()
 
-let manualBlockSequence = 0
 
 function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
@@ -169,12 +169,7 @@ function createLocalDraftId(pageId: string, block: ManualLayoutDraftBlock, index
 }
 
 export function createManualLayoutBlockId(pageId: string): string {
-  manualBlockSequence += 1
-  const randomId = typeof globalThis.crypto?.randomUUID === 'function'
-    ? globalThis.crypto.randomUUID()
-    : `${Date.now().toString(36)}-${manualBlockSequence.toString(36)}`
-  const safePageId = pageId.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 36) || 'page'
-  return `manual-${safePageId}-${randomId}`
+  return createSharedManualLayoutBlockId(pageId)
 }
 
 export function getManualLayoutDraftBlockId(

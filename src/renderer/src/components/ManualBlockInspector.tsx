@@ -5,7 +5,9 @@ import {
   ScissorOutlined,
 } from '@ant-design/icons'
 import {
+  createManualLayoutBlockId,
   getManualLayoutBlockKind,
+  isStableManualLayoutBlockId,
   type ManualLayoutBlockKind,
 } from '@shared/manual-layout'
 import { Alert, Button, Empty, Input, InputNumber, Segmented, Select, Space, Tag, Tooltip, message, theme } from 'antd'
@@ -13,6 +15,7 @@ import { useEffect, useState } from 'react'
 import FacsimileTableEditor, { type FacsimileTableEditorValue } from './FacsimileTableEditor'
 import type { FacsimileTableMerge } from '../utils/facsimileTableEditing'
 import { MANUAL_LAYOUT_BLOCK_KINDS } from '../utils/manualLayoutBlockEditing'
+import { createManualImageAssetUpdate } from '../utils/manualImageAssetEditing'
 import { MANUAL_LAYOUT_KIND_NAMES } from './ManualLayoutToolbar'
 import './ManualBlockInspector.css'
 
@@ -27,7 +30,6 @@ export type ManualBlockInspectorBlock = Record<string, unknown> & {
   image_asset_path?: string
   image_asset_width?: number
   image_asset_height?: number
-  image_asset_revision?: number
   asset_path?: string
   image_path?: string
   image_crop?: unknown
@@ -132,16 +134,21 @@ export default function ManualBlockInspector({
     }
     setImageAction('crop')
     setImageError('')
+    const persistedBlockId = stringValue(block.manual_block_id)
+    const assetBlockId = isStableManualLayoutBlockId(pageId, persistedBlockId)
+      ? persistedBlockId
+      : createManualLayoutBlockId(pageId)
     try {
-      const asset = await window.api.cropManualPageImage({ pageId, blockId, crop })
-      onChange({
-        image_asset_path: asset.assetPath,
-        asset_path: asset.assetPath,
-        image_path: asset.assetPath,
-        image_asset_width: asset.width,
-        image_asset_height: asset.height,
-        image_crop: { source_page_id: pageId, ...crop },
+      const asset = await window.api.cropManualPageImage({ pageId, blockId: assetBlockId, crop })
+      const update = createManualImageAssetUpdate({
+        status: 'success',
+        previous: block,
+        pageId,
+        blockId: assetBlockId,
+        asset,
+        crop,
       })
+      if (update) onChange(update)
       message.success('图片区块已从当前页底图重新裁剪')
     } catch (error) {
       setImageError(String((error as Error)?.message || error || '重新裁剪失败'))
@@ -154,17 +161,21 @@ export default function ManualBlockInspector({
     if (!block || !pageId || imageAction) return
     setImageAction('replace')
     setImageError('')
+    const persistedBlockId = stringValue(block.manual_block_id)
+    const assetBlockId = isStableManualLayoutBlockId(pageId, persistedBlockId)
+      ? persistedBlockId
+      : createManualLayoutBlockId(pageId)
     try {
       const asset = await window.api.selectManualBlockImage(pageId)
       if (!asset) return
-      onChange({
-        image_asset_path: asset.assetPath,
-        asset_path: asset.assetPath,
-        image_path: asset.assetPath,
-        image_asset_width: asset.width,
-        image_asset_height: asset.height,
-        image_crop: undefined,
+      const update = createManualImageAssetUpdate({
+        status: 'success',
+        previous: block,
+        pageId,
+        blockId: assetBlockId,
+        asset,
       })
+      if (update) onChange(update)
       message.success('已复制仓库图片并替换当前区块')
     } catch (error) {
       setImageError(String((error as Error)?.message || error || '替换图片失败'))

@@ -1,5 +1,7 @@
 type LayoutBlockRecord = Record<string, unknown>
 
+let manualLayoutBlockSequence = 0
+
 export type ManualLayoutBlockKind =
   | 'text'
   | 'title'
@@ -26,7 +28,6 @@ export interface ManualLayoutBlockMeta {
   image_asset_path?: string
   image_asset_width?: number
   image_asset_height?: number
-  image_asset_revision?: number
   image_crop?: {
     source_page_id: string
     left: number
@@ -67,6 +68,26 @@ const MANUAL_LAYOUT_BLOCK_KINDS = new Set<ManualLayoutBlockKind>([
   'image',
   'seal',
 ])
+
+function safeManualLayoutPageId(pageId: string): string {
+  return String(pageId || '').trim().replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 36) || 'page'
+}
+
+export function createManualLayoutBlockId(pageId: string): string {
+  manualLayoutBlockSequence += 1
+  const randomId = typeof globalThis.crypto?.randomUUID === 'function'
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now().toString(36)}-${manualLayoutBlockSequence.toString(36)}`
+  return `manual-${safeManualLayoutPageId(pageId)}-${randomId}`
+}
+
+export function isStableManualLayoutBlockId(pageId: string, blockId: string): boolean {
+  const normalized = String(blockId || '').trim()
+  const prefix = `manual-${safeManualLayoutPageId(pageId)}-`
+  if (!normalized.startsWith(prefix) || normalized.length > 180 || /[\\/\0]/.test(normalized)) return false
+  const suffix = normalized.slice(prefix.length)
+  return /^[A-Za-z0-9][A-Za-z0-9-]{5,100}$/.test(suffix)
+}
 
 const LEGACY_TEXT_FIELDS = [
   'words',

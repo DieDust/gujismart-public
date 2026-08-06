@@ -849,7 +849,6 @@ export interface OcrRecognizeLayoutBlock {
   image_asset_path?: string
   image_asset_width?: number
   image_asset_height?: number
-  image_asset_revision?: number
   image_crop?: ManualLayoutBlockMeta['image_crop']
   [key: string]: unknown
 }
