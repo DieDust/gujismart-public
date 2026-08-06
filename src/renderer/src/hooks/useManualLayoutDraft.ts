@@ -12,6 +12,7 @@ export interface ManualLayoutDraftState {
   revision: number
   acknowledgedRevision: number
   saveState: ManualLayoutSaveState
+  discardPending: boolean
 }
 
 export type ManualLayoutDraftAction =
@@ -23,11 +24,11 @@ export type ManualLayoutDraftAction =
   | { type: 'set-active'; blockId: string | null }
   | { type: 'save-started'; draftIdentity?: string; pageId?: string; revision: number }
   | { type: 'save-failed'; draftIdentity?: string; pageId?: string; revision: number }
-  | { type: 'server-ack'; draftIdentity?: string; pageId?: string; revision: number; blocks: ManualLayoutDraftBlock[] }
+  | { type: 'server-ack'; draftIdentity?: string; pageId?: string; revision: number; blocks: ManualLayoutDraftBlock[]; completeDiscard?: boolean }
   | { type: 'server-echo'; pageId: string; blocks: ManualLayoutDraftBlock[] }
   | { type: 'retry' }
   | { type: 'discard' }
-  | { type: 'discard-pending' }
+  | { type: 'discard-pending'; revision: number }
   | { type: 'page-changed'; pageId: string; draftIdentity: string; blocks: ManualLayoutDraftBlock[]; restoredState?: ManualLayoutDraftState | null }
 
 export type ManualLayoutSaveSchedule =
@@ -61,10 +62,12 @@ interface StoredManualLayoutDraft {
   draftIdentity: string
   pageId: string
   blocks: ManualLayoutDraftBlock[]
+  baselineBlocks?: ManualLayoutDraftBlock[]
   activeBlockId: string | null
   revision: number
   acknowledgedRevision: number
   saveState: Exclude<ManualLayoutSaveState, 'clean'>
+  discardPending: boolean
   updatedAt: number
 }
 
@@ -136,11 +139,14 @@ function readStoredManualLayoutDraft(
       || value.draftIdentity !== normalizedIdentity
       || typeof value.pageId !== 'string'
       || !Array.isArray(value.blocks)
+      || (value.baselineBlocks !== undefined && !Array.isArray(value.baselineBlocks))
       || !value.blocks.every(isRecord)
+      || (Array.isArray(value.baselineBlocks) && !value.baselineBlocks.every(isRecord))
       || (value.activeBlockId !== null && typeof value.activeBlockId !== 'string')
       || !Number.isInteger(value.revision)
       || !Number.isInteger(value.acknowledgedRevision)
       || typeof value.updatedAt !== 'number'
+      || (value.discardPending !== undefined && typeof value.discardPending !== 'boolean')
       || !['dirty', 'saving', 'failed'].includes(String(value.saveState))) {
       cache.set(normalizedIdentity, null)
       return null
@@ -274,10 +280,12 @@ export function persistManualLayoutDraftSnapshot(
       draftIdentity,
       pageId: state.pageId,
       blocks: state.blocks,
+      baselineBlocks: state.baselineBlocks,
       activeBlockId: state.activeBlockId,
       revision: state.revision,
       acknowledgedRevision: state.acknowledgedRevision,
       saveState: state.saveState,
+      discardPending: state.discardPending,
       updatedAt: Date.now(),
     }
     storage.setItem(key, JSON.stringify(stored))
@@ -318,7 +326,9 @@ export function restoreManualLayoutDraftSnapshot(
   if (!storage) return null
   const stored = readStoredManualLayoutDraft(storage, draftIdentity)
   if (!stored || stored.pageId !== pageId || stored.revision <= stored.acknowledgedRevision) return null
-  const baselineBlocks = prepareBlocks(pageId, serverBlocks)
+  const baselineBlocks = stored.discardPending && Array.isArray(stored.baselineBlocks)
+    ? prepareBlocks(pageId, stored.baselineBlocks)
+    : prepareBlocks(pageId, serverBlocks)
   const blocks = mergeAcknowledgedBlocks(pageId, prepareBlocks(pageId, stored.blocks), baselineBlocks)
   const activeBlockId = stored.activeBlockId && blocks.some((block, index) => (
     getManualLayoutDraftBlockId(pageId, block, index) === stored.activeBlockId
@@ -334,6 +344,7 @@ export function restoreManualLayoutDraftSnapshot(
     revision: Math.max(1, stored.revision),
     acknowledgedRevision: Math.max(0, Math.min(stored.acknowledgedRevision, stored.revision - 1)),
     saveState: stored.saveState === 'failed' ? 'failed' : 'dirty',
+    discardPending: stored.discardPending === true,
   }
 }
 
@@ -352,6 +363,7 @@ export function createManualLayoutDraft(
     revision: 0,
     acknowledgedRevision: 0,
     saveState: 'clean',
+    discardPending: false,
   }
 }
 
@@ -369,10 +381,15 @@ function nextEditedState(
   }
 }
 
+export function isManualLayoutContentMutationAction(action: ManualLayoutDraftAction): boolean {
+  return ['create', 'update', 'delete', 'replace', 'preview-replace'].includes(action.type)
+}
+
 export function reduceManualLayoutDraft(
   state: ManualLayoutDraftState,
   action: ManualLayoutDraftAction,
 ): ManualLayoutDraftState {
+  if (state.discardPending && isManualLayoutContentMutationAction(action)) return state
   switch (action.type) {
     case 'create': {
       const block = ensureManualLayoutBlockIdentity(state.pageId, action.block, state.blocks.length, true)
@@ -440,6 +457,7 @@ export function reduceManualLayoutDraft(
           baselineBlocks,
           acknowledgedRevision,
           saveState: state.saveState === 'failed' ? 'failed' : 'dirty',
+          discardPending: action.completeDiscard ? false : state.discardPending,
         }
       }
       return {
@@ -448,6 +466,7 @@ export function reduceManualLayoutDraft(
         baselineBlocks,
         acknowledgedRevision,
         saveState: 'clean',
+        discardPending: false,
       }
     }
     case 'server-echo': {
@@ -477,14 +496,16 @@ export function reduceManualLayoutDraft(
         activeBlockId: null,
         revision: state.acknowledgedRevision,
         saveState: 'clean',
+        discardPending: false,
       }
     case 'discard-pending':
       return {
         ...state,
         blocks: state.baselineBlocks.map((block) => ({ ...block })),
         activeBlockId: null,
-        revision: state.revision + 1,
+        revision: action.revision,
         saveState: 'saving',
+        discardPending: true,
       }
     case 'page-changed':
       return action.restoredState || createManualLayoutDraft(action.pageId, action.blocks, action.draftIdentity)
@@ -534,6 +555,94 @@ export function finalizeManualLayoutDraftOnUnmount(
   return true
 }
 
+export interface ManualLayoutDiscardCompensationSnapshot {
+  draftIdentity: string
+  pageId: string
+  blocks: ManualLayoutDraftBlock[]
+  revision: number
+}
+
+export function createManualLayoutDiscardCompensationSnapshot(
+  state: ManualLayoutDraftState,
+): ManualLayoutDiscardCompensationSnapshot {
+  return {
+    draftIdentity: state.draftIdentity,
+    pageId: state.pageId,
+    blocks: state.baselineBlocks.map((block) => ({ ...block })),
+    revision: state.revision + 1,
+  }
+}
+
+export async function runManualLayoutDiscardCompensation(
+  supersededSave: Promise<boolean>,
+  snapshot: ManualLayoutDiscardCompensationSnapshot,
+  persistBaseline: (snapshot: ManualLayoutDiscardCompensationSnapshot) => void | Promise<void>,
+): Promise<boolean> {
+  try {
+    await supersededSave
+  } catch {
+    // A rejected caller cannot prove that the underlying write did not land.
+    // The fixed baseline compensation must still run exactly once.
+  }
+  try {
+    await Promise.resolve(persistBaseline(snapshot))
+    return true
+  } catch {
+    return false
+  }
+}
+
+export interface ManualLayoutDraftPageTarget {
+  pageId: string
+  draftIdentity: string
+  blocks: ManualLayoutDraftBlock[]
+}
+
+export interface ManualLayoutDiscardQueueResult {
+  success: boolean
+  target: ManualLayoutDraftPageTarget | null
+}
+
+export interface ManualLayoutDiscardQueue {
+  request(target: ManualLayoutDraftPageTarget | null): Promise<ManualLayoutDiscardQueueResult>
+}
+
+export function createManualLayoutDiscardQueue(
+  runDiscard: () => Promise<boolean>,
+  applyTarget: (target: ManualLayoutDraftPageTarget) => void,
+): ManualLayoutDiscardQueue {
+  let latestTarget: ManualLayoutDraftPageTarget | null = null
+  let activePromise: Promise<ManualLayoutDiscardQueueResult> | null = null
+  return {
+    request(target) {
+      latestTarget = target
+      if (activePromise) return activePromise
+      const operation = (async (): Promise<ManualLayoutDiscardQueueResult> => {
+        let success = false
+        try {
+          success = await runDiscard()
+        } catch {
+          success = false
+        }
+        if (!success) {
+          latestTarget = null
+          return { success: false, target: null }
+        }
+        const appliedTarget = latestTarget
+        latestTarget = null
+        if (appliedTarget) applyTarget(appliedTarget)
+        return { success: true, target: appliedTarget }
+      })()
+      activePromise = operation
+      void operation.then(
+        () => { if (activePromise === operation) activePromise = null },
+        () => { if (activePromise === operation) activePromise = null },
+      )
+      return operation
+    },
+  }
+}
+
 export async function continueManualLayoutSaveAfterSettlement(
   existingSave: Promise<boolean>,
   getLatestState: () => ManualLayoutDraftState,
@@ -572,9 +681,19 @@ export function useManualLayoutDraft({
   const inFlightRef = useRef<Promise<boolean> | null>(null)
   const saveRunnerRef = useRef<() => Promise<boolean>>(async () => true)
   const saveEpochRef = useRef(0)
+  const runDiscardRef = useRef<() => Promise<boolean>>(async () => true)
+  const applyDiscardTargetRef = useRef<(target: ManualLayoutDraftPageTarget) => void>(() => undefined)
+  const discardQueueRef = useRef<ManualLayoutDiscardQueue | null>(null)
+  if (!discardQueueRef.current) {
+    discardQueueRef.current = createManualLayoutDiscardQueue(
+      () => runDiscardRef.current(),
+      (target) => applyDiscardTargetRef.current(target),
+    )
+  }
 
   const dispatch = useCallback((action: ManualLayoutDraftAction) => {
     const current = stateRef.current
+    if (current.discardPending && isManualLayoutContentMutationAction(action)) return
     let stableAction = action
     if (action.type === 'create') {
       stableAction = {
@@ -730,6 +849,7 @@ export function useManualLayoutDraft({
     dispatch({ type: 'replace', blocks: nextBlocks, activeBlockId })
   }, [dispatch])
   const previewBlocks = useCallback((nextBlocks: ManualLayoutDraftBlock[]) => {
+    if (stateRef.current.discardPending) return
     clearSaveTimer()
     if (mountedRef.current) setPreviewBlocksState(prepareBlocks(stateRef.current.pageId, nextBlocks))
   }, [clearSaveTimer])
@@ -757,64 +877,79 @@ export function useManualLayoutDraft({
       restoredState,
     })
   }, [clearSaveTimer, dispatch])
-  const discardCurrentDraft = useCallback(async (): Promise<boolean> => {
+  const runDiscardCompensation = useCallback(async (): Promise<boolean> => {
     clearSaveTimer()
     const discardedState = stateRef.current
-    const discardedIdentity = discardedState.draftIdentity
-    const discardedPageId = discardedState.pageId
-    const baselineBlocks = discardedState.baselineBlocks.map((block) => ({ ...block }))
+    const compensationSnapshot = discardedState.discardPending
+      ? {
+          draftIdentity: discardedState.draftIdentity,
+          pageId: discardedState.pageId,
+          blocks: discardedState.baselineBlocks.map((block) => ({ ...block })),
+          revision: discardedState.revision,
+        }
+      : createManualLayoutDiscardCompensationSnapshot(discardedState)
     const supersededSave = inFlightRef.current
     saveEpochRef.current += 1
-    const discardEpoch = saveEpochRef.current
     inFlightRef.current = null
-    discardManualLayoutDraftSnapshot(storageRef.current, discardedIdentity, discardedState.revision)
-    if (!supersededSave) {
+    discardManualLayoutDraftSnapshot(
+      storageRef.current,
+      compensationSnapshot.draftIdentity,
+      discardedState.revision,
+    )
+    if (!supersededSave && !discardedState.discardPending) {
       dispatch({ type: 'discard' })
       return true
     }
 
-    dispatch({ type: 'discard-pending' })
-    await supersededSave
-    const compensationState = stateRef.current
-    if (!isManualLayoutSaveEpochCurrent(
-      saveEpochRef.current,
-      discardEpoch,
-      compensationState.draftIdentity,
-      discardedIdentity,
-    )) return false
-    try {
-      await Promise.resolve(saveRef.current(
-        discardedPageId,
-        baselineBlocks,
-        compensationState.revision,
-      ))
+    dispatch({ type: 'discard-pending', revision: compensationSnapshot.revision })
+    const compensated = await runManualLayoutDiscardCompensation(
+      supersededSave || Promise.resolve(true),
+      compensationSnapshot,
+      (fixedSnapshot) => saveRef.current(
+        fixedSnapshot.pageId,
+        fixedSnapshot.blocks,
+        fixedSnapshot.revision,
+      ),
+    )
+    if (compensated) {
       dispatch({
         type: 'server-ack',
-        draftIdentity: discardedIdentity,
-        pageId: discardedPageId,
-        revision: compensationState.revision,
-        blocks: baselineBlocks,
+        draftIdentity: compensationSnapshot.draftIdentity,
+        pageId: compensationSnapshot.pageId,
+        revision: compensationSnapshot.revision,
+        blocks: compensationSnapshot.blocks,
+        completeDiscard: true,
       })
       return true
-    } catch {
-      dispatch({
-        type: 'save-failed',
-        draftIdentity: discardedIdentity,
-        pageId: discardedPageId,
-        revision: compensationState.revision,
-      })
-      return false
     }
+    dispatch({
+      type: 'save-failed',
+      draftIdentity: compensationSnapshot.draftIdentity,
+      pageId: compensationSnapshot.pageId,
+      revision: compensationSnapshot.revision,
+    })
+    return false
   }, [clearSaveTimer, dispatch])
+  runDiscardRef.current = runDiscardCompensation
+  applyDiscardTargetRef.current = (target) => {
+    changePage(target.pageId, target.draftIdentity, target.blocks)
+  }
+  const discardCurrentDraft = useCallback(async (): Promise<boolean> => {
+    const result = await discardQueueRef.current?.request(null)
+    return result?.success === true
+  }, [])
   const discardAndChangePage = useCallback(async (
     nextPageId: string,
     nextDraftIdentity: string,
     nextBlocks: ManualLayoutDraftBlock[],
-  ): Promise<boolean> => {
-    if (!(await discardCurrentDraft())) return false
-    changePage(nextPageId, nextDraftIdentity, nextBlocks)
-    return true
-  }, [changePage, discardCurrentDraft])
+  ): Promise<ManualLayoutDraftPageTarget | null> => {
+    const result = await discardQueueRef.current?.request({
+      pageId: nextPageId,
+      draftIdentity: nextDraftIdentity,
+      blocks: nextBlocks,
+    })
+    return result?.success ? result.target : null
+  }, [])
   const retry = useCallback(() => {
     dispatch({ type: 'retry' })
     void saveCurrentRevision()

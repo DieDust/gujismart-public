@@ -1961,6 +1961,7 @@ export default function GujiFacsimileProofreader({
   }
   const blocks = manualLayoutDraft.state.blocks as LayoutBlock[]
   const editingBlockId = manualLayoutDraft.state.activeBlockId
+  const layoutEditingLocked = manualLayoutDraft.state.discardPending
   const pageSourceText = useMemo(() => blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'), [blocks])
   const translationOpen = controlledTranslationOpen ?? internalTranslationOpen
   const setTranslationOpen = useCallback((open: boolean) => {
@@ -2019,10 +2020,10 @@ export default function GujiFacsimileProofreader({
       resetPageEditorUi()
     }
     const discardAndApplyPageChange = async () => {
-      const changed = await manualLayoutDraft.discardAndChangePage(pageId, draftIdentity, incomingBlocks)
-      if (changed) {
+      const appliedTarget = await manualLayoutDraft.discardAndChangePage(pageId, draftIdentity, incomingBlocks)
+      if (appliedTarget?.draftIdentity === draftIdentity) {
         resetPageEditorUi()
-      } else if (proofreaderMountedRef.current) {
+      } else if (!appliedTarget && proofreaderMountedRef.current) {
         message.error('撤销旧页修改失败，已保留基准草稿，请重试保存')
       }
     }
@@ -2164,6 +2165,13 @@ export default function GujiFacsimileProofreader({
       window.removeEventListener('blur', restoreBlur)
     }
   }, [layoutEditMode])
+
+  useEffect(() => {
+    if (!layoutEditingLocked) return
+    layoutInteractionRef.current = null
+    setDraftCreateRect(null)
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+  }, [layoutEditingLocked])
 
   useEffect(() => {
     let cancelled = false
@@ -2432,6 +2440,7 @@ export default function GujiFacsimileProofreader({
   }, [manualLayoutDraft.setActiveBlockId])
 
   const cancelBlockEditor = useCallback(() => {
+    if (layoutEditingLocked) return
     const baseline = editingBaselineRef.current
     editingBaselineRef.current = null
     if (baseline) {
@@ -2458,9 +2467,10 @@ export default function GujiFacsimileProofreader({
     setEditValue('')
     setTableDraftRows([['']])
     setTableDraftMerges([])
-  }, [manualLayoutDraft.replaceBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId])
+  }, [layoutEditingLocked, manualLayoutDraft.replaceBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId])
 
   const stageTextBlockChange = useCallback((value: string) => {
+    if (layoutEditingLocked) return
     setEditValue(value)
     if (!editingBlockId) return
     manualLayoutDraft.updateBlock(editingBlockId, {
@@ -2477,9 +2487,10 @@ export default function GujiFacsimileProofreader({
       markdown: undefined,
       md: undefined,
     })
-  }, [editingBlockId, manualLayoutDraft.updateBlock])
+  }, [editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
 
   const stageTableBlockChange = useCallback((rows: string[][], merges: FacsimileTableMerge[]) => {
+    if (layoutEditingLocked) return
     setTableDraftRows(rows)
     setTableDraftMerges(merges)
     if (!editingBlockId || !editingBlock) return
@@ -2502,7 +2513,7 @@ export default function GujiFacsimileProofreader({
       markdown: undefined,
       md: undefined,
     })
-  }, [editingBlock, editingBlockId, manualLayoutDraft.updateBlock])
+  }, [editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
 
   const pushHistory = useCallback((nextBlocks: LayoutBlock[]) => {
     setHistory((previous) => {
@@ -2517,6 +2528,7 @@ export default function GujiFacsimileProofreader({
     nextBlocks: LayoutBlock[],
     options: { activeBlockId?: string | null; selectedSourceIndex?: number; closeEditor?: boolean } = {},
   ) => {
+    if (layoutEditingLocked) return
     const nextPageVerticalMode = effectivePreferVerticalLayout || isVerticalPage(nextBlocks)
     const normalizedBlocks = nextBlocks.map((block, index) => ({
       ...block,
@@ -2534,10 +2546,10 @@ export default function GujiFacsimileProofreader({
       setTableDraftMerges([])
     }
     if (typeof options.selectedSourceIndex === 'number') onSelectBox?.(options.selectedSourceIndex)
-  }, [effectivePreferVerticalLayout, manualLayoutDraft.replaceBlocks, onSelectBox, pushHistory])
+  }, [effectivePreferVerticalLayout, layoutEditingLocked, manualLayoutDraft.replaceBlocks, onSelectBox, pushHistory])
 
   const handleUndo = useCallback(() => {
-    if (!canUndo) return
+    if (!canUndo || layoutEditingLocked) return
     const nextBlocks = history[historyIndex - 1].map((block) => ({ ...block }))
     setHistoryIndex(historyIndex - 1)
     blocksRef.current = nextBlocks
@@ -2545,9 +2557,10 @@ export default function GujiFacsimileProofreader({
     setEditValue('')
     setTableDraftRows([['']])
     setTableDraftMerges([])
-  }, [canUndo, history, historyIndex, manualLayoutDraft.replaceBlocks])
+  }, [canUndo, history, historyIndex, layoutEditingLocked, manualLayoutDraft.replaceBlocks])
 
   const beginEditBlock = useCallback((sourceIndex: number) => {
+    if (layoutEditingLocked) return
     const targetIndex = blocks.findIndex((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
     const target = targetIndex < 0 ? undefined : blocks[targetIndex]
     if (!target || isImageLabel(getLabel(target))) return
@@ -2566,10 +2579,10 @@ export default function GujiFacsimileProofreader({
       setTableDraftMerges([])
     }
     onSelectBox?.(sourceIndex)
-  }, [blocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
+  }, [blocks, layoutEditingLocked, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
 
   const handleSaveBlock = useCallback(() => {
-    if (!editingBlockId) return
+    if (!editingBlockId || layoutEditingLocked) return
     const nextBlocks = blocks.map((block, index) => {
       if (getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) !== editingBlockId) return block
       let nextBlock: LayoutBlock
@@ -2604,9 +2617,10 @@ export default function GujiFacsimileProofreader({
     commitBlocks(nextBlocks, { activeBlockId: null, selectedSourceIndex: editingSourceIndex })
     editingBaselineRef.current = null
     message.success('版式修改已加入保存队列')
-  }, [blocks, commitBlocks, editValue, editingBlockId, editingSourceIndex, manualLayoutDraft.state.pageId, tableDraftMerges, tableDraftRows])
+  }, [blocks, commitBlocks, editValue, editingBlockId, editingSourceIndex, layoutEditingLocked, manualLayoutDraft.state.pageId, tableDraftMerges, tableDraftRows])
 
   const handleDeleteBlock = useCallback((blockId: string) => {
+    if (layoutEditingLocked) return
     const targetIndex = blocks.findIndex((block, index) => (
       getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) === blockId
     ))
@@ -2642,9 +2656,10 @@ export default function GujiFacsimileProofreader({
         message.success('已删除文本块，正在后台保存')
       },
     })
-  }, [blocks, commitBlocks, editingBlockId, manualLayoutDraft.state.pageId, onSelectBox, resetBlockEditor])
+  }, [blocks, commitBlocks, editingBlockId, layoutEditingLocked, manualLayoutDraft.state.pageId, onSelectBox, resetBlockEditor])
 
   const handleToggleBlockOrientation = useCallback((blockId: string) => {
+    if (layoutEditingLocked) return
     const pageVerticalModeForToggle = effectivePreferVerticalLayout || isVerticalPage(blocks)
     const targetIndex = blocks.findIndex((block, index) => (
       getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, block, index) === blockId
@@ -2668,7 +2683,7 @@ export default function GujiFacsimileProofreader({
       ? getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, nextBlocks[targetIndex], targetIndex)
       : null
     commitBlocks(nextBlocks, { activeBlockId: editingBlockId === blockId ? nextBlockId : undefined })
-  }, [blocks, commitBlocks, editingBlockId, effectivePreferVerticalLayout, manualLayoutDraft.state.pageId])
+  }, [blocks, commitBlocks, editingBlockId, effectivePreferVerticalLayout, layoutEditingLocked, manualLayoutDraft.state.pageId])
 
   const getPointerCoordinate = useCallback((clientX: number, clientY: number) => {
     const page = pageRef.current
@@ -2687,7 +2702,7 @@ export default function GujiFacsimileProofreader({
     rect: BlockRect,
     handle?: BlockResizeHandle,
   ) => {
-    if (!layoutEditMode || event.button !== 0) return
+    if (!layoutEditMode || layoutEditingLocked || event.button !== 0) return
     const point = getPointerCoordinate(event.clientX, event.clientY)
     if (!point) return
     const targetIndex = blocksRef.current.findIndex((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
@@ -2718,10 +2733,10 @@ export default function GujiFacsimileProofreader({
     layoutInteractionRef.current = handle
       ? { kind: 'resize', blockId: nextBlockId, sourceIndex, handle, start: point, startRect: { ...rect } }
       : { kind: 'move', blockId: nextBlockId, sourceIndex, start: point, startRect: { ...rect } }
-  }, [editingBlockId, getPointerCoordinate, layoutEditMode, manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
+  }, [editingBlockId, getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
 
   const handlePageLayoutMouseDown = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
-    if (!layoutEditMode || event.button !== 0) return
+    if (!layoutEditMode || layoutEditingLocked || event.button !== 0) return
     if (event.target instanceof HTMLElement && event.target.closest('[data-guji-block-index],button,input,textarea')) return
     const point = getPointerCoordinate(event.clientX, event.clientY)
     if (!point) return
@@ -2730,9 +2745,10 @@ export default function GujiFacsimileProofreader({
     layoutInteractionRef.current = { kind: 'create', start: point, current: point }
     setDraftCreateRect({ left: point.x, top: point.y, width: 0, height: 0 })
     onSelectBox?.(-1)
-  }, [getPointerCoordinate, layoutEditMode, onSelectBox])
+  }, [getPointerCoordinate, layoutEditMode, layoutEditingLocked, onSelectBox])
 
   const toggleLayoutEditMode = useCallback(() => {
+    if (layoutEditingLocked) return
     if (!layoutEditMode) {
       setImageUnderlayMode('on')
       setShowRules(true)
@@ -2772,10 +2788,10 @@ export default function GujiFacsimileProofreader({
       cancelText: '继续编辑',
       onOk: saveAndFinish,
     })
-  }, [editingBlock, handleSaveBlock, layoutEditMode, manualLayoutDraft.flush, manualLayoutDraft.state.saveState, setTranslationOpen])
+  }, [editingBlock, handleSaveBlock, layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush, manualLayoutDraft.state.saveState, setTranslationOpen])
 
   useEffect(() => {
-    if (!layoutEditMode) return undefined
+    if (!layoutEditMode || layoutEditingLocked) return undefined
     const handleMove = (event: MouseEvent) => {
       const interaction = layoutInteractionRef.current
       if (!interaction) return
@@ -2854,7 +2870,7 @@ export default function GujiFacsimileProofreader({
       document.removeEventListener('mousemove', handleMove)
       document.removeEventListener('mouseup', handleUp)
     }
-  }, [bounds, commitBlocks, getPointerCoordinate, layoutEditMode, manualLayoutDraft.createBlock, manualLayoutDraft.previewBlocks, manualLayoutDraft.state.pageId, onSelectBox, pageVerticalMode, pushHistory])
+  }, [bounds, commitBlocks, getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.createBlock, manualLayoutDraft.previewBlocks, manualLayoutDraft.state.pageId, onSelectBox, pageVerticalMode, pushHistory])
 
   useEffect(() => {
     if (editingBlockId && !editingBlock) {
@@ -2865,7 +2881,7 @@ export default function GujiFacsimileProofreader({
   }, [editingBlock, editingBlockId, manualLayoutDraft.setActiveBlockId])
 
   useEffect(() => {
-    if (!layoutEditMode) return undefined
+    if (!layoutEditMode || layoutEditingLocked) return undefined
     const handleSaveShortcut = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return
       event.preventDefault()
@@ -2876,7 +2892,7 @@ export default function GujiFacsimileProofreader({
     }
     window.addEventListener('keydown', handleSaveShortcut, true)
     return () => window.removeEventListener('keydown', handleSaveShortcut, true)
-  }, [editingBlock, handleSaveBlock, layoutEditMode, manualLayoutDraft.flush])
+  }, [editingBlock, handleSaveBlock, layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush])
 
   const citationPageNum = useMemo(() => {
     const literature = Number(literaturePageNum || 0)
@@ -3176,7 +3192,7 @@ export default function GujiFacsimileProofreader({
           <Popover trigger="click" placement="bottomLeft" title="显示设置" content={displaySettingsContent}>
             <Button size="small" icon={<SettingOutlined />}>显示设置</Button>
           </Popover>
-          <Button size="small" type={layoutEditMode ? 'primary' : 'default'} icon={<EditOutlined />} onClick={toggleLayoutEditMode}>
+          <Button size="small" type={layoutEditMode ? 'primary' : 'default'} icon={<EditOutlined />} disabled={layoutEditingLocked} onClick={toggleLayoutEditMode}>
             {layoutEditMode ? '完成版式编辑' : '编辑版式'}
           </Button>
           {layoutEditMode || manualLayoutDraft.state.saveState !== 'clean' ? (
@@ -3191,7 +3207,9 @@ export default function GujiFacsimileProofreader({
                       : 'warning'}
                 style={{ marginInlineEnd: 0 }}
               >
-                {manualLayoutDraft.state.saveState === 'failed'
+                {layoutEditingLocked
+                  ? '正在撤销修改'
+                  : manualLayoutDraft.state.saveState === 'failed'
                   ? '保存失败'
                   : manualLayoutDraft.state.saveState === 'clean'
                     ? '已保存'
@@ -3204,9 +3222,9 @@ export default function GujiFacsimileProofreader({
               ) : null}
             </>
           ) : null}
-          {layoutEditMode ? <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>空白处拖拽新建；拖动框移动或缩放；Alt 临时看清底图；Ctrl+S 立即保存</span> : null}
+          {layoutEditMode ? <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{layoutEditingLocked ? '正在等待旧保存结束并恢复数据库基准，编辑已暂时锁定' : '空白处拖拽新建；拖动框移动或缩放；Alt 临时看清底图；Ctrl+S 立即保存'}</span> : null}
         </Space>
-        <Button size="small" icon={<UndoOutlined />} disabled={!canUndo} onClick={handleUndo}>撤销</Button>
+        <Button size="small" icon={<UndoOutlined />} disabled={!canUndo || layoutEditingLocked} onClick={handleUndo}>撤销</Button>
       </div>
 
       <div
@@ -3218,7 +3236,7 @@ export default function GujiFacsimileProofreader({
         style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#d4dbea', borderRadius: 6, padding: 18, display: 'flex', justifyContent: 'center', alignItems: 'flex-start', cursor: layoutEditMode ? 'default' : isPanning ? 'grabbing' : 'grab', userSelect: isPanning || layoutEditMode ? 'none' : undefined }}
       >
         <div ref={pageFrameRef} style={{ width: `${visualFrameWidth}px`, height: `${visualFrameHeight}px`, position: 'relative', flexShrink: 0 }}>
-        <div ref={pageRef} onMouseDown={handlePageLayoutMouseDown} style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden', cursor: layoutEditMode ? 'crosshair' : undefined }}>
+        <div ref={pageRef} aria-busy={layoutEditingLocked} onMouseDown={handlePageLayoutMouseDown} style={{ width: `${fitPageWidth}px`, aspectRatio: `${pageAspect}`, minWidth: fitWidth ? 420 : undefined, maxWidth: fitWidth ? 760 : undefined, position: 'absolute', left: '50%', top: '50%', background: '#fffdf7', color: '#24190f', boxShadow: '0 16px 36px rgba(33, 27, 18, 0.22)', border: '2px solid #21170f', outline: '5px solid #fffdf7', fontFamily: FONT_FAMILY, flexShrink: 0, containerType: 'inline-size', transform: getPageTransform(pageVisualScale, pageRotation), transformOrigin: 'center center', willChange: pageVisualScale === 1 && pageRotation === 0 ? undefined : 'transform', overflow: 'hidden', cursor: layoutEditingLocked ? 'wait' : layoutEditMode ? 'crosshair' : undefined, pointerEvents: layoutEditingLocked ? 'none' : undefined }}>
           {showImageUnderlay ? (
             <img
               src={pageImageSrc}
@@ -3606,6 +3624,7 @@ export default function GujiFacsimileProofreader({
       </div>
       {editingBlock ? (
         <div
+          aria-disabled={layoutEditingLocked}
           onMouseDown={(event) => event.stopPropagation()}
           onMouseUp={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
@@ -3624,6 +3643,8 @@ export default function GujiFacsimileProofreader({
             borderRadius: 8,
             boxShadow: '0 18px 48px rgba(16, 12, 8, 0.28)',
             overflow: 'hidden',
+            pointerEvents: layoutEditingLocked ? 'none' : undefined,
+            opacity: layoutEditingLocked ? 0.68 : 1,
           }}
         >
           <div style={{ padding: '12px 14px 10px', borderBottom: '1px solid rgba(45, 33, 21, 0.12)', display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
@@ -3658,6 +3679,7 @@ export default function GujiFacsimileProofreader({
               />
             ) : (
               <Input.TextArea
+                disabled={layoutEditingLocked}
                 value={editValue}
                 onChange={(event) => stageTextBlockChange(event.target.value)}
                 autoSize={false}

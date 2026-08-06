@@ -89,6 +89,8 @@ const {
 
 const {
   continueManualLayoutSaveAfterSettlement,
+  createManualLayoutDiscardCompensationSnapshot,
+  createManualLayoutDiscardQueue,
   createManualLayoutDraft,
   discardManualLayoutDraftSnapshot,
   ensureManualLayoutBlockIdentity,
@@ -98,9 +100,11 @@ const {
   getManualLayoutDraftStorageKey,
   getManualLayoutSaveSchedule,
   isManualLayoutSaveEpochCurrent,
+  isManualLayoutContentMutationAction,
   persistManualLayoutDraftSnapshot,
   reduceManualLayoutDraft,
   restoreManualLayoutDraftSnapshot,
+  runManualLayoutDiscardCompensation,
   shouldPersistManualLayoutDraftAction,
 } = draftHelperModule.exports
 
@@ -119,6 +123,10 @@ assert.strictEqual(typeof discardManualLayoutDraftSnapshot, 'function', 'discard
 assert.strictEqual(typeof finalizeManualLayoutDraftOnUnmount, 'function', 'unmount cleanup must expose executable persistence and flush behavior')
 assert.strictEqual(typeof shouldPersistManualLayoutDraftAction, 'function', 'preview and selection actions must be distinguishable from durable commits')
 assert.strictEqual(typeof isManualLayoutSaveEpochCurrent, 'function', 'late save responses must be guarded by an explicit runtime epoch')
+assert.strictEqual(typeof isManualLayoutContentMutationAction, 'function', 'discard compensation must expose the content-mutation guard')
+assert.strictEqual(typeof createManualLayoutDiscardCompensationSnapshot, 'function', 'discard compensation must capture one immutable baseline snapshot')
+assert.strictEqual(typeof runManualLayoutDiscardCompensation, 'function', 'discard compensation must expose the serialized old-write barrier')
+assert.strictEqual(typeof createManualLayoutDiscardQueue, 'function', 'repeated discard targets must share one serialized operation')
 
 async function runAsyncDraftChecks() {
   const pageId = 'page-save-race'
@@ -161,6 +169,162 @@ async function runAsyncDraftChecks() {
   assert.deepStrictEqual(savedRevisions, [latestRevision], 'the newer revision must automatically save after the old promise settles')
   assert.strictEqual(state.saveState, 'clean', 'the newer revision must not remain permanently dirty')
   assert.strictEqual(state.blocks[0].words, '2', 'the old acknowledgement must not overwrite the newer local edit')
+
+  const discardIdentity = 'project-race/document-race/page-race'
+  const discardBaseline = ensureManualLayoutBlockIdentity('page-race', { ir_block_id: 'ocr-baseline', words: 'server-baseline' }, 0)
+  const discardBlockId = getManualLayoutDraftBlockId('page-race', discardBaseline, 0)
+  let discardState = createManualLayoutDraft('page-race', [discardBaseline], discardIdentity)
+  discardState = reduceManualLayoutDraft(discardState, { type: 'update', blockId: discardBlockId, changes: { words: 'abandoned-edit' } })
+  const fixedCompensation = createManualLayoutDiscardCompensationSnapshot(discardState)
+  assert.strictEqual(fixedCompensation.revision, discardState.revision + 1, 'the fixed compensation revision must be allocated before waiting for the old save')
+  assert.strictEqual(fixedCompensation.blocks[0].words, 'server-baseline', 'compensation must capture the acknowledged baseline, never the abandoned edit')
+  const discardPendingState = reduceManualLayoutDraft(discardState, { type: 'discard-pending', revision: fixedCompensation.revision })
+  assert.strictEqual(discardPendingState.discardPending, true)
+  assert.strictEqual(discardPendingState.blocks[0].words, 'server-baseline')
+  const interruptedValues = new Map()
+  const interruptedStorage = {
+    getItem: (key) => interruptedValues.get(key) ?? null,
+    setItem: (key, value) => interruptedValues.set(key, value),
+    removeItem: (key) => interruptedValues.delete(key),
+  }
+  persistManualLayoutDraftSnapshot(interruptedStorage, discardPendingState)
+  const restoredCompensation = restoreManualLayoutDraftSnapshot(
+    interruptedStorage,
+    discardIdentity,
+    'page-race',
+    [{ ...discardBaseline, words: 'abandoned-edit-that-may-have-landed' }],
+  )
+  assert.ok(restoredCompensation)
+  assert.strictEqual(restoredCompensation.discardPending, true)
+  assert.strictEqual(restoredCompensation.baselineBlocks[0].words, 'server-baseline', 'an interrupted compensation must restore its fixed baseline instead of trusting a superseded write')
+  assert.strictEqual(restoredCompensation.revision, fixedCompensation.revision, 'restarting must retain the fixed compensation revision')
+  for (const action of [
+    { type: 'create', block: { words: 'blocked-create' } },
+    { type: 'update', blockId: discardBlockId, changes: { words: 'blocked-update' } },
+    { type: 'delete', blockId: discardBlockId },
+    { type: 'replace', blocks: [{ words: 'blocked-replace' }] },
+    { type: 'preview-replace', blocks: [{ words: 'blocked-preview' }] },
+  ]) {
+    assert.strictEqual(isManualLayoutContentMutationAction(action), true)
+    assert.strictEqual(reduceManualLayoutDraft(discardPendingState, action), discardPendingState, `${action.type} must be rejected while baseline compensation is pending`)
+  }
+
+  const defensiveNewer = {
+    ...discardPendingState,
+    blocks: [...discardPendingState.blocks, { manual_block_id: 'defensive-newer', words: 'defensive-newer-edit' }],
+    revision: fixedCompensation.revision + 1,
+    saveState: 'dirty',
+  }
+  const fixedAckWithNewerDraft = reduceManualLayoutDraft(defensiveNewer, {
+    type: 'server-ack',
+    draftIdentity: fixedCompensation.draftIdentity,
+    pageId: fixedCompensation.pageId,
+    revision: fixedCompensation.revision,
+    blocks: fixedCompensation.blocks,
+    completeDiscard: true,
+  })
+  assert.strictEqual(fixedAckWithNewerDraft.revision, defensiveNewer.revision, 'a fixed compensation acknowledgement must not acknowledge a defensive newer revision')
+  assert.strictEqual(fixedAckWithNewerDraft.acknowledgedRevision, fixedCompensation.revision)
+  assert.strictEqual(fixedAckWithNewerDraft.saveState, 'dirty')
+  assert.strictEqual(fixedAckWithNewerDraft.discardPending, false)
+  assert.ok(fixedAckWithNewerDraft.blocks.some((block) => block.words === 'defensive-newer-edit'), 'a defensive newer edit must remain dirty instead of being erased')
+  const guardedCache = new Map()
+  const guardedStorage = {
+    getItem: (key) => guardedCache.get(key) ?? null,
+    setItem: (key, value) => guardedCache.set(key, value),
+    removeItem: (key) => guardedCache.delete(key),
+  }
+  persistManualLayoutDraftSnapshot(guardedStorage, defensiveNewer)
+  persistManualLayoutDraftSnapshot(guardedStorage, fixedAckWithNewerDraft)
+  assert.strictEqual(guardedCache.has(getManualLayoutDraftStorageKey(discardIdentity)), true, 'a fixed acknowledgement must retain the durable cache for a defensive newer revision')
+
+  let settleOldWrite
+  const oldWrite = new Promise((resolve) => { settleOldWrite = resolve })
+  let compensationWrites = 0
+  const compensatedRevisions = []
+  const appliedTargets = []
+  const targetA = { pageId: 'page-a', draftIdentity: 'project/document/page-a', blocks: [{ words: 'A' }] }
+  const targetB = { pageId: 'page-b', draftIdentity: 'project/document/page-b', blocks: [{ words: 'B' }] }
+  const discardQueue = createManualLayoutDiscardQueue(
+    () => runManualLayoutDiscardCompensation(oldWrite, fixedCompensation, async (snapshot) => {
+      compensationWrites += 1
+      compensatedRevisions.push(snapshot.revision)
+    }),
+    (target) => appliedTargets.push(target),
+  )
+  const discardA = discardQueue.request(targetA)
+  const discardB = discardQueue.request(targetB)
+  assert.strictEqual(discardA, discardB, 'a second target must share the exact in-flight discard promise')
+  await Promise.resolve()
+  assert.strictEqual(compensationWrites, 0, 'baseline compensation must wait until the superseded save settles')
+  settleOldWrite(true)
+  const discardResult = await discardA
+  assert.strictEqual(discardResult.success, true)
+  assert.strictEqual(compensationWrites, 1, 'one serialized discard must persist its fixed baseline exactly once')
+  assert.deepStrictEqual(compensatedRevisions, [fixedCompensation.revision])
+  assert.deepStrictEqual(appliedTargets, [targetB], 'only the latest requested target may be applied')
+  assert.strictEqual(discardResult.target, targetB)
+
+  let compensationAfterRejectedOldWrite = 0
+  assert.strictEqual(await runManualLayoutDiscardCompensation(
+    Promise.reject(new Error('old caller rejected after a possible write')),
+    fixedCompensation,
+    () => { compensationAfterRejectedOldWrite += 1 },
+  ), true)
+  assert.strictEqual(compensationAfterRejectedOldWrite, 1, 'a rejected old save cannot cancel the mandatory baseline compensation')
+
+  let failedBaselineState = discardPendingState
+  const failedTargets = []
+  const failingQueue = createManualLayoutDiscardQueue(async () => {
+    const compensated = await runManualLayoutDiscardCompensation(
+      Promise.resolve(true),
+      fixedCompensation,
+      async () => { throw new Error('baseline write failed') },
+    )
+    failedBaselineState = reduceManualLayoutDraft(failedBaselineState, {
+      type: 'save-failed',
+      draftIdentity: fixedCompensation.draftIdentity,
+      pageId: fixedCompensation.pageId,
+      revision: fixedCompensation.revision,
+    })
+    return compensated
+  }, (target) => failedTargets.push(target))
+  const failedDiscard = await failingQueue.request(targetB)
+  assert.strictEqual(failedDiscard.success, false)
+  assert.deepStrictEqual(failedTargets, [], 'a failed baseline compensation must never apply its target page')
+  assert.strictEqual(failedBaselineState.saveState, 'failed')
+  assert.strictEqual(failedBaselineState.discardPending, true)
+  assert.strictEqual(failedBaselineState.blocks[0].words, 'server-baseline')
+  const failedRevision = failedBaselineState.revision
+  failedBaselineState = reduceManualLayoutDraft(failedBaselineState, { type: 'retry' })
+  assert.strictEqual(failedBaselineState.revision, failedRevision, 'retrying baseline compensation must not allocate a new revision')
+  failedBaselineState = reduceManualLayoutDraft(failedBaselineState, {
+    type: 'save-started',
+    draftIdentity: fixedCompensation.draftIdentity,
+    pageId: fixedCompensation.pageId,
+    revision: fixedCompensation.revision,
+  })
+  await Promise.resolve()
+  failedBaselineState = reduceManualLayoutDraft(failedBaselineState, {
+    type: 'server-ack',
+    draftIdentity: fixedCompensation.draftIdentity,
+    pageId: fixedCompensation.pageId,
+    revision: fixedCompensation.revision,
+    blocks: fixedCompensation.blocks,
+  })
+  assert.strictEqual(failedBaselineState.saveState, 'clean')
+  assert.strictEqual(failedBaselineState.discardPending, false)
+  assert.strictEqual(getPendingManualLayoutPageAction(
+    failedBaselineState.draftIdentity,
+    failedBaselineState.pageId,
+    targetB.draftIdentity,
+    targetB.pageId,
+    failedBaselineState.saveState,
+    targetB.draftIdentity,
+  ), 'apply-target')
+  failedBaselineState = reduceManualLayoutDraft(failedBaselineState, { type: 'page-changed', ...targetB })
+  assert.strictEqual(failedBaselineState.draftIdentity, targetB.draftIdentity, 'a successful retry must finally apply the latest retained target')
+  assert.strictEqual(failedBaselineState.blocks[0].words, 'B')
 
   assert.strictEqual(await saveTextEditorPage(async () => true), true, 'a confirmed text-editor write must report success')
   assert.strictEqual(await saveTextEditorPage(async () => false), false, 'a resolved false text-editor write must not report success')
@@ -909,6 +1073,12 @@ assert.ok(draftHelperSource.includes('persistManualLayoutDraftSnapshot(storageRe
 assert.ok(draftHelperSource.includes('finalizeManualLayoutDraftOnUnmount('), 'unmount must execute the tested synchronous-persist and best-effort-flush helper')
 assert.ok(draftHelperSource.includes('setPreviewBlocksState(prepareBlocks('), 'drag and resize preview frames must remain separate from the committed draft state')
 assert.ok(proofreader.includes('manualLayoutDraft.discardAndChangePage(pageId, draftIdentity, incomingBlocks)'), 'the destructive page-change choice must explicitly discard the old draft before applying its target')
+assert.ok(proofreader.includes('const layoutEditingLocked = manualLayoutDraft.state.discardPending'), 'the proofreader UI must derive its mutation lock from discard compensation state')
+assert.ok(proofreader.includes("pointerEvents: layoutEditingLocked ? 'none'"), 'the layout canvas and inspector must block pointer mutations during discard compensation')
+assert.ok(proofreader.includes('disabled={layoutEditingLocked}'), 'focused text editing controls must be disabled while discard compensation is pending')
+assert.ok(draftHelperSource.includes('if (current.discardPending && isManualLayoutContentMutationAction(action)) return'), 'the hook boundary must reject every content mutation while discard compensation is pending')
+assert.ok(draftHelperSource.includes('const compensationSnapshot = discardedState.discardPending'), 'a failed compensation retry must reuse its fixed revision instead of bypassing the baseline write')
+assert.ok(draftHelperSource.includes('discardQueueRef.current = createManualLayoutDiscardQueue('), 'all repeated discard requests must pass through one persistent serialized queue')
 
 const documentView = fs.readFileSync(path.join(root, 'src/renderer/src/views/DocumentView.tsx'), 'utf8')
 const textEditor = fs.readFileSync(path.join(root, 'src/renderer/src/components/TextEditor.tsx'), 'utf8')
