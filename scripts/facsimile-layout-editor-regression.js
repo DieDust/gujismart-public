@@ -142,6 +142,7 @@ const {
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
   createManualLayoutPointerFrameScheduler,
+  createManualLayoutTableProjection,
   createManualLayoutTableSnapshot,
   getManualLayoutBlockConversionWarning,
   getManualLayoutEditEntryPreparation,
@@ -2009,6 +2010,7 @@ assert.deepStrictEqual(commitManualLayoutGeometryPreview(previewUpdated), previe
 assert.deepStrictEqual(rollbackManualLayoutGeometryPreview(previewUpdated), previewBlocks, 'Escape/pointercancel must restore the interaction baseline')
 
 assert.strictEqual(typeof createManualLayoutTableSnapshot, 'function', 'table conversion must expose one canonical snapshot normalizer')
+assert.strictEqual(typeof createManualLayoutTableProjection, 'function', 'table rendering and pseudo-table detection must share one canonical projection')
 assert.strictEqual(typeof applyManualLayoutTableEditorValue, 'function', 'table edits must expose one canonical save transition')
 const tableConversionSource = {
   manual_block_id: 'table-1',
@@ -2097,16 +2099,36 @@ assert.deepStrictEqual(createManualLayoutTableSnapshot({
   rowHeights: [40],
   columnWidths: [120],
 }, 'a non-empty canonical active table must remain authoritative over stale legacy markup and aliases')
+const raggedCanonicalProjection = createManualLayoutTableProjection({
+  label: 'table',
+  rows: [['现行'], ['权威', '数据']],
+  table_html: '<table><tr><td colspan="3">陈旧 HTML</td><td>不得出现</td></tr></table>',
+})
+assert.deepStrictEqual(
+  raggedCanonicalProjection.snapshot.rows,
+  [['现行', ''], ['权威', '数据']],
+  'ragged non-empty canonical rows must remain authoritative and may only be rectangularized, never replaced by stale HTML',
+)
+assert.deepStrictEqual(raggedCanonicalProjection.snapshot.merges, [], 'stale HTML spans must not leak into canonical render geometry')
+assert.strictEqual(raggedCanonicalProjection.plainText, '现行\n权威数据')
+assert.strictEqual(raggedCanonicalProjection.verticalText, '现行\n权威数据')
+assert.ok(!JSON.stringify(raggedCanonicalProjection).includes('陈旧 HTML'), 'render, pseudo text, and vertical classification inputs must exclude stale markup')
 const tableEditorInitializationStart = proofreader.indexOf('useEffect(() => {\n    if (!editingBlock || !editingBlockId) return')
 const tableEditorInitializationEnd = proofreader.indexOf('const resetBlockEditor', tableEditorInitializationStart)
 const tableEditorInitialization = proofreader.slice(tableEditorInitializationStart, tableEditorInitializationEnd)
 assert.ok(tableEditorInitialization.includes('createManualLayoutTableSnapshot(editingBlock)'), 'Inspector initialization must consume the canonical table snapshot')
 assert.ok(!proofreader.includes('function getEditableBlockTableRows('), 'the proofreader must not retain a weaker parallel editable-table extractor')
 assert.ok(!proofreader.includes('function getBlockTableMerges('), 'rendering and editing must not retain a separate weak merge extractor')
+assert.ok(!proofreader.includes('getBlockTableRows'), 'the proofreader must not call the legacy weak table-row extractor on any render or projection path')
 assert.ok(
-  proofreader.includes('const tableSnapshot = isTable ? createManualLayoutTableSnapshot(block) : null'),
-  'the proofreader table display must open the same canonical snapshot as the Inspector',
+  proofreader.includes('const tableProjection = isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null'),
+  'each proofreader render block must create at most one canonical projection for table display, pseudo text, and orientation',
 )
+for (const helperName of ['isRenderableTableBlock', 'getPseudoTableText', 'isLikelyVerticalPseudoTableBlock']) {
+  const helperStart = proofreader.indexOf(`function ${helperName}(`)
+  const helperEnd = proofreader.indexOf('\n}\n', helperStart) + 3
+  assert.ok(proofreader.slice(helperStart, helperEnd).includes('tableProjection'), `${helperName} must consume the shared canonical projection`)
+}
 const stageTableChangeStart = proofreader.indexOf('const stageTableBlockChange = useCallback((')
 const stageTableChangeEnd = proofreader.indexOf('const applyInspectorTypeChange', stageTableChangeStart)
 assert.ok(

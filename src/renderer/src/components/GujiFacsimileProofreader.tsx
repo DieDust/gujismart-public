@@ -18,7 +18,7 @@ import {
 import { getErrorMessage } from '@shared/errors'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
 import OpenCC from 'opencc-js'
-import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
+import { getOrderedOcrBlocks, isTableBlock } from '../utils/ocrText'
 import ManualBlockInspector from './ManualBlockInspector'
 import ManualLayoutToolbar from './ManualLayoutToolbar'
 import {
@@ -41,6 +41,7 @@ import {
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
   createManualLayoutPointerFrameScheduler,
+  createManualLayoutTableProjection,
   createManualLayoutTableSnapshot,
   getManualLayoutBlockConversionWarning,
   getManualLayoutBlockVisualState,
@@ -54,6 +55,7 @@ import {
   type ManualLayoutGeometryPreview,
   type ManualLayoutPointerFrameScheduler,
   type ManualLayoutResizeHandle,
+  type ManualLayoutTableProjection,
   type ManualLayoutTool,
 } from '../utils/manualLayoutBlockEditing'
 import {
@@ -480,11 +482,16 @@ function isBodyTextLabel(label: string): boolean {
   return /^(?:text|paragraph|body)$/.test(label) || /正文/.test(label)
 }
 
-function isOrdinaryVerticalPageTextBlock(block: unknown): boolean {
+function isOrdinaryVerticalPageTextBlock(
+  block: unknown,
+  tableProjection?: ManualLayoutTableProjection | null,
+): boolean {
+  const resolvedTableProjection = tableProjection
+    || (isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null)
   const label = getLabel(block)
-  if (isLikelyVerticalPseudoTableBlock(block)) return true
+  if (isLikelyVerticalPseudoTableBlock(block, resolvedTableProjection)) return true
   if (!isBodyTextLabel(label)) return false
-  if (isTocLabel(label) || isDecorativeLabel(label) || isImageLabel(label) || isRenderableTableBlock(block)) return false
+  if (isTocLabel(label) || isDecorativeLabel(label) || isImageLabel(label) || isRenderableTableBlock(block, resolvedTableProjection)) return false
   const text = getBlockText(block)
   const rect = getRect(block)
   if (!rect || !text.trim()) return false
@@ -495,11 +502,16 @@ function isOrdinaryVerticalPageTextBlock(block: unknown): boolean {
   return getVerticalScriptRatio(text) >= 0.35
 }
 
-function hasVerticalColumnTextShape(block: unknown): boolean {
+function hasVerticalColumnTextShape(
+  block: unknown,
+  tableProjection?: ManualLayoutTableProjection | null,
+): boolean {
+  const resolvedTableProjection = tableProjection
+    || (isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null)
   const label = getLabel(block)
-  if (isLikelyVerticalPseudoTableBlock(block)) return true
+  if (isLikelyVerticalPseudoTableBlock(block, resolvedTableProjection)) return true
   if (!isBodyTextLabel(label) && !isNoteLabel(label) && !isTitleLabel(label)) return false
-  if (isTocLabel(label) || isDecorativeLabel(label) || isImageLabel(label) || isRenderableTableBlock(block)) return false
+  if (isTocLabel(label) || isDecorativeLabel(label) || isImageLabel(label) || isRenderableTableBlock(block, resolvedTableProjection)) return false
   const rect = getRect(block)
   const text = getBlockText(block)
   if (!rect || !text.trim() || getVerticalScriptRatio(text) < 0.42) return false
@@ -522,37 +534,38 @@ function isImageLabel(label: string): boolean {
     || /图片|图像|插图|示意图|图表|照片|印章|藏书印/.test(label)
 }
 
-function isRenderableTableBlock(block: unknown): boolean {
-  return isTableBlock(block) && getBlockTableRows(block).length > 0
+function isRenderableTableBlock(
+  block: unknown,
+  tableProjection?: ManualLayoutTableProjection | null,
+): boolean {
+  if (!isTableBlock(block)) return false
+  const resolvedTableProjection = tableProjection || createManualLayoutTableProjection(block, getBlockText(block))
+  return resolvedTableProjection.snapshot.rows.length > 0
 }
 
 function tableRowsToPlainText(rows: string[][]): string {
   return rows.map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join('')).filter(Boolean).join('\n')
 }
 
-function tableRowsToVerticalColumnText(rows: string[][]): string {
-  const columnCount = Math.max(1, ...rows.map((row) => row.length))
-  if (rows.length <= 4 && columnCount >= 4) {
-    const columns: string[] = []
-    for (let columnIndex = columnCount - 1; columnIndex >= 0; columnIndex -= 1) {
-      const columnText = rows.map((row) => String(row[columnIndex] || '').trim()).filter(Boolean).join('')
-      if (columnText) columns.push(columnText)
-    }
-    return columns.join('\n')
-  }
-  return tableRowsToPlainText(rows)
+function getPseudoTableText(
+  block: unknown,
+  tableProjection?: ManualLayoutTableProjection | null,
+): string {
+  if (!isTableBlock(block)) return getBlockText(block)
+  const resolvedTableProjection = tableProjection || createManualLayoutTableProjection(block, getBlockText(block))
+  return resolvedTableProjection.verticalText || getBlockText(block)
 }
 
-function getPseudoTableText(block: unknown): string {
-  const rows = getBlockTableRows(block)
-  return rows.length > 0 ? tableRowsToVerticalColumnText(rows) : getBlockText(block)
-}
-
-function isLikelyVerticalPseudoTableBlock(block: unknown): boolean {
-  if (!isRenderableTableBlock(block)) return false
-  const rows = getBlockTableRows(block)
+function isLikelyVerticalPseudoTableBlock(
+  block: unknown,
+  tableProjection?: ManualLayoutTableProjection | null,
+): boolean {
+  if (!isTableBlock(block)) return false
+  const resolvedTableProjection = tableProjection || createManualLayoutTableProjection(block, getBlockText(block))
+  if (!isRenderableTableBlock(block, resolvedTableProjection)) return false
+  const rows = resolvedTableProjection.snapshot.rows
   const rect = getRect(block)
-  const text = getPseudoTableText(block)
+  const text = getPseudoTableText(block, resolvedTableProjection)
   const compactCells = rows.flat().map((cell) => String(cell || '').replace(/\s+/g, '')).filter(Boolean)
   const compactText = compactCells.join('')
   if (!rect || compactCells.length < 4 || compactText.length < 16) return false
@@ -586,9 +599,16 @@ function isLikelyVerticalPseudoTableBlock(block: unknown): boolean {
   return verticalLineShape && sparseVocabularyGrid
 }
 
-function shouldRenderAsTableBlock(block: unknown, pageVerticalMode = false): boolean {
+function shouldRenderAsTableBlock(
+  block: unknown,
+  pageVerticalMode = false,
+  tableProjection?: ManualLayoutTableProjection | null,
+): boolean {
+  const resolvedTableProjection = tableProjection
+    || (isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null)
   const manuallyEdited = String(readRecordValue(block, 'segmentation_source') || '').toLowerCase() === 'manual'
-  return isRenderableTableBlock(block) && (manuallyEdited || !(pageVerticalMode && isLikelyVerticalPseudoTableBlock(block)))
+  return isRenderableTableBlock(block, resolvedTableProjection)
+    && (manuallyEdited || !(pageVerticalMode && isLikelyVerticalPseudoTableBlock(block, resolvedTableProjection)))
 }
 
 function getBlockImagePath(block: unknown): string {
@@ -722,7 +742,13 @@ function isStrongHorizontalTextBlock(block: unknown): boolean {
 function isVerticalPage(blocks: LayoutBlock[]): boolean {
   const meaningfulBlocks = blocks.filter((block) => {
     const label = getLabel(block)
-    return (!isRenderableTableBlock(block) || isLikelyVerticalPseudoTableBlock(block)) && !isImageLabel(label) && !!getRect(block) && !!getBlockText(block).trim()
+    const tableProjection = isTableBlock(block)
+      ? createManualLayoutTableProjection(block, getBlockText(block))
+      : null
+    return (!isRenderableTableBlock(block, tableProjection) || isLikelyVerticalPseudoTableBlock(block, tableProjection))
+      && !isImageLabel(label)
+      && !!getRect(block)
+      && !!getBlockText(block).trim()
   })
   if (meaningfulBlocks.length < 3) return false
   const verticalCount = meaningfulBlocks.filter((block) => (
@@ -734,8 +760,14 @@ function isVerticalPage(blocks: LayoutBlock[]): boolean {
   return verticalCount >= 3 && verticalCount / meaningfulBlocks.length >= 0.58 && horizontalCount / meaningfulBlocks.length <= 0.35
 }
 
-function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
-  if (isRenderableTableBlock(block) && !isLikelyVerticalPseudoTableBlock(block)) return 'horizontal'
+function inferOrientation(
+  block: unknown,
+  tableProjection?: ManualLayoutTableProjection | null,
+): 'vertical' | 'horizontal' {
+  const resolvedTableProjection = tableProjection
+    || (isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null)
+  if (isRenderableTableBlock(block, resolvedTableProjection)
+    && !isLikelyVerticalPseudoTableBlock(block, resolvedTableProjection)) return 'horizontal'
   const manualOrientation = getManualOrientation(block)
   if (manualOrientation) return manualOrientation
   if (isStrongHorizontalTextBlock(block)) return 'horizontal'
@@ -751,15 +783,21 @@ function inferOrientation(block: unknown): 'vertical' | 'horizontal' {
   return rect.height >= rect.width * 1.12 ? 'vertical' : 'horizontal'
 }
 
-function inferPageAwareOrientation(block: unknown, pageVerticalMode: boolean): 'vertical' | 'horizontal' {
-  if (shouldRenderAsTableBlock(block, pageVerticalMode) || isImageLabel(getLabel(block))) return 'horizontal'
+function inferPageAwareOrientation(
+  block: unknown,
+  pageVerticalMode: boolean,
+  tableProjection?: ManualLayoutTableProjection | null,
+): 'vertical' | 'horizontal' {
+  const resolvedTableProjection = tableProjection
+    || (isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null)
+  if (shouldRenderAsTableBlock(block, pageVerticalMode, resolvedTableProjection) || isImageLabel(getLabel(block))) return 'horizontal'
   const manualOrientation = getManualOrientation(block)
   if (manualOrientation) return manualOrientation
-  if (!pageVerticalMode) return inferOrientation(block)
+  if (!pageVerticalMode) return inferOrientation(block, resolvedTableProjection)
   if (isTocLabel(getLabel(block))) return 'horizontal'
-  if (isLikelyVerticalPseudoTableBlock(block)) return 'vertical'
-  if (hasVerticalColumnTextShape(block)) return 'vertical'
-  if (isOrdinaryVerticalPageTextBlock(block)) return 'vertical'
+  if (isLikelyVerticalPseudoTableBlock(block, resolvedTableProjection)) return 'vertical'
+  if (hasVerticalColumnTextShape(block, resolvedTableProjection)) return 'vertical'
+  if (isOrdinaryVerticalPageTextBlock(block, resolvedTableProjection)) return 'vertical'
   if (isStrongHorizontalTextBlock(block)) return 'horizontal'
   const explicitOrientation = getExplicitOcrOrientation(block)
   if (explicitOrientation) return explicitOrientation
@@ -851,10 +889,13 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
   blocks.forEach((block, blockIndex) => {
     const rect = block.__rect
     const label = getLabel(block)
+    const tableProjection = isTableBlock(block)
+      ? createManualLayoutTableProjection(block, getBlockText(block))
+      : null
     if (
       !rect
       || block.orientation !== 'vertical'
-      || shouldRenderAsTableBlock(block, true)
+      || shouldRenderAsTableBlock(block, true, tableProjection)
       || isImageLabel(label)
       || isDecorativeLabel(label)
       || rect.width < 72
@@ -864,7 +905,9 @@ function splitWideVerticalBlocks(blocks: LayoutBlock[]): LayoutBlock[] {
       return
     }
 
-    const columnSourceText = isLikelyVerticalPseudoTableBlock(block) ? getPseudoTableText(block) : getBlockText(block)
+    const columnSourceText = isLikelyVerticalPseudoTableBlock(block, tableProjection)
+      ? getPseudoTableText(block, tableProjection)
+      : getBlockText(block)
     const columns = getVerticalColumns(columnSourceText)
     if (columns.length < 2) {
       nextBlocks.push(block)
@@ -1724,11 +1767,14 @@ function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofSta
   const pageVerticalMode = preferVerticalLayout || isVerticalPage(blocks)
   const normalizedBlocks = blocks.map((block, index) => {
     const { __rect, __synthetic, __sourceIndex, __manualDraftId, ...rest } = block
-    const orientation = inferPageAwareOrientation(block, pageVerticalMode)
+    const tableProjection = isTableBlock(block)
+      ? createManualLayoutTableProjection(block, getBlockText(block))
+      : null
+    const orientation = inferPageAwareOrientation(block, pageVerticalMode, tableProjection)
     const pseudoTable = pageVerticalMode
       && String(block.segmentation_source || '').toLowerCase() !== 'manual'
-      && isLikelyVerticalPseudoTableBlock(block)
-    const words = pseudoTable ? getPseudoTableText(block) : getBlockText(block)
+      && isLikelyVerticalPseudoTableBlock(block, tableProjection)
+    const words = pseudoTable ? getPseudoTableText(block, tableProjection) : getBlockText(block)
     return {
       ...rest,
       words,
@@ -2355,13 +2401,16 @@ export default function GujiFacsimileProofreader({
     const label = getLabel(block)
     const labelColor = LABEL_COLORS[label] || LABEL_COLORS.text
     const labelName = LABEL_NAMES[label] || label
-    const isTable = shouldRenderAsTableBlock(block, pageVerticalMode)
+    const tableProjection = isTableBlock(block) ? createManualLayoutTableProjection(block, getBlockText(block)) : null
+    const isTable = shouldRenderAsTableBlock(block, pageVerticalMode, tableProjection)
     const isImage = isImageLabel(label)
-    const tableSnapshot = isTable ? createManualLayoutTableSnapshot(block) : null
+    const tableSnapshot = isTable ? tableProjection?.snapshot || null : null
     const tableRows = tableSnapshot?.rows || []
     const tableMerges = tableSnapshot?.merges || []
-    const orientation = isTable ? 'horizontal' : inferPageAwareOrientation(block, pageVerticalMode)
-    const originalText = !isTable && isLikelyVerticalPseudoTableBlock(block) ? getPseudoTableText(block) : getBlockText(block)
+    const orientation = isTable ? 'horizontal' : inferPageAwareOrientation(block, pageVerticalMode, tableProjection)
+    const originalText = !isTable && isLikelyVerticalPseudoTableBlock(block, tableProjection)
+      ? getPseudoTableText(block, tableProjection)
+      : getBlockText(block)
     const shouldRenderTable = isTable
     const scaledRect = pagePixelWidth > 0 ? getScaledRect(rect, bounds, pagePixelWidth) : rect
     const displayText = transformText(normalizeDisplayText(originalText, orientation, layoutProfile, label, scaledRect), displayScript)

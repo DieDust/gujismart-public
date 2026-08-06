@@ -316,6 +316,12 @@ export interface ManualLayoutTableSnapshot {
 
 export type ManualLayoutTableEditorValue = Omit<ManualLayoutTableSnapshot, 'version'>
 
+export interface ManualLayoutTableProjection {
+  snapshot: ManualLayoutTableSnapshot
+  plainText: string
+  verticalText: string
+}
+
 function firstNonEmptyArrayValue(block: ManualLayoutEditableBlock, keys: readonly string[]): unknown[] {
   for (const key of keys) {
     const value = block[key]
@@ -475,24 +481,25 @@ function normalizeTableSizes(
 }
 
 export function createManualLayoutTableSnapshot(
-  block: ManualLayoutEditableBlock,
+  block: unknown,
   fallbackText = '',
 ): ManualLayoutTableSnapshot {
-  const rows = normalizeTableRows(block, fallbackText)
-  const canonicalRowsActive = Array.isArray(block.rows) && block.rows.length > 0
+  const sourceBlock: ManualLayoutEditableBlock = isRecord(block) ? block : {}
+  const rows = normalizeTableRows(sourceBlock, fallbackText)
+  const canonicalRowsActive = Array.isArray(sourceBlock.rows) && sourceBlock.rows.length > 0
   return {
     version: 1,
     rows,
-    merges: normalizeTableMerges(block, rows),
+    merges: normalizeTableMerges(sourceBlock, rows),
     rowHeights: normalizeTableSizes(
-      block,
+      sourceBlock,
       ['rowHeights', 'row_heights', 'rowSizes', 'row_sizes'],
       rows.length,
       FACSIMILE_TABLE_DEFAULT_ROW_HEIGHT,
       canonicalRowsActive,
     ),
     columnWidths: normalizeTableSizes(
-      block,
+      sourceBlock,
       ['columnWidths', 'column_widths', 'colSizes', 'col_sizes'],
       rows[0]?.length || 1,
       FACSIMILE_TABLE_DEFAULT_COLUMN_WIDTH,
@@ -506,6 +513,34 @@ function manualLayoutTableRowsToPlainText(rows: string[][]): string {
     .map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join(''))
     .filter(Boolean)
     .join('\n')
+}
+
+function manualLayoutTableRowsToVerticalText(rows: string[][]): string {
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  if (rows.length <= 4 && columnCount >= 4) {
+    const columns: string[] = []
+    for (let columnIndex = columnCount - 1; columnIndex >= 0; columnIndex -= 1) {
+      const columnText = rows
+        .map((row) => String(row[columnIndex] || '').trim())
+        .filter(Boolean)
+        .join('')
+      if (columnText) columns.push(columnText)
+    }
+    return columns.join('\n')
+  }
+  return manualLayoutTableRowsToPlainText(rows)
+}
+
+export function createManualLayoutTableProjection(
+  block: unknown,
+  fallbackText = '',
+): ManualLayoutTableProjection {
+  const snapshot = createManualLayoutTableSnapshot(block, fallbackText)
+  return {
+    snapshot,
+    plainText: manualLayoutTableRowsToPlainText(snapshot.rows),
+    verticalText: manualLayoutTableRowsToVerticalText(snapshot.rows),
+  }
 }
 
 export function applyManualLayoutTableEditorValue<T extends ManualLayoutEditableBlock>(
