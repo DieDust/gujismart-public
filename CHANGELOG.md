@@ -1,6 +1,6 @@
 # 更新日志 / Changelog
 
-## 1.2.29 - 2026-08-06
+## 1.2.30 - 2026-08-06
 
 ### 中文
 
@@ -26,8 +26,8 @@
 
 #### 下载 / Downloads
 
-- `GujiSmart-1.2.29-Setup-x64.exe`
-- `GujiSmart-1.2.29-Portable-x64.exe`
+- `GujiSmart-1.2.30-Setup-x64.exe`
+- `GujiSmart-1.2.30-Portable-x64.exe`
 
 ## 1.2.28 - 2026-08-05
 

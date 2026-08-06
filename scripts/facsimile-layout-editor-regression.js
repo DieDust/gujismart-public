@@ -4,6 +4,7 @@ const path = require('path')
 const ts = require('typescript')
 
 const root = path.resolve(__dirname, '..')
+const readUtf8Normalized = (filePath) => fs.readFileSync(filePath, 'utf8').replace(/\r\n?/g, '\n')
 const helperPath = path.join(root, 'src/renderer/src/utils/facsimileTableEditing.ts')
 const helperSource = fs.readFileSync(helperPath, 'utf8')
 const transpiled = ts.transpileModule(helperSource, {
@@ -1159,7 +1160,7 @@ assert.deepStrictEqual(
 )
 assert.deepStrictEqual(normalizeFacsimileTableColumnWidths([], -3), [], 'invalid metadata lengths must safely normalize to an empty list')
 
-const proofreader = fs.readFileSync(path.join(root, 'src/renderer/src/components/GujiFacsimileProofreader.tsx'), 'utf8')
+const proofreader = readUtf8Normalized(path.join(root, 'src/renderer/src/components/GujiFacsimileProofreader.tsx'))
 assert.ok(proofreader.includes('onPointerDown={handlePageLayoutPointerDown}'), 'blank page dragging must create a typed manual box')
 assert.ok(proofreader.includes('BLOCK_RESIZE_HANDLES.map'), 'the active text box must expose edge and corner resize handles')
 assert.ok(proofreader.includes('setImageUnderlayMode(preparation.imageUnderlayMode)'), 'entering manual editing must automatically enable the page image underlay through the shared plan')
@@ -1212,8 +1213,8 @@ assert.ok(draftHelperSource.includes('if (current.discardPending && isManualLayo
 assert.ok(draftHelperSource.includes('const compensationSnapshot = getManualLayoutDiscardCompensationSnapshot(discardedState)'), 'a failed compensation retry must reuse its fixed revision instead of bypassing the baseline write')
 assert.ok(draftHelperSource.includes('discardQueueRef.current = createManualLayoutDiscardQueue('), 'all repeated discard requests must pass through one persistent serialized queue')
 
-const documentView = fs.readFileSync(path.join(root, 'src/renderer/src/views/DocumentView.tsx'), 'utf8')
-const textEditor = fs.readFileSync(path.join(root, 'src/renderer/src/components/TextEditor.tsx'), 'utf8')
+const documentView = readUtf8Normalized(path.join(root, 'src/renderer/src/views/DocumentView.tsx'))
+const textEditor = readUtf8Normalized(path.join(root, 'src/renderer/src/components/TextEditor.tsx'))
 assert.ok(documentView.includes('const handleSavePage = async (pageId: string, data: PageUpdatePayload): Promise<boolean>'), 'the shared page save path must report its real success outcome without rejecting legacy fire-and-forget callers')
 assert.ok(documentView.includes("if (!saved) throw new Error('Facsimile page save failed')"), 'the facsimile-only adapter must convert a swallowed database failure into a rejected draft save')
 assert.ok(documentView.includes('onSave={handleSaveFacsimilePage}'), 'the revisioned facsimile draft must receive the failure-propagating adapter')
@@ -1227,9 +1228,9 @@ assert.ok(!textEditor.includes("saveToDb(nextData)\n        message.success('已
 
 const tableEditorPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.tsx')
 const tableEditorCssPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.css')
-const tableEditor = fs.readFileSync(tableEditorPath, 'utf8')
+const tableEditor = readUtf8Normalized(tableEditorPath)
 assert.ok(fs.existsSync(tableEditorCssPath), 'the Excel-style table editor must have theme-aware component styles')
-const tableEditorCss = fs.readFileSync(tableEditorCssPath, 'utf8')
+const tableEditorCss = readUtf8Normalized(tableEditorCssPath)
 
 const transpiledTableEditor = ts.transpileModule(tableEditor, {
   compilerOptions: {
@@ -2211,8 +2212,8 @@ const manualToolbarPath = path.join(root, 'src/renderer/src/components/ManualLay
 const manualInspectorPath = path.join(root, 'src/renderer/src/components/ManualBlockInspector.tsx')
 assert.ok(fs.existsSync(manualToolbarPath), 'edit mode must have a compact typed block toolbar')
 assert.ok(fs.existsSync(manualInspectorPath), 'edit mode must have a docked stable-ID inspector')
-const manualToolbarSource = fs.readFileSync(manualToolbarPath, 'utf8')
-const manualInspectorSource = fs.readFileSync(manualInspectorPath, 'utf8')
+const manualToolbarSource = readUtf8Normalized(manualToolbarPath)
+const manualInspectorSource = readUtf8Normalized(manualInspectorPath)
 assert.ok(manualToolbarSource.includes('MANUAL_LAYOUT_QUICK_KINDS') && manualToolbarSource.includes('MANUAL_LAYOUT_MORE_KINDS'), 'toolbar UI must be driven by the canonical quick/more kind lists')
 assert.ok(manualToolbarSource.includes("tool === 'select'"), 'toolbar must expose an explicit selection tool')
 assert.ok(manualInspectorSource.includes('blockId'), 'inspector identity must be a stable block ID rather than an array index')
@@ -2289,7 +2290,7 @@ assert.ok(!manualInspectorSource.includes('manual-block-inspector-disabled-cover
 const tableEditorCallers = fs.readdirSync(path.join(root, 'src/renderer/src'), { recursive: true })
   .filter((entry) => typeof entry === 'string' && entry.endsWith('.tsx'))
   .map((entry) => path.join(root, 'src/renderer/src', entry))
-  .filter((sourcePath) => sourcePath !== tableEditorPath && fs.readFileSync(sourcePath, 'utf8').includes('<FacsimileTableEditor'))
+  .filter((sourcePath) => sourcePath !== tableEditorPath && readUtf8Normalized(sourcePath).includes('<FacsimileTableEditor'))
   .sort()
 assert.deepStrictEqual(
   tableEditorCallers.map((sourcePath) => path.relative(root, sourcePath).replace(/\\/g, '/')),
