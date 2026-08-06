@@ -90,14 +90,18 @@ const {
 const {
   continueManualLayoutSaveAfterSettlement,
   createManualLayoutDraft,
+  discardManualLayoutDraftSnapshot,
   ensureManualLayoutBlockIdentity,
+  finalizeManualLayoutDraftOnUnmount,
   getPendingManualLayoutPageAction,
   getManualLayoutDraftBlockId,
   getManualLayoutDraftStorageKey,
   getManualLayoutSaveSchedule,
+  isManualLayoutSaveEpochCurrent,
   persistManualLayoutDraftSnapshot,
   reduceManualLayoutDraft,
   restoreManualLayoutDraftSnapshot,
+  shouldPersistManualLayoutDraftAction,
 } = draftHelperModule.exports
 
 const { saveTextEditorPage } = textEditorSavingModule.exports
@@ -111,6 +115,10 @@ assert.strictEqual(typeof persistManualLayoutDraftSnapshot, 'function', 'dirty d
 assert.strictEqual(typeof restoreManualLayoutDraftSnapshot, 'function', 'the same isolated page identity must restore its durable draft')
 assert.strictEqual(typeof getPendingManualLayoutPageAction, 'function', 'pending page changes must expose a testable failure/retry state machine')
 assert.strictEqual(typeof getManualLayoutUnderlayImageStyle, 'function', 'underlay rendering must expose a testable Alt-clear style')
+assert.strictEqual(typeof discardManualLayoutDraftSnapshot, 'function', 'discarding a draft must explicitly remove only its own durable snapshot')
+assert.strictEqual(typeof finalizeManualLayoutDraftOnUnmount, 'function', 'unmount cleanup must expose executable persistence and flush behavior')
+assert.strictEqual(typeof shouldPersistManualLayoutDraftAction, 'function', 'preview and selection actions must be distinguishable from durable commits')
+assert.strictEqual(typeof isManualLayoutSaveEpochCurrent, 'function', 'late save responses must be guarded by an explicit runtime epoch')
 
 async function runAsyncDraftChecks() {
   const pageId = 'page-save-race'
@@ -223,8 +231,12 @@ async function runAsyncDraftChecks() {
 
 {
   const values = new Map()
+  let storageReads = 0
   const storage = {
-    getItem: (key) => values.get(key) ?? null,
+    getItem: (key) => {
+      storageReads += 1
+      return values.get(key) ?? null
+    },
     setItem: (key, value) => values.set(key, value),
     removeItem: (key) => values.delete(key),
   }
@@ -233,10 +245,15 @@ async function runAsyncDraftChecks() {
   let state = createManualLayoutDraft(pageId, [], identity)
   state = reduceManualLayoutDraft(state, { type: 'create', block: { words: 'survives-unmount', label: 'text' } })
   assert.strictEqual(persistManualLayoutDraftSnapshot(storage, state), true, 'dirty edits must synchronously enter durable cache before debounce')
+  const readsAfterFirstCommit = storageReads
+  const nextTypedState = reduceManualLayoutDraft(state, { type: 'update', blockId: state.activeBlockId, changes: { words: 'survives-unmount!' } })
+  assert.strictEqual(persistManualLayoutDraftSnapshot(storage, nextTypedState), true)
+  assert.strictEqual(storageReads, readsAfterFirstCommit, 'successive committed edits must reuse the module snapshot cache instead of reparsing the whole page')
+  state = nextTypedState
   assert.ok(values.has(getManualLayoutDraftStorageKey(identity)), 'the durable key must include the explicit isolated identity')
   const restored = restoreManualLayoutDraftSnapshot(storage, identity, pageId, [])
   assert.ok(restored, 'remounting the same project/document/page must recover the draft')
-  assert.strictEqual(restored.blocks[0].words, 'survives-unmount')
+  assert.strictEqual(restored.blocks[0].words, 'survives-unmount!', 'remount must recover the latest committed keystroke')
   assert.strictEqual(restored.activeBlockId, state.activeBlockId, 'remount must restore the active manual block')
   assert.strictEqual(restored.revision, state.revision)
   assert.strictEqual(restored.saveState, 'dirty', 'an interrupted dirty or saving draft must resume as saveable work')
@@ -264,6 +281,74 @@ async function runAsyncDraftChecks() {
   assert.doesNotThrow(() => persistManualLayoutDraftSnapshot(failingStorage, state), 'storage failures must not break editing')
   assert.strictEqual(persistManualLayoutDraftSnapshot(failingStorage, state), false)
   assert.strictEqual(restoreManualLayoutDraftSnapshot(failingStorage, identity, pageId, []), null)
+}
+
+{
+  assert.strictEqual(shouldPersistManualLayoutDraftAction({ type: 'set-active', blockId: 'block-a' }), false, 'selection-only changes must not serialize the full page')
+  assert.strictEqual(shouldPersistManualLayoutDraftAction({ type: 'preview-replace', blocks: [] }), false, 'drag and resize preview frames must remain memory-only')
+  assert.strictEqual(shouldPersistManualLayoutDraftAction({ type: 'update', blockId: 'block-a', changes: { words: 'committed' } }), true, 'typed content must remain synchronously durable')
+  assert.strictEqual(shouldPersistManualLayoutDraftAction({ type: 'save-started', revision: 1 }), true, 'save-state transitions must remain durable')
+
+  let clearedTimers = 0
+  let persistedOnUnmount = 0
+  let flushes = 0
+  const dirtyState = reduceManualLayoutDraft(
+    createManualLayoutDraft('page-unmount', [], 'project/document/page-unmount'),
+    { type: 'create', block: { words: 'last-keystroke' } },
+  )
+  assert.strictEqual(finalizeManualLayoutDraftOnUnmount(
+    dirtyState,
+    () => { clearedTimers += 1 },
+    () => { persistedOnUnmount += 1 },
+    () => { flushes += 1; return Promise.resolve(true) },
+  ), true)
+  assert.deepStrictEqual({ clearedTimers, persistedOnUnmount, flushes }, { clearedTimers: 1, persistedOnUnmount: 1, flushes: 1 }, 'unmount must synchronously persist before its best-effort async flush')
+  const cleanState = createManualLayoutDraft('page-clean', [], 'project/document/page-clean')
+  assert.strictEqual(finalizeManualLayoutDraftOnUnmount(cleanState, () => { clearedTimers += 1 }, () => { persistedOnUnmount += 1 }, () => { flushes += 1; return Promise.resolve(true) }), false)
+  assert.deepStrictEqual({ clearedTimers, persistedOnUnmount, flushes }, { clearedTimers: 2, persistedOnUnmount: 2, flushes: 1 }, 'clean unmount must not start a redundant save')
+}
+
+{
+  const values = new Map()
+  const storage = {
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, value),
+    removeItem: (key) => values.delete(key),
+  }
+  const oldIdentity = 'project-a/document-a/page-old'
+  const targetIdentity = 'project-a/document-a/page-target'
+  const baselineBlocks = [{ ir_block_id: 'old-1', words: 'server-baseline' }]
+  let oldDraft = createManualLayoutDraft('page-old', baselineBlocks, oldIdentity)
+  const oldBlockId = getManualLayoutDraftBlockId('page-old', oldDraft.blocks[0], 0)
+  oldDraft = reduceManualLayoutDraft(oldDraft, { type: 'update', blockId: oldBlockId, changes: { words: 'abandoned-local-edit' } })
+  persistManualLayoutDraftSnapshot(storage, oldDraft)
+  assert.strictEqual(discardManualLayoutDraftSnapshot(storage, oldIdentity, oldDraft.revision), true)
+  const discarded = reduceManualLayoutDraft(oldDraft, { type: 'discard' })
+  assert.strictEqual(discarded.blocks[0].words, 'server-baseline', 'discard must reset memory to the latest acknowledged baseline')
+  assert.strictEqual(discarded.saveState, 'clean')
+  const target = reduceManualLayoutDraft(discarded, { type: 'page-changed', pageId: 'page-target', draftIdentity: targetIdentity, blocks: [{ words: 'target' }] })
+  assert.strictEqual(target.draftIdentity, targetIdentity)
+  assert.strictEqual(restoreManualLayoutDraftSnapshot(storage, oldIdentity, 'page-old', baselineBlocks), null, 'returning to an explicitly discarded page must not recover abandoned content')
+
+  const currentEpoch = 2
+  assert.strictEqual(isManualLayoutSaveEpochCurrent(currentEpoch, 1, target.draftIdentity, oldIdentity), false, 'a late old-page acknowledgement must be ignored after discard-and-change')
+  assert.strictEqual(isManualLayoutSaveEpochCurrent(currentEpoch, currentEpoch, target.draftIdentity, targetIdentity), true)
+  const targetDirty = reduceManualLayoutDraft(target, { type: 'create', block: { words: 'new-target-edit' } })
+  persistManualLayoutDraftSnapshot(storage, targetDirty)
+  const oldAck = reduceManualLayoutDraft(oldDraft, { type: 'server-ack', draftIdentity: oldIdentity, revision: oldDraft.revision, blocks: oldDraft.blocks })
+  persistManualLayoutDraftSnapshot(storage, oldAck)
+  assert.ok(restoreManualLayoutDraftSnapshot(storage, targetIdentity, 'page-target', []).blocks.some((block) => block.words === 'new-target-edit'), 'a late old acknowledgement must not rewrite or clear the new target draft')
+
+  const samePageTargetIdentity = 'project-b/document-b/shared-page'
+  let samePageTarget = createManualLayoutDraft('shared-page', [{ ir_block_id: 'shared-1', words: 'new-project' }], samePageTargetIdentity)
+  samePageTarget = reduceManualLayoutDraft(samePageTarget, {
+    type: 'server-ack',
+    draftIdentity: 'project-a/document-a/shared-page',
+    pageId: 'shared-page',
+    revision: 0,
+    blocks: [{ ir_block_id: 'shared-1', words: 'late-old-project' }],
+  })
+  assert.strictEqual(samePageTarget.blocks[0].words, 'new-project', 'identity guards must reject a late ack even when two projects reuse the same page ID')
 }
 
 {
@@ -821,7 +906,9 @@ assert.ok(proofreader.includes('const { __rect, __synthetic, __sourceIndex, __ma
 assert.ok(proofreader.includes('if (!words && !isImage && !isManualBlock) return null'), 'an empty newly-created manual block must survive the parent save echo')
 
 assert.ok(draftHelperSource.includes('persistManualLayoutDraftSnapshot(storageRef.current, stateRef.current)'), 'every draft action must synchronously update durable cache before React can unmount')
-assert.ok(draftHelperSource.includes("if (stateRef.current.saveState !== 'clean') void saveRunnerRef.current()"), 'unmount must also make a best-effort flush without relying on it for recovery')
+assert.ok(draftHelperSource.includes('finalizeManualLayoutDraftOnUnmount('), 'unmount must execute the tested synchronous-persist and best-effort-flush helper')
+assert.ok(draftHelperSource.includes('setPreviewBlocksState(prepareBlocks('), 'drag and resize preview frames must remain separate from the committed draft state')
+assert.ok(proofreader.includes('manualLayoutDraft.discardAndChangePage(pageId, draftIdentity, incomingBlocks)'), 'the destructive page-change choice must explicitly discard the old draft before applying its target')
 
 const documentView = fs.readFileSync(path.join(root, 'src/renderer/src/views/DocumentView.tsx'), 'utf8')
 const textEditor = fs.readFileSync(path.join(root, 'src/renderer/src/components/TextEditor.tsx'), 'utf8')

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 
 export type ManualLayoutDraftBlock = Record<string, unknown>
 export type ManualLayoutSaveState = 'clean' | 'dirty' | 'saving' | 'failed'
@@ -7,6 +7,7 @@ export interface ManualLayoutDraftState {
   draftIdentity: string
   pageId: string
   blocks: ManualLayoutDraftBlock[]
+  baselineBlocks: ManualLayoutDraftBlock[]
   activeBlockId: string | null
   revision: number
   acknowledgedRevision: number
@@ -20,11 +21,13 @@ export type ManualLayoutDraftAction =
   | { type: 'replace'; blocks: ManualLayoutDraftBlock[]; activeBlockId?: string | null }
   | { type: 'preview-replace'; blocks: ManualLayoutDraftBlock[] }
   | { type: 'set-active'; blockId: string | null }
-  | { type: 'save-started'; pageId?: string; revision: number }
-  | { type: 'save-failed'; pageId?: string; revision: number }
-  | { type: 'server-ack'; pageId?: string; revision: number; blocks: ManualLayoutDraftBlock[] }
+  | { type: 'save-started'; draftIdentity?: string; pageId?: string; revision: number }
+  | { type: 'save-failed'; draftIdentity?: string; pageId?: string; revision: number }
+  | { type: 'server-ack'; draftIdentity?: string; pageId?: string; revision: number; blocks: ManualLayoutDraftBlock[] }
   | { type: 'server-echo'; pageId: string; blocks: ManualLayoutDraftBlock[] }
   | { type: 'retry' }
+  | { type: 'discard' }
+  | { type: 'discard-pending' }
   | { type: 'page-changed'; pageId: string; draftIdentity: string; blocks: ManualLayoutDraftBlock[]; restoredState?: ManualLayoutDraftState | null }
 
 export type ManualLayoutSaveSchedule =
@@ -68,6 +71,7 @@ interface StoredManualLayoutDraft {
 export type PendingManualLayoutPageAction = 'same-page' | 'apply-target' | 'confirm-target' | 'wait-for-save'
 
 const MANUAL_LAYOUT_DRAFT_STORAGE_PREFIX = 'gujismart.manual-layout-draft.v1:'
+const manualLayoutDraftStorageCache = new WeakMap<object, Map<string, StoredManualLayoutDraft | null>>()
 
 let manualBlockSequence = 0
 
@@ -104,15 +108,28 @@ function getBrowserDraftStorage(): ManualLayoutDraftStorage | null {
   }
 }
 
+function getManualLayoutDraftStorageCache(storage: ManualLayoutDraftStorage): Map<string, StoredManualLayoutDraft | null> {
+  const existing = manualLayoutDraftStorageCache.get(storage)
+  if (existing) return existing
+  const created = new Map<string, StoredManualLayoutDraft | null>()
+  manualLayoutDraftStorageCache.set(storage, created)
+  return created
+}
+
 function readStoredManualLayoutDraft(
   storage: ManualLayoutDraftStorage,
   draftIdentity: string,
 ): StoredManualLayoutDraft | null {
   const normalizedIdentity = draftIdentity.trim()
   if (!normalizedIdentity) return null
+  const cache = getManualLayoutDraftStorageCache(storage)
+  if (cache.has(normalizedIdentity)) return cache.get(normalizedIdentity) || null
   try {
     const raw = storage.getItem(getManualLayoutDraftStorageKey(normalizedIdentity))
-    if (!raw) return null
+    if (!raw) {
+      cache.set(normalizedIdentity, null)
+      return null
+    }
     const value: unknown = JSON.parse(raw)
     if (!isRecord(value)
       || value.version !== 1
@@ -125,10 +142,14 @@ function readStoredManualLayoutDraft(
       || !Number.isInteger(value.acknowledgedRevision)
       || typeof value.updatedAt !== 'number'
       || !['dirty', 'saving', 'failed'].includes(String(value.saveState))) {
+      cache.set(normalizedIdentity, null)
       return null
     }
-    return value as unknown as StoredManualLayoutDraft
+    const stored = value as unknown as StoredManualLayoutDraft
+    cache.set(normalizedIdentity, stored)
+    return stored
   } catch {
+    cache.delete(normalizedIdentity)
     return null
   }
 }
@@ -237,10 +258,14 @@ export function persistManualLayoutDraftSnapshot(
   const draftIdentity = state.draftIdentity.trim()
   if (!storage || !draftIdentity) return false
   const key = getManualLayoutDraftStorageKey(draftIdentity)
+  const cache = getManualLayoutDraftStorageCache(storage)
   try {
     const existing = readStoredManualLayoutDraft(storage, draftIdentity)
     if (state.saveState === 'clean') {
-      if (!existing || existing.revision <= state.acknowledgedRevision) storage.removeItem(key)
+      if (!existing || existing.revision <= state.acknowledgedRevision) {
+        storage.removeItem(key)
+        cache.set(draftIdentity, null)
+      }
       return true
     }
     if (existing && existing.revision > state.revision) return true
@@ -256,8 +281,30 @@ export function persistManualLayoutDraftSnapshot(
       updatedAt: Date.now(),
     }
     storage.setItem(key, JSON.stringify(stored))
+    cache.set(draftIdentity, stored)
     return true
   } catch {
+    cache.delete(draftIdentity)
+    return false
+  }
+}
+
+export function discardManualLayoutDraftSnapshot(
+  storage: ManualLayoutDraftStorage | null,
+  draftIdentity: string,
+  maximumDiscardedRevision: number,
+): boolean {
+  const normalizedIdentity = draftIdentity.trim()
+  if (!storage || !normalizedIdentity) return false
+  const cache = getManualLayoutDraftStorageCache(storage)
+  try {
+    const existing = readStoredManualLayoutDraft(storage, normalizedIdentity)
+    if (existing && existing.revision > maximumDiscardedRevision) return false
+    storage.removeItem(getManualLayoutDraftStorageKey(normalizedIdentity))
+    cache.set(normalizedIdentity, null)
+    return true
+  } catch {
+    cache.delete(normalizedIdentity)
     return false
   }
 }
@@ -271,7 +318,8 @@ export function restoreManualLayoutDraftSnapshot(
   if (!storage) return null
   const stored = readStoredManualLayoutDraft(storage, draftIdentity)
   if (!stored || stored.pageId !== pageId || stored.revision <= stored.acknowledgedRevision) return null
-  const blocks = mergeAcknowledgedBlocks(pageId, prepareBlocks(pageId, stored.blocks), serverBlocks)
+  const baselineBlocks = prepareBlocks(pageId, serverBlocks)
+  const blocks = mergeAcknowledgedBlocks(pageId, prepareBlocks(pageId, stored.blocks), baselineBlocks)
   const activeBlockId = stored.activeBlockId && blocks.some((block, index) => (
     getManualLayoutDraftBlockId(pageId, block, index) === stored.activeBlockId
   ))
@@ -281,6 +329,7 @@ export function restoreManualLayoutDraftSnapshot(
     draftIdentity: draftIdentity.trim(),
     pageId,
     blocks,
+    baselineBlocks,
     activeBlockId,
     revision: Math.max(1, stored.revision),
     acknowledgedRevision: Math.max(0, Math.min(stored.acknowledgedRevision, stored.revision - 1)),
@@ -293,10 +342,12 @@ export function createManualLayoutDraft(
   blocks: readonly ManualLayoutDraftBlock[],
   draftIdentity = pageId,
 ): ManualLayoutDraftState {
+  const preparedBlocks = prepareBlocks(pageId, blocks)
   return {
     draftIdentity,
     pageId,
-    blocks: prepareBlocks(pageId, blocks),
+    blocks: preparedBlocks,
+    baselineBlocks: preparedBlocks,
     activeBlockId: null,
     revision: 0,
     acknowledgedRevision: 0,
@@ -366,20 +417,27 @@ export function reduceManualLayoutDraft(
     case 'set-active':
       return state.activeBlockId === action.blockId ? state : { ...state, activeBlockId: action.blockId }
     case 'save-started':
-      if ((action.pageId && action.pageId !== state.pageId) || action.revision !== state.revision) return state
+      if ((action.draftIdentity && action.draftIdentity !== state.draftIdentity)
+        || (action.pageId && action.pageId !== state.pageId)
+        || action.revision !== state.revision) return state
       return { ...state, saveState: 'saving' }
     case 'save-failed':
-      if ((action.pageId && action.pageId !== state.pageId) || action.revision > state.revision) return state
+      if ((action.draftIdentity && action.draftIdentity !== state.draftIdentity)
+        || (action.pageId && action.pageId !== state.pageId)
+        || action.revision > state.revision) return state
       if (state.acknowledgedRevision >= state.revision) return state
       if (action.revision < state.revision) return { ...state, saveState: 'dirty' }
       return { ...state, saveState: 'failed' }
     case 'server-ack': {
-      if (action.pageId && action.pageId !== state.pageId) return state
+      if ((action.draftIdentity && action.draftIdentity !== state.draftIdentity)
+        || (action.pageId && action.pageId !== state.pageId)) return state
       if (action.revision < state.acknowledgedRevision || action.revision > state.revision) return state
       const acknowledgedRevision = Math.max(state.acknowledgedRevision, action.revision)
+      const baselineBlocks = prepareBlocks(state.pageId, action.blocks)
       if (action.revision !== state.revision) {
         return {
           ...state,
+          baselineBlocks,
           acknowledgedRevision,
           saveState: state.saveState === 'failed' ? 'failed' : 'dirty',
         }
@@ -387,28 +445,47 @@ export function reduceManualLayoutDraft(
       return {
         ...state,
         blocks: mergeAcknowledgedBlocks(state.pageId, state.blocks, action.blocks),
+        baselineBlocks,
         acknowledgedRevision,
         saveState: 'clean',
       }
     }
     case 'server-echo': {
       if (action.pageId !== state.pageId) return state
+      const baselineBlocks = prepareBlocks(state.pageId, action.blocks)
       if (state.saveState !== 'clean') {
         return {
           ...state,
-          blocks: mergeAcknowledgedBlocks(state.pageId, state.blocks, action.blocks),
+          blocks: mergeAcknowledgedBlocks(state.pageId, state.blocks, baselineBlocks),
+          baselineBlocks,
         }
       }
-      const blocks = prepareBlocks(state.pageId, action.blocks)
+      const blocks = baselineBlocks
       const activeBlockId = state.activeBlockId && blocks.some((block, index) => (
         getManualLayoutDraftBlockId(state.pageId, block, index) === state.activeBlockId
       ))
         ? state.activeBlockId
         : null
-      return { ...state, blocks, activeBlockId }
+      return { ...state, blocks, baselineBlocks, activeBlockId }
     }
     case 'retry':
       return state.saveState === 'failed' ? { ...state, saveState: 'dirty' } : state
+    case 'discard':
+      return {
+        ...state,
+        blocks: state.baselineBlocks.map((block) => ({ ...block })),
+        activeBlockId: null,
+        revision: state.acknowledgedRevision,
+        saveState: 'clean',
+      }
+    case 'discard-pending':
+      return {
+        ...state,
+        blocks: state.baselineBlocks.map((block) => ({ ...block })),
+        activeBlockId: null,
+        revision: state.revision + 1,
+        saveState: 'saving',
+      }
     case 'page-changed':
       return action.restoredState || createManualLayoutDraft(action.pageId, action.blocks, action.draftIdentity)
     default:
@@ -425,6 +502,36 @@ export function getManualLayoutSaveSchedule(
   return state.saveState === 'dirty'
     ? { kind: 'debounce', revision: state.revision }
     : { kind: 'none' }
+}
+
+export function shouldPersistManualLayoutDraftAction(action: ManualLayoutDraftAction): boolean {
+  return action.type !== 'set-active' && action.type !== 'preview-replace'
+}
+
+function shouldClearManualLayoutPreview(action: ManualLayoutDraftAction): boolean {
+  return ['create', 'update', 'delete', 'replace', 'discard', 'discard-pending', 'page-changed'].includes(action.type)
+}
+
+export function isManualLayoutSaveEpochCurrent(
+  currentEpoch: number,
+  capturedEpoch: number,
+  currentDraftIdentity: string,
+  capturedDraftIdentity: string,
+): boolean {
+  return currentEpoch === capturedEpoch && currentDraftIdentity === capturedDraftIdentity
+}
+
+export function finalizeManualLayoutDraftOnUnmount(
+  committedState: ManualLayoutDraftState,
+  clearTimer: () => void,
+  persist: (state: ManualLayoutDraftState) => void,
+  flush: () => Promise<boolean>,
+): boolean {
+  clearTimer()
+  persist(committedState)
+  if (committedState.saveState === 'clean') return false
+  void Promise.resolve(flush()).catch(() => false)
+  return true
 }
 
 export async function continueManualLayoutSaveAfterSettlement(
@@ -457,12 +564,14 @@ export function useManualLayoutDraft({
     () => restoreManualLayoutDraftSnapshot(storageRef.current, draftIdentity, pageId, blocks)
       || createManualLayoutDraft(pageId, blocks, draftIdentity),
   )
+  const [previewBlocksState, setPreviewBlocksState] = useState<ManualLayoutDraftBlock[] | null>(null)
   const stateRef = useRef(state)
   const saveRef = useRef(save)
   const mountedRef = useRef(true)
   const timerRef = useRef<number | null>(null)
   const inFlightRef = useRef<Promise<boolean> | null>(null)
   const saveRunnerRef = useRef<() => Promise<boolean>>(async () => true)
+  const saveEpochRef = useRef(0)
 
   const dispatch = useCallback((action: ManualLayoutDraftAction) => {
     const current = stateRef.current
@@ -493,7 +602,10 @@ export function useManualLayoutDraft({
       }
     }
     stateRef.current = reduceManualLayoutDraft(current, stableAction)
-    persistManualLayoutDraftSnapshot(storageRef.current, stateRef.current)
+    if (shouldClearManualLayoutPreview(stableAction) && mountedRef.current) setPreviewBlocksState(null)
+    if (shouldPersistManualLayoutDraftAction(stableAction)) {
+      persistManualLayoutDraftSnapshot(storageRef.current, stateRef.current)
+    }
     if (mountedRef.current) reducerDispatch(stableAction)
   }, [])
 
@@ -518,23 +630,48 @@ export function useManualLayoutDraft({
     }
     const snapshot = stateRef.current
     if (getManualLayoutSaveSchedule(snapshot, true).kind === 'none') return snapshot.saveState === 'clean'
+    const saveEpoch = saveEpochRef.current
     clearSaveTimer()
-    dispatch({ type: 'save-started', pageId: snapshot.pageId, revision: snapshot.revision })
+    dispatch({
+      type: 'save-started',
+      draftIdentity: snapshot.draftIdentity,
+      pageId: snapshot.pageId,
+      revision: snapshot.revision,
+    })
     const savePromise = (async () => {
       try {
         await Promise.resolve(saveRef.current(snapshot.pageId, snapshot.blocks, snapshot.revision))
+        if (!isManualLayoutSaveEpochCurrent(
+          saveEpochRef.current,
+          saveEpoch,
+          stateRef.current.draftIdentity,
+          snapshot.draftIdentity,
+        )) return true
         dispatch({
           type: 'server-ack',
+          draftIdentity: snapshot.draftIdentity,
           pageId: snapshot.pageId,
           revision: snapshot.revision,
           blocks: snapshot.blocks,
         })
         return true
       } catch {
-        dispatch({ type: 'save-failed', pageId: snapshot.pageId, revision: snapshot.revision })
+        if (isManualLayoutSaveEpochCurrent(
+          saveEpochRef.current,
+          saveEpoch,
+          stateRef.current.draftIdentity,
+          snapshot.draftIdentity,
+        )) {
+          dispatch({
+            type: 'save-failed',
+            draftIdentity: snapshot.draftIdentity,
+            pageId: snapshot.pageId,
+            revision: snapshot.revision,
+          })
+        }
         return false
       } finally {
-        inFlightRef.current = null
+        if (saveEpochRef.current === saveEpoch) inFlightRef.current = null
       }
     })()
     inFlightRef.current = savePromise
@@ -571,8 +708,12 @@ export function useManualLayoutDraft({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
-      clearSaveTimer()
-      if (stateRef.current.saveState !== 'clean') void saveRunnerRef.current()
+      finalizeManualLayoutDraftOnUnmount(
+        stateRef.current,
+        clearSaveTimer,
+        (committedState) => { persistManualLayoutDraftSnapshot(storageRef.current, committedState) },
+        () => saveRunnerRef.current(),
+      )
     }
   }, [clearSaveTimer])
 
@@ -590,8 +731,8 @@ export function useManualLayoutDraft({
   }, [dispatch])
   const previewBlocks = useCallback((nextBlocks: ManualLayoutDraftBlock[]) => {
     clearSaveTimer()
-    dispatch({ type: 'preview-replace', blocks: nextBlocks })
-  }, [clearSaveTimer, dispatch])
+    if (mountedRef.current) setPreviewBlocksState(prepareBlocks(stateRef.current.pageId, nextBlocks))
+  }, [clearSaveTimer])
   const setActiveBlockId = useCallback((blockId: string | null) => {
     dispatch({ type: 'set-active', blockId })
   }, [dispatch])
@@ -600,6 +741,8 @@ export function useManualLayoutDraft({
   }, [dispatch])
   const changePage = useCallback((nextPageId: string, nextDraftIdentity: string, nextBlocks: ManualLayoutDraftBlock[]) => {
     clearSaveTimer()
+    saveEpochRef.current += 1
+    inFlightRef.current = null
     const restoredState = restoreManualLayoutDraftSnapshot(
       storageRef.current,
       nextDraftIdentity,
@@ -614,13 +757,75 @@ export function useManualLayoutDraft({
       restoredState,
     })
   }, [clearSaveTimer, dispatch])
+  const discardCurrentDraft = useCallback(async (): Promise<boolean> => {
+    clearSaveTimer()
+    const discardedState = stateRef.current
+    const discardedIdentity = discardedState.draftIdentity
+    const discardedPageId = discardedState.pageId
+    const baselineBlocks = discardedState.baselineBlocks.map((block) => ({ ...block }))
+    const supersededSave = inFlightRef.current
+    saveEpochRef.current += 1
+    const discardEpoch = saveEpochRef.current
+    inFlightRef.current = null
+    discardManualLayoutDraftSnapshot(storageRef.current, discardedIdentity, discardedState.revision)
+    if (!supersededSave) {
+      dispatch({ type: 'discard' })
+      return true
+    }
+
+    dispatch({ type: 'discard-pending' })
+    await supersededSave
+    const compensationState = stateRef.current
+    if (!isManualLayoutSaveEpochCurrent(
+      saveEpochRef.current,
+      discardEpoch,
+      compensationState.draftIdentity,
+      discardedIdentity,
+    )) return false
+    try {
+      await Promise.resolve(saveRef.current(
+        discardedPageId,
+        baselineBlocks,
+        compensationState.revision,
+      ))
+      dispatch({
+        type: 'server-ack',
+        draftIdentity: discardedIdentity,
+        pageId: discardedPageId,
+        revision: compensationState.revision,
+        blocks: baselineBlocks,
+      })
+      return true
+    } catch {
+      dispatch({
+        type: 'save-failed',
+        draftIdentity: discardedIdentity,
+        pageId: discardedPageId,
+        revision: compensationState.revision,
+      })
+      return false
+    }
+  }, [clearSaveTimer, dispatch])
+  const discardAndChangePage = useCallback(async (
+    nextPageId: string,
+    nextDraftIdentity: string,
+    nextBlocks: ManualLayoutDraftBlock[],
+  ): Promise<boolean> => {
+    if (!(await discardCurrentDraft())) return false
+    changePage(nextPageId, nextDraftIdentity, nextBlocks)
+    return true
+  }, [changePage, discardCurrentDraft])
   const retry = useCallback(() => {
     dispatch({ type: 'retry' })
     void saveCurrentRevision()
   }, [dispatch, saveCurrentRevision])
 
+  const displayState = useMemo(() => (
+    previewBlocksState ? { ...state, blocks: previewBlocksState } : state
+  ), [previewBlocksState, state])
+
   return {
-    state,
+    state: displayState,
     createBlock,
     updateBlock,
     deleteBlock,
@@ -629,6 +834,8 @@ export function useManualLayoutDraft({
     setActiveBlockId,
     receiveServerEcho,
     changePage,
+    discardCurrentDraft,
+    discardAndChangePage,
     retry,
     flush,
   }

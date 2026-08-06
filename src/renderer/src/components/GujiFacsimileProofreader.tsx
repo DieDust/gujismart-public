@@ -1999,9 +1999,8 @@ export default function GujiFacsimileProofreader({
       manualLayoutDraft.receiveServerEcho(pageId, incomingBlocks)
       return
     }
-    const applyPageChange = () => {
+    const resetPageEditorUi = () => {
       if (!proofreaderMountedRef.current) return
-      manualLayoutDraft.changePage(pageId, draftIdentity, incomingBlocks)
       blocksRef.current = incomingBlocks
       setHistory([incomingBlocks.map((block) => ({ ...block }))])
       setHistoryIndex(0)
@@ -2015,6 +2014,18 @@ export default function GujiFacsimileProofreader({
       translationRequestKeyRef.current = ''
       pendingDraftIdentityRef.current = ''
     }
+    const applyPageChange = () => {
+      manualLayoutDraft.changePage(pageId, draftIdentity, incomingBlocks)
+      resetPageEditorUi()
+    }
+    const discardAndApplyPageChange = async () => {
+      const changed = await manualLayoutDraft.discardAndChangePage(pageId, draftIdentity, incomingBlocks)
+      if (changed) {
+        resetPageEditorUi()
+      } else if (proofreaderMountedRef.current) {
+        message.error('撤销旧页修改失败，已保留基准草稿，请重试保存')
+      }
+    }
     if (pageAction === 'apply-target') {
       applyPageChange()
       return
@@ -2027,7 +2038,7 @@ export default function GujiFacsimileProofreader({
       okText: '放弃修改并切换',
       okButtonProps: { danger: true },
       cancelText: '保存后切换',
-      onOk: applyPageChange,
+      onOk: discardAndApplyPageChange,
       onCancel: async () => {
         const saved = await manualLayoutDraft.flush()
         if (!saved && proofreaderMountedRef.current) message.error('版式保存失败，旧页面草稿已保留，请重试')
@@ -2040,6 +2051,7 @@ export default function GujiFacsimileProofreader({
     draftIdentity,
     incomingBlocks,
     manualLayoutDraft.changePage,
+    manualLayoutDraft.discardAndChangePage,
     manualLayoutDraft.flush,
     manualLayoutDraft.receiveServerEcho,
     manualLayoutDraft.state.draftIdentity,
