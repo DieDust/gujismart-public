@@ -12,6 +12,7 @@ import {
   BarsOutlined,
   BookOutlined,
   CloseOutlined,
+  DeleteOutlined,
   DownOutlined,
   EditOutlined,
   ExportOutlined,
@@ -1548,6 +1549,7 @@ export default function DocumentView({
   const [loading, setLoading] = useState(true)
   const [ocrProcessing, setOcrProcessing] = useState(false)
   const [manualPageInsertionLoading, setManualPageInsertionLoading] = useState(false)
+  const [manualPageDeletionLoading, setManualPageDeletionLoading] = useState(false)
   const [extracting, setExtracting] = useState(false)
   const [restoringPdf, setRestoringPdf] = useState(false)
   const [exportingDocument, setExportingDocument] = useState(false)
@@ -1992,6 +1994,14 @@ export default function DocumentView({
     () => chooseFacsimileOcrResult(ocrResultObj, proofingOcrResultObj),
     [ocrResultObj, proofingOcrResultObj],
   )
+  const editableFacsimileOcrResult = useMemo<FacsimileOcrResult>(
+    () => facsimileOcrResultObj || {
+      source_type: 'manual_layout_empty',
+      layout_result: [],
+      words_result: [],
+    },
+    [facsimileOcrResultObj],
+  )
   const facsimileTranslationSourceText = useMemo(
     () => getFacsimileTranslationSourceText(facsimileOcrResultObj),
     [facsimileOcrResultObj],
@@ -2109,6 +2119,8 @@ export default function DocumentView({
     : false
   const isEbookDocument = isManagedTextDocument(doc, sortedPages)
   const hasCurrentPageReadableText = hasReadablePageTextCandidate(currentPage)
+  const canUseManualFacsimileLayout = facsimileProofCandidate
+    || (!!currentPage && !isEbookDocument && !isTextDocumentType && hasCurrentPageImage)
   const hasOcrReaderCandidate = hasAnyOcrText && !isEbookDocument && documentMode === 'read'
   const shouldUseEbookReader = !!currentPage
     && documentMode === 'read'
@@ -2810,15 +2822,14 @@ export default function DocumentView({
 
   useEffect(() => {
     if (documentMode !== 'proof' || proofViewTouched) return
-    setProofViewMode(facsimileProofCandidate && preferFacsimileProofLayout ? 'facsimile' : 'text')
-  }, [documentMode, facsimileProofCandidate, preferFacsimileProofLayout, proofViewTouched])
+    setProofViewMode(canUseManualFacsimileLayout && preferFacsimileProofLayout ? 'facsimile' : 'text')
+  }, [canUseManualFacsimileLayout, documentMode, preferFacsimileProofLayout, proofViewTouched])
 
   useEffect(() => {
-    if (!facsimileOcrResultObj) return
-    if (!facsimileProofCandidate && proofViewMode === 'facsimile') {
+    if (!canUseManualFacsimileLayout && proofViewMode === 'facsimile') {
       setProofViewMode('text')
     }
-  }, [facsimileOcrResultObj, facsimileProofCandidate, proofViewMode])
+  }, [canUseManualFacsimileLayout, proofViewMode])
 
   useLayoutEffect(() => {
     activeDocumentIdRef.current = documentId
@@ -4709,6 +4720,64 @@ export default function DocumentView({
     }
   }, [currentPage?.id, documentId, manualPageInsertionLoading, refreshDocumentKeepPage])
 
+  const handleDeleteManualPage = useCallback(() => {
+    const targetPageId = currentPage?.id
+    if (!documentId || !targetPageId || manualPageDeletionLoading) return
+    if (pageCount <= 1) {
+      message.warning('文献至少需要保留一页，无法删除最后一页')
+      return
+    }
+
+    Modal.confirm({
+      title: '删除当前页面？',
+      content: '该页面的 OCR、版式、翻译、向量和检索缓存会一并移除，但不会删除外部仓库或原始 PDF 文件。删除后后续页面会自动前移。',
+      okText: '删除页面',
+      cancelText: '取消',
+      okType: 'danger',
+      onOk: async () => {
+        pageRangeInFlightRef.current.clear()
+        pageRangeRequestRef.current += 1
+        searchPagesRequestIdRef.current += 1
+        setManualPageDeletionLoading(true)
+        try {
+          const result = await window.api.deleteManualPage({ documentId, pageId: targetPageId })
+          pageRangeInFlightRef.current.clear()
+          pageRangeRequestRef.current += 1
+          searchPagesRequestIdRef.current += 1
+          pageImageCacheRef.current.delete(targetPageId)
+          setImageDataUrl('')
+          setNextImageDataUrl('')
+          setImageViewerResetToken((value) => value + 1)
+          setActiveBoxIndex(-1)
+          setSwitchToRegion(false)
+          setPageOcrVersions([])
+          setPageTranslations((current) => {
+            const next = { ...current }
+            delete next[targetPageId]
+            return next
+          })
+          setSkippedTranslationPageIds((current) => {
+            const next = { ...current }
+            delete next[targetPageId]
+            return next
+          })
+          const refreshed = await refreshDocumentKeepPage(result.nextPageId || undefined)
+          if (!refreshed) throw new Error('删除后无法刷新文献页面')
+          const refreshedPage = result.nextPageId
+            ? refreshed.pages.find((page) => page.id === result.nextPageId)
+            : null
+          setPageInput(String(refreshedPage?.page_num || Math.max(1, result.deletedPageNum)))
+          message.success(`已删除第 ${result.deletedPageNum} 页`)
+        } catch (error: unknown) {
+          console.error('Failed to delete manual page', error)
+          message.error(`删除页面失败：${getErrorMessage(error, '未知错误')}`)
+        } finally {
+          setManualPageDeletionLoading(false)
+        }
+      },
+    })
+  }, [currentPage?.id, documentId, manualPageDeletionLoading, pageCount, refreshDocumentKeepPage])
+
   const getReaderSearchInput = useCallback(() => {
     return containerRef.current?.querySelector<HTMLInputElement>('input[data-reader-search-input="true"]')
       || document.querySelector<HTMLInputElement>('.document-view input[data-reader-search-input="true"]')
@@ -6520,6 +6589,16 @@ export default function DocumentView({
                     插入空白页
                   </Button>
                 </Dropdown>
+                <Button
+                  size="small"
+                  danger
+                  icon={<DeleteOutlined />}
+                  loading={manualPageDeletionLoading}
+                  disabled={manualPageInsertionLoading || manualPageDeletionLoading || !currentPage?.id || pageCount <= 1}
+                  onClick={handleDeleteManualPage}
+                >
+                  删除当前页
+                </Button>
                 <Button size="small" disabled={currentPageIndex === pageCount - 1} onClick={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCount)) }}>
                   下一页
                 </Button>
@@ -6724,11 +6803,11 @@ export default function DocumentView({
               <span style={{ fontWeight: 500, color: 'var(--gs-text-primary)' }}>
                 {proofViewMode === 'facsimile' ? '版式还原校对' : '文本校对'}
               </span>
-              {facsimileProofCandidate ? <Tag color="purple">版式还原</Tag> : null}
+              {canUseManualFacsimileLayout ? <Tag color="purple">版式还原</Tag> : null}
             </Space>
 
             <Space size={4} wrap>
-              {facsimileProofCandidate ? (
+              {canUseManualFacsimileLayout ? (
                 <Segmented
                   size="small"
                   value={proofViewMode}
@@ -6862,10 +6941,10 @@ export default function DocumentView({
               <div className="empty-state">
                 <Spin tip="正在调用 PaddleOCR API..." />
               </div>
-            ) : facsimileOcrResultObj && proofViewMode === 'facsimile' ? (
+            ) : canUseManualFacsimileLayout && proofViewMode === 'facsimile' ? (
               <GujiFacsimileProofreader
                 draftIdentity={`${doc?.library_project_id || 'unknown-project'}/${doc?.id || documentId}/${currentPage?.id || 'unknown-page'}`}
-                ocrResult={facsimileOcrResultObj}
+                ocrResult={editableFacsimileOcrResult}
                 pageId={currentPage?.id || ''}
                 pageImageSrc={imageDataUrl}
                 pageProofStatus={currentPageProofStatus}

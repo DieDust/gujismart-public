@@ -26,6 +26,19 @@ export class SlidingWindowScheduler {
     }
   }
 
+  /**
+   * Drop work that has not entered the window yet. Resolving those promises
+   * lets the caller observe its cancellation flag and unwind its own cleanup
+   * without ever starting another OCR request.
+   */
+  cancelQueued(): number {
+    const pending = this.queue.splice(0)
+    for (const item of pending) {
+      item.resolve(undefined as never)
+    }
+    return pending.length
+  }
+
   run<T>(limit: number, task: () => Promise<T>): Promise<T> {
     const taskLimit = normalizeLimit(limit)
     return new Promise<T>((resolve, reject) => {

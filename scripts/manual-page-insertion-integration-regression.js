@@ -12,6 +12,14 @@ const insertionHandlerSource = documentViewSource.slice(insertionHandlerStart, i
 assert.ok(insertionHandlerSource.includes('pageRangeInFlightRef.current.clear()'), 'manual page insertion must clear in-flight page windows')
 assert.ok(insertionHandlerSource.includes('pageRangeRequestRef.current += 1'), 'manual page insertion must invalidate stale page windows')
 assert.ok(insertionHandlerSource.includes('searchPagesRequestIdRef.current += 1'), 'manual page insertion must invalidate stale search page windows')
+const deletionHandlerStart = documentViewSource.indexOf('const handleDeleteManualPage = useCallback')
+assert.ok(deletionHandlerStart >= 0, 'DocumentView must expose the manual page deletion handler')
+const deletionHandlerEnd = documentViewSource.indexOf('const getReaderSearchInput', deletionHandlerStart)
+assert.ok(deletionHandlerEnd > deletionHandlerStart, 'manual page deletion handler must be placed before reader search helpers')
+const deletionHandlerSource = documentViewSource.slice(deletionHandlerStart, deletionHandlerEnd)
+assert.ok(deletionHandlerSource.includes('window.api.deleteManualPage'), 'manual page deletion must call the preload API')
+assert.ok(deletionHandlerSource.includes('result.nextPageId'), 'manual page deletion must navigate to an adjacent page')
+assert.ok(documentViewSource.includes('删除当前页'), 'DocumentView must expose a delete current page button')
 const tempRoot = fs.mkdtempSync(path.join(__dirname, '.tmp-manual-page-insertion-'))
 const tempDataDir = path.join(tempRoot, 'data')
 const bundlePath = path.join(tempRoot, 'manual-page-insertion-bundle.cjs')
@@ -290,6 +298,70 @@ async function run() {
     })
     assert.strictEqual(noAnchorResult.inserted.page_num, 4)
     assert.deepStrictEqual(getPageRows(database, noAnchorDocId).map((page) => page.page_num), [1, 2, 3, 4])
+
+    const deleteDocId = 'manual_delete_page'
+    insertFixtureDocument(database, deleteDocId, 4)
+    insertPageStateFixtures(database, deleteDocId, `${deleteDocId}_page_2`, 2)
+    const deleteResult = await invoke('pages:deleteManual', {
+      documentId: deleteDocId,
+      pageId: `${deleteDocId}_page_2`,
+    })
+    assert.strictEqual(deleteResult.deletedPageId, `${deleteDocId}_page_2`)
+    assert.strictEqual(deleteResult.deletedPageNum, 2)
+    assert.strictEqual(deleteResult.nextPageId, `${deleteDocId}_page_3`)
+    assert.strictEqual(deleteResult.pageCount, 3)
+    assert.deepStrictEqual(
+      getPageRows(database, deleteDocId).map((page) => ({ id: page.id, page_num: page.page_num })),
+      [
+        { id: `${deleteDocId}_page_1`, page_num: 1 },
+        { id: `${deleteDocId}_page_3`, page_num: 2 },
+        { id: `${deleteDocId}_page_4`, page_num: 3 },
+      ],
+    )
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM page_ocr_versions WHERE page_id = ?', [`${deleteDocId}_page_2`]).count, 0)
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM page_ai_layout_cache WHERE page_id = ?', [`${deleteDocId}_page_2`]).count, 0)
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM page_translation_cache WHERE page_id = ?', [`${deleteDocId}_page_2`]).count, 0)
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM page_translation_units WHERE page_id = ?', [`${deleteDocId}_page_2`]).count, 0)
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM embedding_chunks WHERE page_id = ?', [`${deleteDocId}_page_2`]).count, 0)
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM search_index_segments WHERE page_id = ?', [`${deleteDocId}_page_2`]).count, 0)
+    assert.strictEqual(
+      database.queryOne('SELECT verification_status FROM research_evidence WHERE doc_id = ? AND page_id IS NULL', [deleteDocId]).verification_status,
+      'stale',
+    )
+    assert.strictEqual(database.queryOne('SELECT page_count FROM documents WHERE id = ?', [deleteDocId]).page_count, 3)
+
+    const lastPageDocId = 'manual_delete_last_page'
+    insertFixtureDocument(database, lastPageDocId, 1)
+    await assert.rejects(
+      () => invoke('pages:deleteManual', {
+        documentId: lastPageDocId,
+        pageId: `${lastPageDocId}_page_1`,
+      }),
+      /至少需要保留一页/,
+    )
+    assert.strictEqual(database.queryOne('SELECT COUNT(*) AS count FROM pages WHERE doc_id = ?', [lastPageDocId]).count, 1)
+
+    const ocrBusyDocId = 'manual_delete_ocr_busy'
+    insertFixtureDocument(database, ocrBusyDocId, 3)
+    database.run("UPDATE documents SET ocr_status = 'processing' WHERE id = ?", [ocrBusyDocId])
+    await assert.rejects(
+      () => invoke('pages:deleteManual', {
+        documentId: ocrBusyDocId,
+        pageId: `${ocrBusyDocId}_page_1`,
+      }),
+      /OCR 正在运行/,
+    )
+
+    const deferredDocId = 'manual_delete_deferred_pages'
+    insertFixtureDocument(database, deferredDocId, 3)
+    database.run('UPDATE documents SET page_count = 5 WHERE id = ?', [deferredDocId])
+    await assert.rejects(
+      () => invoke('pages:deleteManual', {
+        documentId: deferredDocId,
+        pageId: `${deferredDocId}_page_1`,
+      }),
+      /页面记录仍在初始化/,
+    )
 
     const rollbackDocId = 'manual_insert_rollback'
     insertFixtureDocument(database, rollbackDocId)

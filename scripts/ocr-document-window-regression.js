@@ -143,6 +143,25 @@ async function main() {
   await Promise.all([hung, follower])
   assert.strictEqual(followerStarted, true, 'forced cancellation must release a hung global OCR slot')
 
+  const cancelQueuedScheduler = new SlidingWindowScheduler()
+  let releaseCancelQueued
+  const cancelQueuedBarrier = new Promise((resolve) => { releaseCancelQueued = resolve })
+  const cancelQueuedStarted = []
+  const cancelQueuedRunning = cancelQueuedScheduler.run(1, async () => {
+    cancelQueuedStarted.push('running')
+    await cancelQueuedBarrier
+  })
+  const cancelQueuedFollowers = [0, 1, 2].map((index) => cancelQueuedScheduler.run(1, async () => {
+    cancelQueuedStarted.push(index)
+  }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.strictEqual(cancelQueuedScheduler.getSnapshot().queuedCount, 3)
+  assert.strictEqual(cancelQueuedScheduler.cancelQueued(), 3, 'cancelQueued should remove all not-yet-started work')
+  assert.strictEqual(cancelQueuedScheduler.getSnapshot().queuedCount, 0)
+  releaseCancelQueued()
+  await Promise.all([cancelQueuedRunning, ...cancelQueuedFollowers])
+  assert.deepStrictEqual(cancelQueuedStarted, ['running'], 'cancelQueued must not start canceled work')
+
   assert.strictEqual(
     buildOcrActivitySummary([
       { status: 'processing' },
@@ -218,7 +237,10 @@ async function main() {
   )
   assert.ok(
     ocrIpc.includes('async function cancelAllPersistedOcrQueues')
-      && ocrIpc.includes('const summary = await cancelAllPersistedOcrQueues()'),
+      && ocrIpc.includes('const summary = await cancelAllPersistedOcrQueues()')
+      && ocrIpc.includes('globalOcrDocumentWindow.cancelQueued()')
+      && ocrIpc.includes('heavyPdfOcrDocumentWindow.cancelQueued()')
+      && ocrIpc.includes('listResumableImportAutoOcrTasks(null)'),
     'cancel-all must use the same nonblocking SQLite writer-lock path',
   )
   const cancelHandler = ocrIpc.slice(

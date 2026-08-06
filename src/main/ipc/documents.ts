@@ -124,6 +124,8 @@ import type {
   DocumentListPage,
   DocumentPage,
   DocumentReadingWindow,
+  ManualPageDeleteRequest,
+  ManualPageDeleteResult,
   ManualPageInsertRequest,
   ManualPageInsertResult,
   DocumentUpdatePayload,
@@ -6568,6 +6570,146 @@ export function registerDocumentIpc(): void {
     notifySearchContentChanged()
     scheduleDatabaseSave()
     return { inserted: hydratePagePayloadRow(inserted), pageCount }
+  })
+
+  ipcMain.handle('pages:deleteManual', async (_event, request: ManualPageDeleteRequest): Promise<ManualPageDeleteResult> => {
+    const documentId = String(request?.documentId || '').trim()
+    const pageId = String(request?.pageId || '').trim()
+    if (!documentId) throw new Error('缺少文献 ID')
+    if (!pageId) throw new Error('缺少页面 ID')
+
+    const libraryProjectId = getActiveLibraryProjectId()
+    assertDocumentInLibraryProject(documentId, libraryProjectId)
+
+    let deletedPageNum = 0
+    let nextPageId: string | null = null
+    let pageCount = 0
+    const now = new Date().toISOString()
+
+    transaction(() => {
+      const document = queryOne<{ id: string; page_count: number | null; ocr_status: string | null }>(
+        'SELECT id, page_count, ocr_status FROM documents WHERE id = ?',
+        [documentId],
+      )
+      if (!document) throw new Error('文献不存在')
+      if (document.ocr_status === 'queued' || document.ocr_status === 'processing') {
+        throw new Error('OCR 正在运行，请先停止该文献的 OCR 后再删除页面')
+      }
+
+      const pages = queryAll<Pick<DocumentPage, 'id' | 'page_num' | 'created_at'>>(
+        `SELECT id, page_num, created_at
+         FROM pages
+         WHERE doc_id = ?
+         ORDER BY CASE WHEN page_num IS NULL THEN 1 ELSE 0 END, page_num ASC, created_at ASC, id ASC`,
+        [documentId],
+      )
+      const targetIndex = pages.findIndex((page) => String(page.id) === pageId)
+      if (targetIndex < 0) throw new Error('页面不存在或不属于当前文献')
+      if (pages.length <= 1) throw new Error('文献至少需要保留一页，无法删除最后一页')
+      if (Number(document.page_count || 0) > pages.length) {
+        throw new Error('当前文献的页面记录仍在初始化，请等待页面列表加载完成后再删除')
+      }
+
+      const targetPage = pages[targetIndex]
+      deletedPageNum = Number(targetPage.page_num || targetIndex + 1)
+      const remainingPages = pages.filter((page) => page.id !== pageId)
+      nextPageId = remainingPages[targetIndex]?.id || remainingPages[remainingPages.length - 1]?.id || null
+
+      // Remove page-scoped search/embedding rows before the page row disappears.
+      // The source PDF/repository file is intentionally untouched.
+      if (isFtsAvailable()) {
+        run('DELETE FROM pages_fts WHERE page_id = ?', [pageId])
+      }
+      run(
+        `DELETE FROM search_ngram_index
+         WHERE segment_id IN (SELECT segment_id FROM search_index_segments WHERE page_id = ?)`,
+        [pageId],
+      )
+      run('DELETE FROM search_index_segments WHERE page_id = ?', [pageId])
+      run(
+        `DELETE FROM search_ngram_index_staging
+         WHERE segment_id IN (SELECT segment_id FROM search_index_segments_staging WHERE page_id = ?)`,
+        [pageId],
+      )
+      run('DELETE FROM search_index_segments_staging WHERE page_id = ?', [pageId])
+      run('DELETE FROM embedding_chunks WHERE page_id = ?', [pageId])
+
+      // Explicit cleanup keeps this safe for databases created before every
+      // page-related foreign key was migrated to ON DELETE CASCADE.
+      run('DELETE FROM page_ocr_versions WHERE page_id = ?', [pageId])
+      run('DELETE FROM ocr_artifact_versions WHERE page_id = ?', [pageId])
+      run('DELETE FROM ocr_page_attempts WHERE page_id = ?', [pageId])
+      run('DELETE FROM ocr_page_active_artifacts WHERE page_id = ?', [pageId])
+      run('DELETE FROM page_ai_layout_cache WHERE page_id = ?', [pageId])
+      run('DELETE FROM page_translation_cache WHERE page_id = ?', [pageId])
+      run('DELETE FROM page_translation_units WHERE page_id = ?', [pageId])
+      run('DELETE FROM translation_context_snapshots WHERE page_id = ?', [pageId])
+
+      const temporaryOffset = Math.max(
+        1_000_000,
+        pages.reduce((max, page) => Math.max(max, Number(page.page_num || 0)), 0) + pages.length + 1,
+      )
+      run('UPDATE pages SET page_num = COALESCE(page_num, 0) + ? WHERE doc_id = ?', [temporaryOffset, documentId])
+      run('DELETE FROM pages WHERE id = ? AND doc_id = ?', [pageId, documentId])
+      remainingPages.forEach((page, index) => {
+        run('UPDATE pages SET page_num = ? WHERE id = ? AND doc_id = ?', [index + 1, page.id, documentId])
+      })
+
+      const pageNumberTables = [
+        'page_ocr_versions',
+        'ocr_artifact_versions',
+        'page_ai_layout_cache',
+        'page_translation_cache',
+        'page_translation_units',
+        'embedding_chunks',
+        'search_index_segments',
+        'search_index_segments_staging',
+        'research_evidence',
+      ] as const
+      for (const table of pageNumberTables) {
+        run(
+          `UPDATE ${table}
+           SET page_num = (SELECT p.page_num FROM pages p WHERE p.id = ${table}.page_id)
+           WHERE doc_id = ? AND page_id IS NOT NULL`,
+          [documentId],
+        )
+      }
+      run(
+        `UPDATE research_evidence
+         SET verification_status = 'stale'
+         WHERE doc_id = ? AND page_id IS NULL AND page_num IS NOT NULL`,
+        [documentId],
+      )
+      run(
+        `UPDATE research_notes
+         SET source_hash = '', updated_at = ?
+         WHERE doc_id = ? AND page_num IS NOT NULL`,
+        [now, documentId],
+      )
+      run(
+        `UPDATE ai_research_records
+         SET source_hash = '', status = 'pending', updated_at = ?
+         WHERE doc_id = ? AND page_num IS NOT NULL`,
+        [now, documentId],
+      )
+      run(
+        `UPDATE embedding_index_status
+         SET status = 'pending', segment_count = 0, embedded_count = 0, content_hash = '', error_message = NULL, updated_at = ?
+         WHERE doc_id = ?`,
+        [now, documentId],
+      )
+      markDocumentTocDirty(documentId)
+      pageCount = remainingPages.length
+      run('UPDATE documents SET page_count = ?, updated_at = ? WHERE id = ?', [pageCount, now, documentId])
+      syncDocumentProofStatus(documentId)
+    })
+
+    recomputeLiteraturePageMap(documentId)
+    markLibraryStateCacheDirty()
+    markSearchIndexStaleForDocuments([documentId])
+    notifySearchContentChanged()
+    scheduleDatabaseSave()
+    return { deletedPageId: pageId, deletedPageNum, nextPageId, pageCount }
   })
 
   ipcMain.handle(

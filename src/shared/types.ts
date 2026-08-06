@@ -1988,6 +1988,18 @@ export interface ManualPageInsertResult {
   pageCount: number
 }
 
+export interface ManualPageDeleteRequest {
+  documentId: string
+  pageId: string
+}
+
+export interface ManualPageDeleteResult {
+  deletedPageId: string
+  deletedPageNum: number
+  nextPageId: string | null
+  pageCount: number
+}
+
 export interface DocumentPage extends Page {
   has_ocr_text?: boolean
   needs_layout_attention?: boolean

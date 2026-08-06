@@ -482,6 +482,11 @@ function forceReleaseAllActiveOcrTasks(): string[] {
   for (const docId of docIds) {
     forceReleaseActiveOcrTask(docId)
   }
+  // Also drop requests that were waiting inside the shared sliding windows.
+  // Releasing only activeOcrTasks would leave canceled books ahead of the
+  // user's next OCR request, which appears as a permanent "waiting" state.
+  globalOcrDocumentWindow.cancelQueued()
+  heavyPdfOcrDocumentWindow.cancelQueued()
   queuedOcrDocIds.clear()
   return docIds
 }
@@ -5731,7 +5736,9 @@ async function cancelPersistedOcrQueueForDocument(docId: string): Promise<void> 
 async function cancelAllPersistedOcrQueues(): Promise<{ canceledJobs: number; canceledDocuments: number }> {
   const nowMs = Date.now()
   const nowIso = new Date(nowMs).toISOString()
-  const resumableJobs = listResumableImportAutoOcrTasks()
+  // "Stop all OCR" is global because the shared OCR window is global. Do not
+  // leave jobs from another project occupying slots after the user stops here.
+  const resumableJobs = listResumableImportAutoOcrTasks(null)
   let canceledJobs = 0
   for (const job of resumableJobs) {
     try {

@@ -130,7 +130,7 @@ export function listImportAutoOcrItems(jobId: string): ImportAutoOcrItem[] {
   })
 }
 
-export function listResumableImportAutoOcrTasks(libraryProjectId = getActiveLibraryProjectId()): TaskJobRecord[] {
+export function listResumableImportAutoOcrTasks(libraryProjectId: string | null = getActiveLibraryProjectId()): TaskJobRecord[] {
   const rows = queryAll<{ id: string }>(
     `SELECT id FROM task_jobs
      WHERE kind = ? AND status IN ('queued', 'running')
@@ -139,7 +139,8 @@ export function listResumableImportAutoOcrTasks(libraryProjectId = getActiveLibr
   )
   return rows
     .map((row) => getTaskJob(row.id))
-    .filter((job) => String(job.settingsSnapshot.libraryProjectId || DEFAULT_LIBRARY_PROJECT_ID) === libraryProjectId)
+    .filter((job) => libraryProjectId === null
+      || String(job.settingsSnapshot.libraryProjectId || DEFAULT_LIBRARY_PROJECT_ID) === libraryProjectId)
 }
 
 export function recoverInterruptedImportAutoOcrTasks(

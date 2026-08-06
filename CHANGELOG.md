@@ -7,6 +7,8 @@
 - 新增 Excel 式表格编辑：支持大块 TSV/HTML 粘贴、单元格编辑、行列调整、合并/拆分、撤销/重做，并保留合并关系、行高和列宽。
 - 新增统一的人工版式区块模型与工具栏：支持文本、标题、注释、表格、图片和印章区块，可移动、八方向缩放，并与底图模糊度联动。
 - 新增人工空白页：可在当前页前或后插入，页码、搜索、翻译、AI 布局和阅读窗口会在同一事务中保持一致；失败时完整回滚。
+- 无 OCR 结果或识别失败的页面现在仍可进入版式编辑，在白色画布上手动创建文本、表格、图片和注释区块；文献页工具栏新增“删除当前页”，事务化清理关联 OCR、翻译、向量和检索数据，自动重排页码并保护最后一页与外部原始文件。
+- 修复“停止全部 OCR”后重新单开仍长期等待的问题：停止操作现在会跨项目取消持久化 OCR 任务，并清空全局 OCR 与大 PDF 滑动窗口中的未启动任务，避免已取消队列继续占用新任务前面的槽位。
 - 图片/印章区块支持受管裁剪、仓库图片替换、资源引用保护和安全清理；资源不可用时自动回退原页裁剪。
 - 阅读、检索、导入和导出统一使用人工区块投影：表格结构、图片裁剪、资源引用、稳定区块定位和无 caption 图片的无文本语义保持一致。
 - 修复新建区块短暂闪现后消失、印章被当作装饰跳过、旧 OCR 图片文字被错误带入正文/搜索/导出的多处问题。
@@ -16,6 +18,8 @@
 - Added Excel-style table editing with bulk TSV/HTML paste, cell editing, row and column sizing, merge/split, undo/redo, and preservation of merges, row heights, and column widths.
 - Added a unified manual-layout block model and toolbar for text, titles, notes, tables, images, and seals, including move, eight-direction resize, and linked underlay blur controls.
 - Added transactional blank-page insertion before or after the current page. Page numbers, search, translation, AI layout, and reader windows stay consistent, and failures roll back atomically.
+- Pages with no OCR result or failed recognition can now enter layout editing and create text, table, image, or annotation blocks on a blank white canvas. The document toolbar also supports transactional current-page deletion with associated OCR, translation, vector, and search cleanup, automatic renumbering, last-page protection, and no deletion of external source files.
+- Fixed new OCR runs remaining stuck after “Stop all OCR.” Cancel-all now cancels persisted OCR jobs across projects and clears not-yet-started work from both the global and heavy-PDF sliding windows, so canceled queue entries cannot stay ahead of a new request.
 - Image and seal blocks now support managed crops, repository replacement, reference-safe cleanup, and automatic fallback to a crop of the original page when a managed asset is unavailable.
 - Reading, search, import, and export now share one manual-block projection, preserving table structure, image crops, asset references, stable block locators, and the rule that captionless visual blocks have no fabricated text.
 - Fixed newly created blocks flashing and disappearing, seals being skipped as decoration, and stale OCR image words leaking into reading text, search, or exports.

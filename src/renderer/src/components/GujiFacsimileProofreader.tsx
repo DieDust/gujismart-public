@@ -1876,7 +1876,8 @@ export function isFacsimileProofCandidate(doc: Partial<Document> | null | undefi
   const blocks = normalizeBlocks(ocrResult)
   const parsed = asOcrResult(ocrResult)
   const pageText = String(page?.proofed_text || page?.ocr_text || parsed.text || '').trim()
-  return blocks.length > 0 || pageText.length > 0 || doc?.doc_type === '古籍'
+  const hasVisualSource = Boolean(String(page?.image_path || '').trim() || String(doc?.file_path || '').trim())
+  return blocks.length > 0 || pageText.length > 0 || hasVisualSource || doc?.doc_type === '古籍'
 }
 
 export default function GujiFacsimileProofreader({
@@ -3319,8 +3320,6 @@ export default function GujiFacsimileProofreader({
     </div>
   )
 
-  if (blocks.length === 0 && !pageImageSrc) return <Empty description="当前页面没有可还原的 OCR 版面或底图" />
-
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 8, position: 'relative' }}>
       {textSelection ? (
@@ -3483,6 +3482,30 @@ export default function GujiFacsimileProofreader({
                 userSelect: 'none',
               }}
             />
+          ) : null}
+          {blocks.length === 0 ? (
+            <div
+              data-manual-layout-empty-state="true"
+              style={{
+                position: 'absolute',
+                inset: '10% 8%',
+                zIndex: 20,
+                display: 'grid',
+                placeItems: 'center',
+                padding: 24,
+                color: '#7b6040',
+                background: pageImageSrc ? 'rgba(255, 253, 247, 0.74)' : 'rgba(255, 253, 247, 0.96)',
+                border: '1px dashed rgba(123, 96, 64, 0.48)',
+                textAlign: 'center',
+                lineHeight: 1.7,
+                pointerEvents: 'none',
+              }}
+            >
+              <div>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>{pageImageSrc ? '本页暂未识别出 OCR 区块' : '这是一个空白编辑页'}</div>
+                <div>{layoutEditMode ? '请在页面空白处拖动，创建文本、表格、图片或注释区块。' : '点击“编辑版式”，即可在页面上手动创建文本、表格、图片或注释区块。'}</div>
+              </div>
+            </div>
           ) : null}
           <div style={{ position: 'absolute', inset: '1.2%', border: showImageUnderlay ? '1px solid rgba(45,33,21,0.35)' : '1px solid #2d2115', pointerEvents: 'none' }} />
           {draftCreateRect ? (
