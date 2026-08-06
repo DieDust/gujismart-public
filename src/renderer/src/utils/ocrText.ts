@@ -3,6 +3,7 @@ import {
   getLayoutBlockSearchText,
   getLosslessLayoutTableRows,
   getManualBlockId,
+  getManualLayoutBlockKind,
   getManualLayoutSignatureSnapshot,
   isManualLayoutBlock,
   type ManualLayoutBlockMeta,
@@ -353,6 +354,7 @@ export function getOcrBlockText(block: unknown): string {
 
 export type ReadablePageElement = {
   type: 'heading' | 'paragraph' | 'table' | 'image' | 'toc'
+  visualKind?: 'image' | 'seal'
   text: string
   displayText?: string
   rows?: string[][]
@@ -362,6 +364,7 @@ export type ReadablePageElement = {
   rect?: Rect
   imagePath?: string
   imageCrop?: ManualLayoutBlockMeta['image_crop']
+  caption?: string
   charStart: number
   charEnd: number
 }
@@ -483,6 +486,11 @@ function isLayoutImageLabel(label: string): boolean {
   const normalized = normalizeLayoutLabel(label)
   return /^(?:image|figure|picture|chart|diagram|photo|illustration)$/.test(normalized)
     || /图片|图像|插图|示意图|图表|照片/.test(normalized)
+}
+
+function getManualVisualKind(block: unknown): 'image' | 'seal' | undefined {
+  const kind = getManualLayoutBlockKind(block)
+  return kind === 'image' || kind === 'seal' ? kind : undefined
 }
 
 function parseMarkdownImageBlocks(markdownText: string): MarkdownImageBlock[] {
@@ -923,6 +931,7 @@ function getBlockRect(block: unknown): Rect | null {
 }
 
 function isDecorativeLayoutBlock(block: unknown, text: string): boolean {
+  if (getManualVisualKind(block)) return false
   const label = getBlockLabel(block)
   if (isLayoutDecorativeLabel(label)) return true
   const compact = String(text || '').replace(/\s+/g, '')
@@ -1933,27 +1942,30 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
       const label = getBlockLabel(block)
       const blockId = getManualBlockId(block)
       const manualSnapshot = getManualLayoutSignatureSnapshot(block)
+      const visualKind = getManualVisualKind(block)
       const rawText = getBlockText(block)
       const displayText = getBlockDisplayText(block)
       const imageRect = getBlockRect(block)
-      if (isLayoutImageLabel(label) && imageRect && imageRect.width > 12 && imageRect.height > 12) {
+      if ((isLayoutImageLabel(label) || visualKind) && imageRect && imageRect.width > 12 && imageRect.height > 12) {
         const charStart = cursor.value
         const imagePath = String(block?.image_asset_path || block?.asset_path || block?.image_path || '').trim()
         elements.push({
           type: 'image',
-          text: manualSnapshot?.caption || manualSnapshot?.altText || rawText || label || 'image',
+          visualKind: visualKind || 'image',
+          text: visualKind ? manualSnapshot?.caption || manualSnapshot?.altText || '' : rawText || label || 'image',
           label: label || 'image',
           blockId,
           rect: imageRect,
           imagePath: imagePath || undefined,
           imageCrop: manualSnapshot?.imageCrop,
+          caption: manualSnapshot?.caption,
           charStart,
           charEnd: charStart,
         })
         cursor.value = charStart + 2
         continue
       }
-      if (isDecorativeLayoutBlock(block, rawText)) continue
+      if (!visualKind && isDecorativeLayoutBlock(block, rawText)) continue
       if (rawText && pushTocElement(elements, rawText, label, cursor, imageRect, blockId)) continue
       const rows = getLosslessLayoutTableRows(block) || getBlockTableRows(block)
       if (rows.length > 0) {
@@ -2014,7 +2026,27 @@ export function getReadablePageElements(page: OcrTextPage): ReadablePageElement[
     for (const block of blocks) {
       const label = getBlockLabel(block)
       const blockId = getManualBlockId(block)
+      const visualKind = getManualVisualKind(block)
       const blockRect = getBlockRect(block)
+      if (visualKind && blockRect && blockRect.width > 12 && blockRect.height > 12) {
+        const manualSnapshot = getManualLayoutSignatureSnapshot(block)
+        const charStart = cursor.value
+        elements.push({
+          type: 'image',
+          visualKind,
+          text: manualSnapshot?.caption || manualSnapshot?.altText || '',
+          caption: manualSnapshot?.caption,
+          label,
+          blockId,
+          rect: blockRect,
+          imagePath: String(block.image_asset_path || block.asset_path || block.image_path || '').trim() || undefined,
+          imageCrop: manualSnapshot?.imageCrop,
+          charStart,
+          charEnd: charStart,
+        })
+        cursor.value = charStart + 2
+        continue
+      }
       if (isTableBlock(block)) {
         const rows = getLosslessLayoutTableRows(block) || getBlockTableRows(block)
         const text = rows.length > 0 ? tableRowsToText(rows) : normalizeOcrTextForReading(getBlockText(block))

@@ -7,6 +7,7 @@ import {
   createManualLayoutLocationKey,
   getLayoutBlockSearchSegments,
   getManualLayoutSearchSegments,
+  hasManualLayoutBlocks,
   parseManualLayoutLocationKey,
   projectLayoutBlocksToPageText,
 } from '../shared/manual-layout'
@@ -948,7 +949,7 @@ function getIndexablePageText(page: SearchPageRow): string {
   const pageWithManualLayout = pageHasLazyOcrResult(page) ? loadPageOcrResultForSearch(page) : page
   const manualPayload = parseMaybeJson<OcrResultPayload>(pageWithManualLayout.ocr_result)
   const manualLayoutBlocks = Array.isArray(manualPayload?.layout_result) ? manualPayload.layout_result : []
-  if (getManualLayoutSearchSegments(manualLayoutBlocks).length > 0) {
+  if (hasManualLayoutBlocks(manualLayoutBlocks)) {
     return projectLayoutBlocksToPageText(manualLayoutBlocks)
   }
   const proofed = String(getHydratedPageTextField(page, 'proofed_text') || '').trim()
@@ -1469,7 +1470,7 @@ function buildSearchIndexSegmentDrafts(docId: string, page: SearchPageRow, index
   const parsed = parseMaybeJson<OcrResultPayload>(pageWithOcrResult.ocr_result)
   const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
   const manualSegments = getManualLayoutSearchSegments(layoutBlocks)
-  if (manualSegments.length > 0) {
+  if (hasManualLayoutBlocks(layoutBlocks)) {
     const meta = parseSegmentMeta(pageWithOcrResult)
     const pageId = String(page.id || '')
     const pageNum = Number(page.page_num || index + 1)

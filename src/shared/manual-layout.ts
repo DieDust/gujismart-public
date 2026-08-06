@@ -364,6 +364,10 @@ export function getManualLayoutSearchSegments(
   )
 }
 
+export function hasManualLayoutBlocks(blocks: readonly unknown[] | null | undefined): boolean {
+  return Array.isArray(blocks) && blocks.some((block) => isManualLayoutBlock(block))
+}
+
 export function getManualLayoutStructuredBlocks(
   blocks: readonly unknown[] | null | undefined,
 ): ManualLayoutStructuredBlock[] {

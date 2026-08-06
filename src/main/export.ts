@@ -14,6 +14,7 @@ import {
   getLayoutBlockSearchText,
   getManualLayoutSearchSegments,
   getManualLayoutStructuredBlocks,
+  hasManualLayoutBlocks,
   projectLayoutBlocksToPageText,
 } from '../shared/manual-layout'
 import { hydratePagePayloadRows } from './page-payload-store'
@@ -364,7 +365,7 @@ function metadataText(metadata: JsonRecord, key: string, fallback = ''): string 
 function getPageText(page: ExportPage): string {
   const parsed = parseMaybeJson<OcrResultPayload>(page.ocr_result, {})
   const layoutResult = asLayoutBlocks(parsed.layout_result)
-  if (getManualLayoutSearchSegments(layoutResult).length > 0) {
+  if (hasManualLayoutBlocks(layoutResult)) {
     const projected = projectLayoutBlocksToPageText(layoutResult).trim()
     if (projected) return projected
   }

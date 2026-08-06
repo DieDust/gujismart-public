@@ -7,6 +7,7 @@ import {
   createManualLayoutLocationKey,
   getLayoutBlockSearchSegments,
   getManualLayoutSearchSegments,
+  hasManualLayoutBlocks,
   projectLayoutBlocksToPageText,
 } from '../shared/manual-layout'
 import {
@@ -510,7 +511,7 @@ function getIndexablePageText(sqlite: NativeDatabase, page: SearchPageRow): stri
   const pageWithManualLayout = pageHasLazyOcrResult(page) ? loadPageOcrResultForSearch(sqlite, page) : page
   const manualPayload = parseMaybeJson<OcrResultPayload>(pageWithManualLayout.ocr_result)
   const manualLayoutBlocks = Array.isArray(manualPayload?.layout_result) ? manualPayload.layout_result : []
-  if (getManualLayoutSearchSegments(manualLayoutBlocks).length > 0) {
+  if (hasManualLayoutBlocks(manualLayoutBlocks)) {
     return projectLayoutBlocksToPageText(manualLayoutBlocks)
   }
   const proofed = String(getHydratedPageTextField(page, 'proofed_text') || '').trim()
@@ -732,7 +733,7 @@ function buildSearchIndexSegmentDrafts(sqlite: NativeDatabase, docId: string, pa
   const parsed = parseMaybeJson<OcrResultPayload>(pageWithOcrResult.ocr_result)
   const layoutBlocks = Array.isArray(parsed?.layout_result) ? parsed.layout_result : []
   const manualSegments = getManualLayoutSearchSegments(layoutBlocks)
-  if (manualSegments.length > 0) {
+  if (hasManualLayoutBlocks(layoutBlocks)) {
     const meta = parseSegmentMeta(sqlite, pageWithOcrResult)
     const pageId = String(page.id || '')
     const pageNum = Number(page.page_num || index + 1)

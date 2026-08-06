@@ -39,9 +39,11 @@ try {
   const tableCellText = 'manual table beta'
   const imageCaption = 'manual image gamma'
   const fabricatedImageOcr = 'fabricated image OCR must stay hidden'
+  const fabricatedSealOcr = 'fabricated seal OCR must stay hidden'
   const noteId = 'manual-page-cross-note001'
   const tableId = 'manual-page-cross-table001'
   const imageId = 'manual-page-cross-image001'
+  const sealId = 'manual-page-cross-seal001'
   const blocks = [
     {
       manual_block_id: noteId,
@@ -82,6 +84,16 @@ try {
       reading_order: 3,
       location: { left: 40, top: 320, width: 360, height: 220 },
     },
+    {
+      manual_block_id: sealId,
+      segmentation_source: 'manual',
+      label: 'seal',
+      words: fabricatedSealOcr,
+      image_asset_path: 'page-assets/page-cross/seal001.png',
+      image_crop: { source_page_id: 'page-cross', left: 440, top: 320, width: 160, height: 160 },
+      reading_order: 4,
+      location: { left: 440, top: 320, width: 160, height: 160 },
+    },
   ]
   const page = {
     id: 'page-cross',
@@ -95,6 +107,7 @@ try {
   const note = elements.find((element) => element.blockId === noteId)
   const table = elements.find((element) => element.blockId === tableId)
   const image = elements.find((element) => element.blockId === imageId)
+  const seal = elements.find((element) => element.blockId === sealId)
   assert.ok(note && note.type === 'paragraph', 'manual note should be readable and keep its stable block id')
   assert.ok(table && table.type === 'table', 'manual table should be readable and keep its stable block id')
   assert.ok(image && image.type === 'image', 'manual image should be readable and keep its stable block id')
@@ -103,18 +116,25 @@ try {
   assert.strictEqual(image.imagePath, blocks[2].image_asset_path)
   assert.strictEqual(image.text, imageCaption)
   assert.deepStrictEqual(image.rect, blocks[2].location)
+  assert.ok(seal && seal.type === 'image' && seal.visualKind === 'seal', 'manual seal should render as a visual image element')
+  assert.strictEqual(seal.text, '')
+  assert.strictEqual(seal.imagePath, blocks[3].image_asset_path)
+  assert.deepStrictEqual(seal.imageCrop, blocks[3].image_crop)
 
   const readableText = ocrText.getReadablePageText(page)
   assert.strictEqual(countOccurrences(readableText, noteText), 1)
   assert.strictEqual(countOccurrences(readableText, tableCellText), 1)
   assert.strictEqual(countOccurrences(readableText, imageCaption), 1)
   assert.ok(!readableText.includes(fabricatedImageOcr), 'reader text must not fabricate OCR text for image blocks')
+  assert.ok(!readableText.includes(fabricatedSealOcr), 'reader text must not fabricate OCR text for seal blocks')
 
   const projectedText = manualLayout.projectLayoutBlocksToPageText(blocks)
   assert.strictEqual(countOccurrences(projectedText, noteText), 1)
   assert.strictEqual(countOccurrences(projectedText, tableCellText), 1)
   assert.strictEqual(countOccurrences(projectedText, imageCaption), 1)
   assert.ok(!projectedText.includes(fabricatedImageOcr), 'shared text projection must ignore stale image words')
+  assert.ok(!projectedText.includes(fabricatedSealOcr), 'shared text projection must ignore stale seal words')
+  assert.strictEqual(manualLayout.hasManualLayoutBlocks(blocks), true)
 
   const searchSegments = manualLayout.getManualLayoutSearchSegments(blocks)
   assert.deepStrictEqual(searchSegments.map((segment) => segment.blockId), [noteId, tableId, imageId])
@@ -122,6 +142,7 @@ try {
   assert.ok(searchSegments.some((segment) => segment.text.includes(tableCellText)))
   assert.ok(searchSegments.some((segment) => segment.text.includes(imageCaption)))
   assert.ok(searchSegments.every((segment) => !segment.text.includes(fabricatedImageOcr)))
+  assert.ok(searchSegments.every((segment) => !segment.text.includes(fabricatedSealOcr)))
 
   const structured = manualLayout.getManualLayoutStructuredBlocks(blocks)
   const structuredTable = structured.find((block) => block.manual_block_id === tableId)
@@ -147,6 +168,10 @@ try {
   assert.match(documentsIpc, /projectLayoutBlocksToPageText/)
   assert.match(documentView, /locator\.blockId/)
   assert.match(documentView, /parseManualLayoutLocationKey/)
+  assert.match(documentView, /ManualLayoutReaderImage/)
+  assert.match(documentView, /element\.imagePath/)
+  assert.match(documentView, /element\.imageCrop/)
+  assert.match(documentView, /element\.caption/)
 
   console.log('Manual layout cross-mode regression checks passed.')
 } finally {

@@ -36,7 +36,7 @@ import {
 } from '@shared/parallel-translation'
 import { releaseCachedPdfDocument, renderPdfFilePageToImage } from '../utils/pdf'
 import { ensurePdfPageImagesForOcr as ensureOcrPageImages, isReadablePageImagePath } from '../utils/ocrPageImages'
-import { extractPageText, getCitationPageNumber, getOcrBlockText, getOrderedOcrBlocks, getReadablePageElements, getReadablePageText, getTextFlowOcrBlocks, normalizeOcrTextForReading } from '../utils/ocrText'
+import { extractPageText, getCitationPageNumber, getOcrBlockText, getOrderedOcrBlocks, getReadablePageElements, getReadablePageText, getTextFlowOcrBlocks, normalizeOcrTextForReading, type ReadablePageElement } from '../utils/ocrText'
 import { clampAiButtonPosition, clampFloatingPanelState, getDefaultFloatingPanelState } from '../utils/floatingViewport'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
@@ -207,7 +207,10 @@ type ReaderPage = {
   sourceEndChar: number
   segmentIndex: number
   text: string
+  elements?: ReadablePageElement[]
+  sourcePage?: DocumentViewPage
 }
+type ReaderThemeStyle = { shell: string; page: string; text: string; muted: string; border: string }
 type SearchMatch = {
   pageIndex: number
   boxIndex: number
@@ -1306,6 +1309,140 @@ function renderBookText(
   )
 }
 
+function ManualLayoutReaderImage({
+  page,
+  element,
+  themeStyle,
+}: {
+  page?: DocumentViewPage
+  element: ReadablePageElement
+  themeStyle: ReaderThemeStyle
+}) {
+  const [assetUrl, setAssetUrl] = useState('')
+  const [pageUrl, setPageUrl] = useState('')
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null)
+  const assetPath = String(element.imagePath || '').trim()
+  const pagePath = String(page?.image_path || '').trim()
+  const crop = element.imageCrop || element.rect
+
+  useEffect(() => {
+    let canceled = false
+    setAssetUrl('')
+    setPageUrl('')
+    setNaturalSize(null)
+    const load = async (filePath: string): Promise<string> => {
+      if (!filePath) return ''
+      if (/^(?:data:|blob:|https?:\/\/)/i.test(filePath)) return filePath
+      try {
+        return await window.api.isReadableFile(filePath) ? toLocalResourceUrl(filePath) : ''
+      } catch {
+        return ''
+      }
+    }
+    void Promise.all([load(assetPath), load(pagePath)]).then(([nextAssetUrl, nextPageUrl]) => {
+      if (canceled) return
+      setAssetUrl(nextAssetUrl)
+      setPageUrl(nextPageUrl)
+    })
+    return () => {
+      canceled = true
+    }
+  }, [assetPath, pagePath])
+
+  const sourceSize = getOcrCoordinateSourceSize(page?.ocr_result)
+  const sourceWidth = Number(sourceSize.width || naturalSize?.width || (crop ? crop.left + crop.width : 1))
+  const sourceHeight = Number(sourceSize.height || naturalSize?.height || (crop ? crop.top + crop.height : 1))
+  const cropWidth = Math.max(1, crop?.width || sourceWidth)
+  const cropHeight = Math.max(1, crop?.height || sourceHeight)
+  const cropLeft = Math.max(0, crop?.left || 0)
+  const cropTop = Math.max(0, crop?.top || 0)
+  const usingAsset = Boolean(assetUrl)
+  const sourceUrl = assetUrl || pageUrl
+
+  return (
+    <figure style={{ margin: '0.35em auto 1em', maxWidth: '100%', color: themeStyle.text }}>
+      <div
+        style={{
+          position: 'relative',
+          width: '100%',
+          maxWidth: 620,
+          margin: '0 auto',
+          aspectRatio: `${cropWidth} / ${cropHeight}`,
+          overflow: 'hidden',
+          border: `1px solid ${themeStyle.border}`,
+          background: 'rgba(120,80,30,0.06)',
+        }}
+      >
+        {sourceUrl ? (
+          <img
+            src={sourceUrl}
+            alt={element.caption || element.visualKind || '文献图片'}
+            draggable={false}
+            onError={() => {
+              if (usingAsset) setAssetUrl('')
+              else setPageUrl('')
+            }}
+            onLoad={(event) => {
+              const image = event.currentTarget
+              if (image.naturalWidth > 0 && image.naturalHeight > 0) setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight })
+            }}
+            style={usingAsset || !crop ? {
+              width: '100%',
+              height: '100%',
+              objectFit: 'contain',
+              pointerEvents: 'none',
+              userSelect: 'none',
+            } : {
+              position: 'absolute',
+              left: `${-(cropLeft / Math.max(cropWidth, 1)) * 100}%`,
+              top: `${-(cropTop / Math.max(cropHeight, 1)) * 100}%`,
+              width: `${(sourceWidth / Math.max(cropWidth, 1)) * 100}%`,
+              height: `${(sourceHeight / Math.max(cropHeight, 1)) * 100}%`,
+              maxWidth: 'none',
+              pointerEvents: 'none',
+              userSelect: 'none',
+            }}
+          />
+        ) : (
+          <div style={{ height: '100%', display: 'grid', placeItems: 'center', color: themeStyle.muted, fontSize: 12 }}>
+            图像区域暂不可用
+          </div>
+        )}
+      </div>
+      {element.caption ? (
+        <figcaption style={{ marginTop: 6, color: themeStyle.muted, fontSize: 13, textAlign: 'center', lineHeight: 1.5 }}>
+          {element.caption}
+        </figcaption>
+      ) : null}
+    </figure>
+  )
+}
+
+function renderReaderPageElements(
+  page: ReaderPage,
+  keyword: string,
+  displayScript: ReaderDisplayScript,
+  activeIndex: number,
+  pageHitStartIndex: number,
+  themeStyle: ReaderThemeStyle,
+) {
+  const elements = page.elements || []
+  if (elements.length === 0) return renderBookText(page.text, keyword, displayScript, activeIndex, pageHitStartIndex)
+  return (
+    <div>
+      {elements.map((element, index) => {
+        const elementStart = pageHitStartIndex + element.charStart
+        if (element.type === 'image') {
+          return <ManualLayoutReaderImage key={`${page.id}-image-${index}`} page={page.sourcePage} element={element} themeStyle={themeStyle} />
+        }
+        const elementText = element.type === 'table' && element.rows?.length ? tableRowsToHtml(element.rows) : element.text
+        if (!elementText.trim()) return null
+        return <div key={`${page.id}-text-${index}`}>{renderBookText(elementText, keyword, displayScript, activeIndex, elementStart)}</div>
+      })}
+    </div>
+  )
+}
+
 function buildReaderPages(sourcePages: DocumentViewPage[], fontSize: number, lineHeight: number, pageWidth: number, viewportHeight: number): ReaderPage[] {
   const usableHeight = Math.max(360, viewportHeight - 310)
   const horizontalPadding = 76
@@ -1318,8 +1455,28 @@ function buildReaderPages(sourcePages: DocumentViewPage[], fontSize: number, lin
   const readerPages: ReaderPage[] = []
 
   sourcePages.forEach((page, sourcePageIndex) => {
+    const elements = getReadablePageElements(page)
+    const hasVisualElements = elements.some((element) => element.type === 'image')
     const text = getPageReadingText(page)
-    if (!text) return
+    if (!text && !hasVisualElements) return
+    if (hasVisualElements) {
+      const physicalPageNum = page.page_num || sourcePageIndex + 1
+      const literaturePageNum = getCitationPageNumber(page, physicalPageNum) || physicalPageNum
+      readerPages.push({
+        id: `${page.id || sourcePageIndex}-visual`,
+        sourcePageIndex,
+        sourcePageNum: physicalPageNum,
+        literaturePageNum,
+        sourcePageId: page.id,
+        sourceStartChar: 0,
+        sourceEndChar: text.length,
+        segmentIndex: 0,
+        text,
+        elements,
+        sourcePage: page,
+      })
+      return
+    }
     let rest = text.replace(/\r/g, '').trim()
     let sourceCursor = text.replace(/\r/g, '').indexOf(rest)
     if (sourceCursor < 0) sourceCursor = 0
@@ -1356,6 +1513,7 @@ function buildReaderPages(sourcePages: DocumentViewPage[], fontSize: number, lin
           sourceEndChar: sourceStartChar + chunk.length,
           segmentIndex,
           text: chunk,
+          sourcePage: page,
         })
       }
       rest = rest.slice(take).trim()
@@ -5216,10 +5374,28 @@ export default function DocumentView({
     (readerSearchResultPageSafe - 1) * READER_SEARCH_RESULT_PAGE_SIZE,
     readerSearchResultPageSafe * READER_SEARCH_RESULT_PAGE_SIZE,
   )
-  const readerThemeStyle = {
-    paper: { shell: '#1c1712', page: '#fffaf0', text: '#24190f', muted: '#8a6a3c' },
-    sepia: { shell: '#21180f', page: '#f2e0bd', text: '#2d2115', muted: '#8a6534' },
-    dark: { shell: '#101112', page: '#1f2226', text: '#e8e2d8', muted: '#9a8f80' },
+  const readerThemeStyle: ReaderThemeStyle = {
+    paper: {
+      shell: '#1c1712',
+      page: '#fffaf0',
+      text: '#24190f',
+      muted: '#8a6a3c',
+      border: 'rgba(120,80,30,0.15)',
+    },
+    sepia: {
+      shell: '#21180f',
+      page: '#f2e0bd',
+      text: '#2d2115',
+      muted: '#8a6534',
+      border: 'rgba(120,80,30,0.22)',
+    },
+    dark: {
+      shell: '#101112',
+      page: '#1f2226',
+      text: '#e8e2d8',
+      muted: '#9a8f80',
+      border: 'rgba(232,226,216,0.18)',
+    },
   }[readerTheme]
   const readerAvailableHeight = Math.max(420, readerViewportHeight - 235)
   const readerSpreadPageHeight = Math.max(360, readerAvailableHeight - 36)
@@ -5612,7 +5788,7 @@ export default function DocumentView({
               >
                 {imageLabel}
               </div>
-              {renderBookText(page.text, effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex)}
+              {renderReaderPageElements(page, effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex, readerThemeStyle)}
               <div
                 aria-label={literatureLabel}
                 title="文献页码：书上印刷/校准页码，与引用、TXT 导出默认一致"
@@ -6464,7 +6640,25 @@ export default function DocumentView({
                         <div style={{ color: '#8a6a3c', fontSize: 12, marginBottom: 18, textAlign: 'center' }}>
                           第 {page.page_num} 页 · 无页图文本预览
                         </div>
-                        {renderBookText(getPageReadingText(page), effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex)}
+                        {renderReaderPageElements({
+                          id: `${page.id}-preview`,
+                          sourcePageIndex: pageIndex,
+                          sourcePageNum: page.page_num,
+                          literaturePageNum: getCitationPageNumber(page, page.page_num) || page.page_num,
+                          sourcePageId: page.id,
+                          sourceStartChar: 0,
+                          sourceEndChar: getPageReadingText(page).length,
+                          segmentIndex: 0,
+                          text: getPageReadingText(page),
+                          elements: getReadablePageElements(page),
+                          sourcePage: page,
+                        }, effectiveSearchKeyword, readerDisplayScript, currentMatchIndex, pageHitStartIndex, {
+                          shell: '#1c1712',
+                          page: '#fffaf0',
+                          text: '#24190f',
+                          muted: '#8a6a3c',
+                          border: 'rgba(120,80,30,0.15)',
+                        })}
                       </div>
                     )
                   })()}
