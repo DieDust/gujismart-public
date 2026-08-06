@@ -4,6 +4,7 @@ import type { MenuProps } from 'antd'
 import { DeleteOutlined, HolderOutlined, RedoOutlined, RollbackOutlined, SaveOutlined, UndoOutlined } from '@ant-design/icons'
 import { getOcrBlockText, getRawOcrBlockText, getTextFlowOcrBlocks } from '../utils/ocrText'
 import { renderOcrInlineHighlighted, renderOcrInlineText } from '../utils/ocrInlineRender'
+import { saveTextEditorPage } from '../utils/textEditorSaving'
 import type { PageUpdatePayload } from '@shared/types'
 
 const LABEL_COLORS: Record<string, string> = {
@@ -37,7 +38,7 @@ const LABEL_NAMES: Record<string, string> = {
 interface TextEditorProps {
   ocrResult: TextEditorOcrResult | null | undefined
   pageId: string
-  onSave: (pageId: string, data: PageUpdatePayload) => void
+  onSave: (pageId: string, data: PageUpdatePayload) => Promise<boolean>
   onReset: (pageId: string) => void
   onModeChange?: (mode: 'markdown' | 'translation' | 'region') => void
   onTextSelectionChange?: (text: string) => void
@@ -216,7 +217,7 @@ export default function TextEditor({
     setHistoryIndex((previous) => Math.min(previous + 1, 49))
   }, [historyIndex])
 
-  const saveToDb = useCallback((nextData: TextEditorOcrBlock[]) => {
+  const saveToDb = useCallback((nextData: TextEditorOcrBlock[]): Promise<boolean> => {
     const normalizedData = normalizeManualReadingOrder(nextData)
     const nextOcrResult = {
       ...(ocrResult || {}),
@@ -224,7 +225,9 @@ export default function TextEditor({
       words_result: normalizedData.map((box) => ({ words: getOcrBlockText(box) || '' })),
     }
     const nextText = normalizedData.map((box) => getOcrBlockText(box) || '').join('\n')
-    onSave(pageId, { ocr_result: nextOcrResult, ocr_text: nextText, proofed_text: nextText })
+    return saveTextEditorPage(() => (
+      onSave(pageId, { ocr_result: nextOcrResult, ocr_text: nextText, proofed_text: nextText })
+    ))
   }, [ocrResult, onSave, pageId])
 
   const handleUndo = useCallback(() => {
@@ -235,7 +238,7 @@ export default function TextEditor({
     setLayoutData(nextData)
     setEditingIndex(-1)
     setLocalActiveBoxIndex(null)
-    saveToDb(nextData)
+    void saveToDb(nextData)
   }, [history, historyIndex, saveToDb])
 
   const handleRedo = useCallback(() => {
@@ -246,7 +249,7 @@ export default function TextEditor({
     setLayoutData(nextData)
     setEditingIndex(-1)
     setLocalActiveBoxIndex(null)
-    saveToDb(nextData)
+    void saveToDb(nextData)
   }, [history, historyIndex, saveToDb])
 
   const handleSaveRegion = (index: number) => {
@@ -257,7 +260,7 @@ export default function TextEditor({
     pushHistory(normalizedData)
     setEditingIndex(-1)
     setEditValue('')
-    saveToDb(normalizedData)
+    void saveToDb(normalizedData)
   }
 
   const handleDeleteBlock = useCallback((index: number) => {
@@ -275,7 +278,7 @@ export default function TextEditor({
       okText: '删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
-      onOk: () => {
+      onOk: async () => {
         const nextData = normalizeManualReadingOrder(layoutData.filter((_, itemIndex) => itemIndex !== index))
         setLayoutData(nextData)
         pushHistory(nextData)
@@ -284,8 +287,8 @@ export default function TextEditor({
         const nextActive = nextData.length === 0 ? null : Math.min(index, nextData.length - 1)
         setLocalActiveBoxIndex(nextActive)
         if (nextActive !== null) onLineFocus?.(nextActive, nextData[nextActive])
-        saveToDb(nextData)
-        message.success('已删除文本块并写入数据库')
+        const saved = await saveToDb(nextData)
+        if (saved) message.success('已删除文本块并写入数据库')
       },
     })
   }, [layoutData, onLineFocus, pushHistory, saveToDb])
@@ -296,7 +299,7 @@ export default function TextEditor({
     pushHistory(nextData)
     setEditingIndex(-1)
     setEditValue('')
-    saveToDb(nextData)
+    void saveToDb(nextData)
     onReset?.(pageId)
   }
 
@@ -360,7 +363,7 @@ export default function TextEditor({
       setEditValue('')
       setLocalActiveBoxIndex(nextTargetIndex)
       onLineFocus?.(nextTargetIndex, nextData[nextTargetIndex])
-      saveToDb(nextData)
+      void saveToDb(nextData)
     }
 
     function handlePointerMove(pointerEvent: PointerEvent) {

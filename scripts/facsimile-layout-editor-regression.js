@@ -30,6 +30,19 @@ if (draftHelperSource) {
   new Function('exports', 'module', 'require', draftTranspiled)(draftHelperModule.exports, draftHelperModule, require)
 }
 
+const textEditorSavingPath = path.join(root, 'src/renderer/src/utils/textEditorSaving.ts')
+const textEditorSavingSource = fs.existsSync(textEditorSavingPath) ? fs.readFileSync(textEditorSavingPath, 'utf8') : ''
+const textEditorSavingModule = { exports: {} }
+if (textEditorSavingSource) {
+  const textEditorSavingTranspiled = ts.transpileModule(textEditorSavingSource, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText
+  new Function('exports', 'module', 'require', textEditorSavingTranspiled)(textEditorSavingModule.exports, textEditorSavingModule, require)
+}
+
 const {
   buildFacsimileTableCells,
   clearFacsimileTableSelection,
@@ -62,6 +75,7 @@ const {
 } = helperModule.exports
 
 const {
+  continueManualLayoutSaveAfterSettlement,
   createManualLayoutDraft,
   ensureManualLayoutBlockIdentity,
   getManualLayoutDraftBlockId,
@@ -69,8 +83,59 @@ const {
   reduceManualLayoutDraft,
 } = draftHelperModule.exports
 
+const { saveTextEditorPage } = textEditorSavingModule.exports
+
 assert.strictEqual(typeof createManualLayoutDraft, 'function', 'manual layout drafts must expose a testable state factory')
 assert.strictEqual(typeof reduceManualLayoutDraft, 'function', 'manual layout drafts must expose a pure reducer')
+assert.strictEqual(typeof continueManualLayoutSaveAfterSettlement, 'function', 'an in-flight save must expose a testable continuation path for newer revisions')
+assert.strictEqual(typeof saveTextEditorPage, 'function', 'text editor saves must expose a testable real-outcome adapter')
+
+async function runAsyncDraftChecks() {
+  const pageId = 'page-save-race'
+  const original = ensureManualLayoutBlockIdentity(pageId, { ir_block_id: 'ocr-race', words: '0' }, 0)
+  const blockId = getManualLayoutDraftBlockId(pageId, original, 0)
+  let state = createManualLayoutDraft(pageId, [original])
+  state = reduceManualLayoutDraft(state, { type: 'update', blockId, changes: { words: '1' } })
+  const firstRevision = state.revision
+  state = reduceManualLayoutDraft(state, { type: 'save-started', revision: firstRevision })
+  state = reduceManualLayoutDraft(state, { type: 'update', blockId, changes: { words: '2' } })
+  const latestRevision = state.revision
+
+  let settleFirstSave
+  const firstSave = new Promise((resolve) => {
+    settleFirstSave = resolve
+  })
+  const savedRevisions = []
+  const continuation = continueManualLayoutSaveAfterSettlement(
+    firstSave,
+    () => state,
+    async () => {
+      const snapshot = state
+      savedRevisions.push(snapshot.revision)
+      state = reduceManualLayoutDraft(snapshot, { type: 'save-started', revision: snapshot.revision })
+      state = reduceManualLayoutDraft(state, {
+        type: 'server-ack',
+        revision: snapshot.revision,
+        blocks: snapshot.blocks,
+      })
+      return true
+    },
+  )
+  state = reduceManualLayoutDraft(state, {
+    type: 'server-ack',
+    revision: firstRevision,
+    blocks: [{ ...original, words: '1' }],
+  })
+  settleFirstSave(true)
+  assert.strictEqual(await continuation, true, 'the save chain must settle only after its latest revision is stored')
+  assert.deepStrictEqual(savedRevisions, [latestRevision], 'the newer revision must automatically save after the old promise settles')
+  assert.strictEqual(state.saveState, 'clean', 'the newer revision must not remain permanently dirty')
+  assert.strictEqual(state.blocks[0].words, '2', 'the old acknowledgement must not overwrite the newer local edit')
+
+  assert.strictEqual(await saveTextEditorPage(async () => true), true, 'a confirmed text-editor write must report success')
+  assert.strictEqual(await saveTextEditorPage(async () => false), false, 'a resolved false text-editor write must not report success')
+  assert.strictEqual(await saveTextEditorPage(async () => { throw new Error('write failed') }), false, 'a rejected text-editor write must be contained and must not report success')
+}
 
 {
   const pageId = 'page-a'
@@ -118,6 +183,12 @@ assert.strictEqual(typeof reduceManualLayoutDraft, 'function', 'manual layout dr
   })
   assert.strictEqual(staleAck.blocks.find((block) => block.manual_block_id === createdBlock.manual_block_id).words, '\u4e59', 'stale acknowledgements must not roll back newer edits')
   assert.strictEqual(staleAck.saveState, 'dirty')
+
+  const staleFailure = reduceManualLayoutDraft(updated, {
+    type: 'save-failed',
+    revision: currentAck.revision,
+  })
+  assert.strictEqual(staleFailure.saveState, 'dirty', 'an older failed save must not strand a newer revision in the failed state')
 
   const failed = reduceManualLayoutDraft(updated, { type: 'save-failed', revision: updated.revision })
   assert.strictEqual(failed.saveState, 'failed', 'failed saves must retain an explicit retryable state')
@@ -611,11 +682,16 @@ assert.ok(proofreader.includes('const { __rect, __synthetic, __sourceIndex, __ma
 assert.ok(proofreader.includes('if (!words && !isImage && !isManualBlock) return null'), 'an empty newly-created manual block must survive the parent save echo')
 
 const documentView = fs.readFileSync(path.join(root, 'src/renderer/src/views/DocumentView.tsx'), 'utf8')
+const textEditor = fs.readFileSync(path.join(root, 'src/renderer/src/components/TextEditor.tsx'), 'utf8')
 assert.ok(documentView.includes('const handleSavePage = async (pageId: string, data: PageUpdatePayload): Promise<boolean>'), 'the shared page save path must report its real success outcome without rejecting legacy fire-and-forget callers')
 assert.ok(documentView.includes("if (!saved) throw new Error('Facsimile page save failed')"), 'the facsimile-only adapter must convert a swallowed database failure into a rejected draft save')
 assert.ok(documentView.includes('onSave={handleSaveFacsimilePage}'), 'the revisioned facsimile draft must receive the failure-propagating adapter')
-assert.ok(documentView.includes('onSave={handleSavePage}'), 'the legacy text editor must retain the non-rejecting save callback contract')
+assert.ok(documentView.includes('onSave={handleSavePage}'), 'the text editor must receive the real boolean save outcome')
 assert.ok(documentView.includes('if (!saved) return'), 'proof status actions must not display success after a failed page write')
+assert.ok(textEditor.includes('onSave: (pageId: string, data: PageUpdatePayload) => Promise<boolean>'), 'the text editor callback must expose the real async database outcome')
+assert.ok(textEditor.includes('const saved = await saveToDb(nextData)'), 'text-block deletion must await the real database outcome')
+assert.ok(textEditor.includes("if (saved) message.success('已删除文本块并写入数据库')"), 'text-block deletion must announce success only after a confirmed write')
+assert.ok(!textEditor.includes("saveToDb(nextData)\n        message.success('已删除文本块并写入数据库')"), 'text-block deletion must not fire an unconditional success message')
 
 const tableEditorPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.tsx')
 const tableEditorCssPath = path.join(root, 'src/renderer/src/components/FacsimileTableEditor.css')
@@ -1241,4 +1317,9 @@ for (const action of ['上方插入行', '下方插入行', '左侧插入列', '
   assert.ok(!toolbarSource.includes(action), `the compact toolbar must leave ${action} in the context menu`)
 }
 
-console.log('Facsimile layout editor regression passed.')
+runAsyncDraftChecks()
+  .then(() => console.log('Facsimile layout editor regression passed.'))
+  .catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })

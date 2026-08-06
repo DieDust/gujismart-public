@@ -228,6 +228,7 @@ export function reduceManualLayoutDraft(
     case 'save-failed':
       if ((action.pageId && action.pageId !== state.pageId) || action.revision > state.revision) return state
       if (state.acknowledgedRevision >= state.revision) return state
+      if (action.revision < state.revision) return { ...state, saveState: 'dirty' }
       return { ...state, saveState: 'failed' }
     case 'server-ack': {
       if (action.pageId && action.pageId !== state.pageId) return state
@@ -283,6 +284,19 @@ export function getManualLayoutSaveSchedule(
     : { kind: 'none' }
 }
 
+export async function continueManualLayoutSaveAfterSettlement(
+  existingSave: Promise<boolean>,
+  getLatestState: () => ManualLayoutDraftState,
+  saveLatestRevision: () => Promise<boolean>,
+): Promise<boolean> {
+  const previousSaved = await existingSave
+  const latestState = getLatestState()
+  if (latestState.saveState === 'dirty') {
+    return saveLatestRevision()
+  }
+  return previousSaved && latestState.saveState === 'clean'
+}
+
 export function useManualLayoutDraft({
   pageId,
   blocks,
@@ -299,6 +313,7 @@ export function useManualLayoutDraft({
   const mountedRef = useRef(true)
   const timerRef = useRef<number | null>(null)
   const inFlightRef = useRef<Promise<boolean> | null>(null)
+  const saveRunnerRef = useRef<() => Promise<boolean>>(async () => true)
 
   const dispatch = useCallback((action: ManualLayoutDraftAction) => {
     const current = stateRef.current
@@ -344,7 +359,13 @@ export function useManualLayoutDraft({
 
   const saveCurrentRevision = useCallback(async (): Promise<boolean> => {
     const existingSave = inFlightRef.current
-    if (existingSave) return existingSave
+    if (existingSave) {
+      return continueManualLayoutSaveAfterSettlement(
+        existingSave,
+        () => stateRef.current,
+        () => saveRunnerRef.current(),
+      )
+    }
     const snapshot = stateRef.current
     if (getManualLayoutSaveSchedule(snapshot, true).kind === 'none') return snapshot.saveState === 'clean'
     clearSaveTimer()
@@ -369,6 +390,7 @@ export function useManualLayoutDraft({
     inFlightRef.current = savePromise
     return savePromise
   }, [clearSaveTimer, dispatch])
+  saveRunnerRef.current = saveCurrentRevision
 
   const flush = useCallback(async (): Promise<boolean> => {
     clearSaveTimer()
