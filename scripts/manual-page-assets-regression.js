@@ -21,6 +21,8 @@ assert.match(source, /rename|renameSync/, 'asset replacement must be atomic')
 assert.match(source, /assertManualPageAssetOwnership/, 'page ownership must have an executable dependency-injected guard')
 assert.match(source, /isStableManualLayoutBlockId/, 'asset service must reject non-manual block IDs')
 assert.match(source, /selectManualPageAssetOnly/, 'dialog cancellation must have an executable asset-only transition')
+assert.match(source, /cleanupUnreferencedManualPageAssets/, 'managed assets must expose a conservative reference-aware GC')
+assert.match(source, /atomicWriteManualPageAssetAsync/, 'managed assets must provide an async atomic writer')
 assert.match(preloadSource, /cropManualPageImage:[\s\S]*pages:cropManualImage/, 'crop API must be exposed through preload')
 assert.match(preloadSource, /selectManualBlockImage:[\s\S]*pages:selectManualImage/, 'replacement API must be exposed through preload')
 assert.match(documentsSource, /assertManualPageAssetOwnership\([\s\S]*getActiveLibraryProjectId\(\)/, 'page ownership must be checked against the active project')
@@ -31,6 +33,7 @@ assert.ok(cropHandlerStart >= 0 && cropHandlerEnd > cropHandlerStart, 'crop asse
 const cropHandlerSource = documentsSource.slice(cropHandlerStart, cropHandlerEnd)
 assert.doesNotMatch(cropHandlerSource, /ocr_result|layout_result|preparePagePayloadUpdate|runAsync|UPDATE pages/, 'crop IPC must never rewrite the page OCR payload')
 assert.match(documentsSource, /resolveRepositoryImageSource\(selectedPath, getPdfRepositoryPaths\(\)\)/, 'replacement selection must remain inside configured repository roots')
+assert.match(documentsSource, /createManualPageAssetRevision\(\)/, 'asset revisions must be unique rather than Date.now-only')
 assert.match(inspectorSource, /window\.api\.cropManualPageImage/, 'inspector must invoke the required crop API directly')
 assert.match(inspectorSource, /window\.api\.selectManualBlockImage/, 'inspector must invoke the required replacement API directly')
 assert.doesNotMatch(inspectorSource, /cropManualPageImage\?\.|selectManualBlockImage\?\./, 'manual image APIs must not be optional probes')
@@ -121,6 +124,8 @@ try {
   }
 
   const dataDir = path.join(tempRoot, 'data')
+  const revisions = new Set(Array.from({ length: 128 }, () => api.createManualPageAssetRevision()))
+  assert.strictEqual(revisions.size, 128, 'concurrent asset revisions must be unique')
   const assetPath = api.buildManualPageAssetPath(dataDir, 'doc-1', 'page-1', 'block-1', 3)
   assert.ok(assetPath.startsWith(path.join(dataDir, 'storage', 'doc-1', 'page-assets')))
   assert.ok(assetPath.endsWith(path.join('page-1', 'block-1', '3.png')))
@@ -163,6 +168,35 @@ try {
   const selectedAssetPath = api.buildManualPageSelectedAssetPath(dataDir, 'doc-1', 'page-1', 5)
   api.atomicWriteManualPageAsset(selectedAssetPath, syntheticPng, managedRoot)
   assert.deepStrictEqual(fs.readFileSync(selectedAssetPath), syntheticPng, 'selected repository image bytes must be copied into managed storage')
+  const asyncAssetPath = api.buildManualPageAssetPath(dataDir, 'doc-1', 'page-1', 'block-async', api.createManualPageAssetRevision())
+  await api.atomicWriteManualPageAssetAsync(asyncAssetPath, syntheticPng, managedRoot)
+  assert.deepStrictEqual(fs.readFileSync(asyncAssetPath), syntheticPng, 'async asset writes must commit the same bytes atomically')
+  assert.throws(() => api.assertManualPageImageByteBudget(new Uint8Array(api.MAX_MANUAL_PAGE_ASSET_BYTES + 1)), 'oversized PNG bytes must be rejected before write')
+
+  const referencedAssetPath = api.buildManualPageAssetPath(dataDir, 'doc-1', 'page-1', 'block-kept', api.createManualPageAssetRevision())
+  const orphanAssetPath = api.buildManualPageAssetPath(dataDir, 'doc-1', 'page-1', 'block-orphan', api.createManualPageAssetRevision())
+  const recentAssetPath = api.buildManualPageAssetPath(dataDir, 'doc-1', 'page-1', 'block-recent', api.createManualPageAssetRevision())
+  for (const filePath of [referencedAssetPath, orphanAssetPath, recentAssetPath]) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, syntheticPng)
+  }
+  const gcNow = Date.now()
+  fs.utimesSync(referencedAssetPath, new Date(gcNow - 3 * 24 * 60 * 60 * 1000), new Date(gcNow - 3 * 24 * 60 * 60 * 1000))
+  fs.utimesSync(orphanAssetPath, new Date(gcNow - 3 * 24 * 60 * 60 * 1000), new Date(gcNow - 3 * 24 * 60 * 60 * 1000))
+  const referenced = api.collectManualPageAssetReferences([
+    { layout_result: [{ image_asset_path: referencedAssetPath }] },
+  ], dataDir)
+  assert.strictEqual(referenced.has(fs.realpathSync(referencedAssetPath)), true, 'reference scanner must retain layout image assets')
+  const gcResult = await api.cleanupUnreferencedManualPageAssets(dataDir, referenced, {
+    nowMs: gcNow,
+    graceMs: 60 * 60 * 1000,
+    budgetMs: 5_000,
+    maxFiles: 50,
+  })
+  assert.ok(gcResult.deletedFiles >= 1, 'GC must remove an old unreferenced asset')
+  assert.strictEqual(fs.existsSync(referencedAssetPath), true, 'GC must retain referenced assets')
+  assert.strictEqual(fs.existsSync(orphanAssetPath), false, 'GC must remove old orphan assets')
+  assert.strictEqual(fs.existsSync(recentAssetPath), true, 'GC grace period must retain recent assets')
 
   const commitState = { tempExists: false, target: 'old-target', cleanupCalls: 0 }
   assert.throws(() => api.commitManualPageAssetFile({

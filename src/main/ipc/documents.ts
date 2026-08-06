@@ -164,12 +164,15 @@ import type {
 import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
 import {
   ManualPageAssetError,
-  atomicWriteManualPageAsset,
+  atomicWriteManualPageAssetAsync,
   assertDecodedManualPageImage,
+  assertManualPageImageByteBudget,
   assertManualPageAssetOwnership,
   assertStableManualPageBlockId,
   buildManualPageAssetPath,
   buildManualPageSelectedAssetPath,
+  createManualPageAssetRevision,
+  MAX_MANUAL_PAGE_SOURCE_BYTES,
   renderManualPdfPageToPng,
   resolveManagedManualPageSource,
   resolveRepositoryImageSource,
@@ -1309,6 +1312,13 @@ async function loadManualPageSourceImage(page: ManualPageAssetRow): Promise<Elec
   if (!sourcePath) {
     throw new ManualPageAssetError('source-unavailable', '当前页面没有可读取的受管页图或已绑定仓库原文')
   }
+  const sourceStats = await stat(sourcePath)
+  if (sourceStats.size <= 0 || sourceStats.size > MAX_MANUAL_PAGE_SOURCE_BYTES) {
+    throw new ManualPageAssetError('source-unavailable', '原文文件为空或超过图片处理大小上限')
+  }
+  // nativeImage decode/crop/toPNG are synchronous Electron calls; keep their
+  // bounded work isolated between event-loop yields and never write in-place.
+  await yieldToEventLoop()
   const source = extname(sourcePath).toLowerCase() === '.pdf'
     ? nativeImage.createFromBuffer(await renderManualPdfPageToPng(sourcePath, Number(page.page_num || 0)))
     : nativeImage.createFromPath(sourcePath)
@@ -1325,11 +1335,12 @@ async function cropManualPageImageAsset(request: ManualPageImageCropRequest): Pr
   const cropped = source.crop(pixelCrop)
   const croppedSize = assertDecodedManualPageImage(cropped)
   const pngBytes = cropped.toPNG()
-  if (pngBytes.length <= 0) throw new ManualPageAssetError('decode-failed', '无法生成裁剪 PNG')
+  assertManualPageImageByteBudget(pngBytes)
+  await yieldToEventLoop()
 
-  const revision = Date.now()
+  const revision = createManualPageAssetRevision()
   const assetPath = buildManualPageAssetPath(getDataDir(), page.doc_id, page.id, blockId, revision)
-  atomicWriteManualPageAsset(assetPath, pngBytes, join(getDataDir(), 'storage', page.doc_id))
+  await atomicWriteManualPageAssetAsync(assetPath, pngBytes, join(getDataDir(), 'storage', page.doc_id))
   allowManagedFileAccessPath(assetPath)
   return { assetPath, width: croppedSize.width, height: croppedSize.height }
 }
@@ -1365,15 +1376,19 @@ async function selectManualPageImageAsset(
       if (!sourcePath) {
         throw new ManualPageAssetError('source-outside-library', '只能选择已绑定原文仓库内的图片')
       }
+      const sourceStats = await stat(sourcePath)
+      if (sourceStats.size <= 0 || sourceStats.size > MAX_MANUAL_PAGE_SOURCE_BYTES) {
+        throw new ManualPageAssetError('decode-failed', '所选图片为空或超过图片处理大小上限')
+      }
+      await yieldToEventLoop()
       const source = nativeImage.createFromPath(sourcePath)
       const size = assertDecodedManualPageImage(source)
       const pngBytes = source.toPNG()
-      if (size.width <= 0 || size.height <= 0 || pngBytes.length <= 0) {
-        throw new ManualPageAssetError('decode-failed', '所选图片内容无效')
-      }
-      const revision = Date.now()
+      assertManualPageImageByteBudget(pngBytes)
+      await yieldToEventLoop()
+      const revision = createManualPageAssetRevision()
       const assetPath = buildManualPageSelectedAssetPath(getDataDir(), page.doc_id, page.id, revision)
-      atomicWriteManualPageAsset(assetPath, pngBytes, join(getDataDir(), 'storage', page.doc_id))
+      await atomicWriteManualPageAssetAsync(assetPath, pngBytes, join(getDataDir(), 'storage', page.doc_id))
       allowManagedFileAccessPath(assetPath)
       return { assetPath, width: size.width, height: size.height }
     },

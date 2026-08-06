@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from 'fs'
-import { readFile } from 'fs/promises'
+import { readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type {
   ManualPageImageAsset,
@@ -60,10 +60,17 @@ export function assertDecodedManualPageImage(image: ManualPageDecodedImage): Man
   const size = image.getSize()
   const width = Math.round(finitePositive(size?.width))
   const height = Math.round(finitePositive(size?.height))
-  if (!width || !height || width * height > MAX_CROP_PIXELS) {
+  if (!width || !height || width * height > MAX_MANUAL_PAGE_IMAGE_PIXELS) {
     throw new ManualPageAssetError('decode-failed', '图片尺寸无效或过大')
   }
   return { width, height }
+}
+
+export function assertManualPageImageByteBudget(bytes: Uint8Array): Uint8Array {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength <= 0 || bytes.byteLength > MAX_MANUAL_PAGE_ASSET_BYTES) {
+    throw new ManualPageAssetError('write-failed', '图片编码结果为空或超过资源大小上限')
+  }
+  return bytes
 }
 
 export interface ManualPageAssetCommitOperations {
@@ -88,6 +95,30 @@ export function commitManualPageAssetFile(input: {
   } catch (error) {
     try {
       input.operations.removeTemp(input.tempPath)
+    } catch {
+      // Cleanup is best effort; the previous committed target is never removed here.
+    }
+    if (error instanceof ManualPageAssetError) throw error
+    throw new ManualPageAssetError('write-failed', String((error as Error)?.message || error || '资源写入失败'))
+  }
+}
+
+export async function commitManualPageAssetFileAsync(input: {
+  tempPath: string
+  targetPath: string
+  pngBytes: Uint8Array
+}): Promise<void> {
+  assertManualPageImageByteBudget(input.pngBytes)
+  try {
+    await writeFile(input.tempPath, input.pngBytes, { flag: 'wx' })
+    const tempStats = await stat(input.tempPath)
+    if (tempStats.size <= 0 || tempStats.size > MAX_MANUAL_PAGE_ASSET_BYTES) {
+      throw new ManualPageAssetError('write-failed', '临时资源写入失败或超过大小上限')
+    }
+    await rename(input.tempPath, input.targetPath)
+  } catch (error) {
+    try {
+      await rm(input.tempPath, { force: true })
     } catch {
       // Cleanup is best effort; the previous committed target is never removed here.
     }
@@ -159,7 +190,14 @@ type CanvasModule = {
 }
 
 const MAX_CROP_PIXELS = 120_000_000
+// Keep nativeImage's worst-case RGBA allocation around 96 MB before decoder overhead.
+export const MAX_MANUAL_PAGE_IMAGE_PIXELS = 24_000_000
+export const MAX_MANUAL_PAGE_ASSET_BYTES = 32 * 1024 * 1024
+export const MAX_MANUAL_PAGE_SOURCE_BYTES = 256 * 1024 * 1024
+export const MAX_MANUAL_PAGE_RENDER_BYTES = 64 * 1024 * 1024
+export const MANUAL_PAGE_ASSET_GC_GRACE_MS = 24 * 60 * 60 * 1000
 const SAFE_SEGMENT = /^[A-Za-z0-9._-]{1,180}$/
+const MANUAL_PAGE_ASSET_REVISION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff'])
 
 function assertSafeSegment(value: string, label: string): string {
@@ -318,18 +356,182 @@ export function resolveManagedManualPageSource(
   return IMAGE_EXTENSIONS.has(extension) || (options?.allowPdf && extension === '.pdf') ? canonicalSource : null
 }
 
+const MANUAL_PAGE_ASSET_REFERENCE_KEYS = new Set(['image_asset_path', 'asset_path', 'image_path', 'crop_path'])
+
+function normalizeManualPageAssetReference(value: unknown, dataDir: string): string | null {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const storageRoot = resolve(dataDir, 'storage')
+  const candidates = [resolve(raw)]
+  if (!isAbsolute(raw)) candidates.push(resolve(dataDir, raw))
+  for (const candidate of candidates) {
+    if (!assertContainedPath(candidate, storageRoot)) continue
+    const relativePath = relative(storageRoot, candidate)
+    const segments = relativePath.split(/[\\/]+/).filter(Boolean)
+    if (segments.length < 5 || segments[1] !== 'page-assets' || extname(candidate).toLowerCase() !== '.png') continue
+    try {
+      const info = lstatSync(candidate)
+      if (info.isSymbolicLink() || !info.isFile()) continue
+      const canonical = realpathSync(candidate)
+      if (!assertContainedPath(canonical, storageRoot)) continue
+      return resolve(canonical)
+    } catch {
+      // A missing reference is still not a deletable file; skip it safely.
+    }
+  }
+  return null
+}
+
+export function collectManualPageAssetReferences(values: readonly unknown[], dataDir: string): Set<string> {
+  const references = new Set<string>()
+  const visit = (value: unknown, key = '', depth = 0): void => {
+    if (depth > 8 || value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (MANUAL_PAGE_ASSET_REFERENCE_KEYS.has(key)) {
+        const normalized = normalizeManualPageAssetReference(value, dataDir)
+        if (normalized) references.add(normalized)
+        return
+      }
+      const trimmed = value.trim()
+      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        try { visit(JSON.parse(trimmed), key, depth + 1) } catch { /* not JSON */ }
+      }
+      return
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, key, depth + 1))
+      return
+    }
+    if (typeof value !== 'object') return
+    Object.entries(value as Record<string, unknown>).forEach(([childKey, childValue]) => {
+      visit(childValue, childKey, depth + 1)
+    })
+  }
+  values.forEach((value) => visit(value))
+  return references
+}
+
+export interface ManualPageAssetGcOptions {
+  nowMs?: number
+  graceMs?: number
+  budgetMs?: number
+  maxFiles?: number
+}
+
+export interface ManualPageAssetGcResult {
+  scannedFiles: number
+  deletedFiles: number
+  deletedBytes: number
+  skippedReferenced: number
+  skippedRecent: number
+  skippedUnsafe: number
+}
+
+export async function cleanupUnreferencedManualPageAssets(
+  dataDir: string,
+  referencedPaths: ReadonlySet<string>,
+  options: ManualPageAssetGcOptions = {},
+): Promise<ManualPageAssetGcResult> {
+  const result: ManualPageAssetGcResult = {
+    scannedFiles: 0,
+    deletedFiles: 0,
+    deletedBytes: 0,
+    skippedReferenced: 0,
+    skippedRecent: 0,
+    skippedUnsafe: 0,
+  }
+  const storageRoot = resolve(dataDir, 'storage')
+  const nowMs = Number(options.nowMs || Date.now())
+  const graceMs = Math.max(MANUAL_PAGE_ASSET_GC_GRACE_MS, Number(options.graceMs || 0))
+  const budgetMs = Math.max(250, Math.min(60_000, Number(options.budgetMs || 8_000)))
+  const maxFiles = Math.max(1, Math.min(10_000, Math.floor(Number(options.maxFiles || 500))))
+  const normalizedReferences = new Set<string>()
+  referencedPaths.forEach((value) => {
+    const normalized = normalizeManualPageAssetReference(value, dataDir)
+    if (normalized) normalizedReferences.add(normalized)
+  })
+  const startedAt = Date.now()
+  const shouldStop = () => result.scannedFiles >= maxFiles || Date.now() - startedAt >= budgetMs
+  const yieldToEventLoop = () => new Promise<void>((resolvePromise) => setImmediate(resolvePromise))
+
+  let documents: Array<import('fs').Dirent>
+  try {
+    documents = await readdir(storageRoot, { withFileTypes: true })
+  } catch {
+    return result
+  }
+  for (const documentEntry of documents) {
+    if (shouldStop()) break
+    if (!documentEntry.isDirectory() || documentEntry.isSymbolicLink() || !SAFE_SEGMENT.test(documentEntry.name)) continue
+    const pageAssetsRoot = join(storageRoot, documentEntry.name, 'page-assets')
+    try {
+      const pageAssetsInfo = lstatSync(pageAssetsRoot)
+      if (pageAssetsInfo.isSymbolicLink() || !pageAssetsInfo.isDirectory()) continue
+    } catch {
+      continue
+    }
+    const walk = async (directory: string): Promise<void> => {
+      if (shouldStop()) return
+      let entries: Array<import('fs').Dirent>
+      try { entries = await readdir(directory, { withFileTypes: true }) } catch { return }
+      for (const entry of entries) {
+        if (shouldStop()) return
+        const candidate = join(directory, entry.name)
+        if (entry.isSymbolicLink()) {
+          result.skippedUnsafe += 1
+          continue
+        }
+        if (entry.isDirectory()) {
+          await walk(candidate)
+          continue
+        }
+        if (!entry.isFile() || extname(entry.name).toLowerCase() !== '.png') continue
+        result.scannedFiles += 1
+        const canonical = normalizeManualPageAssetReference(candidate, dataDir)
+        if (!canonical) {
+          result.skippedUnsafe += 1
+          continue
+        }
+        if (normalizedReferences.has(canonical)) {
+          result.skippedReferenced += 1
+          continue
+        }
+        let fileStats
+        try { fileStats = await stat(canonical) } catch { continue }
+        if (nowMs - fileStats.mtimeMs < graceMs) {
+          result.skippedRecent += 1
+          continue
+        }
+        try {
+          await rm(canonical, { force: true })
+          result.deletedFiles += 1
+          result.deletedBytes += fileStats.size
+        } catch {
+          result.skippedUnsafe += 1
+        }
+        if (result.scannedFiles % 16 === 0) await yieldToEventLoop()
+      }
+    }
+    try { await walk(pageAssetsRoot) } catch { /* best effort maintenance */ }
+  }
+  return result
+}
+
 export function buildManualPageAssetPath(
   dataDir: string,
   docId: string,
   pageId: string,
   blockId: string,
-  revision: number,
+  revision: number | string,
 ): string {
   const safeDocId = assertSafeSegment(docId, 'documentId')
   const safePageId = assertSafeSegment(pageId, 'pageId')
   const safeBlockId = assertSafeSegment(blockId, 'blockId')
-  const safeRevision = Math.floor(Number(revision))
-  if (!Number.isSafeInteger(safeRevision) || safeRevision < 1) {
+  const numericRevision = typeof revision === 'number' ? Math.floor(revision) : null
+  const safeRevision = numericRevision !== null ? String(numericRevision) : String(revision || '').trim()
+  if ((numericRevision !== null && (!Number.isSafeInteger(numericRevision) || numericRevision < 1))
+    || (numericRevision === null && !MANUAL_PAGE_ASSET_REVISION_UUID.test(safeRevision))
+    || !SAFE_SEGMENT.test(safeRevision) || safeRevision === '.' || safeRevision === '..') {
     throw new ManualPageAssetError('invalid-request', 'revision 无效')
   }
   const storageRoot = resolve(dataDir, 'storage')
@@ -344,9 +546,13 @@ export function buildManualPageSelectedAssetPath(
   dataDir: string,
   docId: string,
   pageId: string,
-  revision: number,
+  revision: number | string,
 ): string {
   return buildManualPageAssetPath(dataDir, docId, pageId, 'selected', revision)
+}
+
+export function createManualPageAssetRevision(): string {
+  return randomUUID()
 }
 
 function prepareManagedAssetTarget(targetPath: string, documentRoot: string): string {
@@ -417,11 +623,29 @@ export function atomicWriteManualPageAsset(
   return { assetPath: safeTargetPath, width: 0, height: 0 }
 }
 
+export async function atomicWriteManualPageAssetAsync(
+  targetPath: string,
+  pngBytes: Uint8Array,
+  documentRoot: string,
+): Promise<ManualPageImageAsset> {
+  assertManualPageImageByteBudget(pngBytes)
+  const safeTargetPath = prepareManagedAssetTarget(targetPath, documentRoot)
+  const tempPath = join(dirname(safeTargetPath), `.${randomUUID()}.tmp`)
+  await commitManualPageAssetFileAsync({ tempPath, targetPath: safeTargetPath, pngBytes })
+  return { assetPath: safeTargetPath, width: 0, height: 0 }
+}
+
 export async function renderManualPdfPageToPng(
   pdfPath: string,
   pageNumber: number,
   scale = 2,
 ): Promise<Buffer> {
+  const sourceStats = await stat(pdfPath)
+  if (sourceStats.size <= 0 || sourceStats.size > MAX_MANUAL_PAGE_SOURCE_BYTES) {
+    throw new ManualPageAssetError('source-unavailable', 'PDF 为空或超过图片处理大小上限')
+  }
+  // pdfjs-dist's Node data API requires the source bytes. Bound the read before
+  // loading them so a pathological PDF cannot allocate an unbounded buffer.
   const [pdfjs, canvasModule, sourceBytes] = await Promise.all([
     import('pdfjs-dist/legacy/build/pdf.mjs') as unknown as Promise<PdfJsModule>,
     import('@napi-rs/canvas') as unknown as Promise<CanvasModule>,
@@ -452,7 +676,11 @@ export async function renderManualPdfPageToPng(
         annotationMode: pdfjs.AnnotationMode?.DISABLE ?? 0,
         background: 'rgb(255,255,255)',
       }).promise
-      return canvas.toBuffer('image/png')
+      const renderedBytes = canvas.toBuffer('image/png')
+      if (renderedBytes.byteLength <= 0 || renderedBytes.byteLength > MAX_MANUAL_PAGE_RENDER_BYTES) {
+        throw new ManualPageAssetError('source-unavailable', 'PDF 渲染结果超过图片处理大小上限')
+      }
+      return renderedBytes
     } finally {
       page.cleanup?.()
     }
