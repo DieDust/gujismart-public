@@ -3885,6 +3885,8 @@ export default function GujiFacsimileProofreader({
       {layoutEditMode ? (
         <ManualBlockInspector
           pageId={pageId}
+          coordinateSourceSize={effectiveCoordinateSourceSize}
+          pageImageNaturalSize={pageImageNaturalSize}
           blockId={editingBlockId}
           block={editingBlock}
           disabled={layoutEditingLocked}

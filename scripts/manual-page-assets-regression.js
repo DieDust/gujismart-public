@@ -194,6 +194,29 @@ try {
   }).outputText
   const rendererModule = { exports: {} }
   new Function('exports', 'module', 'require', rendererTranspiled)(rendererModule.exports, rendererModule, require)
+  assert.deepStrictEqual(
+    rendererModule.exports.scaleManualImageCropToNaturalPixels(
+      { left: 10, top: 8, width: 40, height: 32 },
+      { width: 100, height: 80 },
+      { width: 200, height: 160 },
+    ),
+    { left: 20, top: 16, width: 80, height: 64 },
+    'layout coordinates must scale to natural image pixels before the asset-only IPC call',
+  )
+  assert.deepStrictEqual(
+    rendererModule.exports.scaleManualImageCropToNaturalPixels(
+      { left: 20, top: 16, width: 80, height: 64 },
+      { width: 200, height: 160 },
+      { width: 100, height: 80 },
+    ),
+    { left: 10, top: 8, width: 40, height: 32 },
+    'coordinate scaling must also support a smaller natural source',
+  )
+  assert.throws(() => rendererModule.exports.scaleManualImageCropToNaturalPixels(
+    { left: 0, top: 0, width: 10, height: 10 },
+    null,
+    { width: 100, height: 80 },
+  ))
   const previousMetadata = {
     image_asset_path: 'old.png',
     image_asset_width: 10,

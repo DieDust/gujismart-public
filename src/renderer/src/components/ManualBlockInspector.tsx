@@ -15,7 +15,11 @@ import { useEffect, useState } from 'react'
 import FacsimileTableEditor, { type FacsimileTableEditorValue } from './FacsimileTableEditor'
 import type { FacsimileTableMerge } from '../utils/facsimileTableEditing'
 import { MANUAL_LAYOUT_BLOCK_KINDS } from '../utils/manualLayoutBlockEditing'
-import { createManualImageAssetUpdate } from '../utils/manualImageAssetEditing'
+import {
+  createManualImageAssetUpdate,
+  scaleManualImageCropToNaturalPixels,
+  type ManualImageCoordinateSize,
+} from '../utils/manualImageAssetEditing'
 import { MANUAL_LAYOUT_KIND_NAMES } from './ManualLayoutToolbar'
 import './ManualBlockInspector.css'
 
@@ -38,6 +42,8 @@ export type ManualBlockInspectorBlock = Record<string, unknown> & {
 
 export interface ManualBlockInspectorProps {
   pageId: string
+  coordinateSourceSize?: ManualImageCoordinateSize | null
+  pageImageNaturalSize?: ManualImageCoordinateSize | null
   blockId: string | null
   block: ManualBlockInspectorBlock | null
   disabled?: boolean
@@ -77,6 +83,8 @@ function resolveInspectorBlockKind(block: ManualBlockInspectorBlock | null): Man
 
 export default function ManualBlockInspector({
   pageId,
+  coordinateSourceSize,
+  pageImageNaturalSize,
   blockId,
   block,
   disabled = false,
@@ -139,7 +147,12 @@ export default function ManualBlockInspector({
       ? persistedBlockId
       : createManualLayoutBlockId(pageId)
     try {
-      const asset = await window.api.cropManualPageImage({ pageId, blockId: assetBlockId, crop })
+      const pixelCrop = scaleManualImageCropToNaturalPixels(
+        crop,
+        coordinateSourceSize,
+        pageImageNaturalSize,
+      )
+      const asset = await window.api.cropManualPageImage({ pageId, blockId: assetBlockId, crop: pixelCrop })
       const update = createManualImageAssetUpdate({
         status: 'success',
         previous: block,
