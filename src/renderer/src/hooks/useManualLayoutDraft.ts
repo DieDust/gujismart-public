@@ -526,6 +526,23 @@ export function getManualLayoutSaveSchedule(
     : { kind: 'none' }
 }
 
+export interface ManualLayoutPreviewTransition {
+  committedState: ManualLayoutDraftState
+  previewBlocks: ManualLayoutDraftBlock[]
+  saveSchedule: ManualLayoutSaveSchedule
+}
+
+export function createManualLayoutPreviewTransition(
+  committedState: ManualLayoutDraftState,
+  nextBlocks: ManualLayoutDraftBlock[],
+): ManualLayoutPreviewTransition {
+  return {
+    committedState,
+    previewBlocks: prepareBlocks(committedState.pageId, nextBlocks),
+    saveSchedule: getManualLayoutSaveSchedule(committedState, false),
+  }
+}
+
 export function shouldPersistManualLayoutDraftAction(action: ManualLayoutDraftAction): boolean {
   return action.type !== 'set-active' && action.type !== 'preview-replace'
 }
@@ -863,9 +880,12 @@ export function useManualLayoutDraft({
   }, [dispatch])
   const previewBlocks = useCallback((nextBlocks: ManualLayoutDraftBlock[]) => {
     if (stateRef.current.discardPending) return
-    clearSaveTimer()
-    if (mountedRef.current) setPreviewBlocksState(prepareBlocks(stateRef.current.pageId, nextBlocks))
-  }, [clearSaveTimer])
+    const transition = createManualLayoutPreviewTransition(stateRef.current, nextBlocks)
+    if (mountedRef.current) setPreviewBlocksState(transition.previewBlocks)
+  }, [])
+  const clearPreview = useCallback(() => {
+    if (mountedRef.current) setPreviewBlocksState(null)
+  }, [])
   const setActiveBlockId = useCallback((blockId: string | null) => {
     dispatch({ type: 'set-active', blockId })
   }, [dispatch])
@@ -972,6 +992,7 @@ export function useManualLayoutDraft({
     deleteBlock,
     replaceBlocks,
     previewBlocks,
+    clearPreview,
     setActiveBlockId,
     receiveServerEcho,
     changePage,

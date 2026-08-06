@@ -101,6 +101,7 @@ const {
 
 const {
   continueManualLayoutSaveAfterSettlement,
+  createManualLayoutPreviewTransition,
   createManualLayoutDiscardCompensationSnapshot,
   createManualLayoutDiscardQueue,
   createManualLayoutDraft,
@@ -131,7 +132,10 @@ const {
   clampManualLayoutBlockRect,
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
+  createManualLayoutPointerFrameScheduler,
+  createManualLayoutTableSnapshot,
   getManualLayoutBlockConversionWarning,
+  getManualLayoutEditEntryPreparation,
   getManualLayoutBlockVisualState,
   moveManualLayoutBlockRect,
   normalizeManualLayoutBlockRect,
@@ -142,6 +146,7 @@ const {
 } = blockEditingHelperModule.exports
 
 assert.strictEqual(typeof createManualLayoutDraft, 'function', 'manual layout drafts must expose a testable state factory')
+assert.strictEqual(typeof createManualLayoutPreviewTransition, 'function', 'preview must expose an executable transition that preserves committed save scheduling')
 assert.strictEqual(typeof reduceManualLayoutDraft, 'function', 'manual layout drafts must expose a pure reducer')
 assert.strictEqual(typeof continueManualLayoutSaveAfterSettlement, 'function', 'an in-flight save must expose a testable continuation path for newer revisions')
 assert.strictEqual(typeof saveTextEditorPage, 'function', 'text editor saves must expose a testable real-outcome adapter')
@@ -660,6 +665,23 @@ async function runAsyncDraftChecks() {
   assert.strictEqual(rapidSecond.revision, rapidFirst.revision + 1, 'rapid edits must create a monotonically newer debounce revision')
   assert.deepStrictEqual(getManualLayoutSaveSchedule(rapidSecond, false), { kind: 'debounce', revision: rapidSecond.revision })
 
+  const queuedRevision = rapidSecond.revision
+  const previewTransition = createManualLayoutPreviewTransition(rapidSecond, [{ ...rapidSecond.blocks[0], location: { left: 1, top: 2, width: 3, height: 4 } }])
+  assert.strictEqual(previewTransition.committedState, rapidSecond, 'preview must retain the exact committed dirty state and its armed 450ms save')
+  assert.strictEqual(previewTransition.committedState.revision, queuedRevision)
+  assert.deepStrictEqual(previewTransition.saveSchedule, { kind: 'debounce', revision: queuedRevision })
+  const cancelledPreview = createManualLayoutPreviewTransition(previewTransition.committedState, rapidSecond.blocks)
+  assert.strictEqual(cancelledPreview.committedState, rapidSecond, 'cancel/lostcapture without a commit must not replace the dirty committed state')
+  let autoSaved = reduceManualLayoutDraft(cancelledPreview.committedState, { type: 'save-started', revision: queuedRevision })
+  autoSaved = reduceManualLayoutDraft(autoSaved, { type: 'server-ack', revision: queuedRevision, blocks: autoSaved.blocks })
+  assert.strictEqual(autoSaved.saveState, 'clean', 'the originally queued dirty revision must still automatically settle clean after preview cancellation')
+  const previewCommitted = reduceManualLayoutDraft(rapidSecond, {
+    type: 'replace',
+    blocks: previewTransition.previewBlocks,
+    activeBlockId: rapidSecond.activeBlockId,
+  })
+  assert.strictEqual(previewCommitted.revision, queuedRevision + 1, 'pointerup preview commit must create exactly one new revision')
+
   const deleted = reduceManualLayoutDraft(updated, { type: 'delete', blockId: createdBlockId })
   assert.strictEqual(deleted.activeBlockId, null, 'deleting the active block must close its inspector')
   assert.strictEqual(deleted.blocks.length, 1)
@@ -1112,7 +1134,7 @@ assert.deepStrictEqual(normalizeFacsimileTableColumnWidths([], -3), [], 'invalid
 const proofreader = fs.readFileSync(path.join(root, 'src/renderer/src/components/GujiFacsimileProofreader.tsx'), 'utf8')
 assert.ok(proofreader.includes('onPointerDown={handlePageLayoutPointerDown}'), 'blank page dragging must create a typed manual box')
 assert.ok(proofreader.includes('BLOCK_RESIZE_HANDLES.map'), 'the active text box must expose edge and corner resize handles')
-assert.ok(proofreader.includes("setImageUnderlayMode('on')"), 'entering manual editing must automatically enable the page image underlay')
+assert.ok(proofreader.includes('setImageUnderlayMode(preparation.imageUnderlayMode)'), 'entering manual editing must automatically enable the page image underlay through the shared plan')
 assert.ok(proofreader.includes("segmentation_source: 'manual'"), 'manual text, table, and geometry edits must be marked as manual data')
 assert.ok(proofreader.includes('<ManualBlockInspector'), 'recognized tables must reach the visual grid through the docked inspector')
 assert.ok(proofreader.includes("String(block.segmentation_source || '').toLowerCase() !== 'manual'"), 'manual tables must not be converted back into pseudo text tables on vertical pages')
@@ -1121,6 +1143,11 @@ assert.ok(proofreader.includes('await Promise.resolve(onSave('), 'both synchrono
 assert.ok(proofreader.includes('manualLayoutDraft.createBlock(nextBlock)'), 'a new stable block must enter the draft before its debounced save')
 assert.ok(proofreader.includes('manualLayoutDraft.receiveServerEcho(pageId, incomingBlocks)'), 'same-page parent echoes must reconcile through the draft reducer')
 assert.ok(proofreader.includes('manualLayoutDraft.setActiveBlockId(targetBlockId)'), 'the editor selection must use stable block identity rather than an array index')
+assert.ok(proofreader.includes('const enterLayoutEditForBlock = useCallback('), 'all block edit affordances must atomically enter mode through one callback')
+assert.ok(!proofreader.includes('const beginEditBlock = useCallback('), 'a partial edit entry callback must not leave editing state without the toolbar and inspector')
+assert.ok(proofreader.includes('const editingBlockId = layoutEditMode ? manualLayoutDraft.state.activeBlockId : null'), 'stable selection must not expose an editing state while its toolbar and inspector are hidden')
+assert.ok(proofreader.includes('enterLayoutEditForBlock()'), 'the main edit-mode button must reuse the same preparation path')
+assert.ok((proofreader.match(/enterLayoutEditForBlock\(sourceIndex\)/g) || []).length >= 3, 'button, menu and double-click block affordances must all enter through the unified callback')
 assert.ok(proofreader.includes('manualLayoutDraft.updateBlock(editingBlockId,'), 'text and table editor changes must enter the revisioned draft before debounce')
 assert.ok(proofreader.includes('block={editingBlock}'), 'opening an existing block must keep the stable selected draft in the docked inspector')
 assert.ok(proofreader.includes('onDeselect={resetBlockEditor}'), 'closing the docked inspector must clear selection without discarding the revisioned draft')
@@ -1141,7 +1168,14 @@ assert.ok(proofreader.includes('if (!words && !isImage && !isManualBlock) return
 
 assert.ok(draftHelperSource.includes('persistManualLayoutDraftSnapshot(storageRef.current, stateRef.current)'), 'every draft action must synchronously update durable cache before React can unmount')
 assert.ok(draftHelperSource.includes('finalizeManualLayoutDraftOnUnmount('), 'unmount must execute the tested synchronous-persist and best-effort-flush helper')
-assert.ok(draftHelperSource.includes('setPreviewBlocksState(prepareBlocks('), 'drag and resize preview frames must remain separate from the committed draft state')
+assert.ok(draftHelperSource.includes('createManualLayoutPreviewTransition(stateRef.current, nextBlocks)'), 'drag and resize preview frames must remain separate from the committed draft state')
+const previewCallbackStart = draftHelperSource.indexOf('const previewBlocks = useCallback(')
+const previewCallbackEnd = draftHelperSource.indexOf('const setActiveBlockId', previewCallbackStart)
+assert.ok(previewCallbackStart >= 0 && previewCallbackEnd > previewCallbackStart)
+assert.ok(!draftHelperSource.slice(previewCallbackStart, previewCallbackEnd).includes('clearSaveTimer'), 'preview and preview rollback must never cancel an already armed committed-revision save')
+const clearPreviewStart = draftHelperSource.indexOf('const clearPreview = useCallback(')
+assert.ok(clearPreviewStart > previewCallbackStart)
+assert.ok(!draftHelperSource.slice(clearPreviewStart, previewCallbackEnd).includes('clearSaveTimer'), 'clearing a visual preview must not alter the committed revision save schedule')
 assert.ok(proofreader.includes('manualLayoutDraft.discardAndChangePage(pageId, draftIdentity, incomingBlocks)'), 'the destructive page-change choice must explicitly discard the old draft before applying its target')
 assert.ok(proofreader.includes('const layoutEditingLocked = manualLayoutDraft.state.discardPending'), 'the proofreader UI must derive its mutation lock from discard compensation state')
 assert.ok(proofreader.includes("pointerEvents: layoutEditingLocked ? 'none'"), 'the layout canvas and inspector must block pointer mutations during discard compensation')
@@ -1804,6 +1838,50 @@ assert.deepStrictEqual(MANUAL_LAYOUT_MORE_KINDS, ['title', 'paragraph_title', 'a
 assert.strictEqual(reduceManualLayoutTool('note', { type: 'created' }), 'note', 'a draw tool must remain active for repeated creation')
 assert.strictEqual(reduceManualLayoutTool('image', { type: 'escape' }), 'select', 'Escape must return every draw tool to selection')
 assert.strictEqual(reduceManualLayoutTool('select', { type: 'choose-kind', kind: 'table' }), 'table')
+assert.strictEqual(typeof getManualLayoutEditEntryPreparation, 'function', 'all edit entry points must share one executable preparation plan')
+assert.deepStrictEqual(getManualLayoutEditEntryPreparation(), {
+  imageUnderlayMode: 'on',
+  showRules: true,
+  translationOpen: false,
+  pageRotation: 0,
+  tool: 'select',
+  layoutEditMode: true,
+}, 'direct block edit must prepare the same underlay, rules, translation, rotation and tool state as the main edit-mode button')
+assert.strictEqual(typeof createManualLayoutPointerFrameScheduler, 'function', 'pointer previews must expose an executable frame scheduler')
+
+const queuedFrames = new Map()
+const cancelledFrames = []
+const appliedFrameValues = []
+let nextFrameId = 1
+const frameScheduler = createManualLayoutPointerFrameScheduler(
+  (callback) => {
+    const frameId = nextFrameId
+    nextFrameId += 1
+    queuedFrames.set(frameId, callback)
+    return frameId
+  },
+  (frameId) => {
+    cancelledFrames.push(frameId)
+    queuedFrames.delete(frameId)
+  },
+  (value) => appliedFrameValues.push(value),
+)
+frameScheduler.schedule({ x: 1, y: 1 })
+frameScheduler.schedule({ x: 2, y: 3 })
+assert.strictEqual(queuedFrames.size, 1, 'many pointermoves in one frame must allocate only one animation frame')
+const firstQueuedFrame = [...queuedFrames.entries()][0]
+queuedFrames.delete(firstQueuedFrame[0])
+firstQueuedFrame[1]()
+assert.deepStrictEqual(appliedFrameValues, [{ x: 2, y: 3 }], 'one frame must prepare and preview only the latest pointer coordinate')
+frameScheduler.schedule({ x: 5, y: 8 })
+assert.strictEqual(frameScheduler.flush(), true, 'pointerup must synchronously flush the latest queued coordinate')
+assert.deepStrictEqual(appliedFrameValues, [{ x: 2, y: 3 }, { x: 5, y: 8 }])
+assert.strictEqual(queuedFrames.size, 0, 'flushing must cancel the stale browser callback')
+frameScheduler.schedule({ x: 13, y: 21 })
+frameScheduler.cancel()
+assert.strictEqual(queuedFrames.size, 0, 'cancel/lostcapture/page/unmount must cancel the queued frame')
+assert.strictEqual(frameScheduler.flush(), false, 'a cancelled frame must never apply a stale preview')
+assert.ok(cancelledFrames.length >= 2, 'flush and cancel must both release their pending browser frame')
 
 const editingBounds = { left: 0, top: 0, width: 1000, height: 800 }
 assert.deepStrictEqual(
@@ -1845,21 +1923,58 @@ assert.strictEqual(previewUpdated.blocks[1], previewBlocks[1], 'preview updates 
 assert.deepStrictEqual(commitManualLayoutGeometryPreview(previewUpdated), previewUpdated.blocks, 'pointerup must commit the latest preview exactly once')
 assert.deepStrictEqual(rollbackManualLayoutGeometryPreview(previewUpdated), previewBlocks, 'Escape/pointercancel must restore the interaction baseline')
 
-const tableConversionSource = { manual_block_id: 'table-1', label: 'table', rows: [['A']], cells: [{ row: 0, col: 0, text: 'A' }] }
+assert.strictEqual(typeof createManualLayoutTableSnapshot, 'function', 'table conversion must expose one canonical snapshot normalizer')
+const tableConversionSource = {
+  manual_block_id: 'table-1',
+  label: 'table',
+  rows: [['A', 'B']],
+  table_rows: [['stale alias']],
+  tableRows: [['another stale alias']],
+  cells: [{ row: 0, col: 0, text: 'A', colSpan: 2 }],
+  table_cells: [{ row: 0, col: 0, text: 'stale' }],
+  merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 2 }],
+  rowHeights: [31],
+  columnWidths: [90, 120],
+}
+assert.deepStrictEqual(createManualLayoutTableSnapshot(tableConversionSource), {
+  version: 1,
+  rows: [['A', 'B']],
+  merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 2 }],
+  rowHeights: [31],
+  columnWidths: [90, 120],
+}, 'alias-rich active tables must normalize to one bounded canonical archive')
+assert.deepStrictEqual(createManualLayoutTableSnapshot({
+  label: 'table',
+  table_html: '<table><tr><td rowspan="2">甲</td><td>乙</td></tr><tr><td>丙</td></tr></table>',
+}), {
+  version: 1,
+  rows: [['甲', '乙'], ['', '丙']],
+  merges: [{ row: 0, col: 0, rowSpan: 2, colSpan: 1 }],
+  rowHeights: [40, 40],
+  columnWidths: [120, 120],
+}, 'legacy HTML-only archives must remain readable and normalize row spans without retaining markup aliases')
 assert.ok(getManualLayoutBlockConversionWarning(tableConversionSource, 'text'), 'structured-to-text conversion must require a warning')
 assert.strictEqual(applyManualLayoutBlockConversion(tableConversionSource, 'text', false).blocked, true, 'unconfirmed structured conversion must be blocked')
 const confirmedTableConversion = applyManualLayoutBlockConversion(tableConversionSource, 'text', true)
 assert.strictEqual(confirmedTableConversion.block.label, 'text')
-assert.deepStrictEqual(confirmedTableConversion.block.manual_preserved_table.rows, [['A']], 'confirmed conversion must preserve table metadata for lossless reversal')
+assert.deepStrictEqual(confirmedTableConversion.block.manual_preserved_table, createManualLayoutTableSnapshot(tableConversionSource), 'confirmed conversion must preserve exactly one canonical table snapshot')
 assert.strictEqual(confirmedTableConversion.block.rows, undefined, 'inactive table rows must not keep rendering after conversion to text')
+const restoredCanonicalTable = applyManualLayoutBlockConversion(confirmedTableConversion.block, 'table', true).block
+assert.deepStrictEqual(restoredCanonicalTable.rows, [['A', 'B']], 'switching back to table must restore the preserved structure')
+assert.deepStrictEqual(restoredCanonicalTable.merges, [{ row: 0, col: 0, rowSpan: 1, colSpan: 2 }])
+assert.strictEqual(restoredCanonicalTable.manual_preserved_table, undefined, 'the consumed archive must not remain beside active table data')
+for (const alias of ['table_rows', 'tableRows', 'cells', 'table_cells', 'tableCells', 'table_merges', 'tableMerges']) {
+  assert.strictEqual(restoredCanonicalTable[alias], undefined, `restored active tables must not duplicate canonical data into ${alias}`)
+}
+const emptyTableArchive = applyManualLayoutBlockConversion({ label: 'table', rows: [['']], merges: [] }, 'text', true).block
 assert.deepStrictEqual(
-  applyManualLayoutBlockConversion(confirmedTableConversion.block, 'table', true).block.rows,
-  [['A']],
-  'switching back to table must restore the preserved structure',
+  applyManualLayoutBlockConversion(emptyTableArchive, 'table', true).block.rows,
+  [['']],
+  'an intentionally empty table must remain a table instead of being replaced by fallback text',
 )
 const manuallyEditedText = { ...confirmedTableConversion.block, words: '人工改写后的正文' }
 const restoredTableAfterTextEdit = applyManualLayoutBlockConversion(manuallyEditedText, 'table', true).block
-assert.deepStrictEqual(restoredTableAfterTextEdit.rows, [['A']], 'switching back to table must restore the original structured table')
+assert.deepStrictEqual(restoredTableAfterTextEdit.rows, [['A', 'B']], 'switching back to table must restore the original structured table')
 assert.deepStrictEqual(restoredTableAfterTextEdit.manual_preserved_text, {
   text: '人工改写后的正文',
   source: 'manual-type-conversion',
@@ -1875,6 +1990,17 @@ assert.strictEqual(applyManualLayoutBlockConversion(secondTableRoundtrip, 'text'
 const emptyTextRoundtrip = applyManualLayoutBlockConversion({ ...restoredEditedText, words: '' }, 'table', true).block
 assert.strictEqual(emptyTextRoundtrip.manual_preserved_text.text, '', 'an intentional empty manual text must remain distinguishable from no archive')
 assert.strictEqual(applyManualLayoutBlockConversion(emptyTextRoundtrip, 'text', true).block.words, '', 'an intentional empty text must survive a complete table roundtrip')
+let repeatedRoundtrip = restoredTableAfterTextEdit
+const repeatedRoundtripSizes = []
+for (let index = 0; index < 6; index += 1) {
+  const asText = applyManualLayoutBlockConversion(repeatedRoundtrip, 'text', true).block
+  assert.deepStrictEqual(asText.manual_preserved_table, createManualLayoutTableSnapshot(repeatedRoundtrip), 'each table-to-text transition must archive only the current active structure')
+  repeatedRoundtrip = applyManualLayoutBlockConversion({ ...asText, words: '稳定人工正文' }, 'table', true).block
+  assert.strictEqual(repeatedRoundtrip.manual_preserved_table, undefined)
+  assert.strictEqual(repeatedRoundtrip.manual_preserved_text.text, '稳定人工正文')
+  repeatedRoundtripSizes.push(JSON.stringify(repeatedRoundtrip).length)
+}
+assert.strictEqual(new Set(repeatedRoundtripSizes).size, 1, 'repeated roundtrips must not grow JSON through nested or duplicate table archives')
 assert.match(getManualLayoutBlockConversionWarning(manuallyEditedText, 'table'), /独立保留|归档/, 'the confirmation must accurately explain where current manual text is retained')
 const imageConversionSource = { manual_block_id: 'image-1', label: 'image', image_asset_path: 'managed/image.png', caption: '图一' }
 assert.ok(getManualLayoutBlockConversionWarning(imageConversionSource, 'note'), 'image-to-text conversion must require a warning')
@@ -1897,6 +2023,19 @@ assert.ok(proofreader.includes('<ManualLayoutToolbar'), 'the proofreader must mo
 assert.ok(proofreader.includes('<ManualBlockInspector'), 'the proofreader must mount the inspector throughout edit mode')
 assert.ok(proofreader.includes('setPointerCapture'), 'block move/resize/draw must use pointer capture')
 assert.ok(proofreader.includes('onPointerCancel'), 'pointer cancellation must roll back a geometry preview')
+assert.ok(proofreader.includes('layoutPointerFrameSchedulerRef.current?.schedule({'), 'pointermove must enqueue only the latest raw coordinate')
+assert.ok(proofreader.includes('layoutPointerFrameSchedulerRef.current?.flush()'), 'pointerup must flush its final coordinate before the single commit')
+assert.ok((proofreader.match(/layoutPointerFrameSchedulerRef\.current\?\.cancel\(\)/g) || []).length >= 6, 'cancel, page change, lock, mode exit and unmount must all cancel pending preview frames')
+const pointerUpStart = proofreader.indexOf('const handlePageLayoutPointerUp = useCallback(')
+const pointerUpEnd = proofreader.indexOf('const handlePageLayoutPointerCancel', pointerUpStart)
+const pointerUpSource = proofreader.slice(pointerUpStart, pointerUpEnd)
+assert.ok(pointerUpSource.indexOf('.schedule({') < pointerUpSource.indexOf('.flush()'), 'pointerup must queue its own final coordinate before flushing')
+assert.ok(pointerUpSource.indexOf('.flush()') < pointerUpSource.indexOf('commitBlocks(committedBlocks'), 'the final frame must be applied before the one committed revision')
+const stageTableStart = proofreader.indexOf('const stageTableBlockChange = useCallback(')
+const stageTableEnd = proofreader.indexOf('const applyInspectorTypeChange', stageTableStart)
+const stageTableSource = proofreader.slice(stageTableStart, stageTableEnd)
+assert.ok(stageTableSource.includes('merges: normalizedMerges') && stageTableSource.includes('rowHeights: normalizedRowHeights') && stageTableSource.includes('columnWidths: normalizedColumnWidths'), 'table edits must persist one canonical structure including visual sizes')
+assert.ok(!stageTableSource.includes('table_rows: normalizedRows') && !stageTableSource.includes('tableCells: cells'), 'table edits must not fan canonical data back out into legacy aliases')
 for (const handle of ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']) {
   assert.ok(proofreader.includes(`handle: '${handle}'`), `the selected block must expose the ${handle} resize handle`)
 }

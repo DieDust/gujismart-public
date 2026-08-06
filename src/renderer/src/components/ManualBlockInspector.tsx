@@ -9,7 +9,7 @@ import {
   type ManualLayoutBlockKind,
 } from '@shared/manual-layout'
 import { Button, Empty, Input, InputNumber, Segmented, Select, Space, Tag, Tooltip, message, theme } from 'antd'
-import FacsimileTableEditor from './FacsimileTableEditor'
+import FacsimileTableEditor, { type FacsimileTableEditorValue } from './FacsimileTableEditor'
 import type { FacsimileTableMerge } from '../utils/facsimileTableEditing'
 import { MANUAL_LAYOUT_BLOCK_KINDS } from '../utils/manualLayoutBlockEditing'
 import { MANUAL_LAYOUT_KIND_NAMES } from './ManualLayoutToolbar'
@@ -34,8 +34,10 @@ export interface ManualBlockInspectorProps {
   disabled?: boolean
   tableRows?: string[][]
   tableMerges?: FacsimileTableMerge[]
+  tableRowHeights?: number[]
+  tableColumnWidths?: number[]
   onChange: (changes: Record<string, unknown>) => void
-  onTableChange: (value: { rows: string[][]; merges: FacsimileTableMerge[] }) => void
+  onTableChange: (value: FacsimileTableEditorValue) => void
   onTypeChange: (kind: ManualLayoutBlockKind) => void
   onDelete: () => void
   onDeselect: () => void
@@ -61,6 +63,8 @@ export default function ManualBlockInspector({
   disabled = false,
   tableRows = [['']],
   tableMerges = [],
+  tableRowHeights = [],
+  tableColumnWidths = [],
   onChange,
   onTableChange,
   onTypeChange,
@@ -171,8 +175,10 @@ export default function ManualBlockInspector({
                 editorKey={blockId}
                 rows={tableRows}
                 merges={tableMerges}
+                rowHeights={tableRowHeights}
+                columnWidths={tableColumnWidths}
                 disabled={disabled}
-                onChange={(value) => onTableChange({ rows: value.rows, merges: value.merges })}
+                onChange={onTableChange}
               />
             </div>
           ) : null}

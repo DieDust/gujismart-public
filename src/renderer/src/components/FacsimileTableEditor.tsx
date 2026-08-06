@@ -46,12 +46,16 @@ export type FacsimileTableEditorValue = {
   rows: string[][]
   merges: FacsimileTableMerge[]
   cells: Record<string, unknown>[]
+  rowHeights: number[]
+  columnWidths: number[]
 }
 
 type Props = {
   editorKey: string
   rows: string[][]
   merges: FacsimileTableMerge[]
+  rowHeights?: number[]
+  columnWidths?: number[]
   disabled?: boolean
   onChange: (value: FacsimileTableEditorValue) => void
 }
@@ -207,13 +211,18 @@ function cloneSnapshot(snapshot: TableSnapshot): TableSnapshot {
   }
 }
 
-function createSnapshot(rows: unknown, merges: FacsimileTableMerge[]): TableSnapshot {
+function createSnapshot(
+  rows: unknown,
+  merges: FacsimileTableMerge[],
+  rowHeights: unknown = [],
+  columnWidths: unknown = [],
+): TableSnapshot {
   const safeRows = normalizeFacsimileTableRows(rows)
   return {
     rows: safeRows,
     merges: normalizeFacsimileTableMerges(merges, safeRows.length, safeRows[0]?.length || 1),
-    rowHeights: normalizeFacsimileTableRowHeights([], safeRows.length),
-    columnWidths: normalizeFacsimileTableColumnWidths([], safeRows[0]?.length || 1),
+    rowHeights: normalizeFacsimileTableRowHeights(rowHeights, safeRows.length),
+    columnWidths: normalizeFacsimileTableColumnWidths(columnWidths, safeRows[0]?.length || 1),
   }
 }
 
@@ -926,7 +935,15 @@ function selectedIndexes(start: number, end: number): number[] {
   return Array.from({ length: Math.max(0, end - start + 1) }, (_, offset) => start + offset)
 }
 
-export default function FacsimileTableEditor({ editorKey, rows, merges, disabled = false, onChange }: Props) {
+export default function FacsimileTableEditor({
+  editorKey,
+  rows,
+  merges,
+  rowHeights = [],
+  columnWidths = [],
+  disabled = false,
+  onChange,
+}: Props) {
   const { token } = theme.useToken()
   const tableThemeStyle = useMemo(() => createFacsimileTableThemeStyle(token), [token])
   const normalizedPropRows = useMemo(() => normalizeFacsimileTableRows(rows), [rows])
@@ -934,11 +951,24 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, disabled
     () => normalizeFacsimileTableMerges(merges, normalizedPropRows.length, normalizedPropRows[0]?.length || 1),
     [merges, normalizedPropRows],
   )
-  const propDataSignature = useMemo(
-    () => dataSignature(normalizedPropRows, normalizedPropMerges),
-    [normalizedPropMerges, normalizedPropRows],
+  const normalizedPropRowHeights = useMemo(
+    () => normalizeFacsimileTableRowHeights(rowHeights, normalizedPropRows.length),
+    [normalizedPropRows.length, rowHeights],
   )
-  const [tableState, setTableState] = useState<TableSnapshot>(() => createSnapshot(rows, merges))
+  const normalizedPropColumnWidths = useMemo(
+    () => normalizeFacsimileTableColumnWidths(columnWidths, normalizedPropRows[0]?.length || 1),
+    [columnWidths, normalizedPropRows],
+  )
+  const propDataSignature = useMemo(
+    () => snapshotSignature({
+      rows: normalizedPropRows,
+      merges: normalizedPropMerges,
+      rowHeights: normalizedPropRowHeights,
+      columnWidths: normalizedPropColumnWidths,
+    }),
+    [normalizedPropColumnWidths, normalizedPropMerges, normalizedPropRowHeights, normalizedPropRows],
+  )
+  const [tableState, setTableState] = useState<TableSnapshot>(() => createSnapshot(rows, merges, rowHeights, columnWidths))
   const tableStateRef = useRef(tableState)
   const onChangeRef = useRef(onChange)
   const editorKeyRef = useRef(editorKey)
@@ -1001,13 +1031,15 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, disabled
   }
 
   const emitSnapshot = (next: TableSnapshot, previous: TableSnapshot) => {
-    const nextDataSignature = dataSignature(next.rows, next.merges)
-    if (nextDataSignature === dataSignature(previous.rows, previous.merges)) return
+    const nextDataSignature = snapshotSignature(next)
+    if (nextDataSignature === snapshotSignature(previous)) return
     lastEmittedDataSignatureRef.current = nextDataSignature
     onChangeRef.current({
       rows: next.rows,
       merges: next.merges,
       cells: buildFacsimileTableCells(next.rows, next.merges),
+      rowHeights: next.rowHeights,
+      columnWidths: next.columnWidths,
     })
   }
 
@@ -1055,13 +1087,13 @@ export default function FacsimileTableEditor({ editorKey, rows, merges, disabled
     const previous = tableStateRef.current
     const identityChanged = editorKeyRef.current !== editorKey
     const next = identityChanged
-      ? createSnapshot(normalizedPropRows, normalizedPropMerges)
+      ? createSnapshot(normalizedPropRows, normalizedPropMerges, normalizedPropRowHeights, normalizedPropColumnWidths)
       : normalizeSnapshot({
-        rows: normalizedPropRows,
-        merges: normalizedPropMerges,
-        rowHeights: previous.rowHeights,
-        columnWidths: previous.columnWidths,
-      })
+          rows: normalizedPropRows,
+          merges: normalizedPropMerges,
+          rowHeights: normalizedPropRowHeights,
+          columnWidths: normalizedPropColumnWidths,
+        })
     const reconciliation = reconcileFacsimileTableEditorIdentity(
       editorKeyRef.current,
       editorKey,

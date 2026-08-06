@@ -28,6 +28,72 @@ export interface ManualLayoutGeometryPreview<T extends ManualLayoutEditableBlock
   blocks: readonly T[]
 }
 
+export interface ManualLayoutEditEntryPreparation {
+  imageUnderlayMode: 'on'
+  showRules: true
+  translationOpen: false
+  pageRotation: 0
+  tool: 'select'
+  layoutEditMode: true
+}
+
+export function getManualLayoutEditEntryPreparation(): ManualLayoutEditEntryPreparation {
+  return {
+    imageUnderlayMode: 'on',
+    showRules: true,
+    translationOpen: false,
+    pageRotation: 0,
+    tool: 'select',
+    layoutEditMode: true,
+  }
+}
+
+export interface ManualLayoutPointerFrameScheduler<T> {
+  schedule(value: T): void
+  flush(): boolean
+  cancel(): void
+}
+
+export function createManualLayoutPointerFrameScheduler<T>(
+  requestFrame: (callback: () => void) => number,
+  cancelFrame: (frameId: number) => void,
+  applyLatest: (value: T) => void,
+): ManualLayoutPointerFrameScheduler<T> {
+  let frameId: number | null = null
+  let latestValue: T
+  let hasLatestValue = false
+
+  const apply = () => {
+    frameId = null
+    if (!hasLatestValue) return false
+    const value = latestValue
+    hasLatestValue = false
+    applyLatest(value)
+    return true
+  }
+
+  return {
+    schedule(value) {
+      latestValue = value
+      hasLatestValue = true
+      if (frameId !== null) return
+      frameId = requestFrame(() => { apply() })
+    },
+    flush() {
+      if (frameId !== null) {
+        cancelFrame(frameId)
+        frameId = null
+      }
+      return apply()
+    },
+    cancel() {
+      if (frameId !== null) cancelFrame(frameId)
+      frameId = null
+      hasLatestValue = false
+    },
+  }
+}
+
 export const MANUAL_LAYOUT_BLOCK_KINDS: readonly ManualLayoutBlockKind[] = [
   'text',
   'title',
@@ -215,6 +281,9 @@ type ManualLayoutBlockCategory = 'text' | 'table' | 'image'
 const TABLE_STRUCTURE_KEYS = [
   'rows', 'table_rows', 'tableRows',
   'cells', 'table_cells', 'tableCells',
+  'merges', 'table_merges', 'tableMerges',
+  'rowHeights', 'row_heights', 'rowSizes', 'row_sizes',
+  'columnWidths', 'column_widths', 'colSizes', 'col_sizes',
   'html', 'table_html', 'tableHtml',
   'markdown', 'md',
 ] as const
@@ -223,10 +292,220 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function snapshotTableStructure(block: ManualLayoutEditableBlock): Record<string, unknown> {
-  return Object.fromEntries(TABLE_STRUCTURE_KEYS
-    .filter((key) => block[key] !== undefined)
-    .map((key) => [key, block[key]]))
+export interface ManualLayoutTableMerge {
+  row: number
+  col: number
+  rowSpan: number
+  colSpan: number
+}
+
+export interface ManualLayoutTableSnapshot {
+  version: 1
+  rows: string[][]
+  merges: ManualLayoutTableMerge[]
+  rowHeights: number[]
+  columnWidths: number[]
+}
+
+const MANUAL_LAYOUT_TABLE_MAX_ROWS = 2_000
+const MANUAL_LAYOUT_TABLE_MAX_COLUMNS = 256
+const MANUAL_LAYOUT_TABLE_DEFAULT_ROW_HEIGHT = 40
+const MANUAL_LAYOUT_TABLE_DEFAULT_COLUMN_WIDTH = 120
+
+function firstArrayValue(block: ManualLayoutEditableBlock, keys: readonly string[]): unknown[] {
+  for (const key of keys) {
+    const value = block[key]
+    if (Array.isArray(value)) return value
+  }
+  return []
+}
+
+function firstStringValue(block: ManualLayoutEditableBlock, keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = block[key]
+    if (typeof value === 'string' && value.trim()) return value
+  }
+  return ''
+}
+
+function cellInteger(cell: Record<string, unknown>, keys: readonly string[], fallback = 0): number {
+  for (const key of keys) {
+    const value = Number(cell[key])
+    if (Number.isFinite(value)) return Math.max(0, Math.floor(value))
+  }
+  return fallback
+}
+
+function cellText(cell: Record<string, unknown>): string {
+  for (const key of ['text', 'words', 'content', 'value']) {
+    const value = cell[key]
+    if (typeof value === 'string') return value
+    if (typeof value === 'number') return String(value)
+  }
+  return ''
+}
+
+function rowsFromCells(cells: unknown[]): string[][] {
+  const rows: string[][] = []
+  for (const rawCell of cells) {
+    if (!isRecord(rawCell)) continue
+    const row = Math.min(MANUAL_LAYOUT_TABLE_MAX_ROWS - 1, cellInteger(rawCell, ['row', 'row_index', 'rowIndex']))
+    const col = Math.min(MANUAL_LAYOUT_TABLE_MAX_COLUMNS - 1, cellInteger(rawCell, ['col', 'col_index', 'colIndex']))
+    if (!rows[row]) rows[row] = []
+    rows[row][col] = cellText(rawCell)
+  }
+  return rows
+}
+
+function parsePositiveSpan(attributes: string, name: 'rowspan' | 'colspan'): number {
+  const match = attributes.match(new RegExp(`\\b${name}\\s*=\\s*["']?(\\d+)`, 'i'))
+  const maximum = name === 'rowspan' ? MANUAL_LAYOUT_TABLE_MAX_ROWS : MANUAL_LAYOUT_TABLE_MAX_COLUMNS
+  return match ? Math.min(maximum, Math.max(1, Math.floor(Number(match[1])))) : 1
+}
+
+function tableFromHtml(block: ManualLayoutEditableBlock): { rows: string[][]; merges: ManualLayoutTableMerge[] } {
+  const html = firstStringValue(block, ['html', 'table_html', 'tableHtml'])
+  if (!html) return { rows: [], merges: [] }
+  const rows: string[][] = []
+  const merges: ManualLayoutTableMerge[] = []
+  const occupied = new Set<string>()
+  const rawRows = Array.from(html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)).slice(0, MANUAL_LAYOUT_TABLE_MAX_ROWS)
+  rawRows.forEach((rowMatch, row) => {
+    const cells = Array.from(rowMatch[1].matchAll(/<(?:td|th)\b([^>]*)>([\s\S]*?)<\/(?:td|th)>/gi))
+      .slice(0, MANUAL_LAYOUT_TABLE_MAX_COLUMNS)
+    if (cells.length === 0) return
+    if (!rows[row]) rows[row] = []
+    let col = 0
+    for (const cellMatch of cells) {
+      while (occupied.has(`${row}:${col}`)) col += 1
+      if (col >= MANUAL_LAYOUT_TABLE_MAX_COLUMNS) break
+      const rowSpan = Math.min(MANUAL_LAYOUT_TABLE_MAX_ROWS - row, parsePositiveSpan(cellMatch[1], 'rowspan'))
+      const colSpan = Math.min(MANUAL_LAYOUT_TABLE_MAX_COLUMNS - col, parsePositiveSpan(cellMatch[1], 'colspan'))
+      rows[row][col] = cellMatch[2].replace(/<[^>]+>/g, '').replace(/&nbsp;/gi, ' ').trim()
+      for (let coveredRow = row; coveredRow < row + rowSpan; coveredRow += 1) {
+        for (let coveredCol = col; coveredCol < col + colSpan; coveredCol += 1) {
+          if (coveredRow !== row || coveredCol !== col) occupied.add(`${coveredRow}:${coveredCol}`)
+        }
+      }
+      if (rowSpan > 1 || colSpan > 1) merges.push({ row, col, rowSpan, colSpan })
+      col += colSpan
+    }
+  })
+  return { rows, merges }
+}
+
+function rowsFromMarkup(block: ManualLayoutEditableBlock): string[][] {
+  const htmlTable = tableFromHtml(block)
+  if (htmlTable.rows.length > 0) return htmlTable.rows
+  const markdown = firstStringValue(block, ['markdown', 'md'])
+  if (!markdown) return []
+  return markdown.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^\|.*\|$/.test(line) && !/^\|?\s*:?-{3,}/.test(line))
+    .map((line) => line.replace(/^\||\|$/g, '').split('|').map((cell) => cell.trim()))
+}
+
+function normalizeTableRows(block: ManualLayoutEditableBlock): string[][] {
+  const directRows = firstArrayValue(block, ['rows', 'table_rows', 'tableRows'])
+  const rawRows = directRows.length > 0
+    ? directRows
+    : rowsFromCells(firstArrayValue(block, ['cells', 'table_cells', 'tableCells']))
+  const sourceRows = (rawRows.length > 0 ? rawRows : rowsFromMarkup(block)).slice(0, MANUAL_LAYOUT_TABLE_MAX_ROWS)
+  const rows = Array.from({ length: sourceRows.length }, (_, rowIndex) => {
+    const rawRow = sourceRows[rowIndex]
+    const rowValues = Array.isArray(rawRow)
+      ? rawRow
+      : isRecord(rawRow) && Array.isArray(rawRow.cells)
+        ? rawRow.cells
+        : []
+    return rowValues.slice(0, MANUAL_LAYOUT_TABLE_MAX_COLUMNS).map((value) => (
+      isRecord(value)
+        ? cellText(value)
+        : typeof value === 'string'
+          ? value
+          : value == null
+            ? ''
+            : String(value)
+    ))
+  })
+  if (rows.length === 0) return [['']]
+  const columnCount = Math.max(1, ...rows.map((row) => row.length))
+  return rows.map((row) => Array.from({ length: columnCount }, (_, col) => row[col] || ''))
+}
+
+function normalizeTableMerges(block: ManualLayoutEditableBlock, rows: string[][]): ManualLayoutTableMerge[] {
+  const rowCount = rows.length
+  const colCount = rows[0]?.length || 1
+  const directMerges = firstArrayValue(block, ['merges', 'table_merges', 'tableMerges'])
+  const legacyCells = firstArrayValue(block, ['cells', 'table_cells', 'tableCells'])
+  const source = directMerges.length > 0
+    ? directMerges
+    : legacyCells.length > 0
+      ? legacyCells
+      : tableFromHtml(block).merges
+  const candidates = source.slice(0, MANUAL_LAYOUT_TABLE_MAX_ROWS * MANUAL_LAYOUT_TABLE_MAX_COLUMNS).flatMap((rawMerge) => {
+    if (!isRecord(rawMerge)) return []
+    const row = cellInteger(rawMerge, ['row', 'row_index', 'rowIndex'])
+    const col = cellInteger(rawMerge, ['col', 'col_index', 'colIndex'])
+    if (row >= rowCount || col >= colCount) return []
+    const rowSpan = Math.max(1, Math.min(rowCount - row, cellInteger(rawMerge, ['rowSpan', 'row_span', 'rowspan'], 1)))
+    const colSpan = Math.max(1, Math.min(colCount - col, cellInteger(rawMerge, ['colSpan', 'col_span', 'colspan'], 1)))
+    return rowSpan === 1 && colSpan === 1 ? [] : [{ row, col, rowSpan, colSpan }]
+  })
+  const accepted: ManualLayoutTableMerge[] = []
+  const occupied = new Set<string>()
+  for (const merge of candidates.sort((left, right) => left.row - right.row || left.col - right.col)) {
+    let overlaps = false
+    for (let row = merge.row; row < merge.row + merge.rowSpan && !overlaps; row += 1) {
+      for (let col = merge.col; col < merge.col + merge.colSpan; col += 1) {
+        if (occupied.has(`${row}:${col}`)) {
+          overlaps = true
+          break
+        }
+      }
+    }
+    if (overlaps) continue
+    accepted.push(merge)
+    for (let row = merge.row; row < merge.row + merge.rowSpan; row += 1) {
+      for (let col = merge.col; col < merge.col + merge.colSpan; col += 1) occupied.add(`${row}:${col}`)
+    }
+  }
+  return accepted
+}
+
+function normalizeTableSizes(
+  block: ManualLayoutEditableBlock,
+  keys: readonly string[],
+  count: number,
+  fallback: number,
+): number[] {
+  const source = firstArrayValue(block, keys)
+  return Array.from({ length: count }, (_, index) => {
+    const value = source[index]
+    const size = Number(value)
+    return Number.isFinite(size) && size > 0 ? size : fallback
+  })
+}
+
+export function createManualLayoutTableSnapshot(block: ManualLayoutEditableBlock): ManualLayoutTableSnapshot {
+  const rows = normalizeTableRows(block)
+  return {
+    version: 1,
+    rows,
+    merges: normalizeTableMerges(block, rows),
+    rowHeights: normalizeTableSizes(
+      block,
+      ['rowHeights', 'row_heights', 'rowSizes', 'row_sizes'],
+      rows.length,
+      MANUAL_LAYOUT_TABLE_DEFAULT_ROW_HEIGHT,
+    ),
+    columnWidths: normalizeTableSizes(
+      block,
+      ['columnWidths', 'column_widths', 'colSizes', 'col_sizes'],
+      rows[0]?.length || 1,
+      MANUAL_LAYOUT_TABLE_DEFAULT_COLUMN_WIDTH,
+    ),
+  }
 }
 
 function kindCategory(kind: ManualLayoutBlockKind): ManualLayoutBlockCategory {
@@ -270,15 +549,23 @@ export function applyManualLayoutBlockConversion<T extends ManualLayoutEditableB
     segmentation_source: 'manual',
   }
   if (currentCategory === 'table' && nextCategory !== 'table') {
-    nextBlock.manual_preserved_table = snapshotTableStructure(block)
+    nextBlock.manual_preserved_table = createManualLayoutTableSnapshot(block)
     for (const key of TABLE_STRUCTURE_KEYS) nextBlock[key] = undefined
     if (nextCategory === 'text'
       && isRecord(block.manual_preserved_text)
       && typeof block.manual_preserved_text.text === 'string') {
       nextBlock.words = block.manual_preserved_text.text
     }
-  } else if (nextCategory === 'table' && currentCategory !== 'table' && isRecord(block.manual_preserved_table)) {
-    Object.assign(nextBlock, block.manual_preserved_table)
+  } else if (nextCategory === 'table' && currentCategory !== 'table') {
+    for (const key of TABLE_STRUCTURE_KEYS) nextBlock[key] = undefined
+    if (isRecord(block.manual_preserved_table)) {
+      const snapshot = createManualLayoutTableSnapshot(block.manual_preserved_table)
+      nextBlock.rows = snapshot.rows
+      nextBlock.merges = snapshot.merges
+      nextBlock.rowHeights = snapshot.rowHeights
+      nextBlock.columnWidths = snapshot.columnWidths
+    }
+    nextBlock.manual_preserved_table = undefined
   }
   if (currentCategory === 'text' && nextCategory === 'table') {
     const previousVersion = isRecord(block.manual_preserved_text)

@@ -22,8 +22,10 @@ import { getBlockTableRows, getOrderedOcrBlocks, isTableBlock } from '../utils/o
 import ManualBlockInspector from './ManualBlockInspector'
 import ManualLayoutToolbar from './ManualLayoutToolbar'
 import {
-  buildFacsimileTableCells,
   getFacsimileTableMergesFromCells,
+  normalizeFacsimileTableColumnWidths,
+  normalizeFacsimileTableMerges,
+  normalizeFacsimileTableRowHeights,
   normalizeFacsimileTableRows,
   type FacsimileTableMerge,
 } from '../utils/facsimileTableEditing'
@@ -40,8 +42,10 @@ import {
   clampManualLayoutBlockRect,
   commitManualLayoutGeometryPreview,
   createManualLayoutGeometryPreview,
+  createManualLayoutPointerFrameScheduler,
   getManualLayoutBlockConversionWarning,
   getManualLayoutBlockVisualState,
+  getManualLayoutEditEntryPreparation,
   moveManualLayoutBlockRect,
   normalizeManualLayoutBlockRect,
   reduceManualLayoutTool,
@@ -49,6 +53,7 @@ import {
   rollbackManualLayoutGeometryPreview,
   updateManualLayoutGeometryPreview,
   type ManualLayoutGeometryPreview,
+  type ManualLayoutPointerFrameScheduler,
   type ManualLayoutResizeHandle,
   type ManualLayoutTool,
 } from '../utils/manualLayoutBlockEditing'
@@ -88,6 +93,12 @@ type LayoutPointerInteraction =
       preview: ManualLayoutGeometryPreview<LayoutBlock>
       changed: boolean
     }
+
+type LayoutPointerFrame = {
+  pointerId: number
+  clientX: number
+  clientY: number
+}
 
 function releaseCapturedLayoutPointer(interaction: LayoutPointerInteraction | null): void {
   if (!interaction) return
@@ -516,6 +527,15 @@ function isRenderableTableBlock(block: unknown): boolean {
   return isTableBlock(block) && getBlockTableRows(block).length > 0
 }
 
+function getEditableBlockTableRows(block: unknown, fallbackText = ''): string[][] {
+  const directRows = firstRecordValue(block, ['rows', 'table_rows', 'tableRows'])
+  if (Array.isArray(directRows)) return normalizeFacsimileTableRows(directRows)
+  const extractedRows = getBlockTableRows(block)
+  return extractedRows.length > 0
+    ? normalizeFacsimileTableRows(extractedRows)
+    : [[fallbackText]]
+}
+
 function tableRowsToPlainText(rows: string[][]): string {
   return rows.map((row) => row.map((cell) => String(cell || '').trim()).filter(Boolean).join('')).filter(Boolean).join('\n')
 }
@@ -526,7 +546,29 @@ function getBlockTableCells(block: unknown): unknown[] {
 }
 
 function getBlockTableMerges(block: unknown, rows: string[][]): FacsimileTableMerge[] {
+  const direct = firstRecordValue(block, ['merges', 'table_merges', 'tableMerges'])
+  if (Array.isArray(direct)) {
+    return normalizeFacsimileTableMerges(
+      direct as FacsimileTableMerge[],
+      rows.length,
+      rows[0]?.length || 1,
+    )
+  }
   return getFacsimileTableMergesFromCells(getBlockTableCells(block), rows.length, rows[0]?.length || 1)
+}
+
+function getBlockTableRowHeights(block: unknown, rows: string[][]): number[] {
+  return normalizeFacsimileTableRowHeights(
+    firstRecordValue(block, ['rowHeights', 'row_heights', 'rowSizes', 'row_sizes']),
+    rows.length,
+  )
+}
+
+function getBlockTableColumnWidths(block: unknown, rows: string[][]): number[] {
+  return normalizeFacsimileTableColumnWidths(
+    firstRecordValue(block, ['columnWidths', 'column_widths', 'colSizes', 'col_sizes']),
+    rows[0]?.length || 1,
+  )
 }
 
 function tableRowsToVerticalColumnText(rows: string[][]): string {
@@ -1878,10 +1920,21 @@ export default function GujiFacsimileProofreader({
   const dragStartRef = useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
   const blocksRef = useRef<LayoutBlock[]>([])
   const layoutInteractionRef = useRef<LayoutPointerInteraction | null>(null)
+  const applyLayoutPointerFrameRef = useRef<(frame: LayoutPointerFrame) => void>(() => undefined)
+  const layoutPointerFrameSchedulerRef = useRef<ManualLayoutPointerFrameScheduler<LayoutPointerFrame> | null>(null)
+  if (!layoutPointerFrameSchedulerRef.current) {
+    layoutPointerFrameSchedulerRef.current = createManualLayoutPointerFrameScheduler(
+      (callback) => window.requestAnimationFrame(callback),
+      (frameId) => window.cancelAnimationFrame(frameId),
+      (frame) => applyLayoutPointerFrameRef.current(frame),
+    )
+  }
   const [history, setHistory] = useState<LayoutBlock[][]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
   const [tableDraftRows, setTableDraftRows] = useState<string[][]>([['']])
   const [tableDraftMerges, setTableDraftMerges] = useState<FacsimileTableMerge[]>([])
+  const [tableDraftRowHeights, setTableDraftRowHeights] = useState<number[]>([])
+  const [tableDraftColumnWidths, setTableDraftColumnWidths] = useState<number[]>([])
   const [layoutEditMode, setLayoutEditMode] = useState(false)
   const [manualLayoutTool, setManualLayoutTool] = useState<ManualLayoutTool>('select')
   const [altShowsClearUnderlay, setAltShowsClearUnderlay] = useState(false)
@@ -1951,7 +2004,7 @@ export default function GujiFacsimileProofreader({
     }
   }
   const blocks = manualLayoutDraft.state.blocks as LayoutBlock[]
-  const editingBlockId = manualLayoutDraft.state.activeBlockId
+  const editingBlockId = layoutEditMode ? manualLayoutDraft.state.activeBlockId : null
   const layoutEditingLocked = manualLayoutDraft.state.discardPending
   const pageSourceText = useMemo(() => blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'), [blocks])
   const translationOpen = controlledTranslationOpen ?? internalTranslationOpen
@@ -1993,17 +2046,24 @@ export default function GujiFacsimileProofreader({
     }
     const resetPageEditorUi = () => {
       if (!proofreaderMountedRef.current) return
+      const activeInteraction = layoutInteractionRef.current
+      layoutPointerFrameSchedulerRef.current?.cancel()
+      if (activeInteraction && activeInteraction.kind !== 'create') {
+        blocksRef.current = rollbackManualLayoutGeometryPreview(activeInteraction.preview) as LayoutBlock[]
+      }
+      layoutInteractionRef.current = null
+      releaseCapturedLayoutPointer(activeInteraction)
       blocksRef.current = incomingBlocks
       setHistory([incomingBlocks.map((block) => ({ ...block }))])
       setHistoryIndex(0)
       setTableDraftRows([['']])
       setTableDraftMerges([])
+      setTableDraftRowHeights([])
+      setTableDraftColumnWidths([])
       setDraftCreateRect(null)
       setPendingCreateRect(null)
       setManualLayoutTool('select')
       setAltShowsClearUnderlay(false)
-      releaseCapturedLayoutPointer(layoutInteractionRef.current)
-      layoutInteractionRef.current = null
       translationRequestKeyRef.current = ''
       pendingDraftIdentityRef.current = ''
     }
@@ -2160,8 +2220,13 @@ export default function GujiFacsimileProofreader({
 
   useEffect(() => {
     if (!layoutEditingLocked) return
-    releaseCapturedLayoutPointer(layoutInteractionRef.current)
+    const activeInteraction = layoutInteractionRef.current
+    layoutPointerFrameSchedulerRef.current?.cancel()
+    if (activeInteraction && activeInteraction.kind !== 'create') {
+      blocksRef.current = rollbackManualLayoutGeometryPreview(activeInteraction.preview) as LayoutBlock[]
+    }
     layoutInteractionRef.current = null
+    releaseCapturedLayoutPointer(activeInteraction)
     setDraftCreateRect(null)
     setPendingCreateRect(null)
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
@@ -2181,8 +2246,13 @@ export default function GujiFacsimileProofreader({
     proofreaderMountedRef.current = true
     return () => {
       proofreaderMountedRef.current = false
-      releaseCapturedLayoutPointer(layoutInteractionRef.current)
+      const activeInteraction = layoutInteractionRef.current
+      layoutPointerFrameSchedulerRef.current?.cancel()
+      if (activeInteraction && activeInteraction.kind !== 'create') {
+        blocksRef.current = rollbackManualLayoutGeometryPreview(activeInteraction.preview) as LayoutBlock[]
+      }
       layoutInteractionRef.current = null
+      releaseCapturedLayoutPointer(activeInteraction)
       if (wheelAnchorFrameRef.current != null) window.cancelAnimationFrame(wheelAnchorFrameRef.current)
       if (wheelZoomCommitTimerRef.current != null) window.clearTimeout(wheelZoomCommitTimerRef.current)
       if (pageRecenterFrameRef.current != null) window.cancelAnimationFrame(pageRecenterFrameRef.current)
@@ -2420,13 +2490,17 @@ export default function GujiFacsimileProofreader({
   ), [blocks, editingBlockId, manualLayoutDraft.state.pageId])
   useEffect(() => {
     if (!editingBlock || !editingBlockId) return
-    if (isRenderableTableBlock(editingBlock)) {
-      const nextRows = normalizeFacsimileTableRows(getBlockTableRows(editingBlock))
+    if (isTableBlock(editingBlock)) {
+      const nextRows = getEditableBlockTableRows(editingBlock)
       setTableDraftRows(nextRows)
       setTableDraftMerges(getBlockTableMerges(editingBlock, nextRows))
+      setTableDraftRowHeights(getBlockTableRowHeights(editingBlock, nextRows))
+      setTableDraftColumnWidths(getBlockTableColumnWidths(editingBlock, nextRows))
     } else {
       setTableDraftRows([['']])
       setTableDraftMerges([])
+      setTableDraftRowHeights([])
+      setTableDraftColumnWidths([])
     }
   }, [editingBlockId])
 
@@ -2434,6 +2508,8 @@ export default function GujiFacsimileProofreader({
     manualLayoutDraft.setActiveBlockId(null)
     setTableDraftRows([['']])
     setTableDraftMerges([])
+    setTableDraftRowHeights([])
+    setTableDraftColumnWidths([])
   }, [manualLayoutDraft.setActiveBlockId])
 
   const stageTextBlockChange = useCallback((value: string) => {
@@ -2444,24 +2520,45 @@ export default function GujiFacsimileProofreader({
     })
   }, [editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
 
-  const stageTableBlockChange = useCallback((rows: string[][], merges: FacsimileTableMerge[]) => {
+  const stageTableBlockChange = useCallback((
+    rows: string[][],
+    merges: FacsimileTableMerge[],
+    rowHeights: number[],
+    columnWidths: number[],
+  ) => {
     if (layoutEditingLocked) return
-    setTableDraftRows(rows)
-    setTableDraftMerges(merges)
-    if (!editingBlockId || !editingBlock) return
     const normalizedRows = normalizeFacsimileTableRows(rows)
-    const cells = buildFacsimileTableCells(normalizedRows, merges)
+    const normalizedMerges = normalizeFacsimileTableMerges(merges, normalizedRows.length, normalizedRows[0]?.length || 1)
+    const normalizedRowHeights = normalizeFacsimileTableRowHeights(rowHeights, normalizedRows.length)
+    const normalizedColumnWidths = normalizeFacsimileTableColumnWidths(columnWidths, normalizedRows[0]?.length || 1)
+    setTableDraftRows(normalizedRows)
+    setTableDraftMerges(normalizedMerges)
+    setTableDraftRowHeights(normalizedRowHeights)
+    setTableDraftColumnWidths(normalizedColumnWidths)
+    if (!editingBlockId || !editingBlock) return
     manualLayoutDraft.updateBlock(editingBlockId, {
       words: tableRowsToPlainText(normalizedRows),
       label: 'table',
-      type: editingBlock.type === 'text' ? 'table' : editingBlock.type,
-      block_type: editingBlock.block_type === 'text' ? 'table' : editingBlock.block_type,
+      type: 'table',
+      block_type: 'table',
       rows: normalizedRows,
-      table_rows: normalizedRows,
-      tableRows: normalizedRows,
-      cells,
-      table_cells: cells,
-      tableCells: cells,
+      merges: normalizedMerges,
+      rowHeights: normalizedRowHeights,
+      columnWidths: normalizedColumnWidths,
+      manual_preserved_table: undefined,
+      table_rows: undefined,
+      tableRows: undefined,
+      cells: undefined,
+      table_cells: undefined,
+      tableCells: undefined,
+      table_merges: undefined,
+      tableMerges: undefined,
+      row_heights: undefined,
+      rowSizes: undefined,
+      row_sizes: undefined,
+      column_widths: undefined,
+      colSizes: undefined,
+      col_sizes: undefined,
       html: undefined,
       table_html: undefined,
       tableHtml: undefined,
@@ -2476,23 +2573,22 @@ export default function GujiFacsimileProofreader({
     if (conversion.blocked) return
     let convertedBlock = conversion.block as LayoutBlock
     if (nextKind === 'table') {
-      const rows = getBlockTableRows(convertedBlock).length > 0
-        ? normalizeFacsimileTableRows(getBlockTableRows(convertedBlock))
-        : [[getBlockText(editingBlock)]]
+      const rows = getEditableBlockTableRows(convertedBlock, getBlockText(editingBlock))
       const merges = getBlockTableMerges(convertedBlock, rows)
-      const cells = buildFacsimileTableCells(rows, merges)
+      const rowHeights = getBlockTableRowHeights(convertedBlock, rows)
+      const columnWidths = getBlockTableColumnWidths(convertedBlock, rows)
       convertedBlock = {
         ...convertedBlock,
         rows,
-        table_rows: rows,
-        tableRows: rows,
-        cells,
-        table_cells: cells,
-        tableCells: cells,
+        merges,
+        rowHeights,
+        columnWidths,
         words: tableRowsToPlainText(rows),
       }
       setTableDraftRows(rows)
       setTableDraftMerges(merges)
+      setTableDraftRowHeights(rowHeights)
+      setTableDraftColumnWidths(columnWidths)
     } else if ((nextKind === 'image' || nextKind === 'seal') && !String(convertedBlock.caption || '').trim()) {
       convertedBlock = { ...convertedBlock, caption: getBlockText(editingBlock), alt_text: String(convertedBlock.alt_text || '') }
     }
@@ -2572,27 +2668,45 @@ export default function GujiFacsimileProofreader({
     manualLayoutDraft.replaceBlocks(nextBlocks, null)
     setTableDraftRows([['']])
     setTableDraftMerges([])
+    setTableDraftRowHeights([])
+    setTableDraftColumnWidths([])
   }, [canUndo, history, historyIndex, layoutEditingLocked, manualLayoutDraft.replaceBlocks])
 
-  const beginEditBlock = useCallback((sourceIndex: number) => {
+  const enterLayoutEditForBlock = useCallback((sourceIndex?: number) => {
     if (layoutEditingLocked) return
-    const targetIndex = blocks.findIndex((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
-    const target = targetIndex < 0 ? undefined : blocks[targetIndex]
-    if (!target || isImageLabel(getLabel(target))) return
-    setImageUnderlayMode('on')
-    setShowRules(true)
+    const currentBlocks = blocksRef.current
+    const targetIndex = typeof sourceIndex === 'number'
+      ? currentBlocks.findIndex((block, index) => getBlockSourceIndex(block, index) === sourceIndex)
+      : -1
+    const target = targetIndex < 0 ? undefined : currentBlocks[targetIndex]
+    if (typeof sourceIndex === 'number' && (!target || isImageLabel(getLabel(target)))) return
+    const preparation = getManualLayoutEditEntryPreparation()
+    setImageUnderlayMode(preparation.imageUnderlayMode)
+    setShowRules(preparation.showRules)
+    setTranslationOpen(preparation.translationOpen)
+    pageRotationRef.current = preparation.pageRotation
+    setPageRotation(preparation.pageRotation)
+    setManualLayoutTool(preparation.tool)
+    setPendingCreateRect(null)
+    setDraftCreateRect(null)
+    setLayoutEditMode(preparation.layoutEditMode)
+    if (!target || typeof sourceIndex !== 'number') return
     const targetBlockId = getManualLayoutDraftBlockId(manualLayoutDraft.state.pageId, target, targetIndex)
     manualLayoutDraft.setActiveBlockId(targetBlockId)
-    if (isRenderableTableBlock(target)) {
-      const rows = normalizeFacsimileTableRows(getBlockTableRows(target))
+    if (isTableBlock(target)) {
+      const rows = getEditableBlockTableRows(target)
       setTableDraftRows(rows)
       setTableDraftMerges(getBlockTableMerges(target, rows))
+      setTableDraftRowHeights(getBlockTableRowHeights(target, rows))
+      setTableDraftColumnWidths(getBlockTableColumnWidths(target, rows))
     } else {
       setTableDraftRows([['']])
       setTableDraftMerges([])
+      setTableDraftRowHeights([])
+      setTableDraftColumnWidths([])
     }
     onSelectBox?.(sourceIndex)
-  }, [blocks, layoutEditingLocked, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox])
+  }, [layoutEditingLocked, manualLayoutDraft.setActiveBlockId, manualLayoutDraft.state.pageId, onSelectBox, setTranslationOpen])
 
   const selectLayoutBlock = useCallback((sourceIndex: number, fallbackBlockId: string) => {
     onSelectBox?.(sourceIndex)
@@ -2700,7 +2814,6 @@ export default function GujiFacsimileProofreader({
     ), -1) + 1
     const orientation = pageVerticalMode ? 'vertical' : 'horizontal'
     const tableRows = kind === 'table' ? [['']] : undefined
-    const tableCells = tableRows ? buildFacsimileTableCells(tableRows, []) : undefined
     const nextBlock = ensureManualLayoutBlockIdentity(manualLayoutDraft.state.pageId, {
       words: '',
       label: kind,
@@ -2714,11 +2827,9 @@ export default function GujiFacsimileProofreader({
       segmentation_source: 'manual',
       location: rect,
       rows: tableRows,
-      table_rows: tableRows,
-      tableRows,
-      cells: tableCells,
-      table_cells: tableCells,
-      tableCells,
+      merges: tableRows ? [] : undefined,
+      rowHeights: tableRows ? normalizeFacsimileTableRowHeights([], tableRows.length) : undefined,
+      columnWidths: tableRows ? normalizeFacsimileTableColumnWidths([], tableRows[0]?.length || 1) : undefined,
       caption: kind === 'image' || kind === 'seal' ? '' : undefined,
       alt_text: kind === 'image' || kind === 'seal' ? '' : undefined,
       __rect: rect,
@@ -2731,6 +2842,8 @@ export default function GujiFacsimileProofreader({
     manualLayoutDraft.createBlock(nextBlock)
     setTableDraftRows(tableRows || [['']])
     setTableDraftMerges([])
+    setTableDraftRowHeights(tableRows ? normalizeFacsimileTableRowHeights([], tableRows.length) : [])
+    setTableDraftColumnWidths(tableRows ? normalizeFacsimileTableColumnWidths([], tableRows[0]?.length || 1) : [])
     setPendingCreateRect(null)
     setManualLayoutTool((current) => reduceManualLayoutTool(current, { type: 'created' }))
     onSelectBox?.(sourceIndex)
@@ -2749,6 +2862,7 @@ export default function GujiFacsimileProofreader({
     if (targetIndex < 0) return
     event.preventDefault()
     event.stopPropagation()
+    layoutPointerFrameSchedulerRef.current?.cancel()
     setPendingCreateRect(null)
     const baselineBlocks = blocksRef.current
     const baselineBlock = baselineBlocks[targetIndex]
@@ -2794,6 +2908,7 @@ export default function GujiFacsimileProofreader({
     if (!point) return
     event.preventDefault()
     event.stopPropagation()
+    layoutPointerFrameSchedulerRef.current?.cancel()
     setPendingCreateRect(null)
     manualLayoutDraft.setActiveBlockId(null)
     const captureTarget = event.currentTarget
@@ -2811,6 +2926,7 @@ export default function GujiFacsimileProofreader({
   }, [getPointerCoordinate, layoutEditMode, layoutEditingLocked, manualLayoutDraft.setActiveBlockId, manualLayoutTool, onSelectBox])
 
   const cancelLayoutInteraction = useCallback(() => {
+    layoutPointerFrameSchedulerRef.current?.cancel()
     const interaction = layoutInteractionRef.current
     if (!interaction) {
       setDraftCreateRect(null)
@@ -2823,17 +2939,15 @@ export default function GujiFacsimileProofreader({
     if (interaction.kind === 'create') return
     const restoredBlocks = rollbackManualLayoutGeometryPreview(interaction.preview) as LayoutBlock[]
     blocksRef.current = restoredBlocks
-    manualLayoutDraft.previewBlocks(restoredBlocks)
+    manualLayoutDraft.clearPreview()
     manualLayoutDraft.setActiveBlockId(interaction.baselineBlockId)
-  }, [manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId])
+  }, [manualLayoutDraft.clearPreview, manualLayoutDraft.setActiveBlockId])
 
-  const handlePageLayoutPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+  const applyLayoutPointerFrame = useCallback((frame: LayoutPointerFrame) => {
     const interaction = layoutInteractionRef.current
-    if (!interaction || interaction.pointerId !== event.pointerId) return
-    const point = getPointerCoordinate(event.clientX, event.clientY)
+    if (!interaction || interaction.pointerId !== frame.pointerId) return
+    const point = getPointerCoordinate(frame.clientX, frame.clientY)
     if (!point) return
-    event.preventDefault()
-    event.stopPropagation()
     if (interaction.kind === 'create') {
       interaction.current = point
       setDraftCreateRect(clampManualLayoutBlockRect(
@@ -2862,11 +2976,32 @@ export default function GujiFacsimileProofreader({
     manualLayoutDraft.previewBlocks(nextBlocks)
   }, [geometryBounds, geometryMinimum, getPointerCoordinate, manualLayoutDraft.previewBlocks])
 
-  const handlePageLayoutPointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+  applyLayoutPointerFrameRef.current = applyLayoutPointerFrame
+
+  const handlePageLayoutPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const interaction = layoutInteractionRef.current
     if (!interaction || interaction.pointerId !== event.pointerId) return
     event.preventDefault()
     event.stopPropagation()
+    layoutPointerFrameSchedulerRef.current?.schedule({
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    })
+  }, [])
+
+  const handlePageLayoutPointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (layoutInteractionRef.current?.pointerId !== event.pointerId) return
+    event.preventDefault()
+    event.stopPropagation()
+    layoutPointerFrameSchedulerRef.current?.schedule({
+      pointerId: event.pointerId,
+      clientX: event.clientX,
+      clientY: event.clientY,
+    })
+    layoutPointerFrameSchedulerRef.current?.flush()
+    const interaction = layoutInteractionRef.current
+    if (!interaction || interaction.pointerId !== event.pointerId) return
     layoutInteractionRef.current = null
     releaseCapturedLayoutPointer(interaction)
     if (interaction.kind === 'create') {
@@ -2887,7 +3022,7 @@ export default function GujiFacsimileProofreader({
     if (!interaction.changed) {
       const restoredBlocks = rollbackManualLayoutGeometryPreview(interaction.preview) as LayoutBlock[]
       blocksRef.current = restoredBlocks
-      manualLayoutDraft.previewBlocks(restoredBlocks)
+      manualLayoutDraft.clearPreview()
       manualLayoutDraft.setActiveBlockId(interaction.baselineBlockId)
       return
     }
@@ -2897,7 +3032,7 @@ export default function GujiFacsimileProofreader({
       activeBlockId: interaction.blockId,
       selectedSourceIndex: interaction.sourceIndex,
     })
-  }, [bounds.height, bounds.width, commitBlocks, createTypedManualBlock, geometryBounds, geometryMinimum, manualLayoutDraft.previewBlocks, manualLayoutDraft.setActiveBlockId])
+  }, [bounds.height, bounds.width, commitBlocks, createTypedManualBlock, geometryBounds, geometryMinimum, manualLayoutDraft.clearPreview, manualLayoutDraft.setActiveBlockId])
 
   const handlePageLayoutPointerCancel = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const interaction = layoutInteractionRef.current
@@ -2915,20 +3050,12 @@ export default function GujiFacsimileProofreader({
   const toggleLayoutEditMode = useCallback(() => {
     if (layoutEditingLocked) return
     if (!layoutEditMode) {
-      setImageUnderlayMode('on')
-      setShowRules(true)
-      setTranslationOpen(false)
-      pageRotationRef.current = 0
-      setPageRotation(0)
-      setManualLayoutTool('select')
-      setPendingCreateRect(null)
-      setLayoutEditMode(true)
+      enterLayoutEditForBlock()
       return
     }
     const finishEditing = () => {
       if (!proofreaderMountedRef.current) return
-      releaseCapturedLayoutPointer(layoutInteractionRef.current)
-      layoutInteractionRef.current = null
+      cancelLayoutInteraction()
       setDraftCreateRect(null)
       setPendingCreateRect(null)
       setManualLayoutTool('select')
@@ -2957,7 +3084,7 @@ export default function GujiFacsimileProofreader({
       cancelText: '继续编辑',
       onOk: saveAndFinish,
     })
-  }, [layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush, manualLayoutDraft.state.saveState, setTranslationOpen])
+  }, [cancelLayoutInteraction, enterLayoutEditForBlock, layoutEditMode, layoutEditingLocked, manualLayoutDraft.flush, manualLayoutDraft.state.saveState])
 
   useEffect(() => {
     if (editingBlockId && !editingBlock) {
@@ -3595,7 +3722,7 @@ export default function GujiFacsimileProofreader({
                         }}
                       />
                     ) : null}
-                    {!isEditing ? <Button size="small" icon={<EditOutlined />} title={shouldRenderTable ? '编辑表格' : '编辑文字'} aria-label={shouldRenderTable ? '编辑表格' : '编辑文字'} onClick={(event) => { event.stopPropagation(); beginEditBlock(sourceIndex) }} /> : null}
+                    {!isEditing ? <Button size="small" icon={<EditOutlined />} title={shouldRenderTable ? '编辑表格' : '编辑文字'} aria-label={shouldRenderTable ? '编辑表格' : '编辑文字'} onClick={(event) => { event.stopPropagation(); enterLayoutEditForBlock(sourceIndex) }} /> : null}
                     {!isEditing ? (
                       <Button
                         size="small"
@@ -3620,7 +3747,7 @@ export default function GujiFacsimileProofreader({
                       icon: <EditOutlined />,
                       label: shouldRenderTable ? '编辑表格' : '编辑文字',
                       disabled: isEditing || isImage,
-                      onClick: () => beginEditBlock(sourceIndex),
+                      onClick: () => enterLayoutEditForBlock(sourceIndex),
                     },
                     {
                       key: 'copy',
@@ -3650,7 +3777,7 @@ export default function GujiFacsimileProofreader({
               <div
                 data-guji-block-index={sourceIndex}
                 onClick={(event) => { event.stopPropagation(); selectLayoutBlock(sourceIndex, blockId) }}
-                onDoubleClick={(event) => { event.stopPropagation(); beginEditBlock(sourceIndex) }}
+                onDoubleClick={(event) => { event.stopPropagation(); enterLayoutEditForBlock(sourceIndex) }}
                 onContextMenu={() => selectLayoutBlock(sourceIndex, blockId)}
                 onPointerDown={(event) => startBlockInteraction(event, sourceIndex, rect)}
                 style={{ position: 'absolute', left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, boxSizing: 'border-box', ...ruleBorder, border: layoutEditMode ? (isEditingActive ? '2px solid #1677ff' : parentHighlighted ? '1px solid #52c41a' : '1px dashed rgba(22,119,255,0.72)') : ruleBorder.border, boxShadow: blockBoxShadow || undefined, background: isEditingActive ? 'rgba(22,119,255,0.08)' : parentHighlighted ? 'rgba(82,196,26,0.08)' : keywordMatch ? 'rgba(250,219,20,0.14)' : layoutEditMode ? 'rgba(255,255,255,0.18)' : 'transparent', color: label === 'seal' ? '#b42318' : labelColor, cursor: layoutEditMode ? (isEditingActive ? 'move' : 'pointer') : 'text', overflow: 'hidden', padding, zIndex: isEditingActive ? 10 : parentHighlighted ? 9 : keywordMatch ? 8 : isDecorativeLabel(label) ? 2 : 4, userSelect: layoutEditMode ? 'none' : 'text' }}
@@ -3781,8 +3908,15 @@ export default function GujiFacsimileProofreader({
           disabled={layoutEditingLocked}
           tableRows={tableDraftRows}
           tableMerges={tableDraftMerges}
+          tableRowHeights={tableDraftRowHeights}
+          tableColumnWidths={tableDraftColumnWidths}
           onChange={handleInspectorChange}
-          onTableChange={(value) => stageTableBlockChange(value.rows, value.merges)}
+          onTableChange={(value) => stageTableBlockChange(
+            value.rows,
+            value.merges,
+            value.rowHeights,
+            value.columnWidths,
+          )}
           onTypeChange={handleInspectorTypeChange}
           onDelete={() => editingBlockId && handleDeleteBlock(editingBlockId)}
           onDeselect={resetBlockEditor}
