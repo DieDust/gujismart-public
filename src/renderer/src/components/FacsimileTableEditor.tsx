@@ -10,6 +10,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import { Button, Tooltip, message, theme } from 'antd'
+import { PlusOutlined } from '@ant-design/icons'
 import {
   buildFacsimileTableCells,
   clearFacsimileTableSelection,
@@ -1050,6 +1051,12 @@ export default function FacsimileTableEditor({
     ),
     [selection, selectionMode, tableState.merges, tableState.rows],
   )
+  const quickInsertRowAvailable = !disabled
+    && rowCount < FACSIMILE_TABLE_MAX_ROWS
+    && (rowCount + 1) * colCount <= FACSIMILE_TABLE_MAX_CELLS
+  const quickInsertColumnAvailable = !disabled
+    && colCount < FACSIMILE_TABLE_MAX_COLUMNS
+    && rowCount * (colCount + 1) <= FACSIMILE_TABLE_MAX_CELLS
 
   const updateHistoryRefs = (history: FacsimileTableHistory) => {
     undoStackRef.current = history.past
@@ -1312,14 +1319,18 @@ export default function FacsimileTableEditor({
     setFocus(point)
   }
 
-  const applyStructureAction = (action: FacsimileTableStructureAction) => {
+  const applyStructureAction = (
+    action: FacsimileTableStructureAction,
+    targetSelection: FacsimileTableSelection = selection,
+    targetSelectionMode: SelectionMode = selectionMode,
+  ) => {
     if (disabled) return
     const current = tableStateRef.current
     const result = applyFacsimileTableStructureCommand(
       current.rows,
       current.merges,
-      selection,
-      selectionMode,
+      targetSelection,
+      targetSelectionMode,
       action,
     )
     if (!result.changed) return
@@ -1354,6 +1365,24 @@ export default function FacsimileTableEditor({
     setAnchor(point)
     setFocus(point)
     setSelectionMode('cell')
+  }
+
+  const insertQuickRowAfter = (rowIndex: number) => {
+    if (disabled) return
+    applyStructureAction(
+      'insert-row-below',
+      getFacsimileTableWholeRowSelection(rowIndex, rowIndex, rowCount, colCount),
+      'row',
+    )
+  }
+
+  const insertQuickColumnAfter = (colIndex: number) => {
+    if (disabled) return
+    applyStructureAction(
+      'insert-column-right',
+      getFacsimileTableWholeColumnSelection(colIndex, colIndex, rowCount, colCount),
+      'column',
+    )
   }
 
   const applySelectionCommand = (command: 'clear' | 'merge' | 'split') => {
@@ -1809,6 +1838,29 @@ export default function FacsimileTableEditor({
                   >
                     {columnLabel(col)}
                   </button>
+                  {!disabled ? (
+                    <Tooltip title={quickInsertColumnAvailable ? '在此列右侧插入一列' : '已达到表格列数上限'}>
+                      <Button
+                        type="primary"
+                        shape="circle"
+                        size="small"
+                        tabIndex={-1}
+                        disabled={!quickInsertColumnAvailable}
+                        className="facsimile-table-quick-insert facsimile-table-quick-insert-column"
+                        icon={<PlusOutlined />}
+                        aria-label={`在第 ${columnLabel(col)} 列右侧插入一列`}
+                        onPointerDown={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                        }}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          insertQuickColumnAfter(col)
+                        }}
+                      />
+                    </Tooltip>
+                  ) : null}
                   <span
                     className="facsimile-table-column-resize-handle"
                     role="separator"
@@ -1840,6 +1892,29 @@ export default function FacsimileTableEditor({
                   >
                     {rowIndex + 1}
                   </button>
+                  {!disabled ? (
+                    <Tooltip title={quickInsertRowAvailable ? '在此行下方插入一行' : '已达到表格行数上限'}>
+                      <Button
+                        type="primary"
+                        shape="circle"
+                        size="small"
+                        tabIndex={-1}
+                        disabled={!quickInsertRowAvailable}
+                        className="facsimile-table-quick-insert facsimile-table-quick-insert-row"
+                        icon={<PlusOutlined />}
+                        aria-label={`在第 ${rowIndex + 1} 行下方插入一行`}
+                        onPointerDown={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                        }}
+                        onClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          insertQuickRowAfter(rowIndex)
+                        }}
+                      />
+                    </Tooltip>
+                  ) : null}
                   <span
                     className="facsimile-table-row-resize-handle"
                     role="separator"

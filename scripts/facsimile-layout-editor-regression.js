@@ -1244,6 +1244,7 @@ const tableEditorRequire = (request) => {
   if (request === 'react') return {}
   if (request === 'react/jsx-runtime') return { Fragment: Symbol('Fragment'), jsx: () => null, jsxs: () => null }
   if (request === 'antd') return { Button: () => null, Tooltip: () => null, message: {}, theme: {} }
+  if (request === '@ant-design/icons') return { PlusOutlined: () => null }
   if (request === '../utils/facsimileTableEditing') return helperModule.exports
   if (request === './FacsimileTableEditor.css') return {}
   throw new Error(`Unexpected FacsimileTableEditor dependency: ${request}`)

@@ -54,7 +54,7 @@
     "check:manual-page-assets": "node scripts/manual-page-assets-regression.js",
     "check:manual-page-insertion": "electron scripts/manual-page-insertion-integration-regression.js",
     "check:manual-block-inspector-viewport": "node scripts/manual-block-inspector-viewport-regression.js",
-    "check:facsimile-stacked-vertical-blocks": "node scripts/facsimile-stacked-vertical-blocks-regression.js && node scripts/facsimile-layout-editor-regression.js",
+    "check:facsimile-stacked-vertical-blocks": "node scripts/facsimile-stacked-vertical-blocks-regression.js && node scripts/facsimile-layout-editor-regression.js && node scripts/facsimile-table-quick-insert-regression.js",
     "check:database-storage-maintenance": "node scripts/database-storage-maintenance-regression.js",
     "check:document-delete-resilience": "node scripts/document-delete-search-index-resilience-regression.js && electron scripts/document-delete-worker-integration-regression.js",
     "check:backup-storage": "node scripts/backup-storage-regression.js",
