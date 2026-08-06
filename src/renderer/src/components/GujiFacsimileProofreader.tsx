@@ -1941,6 +1941,7 @@ export default function GujiFacsimileProofreader({
   const [tableDraftRowHeights, setTableDraftRowHeights] = useState<number[]>([])
   const [tableDraftColumnWidths, setTableDraftColumnWidths] = useState<number[]>([])
   const [layoutEditMode, setLayoutEditMode] = useState(false)
+  const [inspectorOpen, setInspectorOpen] = useState(false)
   const [manualLayoutTool, setManualLayoutTool] = useState<ManualLayoutTool>('select')
   const [altShowsClearUnderlay, setAltShowsClearUnderlay] = useState(false)
   const [draftCreateRect, setDraftCreateRect] = useState<BlockRect | null>(null)
@@ -2010,6 +2011,13 @@ export default function GujiFacsimileProofreader({
   }
   const blocks = manualLayoutDraft.state.blocks as LayoutBlock[]
   const editingBlockId = layoutEditMode ? manualLayoutDraft.state.activeBlockId : null
+  useEffect(() => {
+    if (!layoutEditMode || !editingBlockId) {
+      setInspectorOpen(false)
+      return
+    }
+    setInspectorOpen(true)
+  }, [editingBlockId, layoutEditMode])
   const layoutEditingLocked = manualLayoutDraft.state.discardPending
   const pageSourceText = useMemo(() => blocks.map((block) => getBlockText(block)).filter(Boolean).join('\n\n'), [blocks])
   const translationOpen = controlledTranslationOpen ?? internalTranslationOpen
@@ -3883,28 +3891,45 @@ export default function GujiFacsimileProofreader({
         </div>
       </div>
       {layoutEditMode ? (
-        <ManualBlockInspector
-          pageId={pageId}
-          coordinateSourceSize={effectiveCoordinateSourceSize}
-          pageImageNaturalSize={pageImageNaturalSize}
-          blockId={editingBlockId}
-          block={editingBlock}
-          disabled={layoutEditingLocked}
-          tableRows={tableDraftRows}
-          tableMerges={tableDraftMerges}
-          tableRowHeights={tableDraftRowHeights}
-          tableColumnWidths={tableDraftColumnWidths}
-          onChange={handleInspectorChange}
-          onTableChange={(value) => stageTableBlockChange(
-            value.rows,
-            value.merges,
-            value.rowHeights,
-            value.columnWidths,
-          )}
-          onTypeChange={handleInspectorTypeChange}
-          onDelete={() => editingBlockId && handleDeleteBlock(editingBlockId)}
-          onDeselect={resetBlockEditor}
-        />
+        <div className={`manual-block-inspector-floating${inspectorOpen ? ' is-open' : ''}`}>
+          <Button
+            className="manual-block-inspector-toggle"
+            size="small"
+            type={inspectorOpen ? 'primary' : 'default'}
+            icon={<SettingOutlined />}
+            aria-expanded={inspectorOpen}
+            aria-label={inspectorOpen ? '收起区块属性' : '打开区块属性'}
+            onClick={() => setInspectorOpen((value) => !value)}
+          >
+            {inspectorOpen ? '收起属性' : '区块属性'}
+          </Button>
+          {inspectorOpen ? (
+            <div className="manual-block-inspector-floating-surface">
+              <ManualBlockInspector
+                pageId={pageId}
+                coordinateSourceSize={effectiveCoordinateSourceSize}
+                pageImageNaturalSize={pageImageNaturalSize}
+                blockId={editingBlockId}
+                block={editingBlock}
+                disabled={layoutEditingLocked}
+                tableRows={tableDraftRows}
+                tableMerges={tableDraftMerges}
+                tableRowHeights={tableDraftRowHeights}
+                tableColumnWidths={tableDraftColumnWidths}
+                onChange={handleInspectorChange}
+                onTableChange={(value) => stageTableBlockChange(
+                  value.rows,
+                  value.merges,
+                  value.rowHeights,
+                  value.columnWidths,
+                )}
+                onTypeChange={handleInspectorTypeChange}
+                onDelete={() => editingBlockId && handleDeleteBlock(editingBlockId)}
+                onDeselect={resetBlockEditor}
+              />
+            </div>
+          ) : null}
+        </div>
       ) : null}
       </div>
     </div>
