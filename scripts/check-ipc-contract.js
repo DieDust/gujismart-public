@@ -180,6 +180,14 @@ const { apiProps, invokeChannels } = collectPreloadContract()
 const mainHandlers = collectMainHandlers()
 const { usages: rendererUsages, optionalProbes } = collectRendererApiUsages()
 
+const requiredManualImageApis = ['cropManualPageImage', 'selectManualBlockImage']
+const missingRequiredManualImageApis = requiredManualImageApis.filter((name) => !apiProps.has(name))
+const requiredManualImageChannels = ['pages:cropManualImage', 'pages:selectManualImage']
+const missingRequiredManualImageChannels = requiredManualImageChannels.filter((channel) => (
+  !invokeChannels.some((item) => item.channel === channel)
+  || !mainHandlers.some((item) => item.channel === channel)
+))
+
 const mainChannels = new Set(mainHandlers.map((item) => item.channel))
 const preloadChannels = new Set(invokeChannels.map((item) => item.channel))
 const missingMainHandlers = invokeChannels.filter((item) => !mainChannels.has(item.channel))
@@ -201,6 +209,8 @@ failIfAny('Duplicate main ipcMain.handle channels:', duplicateMainHandlers, ([ch
 failIfAny('Duplicate preload ipcRenderer.invoke channels:', duplicatePreloadInvokes, ([channel, group]) => `${channel} at ${group.map(formatLocation).join(', ')}`)
 failIfAny('Main ipcMain.handle channels not exposed through preload:', unusedMainHandlers, (item) => `${item.channel} at ${formatLocation(item)}`)
 failIfAny('Renderer optional probes for required window.api members:', optionalProbes, (item) => `${item.name} at ${formatLocation(item)}`)
+failIfAny('Required manual image preload APIs are missing:', missingRequiredManualImageApis, (name) => name)
+failIfAny('Required manual image IPC channels are incomplete:', missingRequiredManualImageChannels, (channel) => channel)
 
 if (failed) {
   process.exit(1)

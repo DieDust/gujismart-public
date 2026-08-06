@@ -847,8 +847,30 @@ export interface OcrRecognizeLayoutBlock {
   caption?: string
   alt_text?: string
   image_asset_path?: string
+  image_asset_width?: number
+  image_asset_height?: number
+  image_asset_revision?: number
   image_crop?: ManualLayoutBlockMeta['image_crop']
   [key: string]: unknown
+}
+
+export interface ManualPageImageCrop {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+export interface ManualPageImageCropRequest {
+  pageId: string
+  blockId: string
+  crop: ManualPageImageCrop
+}
+
+export interface ManualPageImageAsset {
+  assetPath: string
+  width: number
+  height: number
 }
 
 export type ManualOcrRecognizeLayoutBlock = OcrRecognizeLayoutBlock & ManualLayoutBlockMeta

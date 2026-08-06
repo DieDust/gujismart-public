@@ -156,6 +156,8 @@ import type {
   PageOcrOptions,
   PageOcrVersion,
   PageUpdatePayload,
+  ManualPageImageAsset,
+  ManualPageImageCropRequest,
   PageTranslationCacheItem,
   PageTranslationCachePayload,
   PageTranslationRequest,
@@ -461,6 +463,10 @@ const api = {
 
   updatePage: (pageId: string, data: PageUpdatePayload): Promise<boolean> =>
     ipcRenderer.invoke('pages:update', pageId, data),
+  cropManualPageImage: (request: ManualPageImageCropRequest): Promise<ManualPageImageAsset> =>
+    ipcRenderer.invoke('pages:cropManualImage', request),
+  selectManualBlockImage: (pageId: string): Promise<ManualPageImageAsset | null> =>
+    ipcRenderer.invoke('pages:selectManualImage', pageId),
 
   resetPageOcr: (pageId: string): Promise<boolean> =>
     ipcRenderer.invoke('pages:resetOcr', pageId),

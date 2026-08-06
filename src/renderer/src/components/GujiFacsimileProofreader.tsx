@@ -3884,6 +3884,7 @@ export default function GujiFacsimileProofreader({
       </div>
       {layoutEditMode ? (
         <ManualBlockInspector
+          pageId={pageId}
           blockId={editingBlockId}
           block={editingBlock}
           disabled={layoutEditingLocked}

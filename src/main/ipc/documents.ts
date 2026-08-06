@@ -6,7 +6,7 @@ import { nativeImage } from 'electron'
 import { nanoid } from 'nanoid'
 import { basename, dirname, extname, join } from 'path'
 import { posix as posixPath } from 'path'
-import { existsSync, mkdirSync, realpathSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'fs'
 import { copyFile, readFile, readdir, rm, stat, writeFile } from 'fs/promises'
 import JSZip from 'jszip'
 import { XMLParser } from 'fast-xml-parser'
@@ -37,6 +37,7 @@ import {
   getFileFingerprint,
   getPdfFingerprintAsync,
   getPdfRepositoryStatus,
+  getPdfRepositoryPaths,
   indexPdfRepositoriesAsync,
   reconnectIndexedPdfRepositoryLinkForDocumentAsync,
   removePdfRepositoryById,
@@ -92,6 +93,7 @@ import { deriveOcrTextFromIr, ensureOcrResultIr, getOcrPageIr } from '../../shar
 import { allowFileAccessPath, allowManagedFileAccessPath, assertAllowedLocalFilePath } from '../file-access'
 import { documentPipelineDiagnosticsFromImportProgress } from '../../shared/document-pipeline-diagnostics'
 import { statusEnvelopeFromImportProgress } from '../../shared/status-envelope'
+import { getManualBlockId, getManualLayoutBlockKind } from '../../shared/manual-layout'
 import {
   beginDatabaseActivity,
   finishDatabaseActivity,
@@ -140,6 +142,8 @@ import type {
   OcrRecognizeLayoutBlock,
   OcrRecognizeResult,
   PageUpdatePayload,
+  ManualPageImageAsset,
+  ManualPageImageCropRequest,
   PageOcrVersion,
   PageTranslationCacheItem,
   PageTranslationCachePayload,
@@ -157,6 +161,17 @@ import type {
   TranslationMode,
 } from '../../shared/types'
 import { DEFAULT_LIBRARY_PROJECT_ID } from '../../shared/types'
+import {
+  ManualPageAssetError,
+  atomicWriteManualPageAsset,
+  buildManualPageAssetPath,
+  buildManualPageSelectedAssetPath,
+  getManualPageCoordinateSize,
+  renderManualPdfPageToPng,
+  resolveManagedManualPageSource,
+  resolveRepositoryImageSource,
+  toManualPagePixelCrop,
+} from '../manual-page-assets'
 
 type JsonRecord = Record<string, unknown>
 const LIBRARY_IMPORT_QUEUE_STATE_ID = 'default'
@@ -1229,6 +1244,206 @@ function parseJsonRecord(value: unknown): JsonRecord | null {
   } catch {
     return null
   }
+}
+
+type ManualPageAssetRow = DocumentPage & {
+  document_file_path?: string | null
+}
+
+function requireManualPageAssetRow(pageId: string): ManualPageAssetRow {
+  const normalizedPageId = String(pageId || '').trim()
+  if (!normalizedPageId || normalizedPageId.length > 220 || normalizedPageId.includes('\0')) {
+    throw new ManualPageAssetError('invalid-request', 'pageId 无效')
+  }
+  const rawPage = queryOne<ManualPageAssetRow>(
+    `SELECT
+       pages.*,
+       documents.file_path AS document_file_path
+     FROM pages
+     INNER JOIN documents ON documents.id = pages.doc_id
+     WHERE pages.id = ?`,
+    [normalizedPageId],
+  )
+  if (!rawPage) throw new ManualPageAssetError('invalid-request', '页面不存在')
+  assertDocumentInLibraryProject(rawPage.doc_id, getActiveLibraryProjectId())
+  return hydratePagePayloadRow(rawPage) as ManualPageAssetRow
+}
+
+function getManualPageLayoutBlocks(page: ManualPageAssetRow): { result: JsonRecord; blocks: JsonRecord[] } {
+  const result = parseJsonRecord(page.ocr_result)
+  if (!result) throw new ManualPageAssetError('invalid-request', '页面没有可编辑的 OCR 版式数据')
+  const blocks = Array.isArray(result.layout_result) ? result.layout_result.filter(isJsonRecord) : []
+  return { result, blocks }
+}
+
+function getManualPageBlockFallbackId(pageId: string, block: JsonRecord, index: number): string {
+  const irBlockId = String(block.ir_block_id || '').trim()
+  if (irBlockId) return `${pageId}:ir:${irBlockId}`
+  const sourceIndex = Number(block.__sourceIndex)
+  const stableIndex = Number.isFinite(sourceIndex) && sourceIndex >= 0 ? sourceIndex : index
+  return `${pageId}:draft:${stableIndex}`
+}
+
+function findOwnedManualPageImageBlock(
+  pageId: string,
+  blocks: JsonRecord[],
+  requestedBlockId: string,
+): { block: JsonRecord; index: number; assetSegment: string } {
+  const blockId = String(requestedBlockId || '').trim()
+  if (!blockId || blockId.length > 500 || blockId.includes('\0') || /[\\/]/.test(blockId)) {
+    throw new ManualPageAssetError('invalid-request', 'blockId 无效')
+  }
+  const index = blocks.findIndex((block, blockIndex) => (
+    getManualBlockId(block) === blockId
+      || getManualPageBlockFallbackId(pageId, block, blockIndex) === blockId
+  ))
+  if (index < 0) throw new ManualPageAssetError('invalid-request', '图片区块不存在或不属于当前页面')
+  const block = blocks[index]
+  const kind = getManualLayoutBlockKind(block)
+  const legacyLabel = String(block.label || block.block_label || block.type || block.block_type || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+  const isLegacyImage = /^(?:image|figure|picture|photo|illustration|chart|diagram)(?: block)?$/.test(legacyLabel)
+  const isLegacySeal = /^(?:seal|stamp)(?: block)?$/.test(legacyLabel)
+  if (kind !== 'image' && kind !== 'seal' && !isLegacyImage && !isLegacySeal) {
+    throw new ManualPageAssetError('invalid-request', '只有图片或印章区块可以生成受管图片')
+  }
+  const persistedId = getManualBlockId(block)
+  const assetSegment = persistedId && /^[A-Za-z0-9._-]+$/.test(persistedId)
+    ? persistedId
+    : `legacy-${createHash('sha256').update(blockId).digest('hex').slice(0, 24)}`
+  return { block, index, assetSegment }
+}
+
+function resolveManualPageSourcePath(page: ManualPageAssetRow): string | null {
+  const dataDir = getDataDir()
+  const documentRoot = join(dataDir, 'storage', page.doc_id)
+  const repositoryRoots = getPdfRepositoryPaths()
+  const candidates = [page.image_path, page.document_file_path]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+  for (const candidate of candidates) {
+    const relocated = resolveManagedStoragePath(candidate, page.doc_id)
+    const managed = resolveManagedManualPageSource(relocated, documentRoot, { allowPdf: true })
+    if (managed) return managed
+    const repository = resolveRepositoryImageSource(candidate, repositoryRoots, { allowPdf: true })
+    if (repository) return repository
+  }
+  return null
+}
+
+async function loadManualPageSourceImage(page: ManualPageAssetRow): Promise<Electron.NativeImage> {
+  const sourcePath = resolveManualPageSourcePath(page)
+  if (!sourcePath) {
+    throw new ManualPageAssetError('source-unavailable', '当前页面没有可读取的受管页图或已绑定仓库原文')
+  }
+  const source = extname(sourcePath).toLowerCase() === '.pdf'
+    ? nativeImage.createFromBuffer(await renderManualPdfPageToPng(sourcePath, Number(page.page_num || 0)))
+    : nativeImage.createFromPath(sourcePath)
+  if (source.isEmpty()) throw new ManualPageAssetError('decode-failed', '原图解码失败')
+  const size = source.getSize()
+  if (size.width <= 0 || size.height <= 0) throw new ManualPageAssetError('decode-failed', '原图尺寸无效')
+  return source
+}
+
+async function cropManualPageImageAsset(request: ManualPageImageCropRequest): Promise<ManualPageImageAsset> {
+  const page = requireManualPageAssetRow(request?.pageId)
+  const { result, blocks } = getManualPageLayoutBlocks(page)
+  const { block, index, assetSegment } = findOwnedManualPageImageBlock(page.id, blocks, request?.blockId)
+  const source = await loadManualPageSourceImage(page)
+  const sourceSize = source.getSize()
+  const coordinateSize = getManualPageCoordinateSize(result, sourceSize)
+  const pixelCrop = toManualPagePixelCrop(request?.crop, coordinateSize, sourceSize)
+  const cropped = source.crop(pixelCrop)
+  if (cropped.isEmpty()) throw new ManualPageAssetError('decode-failed', '裁剪结果为空')
+  const croppedSize = cropped.getSize()
+  const pngBytes = cropped.toPNG()
+  if (pngBytes.length <= 0) throw new ManualPageAssetError('decode-failed', '无法生成裁剪 PNG')
+
+  const currentRevision = Math.max(0, Math.floor(Number(block.image_asset_revision || 0)))
+  const revision = Math.max(currentRevision + 1, Date.now())
+  const assetPath = buildManualPageAssetPath(getDataDir(), page.doc_id, page.id, assetSegment, revision)
+  atomicWriteManualPageAsset(assetPath, pngBytes, join(getDataDir(), 'storage', page.doc_id))
+
+  const nextBlocks = blocks.map((current, blockIndex) => blockIndex === index
+    ? {
+        ...current,
+        image_asset_path: assetPath,
+        asset_path: assetPath,
+        image_path: assetPath,
+        image_asset_width: croppedSize.width,
+        image_asset_height: croppedSize.height,
+        image_asset_revision: revision,
+        image_crop: {
+          source_page_id: page.id,
+          left: Number(request.crop.left),
+          top: Number(request.crop.top),
+          width: Number(request.crop.width),
+          height: Number(request.crop.height),
+        },
+      }
+    : current)
+  const nextResult = { ...result, layout_result: nextBlocks }
+  const prepared = preparePagePayloadUpdate(page.doc_id, page.id, 'ocr_result', nextResult)
+  try {
+    await runAsync(
+      'UPDATE pages SET ocr_result = ?, ocr_result_ref = ? WHERE id = ? AND doc_id = ?',
+      [prepared.value, prepared.ref, page.id, page.doc_id],
+      { maxWaitMs: 30_000 },
+    )
+  } catch (error) {
+    try {
+      rmSync(assetPath, { force: true })
+    } catch {
+      // The old asset and database reference remain intact; orphan cleanup can retry later.
+    }
+    throw error
+  }
+  allowManagedFileAccessPath(assetPath)
+  scheduleDatabaseSave()
+  return { assetPath, width: croppedSize.width, height: croppedSize.height }
+}
+
+async function selectManualPageImageAsset(
+  ownerId: number,
+  pageId: string,
+): Promise<ManualPageImageAsset | null> {
+  const page = requireManualPageAssetRow(pageId)
+  const selected = await dialog.showOpenDialog({
+    title: '从已绑定原文仓库选择图片',
+    filters: [{ name: '图片文件', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tif', 'tiff'] }],
+    properties: ['openFile'],
+  })
+  if (selected.canceled || selected.filePaths.length === 0) return null
+  const grants = await fileCapabilityService.issueTrustedPaths({
+    ownerId,
+    purpose: 'manual-page-image-replacement',
+    paths: [selected.filePaths[0]],
+    kind: 'file',
+    consumeMode: 'once',
+  })
+  const selectedPath = await fileCapabilityService.consumeFile(
+    ownerId,
+    grants[0].grantId,
+    'manual-page-image-replacement',
+  )
+  const sourcePath = resolveRepositoryImageSource(selectedPath, getPdfRepositoryPaths())
+  if (!sourcePath) {
+    throw new ManualPageAssetError('source-outside-library', '只能选择已绑定原文仓库内的图片')
+  }
+  const source = nativeImage.createFromPath(sourcePath)
+  if (source.isEmpty()) throw new ManualPageAssetError('decode-failed', '所选图片解码失败')
+  const size = source.getSize()
+  const pngBytes = source.toPNG()
+  if (size.width <= 0 || size.height <= 0 || pngBytes.length <= 0) {
+    throw new ManualPageAssetError('decode-failed', '所选图片内容无效')
+  }
+  const revision = Date.now()
+  const assetPath = buildManualPageSelectedAssetPath(getDataDir(), page.doc_id, page.id, revision)
+  atomicWriteManualPageAsset(assetPath, pngBytes, join(getDataDir(), 'storage', page.doc_id))
+  allowManagedFileAccessPath(assetPath)
+  return { assetPath, width: size.width, height: size.height }
 }
 
 function normalizeLibraryImportQueueState(value: unknown): LibraryImportQueueState | null {
@@ -6216,6 +6431,20 @@ export function registerDocumentIpc(): void {
     scheduleDatabaseSave()
     return true
   })
+
+  ipcMain.handle(
+    'pages:cropManualImage',
+    async (_event, request: ManualPageImageCropRequest): Promise<ManualPageImageAsset> => {
+      return cropManualPageImageAsset(request)
+    },
+  )
+
+  ipcMain.handle(
+    'pages:selectManualImage',
+    async (event, pageId: string): Promise<ManualPageImageAsset | null> => {
+      return selectManualPageImageAsset(event.sender.id, pageId)
+    },
+  )
 
   ipcMain.handle('pages:resetOcr', async (_event, pageId: string) => {
     const rawPage = queryOne<DocumentPage>('SELECT * FROM pages WHERE id = ?', [pageId])

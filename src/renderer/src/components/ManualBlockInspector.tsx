@@ -8,7 +8,8 @@ import {
   getManualLayoutBlockKind,
   type ManualLayoutBlockKind,
 } from '@shared/manual-layout'
-import { Button, Empty, Input, InputNumber, Segmented, Select, Space, Tag, Tooltip, message, theme } from 'antd'
+import { Alert, Button, Empty, Input, InputNumber, Segmented, Select, Space, Tag, Tooltip, message, theme } from 'antd'
+import { useEffect, useState } from 'react'
 import FacsimileTableEditor, { type FacsimileTableEditorValue } from './FacsimileTableEditor'
 import type { FacsimileTableMerge } from '../utils/facsimileTableEditing'
 import { MANUAL_LAYOUT_BLOCK_KINDS } from '../utils/manualLayoutBlockEditing'
@@ -24,11 +25,17 @@ export type ManualBlockInspectorBlock = Record<string, unknown> & {
   caption?: string
   alt_text?: string
   image_asset_path?: string
+  image_asset_width?: number
+  image_asset_height?: number
+  image_asset_revision?: number
   asset_path?: string
   image_path?: string
+  image_crop?: unknown
+  location?: unknown
 }
 
 export interface ManualBlockInspectorProps {
+  pageId: string
   blockId: string | null
   block: ManualBlockInspectorBlock | null
   disabled?: boolean
@@ -41,8 +48,6 @@ export interface ManualBlockInspectorProps {
   onTypeChange: (kind: ManualLayoutBlockKind) => void
   onDelete: () => void
   onDeselect: () => void
-  onRequestImageCrop?: () => void
-  onRequestImageReplacement?: () => void
 }
 
 function stringValue(value: unknown): string {
@@ -57,7 +62,19 @@ function isTextKind(kind: ManualLayoutBlockKind): boolean {
   return kind !== 'table' && !isImageKind(kind)
 }
 
+function resolveInspectorBlockKind(block: ManualBlockInspectorBlock | null): ManualLayoutBlockKind {
+  const canonical = getManualLayoutBlockKind(block)
+  if (canonical) return canonical
+  const rawLabel = block ? stringValue(block.label).toLowerCase().replace(/[_-]+/g, ' ').trim() : ''
+  if (rawLabel === 'doc title') return 'title'
+  if (/^(?:image|figure|picture|photo|illustration|chart|diagram)(?: block)?$/.test(rawLabel)) return 'image'
+  if (/^(?:seal|stamp)(?: block)?$/.test(rawLabel)) return 'seal'
+  if (/^table(?: block)?$/.test(rawLabel)) return 'table'
+  return 'text'
+}
+
 export default function ManualBlockInspector({
+  pageId,
   blockId,
   block,
   disabled = false,
@@ -70,18 +87,90 @@ export default function ManualBlockInspector({
   onTypeChange,
   onDelete,
   onDeselect,
-  onRequestImageCrop,
-  onRequestImageReplacement,
 }: ManualBlockInspectorProps) {
   const { token } = theme.useToken()
-  const rawLabel = block ? stringValue(block.label).toLowerCase() : ''
-  const kind = getManualLayoutBlockKind(block) || (rawLabel === 'doc_title' ? 'title' : 'text')
+  const [imageAction, setImageAction] = useState<'crop' | 'replace' | null>(null)
+  const [imageError, setImageError] = useState('')
+  const [imagePreviewSrc, setImagePreviewSrc] = useState('')
+  const kind = resolveInspectorBlockKind(block)
   const imageAssetPath = block
     ? stringValue(block.image_asset_path) || stringValue(block.asset_path) || stringValue(block.image_path)
     : ''
 
-  const unavailableImageAction = () => {
-    message.info('图片资源操作尚未完成，不会修改或丢弃当前区块。')
+  useEffect(() => {
+    let cancelled = false
+    setImageError('')
+    if (!imageAssetPath) {
+      setImagePreviewSrc('')
+      return () => { cancelled = true }
+    }
+    void window.api.readImageAsDataURL(imageAssetPath)
+      .then((dataUrl) => { if (!cancelled) setImagePreviewSrc(dataUrl || '') })
+      .catch(() => { if (!cancelled) setImagePreviewSrc('') })
+    return () => { cancelled = true }
+  }, [imageAssetPath])
+
+  const getCurrentCrop = () => {
+    const location = block?.location
+    if (!location || typeof location !== 'object' || Array.isArray(location)) return null
+    const record = location as Record<string, unknown>
+    const crop = {
+      left: Number(record.left),
+      top: Number(record.top),
+      width: Number(record.width),
+      height: Number(record.height),
+    }
+    return Object.values(crop).every(Number.isFinite) && crop.width > 0 && crop.height > 0 ? crop : null
+  }
+
+  const handleImageCrop = async () => {
+    if (!block || !blockId || !pageId || imageAction) return
+    const crop = getCurrentCrop()
+    if (!crop) {
+      setImageError('当前图片区块没有有效坐标，请先在底图上调整选区。')
+      return
+    }
+    setImageAction('crop')
+    setImageError('')
+    try {
+      const asset = await window.api.cropManualPageImage({ pageId, blockId, crop })
+      onChange({
+        image_asset_path: asset.assetPath,
+        asset_path: asset.assetPath,
+        image_path: asset.assetPath,
+        image_asset_width: asset.width,
+        image_asset_height: asset.height,
+        image_crop: { source_page_id: pageId, ...crop },
+      })
+      message.success('图片区块已从当前页底图重新裁剪')
+    } catch (error) {
+      setImageError(String((error as Error)?.message || error || '重新裁剪失败'))
+    } finally {
+      setImageAction(null)
+    }
+  }
+
+  const handleImageReplacement = async () => {
+    if (!block || !pageId || imageAction) return
+    setImageAction('replace')
+    setImageError('')
+    try {
+      const asset = await window.api.selectManualBlockImage(pageId)
+      if (!asset) return
+      onChange({
+        image_asset_path: asset.assetPath,
+        asset_path: asset.assetPath,
+        image_path: asset.assetPath,
+        image_asset_width: asset.width,
+        image_asset_height: asset.height,
+        image_crop: undefined,
+      })
+      message.success('已复制仓库图片并替换当前区块')
+    } catch (error) {
+      setImageError(String((error as Error)?.message || error || '替换图片失败'))
+    } finally {
+      setImageAction(null)
+    }
   }
 
   return (
@@ -186,11 +275,10 @@ export default function ManualBlockInspector({
           {isImageKind(kind) ? (
             <div className="manual-block-inspector-image">
               <div className="manual-block-inspector-preview">
-                {imageAssetPath ? (
-                  <>
-                    <PictureOutlined />
-                    <span title={imageAssetPath}>已关联图片资源</span>
-                  </>
+                {imagePreviewSrc ? (
+                  <img src={imagePreviewSrc} alt={stringValue(block.alt_text) || stringValue(block.caption)} draggable={false} />
+                ) : imageAssetPath ? (
+                  <><PictureOutlined /><span title={imageAssetPath}>图片资源暂时无法预览</span></>
                 ) : (
                   <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="等待生成裁剪图片" />
                 )}
@@ -215,21 +303,32 @@ export default function ManualBlockInspector({
               <Space wrap>
                 <Button
                   icon={<ScissorOutlined />}
-                  disabled={disabled}
-                  onClick={onRequestImageCrop || unavailableImageAction}
+                  disabled={disabled || imageAction !== null}
+                  loading={imageAction === 'crop'}
+                  onClick={() => { void handleImageCrop() }}
                 >
                   重新裁剪
                 </Button>
                 <Button
                   icon={<PictureOutlined />}
-                  disabled={disabled}
-                  onClick={onRequestImageReplacement || unavailableImageAction}
+                  disabled={disabled || imageAction !== null}
+                  loading={imageAction === 'replace'}
+                  onClick={() => { void handleImageReplacement() }}
                 >
-                  替换图片
+                  从仓库选择替换
                 </Button>
               </Space>
+              {imageError ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  message="图片资源操作失败"
+                  description={imageError}
+                  action={<Button size="small" onClick={() => setImageError('')}>关闭</Button>}
+                />
+              ) : null}
               <Tag color="default" style={{ marginInlineEnd: 0, alignSelf: 'flex-start' }}>
-                操作失败时会保留当前框和原资源
+                操作失败时会保留当前选区和原图片，可直接重试
               </Tag>
             </div>
           ) : null}

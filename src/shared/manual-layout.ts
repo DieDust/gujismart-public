@@ -24,6 +24,9 @@ export interface ManualLayoutBlockMeta {
   caption?: string
   alt_text?: string
   image_asset_path?: string
+  image_asset_width?: number
+  image_asset_height?: number
+  image_asset_revision?: number
   image_crop?: {
     source_page_id: string
     left: number

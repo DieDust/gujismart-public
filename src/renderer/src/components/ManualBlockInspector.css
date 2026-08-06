@@ -111,6 +111,14 @@
   background: color-mix(in srgb, var(--manual-inspector-text) 4%, transparent);
   border: 1px dashed var(--manual-inspector-border);
   border-radius: 6px;
+  overflow: hidden;
+}
+
+.manual-block-inspector-preview > img {
+  display: block;
+  width: 100%;
+  max-height: 220px;
+  object-fit: contain;
 }
 
 .manual-block-inspector-footer {

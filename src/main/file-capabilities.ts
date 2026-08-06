@@ -6,6 +6,7 @@ export type FileCapabilityPurpose =
   | 'document-import'
   | 'pdf-repository'
   | 'pdf-restore'
+  | 'manual-page-image-replacement'
 
 export type FileCapabilityKind = 'file' | 'directory'
 export type FileCapabilityConsumeMode = 'once' | 'session'
