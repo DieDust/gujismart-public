@@ -5,7 +5,7 @@ This project keeps public checks self-contained. New contributors should be able
 ## Documentation helpers
 
 - `node scripts/generate-tutorial-docx.js`  
-  Rebuilds `docs/文献管理-图文使用教程.docx` from `docs/文献管理-图文使用教程.md` (requires `npm install docx --no-save`). If the primary `.docx` is open/locked, writes a versioned fallback such as `文献管理-图文使用教程-1.2.25.docx` instead.
+  Rebuilds `docs/文献管理-图文使用教程.docx` from `docs/文献管理-图文使用教程.md` (requires `npm install docx --no-save`). If the primary `.docx` is open/locked, writes a versioned fallback such as `文献管理-图文使用教程-x.y.z.docx` instead.
   Re-shoot empty-library screenshots into `docs/images/tutorial-*.png` before regenerating when the UI changes.
 
 ## Default Gates

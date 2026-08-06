@@ -218,6 +218,10 @@ function runMetadataChecks() {
   requireText('README.md', readme, /\[Apache License 2\.0\]\(LICENSE\)/, 'README must link the main Apache-2.0 license')
   requireText('README.md', readme, /\[NOTICE\]\(NOTICE\)/, 'README must link NOTICE')
   requireText('README.md', readme, /\[THIRD_PARTY_NOTICES\.md\]\(THIRD_PARTY_NOTICES\.md\)/, 'README must link third-party notices')
+  requireText('README.md', readme, /https:\/\/github\.com\/DieDust\/gujismart-public\/releases\/latest/, 'README must link the version-independent latest release URL')
+  if (/当前\s*(?:\*\*)?v\d+\.\d+\.\d+/i.test(readme)) {
+    addFinding('README.md', 'README must not hardcode the current release version')
+  }
 
   const contributing = readRequiredText('CONTRIBUTING.md')
   requireText('CONTRIBUTING.md', contributing, /Licensing and Attribution/, 'CONTRIBUTING must explain licensing and attribution expectations')
