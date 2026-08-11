@@ -7,16 +7,28 @@
 - 检索摘录导出默认支持 10,000 条，可手动输入更高数量或选择“全部”；大批量任务采用临时文件和完成后替换，支持进度显示与取消。
 - 修复全文导出提交后软件长时间“未响应”、任务停在 0%，随后突然秒完成的问题。全量检索准备现在运行在独立只读工作线程，不再占用 Electron 主进程；准备阶段持续显示当前检索阶段与已等待时间，取得命中总量后再切换为真实百分比；段落还原按小批次让出事件循环，并缓存同页、同段文本以减少重复数据库读取。
 - 修复导出任务开始事件早于启动 IPC 返回、导致界面被旧的“已加入队列”状态覆盖的问题；任务现在先返回编号，再进入后台准备，取消按钮也能终止仍在准备阶段的检索线程。
+- 修复后台全文导出任务启动后立即报错 `Cannot read properties of undefined (reading 'isPackaged')` 的问题。只读检索线程不再加载依赖 Electron 主进程 `app` 对象的环境判断，并增加无 `app` 环境回归测试。
 - 文献卡片“加入文件夹”现在按父文件夹与子文件夹真实层级显示。父文件夹仍可直接选择，已经加入的父文件夹仍会保留为可用子文件夹的路径。
 - 文件夹菜单每一级最多占窗口约 60% 高度，文件夹过多时可独立上下滚动；长名称自动省略并可悬停查看完整内容。
+- 修复单篇文献右键后错误显示“批量加入文件夹”、批量选择后误报未选择文献的问题。只有多选时才使用批量菜单；批量加入文件夹现在像文件管理器一样直接展开右侧父子目录，不再打开额外弹窗。
+- “加入文件夹”已提升为右键一级菜单中的高频操作：单篇显示“加入文件夹”，多选显示“批量加入文件夹”，不再隐藏在“整理”或“整理与 AI”二级菜单中。
+- 文件夹页与文献库现在复用同一套父子文件夹菜单：右键单篇或多选文献都能在一级菜单直接“加入文件夹”；文件夹页原有的“移动到其他文件夹”和“从当前文件夹移出”仍然保留，且单篇操作不再误用批量文案。
+- 优化导出弹窗：“全部”模式不再保留无意义的数量输入框；展开预览会自动生成，尚未生成与确实无结果会分别显示；预览优先复用当前检索结果，避免为少量预览重新发起无上限全库检索。
+- 统一全文导出的数量口径：检索页明确标注为快速统计，“全部”导出会完整扫描原始命中；进度条显示已处理的原始命中数，完成提示同时报告完整扫描数、同段重复命中的合并数和最终写入的完整段落数，不再把三种数字都称为“导出条数”。
 
 ### English
 
 - Search excerpt exports now default to 10,000 records, accept larger custom counts or `All`, and run as cancellable progress-reporting jobs using temporary files and completion-time replacement.
 - Fixed full-text exports leaving the application “Not Responding” at 0% and then finishing suddenly. Exhaustive search preparation now runs in a dedicated read-only worker instead of the Electron main process; the preparation stage continuously reports its current phase and elapsed wait time, then switches to a real percentage once the hit count is known; paragraph restoration yields in small batches and caches repeated page/segment reads.
 - Fixed the export processing event racing ahead of the start IPC response and being overwritten by a stale queued state. The task ID now returns before background preparation starts, and cancellation can terminate a query that is still preparing.
+- Fixed background full-text export failing immediately with `Cannot read properties of undefined (reading 'isPackaged')`. The read-only query worker no longer loads environment detection that requires Electron's main-process `app`, with regression coverage for an app-less worker runtime.
 - “Add to folder” on document cards now preserves the actual parent/child hierarchy. Parent folders remain directly selectable, and an already assigned parent is retained as the path to available descendants.
 - Every folder submenu is capped at roughly 60% of the window height and scrolls independently when needed. Long names are truncated with the full value available on hover.
+- Fixed single-document context menus incorrectly showing “Batch add to folder” and batch operations occasionally reporting no selected documents. Batch menus are now used only for multi-selection, and batch folder assignment opens the nested folder tree directly instead of a separate dialog.
+- “Add to folder” is now a high-priority top-level context-menu action: single selections show “Add to folder,” multi-selections show “Batch add to folder,” and neither is hidden under Organize or Organize & AI.
+- The Folders page and Library now reuse the same parent/child folder menu. Single and multi-selection context menus expose top-level add-to-folder actions, while the Folders page retains move-to-folder and remove-from-current-folder workflows without incorrectly using batch wording for one document.
+- Improved the export dialog: `All` no longer leaves an irrelevant numeric input visible; expanding Preview generates it automatically and distinguishes “not generated” from a genuinely empty result; preview reuses the current search result sample instead of starting an unbounded full-library query.
+- Unified full-text export count semantics. The search page identifies its total as a fast count, while `All` performs an exhaustive raw-hit scan; progress reports processed raw hits, and completion reports the exhaustive total, merged same-paragraph hits, and final complete-paragraph output instead of calling all three values “exported records.”
 
 #### 下载 / Downloads
 

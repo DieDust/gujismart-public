@@ -1322,11 +1322,11 @@ function buildSearchExportTaskHeader(
   if (format === 'markdown') {
     return vectorMode
       ? `\ufeff# 向量库语义证据导出\n\n- 查询：${keyword}\n- 引擎：向量库语义检索（非关键词全文）\n- 文献数：${response.totalDocuments}\n- 命中数：${response.totalHits}\n\n---\n\n`
-      : `\ufeff# Search Excerpts\n\n- Keyword: ${keyword}\n- Documents: ${response.totalDocuments}\n- Hits: ${response.totalHits}\n- Exported At: ${new Date().toLocaleString('zh-CN')}\n\n`
+      : `\ufeff# Search Excerpts\n\n- Keyword: ${keyword}\n- Documents: ${response.totalDocuments}\n- Raw Hits: ${response.totalHits}\n- Output: complete paragraphs; repeated hits in the same paragraph are merged\n- Exported At: ${new Date().toLocaleString('zh-CN')}\n\n`
   }
   return vectorMode
     ? `\ufeff向量库语义证据导出（${VECTOR_EXCERPT_EXPORTER_VERSION}）\n查询：${keyword}\n引擎：向量库语义检索（不是关键词全文检索）\n文献数：${response.totalDocuments}\n命中数：${response.totalHits}\n\n==============================\n\n`
-    : `\ufeff检索摘录导出（${SEARCH_EXCERPT_EXPORTER_VERSION}）\n关键词：${keyword}\n文献数：${response.totalDocuments}\n命中数：${response.totalHits}\n导出时间：${new Date().toLocaleString('zh-CN')}\n\n==============================\n\n`
+    : `\ufeff检索摘录导出（${SEARCH_EXCERPT_EXPORTER_VERSION}）\n关键词：${keyword}\n文献数：${response.totalDocuments}\n原始命中数：${response.totalHits}\n输出说明：同一完整段落内的多处命中会合并为一个导出段落\n导出时间：${new Date().toLocaleString('zh-CN')}\n\n==============================\n\n`
 }
 
 function buildSearchExportTaskRecordText(record: SearchExportRecord, index: number, vectorMode: boolean, format: SearchExportOptions['format']): string {
@@ -1343,6 +1343,31 @@ function buildSearchExportTaskRecordText(record: SearchExportRecord, index: numb
     return `[证据 ${index + 1}]\n${scoreText ? `相似度：${scoreText}\n` : ''}文献：${record.title}\n${record.author ? `作者：${record.author}\n` : ''}${record.pageNum ? `页码：第 ${record.pageNum} 页\n` : ''}引用：${record.citation}\n正文：\n${record.paragraph}\n\n------------------------------\n\n`
   }
   return `[${index + 1}]\n${record.paragraph}\n\n引用：${record.citation}\n段落命中：${record.hitCount}${record.hitTerms.length ? `（${record.hitTerms.join('、')}）` : ''}\n定位：${locatorToText(record.locator, record.pageNum)}\n\n------------------------------\n\n`
+}
+
+function buildSearchExportCompletionMessage(input: {
+  vectorMode: boolean
+  processedRawHits: number
+  totalRawHits: number
+  exportedRecords: number
+  mergedRawHits: number
+  missingRawHits: number
+  filteredRawHits: number
+  maxRecords: number
+  limitReached: boolean
+}): string {
+  const processedLabel = input.processedRawHits >= input.totalRawHits
+    ? `完整扫描 ${input.totalRawHits.toLocaleString()} 条原始命中`
+    : `已处理 ${input.processedRawHits.toLocaleString()} / ${input.totalRawHits.toLocaleString()} 条原始命中`
+  const outputLabel = input.vectorMode ? '条向量证据' : '个完整段落'
+  const details: string[] = []
+  if (!input.vectorMode && input.mergedRawHits > 0) {
+    details.push(`${input.mergedRawHits.toLocaleString()} 处同段重复命中已合并`)
+  }
+  if (input.missingRawHits > 0) details.push(`${input.missingRawHits.toLocaleString()} 处无法还原已跳过`)
+  if (input.filteredRawHits > 0) details.push(`${input.filteredRawHits.toLocaleString()} 处因相似度不足已过滤`)
+  if (input.limitReached) details.push(`已达到 ${input.maxRecords.toLocaleString()} 条导出上限`)
+  return `导出完成：${processedLabel}，最终写入 ${input.exportedRecords.toLocaleString()} ${outputLabel}${details.length > 0 ? `；${details.join('，')}` : ''}。`
 }
 
 async function runSearchExportTask(
@@ -1400,7 +1425,7 @@ async function runSearchExportTask(
       progress: 0,
       totalCount: totalWork,
       completedCount: 0,
-      message: `检索完成，共取得 ${totalWork.toLocaleString()} 条命中，正在写入文件。`,
+      message: `检索完成，共取得 ${totalWork.toLocaleString()} 条原始命中，正在还原并写入文件。`,
     })
     await waitForNextTick()
     const stream = createWriteStream(control.tempFilePath, { encoding: 'utf8' })
@@ -1418,6 +1443,8 @@ async function runSearchExportTask(
     let missing = 0
     let filtered = 0
     let selected = 0
+    let representedRawHits = 0
+    let stoppedAtLimit = false
     let jsonFirstRecord = true
     const emitProgress = (
       message: string,
@@ -1438,6 +1465,7 @@ async function runSearchExportTask(
       const serialized = buildSearchExportTaskRecordText(record, exported, vectorMode, taskOptions.format)
       await writeChunk(taskOptions.format === 'json' ? `${jsonFirstRecord ? '' : ','}${serialized}` : serialized)
       jsonFirstRecord = false
+      representedRawHits += Math.max(1, Math.floor(Number(record.hitCount) || 1))
       exported += 1
     }
 
@@ -1454,7 +1482,10 @@ async function runSearchExportTask(
           filtered += 1
           continue
         }
-        if (selected >= maxRecords) break
+        if (selected >= maxRecords) {
+          stoppedAtLimit = true
+          break
+        }
         selected += 1
         const paragraph = getHitParagraphForVectorExportFast(hit)
         if (!paragraph?.text) {
@@ -1482,7 +1513,7 @@ async function runSearchExportTask(
           segmentId: hit.locator.segmentId || null,
         })
         if (processed % 20 === 0) {
-          emitProgress(`正在写入第 ${exported.toLocaleString()} 条向量证据。`)
+          emitProgress('正在写入向量证据。')
           await waitForNextTick()
         }
       }
@@ -1492,7 +1523,7 @@ async function runSearchExportTask(
         const processedBeforeGroup = processed
         const built = await buildExportParagraphsInBatches(group, control, (groupProcessedHits) => {
           emitProgress(
-            `正在还原命中 ${Math.min(totalWork, processedBeforeGroup + groupProcessedHits).toLocaleString()} / ${totalWork.toLocaleString()}。`,
+            '正在还原并合并同一完整段落内的重复命中。',
             'processing',
             processedBeforeGroup + groupProcessedHits,
           )
@@ -1504,7 +1535,10 @@ async function runSearchExportTask(
           : undefined
         for (const paragraph of built.paragraphs) {
           if (control.canceled) throw new Error('__search_export_canceled__')
-          if (selected >= maxRecords) break
+          if (selected >= maxRecords) {
+            stoppedAtLimit = true
+            break
+          }
           selected += 1
           const hit = paragraph.firstHit
           const pageNum = resolveExportHitPageNum(
@@ -1534,8 +1568,11 @@ async function runSearchExportTask(
           })
           if (exported % 20 === 0) await waitForNextTick()
         }
-        emitProgress(`已处理 ${processed.toLocaleString()} / ${totalWork.toLocaleString()} 条命中。`)
-        if (selected >= maxRecords) break
+        emitProgress('正在写入去重后的完整段落。')
+        if (selected >= maxRecords) {
+          if (processed < totalWork) stoppedAtLimit = true
+          break
+        }
       }
     }
 
@@ -1565,7 +1602,17 @@ async function runSearchExportTask(
       progress: 1,
       totalCount: totalWork,
       completedCount: processed,
-      message: `导出完成：${exported.toLocaleString()} 条，已写入文件。`,
+      message: buildSearchExportCompletionMessage({
+        vectorMode,
+        processedRawHits: processed,
+        totalRawHits: totalWork,
+        exportedRecords: exported,
+        mergedRawHits: Math.max(0, representedRawHits - exported),
+        missingRawHits: missing,
+        filteredRawHits: filtered,
+        maxRecords,
+        limitReached: stoppedAtLimit && maxRecords < Number.MAX_SAFE_INTEGER,
+      }),
     })
   } catch (error) {
     const canceled = control.canceled || (error instanceof Error && error.message === '__search_export_canceled__')

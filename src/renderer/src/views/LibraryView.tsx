@@ -67,6 +67,7 @@ import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
 import { toggleSelectionId } from '../utils/interactionKernel'
 import { buildOcrActivitySummary } from '../utils/ocrActivitySummary'
 import { buildFolderTree, collectFolderDescendantIds, flattenVisibleFolders, isFolderDescendant, type FolderTreeNode } from '../utils/folders'
+import { buildDocumentFolderMenuItems } from '../utils/documentFolderMenu'
 import { getErrorMessage } from '@shared/errors'
 import { getPendingImportDisplayLabels, matchReauthorizedItems, matchReauthorizedSources, transitionAuthorizationJobs } from '../utils/importQueueReauthorization'
 import type { BackgroundTaskProgressEvent, BatchOcrOptions, BookTranslationOptions, DocumentDetail, DocumentExportFormat, DocumentExportOptions, DocumentHealthIssue, DocumentHealthReport, DocumentHealthRow, DocumentListItem, DocumentUpdatePayload, EmbeddingProgressEvent, ExportPageNumberMode, Folder, ImportDocumentResult, ImportSelection, LibraryAiOpenPayload, LibraryAiTab, LibraryDocumentSearchField, LibraryDocumentSortDirection, LibraryDocumentSortKey, LibraryEmbeddingFilter, LibraryFilter, LibraryFolderCounts, LibraryHealthFilterType, LibraryImportQueueJobSnapshotV2, LibraryImportQueueState, LibraryProject, LibrarySmartViewCountKey, LibraryStateCache, ListDocumentOptions, LlmProviderProfile, MetadataStatus, OcrEngine, OcrProgressEvent, OpenDocumentTarget, ReadStatus, Tag as SharedTag } from '@shared/types'
@@ -1787,6 +1788,7 @@ function parseOcrMenuSelection(key: string, prefix: string): OcrMenuSelection | 
 
 /** Grouped batch actions — short top level, submenus expand to the right (Ant Design children). */
 function buildBatchMenuItems(
+  folderTree: FolderTreeNode<FolderItem>[],
   visionProfiles: LlmProviderProfile[],
   activeVisionProfileId: string,
   onDefaultSelect: (action: 'ocr' | 'ocr_failed' | 'ocr_force', selection: OcrMenuSelection) => void,
@@ -1794,6 +1796,13 @@ function buildBatchMenuItems(
   return [
     { key: 'import', label: '批量入库', icon: <InboxOutlined /> },
     { key: 'select_all', label: '全选已加载', icon: <CheckSquareOutlined /> },
+    {
+      key: 'add_folder',
+      label: '批量加入文件夹',
+      icon: <FolderAddOutlined />,
+      popupClassName: 'library-document-folder-submenu',
+      children: buildDocumentFolderMenuItems(folderTree, []),
+    },
     { type: 'divider' },
     {
       key: 'group_ocr',
@@ -1826,7 +1835,6 @@ function buildBatchMenuItems(
       children: [
         { key: 'metadata_extract', label: '批量抓取元数据' },
         { key: 'add_tags', label: '批量添加标签' },
-        { key: 'add_folder', label: '批量加入文件夹' },
         { key: 'link_project', label: '添加到其他项目（同步）', icon: <PlusOutlined /> },
         { key: 'move_project', label: '转移到文献项目', icon: <SwapOutlined /> },
         { key: 'copy_project', label: '创建独立副本', icon: <CopyOutlined /> },
@@ -1871,60 +1879,6 @@ function buildBatchMenuItems(
   ]
 }
 
-type ConcreteMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
-
-function renderFolderMenuLabel(name: string, direct = false) {
-  const label = direct ? `加入“${name}”` : name
-  return <span className="library-folder-menu-label" title={label}>{label}</span>
-}
-
-function buildDocumentFolderMenuItems(
-  folderTree: FolderTreeNode<FolderItem>[],
-  docFolderIds: string[],
-): MenuProps['items'] {
-  const assignedFolderIds = new Set(docFolderIds)
-  const buildNode = (node: FolderTreeNode<FolderItem>): ConcreteMenuItem | null => {
-    const childItems: ConcreteMenuItem[] = []
-    node.children.forEach((child) => {
-      const childItem = buildNode(child)
-      if (childItem) childItems.push(childItem)
-    })
-
-    const canAddToNode = !assignedFolderIds.has(node.id)
-    if (childItems.length === 0) {
-      return canAddToNode
-        ? { key: `folder_${node.id}`, label: renderFolderMenuLabel(node.name) }
-        : null
-    }
-
-    const children: ConcreteMenuItem[] = []
-    if (canAddToNode) {
-      children.push({
-        key: `folder_${node.id}`,
-        label: renderFolderMenuLabel(node.name, true),
-        icon: <FolderAddOutlined />,
-      })
-      children.push({ type: 'divider' })
-    }
-    children.push(...childItems)
-    return {
-      key: `folder-parent:${node.id}`,
-      label: renderFolderMenuLabel(node.name),
-      popupClassName: 'library-document-folder-submenu',
-      children,
-    }
-  }
-
-  const items: ConcreteMenuItem[] = []
-  folderTree.forEach((node) => {
-    const item = buildNode(node)
-    if (item) items.push(item)
-  })
-  return items.length > 0
-    ? items
-    : [{ key: 'folder_none', label: '没有可加入的文件夹', disabled: true }]
-}
-
 /** Single-document context / more menu — primary actions first, heavy groups nested. */
 function buildDocumentMoreMenuItems(input: {
   doc: DocumentItem
@@ -1954,6 +1908,13 @@ function buildDocumentMoreMenuItems(input: {
     { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
     { key: 'edit', label: '编辑元数据', icon: <EditOutlined /> },
     { key: 'favorite', label: doc.is_favorite ? '取消星标' : '加入星标', icon: doc.is_favorite ? <StarFilled /> : <StarOutlined /> },
+    {
+      key: 'add_to_folder',
+      label: '加入文件夹',
+      icon: <FolderAddOutlined />,
+      popupClassName: 'library-document-folder-submenu',
+      children: buildDocumentFolderMenuItems(folderTree, docFolderIds),
+    },
     { type: 'divider' },
     {
       key: 'group_ocr',
@@ -2015,13 +1976,6 @@ function buildDocumentMoreMenuItems(input: {
           children: ratingMenuItems,
         },
         { key: 'add_tag', label: '添加标签', icon: <TagOutlined /> },
-        {
-          key: 'add_to_folder',
-          label: '加入文件夹',
-          icon: <FolderAddOutlined />,
-          popupClassName: 'library-document-folder-submenu',
-          children: buildDocumentFolderMenuItems(folderTree, docFolderIds),
-        },
         ...(docFolderIds.length > 0
           ? [{
               key: 'remove_from_folder',
@@ -2776,8 +2730,6 @@ export default function LibraryView({
   const [documentTagNameInput, setDocumentTagNameInput] = useState('')
   const [documentTagCheckedIds, setDocumentTagCheckedIds] = useState<string[]>([])
   const [documentTagSearch, setDocumentTagSearch] = useState('')
-  const [batchFolderModalOpen, setBatchFolderModalOpen] = useState(false)
-  const [batchFolderTargetId, setBatchFolderTargetId] = useState<string | null>(null)
   const [batchProjectModalOpen, setBatchProjectModalOpen] = useState(false)
   const [batchProjectTargetId, setBatchProjectTargetId] = useState<string | null>(null)
   const [batchProjectDocumentIds, setBatchProjectDocumentIds] = useState<string[]>([])
@@ -2832,6 +2784,7 @@ export default function LibraryView({
   const smartCountsRefreshTimerRef = useRef<number | null>(null)
   const baseDataBusyRetryCountRef = useRef(0)
   const documentsRef = useRef<DocumentItem[]>([])
+  const selectedIdsRef = useRef<string[]>(selectedIds)
   const hasHydratedWarmCacheRef = useRef(false)
   const activeOcrToastKeysRef = useRef<Set<string>>(new Set())
   /** Last batch-level progress line (shared toast); cleared when batches finish. */
@@ -2935,6 +2888,10 @@ export default function LibraryView({
   useEffect(() => {
     ocrProgressByDocRef.current = ocrProgressByDoc
   }, [ocrProgressByDoc])
+
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds
+  }, [selectedIds])
 
   const documentIdOrder = useMemo(() => documents.map((doc) => doc.id), [documents])
   const gridRenderedDocuments = useMemo(() => {
@@ -4537,17 +4494,6 @@ export default function LibraryView({
       message.error('加入文件夹失败')
       return false
     }
-  }
-
-  const handleBatchApplyFolder = async () => {
-    if (!batchFolderTargetId) {
-      message.info('请先选择文件夹')
-      return
-    }
-    const ok = await handleApplyDocumentsToFolder(selectedIds, batchFolderTargetId)
-    if (!ok) return
-    setBatchFolderModalOpen(false)
-    setBatchFolderTargetId(null)
   }
 
   const handleSaveDocumentTagModal = async () => {
@@ -6982,6 +6928,7 @@ export default function LibraryView({
   }
 
   const batchMenuItems: MenuProps['items'] = buildBatchMenuItems(
+    folderTree,
     visionOcrProfiles,
     activeVisionOcrProfileId,
     (action, selection) => {
@@ -7083,6 +7030,11 @@ export default function LibraryView({
 
   const handleBatchMenu: MenuProps['onClick'] = ({ key }) => {
     if (key === 'import') void handleBatchImport()
+    if (key.startsWith('folder_')) {
+      const folderId = key.replace('folder_', '')
+      void handleApplyDocumentsToFolder([...selectedIdsRef.current], folderId)
+      return
+    }
     const ocrSelection = parseOcrMenuSelection(String(key), 'ocr')
     if (ocrSelection) {
       void handleBatchOcr(ocrSelection.engine, { visionProfileId: ocrSelection.visionProfileId })
@@ -7254,14 +7206,6 @@ export default function LibraryView({
       }
       setBatchTagModalOpen(true)
     }
-    if (key === 'add_folder') {
-      if (selectedIds.length === 0) {
-        message.info('请先选择文献')
-        return
-      }
-      setBatchFolderTargetId(null)
-      setBatchFolderModalOpen(true)
-    }
     if (key === 'link_project') {
       openProjectTransfer(selectedIds, 'link')
     }
@@ -7333,12 +7277,11 @@ export default function LibraryView({
   }
 
   const handleDocumentContextMenu = useCallback((docId: string) => {
-    if (selectedIdSet.has(docId) && selectedIds.length > 0) {
-      setBatchMode(true)
+    if (selectedIdSet.has(docId)) {
+      if (selectedIds.length > 1) setBatchMode(true)
       return
     }
     setSelectedIds([docId])
-    setBatchMode(true)
     lastClickedDocIdRef.current = docId
   }, [selectedIdSet, selectedIds.length, setSelectedIds])
 
@@ -7369,7 +7312,7 @@ export default function LibraryView({
       icon: <DeleteOutlined />,
       danger: true,
     }
-    if (selectedIdSet.has(docId) && selectedIds.length > 0) {
+    if (selectedIdSet.has(docId) && selectedIds.length > 1) {
       const contextBatchItems = (batchMenuItems || []).filter((item) => item?.key !== 'group_danger')
       return [
         { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
@@ -7436,7 +7379,7 @@ export default function LibraryView({
         confirmPermanentDelete(targetIds, selectedIds.length > 0)
         return
       }
-      if (selectedIdSet.has(docId) && selectedIds.length > 0) {
+      if (selectedIdSet.has(docId) && selectedIds.length > 1) {
         handleBatchMenu(info)
         return
       }
@@ -9117,41 +9060,6 @@ export default function LibraryView({
               },
               tags.length === 0 ? '还没有标签' : '没有匹配的标签',
             )}
-          </div>
-        </Space>
-      </Modal>
-
-      <Modal
-        title="批量加入文件夹"
-        open={batchFolderModalOpen}
-        onCancel={() => {
-          setBatchFolderModalOpen(false)
-          setBatchFolderTargetId(null)
-        }}
-        onOk={() => void handleBatchApplyFolder()}
-        okText="加入文件夹"
-        cancelText="取消"
-      >
-        <Space direction="vertical" size={12} style={{ width: '100%' }}>
-          <div style={{ color: 'var(--gs-text-secondary)', fontSize: 13 }}>
-            已选 {selectedIds.length} 篇文献
-          </div>
-          <div style={{ maxHeight: 320, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {visibleFolders.map((item) => {
-              const selected = batchFolderTargetId === item.id
-              return (
-                <Button
-                  key={item.id}
-                  type={selected ? 'primary' : 'text'}
-                  icon={<FolderOpenOutlined />}
-                  style={{ justifyContent: 'flex-start', paddingLeft: 8 + item.depth * 16 }}
-                  onClick={() => setBatchFolderTargetId(item.id)}
-                >
-                  {item.name}
-                </Button>
-              )
-            })}
-            {folderItems.length === 0 ? <span style={{ color: 'var(--gs-text-tertiary)', fontSize: 12 }}>还没有文件夹</span> : null}
           </div>
         </Space>
       </Modal>

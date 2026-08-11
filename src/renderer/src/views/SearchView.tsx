@@ -238,6 +238,13 @@ function saveExportMaxRecords(value: SearchExportCount) {
   }
 }
 
+function formatSearchExportProgressCounter(event: BackgroundTaskProgressEvent): string {
+  const completed = Number(event.completedCount)
+  const total = Number(event.totalCount)
+  if (!Number.isFinite(completed) || !Number.isFinite(total) || total <= 0) return ''
+  return `已处理 ${Math.max(0, completed).toLocaleString()} / ${Math.max(0, total).toLocaleString()} 条原始命中`
+}
+
 function loadVectorSearchLimit(): number {
   try {
     return normalizeVectorSearchLimit(
@@ -1349,6 +1356,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const applyExportMinVectorScore = (value: unknown) => {
     const next = normalizeExportMinVectorScore(value)
     setExportMinVectorScore(next)
+    setExportPreview(null)
     saveExportMinVectorScore(next)
     return next
   }
@@ -1363,16 +1371,20 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const applyExportMaxRecords = (value: unknown) => {
     const next = normalizeExportMaxRecords(value)
     setExportMaxRecords(next)
+    setExportPreview(null)
     saveExportMaxRecords(next)
     return next
   }
 
   /** Prefer current on-screen groups so export/preview does not re-scan the vector index. */
-  const buildExportRequestOptions = (extra: Record<string, unknown> = {}) => {
+  const buildExportRequestOptions = (
+    extra: Record<string, unknown> = {},
+    behavior?: { reuseCurrentGroups?: boolean },
+  ) => {
     const useVector = isVectorExportContext()
     const maxRecords = normalizeExportMaxRecords(exportMaxRecords)
     const minScore = useVector ? normalizeExportMinVectorScore(exportMinVectorScore) : 0
-    const groups = useVector ? groupedResponse?.groups : undefined
+    const groups = useVector || behavior?.reuseCurrentGroups ? groupedResponse?.groups : undefined
     const trimmedGroups = groups && groups.length > 0
       ? trimGroupsForExport(groups, maxRecords, minScore)
       : undefined
@@ -1406,13 +1418,16 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
     exportPreviewRequestIdRef.current = requestId
     setExportPreviewLoading(true)
     try {
-      const payload = await window.api.previewSearchExportExcerpts(activeKeyword, buildExportRequestOptions({
-        format: exportFormat,
-        citationMode,
-        citationStyleId: citationMode === 'auto' ? citationStyleIdOverride || selectedCitationStyleId : undefined,
-        citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
-        pageNumberMode: exportPageNumberMode,
-      }))
+      const payload = await window.api.previewSearchExportExcerpts(
+        activeKeyword,
+        buildExportRequestOptions({
+          format: exportFormat,
+          citationMode,
+          citationStyleId: citationMode === 'auto' ? citationStyleIdOverride || selectedCitationStyleId : undefined,
+          citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
+          pageNumberMode: exportPageNumberMode,
+        }, { reuseCurrentGroups: true }),
+      )
       if (exportPreviewRequestIdRef.current === requestId) {
         setExportPreview(payload)
       }
@@ -2497,8 +2512,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             )}
             <Text type="secondary">
               {searchExportTask.message || '正在分批写入文件'}
-              {searchExportTask.completedCount != null && searchExportTask.totalCount
-                ? `（${searchExportTask.completedCount.toLocaleString()} / ${searchExportTask.totalCount.toLocaleString()}）`
+              {formatSearchExportProgressCounter(searchExportTask)
+                ? `（${formatSearchExportProgressCounter(searchExportTask)}）`
                 : ''}
             </Text>
           </Space>
@@ -2522,7 +2537,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             showIcon
             message={isVectorExportContext()
               ? '按当前向量检索结果和相似度筛选导出；大数量任务会在后台分批写入，不会一次性渲染全部内容。'
-              : '全文导出会保持原有完整命中逻辑；大数量任务会在后台分批写入，预览仅在展开后生成。'}
+              : '检索页显示的是快速统计；选择“全部”时会在后台完整扫描，原始命中数可能调整。同一完整段落内的多处命中会合并为一个导出段落。'}
           />
 
           <div style={{
@@ -2536,29 +2551,42 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               <Text strong style={{ display: 'block', marginBottom: 6 }}>
                 {isVectorExportContext() ? '导出证据数量' : '导出段落数量'}
               </Text>
-              <Space.Compact style={{ width: '100%' }}>
-                <InputNumber
-                  min={1}
-                  step={100}
-                  value={typeof exportMaxRecords === 'number' ? exportMaxRecords : undefined}
-                  onChange={applyExportMaxRecords}
-                  style={{ width: '100%' }}
-                  addonAfter="条"
-                  placeholder="输入数量"
-                />
+              {exportMaxRecords === 'all' ? (
                 <Select
-                  value={exportMaxRecords === 'all' ? 'all' : 'custom'}
+                  value="all"
                   onChange={(value) => {
-                    if (value === 'all') applyExportMaxRecords('all')
-                    else if (exportMaxRecords === 'all') applyExportMaxRecords(DEFAULT_EXPORT_MAX_RECORDS)
+                    if (value === 'custom') applyExportMaxRecords(DEFAULT_EXPORT_MAX_RECORDS)
                   }}
-                  style={{ width: 120 }}
+                  style={{ width: '100%' }}
                   options={[
-                    { value: 'custom', label: '自定义' },
-                    { value: 'all', label: '全部' },
+                    { value: 'custom', label: '指定数量' },
+                    { value: 'all', label: '全部命中（耗时可能较长）' },
                   ]}
                 />
-              </Space.Compact>
+              ) : (
+                <Space.Compact style={{ width: '100%' }}>
+                  <InputNumber
+                    min={1}
+                    step={100}
+                    value={exportMaxRecords}
+                    onChange={applyExportMaxRecords}
+                    style={{ width: '100%' }}
+                    addonAfter="条"
+                    placeholder="输入数量"
+                  />
+                  <Select
+                    value="custom"
+                    onChange={(value) => {
+                      if (value === 'all') applyExportMaxRecords('all')
+                    }}
+                    style={{ width: 160 }}
+                    options={[
+                      { value: 'custom', label: '指定数量' },
+                      { value: 'all', label: '全部命中' },
+                    ]}
+                  />
+                </Space.Compact>
+              )}
               <Text type="secondary" style={{ display: 'block', marginTop: 5, fontSize: 12 }}>
                 默认 {DEFAULT_SEARCH_EXPORT_COUNT.toLocaleString()} 条；可输入更高数量，或选择“全部”。超大导出会在后台分批执行并显示进度。
               </Text>
@@ -2684,6 +2712,9 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             onChange={(keys) => {
               const expanded = Array.isArray(keys) ? keys.includes('preview') : keys === 'preview'
               setExportPreviewExpanded(expanded)
+              if (expanded && !exportPreview && !exportPreviewLoading) {
+                void loadExportPreview()
+              }
             }}
             items={[{
               key: 'preview',
@@ -2706,7 +2737,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               ),
               children: (
                 <Space direction={'vertical'} size={10} style={{ width: '100%' }}>
-                  <Space size={8} wrap>
+                  {exportPreview ? <Space size={8} wrap>
                     <Tag color={'blue'}>
                       预计导出 {exportPreview?.exportableParagraphs ?? 0}
                       {isVectorExportContext() ? ' 条证据' : ' 段'}
@@ -2725,7 +2756,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                     {exportPreview?.exporterVersion ? (
                       <Tag>{formatExportVersionLabel(exportPreview.exporterVersion)}</Tag>
                     ) : null}
-                  </Space>
+                  </Space> : null}
                   {exportPreviewLoading ? (
                     <Spin size={'small'} />
                   ) : exportPreview?.previewItems?.length ? (
@@ -2763,12 +2794,14 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
                         </div>
                       ))}
                     </Space>
-                  ) : (
+                  ) : exportPreview ? (
                     <Text type={'secondary'}>
                       {activeResultMode === 'vector'
                         ? '没有可预览的向量证据。请确认已向量化且本次检索有命中。'
                         : '没有可预览的完整段落。可以先运行诊断导出查看缺失原因。'}
                     </Text>
+                  ) : (
+                    <Text type={'secondary'}>预览尚未生成，展开后会自动生成，也可以点击右上角“刷新”。</Text>
                   )}
                 </Space>
               ),
@@ -2879,7 +2912,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
           : groupedResponse
             ? (resultsAreVector
               ? `语义命中 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 条片段（按相似度排序 · 非关键词全文）`
-              : `找到 ${groupedResponse.totalDocuments} 篇文献，${groupedResponse.totalHits} 处命中；当前显示第 ${groupedResultStart}-${groupedResultEnd} 篇；列表仅展示每篇前几条片段，导出会使用完整命中`)
+              : `找到 ${groupedResponse.totalDocuments} 篇文献，快速统计 ${groupedResponse.totalHits} 处命中；当前显示第 ${groupedResultStart}-${groupedResultEnd} 篇；列表仅展示每篇前几条片段，选择“全部”导出时会重新完整扫描并合并同段重复命中`)
             : results.length > 0 ? `找到 ${results.length} 条结果` : ''}
       </div>
       {searchConditionsChanged ? (

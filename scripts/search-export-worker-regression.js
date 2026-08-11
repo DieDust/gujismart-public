@@ -26,16 +26,27 @@ const buildOptions = {
   platform: 'node',
   format: 'cjs',
   external: ['better-sqlite3', 'flexsearch', '@napi-rs/canvas'],
+  logLevel: 'silent',
+}
+
+const mainModuleBuildOptions = {
+  ...buildOptions,
   alias: {
     electron: join(__dirname, 'stubs', 'electron.js'),
     '@electron-toolkit/utils': join(__dirname, 'stubs', 'electron-toolkit-utils.js'),
   },
-  logLevel: 'silent',
 }
 
-buildSync({ ...buildOptions, entryPoints: [moduleEntryPath], outfile: moduleBundlePath })
-buildSync({
+const workerBuildOptions = {
   ...buildOptions,
+  alias: {
+    electron: join(__dirname, 'stubs', 'electron-worker.js'),
+  },
+}
+
+buildSync({ ...mainModuleBuildOptions, entryPoints: [moduleEntryPath], outfile: moduleBundlePath })
+buildSync({
+  ...workerBuildOptions,
   entryPoints: [join(root, 'src', 'main', 'search-export-query-worker.ts')],
   outfile: workerBundlePath,
 })

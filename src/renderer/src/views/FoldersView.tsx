@@ -30,6 +30,7 @@ import type { DocumentExportFormat, DocumentExportOptions, ExportPageNumberMode,
 import { LIBRARY_RELATIONS_CHANGED_EVENT } from '../utils/libraryEvents'
 import { sameStringArray, useDragMultiSelect } from '../utils/dragMultiSelect'
 import { buildFolderTree, flattenVisibleFolders, isFolderDescendant, sortFolders, type FolderTreeNode } from '../utils/folders'
+import { buildDocumentFolderMenuItems } from '../utils/documentFolderMenu'
 import { getErrorMessage } from '@shared/errors'
 import { getPdfFileInfo, renderPdfFilePageToImage } from '../utils/pdf'
 import { ensurePdfPageImagesForOcr as ensureOcrPageImages } from '../utils/ocrPageImages'
@@ -221,6 +222,94 @@ function getInitialFolderDocumentSort(): FolderDocumentSortValue {
   } catch {
     return 'default'
   }
+}
+
+function buildFolderDocumentMenuItems(input: {
+  folderTree: Array<FolderTreeNode<FolderOverviewItem>>
+  assignedFolderIds: string[]
+  documentCount: number
+  includeOpenActions?: boolean
+  canRemoveFromCurrentFolder: boolean
+}): MenuProps['items'] {
+  const batch = input.documentCount > 1
+  return [
+    ...(input.includeOpenActions === false
+      ? []
+      : [
+          { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
+          { key: 'open', label: '打开文献', icon: <BookOutlined /> },
+        ]),
+    {
+      key: 'add_folder',
+      label: batch ? `批量加入文件夹（${input.documentCount} 篇）` : '加入文件夹',
+      icon: <FolderAddOutlined />,
+      popupClassName: 'library-document-folder-submenu',
+      children: buildDocumentFolderMenuItems(input.folderTree, input.assignedFolderIds),
+    },
+    {
+      key: 'move',
+      label: batch ? `移动到其他文件夹（${input.documentCount} 篇）` : '移动到其他文件夹',
+      icon: <SwapOutlined />,
+    },
+    { type: 'divider' },
+    {
+      key: 'group_ocr',
+      label: 'OCR 识别',
+      icon: <ThunderboltOutlined />,
+      children: [
+        { key: 'ocr:paddle', label: batch ? '批量 OCR（飞桨）' : 'OCR（飞桨）' },
+        { key: 'ocr:vision_model', label: batch ? '批量 OCR（大模型）' : 'OCR（大模型）' },
+        { type: 'divider' },
+        { key: 'ocr_force:paddle', label: batch ? '重新 OCR 所选文献（飞桨）' : '重新 OCR（飞桨）' },
+        { key: 'ocr_force:vision_model', label: batch ? '重新 OCR 所选文献（大模型）' : '重新 OCR（大模型）' },
+      ],
+    },
+    {
+      key: 'group_organize',
+      label: '整理与 AI',
+      icon: <RobotOutlined />,
+      children: [
+        { key: 'metadata_extract', label: batch ? '批量抓取元数据' : '抓取元数据' },
+        { key: 'add_tags', label: batch ? '批量添加标签' : '添加标签', icon: <TagOutlined /> },
+      ],
+    },
+    {
+      key: 'export',
+      label: batch ? '批量导出' : '导出',
+      icon: <ExportOutlined />,
+      children: [
+        { key: 'export:txt', label: '导出为 TXT 纯文本' },
+        { key: 'export:markdown', label: '导出为 Markdown' },
+        { key: 'export:tei-xml', label: '导出为 TEI-XML' },
+        { key: 'export:page-xml', label: '导出为 PAGE XML' },
+        { key: 'export:paddle-json', label: '导出为 Paddle JSON' },
+        { key: 'export:reading-pdf', label: batch ? '批量导出阅读模式 PDF' : '导出阅读模式 PDF' },
+        { key: 'export:layout-pdf', label: batch ? '批量导出排版模式 PDF' : '导出排版模式 PDF' },
+      ],
+    },
+    { type: 'divider' },
+    {
+      key: 'group_storage',
+      label: '原文与存储',
+      icon: <PictureOutlined />,
+      children: [
+        { key: 'cleanup_pdf_assets', label: batch ? '删除所选原文件' : '删除原文件' },
+        { key: 'restore_pdf_assets', label: batch ? '补回所选原文' : '补回原文', icon: <ImportOutlined /> },
+      ],
+    },
+    {
+      key: 'group_danger',
+      label: '移除与删除',
+      icon: <DeleteOutlined />,
+      children: [
+        ...(input.canRemoveFromCurrentFolder
+          ? [{ key: 'remove_current', label: batch ? '从当前文件夹移出所选文献' : '从当前文件夹移出', icon: <CloseOutlined /> }]
+          : []),
+        ...(input.canRemoveFromCurrentFolder ? [{ type: 'divider' as const }] : []),
+        { key: 'delete', label: batch ? `从总库永久删除（${input.documentCount} 篇）` : '从总库永久删除', icon: <DeleteOutlined />, danger: true },
+      ],
+    },
+  ]
 }
 
 function parseFolderDocumentSortValue(value: FolderDocumentSortValue): Pick<FolderContentOptions, 'sortKey' | 'sortDirection'> {
@@ -656,6 +745,25 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       message.error(getErrorMessage(error, '移动文献失败'))
     }
   }, [folderById, loadFolderContent, loadOverview, selectedFolder, selectedFolderId])
+
+  const handleAddDocumentsToFolder = useCallback(async (docIds: string[], targetFolderId: string) => {
+    const uniqueDocIds = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    if (uniqueDocIds.length === 0) {
+      message.info('请先选择文献')
+      return
+    }
+    if (!targetFolderId) return
+    try {
+      await window.api.addDocumentsToFolder(uniqueDocIds, targetFolderId)
+      const targetName = folderById.get(targetFolderId)?.name || '目标文件夹'
+      message.success(`已将 ${uniqueDocIds.length} 篇文献加入文件夹“${targetName}”`)
+      await loadOverview()
+      await loadFolderContent(selectedFolderId)
+      window.dispatchEvent(new Event(LIBRARY_RELATIONS_CHANGED_EVENT))
+    } catch (error) {
+      message.error(getErrorMessage(error, '加入文件夹失败'))
+    }
+  }, [folderById, loadFolderContent, loadOverview, selectedFolderId])
 
   const openMoveDocumentsModal = useCallback((docIds: string[]) => {
     const uniqueDocIds = Array.from(new Set(docIds.map((id) => String(id || '').trim()).filter(Boolean)))
@@ -1379,6 +1487,33 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     })
   }
 
+  const handleFolderDocumentMenuClick = (docIds: string[], key: string, primaryDocId?: string) => {
+    if (key === 'open' || key === 'open_new_tab') {
+      if (primaryDocId) openDocumentInTab(primaryDocId)
+      return
+    }
+    if (key.startsWith('folder_')) {
+      void handleAddDocumentsToFolder(docIds, key.replace('folder_', ''))
+      return
+    }
+    if (key.startsWith('ocr_force:')) {
+      void handleFolderBatchOcr(docIds, key.replace('ocr_force:', '') as OcrEngine, true)
+      return
+    }
+    if (key.startsWith('ocr:')) {
+      void handleFolderBatchOcr(docIds, key.replace('ocr:', '') as OcrEngine)
+      return
+    }
+    if (key === 'metadata_extract') void handleFolderBatchMetadataExtract(docIds)
+    if (key === 'add_tags') openTagDocumentsModal(docIds)
+    if (key === 'move') openMoveDocumentsModal(docIds)
+    if (key === 'remove_current') void handleRemoveDocumentsFromCurrentFolder(docIds)
+    if (key.startsWith('export:')) openFolderBatchExportModal(docIds, key.replace('export:', '') as DocumentExportFormat)
+    if (key === 'cleanup_pdf_assets') handleFolderBatchCleanupPdfAssets(docIds)
+    if (key === 'restore_pdf_assets') void handleFolderBatchRestorePdfAssets(docIds)
+    if (key === 'delete') handleDeleteDocuments(docIds)
+  }
+
   const loadMoreDocuments = useCallback(async () => {
     if (!selectedFolderId || contentLoading || contentLoadingMore || !folderContent?.has_more) return
     await loadFolderContent(selectedFolderId, { append: true, offset: folderContent.documents.length })
@@ -1653,71 +1788,19 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     const typeLabel = getDocumentTypeLabel(doc.doc_type)
     const selected = selectedDocumentIdSet.has(doc.id)
     const actionDocIds = getActionDocIds(doc.id)
-    const menuItems: MenuProps['items'] = [
-      { key: 'open_new_tab', label: '在新标签页打开', icon: <BookOutlined /> },
-      { key: 'open', label: '打开文献', icon: <BookOutlined /> },
-      {
-        key: 'ocr',
-        label: 'OCR 识别',
-        icon: <ThunderboltOutlined />,
-        children: [
-          { key: 'ocr:paddle', label: '用飞桨 OCR' },
-          { key: 'ocr:vision_model', label: '用大模型 OCR' },
-        ],
-      },
-      {
-        key: 'ocr_force',
-        label: '重新 OCR 已选文献',
-        icon: <ReloadOutlined />,
-        children: [
-          { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
-          { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
-        ],
-      },
-      { key: 'metadata_extract', label: '批量抓取元数据', icon: <RobotOutlined /> },
-      { key: 'add_tags', label: '批量添加标签', icon: <TagOutlined /> },
-      { key: 'move', label: selected ? `移入文件夹（${actionDocIds.length} 篇）` : '移入文件夹', icon: <SwapOutlined /> },
-      ...(selectedFolder ? [{ key: 'remove_current', label: '从当前文件夹移出', icon: <CloseOutlined /> }] : []),
-      {
-        key: 'export',
-        label: '批量导出',
-        icon: <ExportOutlined />,
-        children: [
-          { key: 'export:txt', label: '导出为 TXT 纯文本' },
-          { key: 'export:markdown', label: '导出为 Markdown' },
-          { key: 'export:tei-xml', label: '导出为 TEI-XML' },
-          { key: 'export:page-xml', label: '导出为 PAGE XML' },
-          { key: 'export:paddle-json', label: '导出为 Paddle JSON' },
-          { key: 'export:reading-pdf', label: '批量导出阅读模式 PDF' },
-          { key: 'export:layout-pdf', label: '批量导出排版模式 PDF' },
-        ],
-      },
-      { type: 'divider' },
-      { key: 'cleanup_pdf_assets', label: '删除所选原文件', icon: <PictureOutlined /> },
-      { key: 'restore_pdf_assets', label: '补回所选原文', icon: <ImportOutlined /> },
-      { key: 'delete', label: selected ? `删除文献本体（${actionDocIds.length} 篇）` : '删除文献本体', icon: <DeleteOutlined />, danger: true },
-    ]
+    const menuItems = buildFolderDocumentMenuItems({
+      folderTree,
+      assignedFolderIds: selectedFolder ? [selectedFolder.id] : [],
+      documentCount: actionDocIds.length,
+      canRemoveFromCurrentFolder: Boolean(selectedFolder),
+    })
     return (
       <Dropdown
         key={doc.id}
         trigger={['contextMenu']}
         menu={{
           items: menuItems,
-          onClick: ({ key }) => {
-            if (key === 'open' || key === 'open_new_tab') {
-              openDocumentInTab(doc.id)
-            }
-            if (String(key).startsWith('ocr:')) void handleFolderBatchOcr(actionDocIds, String(key).replace('ocr:', '') as OcrEngine)
-            if (String(key).startsWith('ocr_force:')) void handleFolderBatchOcr(actionDocIds, String(key).replace('ocr_force:', '') as OcrEngine, true)
-            if (key === 'metadata_extract') void handleFolderBatchMetadataExtract(actionDocIds)
-            if (key === 'add_tags') openTagDocumentsModal(actionDocIds)
-            if (key === 'move') openMoveDocumentsModal(actionDocIds)
-            if (key === 'remove_current') void handleRemoveDocumentsFromCurrentFolder(actionDocIds)
-            if (String(key).startsWith('export:')) openFolderBatchExportModal(actionDocIds, String(key).replace('export:', '') as DocumentExportFormat)
-            if (key === 'cleanup_pdf_assets') handleFolderBatchCleanupPdfAssets(actionDocIds)
-            if (key === 'restore_pdf_assets') void handleFolderBatchRestorePdfAssets(actionDocIds)
-            if (key === 'delete') handleDeleteDocuments(actionDocIds)
-          },
+          onClick: ({ key }) => handleFolderDocumentMenuClick(actionDocIds, String(key), doc.id),
         }}
       >
         <button
@@ -1777,63 +1860,14 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
           </Button>
           <Dropdown
             menu={{
-              items: [
-                {
-                  key: 'ocr',
-                  label: 'OCR 识别',
-                  icon: <ThunderboltOutlined />,
-                  children: [
-                    { key: 'ocr:paddle', label: '用飞桨 OCR' },
-                    { key: 'ocr:vision_model', label: '用大模型 OCR' },
-                  ],
-                },
-                {
-                  key: 'ocr_force',
-                  label: '重新 OCR 已选文献',
-                  icon: <ReloadOutlined />,
-                  children: [
-                    { key: 'ocr_force:paddle', label: '用飞桨 OCR 覆盖' },
-                    { key: 'ocr_force:vision_model', label: '用大模型 OCR 覆盖' },
-                  ],
-                },
-                { key: 'metadata_extract', label: '批量抓取元数据', icon: <RobotOutlined /> },
-                { key: 'add_tags', label: '批量添加标签', icon: <TagOutlined /> },
-                { key: 'move', label: '移入文件夹', icon: <SwapOutlined /> },
-                ...(selectedFolder ? [{ key: 'remove_current', label: '从当前文件夹移出', icon: <CloseOutlined /> }] : []),
-                {
-                  key: 'export',
-                  label: '批量导出',
-                  icon: <ExportOutlined />,
-                  children: [
-                    { key: 'export:txt', label: '导出为 TXT 纯文本' },
-                    { key: 'export:markdown', label: '导出为 Markdown' },
-                    { key: 'export:tei-xml', label: '导出为 TEI-XML' },
-                    { key: 'export:page-xml', label: '导出为 PAGE XML' },
-                    { key: 'export:paddle-json', label: '导出为 Paddle JSON' },
-                    { key: 'export:reading-pdf', label: '导出阅读模式 PDF' },
-                    { key: 'export:layout-pdf', label: '导出排版模式 PDF' },
-                  ],
-                },
-                { type: 'divider' },
-                { key: 'cleanup_pdf_assets', label: '删除所选原文件', icon: <PictureOutlined /> },
-                { key: 'restore_pdf_assets', label: '补回所选原文', icon: <ImportOutlined /> },
-                { key: 'delete', label: '删除文献本体', icon: <DeleteOutlined />, danger: true },
-              ],
-              onClick: ({ key }) => {
-                if (String(key).startsWith('ocr_force:')) {
-                  void handleFolderBatchOcr(selectedDocumentIds, String(key).replace('ocr_force:', '') as OcrEngine, true)
-                  return
-                }
-                if (String(key).startsWith('ocr:')) void handleFolderBatchOcr(selectedDocumentIds, String(key).replace('ocr:', '') as OcrEngine)
-                if (key === 'metadata_extract') void handleFolderBatchMetadataExtract(selectedDocumentIds)
-                if (key === 'add_tags') openTagDocumentsModal(selectedDocumentIds)
-                if (key === 'move') openMoveDocumentsModal(selectedDocumentIds)
-                if (key === 'remove_current') void handleRemoveDocumentsFromCurrentFolder(selectedDocumentIds)
-                if (String(key).startsWith('export:')) openFolderBatchExportModal(selectedDocumentIds, String(key).replace('export:', '') as DocumentExportFormat)
-                if (key === 'cleanup_pdf_assets') handleFolderBatchCleanupPdfAssets(selectedDocumentIds)
-                if (key === 'restore_pdf_assets') void handleFolderBatchRestorePdfAssets(selectedDocumentIds)
-                if (key === 'delete') handleDeleteDocuments(selectedDocumentIds)
-              },
+              items: buildFolderDocumentMenuItems({
+                folderTree,
+                assignedFolderIds: selectedFolder ? [selectedFolder.id] : [],
+                documentCount: selectedDocumentIds.length,
+                includeOpenActions: false,
+                canRemoveFromCurrentFolder: Boolean(selectedFolder),
+              }),
+              onClick: ({ key }) => handleFolderDocumentMenuClick(selectedDocumentIds, String(key)),
             }}
           >
             <Button size="small" icon={<CheckSquareOutlined />}>

@@ -2,7 +2,6 @@
 import { randomUUID } from 'crypto'
 import { basename, dirname, join, normalize, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs'
-import { is } from '@electron-toolkit/utils'
 import Database from 'better-sqlite3'
 import {
   DEFAULT_HISTORY_CITATION_TEMPLATES,
@@ -50,6 +49,10 @@ const DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000
 // claim one without blocking Electron's event loop or repeatedly missing it.
 const DATABASE_ASYNC_BUSY_RETRY_DELAY_MS = 25
 const foregroundDatabaseWriterState = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
+
+function isDevelopmentRuntime(): boolean {
+  return !app?.isPackaged
+}
 
 function beginForegroundDatabaseWrite(): void {
   Atomics.add(foregroundDatabaseWriterState, 0, 1)
@@ -176,7 +179,7 @@ function getPortableDataRoot(): string | null {
 }
 
 function getStableAppRoot(): string {
-  if (is.dev) return resolve(process.cwd(), 'data')
+  if (isDevelopmentRuntime()) return resolve(process.cwd(), 'data')
   return getPortableDataRoot() || getInstallDataRoot()
 }
 
@@ -185,7 +188,7 @@ export function resolveProfileDir(): string {
 }
 
 function getLegacyDataDirs(targetDir: string): string[] {
-  if (is.dev) return []
+  if (isDevelopmentRuntime()) return []
 
   const legacyNames = Array.from(new Set([
     app.getName(),
@@ -250,7 +253,7 @@ export function resolvePreferredDataDir(): string {
     return resolve(process.env.GUJISMART_DATA_DIR)
   }
 
-  const preferredDir = is.dev
+  const preferredDir = isDevelopmentRuntime()
     ? resolve(process.cwd(), 'data')
     : getStableAppRoot()
 
