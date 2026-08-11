@@ -207,6 +207,7 @@ import type {
   SaveSearchExcerptsOptions,
   SaveSearchExcerptsResult,
   SearchExportPreviewResult,
+  SearchExportTaskStartResult,
   SearchExportResult,
   SearchDocumentHitPage,
   SearchGroupedResponse,
@@ -691,6 +692,10 @@ const api = {
     ipcRenderer.invoke('search:listAggregateRelations', projectId, options),
   exportSearchExcerpts: (keyword: string, options?: SearchOptions): Promise<SearchExportResult> =>
     ipcRenderer.invoke('search:exportExcerpts', keyword, options),
+  startSearchExportTask: (keyword: string, options?: SearchOptions): Promise<SearchExportTaskStartResult> =>
+    ipcRenderer.invoke('search:startExportTask', keyword, options),
+  cancelSearchExportTask: (taskId: string): Promise<boolean> =>
+    ipcRenderer.invoke('search:cancelExportTask', taskId),
   previewSearchExportExcerpts: (keyword: string, options?: SearchOptions): Promise<SearchExportPreviewResult> =>
     ipcRenderer.invoke('search:previewExportExcerpts', keyword, options),
   exportSearchDiagnostics: (keyword: string, options?: SearchOptions): Promise<SearchExportResult> =>

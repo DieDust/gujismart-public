@@ -125,6 +125,7 @@
     "check:document-pipeline-diagnostics": "node scripts/document-pipeline-diagnostics-regression.js",
     "check:search-index-health": "node scripts/search-index-health-regression.js",
     "check:embedding-index": "node scripts/embedding-index-regression.js",
+    "check:search-export": "node scripts/search-export-limit-regression.js",
     "check:backup-integrity": "node scripts/backup-integrity-regression.js",
     "check:metadata-tag-guard": "node scripts/metadata-tag-guard-regression.js",
     "check:module-layering": "node scripts/module-layering-regression.js",

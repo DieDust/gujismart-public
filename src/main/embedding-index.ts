@@ -1763,7 +1763,7 @@ async function processEmbeddingQueue(): Promise<void> {
 
 export async function vectorSearch(
   query: string,
-  options?: { limit?: number; folderId?: string; tagId?: string; docId?: string },
+  options?: { limit?: number; limitIsAll?: boolean; allowLargeLimit?: boolean; folderId?: string; tagId?: string; docId?: string },
 ): Promise<VectorSearchResult | VectorSearchError> {
   const q = String(query || '').trim()
   if (!q) return { ok: false, code: 'invalid_args', message: 'query is required' }
@@ -1827,8 +1827,13 @@ export async function vectorSearch(
       : tagSet
   }
 
-  // Preserve the historical service/MCP fallback of 20; the desktop UI explicitly sends 200.
-  const limit = normalizeVectorSearchLimit(options?.limit, 20)
+  // Preserve the historical service/MCP fallback of 20; large export jobs opt out of
+  // the interactive 5,000-hit UI cap and still retain a bounded heap.
+  const limit = options?.limitIsAll
+    ? Number.MAX_SAFE_INTEGER
+    : options?.allowLargeLimit
+      ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, Math.round(Number(options.limit) || 20)))
+      : normalizeVectorSearchLimit(options?.limit, 20)
   type Cand = { segmentId: string; docId: string; pageId: string | null; pageNum: number | null; score: number }
   const bestHeap: Cand[] = []
 

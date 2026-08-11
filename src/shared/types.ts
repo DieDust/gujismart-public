@@ -5,6 +5,8 @@ import type { DocumentPipelineDiagnostics } from './document-pipeline-diagnostic
 import type { ManualLayoutBlockKind, ManualLayoutBlockMeta } from './manual-layout'
 import type { OcrRunMetadata } from './ocr-run-metadata'
 import type { SearchIndexHealthDiagnostics } from './search-index-health'
+export type { SearchExportCount } from './search-export'
+import type { SearchExportCount } from './search-export'
 
 export type OcrStatus = 'pending' | 'queued' | 'processing' | 'completed' | 'error'
 export type ProofStatus = 'pending' | 'completed'
@@ -1603,7 +1605,7 @@ export interface TaskProgressEvent {
   message: string
 }
 
-export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance' | 'embedding-index' | 'document-delete'
+export type BackgroundTaskKind = 'search-index' | 'health-report' | 'ocr-finalize' | 'startup-recovery' | 'database-maintenance' | 'embedding-index' | 'document-delete' | 'search-export'
 
 export interface EmbeddingLinkedProfile {
   id: string
@@ -1685,7 +1687,7 @@ export interface VectorSearchFailure {
   code: string
   message: string
 }
-export type BackgroundTaskStatus = 'queued' | 'processing' | 'completed' | 'error'
+export type BackgroundTaskStatus = 'queued' | 'processing' | 'completed' | 'error' | 'canceled'
 
 export interface BackgroundTaskProgressEvent {
   taskId: string
@@ -3883,7 +3885,7 @@ export interface SearchOptions {
    * Max records to write on export/preview (vector evidence rows or fulltext paragraphs).
    * Clamped server-side; omit for engine default.
    */
-  maxExportRecords?: number
+  maxExportRecords?: SearchExportCount
 }
 
 export interface SearchExportOptions {
@@ -3902,7 +3904,7 @@ export interface SearchExportOptions {
    */
   minVectorScore?: number
   /** Max exportable records after score filter (clamped). */
-  maxExportRecords?: number
+  maxExportRecords?: SearchExportCount
 }
 
 export interface SearchExportPreviewItem {
@@ -3933,7 +3935,7 @@ export interface SearchExportPreviewResult {
   /** Effective min similarity used for this preview (0 = none). */
   minVectorScore?: number
   /** Cap applied to exportable records. */
-  maxExportRecords?: number
+  maxExportRecords?: SearchExportCount
   previewItems: SearchExportPreviewItem[]
 }
 
@@ -3948,7 +3950,14 @@ export interface SearchExportResult {
   /** Hits dropped because score &lt; minVectorScore (vector export). */
   filteredByMinScore?: number
   minVectorScore?: number
-  maxExportRecords?: number
+  maxExportRecords?: SearchExportCount
+}
+
+/** Result returned immediately after a large export is queued in the main process. */
+export interface SearchExportTaskStartResult {
+  taskId: string | null
+  canceled: boolean
+  filePath: string | null
 }
 
 export interface SaveSearchExcerptsOptions extends SearchOptions {

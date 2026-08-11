@@ -477,6 +477,10 @@ let reindexDrainLastErrorMessage = ''
 let reindexDrainTotalCount = 0
 let backgroundReindexPauseDepth = 0
 const MAX_PREVIEW_HITS_PER_DOC = 24
+/**
+ * Reader navigation keeps a bounded in-memory session, while export jobs pass
+ * their requested limit explicitly and must not be silently truncated here.
+ */
 const MAX_DOCUMENT_SEARCH_SESSION_HITS = 20000
 const SHORT_QUERY_PREVIEW_SEGMENTS_PER_DOC = 6
 const MAX_AI_EXPANDED_KEYWORDS = 36
@@ -3177,7 +3181,9 @@ function createSearchHit(
 function buildHitsFromRows(rows: SearchHitRow[], keyword: string, limit: number, options?: SearchOptions): SearchHit[] {
   const hits: SearchHit[] = []
   const queryTerm = keyword.trim()
-  const sessionLimit = options?.resultMode === 'all' ? MAX_DOCUMENT_SEARCH_SESSION_HITS : 1200
+  const sessionLimit = options?.resultMode === 'all'
+    ? Math.max(MAX_DOCUMENT_SEARCH_SESSION_HITS, Math.max(1, Math.floor(Number(limit) || 1)))
+    : 1200
   const hardLimit = Math.max(1, Math.min(limit, sessionLimit))
   for (const row of hydrateSearchRowsText(rows).filter((item) => (
     options?.translationScope === 'translation'
@@ -3719,7 +3725,9 @@ export function querySearchV2(keyword: string, options?: SearchOptions): SearchG
       params.push(...scopedDocIds)
     }
     sql += ' ORDER BY s.doc_id, s.page_num, s.ordinal LIMIT ?'
-    params.push(options.resultMode === 'all' ? MAX_DOCUMENT_SEARCH_SESSION_HITS : Math.max(1000, limit * 80))
+    params.push(options.resultMode === 'all'
+      ? Math.max(1, Math.floor(Number(limit) || 1))
+      : Math.max(1000, limit * 80))
     return withSnapshot(groupRowsByOccurrences(queryAll<SearchHitRow>(sql, params), query, options))
   }
 

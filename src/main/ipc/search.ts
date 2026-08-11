@@ -1,6 +1,7 @@
 ﻿import { dialog, ipcMain } from 'electron'
-import { writeFileSync } from 'fs'
-import { writeFile } from 'fs/promises'
+import { createWriteStream, writeFileSync } from 'fs'
+import { rename, unlink, writeFile } from 'fs/promises'
+import { once } from 'events'
 import { nanoid } from 'nanoid'
 import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { createHash } from 'crypto'
@@ -29,7 +30,12 @@ import {
   semanticSearch
 } from '../semantic-search'
 import { vectorSearch } from '../embedding-index'
-import { VECTOR_SEARCH_DEFAULT_LIMIT, VECTOR_SEARCH_MAX_LIMIT } from '../../shared/vector-search'
+import {
+  DEFAULT_SEARCH_EXPORT_COUNT,
+  normalizeSearchExportCount,
+  searchExportCountToLimit,
+  type SearchExportCount,
+} from '../../shared/search-export'
 import type {
   AiPlannedSearchResponse,
   CursorPage,
@@ -46,6 +52,7 @@ import type {
   SearchExportPreviewItem,
   SearchExportPreviewResult,
   SearchExportResult,
+  SearchExportTaskStartResult,
   SearchGroupedResponse,
   SearchHit,
   SearchIndexStatus,
@@ -70,6 +77,7 @@ import {
   getActiveLibraryProjectId,
   withLibraryProjectContext,
 } from '../library-projects'
+import { emitBackgroundTaskStatus } from '../background-tasks'
 
 function resolveExportPageNumberMode(options?: { pageNumberMode?: ExportPageNumberMode } | null): ExportPageNumberMode {
   return options?.pageNumberMode === 'natural' ? 'natural' : 'literature'
@@ -210,6 +218,47 @@ interface SearchExportRecord {
 
 const SEARCH_EXCERPT_EXPORTER_VERSION = 'full-paragraph-v2'
 const VECTOR_EXCERPT_EXPORTER_VERSION = 'vector-evidence-v1'
+
+interface SearchExportTaskControl {
+  canceled: boolean
+  outputFilePath: string
+  tempFilePath: string
+  projectId: string
+}
+
+const activeSearchExportTasks = new Map<string, SearchExportTaskControl>()
+
+function waitForNextTick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+async function writeExportChunk(stream: ReturnType<typeof createWriteStream>, chunk: string): Promise<void> {
+  if (stream.write(chunk, 'utf8')) return
+  await once(stream, 'drain')
+}
+
+function buildSearchExportTaskConfig(options: SearchOptions | undefined): SearchExportOptions {
+  const requestedCitationMode = options?.citationMode
+  const isVector = options?.searchEngine === 'vector'
+  return {
+    format: ['txt', 'markdown', 'csv', 'json'].includes(String(options?.format))
+      ? String(options?.format) as SearchExportOptions['format']
+      : 'txt',
+    citationMode: ['auto', 'simple', 'template'].includes(String(requestedCitationMode))
+      ? requestedCitationMode
+      : 'auto',
+    citationStyleId: typeof options?.citationStyleId === 'string' && options.citationStyleId.trim()
+      ? options.citationStyleId.trim()
+      : undefined,
+    citationTemplateId: typeof options?.citationTemplateId === 'string' && options.citationTemplateId.trim()
+      ? options.citationTemplateId.trim()
+      : undefined,
+    searchEngine: isVector ? 'vector' : 'fulltext',
+    pageNumberMode: resolveExportPageNumberMode(options),
+    minVectorScore: normalizeMinVectorScore(options?.minVectorScore),
+    maxExportRecords: normalizeMaxExportRecords(options?.maxExportRecords, isVector),
+  }
+}
 
 function formatSimilarityScore(score: unknown): string {
   const value = Number(score)
@@ -777,17 +826,18 @@ function buildExportRecords(
   keyword: string,
   options: SearchExportOptions = {},
   maxRecords = Number.POSITIVE_INFINITY,
+  recordBuildLimit = Number.POSITIVE_INFINITY,
 ): { records: SearchExportRecord[]; missingHitCount: number } {
   const records: SearchExportRecord[] = []
   let missingHitCount = 0
   const exportedAt = new Date().toISOString()
   const pageNumberMode = resolveExportPageNumberMode(options)
   response.groups.forEach((group) => {
-    if (records.length >= maxRecords) return
+    if (records.length >= maxRecords || records.length >= recordBuildLimit) return
     const { paragraphs, missingHits } = buildExportParagraphs(group)
     missingHitCount += missingHits
     paragraphs.forEach((paragraph) => {
-      if (records.length >= maxRecords) return
+      if (records.length >= maxRecords || records.length >= recordBuildLimit) return
       const hit = paragraph.firstHit
       const score = Number(hit.score)
       const pageNum = resolveExportHitPageNum(hit, group, pageNumberMode)
@@ -829,17 +879,9 @@ function normalizeMinVectorScore(value: unknown): number {
   return Math.min(1, Math.max(0, Math.round(raw * 1000) / 1000))
 }
 
-const DEFAULT_VECTOR_EXPORT_MAX = VECTOR_SEARCH_DEFAULT_LIMIT
-const HARD_VECTOR_EXPORT_MAX = VECTOR_SEARCH_MAX_LIMIT
-const HARD_FULLTEXT_EXPORT_MAX = 1000
-
-/** Clamp user-selected export size. */
-function normalizeMaxExportRecords(value: unknown, vectorMode: boolean): number {
-  const fallback = vectorMode ? DEFAULT_VECTOR_EXPORT_MAX : 200
-  const hardMax = vectorMode ? HARD_VECTOR_EXPORT_MAX : HARD_FULLTEXT_EXPORT_MAX
-  const raw = Math.round(Number(value))
-  if (!Number.isFinite(raw) || raw <= 0) return fallback
-  return Math.min(hardMax, Math.max(1, raw))
+/** Normalize the user-selected export size; `all` intentionally has no record cap. */
+function normalizeMaxExportRecords(value: unknown, _vectorMode: boolean): SearchExportCount {
+  return normalizeSearchExportCount(value, DEFAULT_SEARCH_EXPORT_COUNT)
 }
 
 /**
@@ -870,7 +912,7 @@ function buildVectorExportRecords(
   const minScore = normalizeMinVectorScore(options.minVectorScore)
   const cap = Number.isFinite(maxRecords) && maxRecords > 0
     ? maxRecords
-    : normalizeMaxExportRecords(options.maxExportRecords, true)
+    : searchExportCountToLimit(normalizeMaxExportRecords(options.maxExportRecords, true))
   const exportedAt = new Date().toISOString()
   const pageNumberMode = resolveExportPageNumberMode(options)
   // Bulk vector export uses lightweight citations (no per-hit template DB) to avoid freezes.
@@ -952,15 +994,16 @@ function collectExportRecords(
   filteredByMinScore: number
   vectorMode: boolean
   minVectorScore: number
-  maxExportRecords: number
+  maxExportRecords: SearchExportCount
   selectedHitCount: number
 } {
   const vectorMode = isVectorExportResponse(response) || options.searchEngine === 'vector'
   const minVectorScore = normalizeMinVectorScore(options.minVectorScore)
-  const resolvedMax = normalizeMaxExportRecords(
+  const requestedMax = normalizeMaxExportRecords(
     maxRecords ?? options.maxExportRecords,
     vectorMode,
   )
+  const resolvedMax = searchExportCountToLimit(requestedMax)
   if (vectorMode) {
     const built = buildVectorExportRecords(
       response,
@@ -969,15 +1012,15 @@ function collectExportRecords(
       resolvedMax,
       recordBuildLimit,
     )
-    return { ...built, vectorMode, minVectorScore, maxExportRecords: resolvedMax }
+    return { ...built, vectorMode, minVectorScore, maxExportRecords: requestedMax }
   }
-  const built = buildExportRecords(response, keyword, options, resolvedMax)
+  const built = buildExportRecords(response, keyword, options, resolvedMax, recordBuildLimit)
   return {
     ...built,
     filteredByMinScore: 0,
     vectorMode,
     minVectorScore: 0,
-    maxExportRecords: resolvedMax,
+    maxExportRecords: requestedMax,
     selectedHitCount: built.records.length,
   }
 }
@@ -998,9 +1041,7 @@ function buildSearchExportPreview(response: SearchGroupedResponse, keyword: stri
     keyword,
     previewOptions,
     undefined,
-    isVectorExportResponse(response) || options.searchEngine === 'vector'
-      ? EXPORT_PREVIEW_ITEM_LIMIT
-      : undefined,
+    EXPORT_PREVIEW_ITEM_LIMIT,
   )
   const previewItems: SearchExportPreviewItem[] = records.slice(0, EXPORT_PREVIEW_ITEM_LIMIT).map((record) => ({
     title: record.title,
@@ -1021,9 +1062,14 @@ function buildSearchExportPreview(response: SearchGroupedResponse, keyword: stri
     keyword,
     totalDocuments: response.totalDocuments,
     totalHits: response.totalHits,
-    exportableParagraphs: vectorMode
-      ? Math.max(0, selectedHitCount - missingHitCount)
-      : records.length,
+    exportableParagraphs: options.previewOnly
+      ? Math.max(0, Math.min(
+        maxExportRecords === 'all' ? response.totalHits : Number(maxExportRecords || response.totalHits),
+        response.totalHits,
+      ))
+      : vectorMode
+        ? Math.max(0, selectedHitCount - missingHitCount)
+        : records.length,
     skippedHits: missingHitCount,
     filteredByMinScore,
     minVectorScore: vectorMode ? minVectorScore : 0,
@@ -1133,6 +1179,321 @@ function buildSearchExcerptCsv(records: SearchExportRecord[], vectorMode = false
         ]
   ).map(escapeCsvCell).join(','))
   return `\ufeff${headers.join(',')}\n${rows.join('\n')}`
+}
+
+function buildSearchExcerptCsvRow(record: SearchExportRecord, index: number, vectorMode: boolean): string {
+  const values = vectorMode
+    ? [
+        index + 1,
+        formatSimilarityScore(record.score) || '',
+        record.title,
+        record.author || '',
+        record.pageNum || '',
+        record.paragraph,
+        record.citation,
+        record.segmentId || '',
+        JSON.stringify(record.locator),
+        record.searchKeyword,
+        record.exportedAt,
+      ]
+    : [
+        record.title,
+        record.author || '',
+        record.docType,
+        record.pageNum || '',
+        record.chapter || '',
+        record.paragraph,
+        record.hitTerms.join('|'),
+        record.hitCount,
+        record.citation,
+        JSON.stringify(record.locator),
+        record.searchKeyword,
+        record.exportedAt,
+      ]
+  return values.map(escapeCsvCell).join(',')
+}
+
+function buildSearchExportTaskJsonRecord(record: SearchExportRecord, index: number, vectorMode: boolean): Record<string, unknown> {
+  if (!vectorMode) return { ...record }
+  return {
+    rank: index + 1,
+    score: record.score ?? null,
+    similarity: formatSimilarityScore(record.score) || null,
+    title: record.title,
+    author: record.author,
+    pageNum: record.pageNum,
+    text: record.paragraph,
+    citation: record.citation,
+    ref: {
+      docId: record.locator.docId,
+      pageNum: record.pageNum,
+      segmentId: record.segmentId || record.locator.segmentId || null,
+    },
+    locator: record.locator,
+  }
+}
+
+function buildSearchExportTaskHeader(
+  response: SearchGroupedResponse,
+  keyword: string,
+  options: SearchExportOptions,
+  vectorMode: boolean,
+): string {
+  const format = options.format || 'txt'
+  if (format === 'csv') {
+    const headers = vectorMode
+      ? ['rank', 'score', 'title', 'author', 'pageNum', 'paragraph', 'citation', 'segmentId', 'locator', 'searchKeyword', 'exportedAt']
+      : ['title', 'author', 'docType', 'pageNum', 'chapter', 'paragraph', 'hitTerms', 'hitCount', 'citation', 'locator', 'searchKeyword', 'exportedAt']
+    return `\ufeff${headers.join(',')}\n`
+  }
+  if (format === 'json') {
+    const kind = vectorMode ? 'vector_semantic_evidence' : 'fulltext_search_excerpts'
+    const key = vectorMode ? 'evidence' : 'records'
+    return `{"kind":${JSON.stringify(kind)},"keyword":${JSON.stringify(keyword)},"searchEngine":${JSON.stringify(vectorMode ? 'vector' : 'fulltext')},"exporterVersion":${JSON.stringify(vectorMode ? VECTOR_EXCERPT_EXPORTER_VERSION : SEARCH_EXCERPT_EXPORTER_VERSION)},"totalDocuments":${response.totalDocuments},"totalHits":${response.totalHits},"exportedAt":${JSON.stringify(new Date().toISOString())},"${key}":[`
+  }
+  if (format === 'markdown') {
+    return vectorMode
+      ? `\ufeff# 向量库语义证据导出\n\n- 查询：${keyword}\n- 引擎：向量库语义检索（非关键词全文）\n- 文献数：${response.totalDocuments}\n- 命中数：${response.totalHits}\n\n---\n\n`
+      : `\ufeff# Search Excerpts\n\n- Keyword: ${keyword}\n- Documents: ${response.totalDocuments}\n- Hits: ${response.totalHits}\n- Exported At: ${new Date().toLocaleString('zh-CN')}\n\n`
+  }
+  return vectorMode
+    ? `\ufeff向量库语义证据导出（${VECTOR_EXCERPT_EXPORTER_VERSION}）\n查询：${keyword}\n引擎：向量库语义检索（不是关键词全文检索）\n文献数：${response.totalDocuments}\n命中数：${response.totalHits}\n\n==============================\n\n`
+    : `\ufeff检索摘录导出（${SEARCH_EXCERPT_EXPORTER_VERSION}）\n关键词：${keyword}\n文献数：${response.totalDocuments}\n命中数：${response.totalHits}\n导出时间：${new Date().toLocaleString('zh-CN')}\n\n==============================\n\n`
+}
+
+function buildSearchExportTaskRecordText(record: SearchExportRecord, index: number, vectorMode: boolean, format: SearchExportOptions['format']): string {
+  const scoreText = formatSimilarityScore(record.score)
+  if (format === 'csv') return `${buildSearchExcerptCsvRow(record, index, vectorMode)}\n`
+  if (format === 'json') return JSON.stringify(buildSearchExportTaskJsonRecord(record, index, vectorMode))
+  if (format === 'markdown') {
+    if (vectorMode) {
+      return `## 证据 ${index + 1}${scoreText ? ` · 相似度 ${scoreText}` : ''}\n\n- 文献：${record.title}\n${record.author ? `- 作者：${record.author}\n` : ''}${record.pageNum ? `- 页码：第 ${record.pageNum} 页\n` : ''}${scoreText ? `- 相似度：${scoreText}\n` : ''}- 引用：${record.citation}\n\n### 正文\n\n${record.paragraph}\n\n---\n\n`
+    }
+    return `## ${record.title}\n\n${record.author ? `- Author: ${record.author}\n` : ''}${record.pageNum ? `- Page: ${record.pageNum}\n` : ''}\n> ${record.paragraph.replace(/\n/g, '\n> ')}\n\n- No.: ${index + 1}\n- Citation: ${record.citation}\n- Hits: ${record.hitCount}${record.hitTerms.length ? ` (${record.hitTerms.join(', ')})` : ''}\n\n`
+  }
+  if (vectorMode) {
+    return `[证据 ${index + 1}]\n${scoreText ? `相似度：${scoreText}\n` : ''}文献：${record.title}\n${record.author ? `作者：${record.author}\n` : ''}${record.pageNum ? `页码：第 ${record.pageNum} 页\n` : ''}引用：${record.citation}\n正文：\n${record.paragraph}\n\n------------------------------\n\n`
+  }
+  return `[${index + 1}]\n${record.paragraph}\n\n引用：${record.citation}\n段落命中：${record.hitCount}${record.hitTerms.length ? `（${record.hitTerms.join('、')}）` : ''}\n定位：${locatorToText(record.locator, record.pageNum)}\n\n------------------------------\n\n`
+}
+
+async function runSearchExportTask(
+  taskId: string,
+  keyword: string,
+  options: SearchOptions,
+  control: SearchExportTaskControl,
+): Promise<void> {
+  const taskOptions = buildSearchExportTaskConfig(options)
+  const vectorMode = taskOptions.searchEngine === 'vector'
+  try {
+    emitBackgroundTaskStatus({
+      taskId,
+      kind: 'search-export',
+      status: 'processing',
+      progress: 0,
+      totalCount: 0,
+      completedCount: 0,
+      message: '正在准备检索结果和导出文件。',
+    })
+    await waitForNextTick()
+    const response = await withLibraryProjectContext(control.projectId, () => resolveExportSearchResponse(keyword, options))
+    if (!response.totalHits) throw new Error('当前检索没有可导出的命中。')
+
+    const maxRecords = searchExportCountToLimit(taskOptions.maxExportRecords || DEFAULT_SEARCH_EXPORT_COUNT)
+    const totalWork = vectorMode
+      ? response.groups.reduce((sum, group) => sum + group.hits.length, 0)
+      : response.groups.length
+    const stream = createWriteStream(control.tempFilePath, { encoding: 'utf8' })
+    let streamError: Error | null = null
+    stream.on('error', (error) => { streamError = error instanceof Error ? error : new Error(String(error)) })
+    const writeChunk = async (chunk: string) => {
+      if (streamError) throw streamError
+      await writeExportChunk(stream, chunk)
+      if (streamError) throw streamError
+    }
+    await writeChunk(buildSearchExportTaskHeader(response, keyword, taskOptions, vectorMode))
+
+    let processed = 0
+    let exported = 0
+    let missing = 0
+    let filtered = 0
+    let selected = 0
+    let jsonFirstRecord = true
+    const emitProgress = (message: string, status: 'processing' = 'processing') => {
+      emitBackgroundTaskStatus({
+        taskId,
+        kind: 'search-export',
+        status,
+        progress: totalWork > 0 ? Math.min(0.99, processed / totalWork) : 0,
+        totalCount: totalWork,
+        completedCount: processed,
+        message,
+      })
+    }
+    const writeRecord = async (record: SearchExportRecord) => {
+      const serialized = buildSearchExportTaskRecordText(record, exported, vectorMode, taskOptions.format)
+      await writeChunk(taskOptions.format === 'json' ? `${jsonFirstRecord ? '' : ','}${serialized}` : serialized)
+      jsonFirstRecord = false
+      exported += 1
+    }
+
+    const flatHits = vectorMode
+      ? response.groups.flatMap((group) => group.hits.map((hit) => ({ group, hit }))).sort((a, b) => (Number(b.hit.score) || 0) - (Number(a.hit.score) || 0))
+      : []
+    if (vectorMode) {
+      for (const { group, hit } of flatHits) {
+        if (control.canceled) throw new Error('__search_export_canceled__')
+        processed += 1
+        const score = Number(hit.score)
+        const minScore = normalizeMinVectorScore(taskOptions.minVectorScore)
+        if (minScore > 0 && !(Number.isFinite(score) && score >= minScore)) {
+          filtered += 1
+          continue
+        }
+        if (selected >= maxRecords) break
+        selected += 1
+        const paragraph = getHitParagraphForVectorExportFast(hit)
+        if (!paragraph?.text) {
+          missing += 1
+          continue
+        }
+        const pageNum = resolveExportHitPageNum(hit, group, taskOptions.pageNumberMode || 'literature')
+        await writeRecord({
+          title: group.title || 'Untitled',
+          author: group.author || null,
+          docType: group.docType || '',
+          pageNum,
+          chapter: hit.locator.href || null,
+          paragraph: paragraph.text,
+          hitTerms: hit.locator.queryTerm ? [hit.locator.queryTerm] : [],
+          hitCount: 1,
+          citation: [group.author ? String(group.author) : '', group.title || '未命名文献', pageNum ? `第 ${pageNum} 页` : ''].filter(Boolean).join('，'),
+          locator: hit.locator,
+          stableLocator: hit.stableLocator,
+          searchKeyword: keyword,
+          exportedAt: new Date().toISOString(),
+          sourceType: paragraph.source.sourceType,
+          sourceKey: paragraph.source.sourceKey,
+          score: Number.isFinite(score) ? score : null,
+          segmentId: hit.locator.segmentId || null,
+        })
+        if (processed % 20 === 0) {
+          emitProgress(`正在写入第 ${exported.toLocaleString()} 条向量证据。`)
+          await waitForNextTick()
+        }
+      }
+    } else {
+      for (const group of response.groups) {
+        if (control.canceled) throw new Error('__search_export_canceled__')
+        const built = buildExportParagraphs(group)
+        missing += built.missingHits
+        processed += 1
+        for (const paragraph of built.paragraphs) {
+          if (control.canceled) throw new Error('__search_export_canceled__')
+          if (selected >= maxRecords) break
+          selected += 1
+          const hit = paragraph.firstHit
+          const pageNum = resolveExportHitPageNum(hit, group, taskOptions.pageNumberMode || 'literature')
+          await writeRecord({
+            title: group.title || 'Untitled',
+            author: group.author || null,
+            docType: group.docType || '',
+            pageNum,
+            chapter: hit.locator.href || null,
+            paragraph: paragraph.text,
+            hitTerms: [...paragraph.terms],
+            hitCount: paragraph.hitCount,
+            citation: formatHitCitation(group, hit, taskOptions, pageNum),
+            locator: hit.locator,
+            stableLocator: hit.stableLocator,
+            searchKeyword: keyword,
+            exportedAt: new Date().toISOString(),
+            sourceType: paragraph.sourceType,
+            sourceKey: paragraph.sourceKey,
+            score: Number.isFinite(Number(hit.score)) ? Number(hit.score) : null,
+            segmentId: hit.locator.segmentId || null,
+          })
+          if (exported % 20 === 0) await waitForNextTick()
+        }
+        if (processed % 5 === 0) emitProgress(`正在处理文献 ${processed.toLocaleString()} / ${totalWork.toLocaleString()}。`)
+        if (selected >= maxRecords) break
+      }
+    }
+
+    if (exported === 0) throw new Error(vectorMode ? '没有可导出的向量证据。' : '没有取得可导出的完整段落。')
+    if (taskOptions.format === 'json') {
+      await writeChunk(`],"missingHitCount":${missing},"filteredByMinScore":${filtered},"exportedCount":${exported}}`)
+    } else if (missing > 0 || filtered > 0) {
+      const summary = `\n${missing > 0 ? `跳过无法还原：${missing}\n` : ''}${filtered > 0 ? `因相似度不足跳过：${filtered}\n` : ''}`
+      await writeChunk(summary)
+    }
+    await new Promise<void>((resolve, reject) => {
+      const onFinish = () => { stream.removeListener('error', onError); resolve() }
+      const onError = (error: Error) => { stream.removeListener('finish', onFinish); reject(error) }
+      stream.once('finish', onFinish)
+      stream.once('error', onError)
+      stream.end()
+    })
+    if (control.canceled) throw new Error('__search_export_canceled__')
+    // Preserve the existing export behavior: selecting an existing destination
+    // replaces that file only after the temporary export completed successfully.
+    try { await unlink(control.outputFilePath) } catch { /* destination may not exist */ }
+    await rename(control.tempFilePath, control.outputFilePath)
+    emitBackgroundTaskStatus({
+      taskId,
+      kind: 'search-export',
+      status: 'completed',
+      progress: 1,
+      totalCount: totalWork,
+      completedCount: processed,
+      message: `导出完成：${exported.toLocaleString()} 条，已写入文件。`,
+    })
+  } catch (error) {
+    const canceled = control.canceled || (error instanceof Error && error.message === '__search_export_canceled__')
+    try { await unlink(control.tempFilePath) } catch { /* best effort */ }
+    emitBackgroundTaskStatus({
+      taskId,
+      kind: 'search-export',
+      status: canceled ? 'canceled' : 'error',
+      progress: canceled ? 0 : 1,
+      message: canceled ? '导出已取消，临时文件已清理。' : '导出失败。',
+      errorMessage: canceled ? undefined : (error instanceof Error ? error.message : String(error)),
+    })
+  } finally {
+    activeSearchExportTasks.delete(taskId)
+  }
+}
+
+async function startSearchExportTask(keyword: string, options?: SearchOptions): Promise<SearchExportTaskStartResult> {
+  const query = String(keyword || '').trim()
+  if (!query) throw new Error('请先输入检索词')
+  const taskOptions = buildSearchExportTaskConfig(options)
+  const extension = taskOptions.format === 'markdown' ? 'md' : taskOptions.format || 'txt'
+  const selection = await dialog.showSaveDialog({
+    title: '导出检索摘录（后台任务）',
+    defaultPath: `${sanitizeFileName(`检索摘录-${query}`)}.${extension}`,
+    filters: [{ name: taskOptions.format === 'markdown' ? 'Markdown' : String(taskOptions.format || 'txt').toUpperCase(), extensions: [extension] }],
+  })
+  if (selection.canceled || !selection.filePath) return { taskId: null, canceled: true, filePath: null }
+
+  const taskId = `search-export:${nanoid(16)}`
+  const control: SearchExportTaskControl = {
+    canceled: false,
+    outputFilePath: selection.filePath,
+    tempFilePath: `${selection.filePath}.part-${taskId.replace(/[^a-z0-9_-]/gi, '')}`,
+    projectId: captureActiveLibraryProjectId(),
+  }
+  activeSearchExportTasks.set(taskId, control)
+  emitBackgroundTaskStatus({ taskId, kind: 'search-export', status: 'queued', progress: 0, message: '导出任务已加入后台队列。' })
+  void runSearchExportTask(taskId, query, options || {}, control)
+  return { taskId, canceled: false, filePath: null }
+}
+
+function cancelSearchExportTask(taskId: string): boolean {
+  const control = activeSearchExportTasks.get(String(taskId || '').trim())
+  if (!control) return false
+  control.canceled = true
+  return true
 }
 
 function buildSearchExcerptJson(
@@ -1475,6 +1836,8 @@ async function resolveExportSearchResponse(keyword: string, options?: SearchOpti
     maxExportRecords: _maxExportRecords,
     ...searchOptions
   } = options || {}
+  const requestedExportCount = normalizeMaxExportRecords(_maxExportRecords, searchEngine === 'vector')
+  const requestedExportLimit = searchExportCountToLimit(requestedExportCount)
 
   // Reuse on-screen results: no second full-corpus vector/FTS pass (avoids "Not Responding").
   const reusedGroups = normalizeExportGroups(exportGroups)
@@ -1505,9 +1868,15 @@ async function resolveExportSearchResponse(keyword: string, options?: SearchOpti
       || (Array.isArray(searchOptions.folderIds) ? searchOptions.folderIds[0] : undefined)
     const tagId = searchOptions.tagId
       || (Array.isArray(searchOptions.tagIds) ? searchOptions.tagIds[0] : undefined)
-    const requestedLimit = Math.max(1, Math.round(Number(searchOptions?.limit || 40)) || 40)
+    const requestedLimit = Math.max(
+      1,
+      Math.round(Number(searchOptions?.limit || 40)) || 40,
+      requestedExportLimit,
+    )
     const vectorRes = await vectorSearch(query, {
-      limit: Math.min(VECTOR_SEARCH_MAX_LIMIT, requestedLimit),
+      limit: requestedLimit,
+      limitIsAll: requestedExportCount === 'all',
+      allowLargeLimit: true,
       folderId: folderId ? String(folderId) : undefined,
       tagId: tagId ? String(tagId) : undefined,
     })
@@ -1519,7 +1888,7 @@ async function resolveExportSearchResponse(keyword: string, options?: SearchOpti
 
   return querySearchV2(query, {
     ...searchOptions,
-    limit: Math.max(Number(searchOptions?.limit || 0), 1000),
+    limit: Math.max(Number(searchOptions?.limit || 0), requestedExportLimit),
     exhaustive: true,
     resultMode: 'all',
   })
@@ -1915,6 +2284,13 @@ export function registerSearchIpc(): void {
   ipcMain.handle('search:exportExcerpts', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportResult> => {
     return inCapturedLibraryProject(() => exportSearchExcerpts(keyword, options))
   })
+
+  ipcMain.handle('search:startExportTask', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportTaskStartResult> => {
+    const projectId = captureActiveLibraryProjectId()
+    return withLibraryProjectContext(projectId, () => startSearchExportTask(keyword, options))
+  })
+
+  ipcMain.handle('search:cancelExportTask', async (_event, taskId: string): Promise<boolean> => cancelSearchExportTask(taskId))
 
   ipcMain.handle('search:previewExportExcerpts', async (_event, keyword: string, options?: SearchOptions): Promise<SearchExportPreviewResult> => {
     return inCapturedLibraryProject(() => previewSearchExcerpts(keyword, options))

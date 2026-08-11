@@ -1,0 +1,28 @@
+const assert = require('assert')
+const fs = require('fs')
+const path = require('path')
+
+const root = path.resolve(__dirname, '..')
+const read = (...parts) => fs.readFileSync(path.join(root, ...parts), 'utf8')
+
+const contractPath = path.join(root, 'src', 'shared', 'search-export.ts')
+assert.ok(fs.existsSync(contractPath), 'search export count contract must exist')
+const contract = read('src', 'shared', 'search-export.ts')
+const types = read('src', 'shared', 'types.ts')
+const ipc = read('src', 'main', 'ipc', 'search.ts')
+const preload = read('src', 'preload', 'index.ts')
+const renderer = read('src', 'renderer', 'src', 'views', 'SearchView.tsx')
+
+assert.ok(/DEFAULT_SEARCH_EXPORT_COUNT\s*=\s*10_000/.test(contract), 'large export default must be 10,000')
+assert.ok(/SearchExportCount\s*=\s*number\s*\|\s*'all'/.test(contract), 'export count must support numeric values and all')
+assert.ok(contract.includes('Number.MAX_SAFE_INTEGER'), 'numeric export counts must use safe-integer bounds')
+assert.ok(/export type(?:\s+SearchExportCount\s*=|\s*\{\s*SearchExportCount\s*\})/.test(types), 'shared types must expose SearchExportCount')
+assert.ok(/maxExportRecords\?:\s*SearchExportCount/.test(types), 'search options must accept SearchExportCount')
+assert.ok(types.includes("'search-export'"), 'background task contract must include search-export')
+assert.ok(ipc.includes("search:startExportTask"), 'main IPC must expose background export start')
+assert.ok(ipc.includes("search:cancelExportTask"), 'main IPC must expose export cancellation')
+assert.ok(preload.includes('startSearchExportTask'), 'preload must expose background export start')
+assert.ok(renderer.includes('onBackgroundTaskStatusChanged'), 'search UI must subscribe to export progress events')
+assert.ok(renderer.includes('全部'), 'search UI must expose an all export option')
+
+console.log('Search export limit regression checks passed.')

@@ -1,5 +1,5 @@
 ﻿import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Alert, Button, Card, Collapse, Empty, Input, InputNumber, List, Modal, Pagination, Radio, Select, Space, Spin, Switch, Tag, Tooltip, Typography, message, type InputRef } from 'antd'
+import { Alert, Button, Card, Collapse, Empty, Input, InputNumber, List, Modal, Pagination, Progress, Radio, Select, Space, Spin, Switch, Tag, Tooltip, Typography, message, type InputRef } from 'antd'
 import { BulbOutlined, DeleteOutlined, DownOutlined, FileTextOutlined, RightOutlined, RobotOutlined, SaveOutlined, SearchOutlined, StarOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useSearchStore, type SearchFilters } from '../stores/useSearchStore'
 import { hasShortcutBlockingOverlay, isEditableShortcutTarget, loadShortcutSettings, SHORTCUTS_CHANGED_EVENT, shortcutMatches, type ShortcutMap } from '../utils/shortcuts'
@@ -15,6 +15,7 @@ import {
 import type {
   CitationStyle,
   CitationTemplate,
+  BackgroundTaskProgressEvent,
   DocumentListItem,
   Folder,
   LibraryAiOpenPayload,
@@ -25,6 +26,7 @@ import type {
   ExportPageNumberMode,
   SearchExportFormat,
   SearchExportPreviewResult,
+  SearchExportCount,
   SearchGroupedResponse,
   SearchHit,
   SearchHitLocator,
@@ -34,6 +36,7 @@ import type {
   Tag as SharedTag,
   VectorSearchHit,
 } from '@shared/types'
+import { DEFAULT_SEARCH_EXPORT_COUNT } from '@shared/search-export'
 
 const { Text, Title } = Typography
 
@@ -106,7 +109,7 @@ const VECTOR_SEARCH_LIMIT_STORAGE_KEY = 'gujismart.search.vector.limit.v1'
 const DEFAULT_SEARCH_GROUP_LIMIT = 120
 /** Keep historical cache payloads at the old maximum; larger searches rerun when restored. */
 const VECTOR_SEARCH_HISTORY_HIT_LIMIT = 200
-const DEFAULT_EXPORT_MAX_RECORDS = VECTOR_SEARCH_DEFAULT_LIMIT
+const DEFAULT_EXPORT_MAX_RECORDS = DEFAULT_SEARCH_EXPORT_COUNT
 const SEARCH_PAGE_SIZE = 10
 const SEARCH_DOCUMENT_HIT_PAGE_SIZE = 10
 const SEARCH_VIEWER_COUNT_CONCURRENCY = 4
@@ -207,13 +210,14 @@ function saveExportMinVectorScore(value: number) {
   }
 }
 
-function normalizeExportMaxRecords(value: unknown): number {
+function normalizeExportMaxRecords(value: unknown): SearchExportCount {
+  if (value === 'all') return 'all'
   const raw = Math.round(Number(value))
   if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_EXPORT_MAX_RECORDS
-  return Math.min(VECTOR_SEARCH_MAX_LIMIT, Math.max(1, raw))
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, raw))
 }
 
-function loadExportMaxRecords(): number {
+function loadExportMaxRecords(): SearchExportCount {
   try {
     const raw = window.localStorage.getItem(EXPORT_MAX_RECORDS_STORAGE_KEY)
     if (raw == null || raw === '') return DEFAULT_EXPORT_MAX_RECORDS
@@ -223,7 +227,7 @@ function loadExportMaxRecords(): number {
   }
 }
 
-function saveExportMaxRecords(value: number) {
+function saveExportMaxRecords(value: SearchExportCount) {
   try {
     window.localStorage.setItem(
       EXPORT_MAX_RECORDS_STORAGE_KEY,
@@ -259,7 +263,7 @@ function saveVectorSearchLimit(value: number): void {
 /** Keep only top-N hits (by score) that pass minScore — shrinks IPC and export work. */
 function trimGroupsForExport(
   groups: SearchDocumentGroup[],
-  maxRecords: number,
+  maxRecords: SearchExportCount,
   minScore: number,
 ): SearchDocumentGroup[] {
   const flat: Array<{ group: SearchDocumentGroup; hit: SearchHit }> = []
@@ -267,11 +271,12 @@ function trimGroupsForExport(
     ;(group.hits || []).forEach((hit) => flat.push({ group, hit }))
   })
   flat.sort((a, b) => (Number(b.hit.score) || 0) - (Number(a.hit.score) || 0))
-  const kept = flat.filter(({ hit }) => {
+  const filtered = flat.filter(({ hit }) => {
     if (minScore <= 0) return true
     const score = Number(hit.score)
     return Number.isFinite(score) && score >= minScore
-  }).slice(0, Math.max(1, maxRecords))
+  })
+  const kept = maxRecords === 'all' ? filtered : filtered.slice(0, Math.max(1, maxRecords))
 
   const byDoc = new Map<string, SearchDocumentGroup>()
   for (const { group, hit } of kept) {
@@ -901,7 +906,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   /** Vector export: only keep hits with similarity ≥ this (0 = no filter). Persisted in localStorage. */
   const [exportMinVectorScore, setExportMinVectorScore] = useState<number>(() => loadExportMinVectorScore())
   /** Max evidence rows / paragraphs to export. Persisted. */
-  const [exportMaxRecords, setExportMaxRecords] = useState<number>(() => loadExportMaxRecords())
+  const [exportMaxRecords, setExportMaxRecords] = useState<SearchExportCount>(() => loadExportMaxRecords())
   const [aiSearchState, setAiSearchState] = useState<AiSearchState | null>(null)
   const [searchHistory, setSearchHistory] = useState<SearchHistoryEntry[]>([])
   const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([])
@@ -922,6 +927,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const [exportPreviewLoading, setExportPreviewLoading] = useState(false)
   const [exportPreview, setExportPreview] = useState<SearchExportPreviewResult | null>(null)
   const [exportPreviewExpanded, setExportPreviewExpanded] = useState(false)
+  const [searchExportTask, setSearchExportTask] = useState<BackgroundTaskProgressEvent | null>(null)
   const [searchPage, setSearchPage] = useState(groupedResponse?.page || 1)
   const [expandedHitDocId, setExpandedHitDocId] = useState('')
   const [documentHitPages, setDocumentHitPages] = useState<Record<string, SearchDocumentHitPageState>>({})
@@ -932,6 +938,23 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
   const returnStateRestoredRef = useRef(false)
   const viewerHitCountRefreshSignatureRef = useRef<string | null>(null)
   const exportPreviewRequestIdRef = useRef(0)
+
+  useEffect(() => {
+    return window.api.onBackgroundTaskStatusChanged((event) => {
+      if (event.kind !== 'search-export') return
+      setSearchExportTask(event)
+      if (event.status === 'completed') {
+        setExportingExcerpts(false)
+        message.success(event.message || '后台导出完成')
+      } else if (event.status === 'error') {
+        setExportingExcerpts(false)
+        message.error(event.errorMessage || event.message || '后台导出失败')
+      } else if (event.status === 'canceled') {
+        setExportingExcerpts(false)
+        message.info(event.message || '后台导出已取消')
+      }
+    })
+  }, [])
 
   const filterSignature = useMemo(() => JSON.stringify({ filters: compactFilterOptions(filters), sort: searchSort, contextMode }), [filters, searchSort, contextMode])
   const selectedDocIds = filters.docIds || []
@@ -1360,7 +1383,7 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       }),
       limit: useVector
         ? normalizeVectorSearchLimit(vectorSearchLimit, VECTOR_SEARCH_DEFAULT_LIMIT)
-        : 1000,
+        : (maxRecords === 'all' ? DEFAULT_SEARCH_EXPORT_COUNT : maxRecords),
       searchEngine: useVector ? 'vector' as const : 'fulltext' as const,
       maxExportRecords: maxRecords,
       ...(useVector ? { minVectorScore: minScore } : {}),
@@ -1884,33 +1907,58 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       message.info('请先输入检索词')
       return
     }
+    const isLargeExport = exportMaxRecords === 'all'
+      || (typeof exportMaxRecords === 'number' && exportMaxRecords > DEFAULT_SEARCH_EXPORT_COUNT)
+    if (isLargeExport) {
+      const confirmed = await new Promise<boolean>((resolve) => {
+        Modal.confirm({
+          title: '确认后台大批量导出？',
+          content: exportMaxRecords === 'all'
+            ? '“全部”可能包含大量命中，导出时间、磁盘占用和内存压力都会增加。任务会在后台分批执行，但仍可能影响整体性能，是否继续？'
+            : `本次将导出最多 ${exportMaxRecords.toLocaleString()} 条内容。任务会在后台分批执行，但仍可能耗时较长并占用磁盘，是否继续？`,
+          okText: '继续导出',
+          cancelText: '取消',
+          onOk: () => resolve(true),
+          onCancel: () => resolve(false),
+        })
+      })
+      if (!confirmed) return
+    }
     setExportingExcerpts(true)
     try {
       const activeCitationStyleId = citationMode === 'auto'
         ? selectedCitationStyleId || await loadCitationTemplates(true)
         : undefined
-      const payload = await window.api.exportSearchExcerpts(activeKeyword, buildExportRequestOptions({
+      const payload = await window.api.startSearchExportTask(activeKeyword, buildExportRequestOptions({
         format: exportFormat,
         citationMode,
         citationStyleId: activeCitationStyleId,
         citationTemplateId: citationMode === 'template' ? selectedCitationTemplateId : undefined,
         pageNumberMode: exportPageNumberMode,
       }))
-      if (!payload?.canceled) {
+      if (!payload?.canceled && payload.taskId) {
+        setSearchExportTask({
+          taskId: payload.taskId,
+          kind: 'search-export',
+          status: 'queued',
+          progress: 0,
+          message: '导出任务已加入后台队列。',
+          updatedAt: new Date().toISOString(),
+          taskState: {
+            taskId: payload.taskId,
+            kind: 'search-export',
+            status: 'queued',
+            progress: 0,
+            updatedAt: new Date().toISOString(),
+          },
+        })
         setExportModalOpen(false)
         // Persist the threshold the user just used as the next default.
         saveExportMaxRecords(exportMaxRecords)
         if (isVectorExportContext()) {
           saveExportMinVectorScore(exportMinVectorScore)
         }
-        const scoreFilterNote = isVectorExportContext() && (payload.filteredByMinScore || 0) > 0
-          ? `，相似度不足跳过 ${payload.filteredByMinScore}`
-          : ''
-        message.success(
-          isVectorExportContext()
-            ? `已导出向量证据 ${payload.exportableParagraphs ?? payload.totalHits} 条（上限 ${payload.maxExportRecords ?? exportMaxRecords}；无法还原 ${payload.skippedHits ?? 0}${scoreFilterNote}）`
-            : `已导出 ${payload.exportableParagraphs ?? payload.totalHits} 个完整段落（上限 ${payload.maxExportRecords ?? exportMaxRecords}），跳过 ${payload.skippedHits ?? 0} 条无法还原的命中`,
-        )
+        message.info('导出任务已提交，软件可以继续使用；完成后会通知你。')
       }
     } catch (error: unknown) {
       console.error(error)
@@ -1935,6 +1983,17 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
       message.error(getErrorMessage(error, '批量保存摘录失败'))
     } finally {
       setSavingExcerpts(false)
+    }
+  }
+
+  const handleCancelSearchExportTask = async () => {
+    const taskId = searchExportTask?.taskId
+    if (!taskId || !['queued', 'processing'].includes(searchExportTask?.status || '')) return
+    try {
+      await window.api.cancelSearchExportTask(taskId)
+      message.info('已请求取消导出，正在清理临时文件。')
+    } catch (error: unknown) {
+      message.error(getErrorMessage(error, '取消导出失败'))
     }
   }
 
@@ -2418,6 +2477,27 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
         <Button icon={<RobotOutlined />} onClick={() => void handleAskLibraryAi()} loading={askingLibraryAi}>AI 库问答</Button>
       </Space>
 
+      {searchExportTask && ['queued', 'processing'].includes(searchExportTask.status) ? (
+        <Card size="small" style={{ marginTop: 12 }}>
+          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+            <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+              <Text strong>后台导出任务</Text>
+              <Button danger size="small" onClick={() => void handleCancelSearchExportTask()}>取消导出</Button>
+            </Space>
+            <Progress
+              percent={Math.round(Math.max(0, Math.min(1, Number(searchExportTask.progress || 0))) * 100)}
+              status="active"
+            />
+            <Text type="secondary">
+              {searchExportTask.message || '正在分批写入文件'}
+              {searchExportTask.completedCount != null && searchExportTask.totalCount
+                ? `（${searchExportTask.completedCount.toLocaleString()} / ${searchExportTask.totalCount.toLocaleString()}）`
+                : ''}
+            </Text>
+          </Space>
+        </Card>
+      ) : null}
+
       <Modal
         title={'导出命中摘录'}
         open={exportModalOpen}
@@ -2434,8 +2514,8 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
             type="info"
             showIcon
             message={isVectorExportContext()
-              ? '按当前向量检索结果和相似度筛选导出，不会再次扫描向量库。'
-              : '全文导出会保持原有完整命中逻辑；预览仅在展开后生成。'}
+              ? '按当前向量检索结果和相似度筛选导出；大数量任务会在后台分批写入，不会一次性渲染全部内容。'
+              : '全文导出会保持原有完整命中逻辑；大数量任务会在后台分批写入，预览仅在展开后生成。'}
           />
 
           <div style={{
@@ -2449,17 +2529,31 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               <Text strong style={{ display: 'block', marginBottom: 6 }}>
                 {isVectorExportContext() ? '导出证据数量' : '导出段落数量'}
               </Text>
-              <InputNumber
-                min={1}
-                max={VECTOR_SEARCH_MAX_LIMIT}
-                step={100}
-                value={exportMaxRecords}
-                onChange={applyExportMaxRecords}
-                style={{ width: '100%' }}
-                addonAfter="条"
-              />
+              <Space.Compact style={{ width: '100%' }}>
+                <InputNumber
+                  min={1}
+                  step={100}
+                  value={typeof exportMaxRecords === 'number' ? exportMaxRecords : undefined}
+                  onChange={applyExportMaxRecords}
+                  style={{ width: '100%' }}
+                  addonAfter="条"
+                  placeholder="输入数量"
+                />
+                <Select
+                  value={exportMaxRecords === 'all' ? 'all' : 'custom'}
+                  onChange={(value) => {
+                    if (value === 'all') applyExportMaxRecords('all')
+                    else if (exportMaxRecords === 'all') applyExportMaxRecords(DEFAULT_EXPORT_MAX_RECORDS)
+                  }}
+                  style={{ width: 120 }}
+                  options={[
+                    { value: 'custom', label: '自定义' },
+                    { value: 'all', label: '全部' },
+                  ]}
+                />
+              </Space.Compact>
               <Text type="secondary" style={{ display: 'block', marginTop: 5, fontSize: 12 }}>
-                默认 {VECTOR_SEARCH_DEFAULT_LIMIT}，按相关度从高到低截取并记住选择。
+                默认 {DEFAULT_SEARCH_EXPORT_COUNT.toLocaleString()} 条；可输入更高数量，或选择“全部”。超大导出会在后台分批执行并显示进度。
               </Text>
             </div>
             {isVectorExportContext() ? (

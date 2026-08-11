@@ -97,6 +97,7 @@ assert.ok(
     && searchIpc.includes('await writeFile(outputFilePath'),
   'vector export preview should build only samples and bulk export should avoid page-number N+1/sync writes',
 )
+assert.ok(!searchIpc.includes('HARD_FULLTEXT_EXPORT_MAX = 1000'), 'full-text export must not use the legacy 1,000-record cap')
 assert.ok(embedding.includes('/embeddings'), 'OpenAI-compatible embeddings endpoint')
 assert.ok(settingsView.includes('linkedProfiles') || settingsView.includes('handleSelectEmbeddingSourceProfile'), 'settings reuses AI provider list')
 assert.ok(settingsView.includes('fetchEmbeddingModelOptions') || settingsView.includes('listEmbeddingModels'), 'settings can fetch embedding models')
