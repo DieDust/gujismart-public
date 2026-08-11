@@ -4350,3 +4350,29 @@ mark[data-reader-search-hit-index][data-search-active="true"] {
   color: #98a2b3;
   font-size: 12px;
 }
+
+.library-document-menu .ant-dropdown-menu,
+.library-document-folder-submenu .ant-dropdown-menu {
+  max-height: min(60vh, 480px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.library-document-folder-submenu .ant-dropdown-menu {
+  min-width: 220px;
+  max-width: min(360px, calc(100vw - 24px));
+}
+
+.library-document-menu .ant-dropdown-menu-title-content,
+.library-document-folder-submenu .ant-dropdown-menu-title-content {
+  min-width: 0;
+}
+
+.library-folder-menu-label {
+  display: block;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

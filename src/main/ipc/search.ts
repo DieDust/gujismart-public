@@ -3,7 +3,7 @@ import { createWriteStream, writeFileSync } from 'fs'
 import { rename, unlink, writeFile } from 'fs/promises'
 import { once } from 'events'
 import { nanoid } from 'nanoid'
-import { queryAll, queryOne, run, saveDatabase } from '../database'
+import { getDataDir, getDatabaseFilePath, queryAll, queryOne, run, saveDatabase } from '../database'
 import { createHash } from 'crypto'
 import { resolveCanonicalPageContent } from '../canonical-content'
 import { validateSearchSnapshot } from '../search-snapshots'
@@ -78,6 +78,11 @@ import {
   withLibraryProjectContext,
 } from '../library-projects'
 import { emitBackgroundTaskStatus } from '../background-tasks'
+import {
+  isSearchExportQueryWorkerAvailable,
+  startSearchExportQueryWorkerTask,
+  type SearchExportQueryWorkerProgress,
+} from '../search-export-query-worker-client'
 
 function resolveExportPageNumberMode(options?: { pageNumberMode?: ExportPageNumberMode } | null): ExportPageNumberMode {
   return options?.pageNumberMode === 'natural' ? 'natural' : 'literature'
@@ -224,12 +229,26 @@ interface SearchExportTaskControl {
   outputFilePath: string
   tempFilePath: string
   projectId: string
+  cancelPreparation?: () => void
+}
+
+interface HitSourceLoadCache {
+  segments: Map<string, SearchIndexSegmentRow | null>
+  pages: Map<string, string>
 }
 
 const activeSearchExportTasks = new Map<string, SearchExportTaskControl>()
 
 function waitForNextTick(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve))
+}
+
+function formatSearchExportPreparationElapsed(elapsedMs: number): string {
+  const totalSeconds = Math.max(1, Math.floor(elapsedMs / 1000))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds > 0 ? `${minutes} 分 ${seconds} 秒` : `${minutes} 分钟`
 }
 
 async function writeExportChunk(stream: ReturnType<typeof createWriteStream>, chunk: string): Promise<void> {
@@ -388,8 +407,16 @@ function sanitizeFileName(value: string): string {
     .trim()
     .slice(0, 80) || '检索摘录'
 }
-function loadHitSegment(hit: SearchHit): SearchIndexSegmentRow | null {
+function getHitSegmentCacheKey(hit: SearchHit): string {
   const locator = hit.locator
+  return locator.segmentId
+    || `${locator.docId}\u0000${locator.pageNum ?? -1}\u0000${locator.segmentOrdinal ?? -1}\u0000${locator.href || ''}`
+}
+
+function loadHitSegment(hit: SearchHit, cache?: HitSourceLoadCache): SearchIndexSegmentRow | null {
+  const locator = hit.locator
+  const cacheKey = getHitSegmentCacheKey(hit)
+  if (cache?.segments.has(cacheKey)) return cache.segments.get(cacheKey) || null
   const selectSql = `SELECT segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text
     FROM search_index_segments`
   const attempts: Array<{ where: string; params: unknown[] }> = []
@@ -419,15 +446,21 @@ function loadHitSegment(hit: SearchHit): SearchIndexSegmentRow | null {
       `${selectSql} WHERE ${attempt.where} ORDER BY ordinal ASC LIMIT 1`,
       attempt.params,
     )
-    if (row) return row
+    if (row) {
+      cache?.segments.set(cacheKey, row)
+      return row
+    }
   }
 
+  cache?.segments.set(cacheKey, null)
   return null
 }
 
-function loadHitPageText(hit: SearchHit): string {
+function loadHitPageText(hit: SearchHit, cache?: HitSourceLoadCache): string {
   const pageNum = hit.locator.pageNum
   if (!pageNum) return ''
+  const cacheKey = `${hit.locator.docId}\u0000${pageNum}`
+  if (cache?.pages.has(cacheKey)) return cache.pages.get(cacheKey) || ''
   const row = queryOne<{ id: string }>(
     `SELECT id
      FROM pages
@@ -436,7 +469,9 @@ function loadHitPageText(hit: SearchHit): string {
      LIMIT 1`,
     [hit.locator.docId, pageNum],
   )
-  return row?.id ? resolveCanonicalPageContent(row.id).text : ''
+  const text = row?.id ? resolveCanonicalPageContent(row.id).text : ''
+  cache?.pages.set(cacheKey, text)
+  return text
 }
 
 function findNthOccurrence(text: string, term: string, occurrenceIndex: number): number {
@@ -471,9 +506,9 @@ function expandToParagraphWithRange(text: string, hitIndex: number): { text: str
   return { text: normalizeParagraphText(text), start: 0, end: text.length }
 }
 
-function getHitSourceText(hit: SearchHit, allowQueueReindex = true): HitSourceResolution | null {
-  const segment = loadHitSegment(hit)
-  const pageText = cleanExcerptText(loadHitPageText(hit))
+function getHitSourceText(hit: SearchHit, allowQueueReindex = true, cache?: HitSourceLoadCache): HitSourceResolution | null {
+  const segment = loadHitSegment(hit, cache)
+  const pageText = cleanExcerptText(loadHitPageText(hit, cache))
   const rawSegmentText = segment?.text ? cleanExcerptText(segment.text) : ''
   const normalizedSegmentText = segment?.normalized_text ? cleanExcerptText(segment.normalized_text) : ''
   const sourceStart = Math.max(0, Number(segment?.source_start || 0))
@@ -585,8 +620,8 @@ function resolveParagraphFromSource(hit: SearchHit, source: HitSourceResolution)
   }
 }
 
-function getHitParagraph(hit: SearchHit): HitParagraphResolution | null {
-  const source = getHitSourceText(hit)
+function getHitParagraph(hit: SearchHit, cache?: HitSourceLoadCache): HitParagraphResolution | null {
+  const source = getHitSourceText(hit, true, cache)
   if (!source?.text) {
     // Vector hits often carry a usable excerpt even when locator expand fails.
     return getHitParagraphFromSnippet(hit)
@@ -688,36 +723,37 @@ function normalizeExportParagraphHitCount(paragraph: ExportParagraph): ExportPar
   }
 }
 
-function buildExportParagraphs(group: SearchDocumentGroup): ExportParagraphBuildResult {
-  const paragraphs = new Map<string, ExportParagraph>()
-  let missingHits = 0
-  for (const hit of group.hits) {
-    const paragraph = getHitParagraph(hit)
-    if (!paragraph?.text) {
-      missingHits += 1
-      continue
+function collectExportParagraph(
+  paragraphs: Map<string, ExportParagraph>,
+  hit: SearchHit,
+  cache: HitSourceLoadCache,
+): boolean {
+  const paragraph = getHitParagraph(hit, cache)
+  if (!paragraph?.text) return false
+  const hitKey = getExportParagraphHitKey(hit, paragraph)
+  const existing = paragraphs.get(paragraph.key)
+  if (existing) {
+    if (!existing.hitKeys.has(hitKey)) {
+      existing.hitKeys.add(hitKey)
+      existing.hitCount += 1
     }
-    const hitKey = getExportParagraphHitKey(hit, paragraph)
-    const existing = paragraphs.get(paragraph.key)
-    if (existing) {
-      if (!existing.hitKeys.has(hitKey)) {
-        existing.hitKeys.add(hitKey)
-        existing.hitCount += 1
-      }
-      if (hit.locator.queryTerm) existing.terms.add(hit.locator.queryTerm)
-      continue
-    }
-    paragraphs.set(paragraph.key, {
-      key: paragraph.key,
-      text: paragraph.text,
-      firstHit: hit,
-      hitCount: 1,
-      hitKeys: new Set([hitKey]),
-      terms: new Set(hit.locator.queryTerm ? [hit.locator.queryTerm] : []),
-      sourceType: paragraph.source.sourceType,
-      sourceKey: paragraph.source.sourceKey,
-    })
+    if (hit.locator.queryTerm) existing.terms.add(hit.locator.queryTerm)
+    return true
   }
+  paragraphs.set(paragraph.key, {
+    key: paragraph.key,
+    text: paragraph.text,
+    firstHit: hit,
+    hitCount: 1,
+    hitKeys: new Set([hitKey]),
+    terms: new Set(hit.locator.queryTerm ? [hit.locator.queryTerm] : []),
+    sourceType: paragraph.source.sourceType,
+    sourceKey: paragraph.source.sourceKey,
+  })
+  return true
+}
+
+function finalizeExportParagraphs(paragraphs: Map<string, ExportParagraph>, missingHits: number): ExportParagraphBuildResult {
   const normalizedParagraphs = [...paragraphs.values()].map(normalizeExportParagraphHitCount)
   return {
     paragraphs: normalizedParagraphs.sort((left, right) => (
@@ -727,6 +763,38 @@ function buildExportParagraphs(group: SearchDocumentGroup): ExportParagraphBuild
     )),
     missingHits,
   }
+}
+
+function buildExportParagraphs(group: SearchDocumentGroup): ExportParagraphBuildResult {
+  const paragraphs = new Map<string, ExportParagraph>()
+  const cache: HitSourceLoadCache = { segments: new Map(), pages: new Map() }
+  let missingHits = 0
+  for (const hit of group.hits) {
+    if (!collectExportParagraph(paragraphs, hit, cache)) missingHits += 1
+  }
+  return finalizeExportParagraphs(paragraphs, missingHits)
+}
+
+async function buildExportParagraphsInBatches(
+  group: SearchDocumentGroup,
+  control: SearchExportTaskControl,
+  onBatch: (processedHits: number) => void,
+): Promise<ExportParagraphBuildResult> {
+  const paragraphs = new Map<string, ExportParagraph>()
+  const cache: HitSourceLoadCache = { segments: new Map(), pages: new Map() }
+  let missingHits = 0
+  const batchSize = 24
+  for (let index = 0; index < group.hits.length; index += 1) {
+    if (control.canceled) throw new Error('__search_export_canceled__')
+    if (!collectExportParagraph(paragraphs, group.hits[index], cache)) missingHits += 1
+    const processedHits = index + 1
+    if (processedHits % batchSize === 0) {
+      onBatch(processedHits)
+      await waitForNextTick()
+    }
+  }
+  onBatch(group.hits.length)
+  return finalizeExportParagraphs(paragraphs, missingHits)
 }
 
 function getLocationSuffix(hit: SearchHit, displayPageNum?: number | null): string {
@@ -1286,23 +1354,55 @@ async function runSearchExportTask(
   const taskOptions = buildSearchExportTaskConfig(options)
   const vectorMode = taskOptions.searchEngine === 'vector'
   try {
+    const preparationStartedAt = Date.now()
+    let preparationMessage = vectorMode
+      ? '正在准备向量检索结果和导出文件。'
+      : '正在启动后台全文检索。'
+    const emitPreparationStatus = () => {
+      const elapsedMs = Date.now() - preparationStartedAt
+      emitBackgroundTaskStatus({
+        taskId,
+        kind: 'search-export',
+        status: 'processing',
+        message: elapsedMs >= 1000
+          ? `${preparationMessage}（已等待 ${formatSearchExportPreparationElapsed(elapsedMs)}）`
+          : preparationMessage,
+      })
+    }
+    emitPreparationStatus()
+    await waitForNextTick()
+    if (control.canceled) throw new Error('__search_export_canceled__')
+    const preparationHeartbeat = setInterval(emitPreparationStatus, 1000)
+    let response: SearchGroupedResponse
+    try {
+      response = await withLibraryProjectContext(
+        control.projectId,
+        () => resolveExportSearchResponse(keyword, options, {
+          projectId: control.projectId,
+          control,
+          onPreparationProgress: (progress) => {
+            preparationMessage = progress.message
+            emitPreparationStatus()
+          },
+        }),
+      )
+    } finally {
+      clearInterval(preparationHeartbeat)
+    }
+    if (!response.totalHits) throw new Error('当前检索没有可导出的命中。')
+
+    const maxRecords = searchExportCountToLimit(taskOptions.maxExportRecords || DEFAULT_SEARCH_EXPORT_COUNT)
+    const totalWork = response.groups.reduce((sum, group) => sum + group.hits.length, 0)
     emitBackgroundTaskStatus({
       taskId,
       kind: 'search-export',
       status: 'processing',
       progress: 0,
-      totalCount: 0,
+      totalCount: totalWork,
       completedCount: 0,
-      message: '正在准备检索结果和导出文件。',
+      message: `检索完成，共取得 ${totalWork.toLocaleString()} 条命中，正在写入文件。`,
     })
     await waitForNextTick()
-    const response = await withLibraryProjectContext(control.projectId, () => resolveExportSearchResponse(keyword, options))
-    if (!response.totalHits) throw new Error('当前检索没有可导出的命中。')
-
-    const maxRecords = searchExportCountToLimit(taskOptions.maxExportRecords || DEFAULT_SEARCH_EXPORT_COUNT)
-    const totalWork = vectorMode
-      ? response.groups.reduce((sum, group) => sum + group.hits.length, 0)
-      : response.groups.length
     const stream = createWriteStream(control.tempFilePath, { encoding: 'utf8' })
     let streamError: Error | null = null
     stream.on('error', (error) => { streamError = error instanceof Error ? error : new Error(String(error)) })
@@ -1319,14 +1419,18 @@ async function runSearchExportTask(
     let filtered = 0
     let selected = 0
     let jsonFirstRecord = true
-    const emitProgress = (message: string, status: 'processing' = 'processing') => {
+    const emitProgress = (
+      message: string,
+      status: 'processing' = 'processing',
+      completedCount = processed,
+    ) => {
       emitBackgroundTaskStatus({
         taskId,
         kind: 'search-export',
         status,
-        progress: totalWork > 0 ? Math.min(0.99, processed / totalWork) : 0,
+        progress: totalWork > 0 ? Math.min(0.99, completedCount / totalWork) : 0,
         totalCount: totalWork,
-        completedCount: processed,
+        completedCount,
         message,
       })
     }
@@ -1385,15 +1489,30 @@ async function runSearchExportTask(
     } else {
       for (const group of response.groups) {
         if (control.canceled) throw new Error('__search_export_canceled__')
-        const built = buildExportParagraphs(group)
+        const processedBeforeGroup = processed
+        const built = await buildExportParagraphsInBatches(group, control, (groupProcessedHits) => {
+          emitProgress(
+            `正在还原命中 ${Math.min(totalWork, processedBeforeGroup + groupProcessedHits).toLocaleString()} / ${totalWork.toLocaleString()}。`,
+            'processing',
+            processedBeforeGroup + groupProcessedHits,
+          )
+        })
         missing += built.missingHits
-        processed += 1
+        processed += group.hits.length
+        const literaturePageCache = taskOptions.pageNumberMode === 'literature'
+          ? buildLiteraturePageCache(built.paragraphs.map((paragraph) => ({ group, hit: paragraph.firstHit })))
+          : undefined
         for (const paragraph of built.paragraphs) {
           if (control.canceled) throw new Error('__search_export_canceled__')
           if (selected >= maxRecords) break
           selected += 1
           const hit = paragraph.firstHit
-          const pageNum = resolveExportHitPageNum(hit, group, taskOptions.pageNumberMode || 'literature')
+          const pageNum = resolveExportHitPageNum(
+            hit,
+            group,
+            taskOptions.pageNumberMode || 'literature',
+            literaturePageCache,
+          )
           await writeRecord({
             title: group.title || 'Untitled',
             author: group.author || null,
@@ -1415,7 +1534,7 @@ async function runSearchExportTask(
           })
           if (exported % 20 === 0) await waitForNextTick()
         }
-        if (processed % 5 === 0) emitProgress(`正在处理文献 ${processed.toLocaleString()} / ${totalWork.toLocaleString()}。`)
+        emitProgress(`已处理 ${processed.toLocaleString()} / ${totalWork.toLocaleString()} 条命中。`)
         if (selected >= maxRecords) break
       }
     }
@@ -1460,6 +1579,7 @@ async function runSearchExportTask(
       errorMessage: canceled ? undefined : (error instanceof Error ? error.message : String(error)),
     })
   } finally {
+    control.cancelPreparation = undefined
     activeSearchExportTasks.delete(taskId)
   }
 }
@@ -1485,7 +1605,9 @@ async function startSearchExportTask(keyword: string, options?: SearchOptions): 
   }
   activeSearchExportTasks.set(taskId, control)
   emitBackgroundTaskStatus({ taskId, kind: 'search-export', status: 'queued', progress: 0, message: '导出任务已加入后台队列。' })
-  void runSearchExportTask(taskId, query, options || {}, control)
+  setImmediate(() => {
+    void runSearchExportTask(taskId, query, options || {}, control)
+  })
   return { taskId, canceled: false, filePath: null }
 }
 
@@ -1493,6 +1615,7 @@ function cancelSearchExportTask(taskId: string): boolean {
   const control = activeSearchExportTasks.get(String(taskId || '').trim())
   if (!control) return false
   control.canceled = true
+  control.cancelPreparation?.()
   return true
 }
 
@@ -1821,7 +1944,15 @@ function normalizeExportGroups(groups: SearchDocumentGroup[] | undefined | null)
     .filter((group): group is SearchDocumentGroup => !!group)
 }
 
-async function resolveExportSearchResponse(keyword: string, options?: SearchOptions): Promise<SearchGroupedResponse> {
+async function resolveExportSearchResponse(
+  keyword: string,
+  options?: SearchOptions,
+  context?: {
+    projectId?: string
+    control?: SearchExportTaskControl
+    onPreparationProgress?: (progress: SearchExportQueryWorkerProgress) => void
+  },
+): Promise<SearchGroupedResponse> {
   const query = String(keyword || '').trim()
   const {
     citationMode: _citationMode,
@@ -1886,12 +2017,30 @@ async function resolveExportSearchResponse(keyword: string, options?: SearchOpti
     return buildGroupedResponseFromVectorHits(query, vectorRes.hits || [], vectorRes.modelId || '')
   }
 
-  return querySearchV2(query, {
-    ...searchOptions,
-    limit: Math.max(Number(searchOptions?.limit || 0), requestedExportLimit),
-    exhaustive: true,
-    resultMode: 'all',
-  })
+  if (!isSearchExportQueryWorkerAvailable()) {
+    throw new Error('后台全文导出组件缺失，请重新安装完整版本后再试。')
+  }
+  const workerHandle = startSearchExportQueryWorkerTask({
+    databasePath: getDatabaseFilePath(),
+    dataDir: getDataDir(),
+    projectId: context?.projectId || getActiveLibraryProjectId(),
+    keyword: query,
+    options: {
+      ...searchOptions,
+      limit: Math.max(Number(searchOptions?.limit || 0), requestedExportLimit),
+      exhaustive: true,
+      resultMode: 'all',
+      autoReindex: false,
+    },
+  }, context?.onPreparationProgress)
+  if (context?.control) context.control.cancelPreparation = workerHandle.cancel
+  try {
+    return await workerHandle.result
+  } finally {
+    if (context?.control?.cancelPreparation === workerHandle.cancel) {
+      context.control.cancelPreparation = undefined
+    }
+  }
 }
 
 function buildGroupedResponseFromVectorHits(

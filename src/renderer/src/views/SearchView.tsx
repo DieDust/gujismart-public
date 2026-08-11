@@ -2484,10 +2484,17 @@ export default function SearchView({ onSelectDoc, initialKeyword, onOpenLibraryA
               <Text strong>后台导出任务</Text>
               <Button danger size="small" onClick={() => void handleCancelSearchExportTask()}>取消导出</Button>
             </Space>
-            <Progress
-              percent={Math.round(Math.max(0, Math.min(1, Number(searchExportTask.progress || 0))) * 100)}
-              status="active"
-            />
+            {Number(searchExportTask.totalCount || 0) > 0 ? (
+              <Progress
+                percent={Math.round(Math.max(0, Math.min(1, Number(searchExportTask.progress || 0))) * 100)}
+                status="active"
+              />
+            ) : (
+              <Space size={8}>
+                <Spin size="small" />
+                <Text type="secondary">正在后台准备，软件仍可继续使用</Text>
+              </Space>
+            )}
             <Text type="secondary">
               {searchExportTask.message || '正在分批写入文件'}
               {searchExportTask.completedCount != null && searchExportTask.totalCount

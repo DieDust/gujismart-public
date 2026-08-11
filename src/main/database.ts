@@ -329,6 +329,35 @@ export function getDatabaseFilePath(): string {
   return dbFilePath
 }
 
+/**
+ * Open the existing library database for a background worker without running
+ * migrations, checkpoints, or any other startup writes.
+ */
+export function initReadOnlyWorkerDatabase(input: { databasePath: string; dataDir: string }): void {
+  if (db) throw new Error('Database already initialized')
+  const nextDatabasePath = resolve(String(input.databasePath || ''))
+  const nextDataDir = resolve(String(input.dataDir || ''))
+  if (!existsSync(nextDatabasePath)) throw new Error('Worker database file does not exist')
+
+  cachedDataDir = nextDataDir
+  setPayloadDataDir(nextDataDir)
+  dbFilePath = nextDatabasePath
+
+  const database = new Database(nextDatabasePath, { readonly: true, fileMustExist: true })
+  database.pragma('foreign_keys = ON')
+  database.pragma('query_only = ON')
+  database.pragma(`busy_timeout = ${DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS}`)
+  db = database
+
+  const tableRows = database.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('search_segments_fts', 'search_segments_trigram')",
+  ).all() as Array<{ name?: string }>
+  const tableNames = new Set(tableRows.map((row) => String(row.name || '')))
+  ftsAvailable = tableNames.has('search_segments_fts')
+  searchTrigramFtsAvailable = tableNames.has('search_segments_trigram')
+  searchSegmentsFtsNeedsRebuild = false
+}
+
 function sleepAsync(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }

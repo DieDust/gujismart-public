@@ -14,7 +14,8 @@ export default defineConfig({
           'database-diagnostics-worker': resolve(__dirname, 'src/main/database-diagnostics-worker.ts'),
           'document-delete-worker': resolve(__dirname, 'src/main/document-delete-worker.ts'),
           'health-report-worker': resolve(__dirname, 'src/main/health-report-worker.ts'),
-          'search-index-worker': resolve(__dirname, 'src/main/search-index-worker.ts')
+          'search-index-worker': resolve(__dirname, 'src/main/search-index-worker.ts'),
+          'search-export-query-worker': resolve(__dirname, 'src/main/search-export-query-worker.ts')
         }
       }
     }

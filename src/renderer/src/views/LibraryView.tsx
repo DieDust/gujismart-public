@@ -993,7 +993,7 @@ interface DocumentCardContext {
   batchMode: boolean
   selectedIds: string[]
   selectedIdSet: Set<string>
-  folders: FolderItem[]
+  folderTree: Array<FolderTreeNode<FolderItem>>
   tags: TagItem[]
   sortedSidebarTags: TagItem[]
   visionOcrProfiles: LlmProviderProfile[]
@@ -1871,10 +1871,64 @@ function buildBatchMenuItems(
   ]
 }
 
+type ConcreteMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
+
+function renderFolderMenuLabel(name: string, direct = false) {
+  const label = direct ? `加入“${name}”` : name
+  return <span className="library-folder-menu-label" title={label}>{label}</span>
+}
+
+function buildDocumentFolderMenuItems(
+  folderTree: FolderTreeNode<FolderItem>[],
+  docFolderIds: string[],
+): MenuProps['items'] {
+  const assignedFolderIds = new Set(docFolderIds)
+  const buildNode = (node: FolderTreeNode<FolderItem>): ConcreteMenuItem | null => {
+    const childItems: ConcreteMenuItem[] = []
+    node.children.forEach((child) => {
+      const childItem = buildNode(child)
+      if (childItem) childItems.push(childItem)
+    })
+
+    const canAddToNode = !assignedFolderIds.has(node.id)
+    if (childItems.length === 0) {
+      return canAddToNode
+        ? { key: `folder_${node.id}`, label: renderFolderMenuLabel(node.name) }
+        : null
+    }
+
+    const children: ConcreteMenuItem[] = []
+    if (canAddToNode) {
+      children.push({
+        key: `folder_${node.id}`,
+        label: renderFolderMenuLabel(node.name, true),
+        icon: <FolderAddOutlined />,
+      })
+      children.push({ type: 'divider' })
+    }
+    children.push(...childItems)
+    return {
+      key: `folder-parent:${node.id}`,
+      label: renderFolderMenuLabel(node.name),
+      popupClassName: 'library-document-folder-submenu',
+      children,
+    }
+  }
+
+  const items: ConcreteMenuItem[] = []
+  folderTree.forEach((node) => {
+    const item = buildNode(node)
+    if (item) items.push(item)
+  })
+  return items.length > 0
+    ? items
+    : [{ key: 'folder_none', label: '没有可加入的文件夹', disabled: true }]
+}
+
 /** Single-document context / more menu — primary actions first, heavy groups nested. */
 function buildDocumentMoreMenuItems(input: {
   doc: DocumentItem
-  availableFolders: FolderItem[]
+  folderTree: Array<FolderTreeNode<FolderItem>>
   docFolderIds: string[]
   docFolderNames: string[]
   pdfAssetState: 'available' | 'text_only' | 'unknown'
@@ -1882,7 +1936,7 @@ function buildDocumentMoreMenuItems(input: {
   activeVisionProfileId: string
   onOcrDefaultSelect: (action: 'retry_failed_ocr_pages' | 'rerun_ocr_book', selection: OcrMenuSelection) => void
 }): MenuProps['items'] {
-  const { doc, availableFolders, docFolderIds, docFolderNames, pdfAssetState, visionProfiles, activeVisionProfileId, onOcrDefaultSelect } = input
+  const { doc, folderTree, docFolderIds, docFolderNames, pdfAssetState, visionProfiles, activeVisionProfileId, onOcrDefaultSelect } = input
   const readMenuItems: MenuProps['items'] = (Object.keys(READ_STATUS_MAP) as ReadStatus[]).map((status) => ({
     key: status,
     label: READ_STATUS_MAP[status].text,
@@ -1965,9 +2019,8 @@ function buildDocumentMoreMenuItems(input: {
           key: 'add_to_folder',
           label: '加入文件夹',
           icon: <FolderAddOutlined />,
-          children: availableFolders.length > 0
-            ? availableFolders.map((item) => ({ key: `folder_${item.id}`, label: item.name }))
-            : [{ key: 'folder_none', label: '没有可加入的文件夹', disabled: true }],
+          popupClassName: 'library-document-folder-submenu',
+          children: buildDocumentFolderMenuItems(folderTree, docFolderIds),
         },
         ...(docFolderIds.length > 0
           ? [{
@@ -2301,7 +2354,6 @@ function DocumentVirtualRow({
   const visibleTags = orderedDocTags.slice(0, 6)
   const displayAuthor = getDisplayMetadataText(doc.author)
   const displayDynasty = getDisplayMetadataText(doc.dynasty)
-  const availableFolders = context.folders.filter((item) => !docFolderIds.includes(item.id))
   const progressInfo = resolveOcrProgressInfo(doc, context.ocrProgressByDoc[doc.id])
   const bookTranslationProgressInfo = context.bookTranslationProgressByDoc[doc.id]
   const pdfAssetState = getPdfAssetState(doc)
@@ -2317,7 +2369,7 @@ function DocumentVirtualRow({
   ]
   const moreMenuItems: MenuProps['items'] = buildDocumentMoreMenuItems({
     doc,
-    availableFolders,
+    folderTree: context.folderTree,
     docFolderIds,
     docFolderNames,
     pdfAssetState,
@@ -2423,6 +2475,7 @@ function DocumentVirtualRow({
   return (
     <div {...ariaAttributes} style={{ ...style, padding: '0 24px 4px', boxSizing: 'border-box' }}>
       <Dropdown
+        overlayClassName="library-document-menu"
         menu={{
           items: context.getDocumentContextMenuItems(doc.id, moreMenuItems),
           onClick: context.handleDocumentContextMenuClick(doc.id, handleMoreClick),
@@ -2620,7 +2673,7 @@ function DocumentVirtualRow({
               <Dropdown menu={{ items: readMenuItems, onClick: ({ key }) => void context.handleSetReadStatus(doc.id, key as ReadStatus) }}>
                 <Button type="text" size="small" icon={getReadStatusIcon(doc.read_status)} />
               </Dropdown>
-              <Dropdown menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
+              <Dropdown overlayClassName="library-document-menu" menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
                 <Button type="text" size="small" icon={<MoreOutlined />} />
               </Dropdown>
               <Popconfirm
@@ -7503,7 +7556,7 @@ export default function LibraryView({
     batchMode,
     selectedIds,
     selectedIdSet,
-    folders,
+    folderTree,
     tags,
     sortedSidebarTags,
     visionOcrProfiles,
@@ -7551,7 +7604,7 @@ export default function LibraryView({
     batchMode,
     bookTranslationProgressByDoc,
     embeddingProgressByDoc,
-    folders,
+    folderTree,
     handleAddToFolder,
     handleBatchMenu,
     handleCancelEmbedding,
@@ -8428,7 +8481,6 @@ export default function LibraryView({
                 color: docTagColors[index],
                 source: docTagSources[index]
               }))).filter((tagItem) => !!getDisplayTagText(tagItem.name))
-              const availableFolders = folderItems.filter((item) => !docFolderIds.includes(item.id))
               const visibleTagCount = viewMode === 'grid'
                 ? (docFolderNames.length > 0 ? 1 : 2)
                 : 6
@@ -8462,7 +8514,7 @@ export default function LibraryView({
 
               const moreMenuItems: MenuProps['items'] = buildDocumentMoreMenuItems({
                 doc,
-                availableFolders,
+                folderTree,
                 docFolderIds,
                 docFolderNames,
                 pdfAssetState,
@@ -8572,6 +8624,7 @@ export default function LibraryView({
               return (
                 <Dropdown
                   key={doc.id}
+                  overlayClassName="library-document-menu"
                   menu={{
                     items: getDocumentContextMenuItems(doc.id, moreMenuItems),
                     onClick: handleDocumentContextMenuClick(doc.id, handleMoreClick),
@@ -8783,7 +8836,7 @@ export default function LibraryView({
                             <Button type="text" size="small" icon={<TagOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
                           </Popover>
 
-                          <Dropdown menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
+                          <Dropdown overlayClassName="library-document-menu" menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
                             <Button type="text" size="small" icon={<MoreOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
                           </Dropdown>
 

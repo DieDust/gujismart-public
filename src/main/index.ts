@@ -13,6 +13,7 @@ import { fileCapabilityService } from './file-capabilities'
 import { importSelectionService } from './import-selections'
 import { shutdownHealthReportWorkers } from './health-report-worker-client'
 import { shutdownSearchIndexWorkers } from './search-index-worker-client'
+import { shutdownSearchExportQueryWorkers } from './search-export-query-worker-client'
 import { shutdownDatabaseDiagnosticsWorkers } from './database-diagnostics-worker-client'
 import { ensureDisabledMetadataTagBindingsCleared, ensureEnabledMetadataTagBindingsRebuilt } from './metadata-tags'
 import { shutdownStartupRecovery } from './startup-recovery'
@@ -441,6 +442,7 @@ async function shutdownApplicationRuntime(): Promise<void> {
       shutdownDatabaseDiagnosticsWorkers(),
       shutdownHealthReportWorkers(),
       shutdownSearchIndexWorkers(),
+      shutdownSearchExportQueryWorkers(),
     ])
     closeDatabase()
   })()

@@ -1,5 +1,28 @@
 # 更新日志 / Changelog
 
+## 1.2.31 - 2026-08-11
+
+### 中文
+
+- 检索摘录导出默认支持 10,000 条，可手动输入更高数量或选择“全部”；大批量任务采用临时文件和完成后替换，支持进度显示与取消。
+- 修复全文导出提交后软件长时间“未响应”、任务停在 0%，随后突然秒完成的问题。全量检索准备现在运行在独立只读工作线程，不再占用 Electron 主进程；准备阶段持续显示当前检索阶段与已等待时间，取得命中总量后再切换为真实百分比；段落还原按小批次让出事件循环，并缓存同页、同段文本以减少重复数据库读取。
+- 修复导出任务开始事件早于启动 IPC 返回、导致界面被旧的“已加入队列”状态覆盖的问题；任务现在先返回编号，再进入后台准备，取消按钮也能终止仍在准备阶段的检索线程。
+- 文献卡片“加入文件夹”现在按父文件夹与子文件夹真实层级显示。父文件夹仍可直接选择，已经加入的父文件夹仍会保留为可用子文件夹的路径。
+- 文件夹菜单每一级最多占窗口约 60% 高度，文件夹过多时可独立上下滚动；长名称自动省略并可悬停查看完整内容。
+
+### English
+
+- Search excerpt exports now default to 10,000 records, accept larger custom counts or `All`, and run as cancellable progress-reporting jobs using temporary files and completion-time replacement.
+- Fixed full-text exports leaving the application “Not Responding” at 0% and then finishing suddenly. Exhaustive search preparation now runs in a dedicated read-only worker instead of the Electron main process; the preparation stage continuously reports its current phase and elapsed wait time, then switches to a real percentage once the hit count is known; paragraph restoration yields in small batches and caches repeated page/segment reads.
+- Fixed the export processing event racing ahead of the start IPC response and being overwritten by a stale queued state. The task ID now returns before background preparation starts, and cancellation can terminate a query that is still preparing.
+- “Add to folder” on document cards now preserves the actual parent/child hierarchy. Parent folders remain directly selectable, and an already assigned parent is retained as the path to available descendants.
+- Every folder submenu is capped at roughly 60% of the window height and scrolls independently when needed. Long names are truncated with the full value available on hover.
+
+#### 下载 / Downloads
+
+- `GujiSmart-1.2.31-Setup-x64.exe`
+- `GujiSmart-1.2.31-Portable-x64.exe`
+
 ## 1.2.30 - 2026-08-06
 
 ### 中文
