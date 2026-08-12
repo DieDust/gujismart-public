@@ -225,8 +225,7 @@ function getInitialFolderDocumentSort(): FolderDocumentSortValue {
 }
 
 function buildFolderDocumentMenuItems(input: {
-  folderTree: Array<FolderTreeNode<FolderOverviewItem>>
-  assignedFolderIds: string[]
+  folderMenuItems: MenuProps['items']
   documentCount: number
   includeOpenActions?: boolean
   canRemoveFromCurrentFolder: boolean
@@ -244,7 +243,7 @@ function buildFolderDocumentMenuItems(input: {
       label: batch ? `批量加入文件夹（${input.documentCount} 篇）` : '加入文件夹',
       icon: <FolderAddOutlined />,
       popupClassName: 'library-document-folder-submenu',
-      children: buildDocumentFolderMenuItems(input.folderTree, input.assignedFolderIds),
+      children: input.folderMenuItems,
     },
     {
       key: 'move',
@@ -442,6 +441,25 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
       disabled: folder.id === selectedFolder?.id,
     }))
   ), [folders, selectedFolder])
+  const documentFolderMenuItems = useMemo(() => (
+    buildDocumentFolderMenuItems(folderTree, selectedFolder ? [selectedFolder.id] : [])
+  ), [folderTree, selectedFolder?.id])
+  const singleDocumentMenuItems = useMemo(() => buildFolderDocumentMenuItems({
+    folderMenuItems: documentFolderMenuItems,
+    documentCount: 1,
+    canRemoveFromCurrentFolder: Boolean(selectedFolder),
+  }), [documentFolderMenuItems, selectedFolder])
+  const selectedDocumentContextMenuItems = useMemo(() => buildFolderDocumentMenuItems({
+    folderMenuItems: documentFolderMenuItems,
+    documentCount: Math.max(1, selectedDocumentIds.length),
+    canRemoveFromCurrentFolder: Boolean(selectedFolder),
+  }), [documentFolderMenuItems, selectedDocumentIds.length, selectedFolder])
+  const selectedDocumentBatchMenuItems = useMemo(() => buildFolderDocumentMenuItems({
+    folderMenuItems: documentFolderMenuItems,
+    documentCount: Math.max(1, selectedDocumentIds.length),
+    includeOpenActions: false,
+    canRemoveFromCurrentFolder: Boolean(selectedFolder),
+  }), [documentFolderMenuItems, selectedDocumentIds.length, selectedFolder])
 
   const clearDocumentSelection = useCallback(() => {
     setSelectedDocumentIds([])
@@ -1788,12 +1806,9 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
     const typeLabel = getDocumentTypeLabel(doc.doc_type)
     const selected = selectedDocumentIdSet.has(doc.id)
     const actionDocIds = getActionDocIds(doc.id)
-    const menuItems = buildFolderDocumentMenuItems({
-      folderTree,
-      assignedFolderIds: selectedFolder ? [selectedFolder.id] : [],
-      documentCount: actionDocIds.length,
-      canRemoveFromCurrentFolder: Boolean(selectedFolder),
-    })
+    const menuItems = selected && selectedDocumentIds.length > 1
+      ? selectedDocumentContextMenuItems
+      : singleDocumentMenuItems
     return (
       <Dropdown
         key={doc.id}
@@ -1860,13 +1875,7 @@ export default function FoldersView({ onOpenFolder, onOpenDocument, initialState
           </Button>
           <Dropdown
             menu={{
-              items: buildFolderDocumentMenuItems({
-                folderTree,
-                assignedFolderIds: selectedFolder ? [selectedFolder.id] : [],
-                documentCount: selectedDocumentIds.length,
-                includeOpenActions: false,
-                canRemoveFromCurrentFolder: Boolean(selectedFolder),
-              }),
+              items: selectedDocumentBatchMenuItems,
               onClick: ({ key }) => handleFolderDocumentMenuClick(selectedDocumentIds, String(key)),
             }}
           >

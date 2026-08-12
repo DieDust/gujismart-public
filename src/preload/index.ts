@@ -1054,6 +1054,8 @@ const api = {
   openDataDirectory: (): Promise<boolean> => ipcRenderer.invoke('backup:openDataDirectory'),
   openAutoBackupDirectory: (): Promise<boolean> => ipcRenderer.invoke('backup:openAutoBackupDirectory'),
   exportDocumentList: (): Promise<BackupResult> => ipcRenderer.invoke('backup:exportDocumentList'),
+  getDatabaseStartupStorageDiagnostics: (): Promise<DatabaseStorageDiagnostics> =>
+    ipcRenderer.invoke('database:getStartupStorageDiagnostics'),
   getDatabaseStorageDiagnostics: (): Promise<DatabaseStorageDiagnostics> =>
     ipcRenderer.invoke('database:getStorageDiagnostics'),
   getDatabaseLockDiagnostics: (): Promise<DatabaseLockDiagnostics> =>

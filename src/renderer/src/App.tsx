@@ -1007,7 +1007,7 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
     let cancelled = false
     const evaluateDatabaseUpgrade = async () => {
       try {
-        const diagnostics = await window.api.getDatabaseStorageDiagnostics()
+        const diagnostics = await window.api.getDatabaseStartupStorageDiagnostics()
         if (cancelled) return
         setDatabaseUpgradeDiagnostics(diagnostics)
         setDatabaseUpgradeVisible(hasRequiredDatabaseMaintenance(diagnostics))

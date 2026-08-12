@@ -149,6 +149,13 @@ assertIncludes(foldersView, "from '../utils/documentFolderMenu'", 'FoldersView a
 assertIncludes(libraryView, "from '../utils/documentFolderMenu'", 'LibraryView and FoldersView should import the same add-to-folder menu builder')
 assertIncludes(documentFolderMenu, 'export function buildDocumentFolderMenuItems', 'shared folder menu helper should own recursive parent/child rendering')
 assertIncludes(foldersView, 'function buildFolderDocumentMenuItems', 'FoldersView should centralize single and batch document context menu construction')
+assertIncludes(foldersView, 'const documentFolderMenuItems = useMemo(() => (', 'FoldersView should build the recursive folder assignment tree once per folder snapshot')
+assertIncludes(foldersView, 'folderMenuItems: documentFolderMenuItems', 'FoldersView should reuse one recursive folder assignment tree across document cards and batch actions')
+assertNotIncludes(
+  foldersView.slice(foldersView.indexOf('function buildFolderDocumentMenuItems'), foldersView.indexOf('export default function FoldersView')),
+  'buildDocumentFolderMenuItems(',
+  'Per-document menu construction must not recursively rebuild the full folder tree',
+)
 assertIncludes(foldersView, 'handleFolderDocumentMenuClick', 'FoldersView should centralize single and batch document action routing')
 assertIncludes(foldersView, "key: 'add_folder'", 'FoldersView should expose add-to-folder as a primary action')
 assertIncludes(foldersView, 'window.api.addDocumentsToFolder(uniqueDocIds, targetFolderId)', 'FoldersView add-to-folder should preserve existing folder memberships')

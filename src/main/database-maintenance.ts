@@ -17,7 +17,11 @@ import { getDatabase, getDatabaseFilePath, isSearchSegmentsFtsRebuildNeeded, que
 import { emitBackgroundTaskStatus } from './background-tasks'
 import { cleanupUnreferencedPagePayloads, externalizeLargePayloads, getPagePayloadStorageStats } from './page-payload-store'
 import { resolvePayloadDataDir } from './page-payload-files'
-import type { PagePayloadStorageStats } from './page-payload-statistics'
+import {
+  INLINE_JSON_MAX_CHARS,
+  INLINE_TEXT_MAX_CHARS,
+  type PagePayloadStorageStats,
+} from './page-payload-statistics'
 import {
   isDatabaseDiagnosticsWorkerAvailable,
   runDatabaseDiagnosticsWorkerTask,
@@ -43,6 +47,12 @@ interface CountRow {
 interface SampleRow {
   sampleRows?: number | null
   total?: number | null
+}
+
+interface PayloadSampleRow {
+  sampleRows?: number | null
+  candidateRows?: number | null
+  candidateBytes?: number | null
 }
 
 interface RowIdRow {
@@ -396,6 +406,92 @@ function getSearchIndexStorage(): DatabaseSearchIndexStorageStat {
   }
 }
 
+function getStartupSearchIndexStorage(): DatabaseSearchIndexStorageStat {
+  const ngramRows = estimateTableRows('search_ngram_index')
+  return {
+    ngramRows,
+    singleCharNgramRows: estimateSampledRows('search_ngram_index', 'length(gram) <= 1', ngramRows),
+    ngramPositionsBytes: estimateSampledBytes('search_ngram_index', 'length(positions)', ngramRows),
+    segmentRows: 0,
+    segmentTextBytes: 0,
+    segmentOffsetMapBytes: 0,
+    pagesFtsRows: 0,
+    searchSegmentsFtsRows: 0,
+    searchSegmentsTrigramRows: 0,
+    enterpriseSearchMigrationRecommended: isSearchSegmentsFtsRebuildNeeded(),
+  }
+}
+
+function estimateBoundedPayloadCandidates(
+  tableName: string,
+  columns: string,
+  predicate: string,
+  expression: string,
+): { rows: number; bytes: number } {
+  const estimatedRows = estimateTableRows(tableName)
+  if (estimatedRows <= 0) return { rows: 0, bytes: 0 }
+  try {
+    const row = queryOne<PayloadSampleRow>(
+      `SELECT COUNT(*) AS sampleRows,
+              COALESCE(SUM(CASE WHEN ${predicate} THEN 1 ELSE 0 END), 0) AS candidateRows,
+              COALESCE(SUM(CASE WHEN ${predicate} THEN ${expression} ELSE 0 END), 0) AS candidateBytes
+       FROM (SELECT ${columns} FROM ${tableName} ORDER BY rowid DESC LIMIT 512)`,
+    )
+    const sampleRows = numberValue(row?.sampleRows)
+    if (sampleRows <= 0) return { rows: 0, bytes: 0 }
+    const scale = estimatedRows / sampleRows
+    return {
+      rows: Math.min(estimatedRows, Math.round(numberValue(row?.candidateRows) * scale)),
+      bytes: Math.round(numberValue(row?.candidateBytes) * scale),
+    }
+  } catch {
+    return { rows: 0, bytes: 0 }
+  }
+}
+
+function getBoundedStartupPagePayloadStats(): PagePayloadStorageStats {
+  const pageCandidates = estimateBoundedPayloadCandidates(
+    'pages',
+    'ocr_text, ocr_result, proofed_text, ocr_text_ref, ocr_result_ref, proofed_text_ref',
+    `((ocr_text_ref IS NULL OR ocr_text_ref = '') AND length(COALESCE(ocr_text, '')) > ${INLINE_TEXT_MAX_CHARS})
+      OR ((ocr_result_ref IS NULL OR ocr_result_ref = '') AND length(COALESCE(ocr_result, '')) > ${INLINE_JSON_MAX_CHARS})
+      OR ((proofed_text_ref IS NULL OR proofed_text_ref = '') AND length(COALESCE(proofed_text, '')) > ${INLINE_TEXT_MAX_CHARS})`,
+    "length(COALESCE(ocr_text, '')) + length(COALESCE(ocr_result, '')) + length(COALESCE(proofed_text, ''))",
+  )
+  const versionCandidates = estimateBoundedPayloadCandidates(
+    'page_ocr_versions',
+    'ocr_text, ocr_result, ocr_text_ref, ocr_result_ref',
+    `((ocr_text_ref IS NULL OR ocr_text_ref = '') AND length(COALESCE(ocr_text, '')) > ${INLINE_TEXT_MAX_CHARS})
+      OR ((ocr_result_ref IS NULL OR ocr_result_ref = '') AND length(COALESCE(ocr_result, '')) > ${INLINE_JSON_MAX_CHARS})`,
+    "length(COALESCE(ocr_text, '')) + length(COALESCE(ocr_result, ''))",
+  )
+  const aiCacheCandidates = estimateBoundedPayloadCandidates(
+    'page_ai_layout_cache',
+    'result_text, result_text_ref',
+    `(result_text_ref IS NULL OR result_text_ref = '') AND length(COALESCE(result_text, '')) > ${INLINE_TEXT_MAX_CHARS}`,
+    "length(COALESCE(result_text, ''))",
+  )
+  const translationCandidates = estimateBoundedPayloadCandidates(
+    'page_translation_cache',
+    'source_text, translation_text, source_text_ref, translation_text_ref',
+    `((source_text_ref IS NULL OR source_text_ref = '') AND length(COALESCE(source_text, '')) > ${INLINE_TEXT_MAX_CHARS})
+      OR ((translation_text_ref IS NULL OR translation_text_ref = '') AND length(COALESCE(translation_text, '')) > ${INLINE_TEXT_MAX_CHARS})`,
+    "length(COALESCE(source_text, '')) + length(COALESCE(translation_text, ''))",
+  )
+  const candidates = [pageCandidates, versionCandidates, aiCacheCandidates, translationCandidates]
+  return {
+    externalFileCount: 0,
+    externalBytes: 0,
+    referencedFileCount: 0,
+    missingReferencedFileCount: 0,
+    orphanedFileCount: 0,
+    orphanedBytes: 0,
+    estimatedMissingReferencedBytes: 0,
+    inlineCandidateRows: candidates.reduce((sum, item) => sum + item.rows, 0),
+    inlineCandidateBytes: candidates.reduce((sum, item) => sum + item.bytes, 0),
+  }
+}
+
 function tableRowCount(tables: DatabaseTableStorageStat[], tableName: string): number {
   return tables.find((table) => table.tableName === tableName)?.rowCount || 0
 }
@@ -597,6 +693,63 @@ function buildDatabaseStorageDiagnostics(pagePayloadStats: PagePayloadStorageSta
     ...normalizedBase,
     warnings: buildWarnings(normalizedBase),
     requiredMaintenance,
+  }
+}
+
+export function getDatabaseStartupStorageDiagnostics(): DatabaseStorageDiagnostics {
+  const databasePath = getDatabaseFilePath()
+  const databaseBytes = fileSize(databasePath)
+  const pageSize = getStoragePragma('page_size')
+  const pageCount = getStoragePragma('page_count')
+  const freelistCount = getStoragePragma('freelist_count')
+  const freelistBytes = pageSize * freelistCount
+  const compactionRecommended = isDatabaseCompactionWorthwhile(freelistBytes, databaseBytes)
+  const pagePayloadStats = getBoundedStartupPagePayloadStats()
+  const searchIndex = getStartupSearchIndexStorage()
+  const persistedMaintenanceState = readPersistedMaintenanceState()
+  const legacyIndexPresent = searchIndex.ngramRows > 0
+    || searchIndex.singleCharNgramRows > 0
+    || searchIndex.ngramPositionsBytes > 0
+  const maintenanceState: DatabaseMaintenanceState = {
+    ...persistedMaintenanceState,
+    oldIndexRowsRemaining: searchIndex.ngramRows,
+    legacyIndexPresent,
+    compactionRecommended,
+    canResume: persistedMaintenanceState.stage !== 'idle'
+      && persistedMaintenanceState.stage !== 'completed'
+      && (persistedMaintenanceState.stage !== 'failed' || persistedMaintenanceState.canResume),
+    migrationVersion: STORAGE_MODEL_VERSION,
+  }
+  const base = {
+    databasePath,
+    databaseBytes,
+    walBytes: fileSize(`${databasePath}-wal`),
+    shmBytes: fileSize(`${databasePath}-shm`),
+    pageSize,
+    pageCount,
+    freelistCount,
+    freelistBytes,
+    checkedAt: new Date().toISOString(),
+    searchIndexVersion: SEARCH_INDEX_VERSION,
+    storageModelVersion: STORAGE_MODEL_VERSION,
+    tables: [],
+    storageLayers: estimateStorageLayers([], searchIndex, pagePayloadStats),
+    externalPayloads: {
+      fileCount: 0,
+      referencedFileCount: 0,
+      missingReferencedFileCount: 0,
+      orphanedFileCount: 0,
+      bytes: 0,
+      estimatedOrphanedBytes: 0,
+      estimatedMissingReferencedBytes: 0,
+    },
+    searchIndex,
+    maintenanceState,
+  }
+  const normalizedBase = { ...base, requiredMaintenance: buildRequiredMaintenance(base) }
+  return {
+    ...normalizedBase,
+    warnings: buildWarnings(normalizedBase),
   }
 }
 

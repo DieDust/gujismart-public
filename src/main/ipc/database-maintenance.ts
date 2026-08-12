@@ -6,6 +6,7 @@ import {
   compactDatabase,
   externalizePagePayloadStorage,
   exportDatabaseStorageDiagnostics,
+  getDatabaseStartupStorageDiagnostics,
   getDatabaseStorageDiagnostics,
   getDatabaseStorageDiagnosticsAsync,
   optimizeLegacyDatabaseStorage,
@@ -29,6 +30,10 @@ function hasLegacySearchIndexMaintenance(diagnostics: DatabaseStorageDiagnostics
 }
 
 export function registerDatabaseMaintenanceIpc(): void {
+  ipcMain.handle('database:getStartupStorageDiagnostics', (): DatabaseStorageDiagnostics => {
+    return getDatabaseStartupStorageDiagnostics()
+  })
+
   ipcMain.handle('database:getStorageDiagnostics', async (): Promise<DatabaseStorageDiagnostics> => {
     return await getDatabaseStorageDiagnosticsAsync()
   })

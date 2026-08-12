@@ -21,6 +21,7 @@ const libraryStateCache = readSource('src', 'main', 'library-state-cache.ts')
 const embeddingIndex = readSource('src', 'main', 'embedding-index.ts')
 const embeddingIpc = readSource('src', 'main', 'ipc', 'embedding.ts')
 const rendererMain = readSource('src', 'renderer', 'src', 'main.tsx')
+const rendererApp = readSource('src', 'renderer', 'src', 'App.tsx')
 const projectBootstrap = readSource('src', 'renderer', 'src', 'ProjectBootstrap.tsx')
 const appShell = readSource('src', 'renderer', 'src', 'AppShell.tsx')
 const electronViteConfig = readSource('electron.vite.config.ts')
@@ -92,6 +93,16 @@ const markLibraryStateCacheDirtyBody = sliceBetween(
   'export function markLibraryStateCacheDirty',
   'return getLibraryStateCache()',
 )
+const startupDatabaseDiagnosticsBody = sliceBetween(
+  databaseMaintenance,
+  'export function getDatabaseStartupStorageDiagnostics()',
+  'export function getDatabaseStorageDiagnostics()',
+)
+const startupDatabaseUpgradeEffect = sliceBetween(
+  rendererApp,
+  'const evaluateDatabaseUpgrade = async () => {',
+  'void evaluateDatabaseUpgrade()',
+)
 
 assert(
   startupTiming.includes('export function beginStartupPhase')
@@ -107,6 +118,21 @@ assert(
     && mainIndex.includes("logStartupTimingSummary('window-ready-to-show')")
     && mainIndex.includes("logStartupTimingSummary('after-createWindow')"),
   'Main open path should time initDatabase, createWindow, and window-ready checkpoints without blocking recovery.',
+)
+assert(
+  databaseMaintenance.includes('function getBoundedStartupPagePayloadStats()')
+    && databaseMaintenance.includes('function getStartupSearchIndexStorage()')
+    && !startupDatabaseDiagnosticsBody.includes('buildDatabaseStorageDiagnostics(')
+    && !startupDatabaseDiagnosticsBody.includes('getPagePayloadStorageStats()')
+    && !startupDatabaseDiagnosticsBody.includes('scanPayloadDirectory')
+    && !startupDatabaseDiagnosticsBody.includes('collectReferencedPagePayloadRefs'),
+  'Startup database diagnostics must use bounded SQLite samples and must never scan the external payload directory or every payload reference.',
+)
+assert(
+  databaseMaintenanceIpc.includes("ipcMain.handle('database:getStartupStorageDiagnostics'")
+    && startupDatabaseUpgradeEffect.includes('window.api.getDatabaseStartupStorageDiagnostics()')
+    && !startupDatabaseUpgradeEffect.includes('window.api.getDatabaseStorageDiagnostics()'),
+  'App startup should use lightweight maintenance diagnostics; full payload diagnostics remain an explicit settings or maintenance action.',
 )
 assert(
   mainIndex.includes('app.requestSingleInstanceLock()')

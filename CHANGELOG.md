@@ -16,6 +16,8 @@
 - 优化导出弹窗：“全部”模式不再保留无意义的数量输入框；展开预览会自动生成，尚未生成与确实无结果会分别显示；预览优先复用当前检索结果，避免为少量预览重新发起无上限全库检索。
 - 统一全文导出的数量口径：检索页明确标注为快速统计，“全部”导出会完整扫描原始命中；进度条显示已处理的原始命中数，完成提示同时报告完整扫描数、同段重复命中的合并数和最终写入的完整段落数，不再把三种数字都称为“导出条数”。
 - 修复“清理未引用大字段”遗漏新版 OCR 产物引用的问题。清理前现在会把当前页面、OCR 历史、不可变 OCR 产物、AI 版式和翻译缓存的全部外置引用纳入保护，避免误删仍供检索、导出、校对或 OCR 历史使用的正文与坐标数据。
+- 修复超大文献库在选择项目后再次明显变慢的问题。启动检查改为固定 512 行的有界抽样，不再自动遍历数百万条大字段引用及整个外置文件目录；设置页的完整诊断、未引用大字段清理和数据库维护仍保持原有完整扫描能力。
+- 优化文件夹页恢复速度：父子文件夹菜单树现在每次目录快照只生成一次，并由全部已加载文献卡片和批量菜单复用，避免 80 张卡片重复构造同一棵大型菜单树。
 
 ### English
 
@@ -31,6 +33,8 @@
 - Improved the export dialog: `All` no longer leaves an irrelevant numeric input visible; expanding Preview generates it automatically and distinguishes “not generated” from a genuinely empty result; preview reuses the current search result sample instead of starting an unbounded full-library query.
 - Unified full-text export count semantics. The search page identifies its total as a fast count, while `All` performs an exhaustive raw-hit scan; progress reports processed raw hits, and completion reports the exhaustive total, merged same-paragraph hits, and final complete-paragraph output instead of calling all three values “exported records.”
 - Fixed orphaned-payload cleanup omitting references held by the new immutable OCR artifact table. Cleanup now protects every external reference used by current pages, OCR history, immutable OCR artifacts, AI layout, and translation caches, preventing live text or coordinate data used by search, export, proofreading, or OCR history from being deleted.
+- Fixed a renewed slowdown after project selection in very large libraries. Startup maintenance detection now uses a bounded 512-row sample and no longer walks millions of payload references or the entire external payload directory automatically; full Settings diagnostics, orphan cleanup, and database maintenance retain their exhaustive scans.
+- Improved Folders-page restoration by building the parent/child folder menu tree once per folder snapshot and sharing it across all loaded document cards and batch actions instead of rebuilding the same large tree for up to 80 cards.
 
 #### 下载 / Downloads
 
