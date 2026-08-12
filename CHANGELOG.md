@@ -15,6 +15,7 @@
 - 文件夹页与文献库现在复用同一套父子文件夹菜单：右键单篇或多选文献都能在一级菜单直接“加入文件夹”；文件夹页原有的“移动到其他文件夹”和“从当前文件夹移出”仍然保留，且单篇操作不再误用批量文案。
 - 优化导出弹窗：“全部”模式不再保留无意义的数量输入框；展开预览会自动生成，尚未生成与确实无结果会分别显示；预览优先复用当前检索结果，避免为少量预览重新发起无上限全库检索。
 - 统一全文导出的数量口径：检索页明确标注为快速统计，“全部”导出会完整扫描原始命中；进度条显示已处理的原始命中数，完成提示同时报告完整扫描数、同段重复命中的合并数和最终写入的完整段落数，不再把三种数字都称为“导出条数”。
+- 修复“清理未引用大字段”遗漏新版 OCR 产物引用的问题。清理前现在会把当前页面、OCR 历史、不可变 OCR 产物、AI 版式和翻译缓存的全部外置引用纳入保护，避免误删仍供检索、导出、校对或 OCR 历史使用的正文与坐标数据。
 
 ### English
 
@@ -29,6 +30,7 @@
 - The Folders page and Library now reuse the same parent/child folder menu. Single and multi-selection context menus expose top-level add-to-folder actions, while the Folders page retains move-to-folder and remove-from-current-folder workflows without incorrectly using batch wording for one document.
 - Improved the export dialog: `All` no longer leaves an irrelevant numeric input visible; expanding Preview generates it automatically and distinguishes “not generated” from a genuinely empty result; preview reuses the current search result sample instead of starting an unbounded full-library query.
 - Unified full-text export count semantics. The search page identifies its total as a fast count, while `All` performs an exhaustive raw-hit scan; progress reports processed raw hits, and completion reports the exhaustive total, merged same-paragraph hits, and final complete-paragraph output instead of calling all three values “exported records.”
+- Fixed orphaned-payload cleanup omitting references held by the new immutable OCR artifact table. Cleanup now protects every external reference used by current pages, OCR history, immutable OCR artifacts, AI layout, and translation caches, preventing live text or coordinate data used by search, export, proofreading, or OCR history from being deleted.
 
 #### 下载 / Downloads
 

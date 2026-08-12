@@ -272,5 +272,10 @@ assertIncludes(database, "copyDirRecursive(join(sourceDir, 'storage'), join(targ
 assertIncludes(database, 'export function resolveManagedStoragePath', 'database should remap stale managed storage paths after copying a library between machines')
 assertIncludes(pagePayloadStatistics, 'missingReferencedFileCount', 'payload storage stats should count referenced payload files that are missing on disk')
 assertIncludes(pagePayloadStatistics, 'pagePayloadRefExists(ref)', 'payload storage stats should verify referenced payload files exist')
+assertIncludes(
+  pagePayloadStatistics,
+  "{ table: 'ocr_artifact_versions', columns: ['ocr_text_ref', 'ocr_result_ref'] }",
+  'payload cleanup must preserve external fields referenced by immutable OCR artifacts',
+)
 
 console.log('Database storage maintenance regression checks passed')

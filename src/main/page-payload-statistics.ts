@@ -30,6 +30,7 @@ export const INLINE_JSON_MAX_CHARS = 8192
 const PAYLOAD_REF_COLUMNS = [
   { table: 'pages', columns: ['ocr_text_ref', 'ocr_result_ref', 'proofed_text_ref'] },
   { table: 'page_ocr_versions', columns: ['ocr_text_ref', 'ocr_result_ref'] },
+  { table: 'ocr_artifact_versions', columns: ['ocr_text_ref', 'ocr_result_ref'] },
   { table: 'page_ai_layout_cache', columns: ['result_text_ref'] },
   { table: 'page_translation_cache', columns: ['source_text_ref', 'translation_text_ref'] },
 ] as const
