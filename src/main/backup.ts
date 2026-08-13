@@ -5,7 +5,7 @@ import { tmpdir } from 'os'
 import { basename, extname, isAbsolute, join, normalize, relative, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs'
 import { ZipArchive } from 'archiver'
-import extract from 'extract-zip'
+import extract from '@electron-internal/extract-zip'
 import Database from 'better-sqlite3'
 import { backupDatabaseTo, closeDatabase, getDataDir, queryAll, run, saveDatabase, scheduleDatabaseSave } from './database'
 import { getActiveLibraryProjectId } from './library-projects'
@@ -270,20 +270,10 @@ async function writeBackupZip(sourceDir: string, archivePath: string): Promise<v
   })
 }
 
-function assertSafeExtractEntry(entryPath: string): void {
-  const normalized = normalize(entryPath)
-  if (!normalized || isAbsolute(normalized) || normalized.startsWith('..') || normalized.includes(`..\\`) || normalized.includes('../')) {
-    throw new Error('备份压缩包包含不安全路径，已拒绝导入')
-  }
-}
-
 async function extractBackupZip(archivePath: string): Promise<string> {
   const targetDir = createTempBackupDir('gujismart-backup-import')
   try {
-    await extract(archivePath, {
-      dir: targetDir,
-      onEntry: (entry) => assertSafeExtractEntry(entry.fileName),
-    })
+    await extract(archivePath, { dir: targetDir })
     return targetDir
   } catch (error) {
     rmSync(targetDir, { recursive: true, force: true })

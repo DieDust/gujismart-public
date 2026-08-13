@@ -47,6 +47,7 @@ The packaged app uses the following direct runtime dependencies from `package.js
 
 | Package | License |
 | --- | --- |
+| `@electron-internal/extract-zip` | BSD-2-Clause |
 | `@ant-design/icons` | MIT |
 | `@electron-toolkit/utils` | MIT |
 | `@napi-rs/canvas` | MIT |
@@ -58,7 +59,6 @@ The packaged app uses the following direct runtime dependencies from `package.js
 | `better-sqlite3` | MIT |
 | `brace-expansion` | MIT |
 | `epubjs` | BSD-2-Clause |
-| `extract-zip` | BSD-2-Clause |
 | `fast-xml-parser` | MIT |
 | `flexsearch` | Apache-2.0 |
 | `jszip` | MIT OR GPL-3.0-or-later; GujiSmart uses it under the MIT option |

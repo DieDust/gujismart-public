@@ -24,12 +24,12 @@ const rendererOnlyDependencies = [
   'zustand',
 ]
 const packagedRuntimeDependencies = [
+  '@electron-internal/extract-zip',
   '@electron-toolkit/utils',
   '@napi-rs/canvas',
   '@pdf-lib/fontkit',
   'archiver',
   'better-sqlite3',
-  'extract-zip',
   'fast-xml-parser',
   'flexsearch',
   'jszip',

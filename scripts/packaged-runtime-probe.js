@@ -43,7 +43,7 @@ async function main() {
   assert.strictEqual(loadedPdf.numPages, 1)
   await loadedPdf.destroy()
 
-  for (const dependency of ['archiver', 'extract-zip', 'fast-xml-parser', 'flexsearch', 'jszip']) {
+  for (const dependency of ['@electron-internal/extract-zip', 'archiver', 'fast-xml-parser', 'flexsearch', 'jszip']) {
     assert(require(fromPackage(dependency)), `Unable to load packaged runtime dependency: ${dependency}`)
   }
 
