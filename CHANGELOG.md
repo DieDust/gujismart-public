@@ -1,5 +1,22 @@
 # 更新日志 / Changelog
 
+## 1.2.32 - 2026-08-14
+
+### 中文
+
+- 修复正式安装包无法执行全文检索摘录导出的问题。后台导出 Worker 现在使用独立的 Node 构建，不再携带 Electron 主进程依赖，避免安装包中出现 `Cannot find module 'electron'`。
+- 补上安装包级真实导出回归：测试会在打包后的应用中导入测试文献、等待检索命中，并实际调用摘录预览导出；不再只检查应用能启动或开发环境能导出。
+
+### English
+
+- Fixed full-text search excerpt exports failing in packaged builds. The background export worker is now emitted as an isolated Node bundle without Electron main-process dependencies, preventing `Cannot find module 'electron'` at runtime.
+- Added a true packaged-export regression that imports a fixture into the packaged application, waits for a search hit, and executes excerpt preview export instead of merely checking startup or development-mode export.
+
+#### 下载 / Downloads
+
+- `GujiSmart-1.2.32-Setup-x64.exe`
+- `GujiSmart-1.2.32-Portable-x64.exe`
+
 ## 1.2.31 - 2026-08-11
 
 ### 中文

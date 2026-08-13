@@ -3,6 +3,7 @@ const { mkdtempSync, rmSync, writeFileSync } = require('fs')
 const { join } = require('path')
 const { Worker } = require('worker_threads')
 const { buildSync } = require('esbuild')
+const { buildSearchExportWorker } = require('./build-search-export-worker')
 
 const root = join(__dirname, '..')
 const tempRoot = mkdtempSync(join(__dirname, '.tmp-search-export-worker-'))
@@ -37,19 +38,8 @@ const mainModuleBuildOptions = {
   },
 }
 
-const workerBuildOptions = {
-  ...buildOptions,
-  alias: {
-    electron: join(__dirname, 'stubs', 'electron-worker.js'),
-  },
-}
-
 buildSync({ ...mainModuleBuildOptions, entryPoints: [moduleEntryPath], outfile: moduleBundlePath })
-buildSync({
-  ...workerBuildOptions,
-  entryPoints: [join(root, 'src', 'main', 'search-export-query-worker.ts')],
-  outfile: workerBundlePath,
-})
+buildSearchExportWorker({ outfile: workerBundlePath, logLevel: 'silent' })
 
 async function runWorker(task) {
   const worker = new Worker(workerBundlePath)

@@ -15,7 +15,9 @@ const renderer = read('src', 'renderer', 'src', 'views', 'SearchView.tsx')
 const database = read('src', 'main', 'database.ts')
 const workerClientPath = path.join(root, 'src', 'main', 'search-export-query-worker-client.ts')
 const workerPath = path.join(root, 'src', 'main', 'search-export-query-worker.ts')
+const workerBuildPath = path.join(root, 'scripts', 'build-search-export-worker.js')
 const electronVite = read('electron.vite.config.ts')
+const workerBuild = read('scripts', 'build-search-export-worker.js')
 const packageJson = JSON.parse(read('package.json'))
 
 assert.ok(/DEFAULT_SEARCH_EXPORT_COUNT\s*=\s*10_000/.test(contract), 'large export default must be 10,000')
@@ -31,6 +33,7 @@ assert.ok(renderer.includes('onBackgroundTaskStatusChanged'), 'search UI must su
 assert.ok(renderer.includes('全部'), 'search UI must expose an all export option')
 assert.ok(fs.existsSync(workerClientPath), 'full-text export preparation must have a worker client')
 assert.ok(fs.existsSync(workerPath), 'full-text export preparation must have a worker entry')
+assert.ok(fs.existsSync(workerBuildPath), 'full-text export preparation must have an isolated production builder')
 const workerClient = fs.existsSync(workerClientPath) ? fs.readFileSync(workerClientPath, 'utf8') : ''
 const worker = fs.existsSync(workerPath) ? fs.readFileSync(workerPath, 'utf8') : ''
 assert.ok(workerClient.includes('new Worker('), 'full-text export preparation must run outside the Electron main thread')
@@ -61,7 +64,10 @@ assert.ok(
   /exportMaxRecords === 'all'\s*\?\s*\([\s\S]{0,800}全部命中/.test(renderer),
   'all mode must replace the numeric input instead of leaving an empty input beside the selector',
 )
-assert.ok(electronVite.includes("'search-export-query-worker'"), 'electron build must emit the search export worker entry')
+assert.ok(!electronVite.includes("'search-export-query-worker'"), 'Electron Rollup build must not share main-process chunks with the Node worker')
+assert.ok(workerBuild.includes("electron: path.join(__dirname, 'stubs', 'electron-worker.js')"), 'production worker build must replace Electron APIs with the worker-safe stub')
+assert.ok(workerBuild.includes("require\\([\"']electron[\"']\\)"), 'production worker build must reject any remaining runtime Electron dependency')
+assert.ok(String(packageJson.scripts?.build || '').includes('build:search-export-worker'), 'production build must emit the isolated search export worker')
 assert.ok(
   String(packageJson.scripts?.check || '').includes('check:search-export'),
   'the full quality gate must include search export regressions',
