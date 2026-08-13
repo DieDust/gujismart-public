@@ -18,6 +18,7 @@
 - 修复“清理未引用大字段”遗漏新版 OCR 产物引用的问题。清理前现在会把当前页面、OCR 历史、不可变 OCR 产物、AI 版式和翻译缓存的全部外置引用纳入保护，避免误删仍供检索、导出、校对或 OCR 历史使用的正文与坐标数据。
 - 修复超大文献库在选择项目后再次明显变慢的问题。启动检查改为固定 512 行的有界抽样，不再自动遍历数百万条大字段引用及整个外置文件目录；设置页的完整诊断、未引用大字段清理和数据库维护仍保持原有完整扫描能力。
 - 优化文件夹页恢复速度：父子文件夹菜单树现在每次目录快照只生成一次，并由全部已加载文献卡片和批量菜单复用，避免 80 张卡片重复构造同一棵大型菜单树。
+- 修复人工补写正文并保存后，页面仍因陈旧的 OCR 状态留在“OCR 待修复”中的问题。人工版式与叠加校对保存有效文字时会同步完成页面 OCR 状态；最后一个错页修好后，文献级错误提示、当前待修复列表和项目侧栏计数会自动更新，不需要重新 OCR 或手动刷新。
 
 ### English
 
@@ -35,6 +36,7 @@
 - Fixed orphaned-payload cleanup omitting references held by the new immutable OCR artifact table. Cleanup now protects every external reference used by current pages, OCR history, immutable OCR artifacts, AI layout, and translation caches, preventing live text or coordinate data used by search, export, proofreading, or OCR history from being deleted.
 - Fixed a renewed slowdown after project selection in very large libraries. Startup maintenance detection now uses a bounded 512-row sample and no longer walks millions of payload references or the entire external payload directory automatically; full Settings diagnostics, orphan cleanup, and database maintenance retain their exhaustive scans.
 - Improved Folders-page restoration by building the parent/child folder menu tree once per folder snapshot and sharing it across all loaded document cards and batch actions instead of rebuilding the same large tree for up to 80 cards.
+- Fixed manually repaired pages remaining in `OCR Needs Repair` because their OCR status stayed stale after text was saved. Saving usable text from either manual layout editor now completes the page OCR state; once the last broken page is repaired, the document warning, active repair list, and project sidebar count refresh automatically without rerunning OCR or requiring a manual reload.
 
 #### 下载 / Downloads
 

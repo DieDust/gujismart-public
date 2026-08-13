@@ -49,6 +49,7 @@ import {
   markLibraryStateCacheDirty,
   markLibraryStateCacheDirtyAsync,
   scheduleLibraryFolderCountsRefresh,
+  scheduleLibrarySmartViewCountsRefresh,
 } from '../library-state-cache'
 import { applyManualLiteraturePageAnchor, recomputeLiteraturePageMap, resetLiteraturePageMap } from '../literature-page-map'
 import { clearMachineTranslationUnits, ensurePageTranslationUnits, translatePageUnits } from '../translation-service'
@@ -58,6 +59,7 @@ import {
   buildOcrIncompleteCondition,
   buildOcrNeedsRepairCondition,
   buildPageContentAvailableConditionStatusOnly,
+  buildPageNeedsOcrRepairCondition,
 } from '../ocr-library-filters'
 import { FileCapabilityError, fileCapabilityService } from '../file-capabilities'
 import { cancelLegacyImportQueueTasks, registerLegacyImportQueueState } from '../task-import-compat'
@@ -3034,6 +3036,46 @@ function syncDocumentProofStatus(docId: string): void {
   const completed = Number(stats?.completed || 0)
   const nextStatus = total > 0 && completed === total ? 'completed' : 'pending'
   run('UPDATE documents SET proof_status = ?, updated_at = ? WHERE id = ?', [nextStatus, new Date().toISOString(), docId])
+}
+
+function hasUsableManualPageText(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function syncDocumentOcrStatusAfterPageEdit(docId: string): void {
+  const status = queryOne<{ has_pages: number; has_repair_pages: number }>(
+    `SELECT
+       EXISTS(SELECT 1 FROM pages p_any WHERE p_any.doc_id = ?) AS has_pages,
+       EXISTS(
+         SELECT 1
+         FROM pages p_repair
+         WHERE p_repair.doc_id = ?
+           AND ${buildPageNeedsOcrRepairCondition('p_repair')}
+       ) AS has_repair_pages`,
+    [docId, docId],
+  )
+  if (!status?.has_pages || status.has_repair_pages) return
+
+  const document = queryOne<{ ocr_status: string | null; import_status: string | null; error_message: string | null }>(
+    'SELECT ocr_status, import_status, error_message FROM documents WHERE id = ?',
+    [docId],
+  )
+  if (!document) return
+  if (document.ocr_status === 'completed' && document.import_status === 'processed' && !document.error_message) return
+
+  run(
+    'UPDATE documents SET ocr_status = ?, import_status = ?, error_message = NULL, updated_at = ? WHERE id = ?',
+    ['completed', 'processed', new Date().toISOString(), docId],
+  )
+}
+
+function refreshLibraryOcrStateAfterPageEdit(docId: string): void {
+  const projectIds = queryAll<{ project_id: string }>(
+    'SELECT DISTINCT project_id FROM library_project_documents WHERE document_id = ?',
+    [docId],
+  ).map((row) => row.project_id).filter(Boolean)
+  markLibraryStateCacheDirty(projectIds)
+  scheduleLibrarySmartViewCountsRefresh(projectIds)
 }
 
 function markDocumentTocDirty(docId: string): void {
@@ -6337,8 +6379,30 @@ export function registerDocumentIpc(): void {
 
   ipcMain.handle('pages:update', async (_event, pageId: string, data: PageUpdatePayload) => {
     rejectProtectedPathFields(data, ['image_path'])
-    const page = queryOne<{ doc_id: string; page_num: number | null; image_path: string | null; proof_status: string; active_ocr_artifact_id: string | null }>(
-      'SELECT doc_id, page_num, image_path, proof_status, active_ocr_artifact_id FROM pages WHERE id = ?',
+    const page = queryOne<{
+      doc_id: string
+      page_num: number | null
+      image_path: string | null
+      proof_status: string
+      ocr_status: string | null
+      active_ocr_artifact_id: string | null
+      document_ocr_status: string | null
+      document_import_status: string | null
+      document_error_message: string | null
+    }>(
+      `SELECT
+         p.doc_id,
+         p.page_num,
+         p.image_path,
+         p.proof_status,
+         p.ocr_status,
+         p.active_ocr_artifact_id,
+         d.ocr_status AS document_ocr_status,
+         d.import_status AS document_import_status,
+         d.error_message AS document_error_message
+       FROM pages p
+       INNER JOIN documents d ON d.id = p.doc_id
+       WHERE p.id = ?`,
       [pageId],
     )
     if (!page) return false
@@ -6372,6 +6436,16 @@ export function registerDocumentIpc(): void {
       }
     }
 
+    if (
+      normalizedData.ocr_status === undefined
+      && (
+        hasUsableManualPageText(normalizedData.proofed_text)
+        || hasUsableManualPageText(normalizedData.ocr_text)
+      )
+    ) {
+      normalizedData.ocr_status = 'completed'
+    }
+
     const allowedFields: Array<keyof PageUpdatePayload> = ['ocr_text', 'ocr_result', 'proofed_text', 'ocr_status', 'proof_status']
     const sets: string[] = []
     const params: unknown[] = []
@@ -6399,8 +6473,21 @@ export function registerDocumentIpc(): void {
     params.push(pageId)
     run(`UPDATE pages SET ${sets.join(', ')} WHERE id = ?`, params)
     syncDocumentProofStatus(page.doc_id)
-    if ('ocr_text' in normalizedData || 'proofed_text' in normalizedData || 'ocr_result' in normalizedData) {
+    const touchedOcrContent = 'ocr_text' in normalizedData || 'proofed_text' in normalizedData || 'ocr_result' in normalizedData
+    if (touchedOcrContent) {
       markDocumentTocDirty(page.doc_id)
+    }
+    const pageOcrStatusChanged = normalizedData.ocr_status !== undefined
+      && normalizedData.ocr_status !== page.ocr_status
+    const shouldReconcileOcrState = (touchedOcrContent || pageOcrStatusChanged) && (
+      pageOcrStatusChanged
+      || page.document_ocr_status !== 'completed'
+      || page.document_import_status !== 'processed'
+      || !!page.document_error_message
+    )
+    if (shouldReconcileOcrState) {
+      syncDocumentOcrStatusAfterPageEdit(page.doc_id)
+      refreshLibraryOcrStateAfterPageEdit(page.doc_id)
     }
     markSearchIndexStaleForPages([pageId])
     notifySearchContentChanged()

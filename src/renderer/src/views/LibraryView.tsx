@@ -4048,6 +4048,13 @@ export default function LibraryView({
   useEffect(() => {
     const handleLibraryRelationsChanged = (event: Event) => {
       if (event instanceof CustomEvent && event.detail?.source === 'library-folder-counts-refreshed') return
+      if (event instanceof CustomEvent && event.detail?.source === 'ocr-page-content-saved') {
+        void Promise.all([
+          loadSmartViewCounts({ refresh: true }),
+          loadDocuments(filter, { silent: true }),
+        ])
+        return
+      }
       void Promise.all([
         loadBaseData({ refreshFolderCounts: true }),
         loadDocuments(filter, { silent: true }),
@@ -4056,7 +4063,7 @@ export default function LibraryView({
 
     window.addEventListener(LIBRARY_RELATIONS_CHANGED_EVENT, handleLibraryRelationsChanged)
     return () => window.removeEventListener(LIBRARY_RELATIONS_CHANGED_EVENT, handleLibraryRelationsChanged)
-  }, [filter, loadBaseData, loadDocuments])
+  }, [filter, loadBaseData, loadDocuments, loadSmartViewCounts])
 
   useEffect(() => {
     const unsubscribe = window.api.onBookTranslationProgress((payload) => {

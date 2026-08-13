@@ -1805,6 +1805,7 @@ function buildOcrPayload(baseOcrResult: unknown, blocks: LayoutBlock[], proofSta
     ocr_result: { ...asOcrResult(baseOcrResult), layout_result: normalizedBlocks, words_result: normalizedBlocks.map((block) => ({ words: block.words || '' })) },
     ocr_text: fullText,
     proofed_text: fullText,
+    ...(fullText ? { ocr_status: 'completed' as const } : {}),
     proof_status: proofStatus,
   }
 }

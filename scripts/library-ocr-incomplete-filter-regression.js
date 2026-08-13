@@ -19,6 +19,9 @@ const documentsSource = fs.readFileSync(path.join(root, 'src', 'main', 'ipc', 'd
 const libraryCacheSource = fs.readFileSync(path.join(root, 'src', 'main', 'library-state-cache.ts'), 'utf8')
 const ocrFiltersSource = fs.readFileSync(path.join(root, 'src', 'main', 'ocr-library-filters.ts'), 'utf8')
 const libraryViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'LibraryView.tsx'), 'utf8')
+const documentViewSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'views', 'DocumentView.tsx'), 'utf8')
+const facsimileSource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'GujiFacsimileProofreader.tsx'), 'utf8')
+const overlaySource = fs.readFileSync(path.join(root, 'src', 'renderer', 'src', 'components', 'OverlayProofreader.tsx'), 'utf8')
 
 assert(
   databaseSource.includes('CREATE INDEX IF NOT EXISTS idx_pages_doc_ocr_status ON pages(doc_id, ocr_status);'),
@@ -160,6 +163,30 @@ assert(
     && documentsSource.includes('pendingPageNums')
     && documentsSource.includes('summary.pending > 0'),
   'OCR repair list responses should inspect page-level pending rows and expose their page numbers instead of showing an unexplained card.',
+)
+
+const pageUpdateBlock = sliceBetween(
+  documentsSource,
+  "ipcMain.handle('pages:update'",
+  "ipcMain.handle('pages:insertManual'",
+  'page update OCR reconciliation',
+)
+assert(
+  pageUpdateBlock.includes("normalizedData.ocr_status = 'completed'")
+    && pageUpdateBlock.includes('syncDocumentOcrStatusAfterPageEdit(page.doc_id)')
+    && pageUpdateBlock.includes('refreshLibraryOcrStateAfterPageEdit(page.doc_id)')
+    && documentsSource.includes('buildPageNeedsOcrRepairCondition')
+    && documentsSource.includes('scheduleLibrarySmartViewCountsRefresh(projectIds)'),
+  'Manual page text saves should atomically complete the page/document and refresh project-scoped OCR repair counts.',
+)
+
+assert(
+  facsimileSource.includes("...(fullText ? { ocr_status: 'completed' as const } : {})")
+    && overlaySource.includes("...(fullText ? { ocr_status: 'completed' as const } : {})")
+    && documentViewSource.includes("detail: { source: 'ocr-page-content-saved' }")
+    && libraryViewSource.includes("event.detail?.source === 'ocr-page-content-saved'")
+    && libraryViewSource.includes('loadSmartViewCounts({ refresh: true })'),
+  'Both manual proofreaders should send completed OCR status and refresh a mounted OCR repair list without a manual reload.',
 )
 
 console.log('Library OCR incomplete filter regression passed.')

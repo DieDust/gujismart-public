@@ -4149,6 +4149,7 @@ export default function DocumentView({
   }
 
   const handleSavePage = async (pageId: string, data: PageUpdatePayload): Promise<boolean> => {
+    const previousPageOcrStatus = doc?.pages?.find((page) => page.id === pageId)?.ocr_status
     try {
       await window.api.updatePage(pageId, data)
       if (data.ocr_result !== undefined || data.ocr_text !== undefined || data.proofed_text !== undefined) {
@@ -4202,12 +4203,25 @@ export default function DocumentView({
           }
         })
 
+        const allPagesHaveOcrContent = nextPages.length > 0 && nextPages.every((page) => (
+          page.ocr_status === 'completed' || page.has_ocr_text
+        ))
         return {
           ...previous,
+          ...(allPagesHaveOcrContent ? {
+            ocr_status: 'completed' as const,
+            import_status: 'processed' as const,
+            error_message: null,
+          } : {}),
           proof_status: nextPages.length > 0 && nextPages.every((page) => page.proof_status === 'completed') ? 'completed' : 'pending',
           pages: nextPages,
         }
       })
+      if (data.ocr_status === 'completed' && previousPageOcrStatus !== 'completed') {
+        window.dispatchEvent(new CustomEvent(LIBRARY_RELATIONS_CHANGED_EVENT, {
+          detail: { source: 'ocr-page-content-saved' },
+        }))
+      }
       return true
     } catch (error) {
       console.error(error)

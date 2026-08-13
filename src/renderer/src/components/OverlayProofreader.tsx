@@ -564,6 +564,7 @@ function buildOcrPayload(baseOcrResult: OverlayOcrResult | null | undefined, blo
     },
     ocr_text: fullText,
     proofed_text: fullText,
+    ...(fullText ? { ocr_status: 'completed' as const } : {}),
     proof_status: proofStatus,
   }
 }

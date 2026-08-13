@@ -318,19 +318,38 @@ async function run() {
     )
 
     const repairedReviewPage = reviewDetail.pages.find((page) => page.page_num === 3)
-    assert(repairedReviewPage, 'Expected page 3 to exist for stale-error repair simulation')
-    const repairedPageSaved = await win.evaluate(async (page) => window.api.updatePage(page.id, {
-      ocr_text: 'repaired review page text',
-      ocr_result: { text: 'repaired review page text' },
-      ocr_status: 'error',
-    }), repairedReviewPage)
-    assert(repairedPageSaved, 'Failed to simulate a repaired page with a stale error status')
-    const staleReviewDocumentSaved = await win.evaluate(async (id) => window.api.updateDocument(id, {
-      ocr_status: 'completed',
-      import_status: 'processed',
-      error_message: 'stale OCR review message',
-    }), reviewDocId)
-    assert(staleReviewDocumentSaved, 'Failed to simulate stale document review message')
+    assert(repairedReviewPage, 'Expected page 3 to exist for manual OCR repair simulation')
+    const repairedPageSaved = await win.evaluate(async (page) => {
+      const text = 'manually repaired review page text'
+      return window.api.updatePage(page.id, {
+        ocr_text: text,
+        proofed_text: text,
+        ocr_result: {
+          layout_result: [{
+            manual_block_id: `manual-${page.id}-ocr-repair`,
+            segmentation_source: 'manual',
+            label: 'text',
+            words: text,
+            location: { left: 40, top: 40, width: 520, height: 80 },
+          }],
+          words_result: [{ words: text }],
+        },
+      })
+    }, repairedReviewPage)
+    assert(repairedPageSaved, 'Failed to persist manually repaired OCR page')
+
+    const manuallyRepairedDetail = await win.evaluate(async (id) => window.api.getDocument(id), reviewDocId)
+    const manuallyRepairedPage = manuallyRepairedDetail?.pages?.find((page) => page.page_num === 3)
+    assert(
+      manuallyRepairedPage?.ocr_status === 'completed',
+      `Manual text save should complete the repaired page without a separate OCR action: ${JSON.stringify(manuallyRepairedPage)}`,
+    )
+    assert(
+      manuallyRepairedDetail?.ocr_status === 'completed'
+        && manuallyRepairedDetail?.import_status === 'processed'
+        && !manuallyRepairedDetail?.error_message,
+      `Manual text save should clear the document-level OCR repair state immediately: ${JSON.stringify(manuallyRepairedDetail)}`,
+    )
     const repairPageAfterStaleError = await win.evaluate(async () => window.api.listDocumentsPage({
       search: 'library ocr review reconcile',
       searchFields: ['title'],
@@ -340,12 +359,12 @@ async function run() {
     }))
     assert(
       !repairPageAfterStaleError.items.some((item) => item.id === reviewDocId),
-      `Repaired page with stale error status leaked into OCR repair filter: ${JSON.stringify(repairPageAfterStaleError)}`,
+      `Manually repaired page leaked into OCR repair filter: ${JSON.stringify(repairPageAfterStaleError)}`,
     )
     const countsAfterStaleErrorRepair = await win.evaluate(async () => window.api.refreshLibrarySmartViewCounts())
     assert(
       Number(countsAfterStaleErrorRepair.ocrNeedsRepair || 0) === 0,
-      `Sidebar OCR repair count retained stale error rows with usable text: ${JSON.stringify(countsAfterStaleErrorRepair)}`,
+      `Sidebar OCR repair count retained a manually repaired page: ${JSON.stringify(countsAfterStaleErrorRepair)}`,
     )
 
     console.log('Library OCR status reconcile regression passed.')

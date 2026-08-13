@@ -21,6 +21,7 @@ interface DeferredLibraryCachePatch {
 const pendingLibraryCachePatches = new Map<string, DeferredLibraryCachePatch>()
 let libraryCachePatchWriteRunning = false
 const folderCountsRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const smartViewCountsRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 const EMPTY_SMART_VIEW_COUNTS: LibrarySmartViewCounts = {
   all: 0,
@@ -465,11 +466,36 @@ function scheduleSmartViewCacheWrite(projectId: string, smartViewCounts: Library
   scheduleLibraryCachePatch(projectId, { smartViewCounts, updatedAt })
 }
 
-export async function refreshLibrarySmartViewCounts(): Promise<LibrarySmartViewCounts> {
-  const projectId = getActiveLibraryProjectId()
+async function refreshLibrarySmartViewCountsForProject(projectId: string): Promise<LibrarySmartViewCounts> {
+  const pendingTimer = smartViewCountsRefreshTimers.get(projectId)
+  if (pendingTimer) {
+    clearTimeout(pendingTimer)
+    smartViewCountsRefreshTimers.delete(projectId)
+  }
   const smartViewCounts = await buildSmartViewCountsAsync(projectId)
   scheduleSmartViewCacheWrite(projectId, smartViewCounts, new Date().toISOString())
   return smartViewCounts
+}
+
+export async function refreshLibrarySmartViewCounts(): Promise<LibrarySmartViewCounts> {
+  return refreshLibrarySmartViewCountsForProject(getActiveLibraryProjectId())
+}
+
+export function scheduleLibrarySmartViewCountsRefresh(projectIds?: string[], delayMs = 750): void {
+  const activeProjectId = getActiveLibraryProjectId()
+  const scopedProjectIds = [...new Set((projectIds?.length ? projectIds : [activeProjectId]).filter(Boolean))]
+  scopedProjectIds.forEach((projectId) => {
+    const currentTimer = smartViewCountsRefreshTimers.get(projectId)
+    if (currentTimer) clearTimeout(currentTimer)
+    const timer = setTimeout(() => {
+      smartViewCountsRefreshTimers.delete(projectId)
+      void refreshLibrarySmartViewCountsForProject(projectId).catch((error) => {
+        console.warn(`[LibraryStateCache] Deferred smart-view refresh failed for project ${projectId}`, error)
+      })
+    }, Math.max(0, delayMs))
+    timer.unref?.()
+    smartViewCountsRefreshTimers.set(projectId, timer)
+  })
 }
 
 export async function refreshLibraryFolderCounts(projectId = getActiveLibraryProjectId()): Promise<LibraryFolderCounts> {
