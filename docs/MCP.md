@@ -56,12 +56,14 @@ npm run mcp -- --data-dir "<你的数据目录>" --mcp-token "<令牌>"
 | Tool | 作用 |
 |------|------|
 | `library_search` | 全库 **关键词** 检索（默认 **compact**：标题/页码/短摘录/`ref`；`detail:"full"` 才带完整 locator） |
-| `vector_search` | **语义/向量** 检索（需用户在软件内建过向量索引；主题描述优于整词匹配） |
+| `vector_search` | **语义/向量** 检索（需用户在软件内建过向量索引；主题描述优于整词匹配；可用 `docId` 限定单篇文献走索引快速路径） |
 | `vector_index_stats` | 向量索引状态（模型、段数、排队，不含密钥） |
 | `list_documents` | 文献列表（精简元数据，无本地路径） |
-| `get_document` | 元数据；默认不含逐页清单，`includePages:true` 才展开 |
+| `get_document` | 元数据（含白名单书目字段 `metadata`、标签的 `isMetadata` 标记）；默认不含逐页清单，`includePages:true` 才展开 |
+| `get_document_toc` | 文献目录（章节标题 + 页码），配合 `get_page_text` 按章阅读 |
 | `get_page_text` | 页正文（默认不含 content hash） |
 | `resolve_evidence` | 出处解析（需 full locator；日常阅读优先 `get_page_text`） |
+| `list_excerpts` | 用户在软件里保存的**摘录/笔记**（可按 `docId` 或关键词过滤，只读） |
 | `list_folders` / `list_tags` | 文件夹与标签 |
 | `library_stats` | 统计 |
 

@@ -31,6 +31,67 @@ const DEFAULT_EXCERPT_CHARS = 240
 const DEFAULT_SEARCH_LIMIT = 10
 const DEFAULT_HITS_PER_DOC = 3
 const MAX_HITS_PER_DOC = 8
+const MAX_TOC_ITEMS = 500
+const MAX_EXCERPT_LIST_LIMIT = 50
+const MAX_EXCERPT_TEXT_CHARS = 2_000
+
+/**
+ * User-facing bibliographic metadata keys inside documents.metadata JSON.
+ * Everything else in that JSON (file fingerprints, manifests, analysis caches,
+ * absolute paths) is internal and must never reach MCP clients, so exposure is
+ * whitelist-only: unknown keys are dropped by construction.
+ */
+const PUBLIC_METADATA_FIELDS = [
+  'author',
+  'book_author',
+  'editor',
+  'translator',
+  'journal',
+  'newspaper',
+  'publisher',
+  'publish_place',
+  'publication_time',
+  'publication_year',
+  'issue_date',
+  'engraving_style',
+  'dynasty',
+  'version',
+  'volume_info',
+  'collection',
+  'series',
+  'university',
+  'meeting_name',
+  'book_title',
+  'keywords',
+] as const
+
+function extractPublicMetadata(metadataJson: unknown): Record<string, unknown> {
+  let parsed: unknown = metadataJson
+  if (typeof metadataJson === 'string') {
+    try {
+      parsed = JSON.parse(metadataJson)
+    } catch {
+      return {}
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+  const record = parsed as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const key of PUBLIC_METADATA_FIELDS) {
+    const value = record[key]
+    if (value === undefined || value === null) continue
+    if (typeof value === 'string' && !value.trim()) continue
+    if (Array.isArray(value)) {
+      const items = value.filter((item) => typeof item === 'string' && item.trim())
+      if (items.length > 0) out[key] = items
+      continue
+    }
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      out[key] = value
+    }
+  }
+  return out
+}
 
 export interface McpToolDefinition {
   name: string
@@ -134,6 +195,32 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'get_document_toc',
+    description:
+      'Table of contents for a document: chapter/section titles with page numbers. Use hits to jump into get_page_text ranges. Returns an empty list when no TOC has been recognized for the document.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        docId: { type: 'string', description: 'Document id' },
+      },
+      required: ['docId'],
+    },
+  },
+  {
+    name: 'list_excerpts',
+    description:
+      'User-curated excerpts and notes (摘录) saved in the library, newest first. Optional filters: docId, keyword. These are human-selected passages, often the most important material in a document.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        docId: { type: 'string', description: 'Optional document id filter' },
+        search: { type: 'string', description: 'Keyword filter over excerpt and note text' },
+        limit: { type: 'number', description: `Page size (1-${MAX_EXCERPT_LIST_LIMIT})` },
+        offset: { type: 'number', description: 'Pagination offset' },
+      },
+    },
+  },
+  {
     name: 'list_folders',
     description: 'List library folders (id, name, parent).',
     inputSchema: { type: 'object', properties: {} },
@@ -164,6 +251,7 @@ export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
         limit: { type: 'number', description: `Max hits (1-${MAX_SEARCH_LIMIT})` },
         folderId: { type: 'string' },
         tagId: { type: 'string' },
+        docId: { type: 'string', description: 'Optional: restrict semantic search to one document (fast indexed path)' },
       },
       required: ['query'],
     },
@@ -341,8 +429,8 @@ export async function callLibraryTool(
           [docId],
         )?.c || 0,
       )
-      const tags = queryAll<{ id: string; name: string }>(
-        'SELECT t.id, t.name FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? AND t.library_project_id = ? ORDER BY t.name',
+      const tags = queryAll<{ id: string; name: string; is_metadata: number }>(
+        'SELECT t.id, t.name, COALESCE(dt.is_metadata, 0) as is_metadata FROM tags t INNER JOIN document_tags dt ON t.id = dt.tag_id WHERE dt.doc_id = ? AND t.library_project_id = ? ORDER BY t.name',
         [docId, libraryProjectId],
       )
       const folders = queryAll<{ id: string; name: string }>(
@@ -354,8 +442,19 @@ export async function callLibraryTool(
         ...sanitized,
         pageCount,
         pagesWithText,
-        tags,
+        tags: tags.map((tag) => ({
+          id: tag.id,
+          name: tag.name,
+          /** true when the tag was derived from bibliographic metadata (author/dynasty/publisher/...). */
+          isMetadata: Number(tag.is_metadata || 0) > 0,
+        })),
         folders,
+        // Whitelisted bibliographic fields only; internal pdf_* / manifest keys are never exposed.
+        metadata: extractPublicMetadata(doc.metadata),
+      }
+      if (doc.source != null && String(doc.source).trim()) document.source = doc.source
+      if (doc.doc_type != null && String(doc.doc_type).trim() && doc.doc_type !== 'unknown') {
+        document.docType = doc.doc_type
       }
       if (includePages) {
         const pages = queryAll<{
@@ -488,6 +587,124 @@ export async function callLibraryTool(
       }
     }
 
+    case 'get_document_toc': {
+      const docId = String(input.docId || '').trim()
+      if (!docId) return toolError('invalid_args', 'docId is required')
+      const libraryProjectId = getActiveLibraryProjectId()
+      const doc = queryOne<{ id: string; title: string | null }>(
+        `SELECT id, title FROM documents
+         WHERE id = ?
+           AND EXISTS (
+             SELECT 1 FROM library_project_documents project_scope
+             WHERE project_scope.document_id = documents.id
+               AND project_scope.project_id = ?
+           )`,
+        [docId, libraryProjectId],
+      )
+      if (!doc) return toolError('not_found', `Document not found: ${docId}`)
+      const rows = queryAll<{
+        id: string
+        title: string
+        level: number | null
+        order_index: number | null
+        parent_id: string | null
+        source_page_num: number | null
+      }>(
+        `SELECT id, title, level, order_index, parent_id, source_page_num
+         FROM document_toc_items
+         WHERE doc_id = ? AND COALESCE(status, 'active') = 'active'
+         ORDER BY order_index ASC
+         LIMIT ?`,
+        [docId, MAX_TOC_ITEMS],
+      )
+      return {
+        ok: true,
+        docId,
+        title: doc.title,
+        totalItems: rows.length,
+        items: rows.map((row) => ({
+          id: row.id,
+          title: row.title,
+          level: Number(row.level || 1),
+          parentId: row.parent_id || null,
+          /** Physical page number; feed into get_page_text pageNum. */
+          pageNum: Number(row.source_page_num || 0) > 0 ? Number(row.source_page_num) : null,
+        })),
+        hint: rows.length > 0
+          ? 'Use get_page_text with docId + pageNum (until the next item pageNum) to read a chapter.'
+          : 'No TOC recognized for this document; use get_page_text page ranges instead.',
+      }
+    }
+
+    case 'list_excerpts': {
+      const libraryProjectId = getActiveLibraryProjectId()
+      const limit = clampLimit(input.limit, MAX_EXCERPT_LIST_LIMIT, 20)
+      const offset = Math.max(0, Math.round(Number(input.offset || 0)) || 0)
+      const docId = String(input.docId || '').trim()
+      const search = String(input.search || '').trim()
+      const conditions = ['rn.library_project_id = ?']
+      const params: unknown[] = [libraryProjectId]
+      if (docId) {
+        conditions.push('rn.doc_id = ?')
+        params.push(docId)
+      }
+      if (search) {
+        conditions.push('(rn.excerpt LIKE ? OR rn.note LIKE ?)')
+        params.push(`%${search}%`, `%${search}%`)
+      }
+      const whereSql = `WHERE ${conditions.join(' AND ')}`
+      const total = Number(
+        queryOne<{ c: number }>(
+          `SELECT COUNT(*) as c FROM research_notes rn ${whereSql}`,
+          params,
+        )?.c || 0,
+      )
+      const rows = queryAll<{
+        id: string
+        doc_id: string
+        page_num: number | null
+        kind: string | null
+        excerpt: string
+        note: string | null
+        tags: string | null
+        citation_text: string | null
+        updated_at: string | null
+        doc_title: string | null
+      }>(
+        `SELECT rn.id, rn.doc_id, rn.page_num, rn.kind, rn.excerpt, rn.note, rn.tags,
+                rn.citation_text, rn.updated_at, d.title as doc_title
+         FROM research_notes rn
+         INNER JOIN documents d ON rn.doc_id = d.id
+         ${whereSql}
+         ORDER BY rn.updated_at DESC, rn.id ASC
+         LIMIT ? OFFSET ?`,
+        [...params, limit, offset],
+      )
+      return {
+        ok: true,
+        total,
+        limit,
+        offset,
+        items: rows.map((row) => {
+          const pageNum = Number(row.page_num || 0) > 0 ? Number(row.page_num) : null
+          const item: Record<string, unknown> = {
+            id: row.id,
+            docId: row.doc_id,
+            docTitle: row.doc_title,
+            pageNum,
+            kind: row.kind || 'quote',
+            excerpt: clipText(String(row.excerpt || ''), MAX_EXCERPT_TEXT_CHARS),
+            ref: compactHitRef(row.doc_id, pageNum),
+          }
+          if (row.note && row.note.trim()) item.note = clipText(row.note, MAX_EXCERPT_TEXT_CHARS)
+          if (row.tags && row.tags.trim()) item.tags = row.tags
+          if (row.citation_text && row.citation_text.trim()) item.citation = row.citation_text
+          if (row.updated_at) item.updatedAt = row.updated_at
+          return item
+        }),
+      }
+    }
+
     case 'list_folders': {
       const libraryProjectId = getActiveLibraryProjectId()
       const folders = queryAll<{ id: string; name: string; parent_id: string | null; sort_order: number }>(
@@ -549,6 +766,7 @@ export async function callLibraryTool(
         limit: clampLimit(input.limit, MAX_SEARCH_LIMIT, 15),
         folderId: input.folderId ? String(input.folderId) : undefined,
         tagId: input.tagId ? String(input.tagId) : undefined,
+        docId: input.docId ? String(input.docId) : undefined,
       })
       return result
     }

@@ -79,6 +79,25 @@ assert.ok(
   'large Top-K search should use a bounded heap, keyset scan, and batched metadata hydration',
 )
 assert.ok(
+  embedding.includes('HOST_IS_LITTLE_ENDIAN') && embedding.includes('new Float32Array(buf.buffer'),
+  'embedding blob decode must use the typed-array fast path instead of per-element readFloatLE',
+)
+assert.ok(
+  embedding.includes('invalidateVectorSearchCache')
+    && embedding.includes('VECTOR_SCAN_CACHE_MAX_BYTES')
+    && embedding.includes('VECTOR_SCAN_CACHE_TTL_MS'),
+  'vector search must keep a bounded, TTL-guarded in-memory scan cache with an explicit invalidation API',
+)
+assert.ok(
+  embedding.includes('SCOPED_VECTOR_SCAN_MAX_DOCS') && embedding.includes('ec.doc_id IN ('),
+  'folder/tag-scoped vector search should fetch by indexed doc_id instead of scanning the whole table',
+)
+const documentsIpc = read('src', 'main', 'ipc', 'documents.ts')
+assert.ok(
+  (documentsIpc.match(/invalidateVectorSearchCache\(\)/g) || []).length >= 3,
+  'document delete and manual page insert/delete must invalidate the vector scan cache',
+)
+assert.ok(
   searchView.includes('检索前召回')
     && searchView.includes('VECTOR_SEARCH_DEFAULT_LIMIT')
     && searchView.includes('VECTOR_SEARCH_MAX_LIMIT')

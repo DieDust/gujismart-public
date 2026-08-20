@@ -1,5 +1,34 @@
 # 更新日志 / Changelog
 
+## 1.2.33 - 2026-08-20
+
+### 中文
+
+- 优化校对与正文保存：连续输入改为防抖写入并按页串行提交，避免保存互相抢锁导致卡顿；大字段写入改为异步压缩。
+- 删除或插入页面后的页码重排改为一次性集合更新，不再逐页循环 `UPDATE`；文献校对状态改为增量同步。
+- 页编辑后增量更新检索索引，不再把整篇文献标为过期后全量重建；修复按标签检索因参数绑定错误始终返回空结果的问题。
+- 阅读器平移缩放与分栏拖拽不再触发整页重绘；页内搜索框独立为子组件，避免逐键输入重绘整页。
+- 文献库网格卡片与列表行改为按卡片记忆渲染，滚动与多选时不再整表重绘。
+- 向量检索改为零拷贝解码、有界内存缓存，以及按文献/文件夹/标签走索引扫描；重复语义检索与限定范围检索更快。
+- 设置新增「清理 OCR 历史版本」：只删除已被取代且未被当前页或校对底稿引用的历史 OCR 版本、任务记录及未引用大字段文件；当前 OCR 结果与校对文本不受影响。清理后请在空闲时再点「压缩数据库」释放文件空间。
+- MCP 新增 `get_document_toc`（章节目录）与 `list_excerpts`（用户摘录，只读）；`get_document` 按白名单返回书目元数据并标记元数据标签；`vector_search` 支持 `docId` 限定单篇。
+
+### English
+
+- Smoothed proofreading and text saves with debounced, per-page serialized writes so rapid edits no longer contend for the database lock; large payloads are compressed asynchronously.
+- Page insert/delete now renumbers with a single set-based update instead of a per-page loop, and document proof status is updated incrementally.
+- Page edits incrementally refresh the search index instead of marking the whole document stale; tag-scoped search no longer returns empty results because of a parameter-binding bug.
+- Reader pan/zoom and divider dragging no longer re-render the full document view; the in-page search box is isolated so typing does not rebuild the page.
+- Library grid cards and list rows are memoized so scrolling and multi-select no longer re-render every card.
+- Vector search uses zero-copy decoding, a bounded in-memory cache, and indexed scans for document, folder, and tag scopes, making repeated and scoped semantic queries faster.
+- Settings now includes “Clean OCR history versions,” which deletes superseded OCR artifacts, orphaned run/attempt rows, and unreferenced payload files that are not the active page result or the proof base. Live OCR text and proofreading are left intact; compact the database afterwards to reclaim file space.
+- MCP adds `get_document_toc` (chapter outline) and read-only `list_excerpts`; `get_document` returns whitelisted bibliographic metadata and marks metadata-derived tags; `vector_search` accepts `docId` to search one document.
+
+#### 下载 / Downloads
+
+- `GujiSmart-1.2.33-Setup-x64.exe`
+- `GujiSmart-1.2.33-Portable-x64.exe`
+
 ## 1.2.32 - 2026-08-14
 
 ### 中文

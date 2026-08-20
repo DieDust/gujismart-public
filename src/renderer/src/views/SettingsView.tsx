@@ -2291,6 +2291,23 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
     }
   }
 
+  const handlePruneOcrArtifactHistory = async () => {
+    setDatabaseMaintenanceBusy(true)
+    setDatabaseMaintenanceProgress(null)
+    message.loading({ content: '正在清理被取代的 OCR 历史版本...', key: 'database-maintenance', duration: 0 })
+    try {
+      const result = await window.api.pruneOcrArtifactHistory()
+      if (result.success) {
+        message.success({ content: result.message, key: 'database-maintenance', duration: 10 })
+      } else {
+        message.error({ content: result.error || result.message, key: 'database-maintenance', duration: 8 })
+      }
+      setDatabaseDiagnostics(await window.api.getDatabaseStorageDiagnostics())
+    } finally {
+      setDatabaseMaintenanceBusy(false)
+    }
+  }
+
   const refreshPdfRepositoryStatus = async () => {
     setPdfRepositoryStatus(await window.api.listPdfRepositories())
   }
@@ -3309,6 +3326,16 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
                     disabled={!databaseDiagnostics?.externalPayloads.orphanedFileCount}
                   >
                     清理未引用大字段
+                  </Button>
+                </Popconfirm>
+                <Popconfirm
+                  title="每次重新 OCR 都会保留一份历史版本用于追溯，多次重跑后会明显占用空间。此操作只删除已被取代且未被校对底稿引用的历史 OCR 版本；当前使用中的 OCR 结果、校对文本与 PDF 原文不受影响。"
+                  okText="清理"
+                  cancelText="取消"
+                  onConfirm={() => void handlePruneOcrArtifactHistory()}
+                >
+                  <Button icon={<DatabaseOutlined />} loading={databaseMaintenanceBusy}>
+                    清理 OCR 历史版本
                   </Button>
                 </Popconfirm>
                 <Popconfirm

@@ -21,8 +21,10 @@ const requiredTools = [
   'library_search',
   'list_documents',
   'get_document',
+  'get_document_toc',
   'get_page_text',
   'resolve_evidence',
+  'list_excerpts',
   'list_folders',
   'list_tags',
   'library_stats',
@@ -46,6 +48,13 @@ assert.ok(tools.includes("detail: 'full'") || tools.includes('isFullDetail') || 
 assert.ok(tools.includes('compactHitRef') || tools.includes('ref:'), 'search hits should expose compact ref for follow-up reads')
 assert.ok(!tools.includes('readProtectedSetting'), 'MCP tools must never read credential vault')
 assert.ok(!tools.includes('writeProtectedSetting'), 'MCP tools must never write credentials')
+assert.ok(tools.includes('document_toc_items'), 'get_document_toc must read the shared TOC table used by the reader UI')
+assert.ok(tools.includes('research_notes') && tools.includes('rn.library_project_id = ?'), 'list_excerpts must read research_notes scoped to the active library project')
+assert.ok(!/INSERT INTO research_notes|UPDATE research_notes|DELETE FROM research_notes/.test(tools), 'MCP excerpt access must stay read-only')
+assert.ok(tools.includes('PUBLIC_METADATA_FIELDS') && tools.includes('extractPublicMetadata'), 'get_document metadata must go through the public-field whitelist')
+assert.ok(!tools.includes('ebook_manifest') && !tools.includes('pdf_sha256'), 'internal metadata keys must not be special-cased into MCP responses')
+assert.ok(tools.includes('isMetadata'), 'get_document tags should mark metadata-derived tags')
+assert.ok(tools.includes("docId: input.docId ? String(input.docId) : undefined"), 'vector_search must support docId scoping (indexed single-document path)')
 
 assert.ok(server.includes('tools/list') && server.includes('tools/call'), 'stdio server must implement MCP tools methods')
 assert.ok(server.includes('Content-Length'), 'stdio server should support Content-Length framing')
@@ -57,6 +66,7 @@ assert.ok(launcher.includes('electron') || launcher.includes('ELECTRON_RUN_AS_NO
 
 assert.ok(docs.includes('小白') || docs.includes('AI 客户端'), 'user docs should describe beginner multi-client flow')
 assert.ok(docs.includes('Trae') && docs.includes('library_search'), 'docs should cover Trae and list tools')
+assert.ok(docs.includes('get_document_toc') && docs.includes('list_excerpts'), 'docs tool table must list TOC and excerpt tools')
 assert.strictEqual(packageJson.scripts.mcp, 'node scripts/gujismart-mcp.js', 'package.json mcp script')
 assert.ok(String(packageJson.scripts['check:mcp'] || '').includes('mcp-tools-regression'), 'check:mcp script')
 

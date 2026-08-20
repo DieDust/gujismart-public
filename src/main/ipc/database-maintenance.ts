@@ -10,6 +10,7 @@ import {
   getDatabaseStorageDiagnostics,
   getDatabaseStorageDiagnosticsAsync,
   optimizeLegacyDatabaseStorage,
+  pruneOcrArtifactHistory,
 } from '../database-maintenance'
 import { queueAllDocumentsReindex } from '../semantic-search'
 import { getDatabaseLockDiagnostics } from '../database-lock-diagnostics'
@@ -64,6 +65,10 @@ export function registerDatabaseMaintenanceIpc(): void {
 
   ipcMain.handle('database:cleanupExternalPayloads', async (): Promise<DatabaseMaintenanceResult> => {
     return await cleanupExternalPagePayloadStorage()
+  })
+
+  ipcMain.handle('database:pruneOcrArtifactHistory', async (): Promise<DatabaseMaintenanceResult> => {
+    return await pruneOcrArtifactHistory()
   })
 
   ipcMain.handle('search:rebuildLightweightIndex', async (): Promise<DatabaseMaintenanceResult> => {

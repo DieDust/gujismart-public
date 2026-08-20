@@ -305,8 +305,11 @@ try {
   )) {
     throw new Error('proof search still anchors from the stale reading-mode page instead of the current proof page')
   }
-  if (!documentView.includes('const [searchInputDraft, setSearchInputDraft] = useState(searchKeyword)')) {
-    throw new Error('document reader search input still conflates draft text with the committed query')
+  if (
+    !documentView.includes('const DocumentSearchBox = memo(DocumentSearchBoxInner)')
+    || !documentView.includes('const [draft, setDraft] = useState(() => draftRef.current)')
+  ) {
+    throw new Error('document reader search input must keep its draft in a memoized child, separated from the committed query')
   }
   if (!ebookReader.includes('.filter((page) => page.text || page.sourcePage?.has_text || page.sourcePage?.has_ocr_text)')) {
     throw new Error('lightweight text pages can still shift reader search locator indexes')

@@ -117,6 +117,19 @@ const DOC_YIELD_MS = 50
 const EMBEDDINGS_FETCH_TIMEOUT_MS = 90_000
 /** Yield between embedding_chunks scan batches so the window does not go "Not Responding". */
 const SCAN_YIELD_EVERY_BATCHES = 1
+/** Max bytes of decoded vectors kept in the in-memory scan cache; larger indexes always stream from SQLite. */
+const VECTOR_SCAN_CACHE_MAX_BYTES = 256 * 1024 * 1024
+/**
+ * Cache lifetime. Also self-heals invalidations we cannot observe, e.g. writes
+ * made by the main app while this module runs inside the separate MCP host process.
+ */
+const VECTOR_SCAN_CACHE_TTL_MS = 5 * 60 * 1000
+/** Scoped searches over at most this many documents query by doc_id (indexed) instead of scanning the whole table. */
+const SCOPED_VECTOR_SCAN_MAX_DOCS = 128
+/** How many doc ids per IN (...) batch for scoped scans. */
+const SCOPED_VECTOR_SCAN_DOC_BATCH = 32
+/** Yield cadence for the in-memory cache scan (rows between event-loop yields). */
+const CACHE_SCAN_YIELD_EVERY_ROWS = 8192
 
 export type EmbeddingDocStatus = 'pending' | 'queued' | 'processing' | 'ready' | 'error' | 'skipped'
 
@@ -615,14 +628,19 @@ export function getActiveModelId(): string {
   return dim ? `${model}@${dim}` : model
 }
 
+/** Stored blobs are little-endian (writeFloatLE); typed-array fast paths need an LE host. */
+const HOST_IS_LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1
+
 function float32ToBuffer(values: Float32Array | number[]): Buffer {
-  const len = values.length
-  const buf = Buffer.allocUnsafe(len * 4)
-  if (values instanceof Float32Array) {
-    for (let i = 0; i < len; i += 1) buf.writeFloatLE(values[i], i * 4)
-    return buf
+  const vec = values instanceof Float32Array
+    ? values
+    : Float32Array.from(values, (value) => Number(value) || 0)
+  if (HOST_IS_LITTLE_ENDIAN) {
+    // Single memcpy instead of one writeFloatLE call per element.
+    return Buffer.from(vec.buffer.slice(vec.byteOffset, vec.byteOffset + vec.byteLength))
   }
-  for (let i = 0; i < len; i += 1) buf.writeFloatLE(Number(values[i]) || 0, i * 4)
+  const buf = Buffer.allocUnsafe(vec.length * 4)
+  for (let i = 0; i < vec.length; i += 1) buf.writeFloatLE(vec[i], i * 4)
   return buf
 }
 
@@ -631,8 +649,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 function bufferToFloat32(buf: Buffer): Float32Array {
-  const out = new Float32Array(buf.length / 4)
-  for (let i = 0; i < out.length; i += 1) {
+  const count = Math.floor(buf.length / 4)
+  if (HOST_IS_LITTLE_ENDIAN) {
+    if (buf.byteOffset % 4 === 0) {
+      // Zero-copy view; callers treat the result as read-only scan input.
+      return new Float32Array(buf.buffer, buf.byteOffset, count)
+    }
+    const aligned = new ArrayBuffer(count * 4)
+    new Uint8Array(aligned).set(buf.subarray(0, count * 4))
+    return new Float32Array(aligned)
+  }
+  const out = new Float32Array(count)
+  for (let i = 0; i < count; i += 1) {
     out[i] = buf.readFloatLE(i * 4)
   }
   return out
@@ -648,10 +676,70 @@ function l2Normalize(vec: Float32Array | number[]): Float32Array {
 }
 
 function cosine(a: Float32Array, b: Float32Array): number {
+  // Stored vectors are l2-normalized on write, so cosine reduces to a dot product.
   const n = Math.min(a.length, b.length)
-  let s = 0
-  for (let i = 0; i < n; i += 1) s += a[i] * b[i]
+  let s0 = 0
+  let s1 = 0
+  let s2 = 0
+  let s3 = 0
+  const n4 = n - (n % 4)
+  let i = 0
+  for (; i < n4; i += 4) {
+    s0 += a[i] * b[i]
+    s1 += a[i + 1] * b[i + 1]
+    s2 += a[i + 2] * b[i + 2]
+    s3 += a[i + 3] * b[i + 3]
+  }
+  let s = s0 + s1 + s2 + s3
+  for (; i < n; i += 1) s += a[i] * b[i]
   return s
+}
+
+/** Dot product of `query` against one row inside the flat cache matrix, without allocating a subarray view. */
+function dotAtOffset(query: Float32Array, flat: Float32Array, offset: number): number {
+  const n = query.length
+  let s0 = 0
+  let s1 = 0
+  let s2 = 0
+  let s3 = 0
+  const n4 = n - (n % 4)
+  let i = 0
+  for (; i < n4; i += 4) {
+    s0 += query[i] * flat[offset + i]
+    s1 += query[i + 1] * flat[offset + i + 1]
+    s2 += query[i + 2] * flat[offset + i + 2]
+    s3 += query[i + 3] * flat[offset + i + 3]
+  }
+  let s = s0 + s1 + s2 + s3
+  for (; i < n; i += 1) s += query[i] * flat[offset + i]
+  return s
+}
+
+interface VectorScanCache {
+  projectId: string
+  modelId: string
+  count: number
+  dim: number
+  /** Row-major matrix: count × dim floats. */
+  vectors: Float32Array
+  segmentIds: string[]
+  docIds: string[]
+  pageIds: (string | null)[]
+  pageNums: (number | null)[]
+  createdAt: number
+}
+
+/**
+ * One decoded copy of the active project's vectors so repeat searches score in
+ * memory instead of re-reading every BLOB from SQLite (hundreds of MB per scan
+ * on large libraries). Bounded by VECTOR_SCAN_CACHE_MAX_BYTES; validated per
+ * query against the live project-scoped row count and a TTL.
+ */
+let vectorScanCache: VectorScanCache | null = null
+
+/** Drop the in-memory scan cache after any write that changes vectors, page numbers, or scope. */
+export function invalidateVectorSearchCache(): void {
+  vectorScanCache = null
 }
 
 /**
@@ -1144,12 +1232,14 @@ function clearDocumentEmbeddingChunks(docId: string, options?: { onlyCurrentMode
       'DELETE FROM embedding_chunks WHERE doc_id = ? AND (model_id = ? OR model_id LIKE ?)',
       [id, modelId, `${getEmbeddingModel()}@%`],
     )
+    invalidateVectorSearchCache()
     return before
   }
   const before = Number(
     queryOne<{ c: number }>('SELECT COUNT(*) as c FROM embedding_chunks WHERE doc_id = ?', [id])?.c || 0,
   )
   run('DELETE FROM embedding_chunks WHERE doc_id = ?', [id])
+  invalidateVectorSearchCache()
   return before
 }
 
@@ -1619,6 +1709,7 @@ async function embedDocument(docId: string): Promise<void> {
           )
         }
       })
+      invalidateVectorSearchCache()
       embedded += batch.length
       const percent = Math.round((embedded / totalSegments) * 100)
       upsertDocStatus(docId, 'processing', {
@@ -1905,19 +1996,48 @@ export async function vectorSearch(
     }
   }
 
-  // In-document search: query only this doc's chunks (SQL-level), never leak other docs.
-  if (scopedDocId) {
+  type ScanRow = {
+    row_id: number
+    segment_id: string
+    doc_id: string
+    page_id: string | null
+    page_num: number | null
+    embedding: Buffer
+  }
+
+  const cachedScan = vectorScanCache
+  const cacheUsable = Boolean(
+    cachedScan
+    && cachedScan.projectId === activeProjectId
+    && cachedScan.modelId === modelId
+    && cachedScan.count === totalChunks
+    && cachedScan.dim === queryVec.length
+    && Date.now() - cachedScan.createdAt <= VECTOR_SCAN_CACHE_TTL_MS,
+  )
+
+  if (cacheUsable && cachedScan) {
+    // Score against the in-memory copy; covers scoped searches too since the
+    // cache holds the full project+model row set.
+    const { vectors, dim, docIds, segmentIds, pageIds, pageNums, count } = cachedScan
+    for (let i = 0; i < count; i += 1) {
+      if (allowedDocs && !allowedDocs.has(docIds[i])) continue
+      retainCandidate({
+        segmentId: segmentIds[i],
+        docId: docIds[i],
+        pageId: pageIds[i],
+        pageNum: pageNums[i],
+        score: dotAtOffset(queryVec, vectors, i * dim),
+      })
+      if ((i + 1) % CACHE_SCAN_YIELD_EVERY_ROWS === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
+    }
+  } else if (scopedDocId) {
+    // In-document search: query only this doc's chunks (SQL-level), never leak other docs.
     let lastRowId = 0
     let batchIndex = 0
     for (;;) {
-      const rows = queryAll<{
-        row_id: number
-        segment_id: string
-        doc_id: string
-        page_id: string | null
-        page_num: number | null
-        embedding: Buffer
-      }>(
+      const rows = queryAll<ScanRow>(
         `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
          FROM embedding_chunks ec
          WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = ec.doc_id AND project_scope.project_id = ?) AND ec.model_id = ? AND ec.doc_id = ? AND ec.rowid > ?
@@ -1932,18 +2052,50 @@ export async function vectorSearch(
       await yieldScanBatch(batchIndex)
       if (rows.length < SCAN_CHUNK_ROWS) break
     }
+  } else if (allowedDocs && allowedDocs.size <= SCOPED_VECTOR_SCAN_MAX_DOCS) {
+    // Folder/tag scopes over few documents: fetch by doc_id (indexed) instead of
+    // scanning and discarding the rest of the table.
+    const scopeDocIds = [...allowedDocs]
+    let batchIndex = 0
+    for (let start = 0; start < scopeDocIds.length; start += SCOPED_VECTOR_SCAN_DOC_BATCH) {
+      const docBatch = scopeDocIds.slice(start, start + SCOPED_VECTOR_SCAN_DOC_BATCH)
+      const placeholders = docBatch.map(() => '?').join(', ')
+      let lastRowId = 0
+      for (;;) {
+        const rows = queryAll<ScanRow>(
+          `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
+           FROM embedding_chunks ec
+           WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = ec.doc_id AND project_scope.project_id = ?) AND ec.model_id = ? AND ec.doc_id IN (${placeholders}) AND ec.rowid > ?
+           ORDER BY ec.rowid ASC
+           LIMIT ?`,
+          [activeProjectId, modelId, ...docBatch, lastRowId, SCAN_CHUNK_ROWS],
+        )
+        if (rows.length === 0) break
+        rows.forEach(considerRow)
+        lastRowId = Number(rows[rows.length - 1].row_id || lastRowId)
+        batchIndex += 1
+        await yieldScanBatch(batchIndex)
+        if (rows.length < SCAN_CHUNK_ROWS) break
+      }
+    }
   } else {
+    // Full-table scan. Opportunistically rebuild the in-memory cache while we
+    // are already paying to decode every row, so the next query skips SQLite.
+    let cacheEligible = true
+    let cacheBuild: {
+      dim: number
+      vectors: Float32Array
+      segmentIds: string[]
+      docIds: string[]
+      pageIds: (string | null)[]
+      pageNums: (number | null)[]
+      nextIndex: number
+    } | null = null
+
     let lastRowId = 0
     let batchIndex = 0
     for (;;) {
-      const rows = queryAll<{
-        row_id: number
-        segment_id: string
-        doc_id: string
-        page_id: string | null
-        page_num: number | null
-        embedding: Buffer
-      }>(
+      const rows = queryAll<ScanRow>(
         `SELECT ec.rowid AS row_id, ec.segment_id, ec.doc_id, ec.page_id, ec.page_num, ec.embedding
          FROM embedding_chunks ec
          WHERE EXISTS (SELECT 1 FROM library_project_documents project_scope WHERE project_scope.document_id = ec.doc_id AND project_scope.project_id = ?) AND ec.model_id = ? AND ec.rowid > ?
@@ -1952,11 +2104,71 @@ export async function vectorSearch(
         [activeProjectId, modelId, lastRowId, SCAN_CHUNK_ROWS],
       )
       if (rows.length === 0) break
-      rows.forEach(considerRow)
+      for (const row of rows) {
+        if (!cacheEligible) {
+          considerRow(row)
+          continue
+        }
+        const emb = bufferToFloat32(Buffer.isBuffer(row.embedding) ? row.embedding : Buffer.from(row.embedding as ArrayBuffer))
+        if (!cacheBuild) {
+          const bytes = totalChunks * emb.length * 4
+          if (emb.length > 0 && bytes <= VECTOR_SCAN_CACHE_MAX_BYTES) {
+            cacheBuild = {
+              dim: emb.length,
+              vectors: new Float32Array(totalChunks * emb.length),
+              segmentIds: [],
+              docIds: [],
+              pageIds: [],
+              pageNums: [],
+              nextIndex: 0,
+            }
+          } else {
+            cacheEligible = false
+          }
+        }
+        if (cacheBuild) {
+          if (emb.length !== cacheBuild.dim || cacheBuild.nextIndex >= totalChunks) {
+            // Mixed dimensions or concurrent writes: abandon caching, keep scanning.
+            cacheBuild = null
+            cacheEligible = false
+          } else {
+            cacheBuild.vectors.set(emb, cacheBuild.nextIndex * cacheBuild.dim)
+            cacheBuild.segmentIds.push(row.segment_id)
+            cacheBuild.docIds.push(row.doc_id)
+            cacheBuild.pageIds.push(row.page_id)
+            cacheBuild.pageNums.push(row.page_num)
+            cacheBuild.nextIndex += 1
+          }
+        }
+        if (allowedDocs && !allowedDocs.has(row.doc_id)) continue
+        if (emb.length !== queryVec.length) continue
+        retainCandidate({
+          segmentId: row.segment_id,
+          docId: row.doc_id,
+          pageId: row.page_id,
+          pageNum: row.page_num,
+          score: cosine(queryVec, emb),
+        })
+      }
       lastRowId = Number(rows[rows.length - 1].row_id || lastRowId)
       batchIndex += 1
       await yieldScanBatch(batchIndex)
       if (rows.length < SCAN_CHUNK_ROWS) break
+    }
+
+    if (cacheBuild && cacheBuild.nextIndex === totalChunks) {
+      vectorScanCache = {
+        projectId: activeProjectId,
+        modelId,
+        count: totalChunks,
+        dim: cacheBuild.dim,
+        vectors: cacheBuild.vectors,
+        segmentIds: cacheBuild.segmentIds,
+        docIds: cacheBuild.docIds,
+        pageIds: cacheBuild.pageIds,
+        pageNums: cacheBuild.pageNums,
+        createdAt: Date.now(),
+      }
     }
   }
 

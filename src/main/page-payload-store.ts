@@ -4,6 +4,7 @@ import {
   deleteUnreferencedPayloadFiles,
   readPagePayloadValue,
   writePagePayloadRef,
+  writePagePayloadRefAsync,
 } from './page-payload-files'
 import {
   collectReferencedPagePayloadRefsFromDatabase,
@@ -87,6 +88,26 @@ export function preparePagePayloadUpdate(
   return {
     value: field === 'ocr_result' ? '{"externalized":true}' : '',
     ref: writePagePayload(docId, pageId, field, normalizedValue),
+  }
+}
+
+// Async variant of preparePagePayloadUpdate for interactive save paths so large
+// externalized payloads compress and land on disk without blocking the main
+// process event loop.
+export async function preparePagePayloadUpdateAsync(
+  docId: string,
+  pageId: string,
+  field: PagePayloadField,
+  value: unknown,
+): Promise<{ value: string | null; ref: string | null }> {
+  const normalizedValue = normalizeFieldValue(value)
+  if (!shouldExternalizeField(field, normalizedValue)) {
+    return { value: normalizedValue, ref: null }
+  }
+  if (normalizedValue === null) return { value: null, ref: null }
+  return {
+    value: field === 'ocr_result' ? '{"externalized":true}' : '',
+    ref: await writePagePayloadRefAsync(docId, pageId, field, normalizedValue),
   }
 }
 

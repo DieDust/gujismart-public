@@ -1,7 +1,11 @@
-import { createHash } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs'
+import { mkdir, rename, rm, writeFile } from 'fs/promises'
 import { dirname, join, normalize, resolve } from 'path'
-import { gunzipSync, gzipSync } from 'zlib'
+import { promisify } from 'util'
+import { gunzipSync, gzip, gzipSync } from 'zlib'
+
+const gzipAsync = promisify(gzip)
 
 const PAYLOAD_ROOT_NAME = 'page-payloads'
 const LEGACY_REF_PREFIX = 'page-payload:v1:'
@@ -130,6 +134,39 @@ export function writePagePayloadRef(docId: string, pageId: string, field: string
   return ref
 }
 
+// Async variant for interactive save paths: gzip runs on the zlib thread pool
+// and the file lands via temp-file + rename so a crash cannot leave a truncated
+// content-addressed object behind.
+export async function writePagePayloadRefAsync(docId: string, pageId: string, field: string, value: string): Promise<string> {
+  const hash = createHash('sha256').update(value).digest('hex')
+  const ref = `${REF_PREFIX}${['objects', hash.slice(0, 2), `${hash}.json.gz`].join('/')}`
+  const absolutePath = resolvePayloadPath(ref)
+  if (!absolutePath) throw new Error('Invalid page payload path')
+  await mkdir(dirname(absolutePath), { recursive: true })
+  if (!existsSync(absolutePath)) {
+    const compressed = await gzipAsync(JSON.stringify({
+      version: 2,
+      docId,
+      pageId,
+      field,
+      sha256: hash,
+      createdAt: new Date().toISOString(),
+      value,
+    }))
+    const tempPath = `${absolutePath}.${randomUUID()}.tmp`
+    await writeFile(tempPath, compressed)
+    try {
+      await rename(tempPath, absolutePath)
+    } catch (error) {
+      // A concurrent writer may have landed the same content-addressed object.
+      await rm(tempPath, { force: true })
+      if (!existsSync(absolutePath)) throw error
+    }
+  }
+  pagePayloadReadCache.delete(absolutePath)
+  return ref
+}
+
 export function readPagePayloadValue(ref: string | null | undefined): string | null {
   if (!ref) return null
   const absolutePath = resolvePayloadPath(ref)
@@ -205,6 +242,8 @@ export function deleteUnreferencedPayloadFiles(referencedRefs: Set<string>): Pag
       if (referencedRefs.has(ref) || referencedRefs.has(legacyRef)) continue
       const size = statSync(entryPath).size
       rmSync(entryPath, { force: true })
+      // Keep the hot-path read cache honest: a deleted object must not read back.
+      pagePayloadReadCache.delete(normalize(entryPath))
       deletedFiles += 1
       deletedBytes += size
     }

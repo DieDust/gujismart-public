@@ -11,6 +11,8 @@ import {
   ZoomOutOutlined,
 } from '@ant-design/icons'
 import type { ViewerViewport } from './ImageViewer'
+import { createDebouncedPageSaver } from '../utils/textEditorSaving'
+import type { DebouncedPageSaver } from '../utils/textEditorSaving'
 import type { OcrRecognizeLayoutBlock, OcrRecognizeResult, PageUpdatePayload } from '@shared/types'
 
 type JsonRecord = Record<string, unknown>
@@ -600,6 +602,30 @@ export default function OverlayProofreader({
   const controlledViewport = viewport !== undefined
   const currentViewport = controlledViewport ? viewport : viewportState
 
+  const debouncedSaverRef = useRef<DebouncedPageSaver | null>(null)
+  if (!debouncedSaverRef.current) {
+    debouncedSaverRef.current = createDebouncedPageSaver()
+  }
+  const debouncedSaver = debouncedSaverRef.current
+
+  // Flush pending edits before the proofreader moves to another page or
+  // unmounts so the debounce window can never drop a save.
+  useEffect(() => {
+    return () => {
+      void debouncedSaver.flush()
+    }
+  }, [debouncedSaver, pageId])
+
+  useEffect(() => {
+    const flushPendingSave = (): void => {
+      void debouncedSaver.flush()
+    }
+    window.addEventListener('beforeunload', flushPendingSave)
+    return () => {
+      window.removeEventListener('beforeunload', flushPendingSave)
+    }
+  }, [debouncedSaver])
+
   const coordinateScale = useMemo<CoordinateScale>(() => {
     const imageWidth = imageSize.current.width
     const imageHeight = imageSize.current.height
@@ -737,8 +763,12 @@ export default function OverlayProofreader({
   }, [historyIndex])
 
   const persistBlocks = useCallback((nextBlocks: OverlayBlock[]) => {
-    onSave(pageId, buildOcrPayload(ocrResult, nextBlocks, pageProofStatus))
-  }, [ocrResult, onSave, pageId, pageProofStatus])
+    const payload = buildOcrPayload(ocrResult, nextBlocks, pageProofStatus)
+    // Bursts of proofreading actions merge into one debounced full-page save.
+    void debouncedSaver.schedule(() => {
+      onSave(pageId, payload)
+    })
+  }, [debouncedSaver, ocrResult, onSave, pageId, pageProofStatus])
 
   const commitBlocks = useCallback((nextBlocks: OverlayBlock[], nextActiveIndex?: number) => {
     const normalizedBlocks = normalizeBlockOrder(nextBlocks)

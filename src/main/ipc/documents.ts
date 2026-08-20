@@ -43,7 +43,8 @@ import {
   removePdfRepositoryById,
   restorePdfAssetForDocumentAsync,
 } from '../pdf-assets'
-import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex } from '../semantic-search'
+import { markSearchIndexStaleForDocuments, markSearchIndexStaleForPages, notifySearchContentChanged, queueAllDocumentsReindex, updateSearchIndexForPageEdit } from '../semantic-search'
+import { invalidateVectorSearchCache } from '../embedding-index'
 import { syncDocumentMetadataTags } from '../metadata-tags'
 import {
   markLibraryStateCacheDirty,
@@ -72,7 +73,7 @@ import {
   getActiveLibraryProjectId,
   withLibraryProjectContext,
 } from '../library-projects'
-import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate } from '../page-payload-store'
+import { hydratePagePayloadRow, hydratePagePayloadRows, preparePagePayloadUpdate, preparePagePayloadUpdateAsync } from '../page-payload-store'
 import { normalizeHistoryDocType } from '../../shared/history-citation'
 import { getErrorMessage } from '../../shared/errors'
 import {
@@ -877,6 +878,7 @@ function scheduleDocumentDeleteJob(docIds: string[]): void {
             queueAllDocumentsReindex()
           }
           notifySearchContentChanged()
+          invalidateVectorSearchCache()
           refreshDeletedDocumentTags([...affectedTagIds])
           const cleanupTasks = getDeleteCleanupTasks(deletedIds.map((id) => ({ id })))
           emitBackgroundTaskStatus({
@@ -3036,6 +3038,82 @@ function syncDocumentProofStatus(docId: string): void {
   const completed = Number(stats?.completed || 0)
   const nextStatus = total > 0 && completed === total ? 'completed' : 'pending'
   run('UPDATE documents SET proof_status = ?, updated_at = ? WHERE id = ?', [nextStatus, new Date().toISOString(), docId])
+}
+
+// Incremental variant for single-page saves: a page that is not completed makes
+// the document pending without any scan, and a newly completed page only needs
+// an EXISTS probe that stops at the first remaining incomplete page. The full
+// COUNT-based syncDocumentProofStatus stays in use for structural changes
+// (page insert/delete) as the calibration path.
+function syncDocumentProofStatusAfterPageChange(docId: string, nextPageProofStatus: string): void {
+  if (nextPageProofStatus !== 'completed') {
+    run('UPDATE documents SET proof_status = ?, updated_at = ? WHERE id = ?', ['pending', new Date().toISOString(), docId])
+    return
+  }
+  const incomplete = queryOne<{ found: number }>(
+    `SELECT EXISTS(
+       SELECT 1 FROM pages WHERE doc_id = ? AND COALESCE(proof_status, '') != 'completed'
+     ) AS found`,
+    [docId],
+  )
+  const nextStatus = incomplete?.found ? 'pending' : 'completed'
+  run('UPDATE documents SET proof_status = ?, updated_at = ? WHERE id = ?', [nextStatus, new Date().toISOString(), docId])
+}
+
+// pages:update runs on every proofreading save; decoding the full page JPEG
+// just to learn its dimensions costs tens of milliseconds per keystroke burst.
+// Cache the decoded size per image path and revalidate cheaply via mtime.
+const PAGE_IMAGE_SIZE_CACHE_MAX = 64
+const pageImageSizeCache = new Map<string, { width: number; height: number; mtimeMs: number; sizeBytes: number }>()
+
+// pages:update awaits async payload writes, so two rapid saves for the same
+// page could interleave at await points and let an older payload land after a
+// newer one. Serialize updates per page to keep last-write-wins semantics.
+const pageUpdateQueues = new Map<string, Promise<unknown>>()
+
+function enqueuePageUpdate<T>(pageId: string, task: () => Promise<T>): Promise<T> {
+  const previous = pageUpdateQueues.get(pageId) || Promise.resolve()
+  const result = previous.then(task, task)
+  const tail = result.then(() => undefined, () => undefined)
+  pageUpdateQueues.set(pageId, tail)
+  void tail.then(() => {
+    if (pageUpdateQueues.get(pageId) === tail) pageUpdateQueues.delete(pageId)
+  })
+  return result
+}
+
+function getPageImageSizeCached(imagePath: string): { width: number; height: number } | null {
+  let fileStat: { mtimeMs: number; size: number }
+  try {
+    fileStat = statSync(imagePath)
+  } catch {
+    return null
+  }
+  const cached = pageImageSizeCache.get(imagePath)
+  if (cached && cached.mtimeMs === fileStat.mtimeMs && cached.sizeBytes === fileStat.size) {
+    pageImageSizeCache.delete(imagePath)
+    pageImageSizeCache.set(imagePath, cached)
+    return { width: cached.width, height: cached.height }
+  }
+  try {
+    const image = nativeImage.createFromPath(imagePath)
+    if (image.isEmpty()) return null
+    const size = image.getSize()
+    pageImageSizeCache.set(imagePath, {
+      width: size.width,
+      height: size.height,
+      mtimeMs: fileStat.mtimeMs,
+      sizeBytes: fileStat.size,
+    })
+    while (pageImageSizeCache.size > PAGE_IMAGE_SIZE_CACHE_MAX) {
+      const oldest = pageImageSizeCache.keys().next().value
+      if (oldest === undefined) break
+      pageImageSizeCache.delete(oldest)
+    }
+    return size
+  } catch {
+    return null
+  }
 }
 
 function hasUsableManualPageText(value: unknown): boolean {
@@ -6377,7 +6455,7 @@ export function registerDocumentIpc(): void {
     },
   )
 
-  ipcMain.handle('pages:update', async (_event, pageId: string, data: PageUpdatePayload) => {
+  ipcMain.handle('pages:update', async (_event, pageId: string, data: PageUpdatePayload) => enqueuePageUpdate(String(pageId || ''), async () => {
     rejectProtectedPathFields(data, ['image_path'])
     const page = queryOne<{
       doc_id: string
@@ -6386,6 +6464,7 @@ export function registerDocumentIpc(): void {
       proof_status: string
       ocr_status: string | null
       active_ocr_artifact_id: string | null
+      document_proof_status: string | null
       document_ocr_status: string | null
       document_import_status: string | null
       document_error_message: string | null
@@ -6397,6 +6476,7 @@ export function registerDocumentIpc(): void {
          p.proof_status,
          p.ocr_status,
          p.active_ocr_artifact_id,
+         d.proof_status AS document_proof_status,
          d.ocr_status AS document_ocr_status,
          d.import_status AS document_import_status,
          d.error_message AS document_error_message
@@ -6408,16 +6488,8 @@ export function registerDocumentIpc(): void {
     if (!page) return false
     const normalizedData: PageUpdatePayload = { ...data }
     if ('ocr_result' in normalizedData && normalizedData.ocr_result) {
-      let imageSize: { width: number; height: number } | null = null
       const imagePath = String(page.image_path || '').trim()
-      if (imagePath) {
-        try {
-          const image = nativeImage.createFromPath(imagePath)
-          if (!image.isEmpty()) imageSize = image.getSize()
-        } catch {
-          imageSize = null
-        }
-      }
+      const imageSize = imagePath ? getPageImageSizeCached(imagePath) : null
       const pageIndex = Number(page.page_num || 0) || 1
       const repairedResult = normalizeStoredGujiOcrResultForRead(normalizedData.ocr_result, imagePath, pageIndex)
         || normalizedData.ocr_result
@@ -6454,7 +6526,10 @@ export function registerDocumentIpc(): void {
       if (!(field in normalizedData)) continue
       const value = normalizedData[field]
       if (field === 'ocr_text' || field === 'ocr_result' || field === 'proofed_text') {
-        const prepared = preparePagePayloadUpdate(page.doc_id, pageId, field, value)
+        // Interactive saves use the async payload path (preparePagePayloadUpdate
+        // stays the sync API for batch/maintenance callers) so gzip and disk IO
+        // for externalized payloads never block the main process event loop.
+        const prepared = await preparePagePayloadUpdateAsync(page.doc_id, pageId, field, value)
         sets.push(`${field} = ?`, `${field}_ref = ?`)
         params.push(prepared.value, prepared.ref)
         continue
@@ -6472,7 +6547,18 @@ export function registerDocumentIpc(): void {
 
     params.push(pageId)
     run(`UPDATE pages SET ${sets.join(', ')} WHERE id = ?`, params)
-    syncDocumentProofStatus(page.doc_id)
+    const proofStatusChanged = normalizedData.proof_status !== undefined
+      && normalizedData.proof_status !== page.proof_status
+    if (proofStatusChanged) {
+      syncDocumentProofStatusAfterPageChange(page.doc_id, String(normalizedData.proof_status || ''))
+    } else if (page.document_proof_status === 'completed' && effectiveProofStatus !== 'completed') {
+      // Self-heal a stale completed document flag without scanning its pages.
+      run('UPDATE documents SET proof_status = ?, updated_at = ? WHERE id = ?', ['pending', new Date().toISOString(), page.doc_id])
+    } else {
+      // Keep the historical behavior where every page save bumps the parent
+      // document's updated_at without recounting every page's proof status.
+      run('UPDATE documents SET updated_at = ? WHERE id = ?', [new Date().toISOString(), page.doc_id])
+    }
     const touchedOcrContent = 'ocr_text' in normalizedData || 'proofed_text' in normalizedData || 'ocr_result' in normalizedData
     if (touchedOcrContent) {
       markDocumentTocDirty(page.doc_id)
@@ -6489,11 +6575,14 @@ export function registerDocumentIpc(): void {
       syncDocumentOcrStatusAfterPageEdit(page.doc_id)
       refreshLibraryOcrStateAfterPageEdit(page.doc_id)
     }
-    markSearchIndexStaleForPages([pageId])
+    // Single-page saves update the search index incrementally; the function
+    // falls back to the whole-document background rebuild whenever the
+    // in-place update is not provably safe.
+    updateSearchIndexForPageEdit(pageId)
     notifySearchContentChanged()
     scheduleDatabaseSave()
     return true
-  })
+  }))
 
   ipcMain.handle('pages:insertManual', async (_event, request: ManualPageInsertRequest): Promise<ManualPageInsertResult> => {
     const documentId = String(request?.documentId || '').trim()
@@ -6595,10 +6684,21 @@ export function registerDocumentIpc(): void {
         [newPageId, documentId, safeInsertionIndex + 1, null, '', blankOcrResult, null, 'completed', 'pending', now],
       )
 
-      pages.forEach((page, index) => {
-        const nextPageNum = index < safeInsertionIndex ? index + 1 : index + 2
-        run('UPDATE pages SET page_num = ? WHERE id = ? AND doc_id = ?', [nextPageNum, page.id, documentId])
-      })
+      // Renumber existing pages in one set-based statement (pages before the
+      // insertion keep their slot, pages at/after it shift up by one) instead of
+      // one UPDATE per page inside this foreground transaction.
+      const orderedExistingIdsJson = JSON.stringify(pages.map((page) => String(page.id)))
+      run(
+        `UPDATE pages
+         SET page_num = renumbered.new_page_num
+         FROM (
+           SELECT je.value AS page_id,
+                  je.key + 1 + (CASE WHEN je.key >= ? THEN 1 ELSE 0 END) AS new_page_num
+           FROM json_each(?) AS je
+         ) AS renumbered
+         WHERE pages.id = renumbered.page_id AND pages.doc_id = ?`,
+        [safeInsertionIndex, orderedExistingIdsJson, documentId],
+      )
 
       // Keep every page_id-backed cache aligned in the same transaction. Tables that
       // only retain a legacy page_num are deliberately marked stale/rebuildable below;
@@ -6655,6 +6755,8 @@ export function registerDocumentIpc(): void {
     inserted.__full = true
     markSearchIndexStaleForDocuments([documentId])
     notifySearchContentChanged()
+    // Page renumbering rewrote embedding_chunks.page_num in place.
+    invalidateVectorSearchCache()
     scheduleDatabaseSave()
     return { inserted: hydratePagePayloadRow(inserted), pageCount }
   })
@@ -6738,9 +6840,20 @@ export function registerDocumentIpc(): void {
       )
       run('UPDATE pages SET page_num = COALESCE(page_num, 0) + ? WHERE doc_id = ?', [temporaryOffset, documentId])
       run('DELETE FROM pages WHERE id = ? AND doc_id = ?', [pageId, documentId])
-      remainingPages.forEach((page, index) => {
-        run('UPDATE pages SET page_num = ? WHERE id = ? AND doc_id = ?', [index + 1, page.id, documentId])
-      })
+      // Renumber every remaining page in one set-based statement instead of one
+      // UPDATE per page; large books otherwise issue thousands of statements
+      // inside this foreground transaction.
+      const orderedRemainingIdsJson = JSON.stringify(remainingPages.map((page) => String(page.id)))
+      run(
+        `UPDATE pages
+         SET page_num = renumbered.new_page_num
+         FROM (
+           SELECT je.value AS page_id, je.key + 1 AS new_page_num
+           FROM json_each(?) AS je
+         ) AS renumbered
+         WHERE pages.id = renumbered.page_id AND pages.doc_id = ?`,
+        [orderedRemainingIdsJson, documentId],
+      )
 
       const pageNumberTables = [
         'page_ocr_versions',
@@ -6795,6 +6908,8 @@ export function registerDocumentIpc(): void {
     markLibraryStateCacheDirty()
     markSearchIndexStaleForDocuments([documentId])
     notifySearchContentChanged()
+    // Page deletion removed embedding rows and renumbered the rest in place.
+    invalidateVectorSearchCache()
     scheduleDatabaseSave()
     return { deletedPageId: pageId, deletedPageNum, nextPageId, pageCount }
   })

@@ -469,6 +469,10 @@ export function getDocumentSearchSessionCacheDiagnostics(): {
 }
 
 const queuedReindexDocIds = new Set<string>()
+// Documents whose full reindex is executing right now. Incremental page
+// updates must not run concurrently with a full rebuild of the same document
+// because the rebuild commit would overwrite them with stale staged content.
+const currentlyReindexingDocIds = new Set<string>()
 let reindexTimer: NodeJS.Timeout | null = null
 let reindexWorkerRunning = false
 let reindexDrainCompletedCount = 0
@@ -745,6 +749,184 @@ export function markSearchIndexStaleForPages(pageIds: string[]): void {
     uniquePageIds,
   ).map((item) => item.doc_id)
   markSearchIndexStaleForDocuments(docIds)
+}
+
+// Replaces one page's search index rows in place instead of queueing a full
+// document rebuild. Returns false when the incremental path is not safe
+// (index missing/not ready, document queued for or undergoing a full rebuild)
+// so the caller can fall back to the document-level path.
+function applySearchIndexPageUpdate(pageId: string): boolean {
+  const pageRow = queryOne<SearchPageRow>(
+    `${INDEXABLE_PAGE_BASE_SELECT} WHERE p.id = ?`,
+    [pageId],
+  )
+  if (!pageRow) return false
+  const docId = String(pageRow.doc_id || '')
+  if (!docId) return false
+  // Inactive/deleted documents are dropped by the document-level path too;
+  // there is nothing to update incrementally.
+  if (resolveActiveDocumentIds([docId]).length === 0) return true
+  if (queuedReindexDocIds.has(docId) || currentlyReindexingDocIds.has(docId)) return false
+  const status = getCurrentSearchIndexStatus(docId)
+  if (status?.status !== 'ready') return false
+
+  // Match loadIndexablePagesForDocument (ORDER BY page_num) so the ordinal
+  // this page gets equals what a full rebuild would assign it.
+  const pageIndexRow = queryOne<{ count?: number | null }>(
+    `SELECT COUNT(*) as count
+     FROM pages p
+     INNER JOIN documents d ON d.id = p.doc_id
+     WHERE ${getIndexablePagesWhereClause()}
+       AND COALESCE(p.page_num, 0) < ?`,
+    [docId, Number(pageRow.page_num || 0)],
+  )
+  const pageIndex = Number(pageIndexRow?.count || 0)
+  const drafts = buildSearchIndexSegmentDrafts(docId, pageRow, pageIndex)
+  const draftGrams = drafts.map((segment) => ({
+    segment,
+    grams: getSearchNgrams(segment.normalizedText, 3, SEARCH_NGRAM_MAX_POSITIONS_STORED),
+  }))
+
+  const now = new Date().toISOString()
+  const skipFtsDelete = isSearchSegmentsFtsRebuildNeeded()
+  transaction(() => {
+    // Translation segments carry this page's page_id but are owned by the
+    // translation pipeline; page text edits must leave them untouched.
+    if (isFtsAvailable() && !skipFtsDelete) {
+      run(
+        `INSERT INTO search_segments_fts(search_segments_fts, rowid, title, normalized_text)
+         SELECT 'delete', rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND page_id = ? AND source_kind != 'translation'
+           AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId, pageId],
+      )
+    }
+    if (isSearchTrigramFtsAvailable() && !skipFtsDelete) {
+      run(
+        `INSERT INTO search_segments_trigram(search_segments_trigram, rowid, normalized_text)
+         SELECT 'delete', rowid, COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND page_id = ? AND source_kind != 'translation'
+           AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId, pageId],
+      )
+    }
+    run(
+      `DELETE FROM search_ngram_index
+       WHERE segment_id IN (
+         SELECT segment_id FROM search_index_segments
+         WHERE doc_id = ? AND page_id = ? AND source_kind != 'translation'
+       )`,
+      [docId, pageId],
+    )
+    run(
+      `DELETE FROM search_index_segments
+       WHERE doc_id = ? AND page_id = ? AND source_kind != 'translation'`,
+      [docId, pageId],
+    )
+    for (const { segment, grams } of draftGrams) {
+      run(
+        `INSERT INTO search_index_segments (
+          segment_id, doc_id, page_id, page_num, source_kind, href, title, ordinal, source_start, text, normalized_text, offset_map, text_hash, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          segment.segmentId,
+          docId,
+          segment.pageId,
+          segment.pageNum,
+          segment.sourceKind,
+          segment.href,
+          segment.title,
+          segment.ordinal,
+          segment.sourceStart,
+          segment.text.length > SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS
+            ? segment.text.slice(0, SEARCH_INDEX_SEGMENT_STORED_TEXT_MAX_CHARS)
+            : segment.text,
+          segment.normalizedText,
+          '',
+          segment.textHash,
+          now,
+        ],
+      )
+      grams.forEach(({ gram, positions, hitCount }) => {
+        run(
+          `INSERT INTO search_ngram_index (gram, segment_id, doc_id, positions, hit_count)
+           VALUES (?, ?, ?, ?, ?)`,
+          [gram, segment.segmentId, docId, JSON.stringify(positions), hitCount],
+        )
+      })
+    }
+    if (isFtsAvailable()) {
+      run(
+        `INSERT INTO search_segments_fts (rowid, title, normalized_text)
+         SELECT rowid, COALESCE(title, ''), COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND page_id = ? AND source_kind != 'translation'
+           AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId, pageId],
+      )
+    }
+    if (isSearchTrigramFtsAvailable()) {
+      run(
+        `INSERT INTO search_segments_trigram (rowid, normalized_text)
+         SELECT rowid, COALESCE(normalized_text, text, '')
+         FROM search_index_segments
+         WHERE doc_id = ? AND page_id = ? AND source_kind != 'translation'
+           AND TRIM(COALESCE(normalized_text, text, '')) != ''`,
+        [docId, pageId],
+      )
+    }
+    const storedHashes = queryAll<{ text_hash: string }>(
+      `SELECT COALESCE(text_hash, '') as text_hash
+       FROM search_index_segments
+       WHERE doc_id = ?
+       ORDER BY CASE WHEN source_kind = 'translation' THEN 1 ELSE 0 END, ordinal ASC, segment_id ASC`,
+      [docId],
+    )
+    updateSearchIndexStatus(docId, 'ready', {
+      sourceHash: versionedSourceHash(storedHashes.map((row) => row.text_hash)),
+      segmentCount: storedHashes.length,
+      indexedAt: now,
+    })
+  })
+
+  scheduleDatabaseSave()
+  markSearchIndexDirty()
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const embedding = require('./embedding-index') as {
+      notifyDocumentReadyForEmbedding?: (id: string) => void
+    }
+    embedding.notifyDocumentReadyForEmbedding?.(docId)
+  } catch {
+    // ignore
+  }
+  return true
+}
+
+const pendingPageIndexUpdatePageIds = new Set<string>()
+
+// Single-page save path: replace just this page's index rows right away and
+// keep the whole-document background rebuild as the fallback for every case
+// the incremental path cannot prove safe.
+export function updateSearchIndexForPageEdit(pageId: string): void {
+  const id = String(pageId || '').trim()
+  if (!id) return
+  markSearchIndexDirty()
+  if (pendingPageIndexUpdatePageIds.has(id)) return
+  pendingPageIndexUpdatePageIds.add(id)
+  setImmediate(() => {
+    pendingPageIndexUpdatePageIds.delete(id)
+    try {
+      if (!applySearchIndexPageUpdate(id)) {
+        markSearchIndexStaleForPages([id])
+      }
+    } catch (error) {
+      console.warn('[Search] Incremental page index update failed, falling back to document reindex', error)
+      markSearchIndexStaleForPages([id])
+    }
+  })
 }
 
 function normalizeSearchText(value: string): string {
@@ -1787,12 +1969,13 @@ async function reindexDocumentThroughWorker(docId: string, totalCount: number, c
     return { docId, status: 'skipped', segmentCount: 0, error: '文献正在后台删除' }
   }
 
-  if (!isSearchIndexWorkerAvailable()) {
-    queuedReindexDocIds.add(docId)
-    return reindexDocumentInBackground(docId, totalCount, completedCount)
-  }
-
+  currentlyReindexingDocIds.add(docId)
   try {
+    if (!isSearchIndexWorkerAvailable()) {
+      queuedReindexDocIds.add(docId)
+      return await reindexDocumentInBackground(docId, totalCount, completedCount)
+    }
+
     const result = await runSearchIndexWorkerTask(
       {
         dbFilePath: getDatabaseFilePath(),
@@ -1813,6 +1996,8 @@ async function reindexDocumentThroughWorker(docId: string, totalCount: number, c
     updateSearchIndexStatus(docId, 'error', { errorMessage })
     scheduleDatabaseSave()
     return { docId, status: 'error', segmentCount: 0, error: errorMessage }
+  } finally {
+    currentlyReindexingDocIds.delete(docId)
   }
 }
 
@@ -1990,6 +2175,7 @@ export function reindexDocument(docId: string): SearchReindexDocumentResult {
 
   const now = new Date().toISOString()
   const stagingJobId = createSearchIndexStagingJobId(docId)
+  currentlyReindexingDocIds.add(docId)
   try {
     const pages = loadIndexablePagesForDocument(docId)
     const segments = [
@@ -2022,6 +2208,8 @@ export function reindexDocument(docId: string): SearchReindexDocumentResult {
     )
     saveDatabase()
     return { docId, status: 'error', segmentCount: 0, error: errorMessage }
+  } finally {
+    currentlyReindexingDocIds.delete(docId)
   }
 }
 
@@ -2316,11 +2504,14 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
   const params: Array<string | number> = [activeProjectId]
   if (!resolvedOptions.importStatus) conditions.push(activeDocumentCondition('d'))
 
+  // Tag placeholders live in JOIN ON clauses, which precede every WHERE
+  // placeholder in the final SQL, so their params must be bound first.
+  const tagJoinParams: string[] = []
   if (tagIds.length > 0) {
     tagIds.forEach((tagId, index) => {
       const alias = `dt_scope_${index}`
       sql += ` INNER JOIN document_tags ${alias} ON d.id = ${alias}.doc_id AND ${alias}.tag_id = ?`
-      params.push(tagId)
+      tagJoinParams.push(tagId)
     })
   }
 
@@ -2387,7 +2578,7 @@ function resolveSearchFilterDocIds(options?: SearchOptions): string[] | undefine
     sql += ` WHERE ${conditions.join(' AND ')}`
   }
 
-  const docIds = queryAll<{ id: string }>(sql, params).map((item) => item.id)
+  const docIds = queryAll<{ id: string }>(sql, [...tagJoinParams, ...params]).map((item) => item.id)
   setBoundedSearchCacheEntry(searchFilterDocIdsCache, cacheKey, { createdAt: Date.now(), docIds }, 80, SEARCH_FILTER_CACHE_TTL_MS)
   return [...docIds]
 }

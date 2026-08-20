@@ -130,6 +130,42 @@ async function run() {
     assert.strictEqual(cGroup?.totalHits, 4)
     assert.strictEqual(search.getSearchIndexStatus('doc_c')[0]?.status, 'ready')
 
+    // Single-page edits on a ready document must update the search index in
+    // place (segments + FTS rows for just that page) instead of queueing a
+    // full document rebuild, and sibling pages must stay searchable.
+    const incrementalDocId = 'incremental_page_doc'
+    database.run(
+      `INSERT INTO documents (
+        id, title, author, dynasty, source, doc_type, file_path, thumb_path, page_count,
+        ocr_status, proof_status, import_status, metadata_status, metadata, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [incrementalDocId, 'Incremental page index', null, null, null, 'test', null, null, 2, 'completed', 'pending', 'processed', 'pending', '{}', now, now],
+    )
+    database.run(
+      'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['incremental_page_1', incrementalDocId, 1, null, 'incremental-static-token stays put', null, 'completed', 'pending', now],
+    )
+    database.run(
+      'INSERT INTO pages (id, doc_id, page_num, image_path, ocr_text, proofed_text, ocr_status, proof_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['incremental_page_2', incrementalDocId, 2, null, 'incremental-before-token appears once', null, 'completed', 'pending', now],
+    )
+    search.reindexDocument(incrementalDocId)
+    database.run('UPDATE pages SET proofed_text = ? WHERE id = ?', ['incremental-after-token appears once', 'incremental_page_2'])
+    search.updateSearchIndexForPageEdit('incremental_page_2')
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.strictEqual(
+      search.getSearchIndexStatus(incrementalDocId)[0]?.status,
+      'ready',
+      'A single-page edit on a ready document must update the index in place instead of queueing a rebuild',
+    )
+    const incrementalAfter = search.querySearchV2('incremental-after-token', { docIds: [incrementalDocId], limit: 80 })
+    assert.strictEqual(incrementalAfter.totalDocuments, 1, 'Incremental page update must make the new page text searchable')
+    const incrementalBefore = search.querySearchV2('incremental-before-token', { docIds: [incrementalDocId], limit: 80 })
+    assert.strictEqual(incrementalBefore.totalDocuments, 0, 'Incremental page update must drop the replaced page text')
+    const incrementalStatic = search.querySearchV2('incremental-static-token', { docIds: [incrementalDocId], limit: 80 })
+    assert.strictEqual(incrementalStatic.totalDocuments, 1, 'Incremental page update must not disturb sibling pages')
+
     const traditionalResponse = search.querySearchV2('图书馆登记', { limit: 80 })
     assert.strictEqual(traditionalResponse.totalDocuments, 2)
     assert.ok(traditionalResponse.groups.some((group) => group.docId === 'doc_a'))
@@ -447,13 +483,21 @@ async function run() {
 
     const recallFolderId = 'recall_folder'
     const recallTagId = 'recall_tag'
+    // Folder scope resolution filters by the active library project, so raw
+    // inserts must carry library_project_id just like production folder IPC does.
+    const activeLibraryProjectId = String(
+      database.queryOne("SELECT value FROM settings WHERE key = 'active_library_project_id'")?.value
+        || database.queryOne('SELECT id FROM library_projects ORDER BY is_default DESC, created_at ASC LIMIT 1')?.id
+        || '',
+    )
+    assert.ok(activeLibraryProjectId, 'Expected an active library project after initDatabase')
     database.run(
-      'INSERT INTO folders (id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [recallFolderId, 'Recall folder', null, null, 'folder', null, 1, now, now],
+      'INSERT INTO folders (id, library_project_id, name, parent_id, external_path, icon, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [recallFolderId, activeLibraryProjectId, 'Recall folder', null, null, 'folder', null, 1, now, now],
     )
     database.run(
-      'INSERT INTO tags (id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
-      [recallTagId, 'Recall tag', '#1890ff', now, now],
+      'INSERT INTO tags (id, library_project_id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [recallTagId, activeLibraryProjectId, 'Recall tag', '#1890ff', now, now],
     )
 
     const staleRecallDocId = 'stale_recall_doc'

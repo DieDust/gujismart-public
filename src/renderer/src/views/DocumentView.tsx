@@ -1,4 +1,4 @@
-﻿import { Children, cloneElement, isValidElement, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react'
+﻿import { Children, cloneElement, isValidElement, memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type MutableRefObject, type ReactNode } from 'react'
 import { lazy, Suspense } from 'react'
 import { Button, Dropdown, Empty, Input, Modal, Pagination, Popover, Radio, Select, Segmented, Slider, Space, Spin, Tag, Tooltip, Typography, message } from 'antd'
 import { useLayoutEffect } from 'react'
@@ -28,7 +28,6 @@ import {
   SettingOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
-import type { ViewerViewport } from '../components/ImageViewer'
 import GujiFacsimileProofreader, { getFacsimileTranslationSourceText, isFacsimileProofCandidate } from '../components/GujiFacsimileProofreader'
 import EbookReader, { isManagedTextDocument } from '../components/EbookReader'
 import {
@@ -1526,6 +1525,113 @@ function buildReaderPages(sourcePages: DocumentViewPage[], fontSize: number, lin
   return readerPages
 }
 
+type ReaderSearchEngine = 'fulltext' | 'vector'
+
+interface SearchDraftSignal {
+  value: string
+  revision: number
+}
+
+interface DocumentSearchBoxProps {
+  engine: ReaderSearchEngine
+  committedKeyword: string
+  draftSignal: SearchDraftSignal
+  draftRef: MutableRefObject<string>
+  inputWidth: number
+  fulltextPlaceholder: string
+  onEngineChange: (engine: ReaderSearchEngine, draft: string) => void
+  onCommit: (draft: string) => void
+  onClear: () => void
+}
+
+// Owns the search input draft and focus state locally so typing does not
+// re-render the whole DocumentView per keystroke. The parent pushes
+// programmatic draft updates (doc open / highlight navigation) through
+// draftSignal revisions, and reads the live draft through draftRef.
+function DocumentSearchBoxInner({
+  engine,
+  committedKeyword,
+  draftSignal,
+  draftRef,
+  inputWidth,
+  fulltextPlaceholder,
+  onEngineChange,
+  onCommit,
+  onClear,
+}: DocumentSearchBoxProps) {
+  const [draft, setDraft] = useState(() => draftRef.current)
+  const [focused, setFocused] = useState(false)
+  const appliedRevisionRef = useRef(draftSignal.revision)
+
+  useEffect(() => {
+    if (appliedRevisionRef.current === draftSignal.revision) return
+    appliedRevisionRef.current = draftSignal.revision
+    setDraft(draftSignal.value)
+    draftRef.current = draftSignal.value
+  }, [draftRef, draftSignal])
+
+  const highlightActive = focused && !!committedKeyword
+
+  return (
+    <Space.Compact size="small">
+      <Select
+        size="small"
+        value={engine}
+        onChange={(nextEngine) => onEngineChange(nextEngine, draft)}
+        style={{ width: 92 }}
+        options={[
+          {
+            value: 'fulltext',
+            label: (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <FontSizeOutlined />
+                文本
+              </span>
+            ),
+          },
+          {
+            value: 'vector',
+            label: (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <ThunderboltOutlined />
+                向量
+              </span>
+            ),
+          },
+        ]}
+      />
+      <Input
+        data-reader-search-input="true"
+        size="small"
+        placeholder={engine === 'vector' ? '语义检索' : fulltextPlaceholder}
+        prefix={
+          engine === 'vector'
+            ? <ThunderboltOutlined style={{ color: 'var(--gs-gold)' }} />
+            : <SearchOutlined style={{ color: highlightActive ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />
+        }
+        value={draft}
+        onChange={(event) => {
+          const nextValue = event.target.value
+          setDraft(nextValue)
+          draftRef.current = nextValue
+          if (!nextValue) onClear()
+        }}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        onPressEnter={() => onCommit(draft)}
+        allowClear
+        style={{
+          width: inputWidth,
+          background: highlightActive ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
+          borderColor: highlightActive ? '#ffc069' : 'rgba(255,255,255,0.12)',
+        }}
+      />
+    </Space.Compact>
+  )
+}
+
+const DocumentSearchBox = memo(DocumentSearchBoxInner)
+
 export default function DocumentView({
   documentId,
   initialPageIndex = 0,
@@ -1567,7 +1673,8 @@ export default function DocumentView({
   const [pageImageLoading, setPageImageLoading] = useState(false)
   const [floatPanelOpen, setFloatPanelOpen] = useState(false)
   const [localSearchKeyword, setLocalSearchKeyword] = useState(searchKeyword)
-  const [searchInputDraft, setSearchInputDraft] = useState(searchKeyword)
+  const searchDraftRef = useRef(searchKeyword)
+  const [searchDraftSignal, setSearchDraftSignal] = useState<SearchDraftSignal>(() => ({ value: searchKeyword, revision: 0 }))
   const [readerSearchEngine, setReaderSearchEngine] = useState<'fulltext' | 'vector'>(
     searchSession?.engine === 'vector' || sourceId === 'vector-search' ? 'vector' : 'fulltext',
   )
@@ -1576,12 +1683,10 @@ export default function DocumentView({
   const [readerSearchPages, setReaderSearchPages] = useState<DocumentPage[]>([])
   const [currentMatchIndex, setCurrentMatchIndex] = useState(-1)
   const [documentSearchSession, setDocumentSearchSession] = useState<SearchSessionState | undefined>(searchSession)
-  const [searchFocused, setSearchFocused] = useState(false)
   const [leftWidth, setLeftWidth] = useState(50)
   const [isDraggingDivider, setIsDraggingDivider] = useState(false)
   const [pageViewMode, setPageViewMode] = useState<PageViewMode>('single')
   const [birdDensity, setBirdDensity] = useState<BirdDensity>('medium')
-  const [sharedViewport, setSharedViewport] = useState<ViewerViewport | undefined>(undefined)
   const [imageViewerResetToken, setImageViewerResetToken] = useState(0)
   const [pageTranslations, setPageTranslations] = useState<Record<string, string>>({})
   const [pageTranslationUnits, setPageTranslationUnits] = useState<Record<string, TranslationUnitV1[]>>({})
@@ -1635,6 +1740,9 @@ export default function DocumentView({
 
   const containerRef = useRef<HTMLDivElement>(null)
   const draggingDivider = useRef(false)
+  const leftPaneRef = useRef<HTMLDivElement | null>(null)
+  const rightPaneRef = useRef<HTMLDivElement | null>(null)
+  const leftWidthRef = useRef(50)
   const floatingPanelRef = useRef<HTMLDivElement>(null)
   const panelState = useRef({ x: 0, y: 0, w: 420, h: 600 })
   const draggingPanel = useRef(false)
@@ -1689,6 +1797,18 @@ export default function DocumentView({
   const effectiveSearchKeyword = localSearchKeyword
   const releaseTemporaryNavigation = useCallback(() => {
     temporaryNavigationRef.current = false
+  }, [])
+  const goToPrevPage = useCallback(() => {
+    releaseTemporaryNavigation()
+    setCurrentPageIndex((value) => clampPageIndex(value - 1, pageCountRef.current))
+  }, [releaseTemporaryNavigation])
+  const goToNextPage = useCallback(() => {
+    releaseTemporaryNavigation()
+    setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCountRef.current))
+  }, [releaseTemporaryNavigation])
+  const handleImageViewerBoxClick = useCallback((index: number) => {
+    setActiveBoxIndex(index)
+    setSwitchToRegion(true)
   }, [])
   const handleAiOpenDocument = useCallback((target: OpenDocumentTarget) => {
     if (target.docId && target.docId !== documentId) {
@@ -2840,7 +2960,6 @@ export default function DocumentView({
     setReaderSearchPages([])
     setImageDataUrl('')
     setNextImageDataUrl('')
-    setSharedViewport(undefined)
     setActiveBoxIndex(-1)
     setPageOcrVersions([])
     pageImageCacheRef.current.clear()
@@ -2862,7 +2981,8 @@ export default function DocumentView({
     setProofViewTouched(false)
     setFacsimileTranslationOpen(false)
     setLocalSearchKeyword(highlightExcerpt || searchKeyword)
-    setSearchInputDraft(highlightExcerpt || searchKeyword)
+    searchDraftRef.current = highlightExcerpt || searchKeyword
+    setSearchDraftSignal((prev) => ({ value: highlightExcerpt || searchKeyword, revision: prev.revision + 1 }))
     setReaderSearchEngine(searchSession?.engine === 'vector' || sourceId === 'vector-search' ? 'vector' : 'fulltext')
     setInitialReaderLocationKey('')
     setReaderStateReady(false)
@@ -3288,7 +3408,6 @@ export default function DocumentView({
   }, [flushReaderStateNow])
 
   useEffect(() => {
-    setSharedViewport(undefined)
     setActiveBoxIndex(-1)
   }, [currentPageIndex])
 
@@ -3963,13 +4082,18 @@ export default function DocumentView({
       const containerWidth = containerRef.current.clientWidth
       const dividerOffset = event.clientX - containerRef.current.getBoundingClientRect().left
       const nextPercent = Math.max(20, Math.min(80, (dividerOffset / containerWidth) * 100))
-      setLeftWidth(nextPercent)
+      // Write the split directly to the DOM while dragging; committing React state
+      // per mousemove would re-render the entire view on every pixel of movement.
+      leftWidthRef.current = nextPercent
+      if (leftPaneRef.current) leftPaneRef.current.style.width = `${nextPercent}%`
+      if (rightPaneRef.current) rightPaneRef.current.style.width = `${100 - nextPercent}%`
     }
 
     const handleMouseUp = () => {
       if (draggingDivider.current) {
         draggingDivider.current = false
         setIsDraggingDivider(false)
+        setLeftWidth(leftWidthRef.current)
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
       }
@@ -4049,14 +4173,28 @@ export default function DocumentView({
     activateReaderSearchMatch(currentMatchIndex > 0 ? currentMatchIndex - 1 : matches.length - 1)
   }
 
-  const commitSearchInputDraft = () => {
-    const nextKeyword = searchInputDraft.trim()
+  const commitSearchDraft = useCallback((draft: string) => {
+    const nextKeyword = draft.trim()
     // Same keyword still re-runs when engine differs or user hits Enter after 向量→文本.
     setLocalSearchKeyword(nextKeyword)
     setCurrentMatchIndex(-1)
     setActiveBoxIndex(-1)
     runInDocumentSearch(nextKeyword, readerSearchEngine)
-  }
+  }, [readerSearchEngine, runInDocumentSearch])
+
+  const handleSearchEngineChange = useCallback((engine: ReaderSearchEngine, draft: string) => {
+    setReaderSearchEngine(engine)
+    const keyword = draft.trim() || localSearchKeyword.trim()
+    if (keyword) {
+      setLocalSearchKeyword(keyword)
+      runInDocumentSearch(keyword, engine)
+    }
+  }, [localSearchKeyword, runInDocumentSearch])
+
+  const handleSearchClear = useCallback(() => {
+    setLocalSearchKeyword('')
+    runInDocumentSearch('', readerSearchEngine)
+  }, [readerSearchEngine, runInDocumentSearch])
 
   const proofSearchHighlightKeyword = useMemo(() => {
     if (!isVectorReaderSearch) return effectiveSearchKeyword
@@ -5312,7 +5450,6 @@ export default function DocumentView({
     setReaderLineHeight(DEFAULT_READER_GLOBAL_PREFERENCES.line_height)
     setReaderPageWidth(DEFAULT_READER_GLOBAL_PREFERENCES.page_width)
     setPageViewMode('single')
-    setSharedViewport(undefined)
     setImageViewerResetToken((value) => value + 1)
     window.dispatchEvent(new Event(SOURCE_PAGE_READER_RESET_VIEW_EVENT))
   }, [])
@@ -6445,69 +6582,17 @@ export default function DocumentView({
             }}
           >
             <Space size={6} wrap>
-              <Space.Compact size="small">
-                <Select
-                  size="small"
-                  value={readerSearchEngine}
-                  onChange={(engine) => {
-                    setReaderSearchEngine(engine)
-                    const keyword = searchInputDraft.trim() || effectiveSearchKeyword.trim()
-                    if (keyword) {
-                      setLocalSearchKeyword(keyword)
-                      runInDocumentSearch(keyword, engine)
-                    }
-                  }}
-                  style={{ width: 92 }}
-                  options={[
-                    {
-                      value: 'fulltext',
-                      label: (
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                          <FontSizeOutlined />
-                          文本
-                        </span>
-                      ),
-                    },
-                    {
-                      value: 'vector',
-                      label: (
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                          <ThunderboltOutlined />
-                          向量
-                        </span>
-                      ),
-                    },
-                  ]}
-                />
-                <Input
-                  data-reader-search-input="true"
-                  size="small"
-                  placeholder={readerSearchEngine === 'vector' ? '语义检索' : '搜索正文'}
-                  prefix={
-                    readerSearchEngine === 'vector'
-                      ? <ThunderboltOutlined style={{ color: 'var(--gs-gold)' }} />
-                      : <SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />
-                  }
-                  value={searchInputDraft}
-                  onChange={(event) => {
-                    const nextValue = event.target.value
-                    setSearchInputDraft(nextValue)
-                    if (!nextValue) {
-                      setLocalSearchKeyword('')
-                      runInDocumentSearch('', readerSearchEngine)
-                    }
-                  }}
-                  onFocus={() => setSearchFocused(true)}
-                  onBlur={() => setSearchFocused(false)}
-                  onPressEnter={commitSearchInputDraft}
-                  allowClear
-                  style={{
-                    width: 180,
-                    background: searchFocused && effectiveSearchKeyword ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
-                    borderColor: searchFocused && effectiveSearchKeyword ? '#ffc069' : 'rgba(255,255,255,0.12)',
-                  }}
-                />
-              </Space.Compact>
+              <DocumentSearchBox
+                engine={readerSearchEngine}
+                committedKeyword={effectiveSearchKeyword}
+                draftSignal={searchDraftSignal}
+                draftRef={searchDraftRef}
+                inputWidth={180}
+                fulltextPlaceholder="搜索正文"
+                onEngineChange={handleSearchEngineChange}
+                onCommit={commitSearchDraft}
+                onClear={handleSearchClear}
+              />
               <Button size="small" icon={<LeftOutlined />} onClick={handleSearchPrev} disabled={readerSearchMatches.length === 0} />
               <span data-reader-search-counter="true" style={{ fontSize: 12, color: 'var(--gs-text-secondary)', minWidth: 56, textAlign: 'center' }}>
                 {effectiveSearchKeyword
@@ -6532,6 +6617,7 @@ export default function DocumentView({
       ) : (
       <div ref={containerRef} style={{ flex: 1, display: 'flex', minHeight: 0, gap: 0 }}>
         <div
+          ref={leftPaneRef}
           style={{
             width: `${leftWidth}%`,
             height: '100%',
@@ -6571,7 +6657,7 @@ export default function DocumentView({
 
             {pageCount > 0 ? (
               <Space size={4} wrap>
-                <Button size="small" disabled={currentPageIndex === 0} onClick={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value - 1, pageCount)) }}>
+                <Button size="small" disabled={currentPageIndex === 0} onClick={goToPrevPage}>
                   上一页
                 </Button>
                 <Input
@@ -6613,7 +6699,7 @@ export default function DocumentView({
                 >
                   删除当前页
                 </Button>
-                <Button size="small" disabled={currentPageIndex === pageCount - 1} onClick={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCount)) }}>
+                <Button size="small" disabled={currentPageIndex === pageCount - 1} onClick={goToNextPage}>
                   下一页
                 </Button>
               </Space>
@@ -6639,17 +6725,12 @@ export default function DocumentView({
                 coordinateSourceSize={imageCoordinateSourceSize}
                 activeBoxIndex={activeBoxIndex}
                 searchKeyword={effectiveSearchKeyword}
-                viewport={sharedViewport}
-                onViewportChange={setSharedViewport}
                 resetToken={imageViewerResetToken}
-                onBoxClick={(index) => {
-                  setActiveBoxIndex(index)
-                  setSwitchToRegion(true)
-                }}
+                onBoxClick={handleImageViewerBoxClick}
                 hasPrevPage={currentPageIndex > 0}
                 hasNextPage={currentPageIndex < pageCount - 1}
-                onPrevPage={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value - 1, pageCount)) }}
-                onNextPage={() => { releaseTemporaryNavigation(); setCurrentPageIndex((value) => clampPageIndex(value + 1, pageCount)) }}
+                onPrevPage={goToPrevPage}
+                onNextPage={goToNextPage}
               />
             ) : pageImageLoading ? (
               <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -6791,6 +6872,7 @@ export default function DocumentView({
         </div>
 
         <div
+          ref={rightPaneRef}
           style={{
             width: `${100 - leftWidth}%`,
             height: '100%',
@@ -6869,69 +6951,17 @@ export default function DocumentView({
                   {getOcrEngineLabel(String(currentOcrEngineForUi))}
                 </Tag>
               )}
-              <Space.Compact size="small">
-                <Select
-                  size="small"
-                  value={readerSearchEngine}
-                  onChange={(engine) => {
-                    setReaderSearchEngine(engine)
-                    const keyword = searchInputDraft.trim() || effectiveSearchKeyword.trim()
-                    if (keyword) {
-                      setLocalSearchKeyword(keyword)
-                      runInDocumentSearch(keyword, engine)
-                    }
-                  }}
-                  style={{ width: 92 }}
-                  options={[
-                    {
-                      value: 'fulltext',
-                      label: (
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                          <FontSizeOutlined />
-                          文本
-                        </span>
-                      ),
-                    },
-                    {
-                      value: 'vector',
-                      label: (
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                          <ThunderboltOutlined />
-                          向量
-                        </span>
-                      ),
-                    },
-                  ]}
-                />
-                <Input
-                  data-reader-search-input="true"
-                  size="small"
-                  placeholder={readerSearchEngine === 'vector' ? '语义检索' : '搜索本页文本'}
-                  prefix={
-                    readerSearchEngine === 'vector'
-                      ? <ThunderboltOutlined style={{ color: 'var(--gs-gold)' }} />
-                      : <SearchOutlined style={{ color: searchFocused && effectiveSearchKeyword ? 'var(--gs-gold)' : 'rgba(255,255,255,0.25)' }} />
-                  }
-                  value={searchInputDraft}
-                  onChange={(event) => {
-                    const nextValue = event.target.value
-                    setSearchInputDraft(nextValue)
-                    if (!nextValue) {
-                      setLocalSearchKeyword('')
-                      runInDocumentSearch('', readerSearchEngine)
-                    }
-                  }}
-                  onPressEnter={commitSearchInputDraft}
-                  onFocus={() => setSearchFocused(true)}
-                  onBlur={() => setSearchFocused(false)}
-                  allowClear
-                  style={{
-                    width: 160,
-                    background: searchFocused && effectiveSearchKeyword ? 'rgba(255,192,105,0.1)' : 'rgba(255,255,255,0.04)',
-                    borderColor: searchFocused && effectiveSearchKeyword ? '#ffc069' : 'rgba(255,255,255,0.12)',
-                  }}
-                />
-              </Space.Compact>
+              <DocumentSearchBox
+                engine={readerSearchEngine}
+                committedKeyword={effectiveSearchKeyword}
+                draftSignal={searchDraftSignal}
+                draftRef={searchDraftRef}
+                inputWidth={160}
+                fulltextPlaceholder="搜索本页文本"
+                onEngineChange={handleSearchEngineChange}
+                onCommit={commitSearchDraft}
+                onClear={handleSearchClear}
+              />
               {effectiveSearchKeyword && searchMatches.length > 0 ? (
                 <>
                   <Button size="small" icon={<LeftOutlined />} onClick={handleSearchPrev} type="text" style={{ color: 'var(--gs-text-secondary)' }} />

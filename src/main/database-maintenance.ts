@@ -13,7 +13,7 @@ import type {
   DatabaseTableStorageStat,
 } from '../shared/types'
 import { SEARCH_INDEX_VERSION, SEARCH_NGRAM_INDEX_ENABLED } from './search-index-constants'
-import { getDatabase, getDatabaseFilePath, isSearchSegmentsFtsRebuildNeeded, queryOne, rebuildSearchTables, run, scheduleDatabaseSave } from './database'
+import { getDatabase, getDatabaseFilePath, isSearchSegmentsFtsRebuildNeeded, queryAll, queryOne, rebuildSearchTables, run, scheduleDatabaseSave } from './database'
 import { emitBackgroundTaskStatus } from './background-tasks'
 import { cleanupUnreferencedPagePayloads, externalizeLargePayloads, getPagePayloadStorageStats } from './page-payload-store'
 import { resolvePayloadDataDir } from './page-payload-files'
@@ -1058,6 +1058,160 @@ export async function cleanupExternalPagePayloadStorage(): Promise<DatabaseMaint
       message: '未引用大字段清理失败，数据库记录未被更改。',
       beforeBytes: before.externalPayloads.bytes,
       afterBytes: getDatabaseStorageDiagnostics().externalPayloads.bytes,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+// Superseded OCR artifacts keep a full copy of every historical OCR result and
+// grow without bound on re-OCR. Rows referenced as the active artifact or as a
+// proofreading base are never touched; everything else is provenance-only.
+const OCR_HISTORY_PRUNE_BATCH_SIZE = 2_000
+
+const PRUNABLE_OCR_ARTIFACT_SELECT = `
+  SELECT a.rowid AS rowid FROM ocr_artifact_versions a
+  WHERE a.status IN ('superseded', 'error')
+    AND a.id NOT IN (SELECT active_ocr_artifact_id FROM pages WHERE active_ocr_artifact_id IS NOT NULL)
+    AND a.id NOT IN (SELECT proof_base_artifact_id FROM pages WHERE proof_base_artifact_id IS NOT NULL)
+    AND a.id NOT IN (SELECT artifact_id FROM ocr_page_active_artifacts)`
+
+const PRUNABLE_OCR_ATTEMPT_SELECT = `
+  SELECT t.rowid AS rowid FROM ocr_page_attempts t
+  WHERE t.status IN ('completed', 'error', 'canceled')
+    AND t.id NOT IN (SELECT attempt_id FROM ocr_artifact_versions WHERE attempt_id IS NOT NULL)`
+
+const PRUNABLE_OCR_RUN_SELECT = `
+  SELECT r.rowid AS rowid FROM ocr_runs r
+  WHERE r.status IN ('completed', 'error', 'canceled')
+    AND r.id NOT IN (SELECT run_id FROM ocr_artifact_versions WHERE run_id IS NOT NULL)
+    AND r.id NOT IN (SELECT run_id FROM ocr_page_attempts WHERE run_id IS NOT NULL)`
+
+async function deletePrunableOcrRowsInBatches(
+  selectSql: string,
+  tableName: 'ocr_artifact_versions' | 'ocr_page_attempts' | 'ocr_runs',
+  onProgress: (deletedSoFar: number) => void,
+): Promise<number> {
+  let deleted = 0
+  for (;;) {
+    const rows = queryAll<RowIdRow>(`${selectSql} LIMIT ?`, [OCR_HISTORY_PRUNE_BATCH_SIZE])
+    if (rows.length === 0) return deleted
+    const placeholders = rows.map(() => '?').join(', ')
+    run(`DELETE FROM ${tableName} WHERE rowid IN (${placeholders})`, rows.map((row) => row.rowid))
+    deleted += rows.length
+    onProgress(deleted)
+    await delay(LEGACY_SEARCH_CLEANUP_YIELD_MS)
+  }
+}
+
+export async function pruneOcrArtifactHistory(): Promise<DatabaseMaintenanceResult> {
+  const before = getDatabaseStorageDiagnostics()
+  const taskId = 'database-maintenance:ocr-history-prune'
+  try {
+    persistMaintenanceState({
+      stage: 'externalize-page-payloads',
+      canResume: true,
+      lastStartedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: before.freelistBytes > 0,
+    })
+    emitBackgroundTaskStatus({
+      taskId,
+      kind: 'database-maintenance',
+      status: 'processing',
+      progress: 0.05,
+      completedCount: 0,
+      message: '正在扫描可清理的 OCR 历史版本。',
+    })
+
+    let deletedRows = 0
+    const reportProgress = (message: string) => (deletedSoFar: number) => {
+      emitBackgroundTaskStatus({
+        taskId,
+        kind: 'database-maintenance',
+        status: 'processing',
+        progress: 0.5,
+        completedCount: deletedRows + deletedSoFar,
+        message: `${message}：已删除 ${formatCount(deletedRows + deletedSoFar)} 行。`,
+      })
+    }
+    const deletedArtifacts = await deletePrunableOcrRowsInBatches(
+      PRUNABLE_OCR_ARTIFACT_SELECT,
+      'ocr_artifact_versions',
+      reportProgress('正在清理被取代的 OCR 历史版本'),
+    )
+    deletedRows += deletedArtifacts
+    const deletedAttempts = await deletePrunableOcrRowsInBatches(
+      PRUNABLE_OCR_ATTEMPT_SELECT,
+      'ocr_page_attempts',
+      reportProgress('正在清理历史 OCR 任务记录'),
+    )
+    deletedRows += deletedAttempts
+    const deletedRuns = await deletePrunableOcrRowsInBatches(
+      PRUNABLE_OCR_RUN_SELECT,
+      'ocr_runs',
+      reportProgress('正在清理历史 OCR 任务记录'),
+    )
+    deletedRows += deletedRuns
+
+    // Historical artifacts may have been the last reference to externalized
+    // payload files; sweep them in the same action so disk space is returned.
+    let cleanedPayloadFiles = 0
+    let cleanedPayloadBytes = 0
+    if (deletedArtifacts > 0) {
+      const cleanup = cleanupUnreferencedPagePayloads()
+      cleanedPayloadFiles = cleanup.deletedFiles
+      cleanedPayloadBytes = cleanup.deletedBytes
+    }
+
+    scheduleDatabaseSave()
+    const after = getDatabaseStorageDiagnostics()
+    persistMaintenanceState({
+      stage: 'verify',
+      canResume: false,
+      lastCompletedAt: nowIso(),
+      lastError: null,
+      compactionRecommended: deletedRows > 0 || after.freelistBytes > 0,
+    })
+    emitBackgroundTaskStatus({
+      taskId,
+      kind: 'database-maintenance',
+      status: 'completed',
+      progress: 1,
+      completedCount: deletedRows,
+      message: deletedRows > 0
+        ? `OCR 历史版本清理完成：已删除 ${formatCount(deletedRows)} 行。`
+        : '没有发现可清理的 OCR 历史版本。',
+    })
+    return {
+      success: true,
+      message: deletedRows > 0
+        ? `OCR 历史版本清理完成：已删除 ${formatCount(deletedArtifacts)} 个被取代的历史 OCR 版本和 ${formatCount(deletedAttempts + deletedRuns)} 条历史任务记录${cleanedPayloadFiles > 0 ? `，并清理 ${formatCount(cleanedPayloadFiles)} 个未引用大字段文件（约 ${formatStorageBytes(cleanedPayloadBytes)}）` : ''}。当前使用中的 OCR 结果与校对底稿未受影响；请在空闲时点击“压缩数据库”释放数据库文件空间。`
+        : '没有发现可清理的 OCR 历史版本：所有 OCR 结果都是当前使用中或被校对底稿引用的版本。',
+      beforeBytes: before.databaseBytes,
+      afterBytes: after.databaseBytes,
+      deletedRows,
+    }
+  } catch (error) {
+    persistMaintenanceState({
+      stage: 'failed',
+      canResume: true,
+      lastError: error instanceof Error ? error.message : String(error),
+      compactionRecommended: true,
+    })
+    emitBackgroundTaskStatus({
+      taskId,
+      kind: 'database-maintenance',
+      status: 'error',
+      progress: 1,
+      completedCount: 0,
+      message: 'OCR 历史版本清理失败。',
+      errorMessage: error instanceof Error ? error.message : String(error),
+    })
+    return {
+      success: false,
+      message: 'OCR 历史版本清理失败，当前使用中的 OCR 结果未受影响。',
+      beforeBytes: before.databaseBytes,
+      afterBytes: getDatabaseStorageDiagnostics().databaseBytes,
       error: error instanceof Error ? error.message : String(error),
     }
   }

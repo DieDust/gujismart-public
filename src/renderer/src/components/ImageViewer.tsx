@@ -68,7 +68,7 @@ function getBoxRect(box: ImageViewerOcrBox, coordinateScale: BoxCoordinateScale 
   return { x: scaled.left, y: scaled.top, width: scaled.width, height: scaled.height }
 }
 
-export default function ImageViewer({
+function ImageViewer({
   src,
   ocrBoxes = [],
   coordinateSourceSize,
@@ -502,3 +502,7 @@ export default function ImageViewer({
     </div>
   )
 }
+
+// Memoized so unrelated DocumentView state updates (typing, translation progress)
+// do not re-render the image pane; pan/zoom state already lives inside this component.
+export default React.memo(ImageViewer)

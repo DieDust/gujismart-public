@@ -43,6 +43,11 @@ let deferredDatabaseCheckpointPromise: Promise<void> | null = null
 let databaseCheckpointDeferralCount = 0
 let lastDatabaseCheckpointAt = 0
 const DATABASE_BUSY_TIMEOUT_MS = 250
+// Negative cache_size means KiB. 64MB balances large-library scans against
+// memory on low-end machines; each connection keeps its own cache.
+const DATABASE_CACHE_SIZE_KIB = 65_536
+// mmap serves read pages via the OS page cache without syscall copies.
+const DATABASE_MMAP_SIZE_BYTES = 268_435_456
 const DATABASE_BUSY_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1200]
 const DATABASE_ASYNC_BUSY_RETRY_MAX_WAIT_MS = 30_000
 // Delete/import workers can expose short writer windows. Poll often enough to
@@ -3391,6 +3396,12 @@ export async function initDatabase(): Promise<void> {
     database.pragma('wal_autocheckpoint = 0')
     database.pragma('synchronous = NORMAL')
     database.pragma(`busy_timeout = ${DATABASE_BUSY_TIMEOUT_MS}`)
+    // Large libraries hold multi-GB databases; the SQLite defaults (~2MB page
+    // cache, no mmap, temp spill to disk) make scan-heavy queries IO-bound on
+    // the main process. Keep these bounded so small machines are unaffected.
+    database.pragma(`cache_size = ${DATABASE_CACHE_SIZE_KIB * -1}`)
+    database.pragma(`mmap_size = ${DATABASE_MMAP_SIZE_BYTES}`)
+    database.pragma('temp_store = MEMORY')
     db = database
   })
   const database = db

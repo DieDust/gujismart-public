@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type MouseEvent } from 'react'
+﻿import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type MouseEvent, type MutableRefObject } from 'react'
 import {
   AppstoreOutlined,
   BookOutlined,
@@ -1036,6 +1036,119 @@ interface DocumentCardContext {
   handleTranslateBook: (doc: DocumentItem, options?: BookTranslationOptions) => Promise<void>
   setTaggingDocId: (docId: string | null) => void
   setTaggingChecked: (ids: string[]) => void
+}
+
+type DocumentCardData = Pick<
+  DocumentCardContext,
+  | 'viewMode'
+  | 'batchMode'
+  | 'selectedIds'
+  | 'selectedIdSet'
+  | 'folderTree'
+  | 'tags'
+  | 'sortedSidebarTags'
+  | 'visionOcrProfiles'
+  | 'activeVisionOcrProfileId'
+  | 'ocrProgressByDoc'
+  | 'bookTranslationProgressByDoc'
+  | 'embeddingProgressByDoc'
+  | 'taggingDocId'
+  | 'taggingChecked'
+>
+
+type DocumentCardHandlers = Omit<DocumentCardContext, keyof DocumentCardData>
+
+const DOCUMENT_CARD_HANDLER_KEYS = [
+  'handleRowClick',
+  'handleDocumentOpen',
+  'handleDocumentContextMenu',
+  'getDocumentContextMenuItems',
+  'handleDocumentContextMenuClick',
+  'openMetadataEditor',
+  'applyLibraryFilter',
+  'toggleTagFilter',
+  'handleRetryDocument',
+  'handleRetryFailedPages',
+  'handleToggleFavorite',
+  'handleSetReadStatus',
+  'handleSetRating',
+  'handleTaggingChange',
+  'handleForceRerunDocument',
+  'handleCancelOcr',
+  'handleCancelEmbedding',
+  'handleQuickAddTagToDocument',
+  'openDocumentTagModal',
+  'handleAddToFolder',
+  'handleRemoveFromFolder',
+  'getDragDocIds',
+  'handleDocumentDragStart',
+  'handleBatchMenu',
+  'handleRemoveFromProject',
+  'handleDelete',
+  'handleCleanupPdfAssets',
+  'handleRestorePdfAssets',
+  'handleAiExtractForDoc',
+  'handleTranslateBook',
+  'setTaggingDocId',
+  'setTaggingChecked',
+] as const satisfies ReadonlyArray<keyof DocumentCardHandlers>
+
+// Compile-time guarantee that every handler in DocumentCardHandlers is forwarded.
+type MissingDocumentCardHandlerKeys = Exclude<keyof DocumentCardHandlers, (typeof DOCUMENT_CARD_HANDLER_KEYS)[number]>
+const assertAllDocumentCardHandlersForwarded: MissingDocumentCardHandlerKeys extends never ? true : never = true
+void assertAllDocumentCardHandlersForwarded
+
+// Builds handler wrappers with a stable identity that always dispatch to the
+// latest closures via the ref, so memoized cards never call stale handlers and
+// never need to re-render because a handler was re-created.
+function createForwardingCardHandlers(ref: MutableRefObject<DocumentCardHandlers>): DocumentCardHandlers {
+  const handlers = {} as Record<string, unknown>
+  for (const key of DOCUMENT_CARD_HANDLER_KEYS) {
+    handlers[key] = (...args: unknown[]) =>
+      (ref.current[key] as unknown as (...inner: unknown[]) => unknown)(...args)
+  }
+  // handleDocumentContextMenuClick returns a closure captured by the Dropdown at
+  // card render time; defer resolution to event time so the closure never holds
+  // a stale selection snapshot.
+  handlers.handleDocumentContextMenuClick = (docId: string, singleHandler: MenuProps['onClick']): MenuProps['onClick'] =>
+    (info) => ref.current.handleDocumentContextMenuClick(docId, singleHandler)?.(info)
+  return handlers as unknown as DocumentCardHandlers
+}
+
+function shallowEqualRecord(prev: Record<string, unknown>, next: Record<string, unknown>): boolean {
+  if (prev === next) return true
+  const prevKeys = Object.keys(prev)
+  const nextKeys = Object.keys(next)
+  if (prevKeys.length !== nextKeys.length) return false
+  return prevKeys.every((key) => Object.is(prev[key], next[key]))
+}
+
+// Per-document equivalence over the context data fields a card actually renders
+// from. Handlers are identity-stable (forwarding wrappers) so they are not
+// compared. Any new data field added to DocumentCardData must be compared here.
+function isCardContextEquivalentForDoc(docId: string, prev: DocumentCardContext, next: DocumentCardContext): boolean {
+  if (prev === next) return true
+  if (prev.viewMode !== next.viewMode) return false
+  if (prev.batchMode !== next.batchMode) return false
+  if (prev.folderTree !== next.folderTree) return false
+  if (prev.tags !== next.tags) return false
+  if (prev.sortedSidebarTags !== next.sortedSidebarTags) return false
+  if (prev.visionOcrProfiles !== next.visionOcrProfiles) return false
+  if (prev.activeVisionOcrProfileId !== next.activeVisionOcrProfileId) return false
+  if (prev.ocrProgressByDoc[docId] !== next.ocrProgressByDoc[docId]) return false
+  if (prev.bookTranslationProgressByDoc[docId] !== next.bookTranslationProgressByDoc[docId]) return false
+  if (prev.embeddingProgressByDoc[docId] !== next.embeddingProgressByDoc[docId]) return false
+  const prevSelected = prev.selectedIdSet.has(docId)
+  const nextSelected = next.selectedIdSet.has(docId)
+  if (prevSelected !== nextSelected) return false
+  // Context menus on selected cards embed batch actions derived from the whole
+  // selection, so selected cards must refresh whenever the selection changes.
+  if (nextSelected && prev.selectedIds !== next.selectedIds) return false
+  const prevTagging = prev.taggingDocId === docId
+  const nextTagging = next.taggingDocId === docId
+  if (prevTagging !== nextTagging) return false
+  if (nextTagging && prev.taggingChecked !== next.taggingChecked) return false
+  return true
 }
 
 const DOC_TYPE_ICON_MAP: Record<string, string> = {
@@ -2278,7 +2391,7 @@ function getDocumentListRowHeight(doc: DocumentItem | undefined, context: Docume
   return Math.min(LIST_ROW_MAX_HEIGHT, Math.max(LIST_ROW_MIN_HEIGHT, height))
 }
 
-function DocumentVirtualRow({
+function DocumentVirtualRowInner({
   index,
   style,
   ariaAttributes,
@@ -2665,6 +2778,638 @@ type DocumentVirtualRowProps = {
   documents: DocumentItem[]
   context: DocumentCardContext
 }
+
+type DocumentVirtualRowFullProps = {
+  index: number
+  style: CSSProperties
+  ariaAttributes: Record<string, unknown>
+} & DocumentVirtualRowProps
+
+function areDocumentVirtualRowPropsEqual(prev: DocumentVirtualRowFullProps, next: DocumentVirtualRowFullProps): boolean {
+  if (prev.index !== next.index) return false
+  const prevDoc = prev.documents[prev.index]
+  const nextDoc = next.documents[next.index]
+  if (prevDoc !== nextDoc) return false
+  if (!shallowEqualRecord(prev.style as unknown as Record<string, unknown>, next.style as unknown as Record<string, unknown>)) return false
+  if (!shallowEqualRecord(prev.ariaAttributes, next.ariaAttributes)) return false
+  if (!nextDoc) return true
+  return isCardContextEquivalentForDoc(nextDoc.id, prev.context, next.context)
+}
+
+// Cast keeps react-window's rowComponent signature (ReactElement | null) which
+// MemoExoticComponent widens to ReactNode.
+const DocumentVirtualRow = memo(DocumentVirtualRowInner, areDocumentVirtualRowPropsEqual) as unknown as typeof DocumentVirtualRowInner
+
+const EMPTY_ROW_ARIA_ATTRIBUTES: Record<string, unknown> = {}
+
+function documentVirtualRowHeight(index: number, rowProps: DocumentVirtualRowProps): number {
+  return getDocumentListRowHeight(rowProps.documents[index], rowProps.context)
+}
+
+type GridDocumentCardProps = {
+  doc: DocumentItem
+  context: DocumentCardContext
+}
+
+function areGridDocumentCardPropsEqual(prev: GridDocumentCardProps, next: GridDocumentCardProps): boolean {
+  if (prev.doc !== next.doc) return false
+  return isCardContextEquivalentForDoc(next.doc.id, prev.context, next.context)
+}
+
+function GridDocumentCardInner({ doc, context }: GridDocumentCardProps) {
+  const {
+    viewMode,
+    batchMode,
+    selectedIdSet,
+    folderTree,
+    tags,
+    sortedSidebarTags,
+    visionOcrProfiles,
+    activeVisionOcrProfileId,
+    ocrProgressByDoc,
+    bookTranslationProgressByDoc,
+    embeddingProgressByDoc,
+    taggingDocId,
+    taggingChecked,
+    handleRowClick,
+    handleDocumentOpen,
+    handleDocumentContextMenu,
+    getDocumentContextMenuItems,
+    handleDocumentContextMenuClick,
+    openMetadataEditor,
+    applyLibraryFilter,
+    toggleTagFilter,
+    handleRetryDocument,
+    handleRetryFailedPages,
+    handleToggleFavorite,
+    handleSetReadStatus,
+    handleSetRating,
+    handleTaggingChange,
+    handleForceRerunDocument,
+    handleCancelOcr,
+    handleCancelEmbedding,
+    openDocumentTagModal,
+    handleAddToFolder,
+    handleRemoveFromFolder,
+    handleDocumentDragStart,
+    handleRemoveFromProject,
+    handleDelete,
+    handleCleanupPdfAssets,
+    handleRestorePdfAssets,
+    handleAiExtractForDoc,
+    handleTranslateBook,
+    setTaggingDocId,
+    setTaggingChecked,
+  } = context
+
+  const isSelected = selectedIdSet.has(doc.id)
+  const docTagNames = splitPipe(doc.tag_names)
+  const docTagColors = splitPipe(doc.tag_colors)
+  const docTagIds = splitPipe(doc.tag_ids)
+  const docTagSources = splitPipe(doc.tag_sources)
+  const docFolderIds = splitPipe(doc.folder_ids)
+  const docFolderNames = splitPipe(doc.folder_names)
+  const orderedDocTags = sortDocumentTags(docTagNames.map((name, index) => ({
+    id: docTagIds[index],
+    name,
+    color: docTagColors[index],
+    source: docTagSources[index]
+  }))).filter((tagItem) => !!getDisplayTagText(tagItem.name))
+  const visibleTagCount = viewMode === 'grid'
+    ? (docFolderNames.length > 0 ? 1 : 2)
+    : 6
+  const visibleTags = orderedDocTags.slice(0, visibleTagCount)
+  const hiddenTags = orderedDocTags.slice(visibleTagCount)
+  const visibleFolderEntries = viewMode === 'grid'
+    ? docFolderNames.slice(0, 1)
+    : docFolderNames
+  const hiddenFolderEntries = viewMode === 'grid'
+    ? docFolderNames.slice(1)
+    : []
+  const displayAuthor = getDisplayMetadataText(doc.author)
+  const displayDynasty = getDisplayMetadataText(doc.dynasty)
+  const progressInfo = resolveOcrProgressInfo(doc, ocrProgressByDoc[doc.id])
+  const bookTranslationProgressInfo = bookTranslationProgressByDoc[doc.id]
+  const pdfAssetState = getPdfAssetState(doc)
+
+  const readMenuItems: MenuProps['items'] = (Object.keys(READ_STATUS_MAP) as ReadStatus[]).map((status) => ({
+    key: status,
+    label: READ_STATUS_MAP[status].text,
+    icon: getReadStatusIcon(status)
+  }))
+
+  const ratingMenuItems: MenuProps['items'] = [
+    { key: '0', label: '清除评分' },
+    ...[1, 2, 3, 4, 5].map((value) => ({
+      key: String(value),
+      label: `${'★'.repeat(value)}${'☆'.repeat(5 - value)}`
+    }))
+  ]
+  void ratingMenuItems
+
+  const moreMenuItems: MenuProps['items'] = buildDocumentMoreMenuItems({
+    doc,
+    folderTree,
+    docFolderIds,
+    docFolderNames,
+    pdfAssetState,
+    visionProfiles: visionOcrProfiles,
+    activeVisionProfileId: activeVisionOcrProfileId,
+    onOcrDefaultSelect: (action, selection) => {
+      if (action === 'retry_failed_ocr_pages') {
+        void handleRetryFailedPages(doc, selection.engine, selection.visionProfileId)
+      } else {
+        void handleForceRerunDocument(doc, selection.engine, selection.visionProfileId)
+      }
+    },
+  })
+
+  const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
+    domEvent.stopPropagation()
+    if (key === 'open_new_tab') {
+      handleDocumentOpen(doc.id)
+      return
+    }
+    if (key === 'edit') {
+      void openMetadataEditor(doc.id)
+      return
+    }
+    if (key === 'retry') {
+      void handleRetryDocument(doc)
+      return
+    }
+    const failedPageSelection = parseOcrMenuSelection(String(key), 'retry_failed_ocr_pages')
+    if (failedPageSelection) {
+      void handleRetryFailedPages(doc, failedPageSelection.engine, failedPageSelection.visionProfileId)
+      return
+    }
+    const forceSelection = parseOcrMenuSelection(String(key), 'rerun_ocr_book')
+    if (forceSelection) {
+      void handleForceRerunDocument(doc, forceSelection.engine, forceSelection.visionProfileId)
+      return
+    }
+    if (key === 'ai_extract') {
+      void handleAiExtractForDoc(doc.id)
+      return
+    }
+    if (String(key).startsWith('translate_book:start:')) {
+      const mode = String(key).replace('translate_book:start:', '') as BookTranslationOptions['mode']
+      void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE, mode })
+      return
+    }
+    if (key === 'translate_book' || key === 'translate_book:start') {
+      void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE })
+      return
+    }
+    if (key === 'translate_book:retry_failed') {
+      void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE, retryFailedOnly: true })
+      return
+    }
+    if (key === 'translate_book:clear_cache') {
+      Modal.confirm({
+        title: '清除本书翻译缓存',
+        content: '会清除这本文献的页面译文缓存。原文和 OCR 结果不会受影响，之后可以重新整书翻译。',
+        okText: '清除缓存',
+        cancelText: '取消',
+        okButtonProps: { danger: true },
+        onOk: () => handleTranslateBook(doc, { clearCache: true })
+      })
+      return
+    }
+    if (key === 'favorite') {
+      void handleToggleFavorite(doc)
+      return
+    }
+    if (key === 'add_tag') {
+      openDocumentTagModal(doc.id)
+      return
+    }
+    if (key.startsWith('folder_')) {
+      void handleAddToFolder(doc.id, key.replace('folder_', ''))
+      return
+    }
+    if (key.startsWith('remove_folder_')) {
+      void handleRemoveFromFolder(doc.id, key.replace('remove_folder_', ''))
+      return
+    }
+    if (key === 'cleanup_pdf_assets') {
+      Modal.confirm({
+        title: '删除原文件/页图缓存',
+        content: '只会删除软件数据目录（storage）内的 PDF 副本和页图缓存。绝不删除 OCR 文本、检索结果，也绝不删除 PDF 原件仓库 / NAS /「仅登记路径」指向的外部源文件。以后可从原件仓库或外盘补回。',
+        okText: '删除原文件',
+        cancelText: '取消',
+        okButtonProps: { danger: true },
+        onOk: () => handleCleanupPdfAssets(doc)
+      })
+      return
+    }
+    if (key === 'restore_pdf_assets') {
+      void handleRestorePdfAssets(doc)
+      return
+    }
+    if (key === '0') {
+      void handleSetRating(doc.id, null)
+      return
+    }
+    if (/^[1-5]$/.test(key)) {
+      void handleSetRating(doc.id, Number(key))
+    }
+  }
+
+  return (
+    <Dropdown
+      overlayClassName="library-document-menu"
+      menu={{
+        items: getDocumentContextMenuItems(doc.id, moreMenuItems),
+        onClick: handleDocumentContextMenuClick(doc.id, handleMoreClick),
+      }}
+      trigger={['contextMenu']}
+    >
+      <div
+        draggable
+        onDragStart={(event) => handleDocumentDragStart(event, doc.id)}
+        data-library-document-card="true"
+        data-document-id={doc.id}
+        onMouseDown={(event) => {
+          if (event.button === 2) handleDocumentContextMenu(doc.id)
+        }}
+        onContextMenu={() => handleDocumentContextMenu(doc.id)}
+        onClick={(event) => handleRowClick(doc.id, event)}
+        onDoubleClick={() => handleDocumentOpen(doc.id)}
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          padding: 12,
+          border: '1px solid rgba(255,255,255,0.08)',
+          borderRadius: 8,
+          background: isSelected ? 'rgba(24, 144, 255, 0.15)' : 'rgba(255,255,255,0.03)',
+          cursor: 'pointer',
+          transition: 'background 0.15s ease',
+          minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowDocumentReviewMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) || shouldShowEmbeddingProgress(embeddingProgressByDoc[doc.id]) ? 176 : 140,
+          overflow: 'hidden'
+        }}
+        onMouseEnter={(event) => {
+          if (!isSelected) {
+            event.currentTarget.style.background = 'rgba(255,255,255,0.04)'
+          }
+        }}
+        onMouseLeave={(event) => {
+          if (!isSelected) {
+            event.currentTarget.style.background = 'rgba(255,255,255,0.03)'
+          }
+        }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          {batchMode ? (
+            <div
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                border: isSelected ? '2px solid #1890ff' : '2px solid rgba(255,255,255,0.3)',
+                background: isSelected ? '#1890ff' : 'transparent',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0
+              }}
+            >
+              {isSelected ? <span style={{ color: '#fff', fontSize: 11 }}>✓</span> : null}
+            </div>
+          ) : null}
+          <div
+            style={{
+              flex: 1,
+              minWidth: 0,
+              fontSize: 14,
+              fontWeight: 600,
+              color: 'var(--gs-text-primary)',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}
+          >
+            {doc.title || '未命名文献'}
+          </div>
+        </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 8, minWidth: 0 }}>
+            <span
+              style={{
+                minWidth: 0,
+                maxWidth: '100%',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                color: 'var(--gs-text-secondary)',
+                fontSize: 12,
+                lineHeight: '22px',
+                flex: '1 1 100%',
+              }}
+            >
+              {[displayAuthor, displayDynasty, `${getEffectivePageCount(doc)} 页`].filter(Boolean).join(' · ')}
+            </span>
+            <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
+              {getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).text}
+            </Tag>
+            <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
+              {getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).text}
+            </Tag>
+            {renderEmbeddingStatusTag(doc)}
+            {!batchMode ? (
+              <div
+                data-library-document-action="true"
+                style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'flex-end',
+                gap: 2,
+                minWidth: 0,
+                maxWidth: 174,
+                flexWrap: 'nowrap',
+                overflow: 'hidden'
+              }}
+              onPointerDown={stopLibraryDocumentActionPropagation}
+              onMouseDown={stopLibraryDocumentActionPropagation}
+              onClick={stopLibraryDocumentActionPropagation}
+            >
+              {hasOcrFailedPages(doc) ? (
+                <Tooltip title="重新 OCR 错页">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    style={{ width: 24, height: 24, padding: 0 }}
+                    onClick={() => void handleRetryFailedPages(doc)}
+                  />
+                </Tooltip>
+              ) : shouldShowRetryAction(doc) ? (
+                <Tooltip title={getRetryActionLabel(doc)}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<ReloadOutlined />}
+                    style={{ width: 24, height: 24, padding: 0 }}
+                    onClick={() => void handleRetryDocument(doc)}
+                  />
+                </Tooltip>
+              ) : null}
+
+              <Tooltip title={doc.is_favorite ? '取消星标' : '加入星标'}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={doc.is_favorite ? <StarFilled style={{ color: '#faad14' }} /> : <StarOutlined />}
+                  style={{ width: 24, height: 24, padding: 0 }}
+                  onClick={() => void handleToggleFavorite(doc)}
+                />
+              </Tooltip>
+
+              <Dropdown
+                menu={{
+                  items: readMenuItems,
+                  onClick: ({ key }) => void handleSetReadStatus(doc.id, key as ReadStatus)
+                }}
+              >
+                <Button type="text" size="small" icon={getReadStatusIcon(doc.read_status)} style={{ width: 24, height: 24, padding: 0 }} />
+              </Dropdown>
+
+              <Popover
+                open={taggingDocId === doc.id}
+                onOpenChange={(open) => {
+                  if (open) {
+                    setTaggingDocId(doc.id)
+                    setTaggingChecked(docTagIds)
+                  } else {
+                    setTaggingDocId(null)
+                  }
+                }}
+                trigger="click"
+                title="标签"
+                content={(
+                  <div style={{ minWidth: 180, maxWidth: 280 }}>
+                    {tags.length === 0 ? (
+                      <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>还没有标签，请先创建</span>
+                    ) : (
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                        {sortedSidebarTags.map((item) => {
+                          const checked = taggingChecked.includes(item.id)
+                          return (
+                            <Tooltip key={item.id} title={getTooltipTitle(item.name, 18)}>
+                              <Tag
+                                color={checked ? TAG_KIND_META[getTagKind(item)].color : undefined}
+                                style={{
+                                  cursor: 'pointer',
+                                  margin: 0,
+                                  opacity: checked ? 1 : 0.6,
+                                  maxWidth: 220,
+                                  overflow: 'hidden',
+                                  whiteSpace: 'nowrap',
+                                  textOverflow: 'ellipsis',
+                                  border: checked
+                                    ? `1px solid ${item.color || '#1677ff'}`
+                                    : '1px solid rgba(255,255,255,0.2)'
+                                }}
+                                onClick={() => {
+                                  const nextChecked = checked
+                                    ? taggingChecked.filter((id) => id !== item.id)
+                                    : [...taggingChecked, item.id]
+                                  void handleTaggingChange(doc.id, nextChecked)
+                                }}
+                              >
+                                {checked ? '✓ ' : ''}{truncateLabel(item.name, 18)}
+                              </Tag>
+                            </Tooltip>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+              >
+                <Button type="text" size="small" icon={<TagOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
+              </Popover>
+
+              <Dropdown overlayClassName="library-document-menu" menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
+                <Button type="text" size="small" icon={<MoreOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
+              </Dropdown>
+
+              <Popconfirm
+                title="从当前项目移除文献"
+                description="只移除当前项目关联；其他项目和文献正文数据会保留。"
+                onConfirm={(event) => void handleRemoveFromProject(event ?? { stopPropagation() {} }, doc.id)}
+                onCancel={(event) => event?.stopPropagation()}
+                okText="移出项目"
+                cancelText="取消"
+              >
+                <Tooltip title="从当前项目移除">
+                  <Button type="text" size="small" icon={<MinusCircleOutlined />} style={{ width: 24, height: 24, padding: 0 }} onClick={(event) => event.stopPropagation()} />
+                </Tooltip>
+              </Popconfirm>
+
+              <Popconfirm
+                title="从总库永久删除文献"
+                description="将从所有项目删除这篇文献及其文件、OCR、向量和关联数据。"
+                onConfirm={(event) => void handleDelete(event ?? { stopPropagation() {} }, doc.id)}
+                onCancel={(event) => event?.stopPropagation()}
+                okText="删除"
+                cancelText="取消"
+              >
+                <Button type="text" danger size="small" icon={<DeleteOutlined />} style={{ width: 24, height: 24, padding: 0 }} onClick={(event) => event.stopPropagation()} />
+              </Popconfirm>
+              </div>
+            ) : null}
+          </div>
+
+        {(docFolderNames.length > 0 || visibleTags.length > 0) ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, minWidth: 0, height: 24, maxHeight: 24, whiteSpace: 'nowrap', overflow: 'hidden' }}>
+            {docFolderNames.length > 0 ? (
+              <>
+              {visibleFolderEntries.map((name, index) => (
+                <Tag
+                  key={`${doc.id}-folder-${docFolderIds[index] || index}`}
+                  style={{ margin: 0, cursor: 'pointer', maxWidth: 110, height: 22, lineHeight: '20px', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis', flexShrink: 0 }}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    void applyLibraryFilter({ type: 'folder', value: docFolderIds[index] })
+                  }}
+                >
+                  {name}
+                </Tag>
+              ))}
+              {hiddenFolderEntries.length > 0 ? renderTagSummaryPopover(
+                hiddenFolderEntries.map((name, index) => (
+                  <Tag key={`${doc.id}-hidden-folder-${docFolderIds[index + visibleFolderEntries.length] || index}`} style={{ margin: 0 }}>{name}</Tag>
+                )),
+                `+${hiddenFolderEntries.length}`,
+              ) : null}
+              </>
+            ) : null}
+
+            {visibleTags.map((tagItem) => {
+              const tagText = getDisplayTagText(tagItem.name) || tagItem.name
+              return (
+              <Tooltip
+                key={`${doc.id}-tag-${tagItem.id || tagItem.name}`}
+                title={getTooltipTitle(tagText, viewMode === 'grid' ? 12 : 22)}
+              >
+                <Tag
+                  color={TAG_KIND_META[getTagKind(tagItem)].color}
+                  style={{
+                    margin: 0,
+                    cursor: 'pointer',
+                    maxWidth: viewMode === 'grid' ? 92 : 220,
+                    height: 22,
+                    lineHeight: '20px',
+                    overflow: 'hidden',
+                    whiteSpace: 'nowrap',
+                    textOverflow: 'ellipsis',
+                    flexShrink: 0
+                  }}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    if (tagItem.id) {
+                      void toggleTagFilter(tagItem.id)
+                    }
+                  }}
+                >
+                  {truncateLabel(tagText, viewMode === 'grid' ? 12 : 22)}
+                </Tag>
+              </Tooltip>
+              )
+            })}
+            {hiddenTags.length > 0 ? (
+              <Popover
+                trigger="click"
+                title="其余标签"
+                content={(
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 320 }}>
+                    {hiddenTags.map((tagItem) => {
+                      const tagText = getDisplayTagText(tagItem.name) || tagItem.name
+                      return (
+                      <Tooltip
+                        key={`${doc.id}-hidden-${tagItem.id || tagItem.name}`}
+                        title={getTooltipTitle(tagText, 22)}
+                      >
+                        <Tag
+                          color={TAG_KIND_META[getTagKind(tagItem)].color}
+                          style={{
+                            margin: 0,
+                            cursor: 'pointer',
+                            maxWidth: 220,
+                            overflow: 'hidden',
+                            whiteSpace: 'nowrap',
+                            textOverflow: 'ellipsis'
+                          }}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            if (tagItem.id) {
+                              void toggleTagFilter(tagItem.id)
+                            }
+                          }}
+                        >
+                          {truncateLabel(tagText, 22)}
+                        </Tag>
+                      </Tooltip>
+                      )
+                    })}
+                  </div>
+                )}
+              >
+                <Tag
+                  style={{ margin: 0, cursor: 'pointer', flexShrink: 0 }}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  +{hiddenTags.length}
+                </Tag>
+              </Popover>
+            ) : null}
+          </div>
+        ) : null}
+
+        {shouldShowDocumentErrorMessage(doc, progressInfo) ? (
+          <div
+            style={{
+              marginTop: 8,
+              padding: '6px 8px',
+              borderRadius: 6,
+              background: 'rgba(255, 77, 79, 0.10)',
+              border: '1px solid rgba(255, 77, 79, 0.22)',
+              color: '#ffccc7',
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            失败原因：{doc.error_message}
+          </div>
+        ) : null}
+
+        {shouldShowDocumentReviewMessage(doc, progressInfo) ? (
+          <div
+            style={{
+              marginTop: 8,
+              padding: '6px 8px',
+              borderRadius: 6,
+              background: 'rgba(250, 173, 20, 0.12)',
+              border: '1px solid rgba(250, 173, 20, 0.28)',
+              color: '#ffd666',
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            {doc.error_message}
+          </div>
+        ) : null}
+
+        {progressInfo ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
+        {renderBookTranslationProgress(bookTranslationProgressInfo)}
+        {renderEmbeddingProgress(embeddingProgressByDoc[doc.id], handleCancelEmbedding)}
+      </div>
+    </Dropdown>
+  )
+}
+
+const GridDocumentCard = memo(GridDocumentCardInner, areGridDocumentCardPropsEqual)
 
 export default function LibraryView({
   onSelectDoc,
@@ -7501,21 +8246,11 @@ export default function LibraryView({
     })
   }, [documents, embeddingProgressByDoc, embeddingQueueSnapshot, smartViewCounts.embeddingQueued])
 
-  const listCardContext = useMemo<DocumentCardContext>(() => ({
-    viewMode,
-    batchMode,
-    selectedIds,
-    selectedIdSet,
-    folderTree,
-    tags,
-    sortedSidebarTags,
-    visionOcrProfiles,
-    activeVisionOcrProfileId,
-    ocrProgressByDoc,
-    bookTranslationProgressByDoc,
-    embeddingProgressByDoc,
-    taggingDocId,
-    taggingChecked,
+  // Latest-closure snapshot of every card handler, refreshed on each render so
+  // the stable forwarding wrappers always dispatch to fresh state. Without this
+  // split the context identity changed every render (several handlers are not
+  // useCallback-wrapped), defeating card memoization entirely.
+  const latestCardHandlers: DocumentCardHandlers = {
     handleRowClick,
     handleDocumentOpen,
     handleDocumentContextMenu,
@@ -7548,33 +8283,34 @@ export default function LibraryView({
     handleTranslateBook,
     setTaggingDocId,
     setTaggingChecked,
-  }), [
+  }
+  const cardHandlersRef = useRef<DocumentCardHandlers>(latestCardHandlers)
+  cardHandlersRef.current = latestCardHandlers
+  const stableCardHandlers = useMemo(() => createForwardingCardHandlers(cardHandlersRef), [])
+
+  const listCardContext = useMemo<DocumentCardContext>(() => ({
+    ...stableCardHandlers,
+    viewMode,
+    batchMode,
+    selectedIds,
+    selectedIdSet,
+    folderTree,
+    tags,
+    sortedSidebarTags,
+    visionOcrProfiles,
     activeVisionOcrProfileId,
-    applyLibraryFilter,
+    ocrProgressByDoc,
+    bookTranslationProgressByDoc,
+    embeddingProgressByDoc,
+    taggingDocId,
+    taggingChecked,
+  }), [
+    stableCardHandlers,
+    activeVisionOcrProfileId,
     batchMode,
     bookTranslationProgressByDoc,
     embeddingProgressByDoc,
     folderTree,
-    handleAddToFolder,
-    handleBatchMenu,
-    handleCancelEmbedding,
-    handleCancelOcr,
-    handleDocumentContextMenu,
-    getDocumentContextMenuItems,
-    handleDocumentContextMenuClick,
-    handleDocumentDragStart,
-    handleDocumentOpen,
-    handleCleanupPdfAssets,
-    handleForceRerunDocument,
-    handleQuickAddTagToDocument,
-    handleRemoveFromProject,
-    handleRestorePdfAssets,
-    handleAiExtractForDoc,
-    handleTranslateBook,
-    handleRemoveFromFolder,
-    handleRowClick,
-    getDragDocIds,
-    openDocumentTagModal,
     ocrProgressByDoc,
     selectedIds,
     selectedIdSet,
@@ -7582,7 +8318,6 @@ export default function LibraryView({
     taggingChecked,
     taggingDocId,
     tags,
-    toggleTagFilter,
     viewMode,
     visionOcrProfiles,
   ])
@@ -8391,7 +9126,7 @@ export default function LibraryView({
                   key={doc.id}
                   index={index}
                   style={{ height: getDocumentListRowHeight(doc, listCardContext), position: 'relative' }}
-                  ariaAttributes={{}}
+                  ariaAttributes={EMPTY_ROW_ARIA_ATTRIBUTES}
                   documents={documents}
                   context={listCardContext}
                 />
@@ -8400,7 +9135,7 @@ export default function LibraryView({
           ) : viewMode === 'list' ? (
             <List<DocumentVirtualRowProps>
               rowCount={documents.length}
-              rowHeight={(index, rowProps) => getDocumentListRowHeight(rowProps.documents[index], rowProps.context)}
+              rowHeight={documentVirtualRowHeight}
               rowComponent={DocumentVirtualRow}
               rowProps={{
                 documents,
@@ -8417,553 +9152,9 @@ export default function LibraryView({
               style={{ width: '100%', height: '100%' }}
             />
           ) : (
-            gridRenderedDocuments.map((doc) => {
-              const isSelected = selectedIdSet.has(doc.id)
-              const docTagNames = splitPipe(doc.tag_names)
-              const docTagColors = splitPipe(doc.tag_colors)
-              const docTagIds = splitPipe(doc.tag_ids)
-              const docTagSources = splitPipe(doc.tag_sources)
-              const docFolderIds = splitPipe(doc.folder_ids)
-              const docFolderNames = splitPipe(doc.folder_names)
-              const orderedDocTags = sortDocumentTags(docTagNames.map((name, index) => ({
-                id: docTagIds[index],
-                name,
-                color: docTagColors[index],
-                source: docTagSources[index]
-              }))).filter((tagItem) => !!getDisplayTagText(tagItem.name))
-              const visibleTagCount = viewMode === 'grid'
-                ? (docFolderNames.length > 0 ? 1 : 2)
-                : 6
-              const visibleTags = orderedDocTags.slice(0, visibleTagCount)
-              const hiddenTags = orderedDocTags.slice(visibleTagCount)
-              const visibleFolderEntries = viewMode === 'grid'
-                ? docFolderNames.slice(0, 1)
-                : docFolderNames
-              const hiddenFolderEntries = viewMode === 'grid'
-                ? docFolderNames.slice(1)
-                : []
-              const displayAuthor = getDisplayMetadataText(doc.author)
-              const displayDynasty = getDisplayMetadataText(doc.dynasty)
-              const progressInfo = resolveOcrProgressInfo(doc, ocrProgressByDoc[doc.id])
-              const bookTranslationProgressInfo = bookTranslationProgressByDoc[doc.id]
-              const pdfAssetState = getPdfAssetState(doc)
-
-              const readMenuItems: MenuProps['items'] = (Object.keys(READ_STATUS_MAP) as ReadStatus[]).map((status) => ({
-                key: status,
-                label: READ_STATUS_MAP[status].text,
-                icon: getReadStatusIcon(status)
-              }))
-
-              const ratingMenuItems: MenuProps['items'] = [
-                { key: '0', label: '清除评分' },
-                ...[1, 2, 3, 4, 5].map((value) => ({
-                  key: String(value),
-                  label: `${'★'.repeat(value)}${'☆'.repeat(5 - value)}`
-                }))
-              ]
-
-              const moreMenuItems: MenuProps['items'] = buildDocumentMoreMenuItems({
-                doc,
-                folderTree,
-                docFolderIds,
-                docFolderNames,
-                pdfAssetState,
-                visionProfiles: visionOcrProfiles,
-                activeVisionProfileId: activeVisionOcrProfileId,
-                onOcrDefaultSelect: (action, selection) => {
-                  if (action === 'retry_failed_ocr_pages') {
-                    void handleRetryFailedPages(doc, selection.engine, selection.visionProfileId)
-                  } else {
-                    void handleForceRerunDocument(doc, selection.engine, selection.visionProfileId)
-                  }
-                },
-              })
-
-              const handleMoreClick: MenuProps['onClick'] = ({ key, domEvent }) => {
-                domEvent.stopPropagation()
-                if (key === 'open_new_tab') {
-                  handleDocumentOpen(doc.id)
-                  return
-                }
-                if (key === 'edit') {
-                  void openMetadataEditor(doc.id)
-                  return
-                }
-                if (key === 'retry') {
-                  void handleRetryDocument(doc)
-                  return
-                }
-                const failedPageSelection = parseOcrMenuSelection(String(key), 'retry_failed_ocr_pages')
-                if (failedPageSelection) {
-                  void handleRetryFailedPages(doc, failedPageSelection.engine, failedPageSelection.visionProfileId)
-                  return
-                }
-                const forceSelection = parseOcrMenuSelection(String(key), 'rerun_ocr_book')
-                if (forceSelection) {
-                  void handleForceRerunDocument(doc, forceSelection.engine, forceSelection.visionProfileId)
-                  return
-                }
-                if (key === 'ai_extract') {
-                  void handleAiExtractForDoc(doc.id)
-                  return
-                }
-                if (String(key).startsWith('translate_book:start:')) {
-                  const mode = String(key).replace('translate_book:start:', '') as BookTranslationOptions['mode']
-                  void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE, mode })
-                  return
-                }
-                if (key === 'translate_book' || key === 'translate_book:start') {
-                  void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE })
-                  return
-                }
-                if (key === 'translate_book:retry_failed') {
-                  void handleTranslateBook(doc, { style: DEFAULT_TRANSLATION_STYLE, retryFailedOnly: true })
-                  return
-                }
-                if (key === 'translate_book:clear_cache') {
-                  Modal.confirm({
-                    title: '清除本书翻译缓存',
-                    content: '会清除这本文献的页面译文缓存。原文和 OCR 结果不会受影响，之后可以重新整书翻译。',
-                    okText: '清除缓存',
-                    cancelText: '取消',
-                    okButtonProps: { danger: true },
-                    onOk: () => handleTranslateBook(doc, { clearCache: true })
-                  })
-                  return
-                }
-                if (key === 'favorite') {
-                  void handleToggleFavorite(doc)
-                  return
-                }
-                if (key === 'add_tag') {
-                  openDocumentTagModal(doc.id)
-                  return
-                }
-                if (key.startsWith('folder_')) {
-                  void handleAddToFolder(doc.id, key.replace('folder_', ''))
-                  return
-                }
-                if (key.startsWith('remove_folder_')) {
-                  void handleRemoveFromFolder(doc.id, key.replace('remove_folder_', ''))
-                  return
-                }
-                if (key === 'cleanup_pdf_assets') {
-                  Modal.confirm({
-                    title: '删除原文件/页图缓存',
-                    content: '只会删除软件数据目录（storage）内的 PDF 副本和页图缓存。绝不删除 OCR 文本、检索结果，也绝不删除 PDF 原件仓库 / NAS /「仅登记路径」指向的外部源文件。以后可从原件仓库或外盘补回。',
-                    okText: '删除原文件',
-                    cancelText: '取消',
-                    okButtonProps: { danger: true },
-                    onOk: () => handleCleanupPdfAssets(doc)
-                  })
-                  return
-                }
-                if (key === 'restore_pdf_assets') {
-                  void handleRestorePdfAssets(doc)
-                  return
-                }
-                if (key === '0') {
-                  void handleSetRating(doc.id, null)
-                  return
-                }
-                if (/^[1-5]$/.test(key)) {
-                  void handleSetRating(doc.id, Number(key))
-                }
-              }
-
-              return (
-                <Dropdown
-                  key={doc.id}
-                  overlayClassName="library-document-menu"
-                  menu={{
-                    items: getDocumentContextMenuItems(doc.id, moreMenuItems),
-                    onClick: handleDocumentContextMenuClick(doc.id, handleMoreClick),
-                  }}
-                  trigger={['contextMenu']}
-                >
-                  <div
-                    draggable
-                    onDragStart={(event) => handleDocumentDragStart(event, doc.id)}
-                    data-library-document-card="true"
-                    data-document-id={doc.id}
-                    onMouseDown={(event) => {
-                      if (event.button === 2) handleDocumentContextMenu(doc.id)
-                    }}
-                    onContextMenu={() => handleDocumentContextMenu(doc.id)}
-                    onClick={(event) => handleRowClick(doc.id, event)}
-                    onDoubleClick={() => handleDocumentOpen(doc.id)}
-                    style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      padding: 12,
-                      border: '1px solid rgba(255,255,255,0.08)',
-                      borderRadius: 8,
-                      background: isSelected ? 'rgba(24, 144, 255, 0.15)' : 'rgba(255,255,255,0.03)',
-                      cursor: 'pointer',
-                      transition: 'background 0.15s ease',
-                      minHeight: shouldShowDocumentErrorMessage(doc, progressInfo) || shouldShowDocumentReviewMessage(doc, progressInfo) || shouldShowOcrProgressForDocument(doc, progressInfo) || shouldShowBookTranslationProgress(bookTranslationProgressInfo) || shouldShowEmbeddingProgress(embeddingProgressByDoc[doc.id]) ? 176 : 140,
-                      overflow: 'hidden'
-                    }}
-                    onMouseEnter={(event) => {
-                      if (!isSelected) {
-                        event.currentTarget.style.background = 'rgba(255,255,255,0.04)'
-                      }
-                    }}
-                    onMouseLeave={(event) => {
-                      if (!isSelected) {
-                        event.currentTarget.style.background = 'rgba(255,255,255,0.03)'
-                      }
-                    }}
-                    >
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                      {batchMode ? (
-                        <div
-                          style={{
-                            width: 18,
-                            height: 18,
-                            borderRadius: 4,
-                            border: isSelected ? '2px solid #1890ff' : '2px solid rgba(255,255,255,0.3)',
-                            background: isSelected ? '#1890ff' : 'transparent',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            flexShrink: 0
-                          }}
-                        >
-                          {isSelected ? <span style={{ color: '#fff', fontSize: 11 }}>✓</span> : null}
-                        </div>
-                      ) : null}
-                      <div
-                        style={{
-                          flex: 1,
-                          minWidth: 0,
-                          fontSize: 14,
-                          fontWeight: 600,
-                          color: 'var(--gs-text-primary)',
-                          whiteSpace: 'nowrap',
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis'
-                        }}
-                      >
-                        {doc.title || '未命名文献'}
-                      </div>
-                    </div>
-
-                      <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 8, minWidth: 0 }}>
-                        <span
-                          style={{
-                            minWidth: 0,
-                            maxWidth: '100%',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            whiteSpace: 'nowrap',
-                            color: 'var(--gs-text-secondary)',
-                            fontSize: 12,
-                            lineHeight: '22px',
-                            flex: '1 1 100%',
-                          }}
-                        >
-                          {[displayAuthor, displayDynasty, `${getEffectivePageCount(doc)} 页`].filter(Boolean).join(' · ')}
-                        </span>
-                        <Tag color={getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
-                          {getStatusMeta(OCR_STATUS_MAP, doc.ocr_status).text}
-                        </Tag>
-                        <Tag color={getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).color} style={{ margin: 0, flexShrink: 0, height: 22, lineHeight: '20px' }}>
-                          {getStatusMeta(IMPORT_STATUS_MAP, doc.import_status).text}
-                        </Tag>
-                        {renderEmbeddingStatusTag(doc)}
-                        {!batchMode ? (
-                          <div
-                            data-library-document-action="true"
-                            style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'flex-end',
-                            gap: 2,
-                            minWidth: 0,
-                            maxWidth: 174,
-                            flexWrap: 'nowrap',
-                            overflow: 'hidden'
-                          }}
-                          onPointerDown={stopLibraryDocumentActionPropagation}
-                          onMouseDown={stopLibraryDocumentActionPropagation}
-                          onClick={stopLibraryDocumentActionPropagation}
-                        >
-                          {hasOcrFailedPages(doc) ? (
-                            <Tooltip title="重新 OCR 错页">
-                              <Button
-                                type="text"
-                                size="small"
-                                icon={<ReloadOutlined />}
-                                style={{ width: 24, height: 24, padding: 0 }}
-                                onClick={() => void handleRetryFailedPages(doc)}
-                              />
-                            </Tooltip>
-                          ) : shouldShowRetryAction(doc) ? (
-                            <Tooltip title={getRetryActionLabel(doc)}>
-                              <Button
-                                type="text"
-                                size="small"
-                                icon={<ReloadOutlined />}
-                                style={{ width: 24, height: 24, padding: 0 }}
-                                onClick={() => void handleRetryDocument(doc)}
-                              />
-                            </Tooltip>
-                          ) : null}
-
-                          <Tooltip title={doc.is_favorite ? '取消星标' : '加入星标'}>
-                            <Button
-                              type="text"
-                              size="small"
-                              icon={doc.is_favorite ? <StarFilled style={{ color: '#faad14' }} /> : <StarOutlined />}
-                              style={{ width: 24, height: 24, padding: 0 }}
-                              onClick={() => void handleToggleFavorite(doc)}
-                            />
-                          </Tooltip>
-
-                          <Dropdown
-                            menu={{
-                              items: readMenuItems,
-                              onClick: ({ key }) => void handleSetReadStatus(doc.id, key as ReadStatus)
-                            }}
-                          >
-                            <Button type="text" size="small" icon={getReadStatusIcon(doc.read_status)} style={{ width: 24, height: 24, padding: 0 }} />
-                          </Dropdown>
-
-                          <Popover
-                            open={taggingDocId === doc.id}
-                            onOpenChange={(open) => {
-                              if (open) {
-                                setTaggingDocId(doc.id)
-                                setTaggingChecked(docTagIds)
-                              } else {
-                                setTaggingDocId(null)
-                              }
-                            }}
-                            trigger="click"
-                            title="标签"
-                            content={(
-                              <div style={{ minWidth: 180, maxWidth: 280 }}>
-                                {tags.length === 0 ? (
-                                  <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>还没有标签，请先创建</span>
-                                ) : (
-                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                    {sortedSidebarTags.map((item) => {
-                                      const checked = taggingChecked.includes(item.id)
-                                      return (
-                                        <Tooltip key={item.id} title={getTooltipTitle(item.name, 18)}>
-                                          <Tag
-                                            color={checked ? TAG_KIND_META[getTagKind(item)].color : undefined}
-                                            style={{
-                                              cursor: 'pointer',
-                                              margin: 0,
-                                              opacity: checked ? 1 : 0.6,
-                                              maxWidth: 220,
-                                              overflow: 'hidden',
-                                              whiteSpace: 'nowrap',
-                                              textOverflow: 'ellipsis',
-                                              border: checked
-                                                ? `1px solid ${item.color || '#1677ff'}`
-                                                : '1px solid rgba(255,255,255,0.2)'
-                                            }}
-                                            onClick={() => {
-                                              const nextChecked = checked
-                                                ? taggingChecked.filter((id) => id !== item.id)
-                                                : [...taggingChecked, item.id]
-                                              void handleTaggingChange(doc.id, nextChecked)
-                                            }}
-                                          >
-                                            {checked ? '✓ ' : ''}{truncateLabel(item.name, 18)}
-                                          </Tag>
-                                        </Tooltip>
-                                      )
-                                    })}
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          >
-                            <Button type="text" size="small" icon={<TagOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
-                          </Popover>
-
-                          <Dropdown overlayClassName="library-document-menu" menu={{ items: moreMenuItems, onClick: handleMoreClick }}>
-                            <Button type="text" size="small" icon={<MoreOutlined />} style={{ width: 24, height: 24, padding: 0 }} />
-                          </Dropdown>
-
-                          <Popconfirm
-                            title="从当前项目移除文献"
-                            description="只移除当前项目关联；其他项目和文献正文数据会保留。"
-                            onConfirm={(event) => void handleRemoveFromProject(event ?? { stopPropagation() {} }, doc.id)}
-                            onCancel={(event) => event?.stopPropagation()}
-                            okText="移出项目"
-                            cancelText="取消"
-                          >
-                            <Tooltip title="从当前项目移除">
-                              <Button type="text" size="small" icon={<MinusCircleOutlined />} style={{ width: 24, height: 24, padding: 0 }} onClick={(event) => event.stopPropagation()} />
-                            </Tooltip>
-                          </Popconfirm>
-
-                          <Popconfirm
-                            title="从总库永久删除文献"
-                            description="将从所有项目删除这篇文献及其文件、OCR、向量和关联数据。"
-                            onConfirm={(event) => void handleDelete(event ?? { stopPropagation() {} }, doc.id)}
-                            onCancel={(event) => event?.stopPropagation()}
-                            okText="删除"
-                            cancelText="取消"
-                          >
-                            <Button type="text" danger size="small" icon={<DeleteOutlined />} style={{ width: 24, height: 24, padding: 0 }} onClick={(event) => event.stopPropagation()} />
-                          </Popconfirm>
-                          </div>
-                        ) : null}
-                      </div>
-
-                    {(docFolderNames.length > 0 || visibleTags.length > 0) ? (
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, minWidth: 0, height: 24, maxHeight: 24, whiteSpace: 'nowrap', overflow: 'hidden' }}>
-                        {docFolderNames.length > 0 ? (
-                          <>
-                          {visibleFolderEntries.map((name, index) => (
-                            <Tag
-                              key={`${doc.id}-folder-${docFolderIds[index] || index}`}
-                              style={{ margin: 0, cursor: 'pointer', maxWidth: 110, height: 22, lineHeight: '20px', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis', flexShrink: 0 }}
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                void applyLibraryFilter({ type: 'folder', value: docFolderIds[index] })
-                              }}
-                            >
-                              {name}
-                            </Tag>
-                          ))}
-                          {hiddenFolderEntries.length > 0 ? renderTagSummaryPopover(
-                            hiddenFolderEntries.map((name, index) => (
-                              <Tag key={`${doc.id}-hidden-folder-${docFolderIds[index + visibleFolderEntries.length] || index}`} style={{ margin: 0 }}>{name}</Tag>
-                            )),
-                            `+${hiddenFolderEntries.length}`,
-                          ) : null}
-                          </>
-                        ) : null}
-
-                        {visibleTags.map((tagItem) => {
-                          const tagText = getDisplayTagText(tagItem.name) || tagItem.name
-                          return (
-                          <Tooltip
-                            key={`${doc.id}-tag-${tagItem.id || tagItem.name}`}
-                            title={getTooltipTitle(tagText, viewMode === 'grid' ? 12 : 22)}
-                          >
-                            <Tag
-                              color={TAG_KIND_META[getTagKind(tagItem)].color}
-                              style={{
-                                margin: 0,
-                                cursor: 'pointer',
-                                maxWidth: viewMode === 'grid' ? 92 : 220,
-                                height: 22,
-                                lineHeight: '20px',
-                                overflow: 'hidden',
-                                whiteSpace: 'nowrap',
-                                textOverflow: 'ellipsis',
-                                flexShrink: 0
-                              }}
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                if (tagItem.id) {
-                                  void toggleTagFilter(tagItem.id)
-                                }
-                              }}
-                            >
-                              {truncateLabel(tagText, viewMode === 'grid' ? 12 : 22)}
-                            </Tag>
-                          </Tooltip>
-                          )
-                        })}
-                        {hiddenTags.length > 0 ? (
-                          <Popover
-                            trigger="click"
-                            title="其余标签"
-                            content={(
-                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: 320 }}>
-                                {hiddenTags.map((tagItem) => {
-                                  const tagText = getDisplayTagText(tagItem.name) || tagItem.name
-                                  return (
-                                  <Tooltip
-                                    key={`${doc.id}-hidden-${tagItem.id || tagItem.name}`}
-                                    title={getTooltipTitle(tagText, 22)}
-                                  >
-                                    <Tag
-                                      color={TAG_KIND_META[getTagKind(tagItem)].color}
-                                      style={{
-                                        margin: 0,
-                                        cursor: 'pointer',
-                                        maxWidth: 220,
-                                        overflow: 'hidden',
-                                        whiteSpace: 'nowrap',
-                                        textOverflow: 'ellipsis'
-                                      }}
-                                      onClick={(event) => {
-                                        event.stopPropagation()
-                                        if (tagItem.id) {
-                                          void toggleTagFilter(tagItem.id)
-                                        }
-                                      }}
-                                    >
-                                      {truncateLabel(tagText, 22)}
-                                    </Tag>
-                                  </Tooltip>
-                                  )
-                                })}
-                              </div>
-                            )}
-                          >
-                            <Tag
-                              style={{ margin: 0, cursor: 'pointer', flexShrink: 0 }}
-                              onClick={(event) => event.stopPropagation()}
-                            >
-                              +{hiddenTags.length}
-                            </Tag>
-                          </Popover>
-                        ) : null}
-                      </div>
-                    ) : null}
-
-                    {shouldShowDocumentErrorMessage(doc, progressInfo) ? (
-                      <div
-                        style={{
-                          marginTop: 8,
-                          padding: '6px 8px',
-                          borderRadius: 6,
-                          background: 'rgba(255, 77, 79, 0.10)',
-                          border: '1px solid rgba(255, 77, 79, 0.22)',
-                          color: '#ffccc7',
-                          fontSize: 12,
-                          lineHeight: 1.5,
-                        }}
-                      >
-                        失败原因：{doc.error_message}
-                      </div>
-                    ) : null}
-
-                    {shouldShowDocumentReviewMessage(doc, progressInfo) ? (
-                      <div
-                        style={{
-                          marginTop: 8,
-                          padding: '6px 8px',
-                          borderRadius: 6,
-                          background: 'rgba(250, 173, 20, 0.12)',
-                          border: '1px solid rgba(250, 173, 20, 0.28)',
-                          color: '#ffd666',
-                          fontSize: 12,
-                          lineHeight: 1.5,
-                        }}
-                      >
-                        {doc.error_message}
-                      </div>
-                    ) : null}
-
-                    {progressInfo ? renderOcrProgress(progressInfo, handleCancelOcr) : null}
-                    {renderBookTranslationProgress(bookTranslationProgressInfo)}
-                    {renderEmbeddingProgress(embeddingProgressByDoc[doc.id], handleCancelEmbedding)}
-                  </div>
-                </Dropdown>
-              )
-            })
+            gridRenderedDocuments.map((doc) => (
+              <GridDocumentCard key={doc.id} doc={doc} context={listCardContext} />
+            ))
           )}
         </div>
         {!loading && listLoadingMore ? (

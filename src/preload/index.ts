@@ -1072,6 +1072,8 @@ const api = {
     ipcRenderer.invoke('database:externalizePagePayloads'),
   cleanupExternalPayloads: (): Promise<DatabaseMaintenanceResult> =>
     ipcRenderer.invoke('database:cleanupExternalPayloads'),
+  pruneOcrArtifactHistory: (): Promise<DatabaseMaintenanceResult> =>
+    ipcRenderer.invoke('database:pruneOcrArtifactHistory'),
 
   getVersion: (): Promise<string> =>
     ipcRenderer.invoke('app:getVersion'),

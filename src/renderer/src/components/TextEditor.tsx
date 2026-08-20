@@ -4,7 +4,8 @@ import type { MenuProps } from 'antd'
 import { DeleteOutlined, HolderOutlined, RedoOutlined, RollbackOutlined, SaveOutlined, UndoOutlined } from '@ant-design/icons'
 import { getOcrBlockText, getRawOcrBlockText, getTextFlowOcrBlocks } from '../utils/ocrText'
 import { renderOcrInlineHighlighted, renderOcrInlineText } from '../utils/ocrInlineRender'
-import { saveTextEditorPage } from '../utils/textEditorSaving'
+import { createDebouncedPageSaver } from '../utils/textEditorSaving'
+import type { DebouncedPageSaver } from '../utils/textEditorSaving'
 import type { PageUpdatePayload } from '@shared/types'
 
 const LABEL_COLORS: Record<string, string> = {
@@ -217,6 +218,31 @@ export default function TextEditor({
     setHistoryIndex((previous) => Math.min(previous + 1, 49))
   }, [historyIndex])
 
+  const debouncedSaverRef = useRef<DebouncedPageSaver | null>(null)
+  if (!debouncedSaverRef.current) {
+    debouncedSaverRef.current = createDebouncedPageSaver()
+  }
+  const debouncedSaver = debouncedSaverRef.current
+
+  // Flush pending edits before the editor moves to another page or unmounts so
+  // the debounce window can never drop a save.
+  useEffect(() => {
+    const saver = debouncedSaverRef.current
+    return () => {
+      void saver?.flush()
+    }
+  }, [pageId])
+
+  useEffect(() => {
+    const flushPendingSave = (): void => {
+      void debouncedSaverRef.current?.flush()
+    }
+    window.addEventListener('beforeunload', flushPendingSave)
+    return () => {
+      window.removeEventListener('beforeunload', flushPendingSave)
+    }
+  }, [])
+
   const saveToDb = useCallback((nextData: TextEditorOcrBlock[]): Promise<boolean> => {
     const normalizedData = normalizeManualReadingOrder(nextData)
     const nextOcrResult = {
@@ -225,10 +251,11 @@ export default function TextEditor({
       words_result: normalizedData.map((box) => ({ words: getOcrBlockText(box) || '' })),
     }
     const nextText = normalizedData.map((box) => getOcrBlockText(box) || '').join('\n')
-    return saveTextEditorPage(() => (
+    // Bursts of proofreading actions merge into one debounced full-page save.
+    return debouncedSaver.schedule(() => (
       onSave(pageId, { ocr_result: nextOcrResult, ocr_text: nextText, proofed_text: nextText })
     ))
-  }, [ocrResult, onSave, pageId])
+  }, [debouncedSaver, ocrResult, onSave, pageId])
 
   const handleUndo = useCallback(() => {
     if (historyIndex <= 0) return

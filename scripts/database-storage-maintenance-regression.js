@@ -278,4 +278,25 @@ assertIncludes(
   'payload cleanup must preserve external fields referenced by immutable OCR artifacts',
 )
 
+// OCR artifact history pruning: superseded artifacts accumulate a full OCR
+// copy per re-run and must be prunable, but never at the cost of the active
+// artifact or the proofreading base version.
+assertIncludes(maintenance, 'export async function pruneOcrArtifactHistory', 'maintenance should provide OCR artifact history pruning')
+assertIncludes(maintenance, "a.status IN ('superseded', 'error')", 'OCR history pruning must only target superseded or errored artifact rows')
+assertIncludes(maintenance, 'SELECT active_ocr_artifact_id FROM pages WHERE active_ocr_artifact_id IS NOT NULL', 'OCR history pruning must never delete the active artifact of a page')
+assertIncludes(maintenance, 'SELECT proof_base_artifact_id FROM pages WHERE proof_base_artifact_id IS NOT NULL', 'OCR history pruning must never delete the proofreading base artifact of a page')
+assertIncludes(maintenance, 'SELECT artifact_id FROM ocr_page_active_artifacts', 'OCR history pruning must respect the active artifact pointer table')
+assertIncludes(maintenance, 'OCR_HISTORY_PRUNE_BATCH_SIZE', 'OCR history pruning should delete in bounded batches')
+assertIncludes(maintenance, "taskId = 'database-maintenance:ocr-history-prune'", 'OCR history pruning should emit visible progress')
+const pruneStart = maintenance.indexOf('export async function pruneOcrArtifactHistory')
+const pruneEnd = maintenance.indexOf('export async function optimizeLegacyDatabaseStorage', pruneStart)
+const pruneBody = maintenance.slice(pruneStart, pruneEnd)
+assertIncludes(pruneBody, 'cleanupUnreferencedPagePayloads()', 'OCR history pruning should sweep newly unreferenced external payload files in the same action')
+assertIncludes(maintenanceIpc, 'database:pruneOcrArtifactHistory', 'OCR artifact history pruning IPC should exist')
+assertIncludes(preload, 'pruneOcrArtifactHistory', 'preload should expose OCR artifact history pruning')
+assertIncludes(settingsView, 'handlePruneOcrArtifactHistory', 'settings should expose OCR history pruning')
+assertIncludes(settingsView, 'window.api.pruneOcrArtifactHistory()', 'settings should invoke OCR history pruning through preload')
+assertIncludes(settingsView, '清理 OCR 历史版本', 'settings should render the OCR history pruning button')
+assertIncludes(settingsView, '当前使用中的 OCR 结果、校对文本与 PDF 原文不受影响', 'OCR history pruning confirmation should state what is preserved')
+
 console.log('Database storage maintenance regression checks passed')
