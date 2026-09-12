@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { _electron: electron } = require('playwright')
+const { enterResearchFixture } = require('./research-ui-fixture-startup')
 process.on('uncaughtException', (error) => { console.error(error); process.exit(1) })
 
 async function run() {
@@ -19,16 +20,7 @@ async function run() {
     const window = await app.firstWindow()
     const errors = []
     window.on('pageerror', (error) => errors.push(error.message))
-    await window.locator('[data-project-gate-ready="true"]').waitFor()
-    await window.locator('[data-library-project-choice="true"]').first().click()
-    await window.locator('main').waitFor()
-    await window.waitForTimeout(800)
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const close = window.locator('.ant-modal-wrap:visible .ant-modal-close').first()
-      if (!await close.count()) break
-      await close.click()
-      await window.waitForTimeout(200)
-    }
+    await enterResearchFixture(window, true)
     await app.evaluate(({ ipcMain }, { large, topic }) => {
       const project = (id, name) => ({
         id, name, description: '', tags: '', status: 'active', created_at: '', updated_at: '',

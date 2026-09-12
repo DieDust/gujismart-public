@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { _electron: electron } = require('playwright')
+const { enterResearchFixture } = require('./research-ui-fixture-startup')
 
 async function run() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-corpus-ui-'))
@@ -19,16 +20,7 @@ async function run() {
     page.setDefaultTimeout(15000)
     const errors = []
     page.on('pageerror', (error) => errors.push(error.message))
-    await page.locator('[data-project-gate-ready="true"]').waitFor()
-    await page.locator('[data-library-project-choice="true"]').first().click()
-    await page.locator('main').waitFor()
-    await page.waitForTimeout(800)
-    for (let i = 0; i < 4; i++) {
-      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
-      if (!await close.count()) break
-      await close.click()
-      await page.waitForTimeout(200)
-    }
+    await enterResearchFixture(page, true)
     await app.evaluate(({ ipcMain }) => {
       const state = globalThis.corpusUiFixture = { task: null, calls: [], createFailures: 1, startFailures: 1, sourceStatus: 'current', sessions: [], turns: {} }
       const replace = (channel, handler) => { ipcMain.removeHandler(channel); ipcMain.handle(channel, handler) }

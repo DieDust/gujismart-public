@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { _electron: electron } = require('playwright')
+const { enterResearchFixture } = require('./research-ui-fixture-startup')
 
 async function run() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-progress-ui-'))
@@ -18,16 +19,7 @@ async function run() {
     page.setDefaultTimeout(12000)
     const errors = []
     page.on('pageerror', (error) => errors.push(error.message))
-    await page.locator('[data-project-gate-ready="true"]').waitFor()
-    await page.locator('[data-library-project-choice="true"]').first().click()
-    await page.locator('main').waitFor()
-    await page.waitForTimeout(800)
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
-      if (!await close.count()) break
-      await close.click()
-      await page.waitForTimeout(200)
-    }
+    await enterResearchFixture(page, true)
     await app.evaluate(() => {
       const require = process.getBuiltinModule('module').createRequire(`${process.cwd()}/package.json`)
       const path = require('node:path')

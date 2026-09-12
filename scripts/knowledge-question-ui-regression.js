@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { _electron: electron } = require('playwright')
+const { enterResearchFixture } = require('./research-ui-fixture-startup')
 
 async function run() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-question-ui-'))
@@ -13,17 +14,9 @@ async function run() {
     const page = await app.firstWindow()
     const errors = []
     page.on('pageerror', (error) => errors.push(error.message))
-    await page.locator('[data-project-gate-ready="true"]').waitFor()
-    await page.locator('[data-library-project-choice="true"]').first().click()
-    await page.locator('main').waitFor()
-    await page.waitForTimeout(800)
+    await enterResearchFixture(page, true)
     if (process.env.GUJISMART_TEST_BACKGROUND === '1') {
       assert(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().every((window) => !window.isVisible())), 'background UI fixtures must not appear on the desktop')
-    }
-    for (let i = 0; i < 4; i++) {
-      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
-      if (!await close.count()) break
-      await close.click(); await page.waitForTimeout(200)
     }
     await app.evaluate(({ ipcMain }) => {
       const state = globalThis.__questionFixture = { calls: [], notes: [], sessions: [], turns: {}, graphLoads: 0 }
@@ -151,13 +144,7 @@ async function run() {
     await view.getByText('两部材料纪年不一致，尚待核验。', { exact: true }).waitFor()
     await view.getByRole('textbox', { name: '想研究的问题' }).fill('待续的问题草稿')
     await page.reload()
-    await page.locator('[data-library-project-choice="true"]').first().click()
-    await page.waitForTimeout(800)
-    for (let i = 0; i < 4; i++) {
-      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
-      if (!await close.count()) break
-      await close.click(); await page.waitForTimeout(200)
-    }
+    await enterResearchFixture(page)
     await page.locator('.ant-menu-item').filter({ hasText: /^知识图谱$/ }).click()
     await view.getByRole('textbox', { name: '想研究的问题' }).waitFor()
     await view.getByText('两部材料纪年不一致，尚待核验。', { exact: true }).waitFor()
@@ -303,13 +290,7 @@ async function run() {
       }
     }))
     await page.reload()
-    await page.locator('[data-library-project-choice="true"]').first().click()
-    await page.waitForTimeout(800)
-    for (let i = 0; i < 4; i++) {
-      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
-      if (!await close.count()) break
-      await close.click(); await page.waitForTimeout(200)
-    }
+    await enterResearchFixture(page)
     await research.getByRole('tab', { name: /证据摘录/ }).waitFor()
     assert(await modes.getByText('专题研究', { exact: true }).isVisible())
     assert(await page.locator('.ant-menu-item-selected').filter({ hasText: /^知识图谱$/ }).isVisible(), 'legacy research route highlights unified sidebar entry')
