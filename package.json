@@ -1,6 +1,6 @@
 {
   "name": "gujismart",
-  "version": "1.2.34",
+  "version": "1.2.35",
   "description": "文献管理（GujiSmart） - 面向古籍与通用文献的研究工作台",
   "main": "./out/main/index.js",
   "author": "DieDust",
@@ -127,7 +127,8 @@
     "check:app-update": "node scripts/app-update-regression.js",
     "check:ai-response-envelope": "node scripts/ai-response-envelope-regression.js",
     "check:citation-field-resolver": "node scripts/citation-field-resolver-regression.js && npm run check:citation-snapshot && npm run check:export-snapshot",
-    "check:export-snapshot": "electron scripts/export-snapshot-atomic-regression.js",
+    "check:export-snapshot": "node scripts/ocr-export-feedback-regression.js && electron scripts/export-snapshot-atomic-regression.js",
+    "check:ocr-export-feedback-ui": "node scripts/ocr-export-feedback-ui-regression.js",
     "check:ocr-run-metadata": "node scripts/ocr-run-metadata-regression.js",
     "check:document-pipeline-diagnostics": "node scripts/document-pipeline-diagnostics-regression.js",
     "check:search-index-health": "node scripts/search-index-health-regression.js",

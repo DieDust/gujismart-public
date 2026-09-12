@@ -364,7 +364,7 @@ function installRegressingProgressFetch() {
 }
 
 function installStalledProgressFetch() {
-  let uploaded = false
+  let uploaded = 0
 
   global.fetch = async (input, init = {}) => {
     const url = String(input)
@@ -372,7 +372,7 @@ function installStalledProgressFetch() {
 
     if (method === 'POST' && url.includes('/api/v2/ocr/jobs')) {
       await readUploadedPdf(init.body)
-      uploaded = true
+      uploaded += 1
       return new Response(JSON.stringify({ data: { jobId: 'job-stalled' } }), { status: 200 })
     }
 
@@ -390,6 +390,7 @@ function installStalledProgressFetch() {
 
     throw new Error(`unexpected fetch: ${method} ${url}`)
   }
+  return { get uploads() { return uploaded } }
 }
 
 async function withFastPollTimers(fn) {
@@ -527,15 +528,16 @@ async function runQpdfChunkingScenario(ocr, pdfPath) {
 }
 
 async function runStalledProgressScenario(ocr, pdfPath) {
-  installStalledProgressFetch()
+  const state = installStalledProgressFetch()
 
   await assert.rejects(
     () => withFastPollTimers(() => ocr.recognizePdfAsync(pdfPath, undefined, {
       model: 'PaddleOCR-VL-1.6',
       targetPageNums: [1],
     })),
-    /长时间没有进展/,
+    /停止自动重提以避免重复计费/,
   )
+  assert.strictEqual(state.uploads, 1, 'an unresolved accepted job must not be submitted repeatedly')
 }
 
 async function runWholePdfFallbackScenario(ocr, pdfPath) {
@@ -642,6 +644,49 @@ async function runEmptyTargetScenario(ocr, pdfPath) {
   assert.strictEqual(chunks.length, 0)
 }
 
+async function runSlowTailReuseScenario(ocr, pdfPath, awaitingResultFile = false) {
+  const originalDateNow = Date.now
+  let elapsed = 0
+  let uploads = 0
+  let polls = 0
+  const progress = []
+  Date.now = () => originalDateNow() + elapsed
+  global.fetch = async (input, init = {}) => {
+    const url = String(input)
+    if (init.method === 'POST' && url.includes('/api/v2/ocr/jobs')) {
+      await readUploadedPdf(init.body)
+      uploads += 1
+      return new Response(JSON.stringify({ data: { jobId: 'slow-tail' } }))
+    }
+    if (url.includes('/api/v2/ocr/jobs/slow-tail')) {
+      polls += 1
+      elapsed += 4 * 60 * 1000
+      return new Response(JSON.stringify({ data: {
+        status: awaitingResultFile || polls >= 3 ? 'completed' : 'running',
+        completedPages: awaitingResultFile || polls >= 3 ? 5 : 4,
+        totalPages: 5,
+        jsonUrl: polls >= 3 ? 'mock://slow-tail-result' : undefined,
+      } }))
+    }
+    if (url === 'mock://slow-tail-result') {
+      return new Response(JSON.stringify({ layoutParsingResults:
+        Array.from({ length: 5 }, (_, index) => ({ markdown: `page ${index + 1}` })),
+      }))
+    }
+    throw new Error(`unexpected slow-tail fetch: ${url}`)
+  }
+  try {
+    const results = await ocr.recognizePdfAsync(pdfPath, payload => progress.push(payload.completedPages), {
+      model: 'PaddleOCR-VL-1.6', maxWorkers: 1,
+    })
+    assert.strictEqual(results.length, 5)
+    assert.strictEqual(uploads, 1, 'a slow running job must be queried again, not submitted twice')
+    assert.ok(progress.every((value, index) => !index || value >= progress[index - 1]), 'query retries must not reset completed pages')
+  } finally {
+    Date.now = originalDateNow
+  }
+}
+
 async function runIncompleteChunkRetryScenario(ocr, pdfPath) {
   const uploads = installIncompleteChunkFetch()
   const chunks = []
@@ -734,6 +779,8 @@ async function run() {
   const { ocr } = require(bundlePath)
   await runResumeScenario(ocr, pdfPath)
   await runRegressingProgressScenario(ocr, pdfPath)
+  await runSlowTailReuseScenario(ocr, pdfPath)
+  await runSlowTailReuseScenario(ocr, pdfPath, true)
   await runStalledProgressScenario(ocr, pdfPath)
   await runQpdfChunkingScenario(ocr, largePdfPath)
   await runWholePdfFallbackScenario(ocr, largePdfPath)

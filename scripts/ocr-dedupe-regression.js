@@ -55,6 +55,17 @@ try {
   })
   assert.strictEqual(normalRepeatIssue, null)
 
+  const longCycle = Array.from({ length: 20 }, (_, index) => `entry${index};`).join('')
+  const cyclicResult = { layout_result: [{ words: 'Index heading\n' + longCycle.repeat(45) }] }
+  const cyclicSnapshot = JSON.stringify(cyclicResult)
+  const longCycleIssue = ocr.findSuspiciousRepeatedOcrText(cyclicResult)
+  assert.ok(longCycleIssue, 'long repeating sequences must not evade the short-phrase guard')
+  assert.ok(longCycleIssue.unit.length > 18)
+  assert.ok(longCycleIssue.repeatCount >= 20)
+  assert.strictEqual(JSON.stringify(cyclicResult), cyclicSnapshot, 'detection must not mutate source text')
+  assert.strictEqual(ocr.findSuspiciousRepeatedOcrText(longCycle.repeat(5)), null, 'ordinary short repetitions remain untouched')
+  assert.strictEqual(ocr.findSuspiciousRepeatedOcrText(Array.from({ length: 1500 }, (_, index) => `entry${index};`).join('')), null, 'a long nonrepeating index must remain valid')
+
   const repeatedText = 'county council report about school affairs and public administration procedure '.repeat(5)
   const repeated = Array.from({ length: 5 }, (_item, index) => block(repeatedText, 120 + index * 48, 80, 44, 620, { reading_order: index }))
   const repeatedResult = ocr.normalizePageResult({ layout_result: repeated, text: repeated.map((item) => item.words).join('\n') })

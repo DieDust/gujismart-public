@@ -4,6 +4,7 @@ const { tmpdir } = require('node:os')
 const { join } = require('node:path')
 const { buildSync } = require('esbuild')
 const zlib = require('node:zlib')
+const ts = require('typescript')
 process.on('uncaughtException', (error) => { console.error(error); process.exit(1) })
 process.on('unhandledRejection', (error) => { console.error(error); process.exit(1) })
 const root = join(__dirname, '..')
@@ -63,6 +64,58 @@ async function run() {
       assert.equal(row.ocr_status, 'completed')
       assert.equal(row.proof_base_stale, 1)
     }
+    const cycle = Array.from({ length: 20 }, (_, i) => `entry${i};`).join('')
+    const rejected = await mod.exports.processor.postProcessPdfResultsBatched([
+      { page: { id: 'fixture-page-1', image_path: null }, sourcePageIndex: 1, resultIndex: 0 },
+    ], [{ words_result: [{ words: cycle.repeat(45) }] }], {
+      profile: 'guji_print_vertical', secondPass: 'none', imageRotation: 0,
+    })
+    assert.equal(rejected[0].status, 'error', 'legacy PDF batches must reject runaway repeated output')
+    assert.equal(rejected[0].result, null)
+    assert.equal(rejected[0].text, '')
+    const beforeFailure = db.queryOne("SELECT * FROM pages WHERE id = 'fixture-page-1'")
+    const beforePayload = mod.exports.payload.hydratePagePayloadRow({ ...beforeFailure })
+    const compressionCount = compressions
+    const failedChanges = await mod.exports.processor.savePageResults([{
+      pageId: 'fixture-page-1', status: 'error', text: '', result: null, error: 'Synthetic failed retry',
+    }], { deferSearchRefresh: true, deferDatabaseSave: true })
+    const afterFailure = db.queryOne("SELECT * FROM pages WHERE id = 'fixture-page-1'")
+    const afterPayload = mod.exports.payload.hydratePagePayloadRow({ ...afterFailure })
+    assert.equal(afterFailure.ocr_status, 'error')
+    for (const field of ['ocr_text', 'ocr_text_ref', 'ocr_result', 'ocr_result_ref', 'proofed_text', 'proof_base_stale']) {
+      assert.equal(afterFailure[field], beforeFailure[field], `${field} must survive a failed retry`)
+    }
+    assert.equal(afterPayload.ocr_text, beforePayload.ocr_text)
+    assert.equal(afterPayload.ocr_result, beforePayload.ocr_result)
+    assert.equal(compressions, compressionCount, 'failed results must not overwrite external payload files')
+    assert.deepEqual(failedChanges, [], 'unchanged text needs no search refresh')
+    // Exercise the regular IPC save function against the same isolated SQLite payloads.
+    const ipcSource = ts.createSourceFile('ocr.ts', require('node:fs').readFileSync(join(root, 'src/main/ipc/ocr.ts'), 'utf8'), ts.ScriptTarget.Latest, true)
+    const saveNode = ipcSource.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'savePageOcrResults')
+    assert(saveNode)
+    const saveCode = ts.transpileModule(saveNode.getText(ipcSource), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText
+    let preparedPayloads = 0
+    const context = {
+      guardRepeatedOcrPageResult: value => value,
+      getPageSnapshotsForOcrSave: ids => new Map(ids.map(id => [id, mod.exports.payload.hydratePagePayloadRow(db.queryOne('SELECT * FROM pages WHERE id = ?', [id]))])),
+      isOcrQualityFailureMessage: value => value === 'Synthetic quality rejection',
+      preparePagePayloadUpdate: () => { preparedPayloads++; throw Error('Failed retry must not prepare replacement payloads') },
+      transaction: db.transaction, run: db.run,
+      markPageOcrVersionsInactive: ids => assert.equal(ids.length, 0, 'Previous OCR versions must survive rejected retries'),
+      logSlowOcrStep: () => {},
+    }
+    const saveIpc = new Function(...Object.keys(context), `${saveCode}\nreturn savePageOcrResults`)(...Object.values(context))
+    for (const [error, expectedStatus] of [['Synthetic quality rejection', 'error'], ['Synthetic transient failure', 'completed']]) {
+      db.run("UPDATE pages SET ocr_status = 'processing' WHERE id = 'fixture-page-1'")
+      saveIpc([{ pageId: 'fixture-page-1', result: null, text: '', status: 'error', error }], 'paddle', { deferFinalize: true, deferDatabaseSave: true, markTocDirty: false })
+      const stored = db.queryOne("SELECT * FROM pages WHERE id = 'fixture-page-1'")
+      assert.equal(stored.ocr_status, expectedStatus)
+      for (const field of ['ocr_text', 'ocr_text_ref', 'ocr_result', 'ocr_result_ref', 'proofed_text', 'proof_base_stale']) {
+        assert.equal(stored[field], beforeFailure[field], `Regular IPC: ${field} must survive ${error}`)
+      }
+      assert.equal(mod.exports.payload.hydratePagePayloadRow({ ...stored }).ocr_text, beforePayload.ocr_text)
+    }
+    assert.equal(preparedPayloads, 0)
     console.log(`Batch async preparation regression passed: ${compressions} compressions outside transactions; complete OCR retained, proofreading preserved, concurrent deletion not resurrected.`)
   } finally { zlib.gzip = originalGzip; db.closeDatabase() }
 }

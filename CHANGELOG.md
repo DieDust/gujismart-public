@@ -1,6 +1,32 @@
 # 更新日志 / Changelog
 
-## Unreleased / 待发布
+## 1.2.35 - 2026-09-12
+
+### 中文
+
+- 下载：`GujiSmart-1.2.35-Setup-x64.exe` 为安装版，`GujiSmart-1.2.35-Portable-x64.exe` 为便携版。
+- 修复设置页和首次引导把已保存的 PaddleOCR-VL 显示为 VL-1.6 的问题，保留用户选择，不自动迁移模型。
+- 阅读 PDF 和可搜索 PDF 不再被仅适用于可编辑排版 PDF 的 Type 3 字体检查阻断；保留可编辑排版 PDF 的检查，并取消导出加载完成后的重复等待。
+- 飞桨服务端正常返回排队状态时继续查询原任务，不再因为排队超过进度停滞阈值而自动重复提交；保留处理中失联与取消保护。
+- PDF OCR 处理中进度暂时停留或结果文件未就绪时，优先重查已受理的原任务，保留已有进度；超过重查上限明确报错，不再自动重复上传同批文件。
+- 古籍竖排 PDF 使用 VL 模型时保留外层文字区域，减少嵌套版面框过滤造成的漏列；普通文献及其他模型维持原参数。识别结果仍需核对原图。
+- 增加长段循环生成检测，拦截高占比、数千字的重复新结果；不自动删除已有正文或正常重复文字。
+- 旧版批处理接入重复生成检测；失败重试保留已有 OCR 正文、外置内容和校对文字。普通导入的新结果质量异常时也保留旧正文，但本页仍标记为失败，不冒充识别完成。
+- README 新增 QQ 交流群 **1124897826** 与入群二维码。
+- 升级前请备份资料库；沿用原有应用标识和数据目录，不自动重写旧 OCR、不自动调用收费服务。漏列修复已有问题页实测，但不保证消除所有识别遗漏或错误，仍需对照原图校核。安装包未数字签名，Windows 可能提示未知发布者。
+
+### English
+
+- Downloads: `GujiSmart-1.2.35-Setup-x64.exe` is the installer; `GujiSmart-1.2.35-Portable-x64.exe` is the portable build.
+- Preserve the saved PaddleOCR-VL selection in Settings and onboarding instead of displaying VL-1.6; no automatic model migration.
+- Restrict the Type 3 font editing guard to editable layout PDFs, allowing reading and searchable PDFs to export. Remove the redundant wait after the export page has loaded.
+- Keep polling the original Paddle job while the provider acknowledges queueing instead of resubmitting after the progress-stall threshold. Preserve processing-stall and cancellation safeguards.
+- Retry the accepted PDF OCR job when processing pauses or its result file is not ready, preserving progress. Stop with an explicit error after bounded retries rather than uploading the same batch again.
+- Retain enclosing text regions for historical vertical PDFs using VL models to reduce missing columns from nested-box filtering. Other document profiles and models retain their parameters; source-image verification remains necessary.
+- Detect long repeated generation cycles in new OCR results, without automatically deleting existing text or ordinary repetitions.
+- Apply repeated-generation checks to legacy PDF batches. Preserve existing OCR payloads and proofreading on failed legacy retries; regular import quality failures retain prior text while marking the page as an error rather than completed.
+- Add QQ community group **1124897826** and its QR code to the README.
+- Back up your library before upgrading. The app identity and data locations remain unchanged; upgrading does not automatically rewrite old OCR or invoke paid services. Missing-column fixes were tested on affected pages, but do not eliminate all omissions or transcription errors; source-image checking remains necessary. Installers are unsigned and Windows may display an unknown-publisher warning.
 
 ## 1.2.34 - 2026-09-12
 

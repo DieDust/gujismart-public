@@ -5860,11 +5860,17 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
   }
   const pendingWrites: PendingPageWrite[] = []
   const statusOnlyCompletions: Array<{ pageId: string; docId: string; hasProofedText: boolean }> = []
+  const statusOnlyFailures: string[] = []
 
   for (const pageResult of guardedPageResults) {
     const existingPage = pageSnapshots.get(pageResult.pageId)
     const hasProofedText = String(existingPage?.proofed_text || '').trim().length > 0
     const hasExistingOcrText = String(existingPage?.ocr_text || '').trim().length > 0
+    // A rejected new result must not destroy the previous text or its active version.
+    if (pageResult.status === 'error' && existingPage && hasExistingOcrText && isOcrQualityFailureMessage(pageResult.error)) {
+      statusOnlyFailures.push(pageResult.pageId)
+      continue
+    }
     if (pageResult.status === 'error' && existingPage && hasExistingOcrText && !isOcrQualityFailureMessage(pageResult.error)) {
       if (String(existingPage.ocr_status || '') !== 'completed') {
         statusOnlyCompletions.push({
@@ -5947,8 +5953,12 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
   })
 
   // Phase 2 — short SQL-only transaction.
-  if (statusOnlyCompletions.length > 0 || pendingWrites.length > 0 || preparedVersionWrites.length > 0) {
+  if (statusOnlyFailures.length > 0 || statusOnlyCompletions.length > 0 || pendingWrites.length > 0 || preparedVersionWrites.length > 0) {
     transaction(() => {
+      for (const pageId of statusOnlyFailures) {
+        run('UPDATE pages SET ocr_status = ? WHERE id = ?', ['error', pageId])
+        changedPageIds.push(pageId)
+      }
       for (const item of statusOnlyCompletions) {
         run(
           `UPDATE pages

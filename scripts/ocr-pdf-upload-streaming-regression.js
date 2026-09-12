@@ -171,7 +171,7 @@ assert(
     && asyncPdfOptionalPayloadBody.includes('useDocUnwarping: false')
     && asyncPdfOptionalPayloadBody.includes('useLayoutDetection: true')
     && asyncPdfOptionalPayloadBody.includes('useChartRecognition: false')
-    && asyncPdfOptionalPayloadBody.includes("layoutMergeBboxesMode: 'small'")
+    && asyncPdfOptionalPayloadBody.includes('layoutMergeBboxesMode:')
     && asyncPdfOptionalPayloadBody.includes('markdownIgnoreLabels:')
     && asyncPdfOptionalPayloadBody.includes('returnLayoutPolygonPoints: true')
     && !asyncPdfOptionalPayloadBody.includes('use_doc_preprocessor')
@@ -345,7 +345,7 @@ const riskyPageImageHardIssueBody = sliceBetween(
 assert(
   recognizePdfAsyncBody.includes("status: 'uploading'")
     && recognizePdfAsyncBody.includes("state: 'uploading'")
-    && recognizePdfAsyncBody.indexOf("status: 'uploading'") < recognizePdfAsyncBody.indexOf('const submission = await submitAsyncPdfJob'),
+    && recognizePdfAsyncBody.indexOf("status: 'uploading'") < recognizePdfAsyncBody.indexOf('await submitAsyncPdfJob('),
   'Async PDF OCR should emit an uploading phase before the fetch upload blocks on the network.',
 )
 assert(

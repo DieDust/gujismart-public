@@ -116,7 +116,7 @@ export default function OnboardingWizard() {
         if (cancelled) return
         setSettings(nextSettings)
         setPaddleApiKey('')
-        setPaddleModel(nextSettings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : nextSettings.ocr_async_model || 'PaddleOCR-VL-1.6')
+        setPaddleModel(nextSettings.ocr_async_model || 'PaddleOCR-VL-1.6')
         const currentAiPreset = AI_PROVIDER_PRESETS.find((preset) => preset.name === nextSettings.llm_provider) || AI_PROVIDER_PRESETS[0]
         setAiProvider(nextSettings.llm_provider || currentAiPreset.name)
         setAiBaseUrl(nextSettings.llm_base_url || currentAiPreset.baseUrl)

@@ -209,6 +209,7 @@ const ASYNC_RESULT_PARSE_YIELD_LINE_INTERVAL = 100
 const ASYNC_RESULT_NORMALIZE_CHUNK_SIZE = 50
 const OCR_REPEATED_TEXT_SCAN_LIMIT = 60_000
 const OCR_REPEATED_TEXT_MAX_UNIT_LENGTH = 18
+const OCR_REPEATED_TEXT_MAX_LONG_UNIT_LENGTH = 256
 const OCR_REPEATED_TEXT_MIN_COMPACT_LENGTH = 1_200
 const QPDF_CHUNK_TIMEOUT_MS = 120 * 1000
 const QPDF_HEAVY_CHUNK_TIMEOUT_MS = 240 * 1000
@@ -494,7 +495,6 @@ async function waitForAsyncPdfSubmitPacing(signal?: AbortSignal): Promise<void> 
 function normalizeAsyncOcrModel(model: unknown): AsyncOcrModel {
   const value = String(model || '').trim()
   if (/^PaddleOCR-VL(?:-|$)/i.test(value) || /^PP-Structure/i.test(value)) return value
-  if (value === 'PaddleOCR-VL') return DEFAULT_ASYNC_OCR_MODEL
   return DEFAULT_ASYNC_OCR_MODEL
 }
 
@@ -3001,6 +3001,9 @@ function getOcrRepeatedTextCandidates(value: unknown): OcrRepeatedTextCandidate[
 
 function isSuspiciousRepeatedTextIssue(issue: OcrRepeatedTextIssue): boolean {
   if (issue.compactLength < OCR_REPEATED_TEXT_MIN_COMPACT_LENGTH) return false
+  if (issue.unit.length > OCR_REPEATED_TEXT_MAX_UNIT_LENGTH) {
+    return issue.repeatChars >= 3_600 && issue.repeatCount >= 20 && issue.ratio >= 0.65
+  }
   if (issue.repeatChars >= 1_800 && issue.repeatCount >= 120 && issue.ratio >= 0.35) return true
   if (issue.unit.length <= 2 && issue.repeatChars >= 1_200 && issue.repeatCount >= 500 && issue.ratio >= 0.35) return true
   return issue.repeatChars >= 3_600 && issue.repeatCount >= 80 && issue.ratio >= 0.25
@@ -3014,7 +3017,8 @@ function findRepeatedTextIssueInCandidate(candidate: OcrRepeatedTextCandidate): 
   let bestChars = 0
   let bestStart = 0
 
-  for (let unitLength = 1; unitLength <= OCR_REPEATED_TEXT_MAX_UNIT_LENGTH; unitLength += 1) {
+  const maxUnitLength = compact.length >= 3_600 ? OCR_REPEATED_TEXT_MAX_LONG_UNIT_LENGTH : OCR_REPEATED_TEXT_MAX_UNIT_LENGTH
+  for (let unitLength = 1; unitLength <= maxUnitLength; unitLength += 1) {
     let index = 0
     while (index + unitLength * 3 <= compact.length) {
       const unit = compact.slice(index, index + unitLength)
@@ -3029,7 +3033,9 @@ function findRepeatedTextIssueInCandidate(candidate: OcrRepeatedTextCandidate): 
         cursor += unitLength
       }
       const repeatChars = repeatCount * unitLength
-      if (repeatCount >= 3 && repeatChars > bestChars) {
+      const eligibleLongCycle = unitLength <= OCR_REPEATED_TEXT_MAX_UNIT_LENGTH
+        || (repeatChars >= 3_600 && repeatCount >= 20 && repeatChars / compact.length >= 0.65)
+      if (repeatCount >= 3 && repeatChars > bestChars && eligibleLongCycle) {
         bestUnit = unit
         bestCount = repeatCount
         bestChars = repeatChars
@@ -4253,7 +4259,7 @@ interface AsyncPdfJobSubmission {
   lease: PaddleOcrTokenLease
 }
 
-function getAsyncPdfOptionalPayload(_options?: PageOcrOptions, model?: AsyncOcrModel): JsonRecord | undefined {
+function getAsyncPdfOptionalPayload(options?: PageOcrOptions, model?: AsyncOcrModel): JsonRecord | undefined {
   if (model && !/^PaddleOCR-VL(?:-|$)/i.test(model) && !/^PP-Structure/i.test(model)) {
     return undefined
   }
@@ -4266,7 +4272,8 @@ function getAsyncPdfOptionalPayload(_options?: PageOcrOptions, model?: AsyncOcrM
     useDocUnwarping: false,
     useLayoutDetection: true,
     useChartRecognition: false,
-    layoutMergeBboxesMode: 'small',
+    // Inner-only filtering can discard enclosing vertical text columns.
+    layoutMergeBboxesMode: options?.profile === 'guji_print_vertical' && /^PaddleOCR-VL(?:-|$)/i.test(model || '') ? 'large' : 'small',
     markdownIgnoreLabels: ['number', 'footnote', 'header', 'header_image', 'footer', 'footer_image', 'aside_text'],
     returnLayoutPolygonPoints: true,
   }
@@ -5146,10 +5153,12 @@ async function waitForAsyncPdfResult(jobId: string, lease: PaddleOcrTokenLease, 
       statusPayload.extractProgress?.totalPages ?? '',
     ].join('|')
     const progressChanged = progressSignature !== lastProgressSignature
+    // Acknowledged queueing is not a lost job; resubmitting only adds paid work.
+    const isWaitingInProviderQueue = state === 'pending' || state === 'queued' || state === 'waiting'
     if (progressChanged) {
       lastProgressSignature = progressSignature
       lastProgressAt = Date.now()
-    } else if (Date.now() - lastProgressAt > (completedPages > 0 ? ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS : ASYNC_JOB_STALLED_TIMEOUT_MS)) {
+    } else if (!isWaitingInProviderQueue && Date.now() - lastProgressAt > (completedPages > 0 ? ASYNC_JOB_STALLED_AFTER_PROGRESS_TIMEOUT_MS : ASYNC_JOB_STALLED_TIMEOUT_MS)) {
       throw new Error(`${ASYNC_JOB_STALLED_PREFIX} PaddleOCR 异步任务长时间没有进展，已停在 ${completedPages}/${totalPages || '?'} 页。软件会自动改用原 PDF 分段补跑未完成页。`)
     }
     if (allPagesCompleted && !jsonUrl) {
@@ -5535,13 +5544,15 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
         progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
       })
       let normalizedChunkResults: Array<OcrResultPayload | null> = []
+      // Keep the accepted job across status/result retries to avoid charging twice.
+      let pendingSubmission: AsyncPdfJobSubmission | null = null
       for (let resultAttempt = 1; resultAttempt <= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS; resultAttempt += 1) {
         try {
           normalizedChunkResults = await asyncPdfJobLimit(async () => {
           const excludedTokenIds = new Set<string>()
           let jsonUrl = ''
           while (!jsonUrl) {
-            const submission = await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
+            const submission: AsyncPdfJobSubmission = pendingSubmission || await submitAsyncPdfJob(chunk.filePath, model, signal, (queuePayload) => {
               onProgress?.({
                 status: 'queued',
                 state: 'queued',
@@ -5559,6 +5570,7 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
                 progress: getCompletedPagesAcrossChunks() / Math.max(1, totalPages),
               })
             }, { pageRanges: chunk.pageRanges, optionalPayload }, excludedTokenIds)
+            pendingSubmission = submission
             try {
               jsonUrl = await waitForAsyncPdfResult(submission.jobId, submission.lease, (payload) => {
                 const chunkCompleted = getChunkCompletedPages(chunk, payload)
@@ -5584,6 +5596,7 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
               if (!isPaddleOcrTokenFailure(error)) throw error
               markPaddleOcrTokenFailure(submission.lease, error)
               excludedTokenIds.add(submission.lease.id)
+              pendingSubmission = null
               completedByChunk[chunkIndex] = 0
               onProgress?.({
                 status: 'queued',
@@ -5604,7 +5617,10 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
             return normalizeAsyncPdfChunkResults(pagePayloads, chunk, signal)
           }, signal)
         } catch (error) {
-          const shouldSwitchWholePdfToChunks = chunk.fallbackWholePdf && !plan.requireFullFileUpload
+          const shouldSwitchWholePdfToChunks = !pendingSubmission && chunk.fallbackWholePdf && !plan.requireFullFileUpload
+          if (pendingSubmission && isRecoverableAsyncChunkJobError(error) && resultAttempt >= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS) {
+            throw Object.assign(new Error('服务端任务结果持续未就绪，已停止自动重提以避免重复计费；已保存的页面不受影响。请先确认服务端任务状态，再决定是否重新识别。'), { cause: error })
+          }
           if (
             !isRecoverableAsyncChunkJobError(error)
             || shouldSwitchWholePdfToChunks
@@ -5613,11 +5629,13 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
             throw error
           }
           const switchedToReliabilityMode = activateAsyncPdfReliabilityMode()
-          completedByChunk[chunkIndex] = 0
+          if (!pendingSubmission) completedByChunk[chunkIndex] = 0
           onProgress?.({
-            status: 'queued',
-            state: 'queued',
-            errorMessage: switchedToReliabilityMode
+            status: pendingSubmission ? 'running' : 'queued',
+            state: pendingSubmission ? 'running' : 'queued',
+            errorMessage: pendingSubmission
+              ? `服务端尚未返回完整结果，正在继续查询第 ${chunkStartPage}-${chunkEndPage} 页的原任务，不重复上传（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`
+              : switchedToReliabilityMode
               ? `当前分片与服务端暂时失联，已切换稳健模式并自动重新提交第 ${chunkStartPage}-${chunkEndPage} 页（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`
               : `当前分片与服务端暂时失联，正在自动重新提交第 ${chunkStartPage}-${chunkEndPage} 页（${resultAttempt + 1}/${MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS}）`,
             chunkIndex: chunkIndex + 1,
@@ -5640,6 +5658,7 @@ export async function recognizePdfAsync(filePath: string, onProgress?: (payload:
         const missingSummary = missingPageNums.length > 0
           ? missingPageNums.slice(0, 8).join('、') + (missingPageNums.length > 8 ? '…' : '')
           : `${chunkStartPage}-${chunkEndPage}`
+        pendingSubmission = null
         const switchedToReliabilityMode = activateAsyncPdfReliabilityMode()
         if (resultAttempt >= MAX_ASYNC_PDF_CHUNK_RESULT_ATTEMPTS) {
           throw new Error(`${ASYNC_PDF_INCOMPLETE_CHUNK_PREFIX} 第 ${missingSummary} 页未返回完整 OCR 结果，已停止重复提交并转入失败页补跑。`)

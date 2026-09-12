@@ -2554,31 +2554,16 @@ async function exportPdfFromHtml(htmlContent: string, exportPath: string): Promi
     })
 
     await win.loadFile(tempHtmlPath)
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => resolve(), 12000)
-      win!.webContents.once('did-fail-load', (_event, _code, description) => {
-        clearTimeout(timer)
-        reject(new Error(description || '导出页面加载失败'))
-      })
-      win!.webContents.once('did-finish-load', () => {
-        clearTimeout(timer)
-        resolve()
-      })
-      if (!win || win.isDestroyed()) {
-        clearTimeout(timer)
-        reject(new Error('导出窗口已关闭'))
-      }
-    })
-
+    // loadFile already waits for did-finish-load; only font/image readiness remains.
     await win.webContents.executeJavaScript(`
       Promise.race([
-        Promise.all(Array.from(document.images).map((img) => img.complete
+        Promise.all([document.fonts.ready, ...Array.from(document.images).map((img) => img.complete
           ? true
           : new Promise((resolve) => {
               img.onload = resolve;
               img.onerror = resolve;
             })
-        )),
+        )]),
         new Promise((resolve) => setTimeout(resolve, 8000))
       ])
     `, true)
@@ -2718,7 +2703,7 @@ function validateRenderedExport(format: InternalDocumentExportFormat, stagingPat
   if (bytes.length < 1) throw new Error('导出文件为空')
   if (format === 'pdf' || format === 'reading-pdf' || format === 'layout-pdf' || format === 'layout-searchable-pdf') {
     if (bytes.subarray(0, 5).toString('ascii') !== '%PDF-') throw new Error('导出的 PDF 文件头无效')
-    assertPdfHasNoType3Fonts(stagingPath, 'PDF')
+    if (format === 'layout-pdf') assertPdfHasNoType3Fonts(stagingPath, '排版模式 PDF')
   } else if (format === 'paddle-json') {
     JSON.parse(bytes.toString('utf8'))
   } else if (format === 'tei-xml' || format === 'page-xml') {

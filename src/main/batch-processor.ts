@@ -4,6 +4,8 @@ import { autoExtractAndApply } from './ai'
 import { queryAll, queryOne, run, saveDatabase, scheduleDatabaseSave, transaction } from './database'
 import {
   OcrAbortError,
+  findSuspiciousRepeatedOcrText,
+  formatSuspiciousRepeatedOcrTextIssue,
   getOcrDocumentConcurrency,
   getPageImageSize,
   isOcrAbortError,
@@ -328,13 +330,18 @@ class BatchProcessor {
       const preparedWrites: Array<{
         pageResult: OcrPageResult
         docId: string
-        preparedResult: Awaited<ReturnType<typeof preparePagePayloadUpdateAsync>>
-        preparedText: Awaited<ReturnType<typeof preparePagePayloadUpdateAsync>>
+        preparedResult: Awaited<ReturnType<typeof preparePagePayloadUpdateAsync>> | null
+        preparedText: Awaited<ReturnType<typeof preparePagePayloadUpdateAsync>> | null
       }> = []
       // Compress before acquiring the write transaction; keep preparation concurrency bounded.
       for (const pageResult of chunk) {
         const page = sourcePages.get(pageResult.pageId)
         if (!page) continue
+        // Failed retries must not replace either inline text or external payload files.
+        if (pageResult.status === 'error') {
+          preparedWrites.push({ pageResult, docId: page.doc_id, preparedResult: null, preparedText: null })
+          continue
+        }
         const preparedResult = await preparePagePayloadUpdateAsync(page.doc_id, pageResult.pageId, 'ocr_result', pageResult.result ? JSON.stringify(pageResult.result) : null)
         const preparedText = await preparePagePayloadUpdateAsync(page.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
         preparedWrites.push({ pageResult, docId: page.doc_id, preparedResult, preparedText })
@@ -352,6 +359,11 @@ class BatchProcessor {
           }
           const page = pageById.get(pageResult.pageId)
           if (!page || page.doc_id !== docId) return
+          if (pageResult.status === 'error') {
+            run('UPDATE pages SET ocr_status = ? WHERE id = ?', ['error', pageResult.pageId])
+            return
+          }
+          if (!preparedResult || !preparedText) throw new Error('Missing prepared OCR payload')
 
           run(
             `UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, ocr_status = ?,
@@ -398,6 +410,16 @@ class BatchProcessor {
       const chunkResults = await Promise.all(chunk.map(async (item) => {
         if (signal?.aborted) throw new OcrAbortError()
         const rawResult = results[item.resultIndex] || null
+        const repeatedTextIssue = findSuspiciousRepeatedOcrText(rawResult)
+        if (repeatedTextIssue) {
+          return {
+            pageId: item.page.id,
+            result: null,
+            text: '',
+            status: 'error' as const,
+            error: formatSuspiciousRepeatedOcrTextIssue(repeatedTextIssue),
+          }
+        }
         const result = rawResult
           ? await postProcessRecognizedPageResult(rawResult, item.page.image_path, postProcessOptions, {
             signal,

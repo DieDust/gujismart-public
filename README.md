@@ -4,6 +4,14 @@
 
 最新安装包见 [GitHub Releases](https://github.com/DieDust/gujismart-public/releases/latest)。该链接始终指向当前最新版；完整图文教程见 [docs/文献管理-图文使用教程.md](docs/文献管理-图文使用教程.md)。
 
+## 交流与反馈
+
+QQ 交流群：**1124897826**（文献管理软件交流群）。欢迎交流使用经验、反馈问题和提出建议。
+
+可以在 QQ 中搜索群号，也可以扫描下方二维码加入。反馈问题时请附上软件版本、复现步骤和已隐去隐私信息的截图；不要公开 API Key 或私人文献。
+
+<a href="docs/images/qq-community.jpg"><img src="docs/images/qq-community.jpg" alt="文献管理软件 QQ 交流群二维码，群号 1124897826" width="360" /></a>
+
 ## 界面预览
 
 以下截图使用空库或合成示例数据，不包含真实用户文献。界面若有迭代，以软件内实际界面为准；维护者可用隔离数据目录重拍 `docs/images/tutorial-*.png`。

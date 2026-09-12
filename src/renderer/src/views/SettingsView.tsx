@@ -737,7 +737,7 @@ const SettingsView = forwardRef<SettingsViewHandle, SettingsViewProps>(function 
         }
         form.setFieldsValue({
           paddleocr_api_key: '',
-          ocr_async_model: settings.ocr_async_model === 'PaddleOCR-VL' ? 'PaddleOCR-VL-1.6' : settings.ocr_async_model || 'PaddleOCR-VL-1.6',
+          ocr_async_model: settings.ocr_async_model || 'PaddleOCR-VL-1.6',
           ocr_async_pdf_chunk_concurrency: settings.ocr_async_pdf_chunk_concurrency || '2',
           ocr_heavy_pdf_document_concurrency: settings.ocr_heavy_pdf_document_concurrency || '2',
           ocr_upload_timeout_seconds: settings.ocr_upload_timeout_seconds || '3600',
