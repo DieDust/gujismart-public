@@ -263,7 +263,7 @@ assertIncludes(pagePayloadFiles, 'pagePayloadRefExists', 'external page payload 
 assertIncludes(pagePayloadFiles, 'setPayloadDataDir', 'external page payload storage should follow the active database data directory')
 assertIncludes(database, 'setPayloadDataDir(cachedDataDir)', 'database data directory resolution should update external payload storage')
 assertIncludes(database, 'return getPortableDataRoot() || getInstallDataRoot()', 'packaged builds should keep the data directory beside the current software directory')
-assertIncludes(database, 'softwareDir = dirname(app.getPath(\'exe\'))', 'packaged builds should explain failures against the current software directory')
+assertIncludes(database, 'describeDirectoryAccessFailure(preferredDir, error)', 'directory failures should identify the actual preferred data directory and original error')
 assertNotIncludes(database, 'function getPackagedUserDataRoot', 'packaged builds should not default the library data directory to AppData')
 assertNotIncludes(database, "join(app.getPath('documents'), 'GujiSmart', 'data')", 'packaged builds should not silently move the library data directory to Documents')
 assertIncludes(database, 'function getInstallDataRoot()', 'legacy install-directory data should still be detected for migration')

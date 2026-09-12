@@ -1,0 +1,28 @@
+.knowledge-question-host { height: 100%; min-height: 0; }
+.knowledge-question.gs-view-container { height: 100%; min-height: 0; overflow: auto; padding: 20px 24px; letter-spacing: 0; }
+.knowledge-question-header, .knowledge-question-scope, .knowledge-question-submit { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.knowledge-question-header, .knowledge-question-submit { justify-content: space-between; }
+.knowledge-question-header h4.ant-typography { margin: 0; font-size: 20px; }
+.knowledge-question-compose { padding: 22px 0 18px; border-bottom: 1px solid var(--gs-glass-border); }
+.knowledge-question-scope { margin-bottom: 12px; }
+.knowledge-question-submit { margin-top: 12px; }
+.knowledge-question-progress { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: wrap; }
+.knowledge-question-results { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 280px; }
+.knowledge-question-results:has(.knowledge-question-sources) { grid-template-columns: minmax(0, 1fr) minmax(280px, 32%); }
+.knowledge-question-answer { padding: 20px 24px 60px 0; min-width: 0; overflow-wrap: anywhere; }
+.knowledge-question-answer .ant-empty { margin-top: 70px; }
+.knowledge-question-result-heading { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+.knowledge-question-result-heading h5 { margin: 0; font-size: 16px; }
+.knowledge-question-result-heading .ant-select { width: 190px; }
+.knowledge-question-answer table { display: block; max-width: 100%; overflow-x: auto; }
+.knowledge-question-sources { border-left: 1px solid var(--gs-glass-border); padding: 20px 0 90px 20px; min-width: 0; overflow-wrap: anywhere; }
+.knowledge-question-sources .ant-list-item > div { width: 100%; min-width: 0; }
+.knowledge-question-sources .ant-typography { white-space: pre-wrap; }
+.knowledge-question .ant-alert { margin-top: 10px; }
+.knowledge-question-history-item.ant-btn { white-space: normal; height: auto; text-align: left; display: flex; flex-direction: column; align-items: flex-start; overflow-wrap: anywhere; max-width: 100%; }
+@media (max-width: 1100px) {
+  .knowledge-question.gs-view-container { padding: 16px; }
+  .knowledge-question-results:has(.knowledge-question-sources) { grid-template-columns: minmax(0, 1fr); }
+  .knowledge-question-answer { padding-right: 0; padding-bottom: 20px; }
+  .knowledge-question-sources { padding-left: 0; border-left: 0; border-top: 1px solid var(--gs-glass-border); }
+}

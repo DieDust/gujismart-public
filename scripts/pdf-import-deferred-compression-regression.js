@@ -24,6 +24,14 @@ assert(importHandlerStart >= 0, 'documents:import handler not found')
 const importHandlerEnd = documentsSource.indexOf("ipcMain.handle('documents:list'", importHandlerStart)
 assert(importHandlerEnd > importHandlerStart, 'documents:import handler end marker not found')
 const importHandler = documentsSource.slice(importHandlerStart, importHandlerEnd)
+const ebookStart = importHandler.indexOf('if (TEXT_IMPORT_EXTENSIONS.has(ext) || EPUB_IMPORT_EXTENSIONS.has(ext))')
+const ebookEnd = importHandler.indexOf('const ebookFingerprint', ebookStart)
+const ebookBranch = importHandler.slice(ebookStart, ebookEnd)
+assert(ebookStart >= 0 && ebookEnd > ebookStart, 'text/EPUB import branch exists')
+assert(ebookBranch.includes('await copyFileWithFingerprintAsync(filePath, destPath, undefined')
+  && !importHandler.includes('getFileFingerprint(destPath)')
+  && importHandler.includes('const ebookFingerprint = copiedEbook.storedFingerprint'), 'ebooks copy and hash in one nonblocking pass')
+assert(ebookBranch.includes('await parseEpubFile(destPath)') && ebookBranch.includes('await readPlainTextFile(destPath)'), 'parse the imported snapshot, not a mutable external source')
 
 assert(
   !importHandler.includes('storePdfWithCompression('),

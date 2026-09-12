@@ -20,9 +20,9 @@ function assertNotIncludes(source, needle, label) {
   if (source.includes(needle)) fail(`${label}: should not include ${needle}`)
 }
 
-assertIncludes(evidenceQa, 'const { plan, warnings: planWarnings } = await buildEvidencePlan(trimmed)', 'evidence QA should plan keywords before reading evidence')
-assertIncludes(evidenceQa, 'const firstSearch = searchEvidence(trimmed, plan, docIds, options)', 'evidence QA should start with keyword search')
-assertIncludes(evidenceQa, 'const pages = getPageWindow(docId, pageNum, radius)', 'evidence QA should read page windows around keyword hits')
+assertIncludes(evidenceQa, 'const { plan, warnings: planWarnings } = await buildEvidencePlan(trimmed, docIds)', 'evidence QA should plan keywords using the selected scope before reading evidence')
+assertIncludes(evidenceQa, 'addSemanticEvidence(trimmed, docIds, searchEvidence(trimmed, plan, docIds, options))', 'hybrid QA preserves keyword retrieval before adding scoped semantic candidates')
+assertIncludes(evidenceQa, 'const pages = getPageWindow(docId, pageNum, radius, anchors)', 'evidence QA should read page windows around keyword hits')
 assertIncludes(evidenceQa, 'getCachedDocumentBrief(docId)', 'query refinement may use cached metadata only')
 assertIncludes(evidenceQa, 'autoReindex: false', 'AI evidence search should not trigger background reindex')
 assertIncludes(evidenceQa, 'diversifyByDocument', 'evidence QA should diversify search hits across documents')
@@ -45,7 +45,7 @@ assertNotIncludes(evidenceQa, 'isOverviewQuestion(', 'evidence QA must not branc
 assertIncludes(aiPanel, '不会通篇阅读', 'library quick prompt should forbid full reading')
 assertIncludes(aiPanel, '关键词命中的原文页及前后文本', 'library quick prompt should describe keyword-hit page windows')
 
-if (packageJson.scripts['check:ai-evidence-keyword-first'] !== 'node scripts/ai-evidence-keyword-first-regression.js') {
+if (packageJson.scripts['check:ai-evidence-keyword-first'] !== 'node scripts/ai-evidence-keyword-first-regression.js && node scripts/evidence-selection-regression.js && npm run test:evidence-qa') {
   fail('package.json is missing check:ai-evidence-keyword-first')
 }
 if (!String(packageJson.scripts.check || '').includes('check:ai-evidence-keyword-first')) {

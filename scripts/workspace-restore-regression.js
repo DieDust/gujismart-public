@@ -141,6 +141,17 @@ async function main() {
   assert.strictEqual(loadAppWorkspace(storage).activeTabId, 'home')
 
   console.log('Workspace restore regression passed.')
+  const legacyResearch = new MemoryStorage()
+  saveAppWorkspace(legacyResearch, { activeTabId: 'old-research', siderCollapsed: false, tabGroups: [], tabs: [
+    { id: 'home', kind: 'home', title: '首页' },
+    { id: 'old-research', kind: 'view', view: 'research', title: '研究', singleton: false },
+    { id: 'custom-research', kind: 'view', view: 'research', title: '我的专题', singleton: false },
+  ] })
+  const migrated = loadAppWorkspace(legacyResearch)
+  assert.strictEqual(migrated.activeTabId, 'old-research')
+  assert.strictEqual(migrated.tabs[1].view, 'research', 'keep legacy route to open integrated research mode')
+  assert.strictEqual(migrated.tabs[1].title, '知识图谱')
+  assert.strictEqual(migrated.tabs[2].title, '我的专题', 'preserve custom tab names')
 }
 
 main()

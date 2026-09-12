@@ -47,6 +47,7 @@ import type {
 } from '@shared/types'
 import { getErrorMessage } from '@shared/errors'
 import { legacySearchLocatorFromUnknown } from '@shared/stable-reader-locator'
+import { getResearchNotePageSource } from '@shared/research-note-pages'
 import {
   DEFAULT_HIGHLIGHT_COLOR,
   HIGHLIGHT_COLOR_OPTIONS,
@@ -58,6 +59,8 @@ import {
 import {
   buildResearchNoteFallbackCitation,
   buildResearchNoteMarkdown,
+  formatResearchNoteMarkdown,
+  resolveResearchNoteCitation,
   resolveResearchNoteCitationMap,
 } from '../utils/citations'
 
@@ -148,12 +151,6 @@ function parseJson(value?: string | null): JsonRecord | null {
 function getSourceString(source: JsonRecord | null | undefined, key: string): string | undefined {
   const value = source?.[key]
   return typeof value === 'string' ? value : undefined
-}
-
-function getSourceNumber(source: JsonRecord | null | undefined, key: string): number | undefined {
-  const value = source?.[key]
-  const numberValue = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
-  return Number.isFinite(numberValue) ? numberValue : undefined
 }
 
 function asSearchHitLocator(value: unknown): SearchHitLocator | undefined {
@@ -553,7 +550,7 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
   const openNoteSource = useCallback((note: ResearchNote) => {
     const legacySource = parseJson(note.source_id)
     const locator = asSearchHitLocator(parseJson(note.locator_json)) || asSearchHitLocator(legacySource?.['locator'])
-    const legacyPageNum = getSourceNumber(legacySource, 'pageNum')
+    const legacyPageNum = getResearchNotePageSource(note).sourcePageNum
     const sourceKeyword = getSourceString(legacySource, 'searchKeyword') || getSourceString(legacySource, 'matchedQuery')
     const highlightText = getNoteHighlightText(note, locator, legacySource)
     const keyword = highlightText || normalizeHighlightCandidate(sourceKeyword || locator?.queryTerm || note.excerpt, 120)
@@ -594,16 +591,17 @@ export default function ExcerptsView({ onOpenDocument }: ExcerptsViewProps) {
   }, [])
 
   const copyNoteCitation = useCallback(async (note: ResearchNote) => {
-    await navigator.clipboard.writeText(getDisplayCitation(note))
+    await navigator.clipboard.writeText(await resolveResearchNoteCitation(note))
     message.success('已复制引用')
-  }, [getDisplayCitation])
+  }, [])
 
   const copyNotesMarkdown = useCallback(async (items: ResearchNote[], label: string) => {
     if (items.length === 0) return
-    const markdown = await Promise.all(items.map((note) => buildResearchNoteMarkdown(note, {
+    const citations = await resolveResearchNoteCitationMap(items)
+    const markdown = items.map((note) => formatResearchNoteMarkdown(note, citations[note.id], {
       kindLabel: getKindMeta(note.kind).label,
       sourceLabel: getNoteSourceLabel(note),
-    })))
+    }))
     await navigator.clipboard.writeText(markdown.join('\n\n---\n\n'))
     message.success(`已复制${label}：${items.length} 条`)
   }, [])

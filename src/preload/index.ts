@@ -1,5 +1,13 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
+  CorpusEntityPage,
+  CorpusEntityQuery,
+  CorpusEntityReview,
+  CorpusResearchCreatePayload,
+  CorpusResearchDocumentRow,
+  CorpusResearchFinding,
+  CorpusResearchPageOptions,
+  CorpusResearchStatus,
   AiChatSessionCreatePayload,
   AiChatSessionListPayload,
   AiChatSession,
@@ -263,6 +271,15 @@ async function saveCredential(key: RendererCredentialKey, value: string): Promis
 type IpcUnsubscribe = () => void
 
 const api = {
+  listCorpusEntities: (id: string, options?: CorpusEntityQuery): Promise<CorpusEntityPage> => ipcRenderer.invoke('corpusResearch:entities', id, options),
+  reviewCorpusEntities: (id: string, payload: CorpusEntityReview): Promise<void> => ipcRenderer.invoke('corpusResearch:reviewEntities', id, payload),
+  createCorpusResearch: (payload: CorpusResearchCreatePayload): Promise<CorpusResearchStatus> => ipcRenderer.invoke('corpusResearch:create', payload),
+  getCorpusResearch: (id: string): Promise<CorpusResearchStatus> => ipcRenderer.invoke('corpusResearch:get', id),
+  listCorpusResearch: (projectId?: string): Promise<CorpusResearchStatus[]> => ipcRenderer.invoke('corpusResearch:list', projectId),
+  startCorpusResearch: (id: string, options?: { retryFailed?: boolean; additionalRequests?: number }): Promise<CorpusResearchStatus> => ipcRenderer.invoke('corpusResearch:start', id, options),
+  pauseCorpusResearch: (id: string): Promise<CorpusResearchStatus> => ipcRenderer.invoke('corpusResearch:pause', id),
+  listCorpusResearchDocuments: (id: string, options?: CorpusResearchPageOptions): Promise<{ items: CorpusResearchDocumentRow[]; total: number }> => ipcRenderer.invoke('corpusResearch:documents', id, options),
+  listCorpusResearchFindings: (id: string, options?: CorpusResearchPageOptions): Promise<{ items: CorpusResearchFinding[]; total: number }> => ipcRenderer.invoke('corpusResearch:findings', id, options),
   readFileBuffer: (filePath: string): Promise<ArrayBuffer> =>
     ipcRenderer.invoke('fs:readFileBuffer', filePath),
   isReadableFile: (filePath: string): Promise<boolean> =>
@@ -595,8 +612,12 @@ const api = {
     ipcRenderer.invoke('aiResearch:getTask', taskId),
   listAiResearchTaskSteps: (taskId: string): Promise<AiResearchTaskStep[]> =>
     ipcRenderer.invoke('aiResearch:listTaskSteps', taskId),
+  getKnowledgeGraphData: (query: import('../shared/types').KnowledgeGraphDataQuery): Promise<import('../shared/types').KnowledgeGraphData> =>
+    ipcRenderer.invoke('knowledgeGraph:getData', query),
   listAiResearchDatasets: (projectId?: string | null): Promise<AiResearchDataset[]> =>
     ipcRenderer.invoke('aiResearch:listDatasets', projectId),
+  deleteAiResearchDataset: (datasetId: string): Promise<void> =>
+    ipcRenderer.invoke('aiResearch:deleteDataset', datasetId),
   listAiResearchRecords: (datasetId: string, options?: AiResearchRecordListOptions): Promise<AiResearchRecord[]> =>
     ipcRenderer.invoke('aiResearch:listRecords', datasetId, options),
   updateAiResearchRecord: (recordId: string, payload: AiResearchRecordUpdatePayload): Promise<AiResearchRecord> =>
@@ -760,6 +781,7 @@ const api = {
     docType?: string,
     options?: CitationGenerateOptions,
   ): Promise<string> =>
+    // Forward printed-page overrides and physical provenance through the same typed contract.
     ipcRenderer.invoke('citation:generateByStyle', docId, styleId, docType, options),
   generateBatchCitation: (docIds: string[], templateId: string): Promise<string[]> =>
     ipcRenderer.invoke('citation:generateBatch', docIds, templateId),

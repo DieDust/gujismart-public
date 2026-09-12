@@ -1,7 +1,8 @@
 import { createHash } from 'crypto'
 import { ipcMain } from 'electron'
 import { nanoid } from 'nanoid'
-import { callLLM } from '../ai'
+import { callLLM as requestLLM, LlmRequestError } from '../ai'
+import { researchModelLane, generateResearchReportBatches, RESEARCH_REQUEST_TIMEOUT_MS, retryResearchRequest } from '../research-report-execution'
 import { queryAll, queryOne, run, saveDatabase } from '../database'
 import { fullTextSearch } from '../semantic-search'
 import { getErrorMessage } from '../../shared/errors'
@@ -56,8 +57,12 @@ type JsonRecord = Record<string, unknown>
 const DEFAULT_FIELDS: AiResearchFieldSchema[] = [
   { key: 'time', label: '时间', type: 'date', description: '材料中出现的时间、年代或阶段' },
   { key: 'place', label: '地点', type: 'place', description: '材料涉及的地点、区域或空间范围' },
-  { key: 'subject', label: '对象', type: 'text', description: '人物、机构、事项或研究对象' },
-  { key: 'event', label: '事件/数据', type: 'text', description: '需要抽取的事实、数据、现象或论点' },
+  { key: 'person', label: '人物/主体', type: 'person', description: '原文明确提到的人物或关系主体' },
+  { key: 'event', label: '事件', type: 'event', description: '原文明确叙述的事件或行动，不把主题摘要当事件' },
+  { key: 'relation_object', label: '关系客体', type: 'text', description: '关系中被指向的人物、地点、机构或事物' },
+  { key: 'relation_type', label: '关系类型', type: 'text', description: '原文明确表达的关系，如任职、攻伐、往来、师承' },
+  { key: 'relation_status', label: '证据状态', type: 'category', description: '明确陈述、共现线索、待核验或存在歧义' },
+  { key: 'ambiguity', label: '歧义说明', type: 'text', description: '同名、代称、年代或出处方面的不确定性' },
   { key: 'theme', label: '主题分类', type: 'category', description: '归纳后的主题或类型' },
 ]
 const MAX_PLAN_FIELDS = 10
@@ -66,6 +71,15 @@ const MAX_RECORDS_PER_RUN = 80
 const FALLBACK_QUERY_LIMIT = 16
 const MAX_SEARCH_ROUNDS = 10
 const QUERIES_PER_ROUND = 8
+const researchRequestLane = researchModelLane
+const activeReports = new Set<string>()
+
+function callLLM(messages: Parameters<typeof requestLLM>[0], onRetry: () => void = () => {}): Promise<string> {
+  return researchRequestLane(() => retryResearchRequest(
+    () => requestLLM(messages, { timeoutMs: RESEARCH_REQUEST_TIMEOUT_MS }),
+    { retryable: (error) => error instanceof LlmRequestError && error.retryable, onRetry },
+  ))
+}
 
 interface CandidateHitCollection {
   hits: SearchResult[]
@@ -265,6 +279,16 @@ function createTask(payload: AiResearchCreateTaskPayload): AiResearchTask {
   )) {
     throw new Error('Research project does not belong to the active library project')
   }
+  const reusableDataset = payload.projectId && (kind === 'extraction' || kind === 'mixed')
+    ? queryOne<{ id: string }>(
+        `SELECT ds.id FROM ai_research_datasets ds
+         INNER JOIN ai_research_tasks owner ON owner.id = ds.task_id
+         WHERE ds.library_project_id = ? AND ds.project_id = ? AND ds.description = ?
+           AND ds.field_schema_json = ? AND owner.kind = ?
+         ORDER BY ds.updated_at DESC LIMIT 1`,
+        [libraryProjectId, payload.projectId, goal, JSON.stringify(fields), kind],
+      )
+    : null
   run(
     `INSERT INTO ai_research_tasks (
       id, library_project_id, project_id, title, goal, kind, scope_json, field_schema_json, suggested_queries_json, status, error_message, dataset_id, created_at, updated_at
@@ -283,6 +307,9 @@ function createTask(payload: AiResearchCreateTaskPayload): AiResearchTask {
       now,
     ],
   )
+  if (reusableDataset) {
+    run('UPDATE ai_research_tasks SET dataset_id = ? WHERE id = ?', [reusableDataset.id, id])
+  }
   saveDatabase()
   return getTask(id)
 }
@@ -572,7 +599,6 @@ function insertStatisticalRecords(
 
 async function extractValuesFromHit(task: AiResearchTask, hit: SearchResult): Promise<{ values: Record<string, string>; confidence: number; note: string }> {
   const fields = task.fieldSchema || DEFAULT_FIELDS
-  const fallbackValues = Object.fromEntries(fields.map((field) => [field.key, field.key === 'event' ? String(hit.snippet || '').replace(/<<|>>/g, '').trim().slice(0, 220) : '']))
   const prompt = [
     '你是 GujiSmart 的文献数据抽取助手。请只根据给定原文片段抽取结构化字段。',
     '只返回 JSON，不要 Markdown。',
@@ -586,13 +612,13 @@ async function extractValuesFromHit(task: AiResearchTask, hit: SearchResult): Pr
   ].join('\n')
   try {
     const parsed = parseJsonObject(await callLLM([{ role: 'user', content: prompt }]))
-    const rawValues = isRecord(parsed.values) ? parsed.values : {}
+    if (!isRecord(parsed.values)) throw new Error('模型返回缺少结构化字段 values')
+    const rawValues = parsed.values
     const values = Object.fromEntries(fields.map((field) => [field.key, String(rawValues[field.key] || '').trim()]))
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence || 0.65)))
     return { values, confidence, note: String(parsed.note || '').trim() }
   } catch (error) {
-    console.warn('[AI Research] Failed to extract values, using source-only record:', error)
-    return { values: fallbackValues, confidence: 0.45, note: 'AI 抽取失败，已保留候选原文，建议人工复核。' }
+    throw new Error(`第 ${hit.page_num || '?'} 页抽取失败：${getErrorMessage(error, '模型返回异常')}。先前成功的材料已保留，本条未作为事件入库。`)
   }
 }
 
@@ -603,6 +629,20 @@ async function runTask(taskId: string): Promise<AiResearchRunResult> {
   upsertStep(taskId, 'counting', '全库统计检索', 'running', '正在对当前范围做本地全文统计，不会把全部命中交给 AI', 0.12)
   saveDatabase()
   try {
+    if (task.dataset_id) {
+      const existing = queryOne<{ field_schema_json: string; task_id: string; kind: string }>(
+        `SELECT ds.field_schema_json, ds.task_id, owner.kind FROM ai_research_datasets ds
+         INNER JOIN ai_research_tasks owner ON owner.id = ds.task_id
+         WHERE ds.id = ? AND ds.library_project_id = ?`,
+        [task.dataset_id, task.library_project_id],
+      )
+      if (existing && (
+        JSON.stringify(normalizeFields(safeJsonParse(existing.field_schema_json, []))) !== JSON.stringify(task.fieldSchema)
+        || (existing.task_id !== task.id && (existing.kind !== task.kind || !['extraction', 'mixed'].includes(task.kind)))
+      )) {
+        throw new Error('任务类型或字段与已有数据集不一致，已停止写入。请按当前要求新建分析任务；原有记录已保留。')
+      }
+    }
     const retrieval = runResearchRetrievalForTask(task)
     const { stats, evidencePack } = retrieval
     const firstHighFrequency = stats.queryStats.find((stat) => stat.highFrequency)
@@ -737,16 +777,24 @@ function getDataset(datasetId: string): AiResearchDataset {
 
 function listDatasets(projectId?: string | null): AiResearchDataset[] {
   const libraryProjectId = getActiveLibraryProjectId()
-  const rows = projectId
-    ? queryAll<AiResearchDataset>(
-        'SELECT * FROM ai_research_datasets WHERE library_project_id = ? AND project_id = ? ORDER BY updated_at DESC',
-        [libraryProjectId, projectId],
-      )
-    : queryAll<AiResearchDataset>(
-        'SELECT * FROM ai_research_datasets WHERE library_project_id = ? ORDER BY updated_at DESC',
-        [libraryProjectId],
-      )
-  return rows.map((row) => getDataset(row.id))
+  return queryAll<AiResearchDataset>(
+    `SELECT ds.*, (SELECT COUNT(*) FROM ai_research_records r WHERE r.dataset_id = ds.id) AS record_count
+     FROM ai_research_datasets ds
+     WHERE ds.library_project_id = ? ${projectId ? 'AND ds.project_id = ?' : ''}
+     ORDER BY ds.updated_at DESC`,
+    projectId ? [libraryProjectId, projectId] : [libraryProjectId],
+  ).map(rowToDataset)
+}
+
+function deleteDataset(datasetId: string): void {
+  const libraryProjectId = getActiveLibraryProjectId()
+  const dataset = queryOne<{ id: string; name: string }>(
+    'SELECT id, name FROM ai_research_datasets WHERE id = ? AND library_project_id = ?',
+    [datasetId, libraryProjectId],
+  )
+  if (!dataset) throw new Error('未找到要删除的知识数据集')
+  run('DELETE FROM ai_research_datasets WHERE id = ? AND library_project_id = ?', [datasetId, libraryProjectId])
+  saveDatabase()
 }
 
 function normalizeRecordListOptions(options?: AiResearchRecordListOptions): { limit: number; offset: number } | null {
@@ -873,7 +921,7 @@ function buildReportContext(dataset: AiResearchDataset, records: AiResearchRecor
     scopeSummary.titles.length > 0 ? `- 纳入范围示例：${scopeSummary.titles.join('；')}${scopeSummary.count > scopeSummary.titles.length ? '；……' : ''}` : '',
     stats ? `- 本地检索统计：${stats.queryStats.length} 个查询，可读文本段 ${stats.readableSegmentCount} 段，累计命中 ${stats.totalHitCount} 次。` : '',
     stats ? '- 注意：各查询的“命中文献数/页数”是逐查询统计，可能重复计算同一文献；不要把它当成去重后的文献总数。' : '',
-    evidencePack ? `- 代表证据包：${evidencePack.totalEvidenceCount} 条代表证据，覆盖 ${evidenceDocCount} 篇文献；这是压缩后交给 AI 阅读的材料，不等于全部研究范围。` : '',
+    evidencePack ? `- 代表证据包：${evidencePack.totalEvidenceCount} 条代表证据，覆盖 ${evidenceDocCount} 篇文献；这是交给 AI 阅读的材料，不等于全部研究范围，也不能据此推断所有文献都有命中。` : '',
     `- 当前结构化数据集记录：${records.length} 条，来源覆盖 ${recordDocCount} 篇文献；这些记录是代表证据或统计记录，不代表本次只分析了这些文献。`,
     queryLines.length > 0 ? ['- 关键词统计概览：', ...queryLines].join('\n') : '',
     '',
@@ -935,21 +983,54 @@ function buildAiResearchOutputSnapshotJson(
 
 async function generateReport(payload: AiResearchReportPayload): Promise<{ content: string; outputId: string | null }> {
   const dataset = getDataset(payload.datasetId)
+  const key = `${dataset.library_project_id}:${dataset.id}`
+  if (activeReports.has(key)) throw new Error('该数据集正在生成报告，请等待当前任务结束，不要重复提交。')
+  activeReports.add(key)
+  try {
+    upsertStep(dataset.task_id, 'report', '生成研究报告', 'running', '抽取结果已保留，正在生成报告', 0)
+    saveDatabase()
+    const result = await generateReportContent(payload)
+    upsertStep(dataset.task_id, 'report', '生成研究报告', 'completed', result.outputId ? '报告已生成并保存' : '报告已生成，返回当前会话', 1)
+    saveDatabase()
+    return result
+  } catch (error) {
+    upsertStep(dataset.task_id, 'report', '生成研究报告', 'error', getErrorMessage(error, '生成报告失败'), 0)
+    saveDatabase()
+    throw error
+  } finally {
+    activeReports.delete(key)
+  }
+}
+
+async function generateReportContent(payload: AiResearchReportPayload): Promise<{ content: string; outputId: string | null }> {
+  const dataset = getDataset(payload.datasetId)
   const records = listRecords(payload.datasetId).filter((record) => record.status !== 'excluded')
   if (records.length === 0) throw new Error('数据集中没有可用于生成报告的记录')
-  const table = recordsToMarkdown(dataset, records)
   const reportContext = buildReportContext(dataset, records)
   const prompt = [
     '你是 GujiSmart 的研究写作助手。请只根据下方结构化数据集生成中文研究报告。',
-    '必须包含：总体判断、时空归类、特点规律、证据表格解读、待核查问题。',
+    '默认按总体判断、时空归类、特点规律、证据表格解读、待核查问题组织。用户指定短摘要或篇幅时，优先遵守其要求并合并结构，不要额外附加长报告。',
     '引用材料时使用数据表中的来源和页码，不要编造外部材料。',
-    '本地统计结果中的数量优先于 AI 自行判断；如果代表证据数量少于研究范围，必须说明这是证据压缩结果。',
+    '本地统计结果中的数量优先于 AI 自行判断。研究范围的文献数、命中次数与记录条数是不同单位，不可直接比较。证据较少可能源于未命中、筛选、压缩或排除；不能仅凭研究范围较大就断言发生了证据压缩。原因不明时明确说明无法确定。',
     payload.customPrompt ? `用户额外要求：${payload.customPrompt}` : '',
     `报告类型：${payload.templateType || 'theme_analysis'}`,
     reportContext,
-    table.slice(0, 18000),
   ].filter(Boolean).join('\n\n')
-  const content = await callLLM([{ role: 'user', content: prompt }])
+  const progress = (message: string, fraction: number) => {
+    upsertStep(dataset.task_id, 'report', '生成研究报告', 'running', message, fraction)
+    saveDatabase()
+  }
+  const content = await generateResearchReportBatches({
+    context: prompt,
+    sources: records.map((record) => ({ id: record.id, text: JSON.stringify({
+      sourceId: record.id, document: record.doc_title || record.doc_id, page: record.page_num,
+      fields: record.values, evidence: record.excerpt, status: record.status, note: record.note,
+    }) })),
+    progress,
+    generate: (content, label) => callLLM([{ role: 'user', content }], () => {
+      progress(`${label}请求超时或服务暂不可用，5 秒后重试一次；原有材料保留。重试可能产生额外模型费用。`, 0)
+    }),
+  })
   let outputId: string | null = null
   if (dataset.project_id) {
     outputId = nanoid()
@@ -1050,6 +1131,9 @@ export function registerAiResearchIpc(): void {
   ))
   ipcMain.handle('aiResearch:listDatasets', async (_event, projectId?: string | null): Promise<AiResearchDataset[]> => (
     inCapturedLibraryProject(() => listDatasets(projectId))
+  ))
+  ipcMain.handle('aiResearch:deleteDataset', async (_event, datasetId: string): Promise<void> => (
+    inCapturedLibraryProject(() => deleteDataset(datasetId))
   ))
   ipcMain.handle('aiResearch:listRecords', async (_event, datasetId: string, options?: AiResearchRecordListOptions): Promise<AiResearchRecord[]> => (
     inCapturedLibraryProject(() => listRecords(datasetId, options))

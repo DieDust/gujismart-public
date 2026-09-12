@@ -718,7 +718,7 @@ export function useManualLayoutDraft({
 
   const dispatch = useCallback((action: ManualLayoutDraftAction) => {
     const current = stateRef.current
-    if (current.discardPending && isManualLayoutContentMutationAction(action)) return
+    if (current.discardPending && isManualLayoutContentMutationAction(action)) return current
     let stableAction = action
     if (action.type === 'create') {
       stableAction = {
@@ -751,6 +751,7 @@ export function useManualLayoutDraft({
       persistManualLayoutDraftSnapshot(storageRef.current, stateRef.current)
     }
     if (mountedRef.current) reducerDispatch(stableAction)
+    return stateRef.current
   }, [])
 
   useEffect(() => {
@@ -865,7 +866,7 @@ export function useManualLayoutDraft({
     dispatch({ type: 'create', block })
   }, [dispatch])
   const updateBlock = useCallback((blockId: string, changes: ManualLayoutDraftBlock) => {
-    dispatch({ type: 'update', blockId, changes })
+    return dispatch({ type: 'update', blockId, changes })
   }, [dispatch])
   const deleteBlock = useCallback((blockId: string) => {
     dispatch({ type: 'delete', blockId })

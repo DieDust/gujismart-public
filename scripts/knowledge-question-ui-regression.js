@@ -1,0 +1,329 @@
+// Isolated UI fixtures: no private documents, model credentials or paid requests.
+const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { _electron: electron } = require('playwright')
+
+async function run() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gujismart-question-ui-'))
+  const app = await electron.launch({ args: ['--disable-gpu', `--user-data-dir=${path.join(root, 'user')}`, '.'], cwd: path.join(__dirname, '..'),
+    env: { ...process.env, GUJISMART_SMOKE: '1', GUJISMART_DATA_DIR: path.join(root, 'data'), GUJISMART_PROFILE_DIR: path.join(root, 'profile') } })
+  try {
+    const page = await app.firstWindow()
+    const errors = []
+    page.on('pageerror', (error) => errors.push(error.message))
+    await page.locator('[data-project-gate-ready="true"]').waitFor()
+    await page.locator('[data-library-project-choice="true"]').first().click()
+    await page.locator('main').waitFor()
+    await page.waitForTimeout(800)
+    if (process.env.GUJISMART_TEST_BACKGROUND === '1') {
+      assert(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().every((window) => !window.isVisible())), 'background UI fixtures must not appear on the desktop')
+    }
+    for (let i = 0; i < 4; i++) {
+      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
+      if (!await close.count()) break
+      await close.click(); await page.waitForTimeout(200)
+    }
+    await app.evaluate(({ ipcMain }) => {
+      const state = globalThis.__questionFixture = { calls: [], notes: [], sessions: [], turns: {}, graphLoads: 0 }
+      const replace = (channel, handler) => { ipcMain.removeHandler(channel); ipcMain.handle(channel, handler) }
+      const docs = [{ id: 'example-book', title: '书院记事（虚构）', doc_type: '书籍', tag_ids: 'long-tag', folder_ids: '' }, { id: 'example-no-text', title: '未识别材料（虚构）', doc_type: '书籍', tag_ids: '', folder_ids: '' }]
+      replace('documents:list', (_event, options) => docs.slice(options.offset || 0, (options.offset || 0) + options.limit))
+      replace('folders:list', () => [])
+      replace('tags:list', () => [{ id: 'long-tag', name: '跨地区学术交往与文献传播研究专题的长标签名称（界面测试）' }, { id: 'short-tag', name: '短标签' }])
+      replace('ai:previewScope', (_event, scope) => {
+        const selected = docs.filter((doc) => scope.type === 'all' || scope.docIds?.includes(doc.id))
+        return { count: selected.length, ocrReadyCount: selected.filter((doc) => doc.id !== 'example-no-text').length, documents: selected }
+      })
+      replace('research:createNote', (_event, payload) => { state.notes.push(payload); return { id: `note-${state.notes.length}`, ...payload } })
+      replace('aiResearch:listDatasets', () => { state.graphLoads++; return [] })
+      replace('ai:chatSessions:create', (_event, payload) => {
+        const session = { id: `session-${state.sessions.length + 1}`, title: payload.title, mode: 'library', scope_json: JSON.stringify(payload.scope), updated_at: '2026-01-01', message_count: 0 }
+        state.sessions.push(session); state.turns[session.id] = []; return session
+      })
+      replace('ai:chatSessions:list', () => [...state.sessions].reverse())
+      replace('ai:chatSessions:getTurns', (_event, id) => state.turns[id] || [])
+      replace('ai:libraryAskStream', async (event, requestId, question, scope, options) => {
+        state.calls.push({ question, scope, options })
+        const emit = (type, payload) => event.sender.send('ai:streamEvent', { requestId, type, payload })
+        emit('phase', '正在查找原文（测试）')
+        await new Promise((resolve) => setTimeout(resolve, 1400))
+        if (question.includes('失败测试')) { emit('error', '模拟服务超时，已保存的回答保留'); throw new Error('模拟服务超时，已保存的回答保留') }
+        const sources = Array.from({ length: 8 }, (_, index) => ({ doc_id: 'example-book', doc_title: '书院记事（虚构）', page_num: index + 1,
+          snippet: `虚构原文${index + 1}：甲与乙共同讲学于书院。`, source_hash: `fixture-hash-${index}`, locator: { docId: docs[0].id, pageIndex: index, pageNum: index + 1, segmentId: `segment-${index}` } }))
+        const answer = '## 发现\n\n共同讲学是交往线索，不能单独证明师承。[1](#source-1)\n\n## 尚待核验\n\n不同文献对时间的记载存在差异。'
+        const warnings = ['两部材料纪年不一致，尚待核验。']
+        emit('sources', { sources, warnings }); emit('phase', '正在组织回答（测试）'); emit('delta', answer)
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        const session = state.sessions.find((item) => item.id === options.sessionId)
+        const turn = { id: `turn-${state.calls.length}`, session_id: session.id, prompt: question, result: answer, sources, warnings, created_at: new Date().toISOString(), metadata_json: JSON.stringify({ sources, warnings }) }
+        state.turns[session.id].push(turn); session.message_count++
+        // Exercise completion events arriving after the invoke reply.
+        setTimeout(() => emit('done', { answer, sources, warnings, session, turn }), 150)
+        return { requestId, sessionId: session.id }
+      })
+    })
+    await page.locator('.ant-menu-item').filter({ hasText: /^知识图谱$/ }).click()
+    const view = page.locator('.knowledge-question')
+    const browse = page.locator('.knowledge-workbench')
+    const modes = page.locator('.knowledge-workspace-header')
+    const context = page.locator('.knowledge-context-bar')
+    await view.getByRole('textbox', { name: '想研究的问题' }).waitFor()
+    assert.equal(await browse.isVisible(), false, 'question mode keeps browsing available through its mode selector')
+    const graphLoads = (await app.evaluate(() => globalThis.__questionFixture)).graphLoads
+    assert.equal(graphLoads, 0, 'default question page does not load graph datasets')
+    assert.equal(await page.locator('.ant-menu-item').filter({ hasText: /^研究$/ }).count(), 0, 'research is integrated, not a separate sidebar page')
+    assert(await view.getByRole('button', { name: /查找并回答/ }).isDisabled())
+    await context.getByRole('button', { name: /选择文献/ }).click()
+    const picker = page.getByRole('dialog', { name: '选择要分析的文献' })
+    const tagFilter = picker.getByRole('combobox', { name: '筛选文献标签' })
+    for (const width of [1440, 1024]) {
+      const metrics = await page.context().newCDPSession(page)
+      await metrics.send('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: false })
+      await tagFilter.fill('跨地区')
+      await tagFilter.press('ArrowDown')
+      const popup = page.locator('.knowledge-analysis-tag-popup:visible')
+      const option = popup.locator('.ant-select-item-option-content').first()
+      await option.waitFor()
+      const tagSize = await option.evaluate((element) => ({ scrollWidth: element.scrollWidth, width: element.clientWidth, scrollHeight: element.scrollHeight, height: element.clientHeight,
+        whiteSpace: getComputedStyle(element).whiteSpace, lineHeight: getComputedStyle(element).lineHeight, text: element.textContent }))
+      assert(tagSize.scrollWidth <= tagSize.width + 1 && tagSize.scrollHeight <= tagSize.height + 1, `long tag must wrap without clipping: ${JSON.stringify(tagSize)}`)
+      const box = await popup.boundingBox()
+      assert(box.width >= 320 && box.x >= 0 && box.x + box.width <= width + 1, 'tag popup stays readable and inside viewport')
+      await page.screenshot({ path: path.join(root, `tag-picker-${width}.png`) })
+      await tagFilter.press('Escape')
+      await metrics.send('Emulation.clearDeviceMetricsOverride')
+      await metrics.detach()
+    }
+    await tagFilter.fill('跨地区')
+    await tagFilter.press('ArrowDown')
+    await page.locator('.knowledge-analysis-tag-popup:visible .ant-select-item-option').first().click()
+    assert.equal(await picker.locator('[data-analysis-select-id]').count(), 1, 'tag filtering still selects the correct documents')
+    const selectedTag = tagFilter.locator('..').locator('..').locator('.ant-select-selection-item')
+    await selectedTag.hover()
+    await page.getByRole('tooltip').getByText('跨地区学术交往与文献传播研究专题的长标签名称（界面测试）', { exact: true }).waitFor()
+    await picker.locator('.ant-select').filter({ has: page.getByRole('combobox', { name: '筛选文献标签' }) }).locator('.ant-select-clear').click()
+    assert.equal(await picker.locator('[data-analysis-select-id]').count(), 2, 'clearing restores all documents')
+    await picker.getByRole('button', { name: /全选当前筛选/ }).click()
+    await picker.getByRole('button', { name: /使用所选文献/ }).click()
+    await context.getByText('2 篇选读 · 1 篇有可用文本', { exact: true }).waitFor()
+    assert.equal((await app.evaluate(() => globalThis.__questionFixture)).calls.length, 0, 'selection must not call a model')
+    await view.getByRole('textbox', { name: '想研究的问题' }).fill('书院讲学与跨地交游有什么关系？')
+    await view.getByRole('button', { name: /查找并回答/ }).evaluate((button) => { button.click(); button.click() })
+    await view.getByRole('status').filter({ hasText: '正在查找原文' }).waitFor()
+    assert(await context.getByRole('button', { name: /选择文献/ }).isDisabled())
+    assert(await context.getByRole('combobox', { name: '研究专题' }).isDisabled(), 'running answer locks shared topic')
+    await view.getByText('已保存', { exact: true }).waitFor()
+    assert.equal((await app.evaluate(() => globalThis.__questionFixture)).calls.length, 1, 'double submission must stay single-flight')
+    assert.equal((await app.evaluate(() => globalThis.__questionFixture)).graphLoads, graphLoads, 'asking does not repeatedly reload browsing datasets')
+    await view.getByText('两部材料纪年不一致，尚待核验。', { exact: true }).waitFor()
+    assert((await view.locator('.knowledge-question-answer').innerText()).includes('不能单独证明师承'))
+    const sources = view.locator('.knowledge-question-sources')
+    await sources.locator('.ant-pagination-next').click()
+    await sources.getByText('虚构原文7：甲与乙共同讲学于书院。', { exact: true }).waitFor()
+    await sources.getByRole('button', { name: /收藏证据/ }).first().click()
+    await sources.getByRole('button', { name: /已收藏/ }).waitFor()
+    const note = (await app.evaluate(() => globalThis.__questionFixture)).notes[0]
+    assert.equal(note.page_num, 7); assert.equal(note.locator.pageIndex, 6)
+    assert.equal(note.excerpt, '虚构原文7：甲与乙共同讲学于书院。')
+    assert(note.note.includes('待核验')); assert.equal(note.project_id, undefined, 'collection must not require a topic')
+    await view.getByRole('textbox', { name: '想研究的问题' }).fill('失败测试：还有哪些反证？')
+    await view.getByRole('button', { name: /继续追问/ }).click()
+    await view.getByRole('alert').filter({ hasText: '模拟服务超时' }).waitFor()
+    assert.equal(await view.getByRole('textbox', { name: '想研究的问题' }).inputValue(), '失败测试：还有哪些反证？')
+    const nativeMetrics = await page.context().newCDPSession(page)
+    await nativeMetrics.send('Emulation.clearDeviceMetricsOverride')
+    await nativeMetrics.detach()
+    await page.waitForTimeout(400)
+    await view.getByRole('button', { name: /研究历史/ }).click()
+    const history = page.getByRole('dialog', { name: '研究历史' })
+    await history.waitFor()
+    await page.screenshot({ path: path.join(root, 'history-native-window.png'), animations: 'disabled' })
+    const historyBounds = await history.boundingBox()
+    const nativeViewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }))
+    assert(historyBounds && Math.abs(historyBounds.x + historyBounds.width - nativeViewport.width) <= 2
+      && historyBounds.y >= 0 && historyBounds.y + historyBounds.height <= nativeViewport.height + 2,
+      `history drawer must align with the real window right edge without clipping: ${JSON.stringify({ historyBounds, nativeViewport })}`)
+    await page.waitForTimeout(200)
+    await page.screenshot({ path: path.join(root, 'history-native-window.png') })
+    await history.getByRole('button', { name: /书院讲学与跨地交游/ }).click()
+    await view.getByText('两部材料纪年不一致，尚待核验。', { exact: true }).waitFor()
+    await view.getByRole('textbox', { name: '想研究的问题' }).fill('待续的问题草稿')
+    await page.reload()
+    await page.locator('[data-library-project-choice="true"]').first().click()
+    await page.waitForTimeout(800)
+    for (let i = 0; i < 4; i++) {
+      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
+      if (!await close.count()) break
+      await close.click(); await page.waitForTimeout(200)
+    }
+    await page.locator('.ant-menu-item').filter({ hasText: /^知识图谱$/ }).click()
+    await view.getByRole('textbox', { name: '想研究的问题' }).waitFor()
+    await view.getByText('两部材料纪年不一致，尚待核验。', { exact: true }).waitFor()
+    assert.equal(await view.getByRole('textbox', { name: '想研究的问题' }).inputValue(), '待续的问题草稿')
+    assert.equal((await app.evaluate(() => globalThis.__questionFixture)).calls.length, 2, 'restoring results must not re-run analysis')
+    for (const [width, height] of [[1440, 1000], [1024, 900]]) {
+      const session = await page.context().newCDPSession(page)
+      await session.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
+      await page.waitForTimeout(300)
+      const before = await modes.boundingBox()
+      const switchBefore = await modes.locator('.ant-segmented').boundingBox()
+      await modes.getByText('资料浏览', { exact: true }).click()
+      await browse.getByText('材料核验', { exact: true }).waitFor()
+      await browse.locator('.ant-spin-spinning').waitFor({ state: 'hidden' })
+      for (const label of ['人物考察', '地点考察', '事件考察', '关系考证', '时间线索', '关系网络']) {
+        assert(await browse.getByText(label, { exact: true }).isVisible(), `keep ${label} accessible`)
+      }
+      const switchAfter = await modes.locator('.ant-segmented').boundingBox()
+      assert(Math.abs(switchBefore.x - switchAfter.x) < 1 && Math.abs(switchBefore.y - switchAfter.y) < 1, 'mode controls must not move when actions change')
+      assert(Math.abs(before.height - (await modes.boundingBox()).height) < 1, 'shared header keeps stable height')
+      const title = await modes.getByRole('heading', { name: /知识图谱/ }).boundingBox()
+      assert(switchAfter.x >= title.x + title.width && Math.abs(switchAfter.y + switchAfter.height / 2 - title.y - title.height / 2) < 2, 'switch stays immediately right of title')
+      await modes.getByText('向文献提问', { exact: true }).click()
+      assert(await view.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), 'no horizontal page overflow')
+      const bounds = await view.evaluate((element) => {
+        const a = element.querySelector('.knowledge-question-answer').getBoundingClientRect()
+        const b = element.querySelector('.knowledge-question-sources').getBoundingClientRect()
+        return !(a.right > b.left + 1 && a.bottom > b.top + 1)
+      })
+      assert(bounds, 'answer and citations must not overlap')
+      await page.screenshot({ path: path.join(root, `question-${width}.png`) })
+      await session.detach()
+    }
+    await modes.getByText('资料浏览', { exact: true }).click()
+    await page.locator('.knowledge-workbench').getByText('材料核验', { exact: true }).waitFor()
+    await modes.getByText('向文献提问', { exact: true }).click()
+    assert(await view.isVisible())
+    // Exercise the existing research persistence against the isolated test database.
+    const topics = await page.evaluate(async () => {
+      const a = await window.api.createResearchProject({ name: '专题甲（测试）', description: '问题甲' })
+      const b = await window.api.createResearchProject({ name: '专题乙（测试）', description: '问题乙' })
+      await window.api.createResearchOutlineItem({ project_id: a.id, title: '甲的既有大纲' })
+      await window.api.createResearchOutlineItem({ project_id: b.id, title: '乙的既有大纲' })
+      return [a, b]
+    })
+    await app.evaluate(({ ipcMain }, projects) => {
+      const datasets = projects.map((project, index) => ({ id: `topic-materials-${index}`, project_id: project.id,
+        name: `${project.name}资料`, field_schema_json: '[]', record_count: 0 }))
+      ipcMain.removeHandler('aiResearch:listDatasets')
+      ipcMain.handle('aiResearch:listDatasets', () => datasets)
+      ipcMain.removeHandler('knowledgeGraph:getData')
+      ipcMain.handle('knowledgeGraph:getData', (_event, query) => ({ libraryProjectId: 'fixture-library',
+        datasets: datasets.filter((dataset) => query.datasetIds.includes(dataset.id)), records: [], totalRecords: 0, truncated: false }))
+      ipcMain.removeHandler('research:listProjectDocuments')
+      ipcMain.handle('research:listProjectDocuments', () => [{ id: 'example-book', title: '书院记事（虚构）', doc_type: '书籍' }])
+      ipcMain.removeHandler('research:listNotes')
+      ipcMain.handle('research:listNotes', (_event, projectId) => globalThis.__questionFixture.notes.filter((note) => !projectId || note.project_id === projectId)
+        .map((note, index) => ({ id: `saved-note-${index}`, tags: '', source_available: true, doc_title: '书院记事（虚构）', created_at: '', updated_at: '', ...note })))
+    }, topics)
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('gujismart:research-workspace-updated')))
+    await context.getByRole('combobox', { name: '研究专题' }).locator('..').locator('..').click()
+    await page.locator('.ant-select-item-option:visible').filter({ hasText: '专题乙（测试）' }).click()
+    await context.getByText('1 篇选读 · 1 篇有可用文本', { exact: true }).waitFor()
+    assert.equal(await view.getByRole('textbox', { name: '想研究的问题' }).inputValue(), '', 'new topic does not inherit temporary question draft')
+    await view.getByRole('textbox', { name: '想研究的问题' }).fill('专题内的交游证据有哪些？')
+    await view.getByRole('button', { name: /查找并回答/ }).click()
+    await view.getByText('已保存', { exact: true }).waitFor()
+    await view.getByRole('button', { name: /保存回答/ }).click()
+    await view.getByRole('button', { name: /查看专题成果/ }).waitFor()
+    const savedOutputs = await page.evaluate((id) => window.api.listResearchOutputs(id), topics[1].id)
+    assert.equal(savedOutputs.length, 1)
+    assert(savedOutputs[0].content.includes('未经研究者核验') && savedOutputs[0].content.includes('虚构原文8'), 'saved answer keeps uncertainty and every returned source')
+    await sources.getByRole('button', { name: /存入专题/ }).first().click()
+    await sources.getByRole('button', { name: /查看专题证据/ }).waitFor()
+    assert.equal((await app.evaluate(() => globalThis.__questionFixture)).notes.at(-1).project_id, topics[1].id)
+    const fixedSwitch = await modes.locator('.ant-segmented').boundingBox()
+    await sources.getByRole('button', { name: /查看专题证据/ }).click()
+    const research = page.locator('.knowledge-research-host')
+    await research.getByText('虚构原文1：甲与乙共同讲学于书院。', { exact: false }).first().waitFor()
+    assert.equal(await research.locator('.research-overview-card').count(), 0, 'no duplicated overview or statistic cards')
+    assert.equal(await research.getByRole('tab', { name: '专题概览' }).count(), 0, 'evidence is directly accessible')
+    assert.equal(await research.getByRole('combobox', { name: '专题研究项目' }).count(), 0, 'one shared topic selector')
+    await page.evaluate(async (id) => {
+      await window.api.createResearchOutput({ project_id: id, output_type: 'custom', title: '长篇结果（全文测试）', content: '虚构材料说明。'.repeat(220) + '\n\n完整结果末尾标记' })
+      window.dispatchEvent(new CustomEvent('gujismart:research-workspace-updated', { detail: { projectId: id } }))
+    }, topics[1].id)
+    await research.getByRole('tab', { name: /研究结果/ }).click()
+    await research.getByPlaceholder('搜索结果标题').fill('长篇结果')
+    await research.getByRole('button', { name: '长篇结果（全文测试）', exact: true }).click()
+    const fullOutput = page.getByRole('dialog', { name: '长篇结果（全文测试）' })
+    await fullOutput.getByText('完整结果末尾标记', { exact: true }).waitFor()
+    await fullOutput.locator('.ant-modal-close').click()
+    await page.evaluate(async (id) => {
+      await window.api.createResearchOutput({ project_id: id, output_type: 'custom', title: '长篇结果（更新测试）', content: '另一次保存的虚构研究结果。' })
+      window.dispatchEvent(new CustomEvent('gujismart:research-workspace-updated', { detail: { projectId: id } }))
+    }, topics[1].id)
+    await research.getByRole('button', { name: '长篇结果（更新测试）', exact: true }).waitFor()
+    await research.getByRole('tab', { name: '大纲整理' }).click()
+    await research.getByText('乙的既有大纲', { exact: true }).first().waitFor()
+    await research.locator('.research-outline-evidence').getByText('虚构原文1：甲与乙共同讲学于书院。', { exact: true }).waitFor()
+    assert.equal(await research.locator('.research-focus-strip').count(), 0, 'outline shows usable evidence, not a second statistics dashboard')
+    const researchSwitch = await modes.locator('.ant-segmented').boundingBox()
+    assert.equal(researchSwitch.x, fixedSwitch.x); assert.equal(researchSwitch.y, fixedSwitch.y)
+    for (const label of [/证据摘录/, /研究结果/, /写作导出/]) assert(await research.getByRole('tab', { name: label }).isVisible())
+    await modes.getByText('资料浏览', { exact: true }).click()
+    await browse.locator('.ant-spin-spinning').waitFor({ state: 'hidden' })
+    assert((await context.getByRole('combobox', { name: '研究专题', exact: true }).locator('..').locator('..').innerText()).includes('专题乙（测试）'))
+    await browse.locator('.knowledge-source-select').getByText('专题乙（测试）资料 (0)', { exact: true }).waitFor()
+    assert.equal(await browse.locator('.knowledge-source-select').getByText('专题甲（测试）资料 (0)', { exact: true }).count(), 0, 'switching research topics must not retain another topic material selection')
+    await modes.getByText('专题研究', { exact: true }).click()
+    await research.getByText('乙的既有大纲', { exact: true }).first().waitFor()
+    await page.screenshot({ path: path.join(root, 'research-integrated.png') })
+    const desktop = await page.context().newCDPSession(page)
+    await desktop.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1000, deviceScaleFactor: 1, mobile: false })
+    await page.waitForTimeout(300)
+    assert(await research.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), 'integrated research stays within desktop width')
+    const outlinePanel = await research.locator('.research-outline-layout > .research-panel').first().boundingBox()
+    const evidencePanel = await research.locator('.research-outline-evidence').boundingBox()
+    assert(outlinePanel.x + outlinePanel.width <= evidencePanel.x + 1, 'outline and evidence are side by side without overlap on desktop')
+    await page.screenshot({ path: path.join(root, 'research-integrated-desktop.png') })
+    await desktop.detach()
+    await modes.getByText('向文献提问', { exact: true }).click()
+    assert.equal((await app.evaluate(() => globalThis.__questionFixture)).calls.length, 3, 'saving and navigating never generate additional model calls')
+    assert.equal((await page.evaluate((id) => window.api.listResearchOutline(id), topics[1].id))[0].title, '乙的既有大纲')
+    await modes.getByText('资料浏览', { exact: true }).click()
+    await context.getByRole('combobox', { name: '研究专题', exact: true }).locator('..').locator('..').click()
+    await page.locator('.ant-select-item-option:visible').filter({ hasText: '专题甲（测试）' }).click()
+    await browse.locator('.knowledge-source-select').getByText('专题甲（测试）资料 (0)', { exact: true }).waitFor()
+    await modes.getByText('专题研究', { exact: true }).click()
+    await research.getByText('甲的既有大纲', { exact: true }).first().waitFor()
+    await modes.getByText('向文献提问', { exact: true }).click()
+    const topicSelect = context.locator('.ant-select').filter({ has: page.getByRole('combobox', { name: '研究专题', exact: true }) })
+    await topicSelect.hover()
+    await topicSelect.locator('.ant-select-clear').click()
+    await view.getByText('两部材料纪年不一致，尚待核验。', { exact: true }).waitFor()
+    assert.equal(await view.getByRole('textbox', { name: '想研究的问题' }).inputValue(), '待续的问题草稿', 'temporary draft survives topic workflow')
+    // Simulate a pre-merge saved tab after the app's own beforeunload flush.
+    await page.evaluate(() => window.addEventListener('beforeunload', () => {
+      for (const key of Object.keys(localStorage).filter((key) => key.startsWith('gujismart.app-workspace.v2.project.'))) {
+        const saved = JSON.parse(localStorage.getItem(key))
+        const active = saved.tabs.find((tab) => tab.id === saved.activeTabId && tab.view === 'knowledge')
+        if (active) { active.view = 'research'; active.title = '研究'; localStorage.setItem(key, JSON.stringify(saved)) }
+      }
+    }))
+    await page.reload()
+    await page.locator('[data-library-project-choice="true"]').first().click()
+    await page.waitForTimeout(800)
+    for (let i = 0; i < 4; i++) {
+      const close = page.locator('.ant-modal-wrap:visible .ant-modal-close').first()
+      if (!await close.count()) break
+      await close.click(); await page.waitForTimeout(200)
+    }
+    await research.getByRole('tab', { name: /证据摘录/ }).waitFor()
+    assert(await modes.getByText('专题研究', { exact: true }).isVisible())
+    assert(await page.locator('.ant-menu-item-selected').filter({ hasText: /^知识图谱$/ }).isVisible(), 'legacy research route highlights unified sidebar entry')
+    assert.deepEqual(errors, [])
+    console.log(`Knowledge question UI regression passed. Screenshots: ${root}`)
+  } catch (error) {
+    const page = app.windows()[0]
+    if (page) {
+      await page.screenshot({ path: path.join(root, 'failure.png') })
+      console.error(await page.locator('.knowledge-workspace').evaluateAll((elements) => elements.map((element) => ({ mode: element.querySelector('.knowledge-workspace-header .ant-segmented-item-selected')?.textContent,
+        research: element.querySelector('.knowledge-research-host')?.getAttribute('hidden'), inputs: Array.from(element.querySelectorAll('input')).map((input) => ({ label: input.getAttribute('aria-label'), placeholder: input.placeholder })) }))))
+    }
+    console.error(`Failure screenshot: ${path.join(root, 'failure.png')}`)
+    throw error
+  } finally { await app.close() }
+}
+run().catch((error) => { console.error(error); process.exitCode = 1 })

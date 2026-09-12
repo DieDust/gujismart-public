@@ -2,6 +2,7 @@ import { ipcMain, dialog } from 'electron'
 import { existsSync, readFileSync } from 'fs'
 import { basename, extname } from 'path'
 import { queryAll, queryOne, run, saveDatabase } from '../database'
+import { resolveCitationPageOptions } from '../citation-page-source'
 import { nanoid } from 'nanoid'
 import { callLLM } from '../ai'
 import JSZip from 'jszip'
@@ -601,6 +602,7 @@ async function inferCitationTemplateFromSample(
 }
 
 export function buildCitationWithDiagnostics(docId: string, templateId: string, options?: CitationGenerateOptions): CitationWithDiagnostics {
+  options = resolveCitationPageOptions(docId, options)
   ensureCitationSchema()
   const doc = queryOne<CitationDocumentRow>('SELECT title, author, dynasty, source, metadata, doc_type FROM documents WHERE id = ?', [docId])
   if (!doc) return { citation: null, fieldReport: null }
@@ -621,6 +623,7 @@ export function buildCitationWithDiagnostics(docId: string, templateId: string, 
 }
 
 export function resolveCitationV2(docId: string, templateId: string, options?: CitationGenerateOptions): CitationResolutionV2 | null {
+  options = resolveCitationPageOptions(docId, options)
   ensureCitationSchema()
   const doc = queryOne<CitationDocumentRow>('SELECT title, author, dynasty, source, metadata, doc_type FROM documents WHERE id = ?', [docId])
   const template = queryOne<CitationTemplate>('SELECT * FROM citation_templates WHERE id = ?', [templateId])

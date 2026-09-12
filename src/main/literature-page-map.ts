@@ -279,7 +279,8 @@ export function applyManualLiteraturePageAnchor(
       return {
         physicalPageNum: phys,
         literaturePageNum: existingLit > 0 ? existingLit : phys,
-        source: (isManualSource(row.literature_page_source) ? 'manual' : 'fallback') as LiteraturePageSource,
+        source: (['manual', 'ocr', 'inferred', 'fallback'].includes(String(row.literature_page_source))
+          ? row.literature_page_source : 'fallback') as LiteraturePageSource,
       }
     }),
     physical,
@@ -294,14 +295,16 @@ export function applyManualLiteraturePageAnchor(
       const phys = Number(row.page_num || 0)
       const item = byPhysical.get(phys)
       if (!item) continue
-      run(
-        `UPDATE pages
-         SET literature_page_num = ?,
-             literature_page_source = ?
-         WHERE id = ?`,
-        [item.literaturePageNum, item.source, row.id],
-      )
-      updated += 1
+      if (phys >= physical) {
+        run(
+          `UPDATE pages
+           SET literature_page_num = ?,
+               literature_page_source = ?
+           WHERE id = ?`,
+          [item.literaturePageNum, item.source, row.id],
+        )
+        updated += 1
+      }
       pages.push({
         id: row.id,
         page_num: phys,

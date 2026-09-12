@@ -311,6 +311,30 @@ async function verifyPackagedDiagnosticsBackupAndDeletion(window, docIds) {
   console.log('Packaged library caches, diagnostics, backup, and batch-deletion worker passed.')
 }
 
+async function verifyPackagedCorpusResearch(window, docId) {
+  const result = await window.evaluate(async (id) => {
+    const task = await window.api.createCorpusResearch({ scope: { type: 'documents', docIds: [id] },
+      question: 'Which claims does this synthetic source support?', requestKey: crypto.randomUUID(), maxRequests: 1 })
+    const restored = await window.api.getCorpusResearch(task.id)
+    const recent = await window.api.listCorpusResearch()
+    const documents = await window.api.listCorpusResearchDocuments(task.id, { limit: 20 })
+    const findings = await window.api.listCorpusResearchFindings(task.id, { limit: 20 })
+    const entities = await window.api.listCorpusEntities(task.id, { limit: 20 })
+    let emptyUndoRejected = false
+    try {
+      await window.api.reviewCorpusEntities(task.id, { revision: entities.revision, action: 'undo', mentionIds: [], reason: 'Synthetic empty undo' })
+    } catch { emptyUndoRejected = true }
+    const paused = await window.api.pauseCorpusResearch(task.id)
+    return { task, restored, recent, documents, findings, entities, emptyUndoRejected, paused }
+  }, docId)
+  assertCondition(result.task.phase === 'ready' && !result.task.active && result.task.requests === 0, 'Packaged corpus preparation must not start model requests', result.task)
+  assertCondition(result.restored.id === result.task.id && result.recent.some((item) => item.id === result.task.id), 'Packaged corpus task recovery failed')
+  assertCondition(result.documents.total === 1 && result.documents.items[0].docId === docId && result.task.totalUnits > 0, 'Packaged corpus snapshot lost its selected document')
+  assertCondition(result.findings.total === 0 && result.entities.total === 0 && result.entities.history.length === 0 && result.emptyUndoRejected, 'Packaged findings/entity-review contract failed')
+  assertCondition(result.paused.status === 'paused' && result.paused.requests === 0, 'Packaged pause changed the no-request guarantee')
+  console.log('Packaged corpus snapshot, history, findings, entity review and pause passed without model calls.')
+}
+
 function verifyPackagedRuntime(executable) {
   const probe = path.join(root, 'scripts', 'packaged-runtime-probe.js')
   const result = spawnSync(executable, [probe], {
@@ -363,6 +387,7 @@ async function main() {
     const library = await verifyPackagedLibraryProjectsFoldersAndTags(window, smokeRoot, startup.activeProject)
     await verifyPackagedResearchNotes(window, library.primaryDocId)
     const search = await verifyPackagedSearchExcerptExport(window, smokeRoot)
+    await verifyPackagedCorpusResearch(window, search.docId)
     await verifyPackagedDiagnosticsBackupAndDeletion(window, [library.deleteDocId, search.docId])
     console.log('Packaged comprehensive offline smoke passed.')
   } finally {

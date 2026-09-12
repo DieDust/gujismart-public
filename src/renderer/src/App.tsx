@@ -3,6 +3,7 @@ import { lazy, Suspense, useLayoutEffect } from 'react'
 import { Alert, Button, Dropdown, Input, Layout, Menu, Modal, Popover, Progress, Spin, Tooltip, message } from 'antd'
 import {
   BookOutlined,
+  ApartmentOutlined,
   CloseOutlined,
   DashboardOutlined,
   DownOutlined,
@@ -13,7 +14,6 @@ import {
   FormatPainterOutlined,
   HomeOutlined,
   PlusOutlined,
-  ReadOutlined,
   LeftOutlined,
   RightOutlined,
   RobotOutlined,
@@ -43,7 +43,7 @@ import './styles/app.css'
 
 const { Sider, Content, Header } = Layout
 
-type ViewKey = 'welcome' | 'library' | 'folders' | 'settings' | 'dashboard' | 'search' | 'citation' | 'tags' | 'research' | 'excerpts'
+type ViewKey = 'welcome' | 'library' | 'folders' | 'settings' | 'dashboard' | 'search' | 'citation' | 'tags' | 'research' | 'excerpts' | 'knowledge'
 type AppViewKey = WorkspaceViewKey
 type MenuItem = Required<MenuProps>['items'][number]
 type DatabaseUpgradePhase = 'idle' | 'precompact' | 'cleanup' | 'compact'
@@ -126,7 +126,7 @@ const DocumentView = lazy(() => import('./views/DocumentView'))
 const ExcerptsView = lazy(() => import('./views/ExcerptsView'))
 const FoldersView = lazy(() => import('./views/FoldersView'))
 const LibraryView = lazy(() => import('./views/LibraryView'))
-const ResearchView = lazy(() => import('./views/ResearchView'))
+const KnowledgeGraphView = lazy(() => import('./views/KnowledgeGraphView'))
 const SearchView = lazy(() => import('./views/SearchView'))
 const SettingsView = lazy(() => import('./views/SettingsView'))
 const TagsView = lazy(() => import('./views/TagsView'))
@@ -165,7 +165,7 @@ const TAB_STRIP_HORIZONTAL_PADDING = 16
 const TAB_GROUP_HORIZONTAL_PADDING = 8
 const MAX_CLOSED_TAB_HISTORY = 20
 const SINGLETON_VIEW_KEYS = new Set<AppViewKey>(['library', 'excerpts', 'citation', 'tags', 'dashboard', 'settings'])
-const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research'])
+const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research', 'knowledge'])
 const VIEW_TITLES: Record<AppViewKey, string> = {
   library: '文献库',
   folders: '文件夹',
@@ -174,7 +174,8 @@ const VIEW_TITLES: Record<AppViewKey, string> = {
   search: '检索',
   citation: '引用格式',
   tags: '标签',
-  research: '研究',
+  research: '知识图谱',
+  knowledge: '知识图谱',
   excerpts: '摘录',
 }
 const TAB_GROUP_COLORS = [
@@ -332,7 +333,8 @@ function getViewIcon(view: AppViewKey) {
     case 'folders':
       return <FolderOpenOutlined />
     case 'research':
-      return <ReadOutlined />
+    case 'knowledge':
+      return <ApartmentOutlined />
     case 'excerpts':
       return <FileTextOutlined />
     case 'search':
@@ -696,7 +698,7 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
     : 'library'
   const activeDocumentTab = activeTab.kind === 'document' ? activeTab : null
   const showFloatingActions = activeTab.kind !== 'document' && !libraryAiOpen
-  const selectedMenuKeys = activeTab.kind === 'view' ? [activeTab.view] : []
+  const selectedMenuKeys = activeTab.kind === 'view' ? [activeTab.view === 'research' ? 'knowledge' : activeTab.view] : []
   // Ideal width must follow the collapsed strip: hidden group tabs do not reserve preferred width.
   const tabStripIdealWidth = (
     visibleTabCount * TAB_PREFERRED_WIDTH
@@ -1190,7 +1192,7 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
   const menuItems: MenuItem[] = useMemo(() => ([
     { key: 'library', icon: <BookOutlined />, label: '文献库' },
     { key: 'folders', icon: <FolderOpenOutlined />, label: '文件夹' },
-    { key: 'research', icon: <ReadOutlined />, label: '研究' },
+    { key: 'knowledge', icon: <ApartmentOutlined />, label: '知识图谱' },
     { key: 'excerpts', icon: <FileTextOutlined />, label: '摘录' },
     { key: 'search', icon: <FileSearchOutlined />, label: '检索' },
     { key: 'citation', icon: <FormatPainterOutlined />, label: '引用格式' },
@@ -2922,13 +2924,10 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
       case 'settings':
         return <SettingsView ref={settingsViewRef} onDirtyChange={setSettingsDirty} />
       case 'research':
-        return (
-          <ResearchView
-            onOpenDocument={openDocumentTarget}
-            onOpenLibraryAi={openLibraryAi}
-            onActiveProjectChange={setActiveResearchProjectId}
-          />
-        )
+      case 'knowledge':
+        return <KnowledgeGraphView key={`${activeLibraryProject?.id}:${activeTab.id}`} libraryProjectId={activeLibraryProject?.id || ''}
+          initialMode={activeTab.view === 'research' ? 'research' : 'question'} onActiveProjectChange={setActiveResearchProjectId}
+          onOpenDocument={openDocumentTarget} onOpenLibraryAi={openLibraryAi} />
       case 'excerpts':
         return (
           <ExcerptsView
@@ -3513,7 +3512,7 @@ export default function App({ initialLibraryProject, initialLibraryProjects }: A
             if (!btnDragState.current.moved) {
               openLibraryAi({
                 question: '',
-                researchProjectId: activeViewKey === 'research' ? activeResearchProjectId : null,
+                researchProjectId: activeViewKey === 'research' || activeViewKey === 'knowledge' ? activeResearchProjectId : null,
               })
             }
           }}

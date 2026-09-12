@@ -34,7 +34,6 @@ import {
   cleanupPdfAssetsAsync,
   capturePdfRepositorySourceMetadataAsync,
   copyFileWithFingerprintAsync,
-  getFileFingerprint,
   getPdfFingerprintAsync,
   getPdfRepositoryStatus,
   getPdfRepositoryPaths,
@@ -5013,20 +5012,26 @@ export function registerDocumentIpc(): void {
         if (TEXT_IMPORT_EXTENSIONS.has(ext) || EPUB_IMPORT_EXTENSIONS.has(ext)) {
           const destDir = join(storageDir, id)
           const destPath = join(destDir, basename(filePath))
-          mkdirSync(destDir, { recursive: true })
-          await copyFile(filePath, destPath)
+          const copiedEbook = await copyFileWithFingerprintAsync(filePath, destPath, undefined, ({ bytesDone, totalBytes }) => {
+            fileCapabilityService.renewFileBatch(lease.leaseId, IMPORT_FILE_LEASE_TTL_MS)
+            sendImportProgress(event.sender, {
+              phase: 'copying', filePath: sourceGrantId, fileName: basename(filePath), fileIndex,
+              totalFiles: filePaths.length, bytesDone, totalBytes,
+              progress: totalBytes > 0 ? bytesDone / totalBytes : undefined,
+            })
+          })
 
           const parsedEbook = EPUB_IMPORT_EXTENSIONS.has(ext)
-            ? await parseEpubFile(filePath)
+            ? await parseEpubFile(destPath)
             : parsePlainTextEbook(
-              filePath,
-              await readPlainTextFile(filePath),
+              destPath,
+              await readPlainTextFile(destPath),
               ext === '.md' || ext === '.markdown' ? 'markdown' : 'plain_text',
             )
           if (parsedEbook.sections.length === 0) {
             throw new Error('没有读取到可导入的文本内容')
           }
-          const ebookFingerprint = getFileFingerprint(destPath)
+          const ebookFingerprint = copiedEbook.storedFingerprint
           allowFileAccessPath(destPath)
 
           const metadata = {

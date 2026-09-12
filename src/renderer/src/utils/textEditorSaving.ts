@@ -40,21 +40,24 @@ export function createDebouncedPageSaver(delayMs: number = TEXT_EDITOR_SAVE_DEBO
     }
   }
 
-  const runPending = async (): Promise<boolean> => {
-    while (inFlight) {
-      await inFlight
-    }
+  const runPending = (): Promise<boolean> => {
+    // Seal the page snapshot before waiting: a new page must not replace it.
     const save = pendingSave
-    if (!save) return true
+    if (!save) return inFlight || Promise.resolve(true)
     pendingSave = null
     const waiters = pendingWaiters
     pendingWaiters = []
-    const execution = saveTextEditorPage(save)
+    const previous = inFlight
+    const execution = (async () => {
+      if (previous) await previous
+      return saveTextEditorPage(save)
+    })()
     inFlight = execution
-    const saved = await execution
-    inFlight = null
-    waiters.forEach((resolve) => resolve(saved))
-    return saved
+    void execution.then((saved) => {
+      if (inFlight === execution) inFlight = null
+      waiters.forEach((resolve) => resolve(saved))
+    })
+    return execution
   }
 
   return {

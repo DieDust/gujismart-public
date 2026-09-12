@@ -29,8 +29,9 @@ writeFileSync(electronStubPath, `
 writeFileSync(entryPath, `
   const database = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'database.ts'))})
   const research = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'ipc', 'research.ts'))})
+  const aiResearch = require(${JSON.stringify(join(__dirname, '..', 'src', 'main', 'ipc', 'ai-research.ts'))})
   const electron = require('electron')
-  module.exports = { database, research, handlers: electron.__handlers }
+  module.exports = { database, research, aiResearch, handlers: electron.__handlers }
 `)
 
 buildSync({
@@ -54,6 +55,7 @@ async function run() {
     database = modules.database
     await database.initDatabase()
     modules.research.registerResearchIpc()
+    modules.aiResearch.registerAiResearchIpc()
 
     const invoke = async (channel, ...args) => {
       const handler = modules.handlers.get(channel)
@@ -62,6 +64,29 @@ async function run() {
     }
 
     const now = new Date().toISOString()
+    const schemaProject = await invoke('research:createProject', { name: 'Schema reuse fixture' })
+    const plan = { projectId: schemaProject.id, goal: 'Extract fixture evidence', kind: 'extraction', fields: [{ key: 'person', label: 'Person', type: 'person' }] }
+    const owner = await invoke('aiResearch:createTask', plan)
+    const datasetId = 'schema-dataset'
+    database.run('INSERT INTO ai_research_datasets (id, library_project_id, task_id, project_id, name, description, field_schema_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [datasetId, owner.library_project_id, owner.id, schemaProject.id, 'Schema fixture', plan.goal, owner.field_schema_json, now, now])
+    database.run('INSERT INTO documents (id, title, library_project_id) VALUES (?, ?, ?)', ['schema-doc', 'Schema evidence fixture', owner.library_project_id])
+    database.run('INSERT INTO ai_research_records (id, task_id, dataset_id, doc_id, library_project_id, excerpt, values_json) VALUES (?, ?, ?, ?, ?, ?, ?)', ['schema-record', owner.id, datasetId, 'schema-doc', owner.library_project_id, 'Preserved original evidence', JSON.stringify({ person: 'Fixture person' })])
+    const repeat = await invoke('aiResearch:createTask', plan)
+    assert.strictEqual(repeat.dataset_id, datasetId, 'compatible extraction batches can reuse a dataset')
+    const changed = await invoke('aiResearch:createTask', { ...plan, fields: [{ key: 'place', label: 'Place', type: 'place' }] })
+    assert.strictEqual(changed.dataset_id, null, 'changing fields must not reuse unrelated values or deduplication hashes')
+    const mixed = await invoke('aiResearch:createTask', { ...plan, kind: 'mixed' })
+    assert.strictEqual(mixed.dataset_id, null, 'different task kinds must not share automatic result reuse')
+    const statistical = await invoke('aiResearch:createTask', { ...plan, kind: 'statistical' })
+    assert.strictEqual(statistical.dataset_id, null, 'statistics from distinct selections must not merge')
+    database.run('UPDATE ai_research_tasks SET dataset_id = ? WHERE id = ?', [datasetId, changed.id])
+    await assert.rejects(invoke('aiResearch:runTask', changed.id), /任务类型或字段与已有数据集不一致/, 'legacy mismatched tasks must stop before retrieval or model calls')
+    database.run('UPDATE ai_research_tasks SET dataset_id = ? WHERE id = ?', [datasetId, statistical.id])
+    await assert.rejects(invoke('aiResearch:runTask', statistical.id), /任务类型或字段与已有数据集不一致/, 'legacy statistical reuse must also stop')
+    assert.strictEqual(database.queryOne('SELECT field_schema_json FROM ai_research_datasets WHERE id = ?', [datasetId]).field_schema_json, owner.field_schema_json)
+    assert.deepStrictEqual(database.queryOne('SELECT excerpt, values_json FROM ai_research_records WHERE id = ?', ['schema-record']), { excerpt: 'Preserved original evidence', values_json: JSON.stringify({ person: 'Fixture person' }) })
+    await invoke('research:deleteProject', schemaProject.id)
+    database.run('DELETE FROM documents WHERE id = ?', ['schema-doc'])
     const fixtureDocId = 'doc_rx'
     database.run(
       `INSERT INTO documents (

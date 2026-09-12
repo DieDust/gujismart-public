@@ -66,8 +66,11 @@ fs.writeFileSync(electronStubPath, `
 fs.writeFileSync(entryPath, `
   const database = require(${JSON.stringify(path.join(root, 'src', 'main', 'database.ts'))})
   const documents = require(${JSON.stringify(path.join(root, 'src', 'main', 'ipc', 'documents.ts'))})
+  const research = require(${JSON.stringify(path.join(root, 'src', 'main', 'ipc', 'research.ts'))})
+  const citation = require(${JSON.stringify(path.join(root, 'src', 'main', 'ipc', 'citation.ts'))})
+  const library = require(${JSON.stringify(path.join(root, 'src', 'main', 'library-projects.ts'))})
   const electron = require('electron')
-  module.exports = { database, documents, handlers: electron.__handlers }
+  module.exports = { database, documents, research, citation, library, handlers: electron.__handlers }
 `)
 
 buildSync({
@@ -220,6 +223,8 @@ async function run() {
     database = modules.database
     await database.initDatabase()
     modules.documents.registerDocumentIpc()
+    modules.research.registerResearchIpc()
+    modules.citation.registerCitationIpc()
 
     const invoke = async (channel, ...args) => {
       const handler = modules.handlers.get(channel)
@@ -228,6 +233,50 @@ async function run() {
     }
 
     const beforeDocId = 'manual_insert_before'
+    const pageMapDocId = 'page_map_calibration_fixture'
+    insertFixtureDocument(database, pageMapDocId, 6)
+    database.run("UPDATE pages SET literature_page_num = page_num + 100, literature_page_source = 'ocr' WHERE doc_id = ?", [pageMapDocId])
+    const calibration = await invoke('documents:applyLiteraturePageAnchor', pageMapDocId, 4, 201)
+    assert.strictEqual(calibration.updated, 3, 'calibration must write only the anchor and later pages')
+    assert.deepStrictEqual(calibration.pages.map(page => page.literature_page_num), [101, 102, 103, 201, 202, 203])
+    assert.deepStrictEqual(calibration.pages.map(page => page.literature_page_source), ['ocr', 'ocr', 'ocr', 'manual', 'inferred', 'inferred'], 'earlier page number provenance must survive calibration')
+    const persistedMap = database.queryAll('SELECT page_num, literature_page_num, literature_page_source FROM pages WHERE doc_id = ? ORDER BY page_num', [pageMapDocId])
+    assert.deepStrictEqual(persistedMap.map(page => page.literature_page_source), ['ocr', 'ocr', 'ocr', 'manual', 'inferred', 'inferred'])
+    await invoke('documents:recomputeLiteraturePages', pageMapDocId)
+    const recomputed = database.queryAll('SELECT literature_page_num FROM pages WHERE doc_id = ? AND page_num >= 4 ORDER BY page_num', [pageMapDocId])
+    assert.deepStrictEqual(recomputed.map(page => page.literature_page_num), [201, 202, 203], 'manual anchor must survive the reopen/OCR recomputation path')
+
+    const libraryId = modules.library.getActiveLibraryProjectId()
+    database.run('INSERT OR IGNORE INTO library_project_documents (project_id, document_id, created_at, updated_at) VALUES (?, ?, ?, ?)', [libraryId, pageMapDocId, '2026-01-01', '2026-01-01'])
+    const project = await invoke('research:createProject', { name: 'Page citation fixture' })
+    const style = await invoke('citation:createStyle', { name: 'Page citation fixture', is_default: 1 })
+    await invoke('citation:createTemplate', { style_id: style.id, name: 'Page fixture', format_type: 'Custom', template_text: '{{title}} | {{cite_pages}}' })
+    const provenance = { pageId: `${pageMapDocId}_page_4`, pageNum: 4, citationPageNum: 201 }
+    const note = await invoke('research:createNote', { project_id: project.id, doc_id: pageMapDocId, page_num: 201, excerpt: 'Immutable evidence', source_id: JSON.stringify(provenance) })
+    const listed = await invoke('research:listNotes', project.id)
+    assert.strictEqual(listed.find(item => item.id === note.id).source_available, 1, 'printed page 201 must not be looked up as physical page 201')
+    const paginated = await invoke('research:listNotesPage', { projectId: project.id })
+    assert.strictEqual(paginated.items.find(item => item.id === note.id).source_available, 1)
+    const citationOptions = { sourcePageId: provenance.pageId, sourcePageNum: 4, pageNum: 201 }
+    assert.match(await invoke('citation:generateByStyle', pageMapDocId, style.id, '', citationOptions), /\| 201$/)
+    await invoke('documents:applyLiteraturePageAnchor', pageMapDocId, 4, 301)
+    assert.match(await invoke('citation:generateByStyle', pageMapDocId, style.id, '', citationOptions), /\| 301$/, 'new citations follow recalibration')
+    const exported = await invoke('research:exportProject', project.id, { format: 'markdown', citationStyleId: style.id, includeReferences: false })
+    assert.match(exported.content, /\| 301/, 'project exports use the same live citation page as copying')
+    const defaultExport = await invoke('research:exportProject', project.id, { format: 'markdown', includeReferences: false })
+    assert.match(defaultExport.content, /\| 301/, 'export without an explicit style follows the active default style')
+    const persistedNote = database.queryOne('SELECT page_num, excerpt, source_id FROM research_notes WHERE id = ?', [note.id])
+    assert.strictEqual(persistedNote.page_num, 201, 'original excerpt page snapshot is not rewritten')
+    assert.strictEqual(persistedNote.excerpt, 'Immutable evidence')
+    assert.strictEqual(persistedNote.source_id, JSON.stringify(provenance))
+    assert.match(await invoke('citation:generateByStyle', pageMapDocId, style.id, '', { pageNum: '12-14' }), /\| 12-14$/, 'explicit page ranges and legacy callers remain compatible')
+    await invoke('pages:insertManual', { documentId: pageMapDocId, anchorPageId: `${pageMapDocId}_page_1`, position: 'before' })
+    const moved = database.queryOne('SELECT page_num, literature_page_num FROM pages WHERE id = ?', [provenance.pageId])
+    assert.strictEqual(moved.page_num, 5)
+    assert.match(await invoke('citation:generateByStyle', pageMapDocId, style.id, '', citationOptions), new RegExp(`\\| ${moved.literature_page_num}$`), 'stable ID wins over the stale physical ordinal after insertion')
+    const missingOptions = { ...citationOptions, sourcePageId: 'missing-fixture-page', pageNum: 901 }
+    assert.match(await invoke('citation:generateByStyle', pageMapDocId, style.id, '', missingOptions), /\| 901$/, 'missing stable IDs must not retarget other pages')
+
     insertFixtureDocument(database, beforeDocId)
     const beforeResult = await invoke('pages:insertManual', {
       documentId: beforeDocId,

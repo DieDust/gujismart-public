@@ -4,6 +4,8 @@ import { fullTextSearch, previewLibraryAiScope } from './semantic-search'
 import { queryAll, queryOne } from './database'
 import { resolveFolderAndDescendantIds } from './folder-scope'
 import { getActiveLibraryProjectId } from './library-projects'
+import { vectorSearch } from './embedding-index'
+import { evidenceExcerpt, EVIDENCE_CANDIDATE_LIMIT, EVIDENCE_CONTEXT_BYTES, EVIDENCE_SOURCE_LIMIT, fuseEvidenceRanks, renderEvidenceCluster, researchEvidenceAspects, selectEvidenceClusters } from './evidence-selection'
 import type {
   AiSearchPlan,
   EvidenceQaCluster,
@@ -19,8 +21,6 @@ import type {
 
 const DEFAULT_RESULT_LIMIT = 12
 const MAX_QUERIES = 18
-const MAX_CLUSTERS = 8
-const MAX_CONTEXT_CHARS = 26000
 const MAX_PAGE_TEXT_CHARS = 1800
 const MIN_TEXT_FOR_WIDE_RADIUS = 360
 const OVERVIEW_QUERY_LABEL = '全文概览'
@@ -126,10 +126,17 @@ function normalizePlan(raw: Partial<AiSearchPlan> | null | undefined, question: 
   }
 }
 
-async function buildEvidencePlan(question: string): Promise<{ plan: EvidenceQaPlan; warnings: string[] }> {
+async function buildEvidencePlan(question: string, docIds?: string[]): Promise<{ plan: EvidenceQaPlan; warnings: string[] }> {
   const warnings: string[] = []
   try {
-    const raw = await runAiTask('ai_search_plan', question)
+    const titles = docIds?.length && docIds.length <= 12
+      ? queryAll<{ title: string }>(`SELECT title FROM documents WHERE id IN (${docIds.map(() => '?').join(',')})`, docIds)
+        .map((doc) => String(doc.title || '').slice(0, 160)) : []
+    const request = [question,
+      docIds ? `用户已选定 ${docIds.length} 篇文献，范围已由程序约束。${titles.length ? `题录：${titles.join('；')}` : ''}` : '',
+      '请覆盖问题的各个研究方面，不只检索人名和地名。若询问材料来源、研究方法或偏见，检索词还应包含相关的史料类型、方法或争议术语，例如档案、访谈、口述、偏向；不要仅因它们不是专名就遗漏。题录只用于理解范围，不需要把每个书名重复作为查询词。',
+    ].filter(Boolean).join('\n\n')
+    const raw = await runAiTask('ai_search_plan', request)
     const parsed = JSON.parse(String(raw || '').replace(/```json/gi, '').replace(/```/g, '').trim())
     const plan = normalizePlan(parsed, question)
     if (plan.keywords.length === 0) plan.keywords = fallbackPlan(question).keywords
@@ -196,6 +203,8 @@ function buildQueries(question: string, plan: EvidenceQaPlan): string[] {
   if (isLikelyDirectSearchPhrase(direct)) priority.push(direct)
   return uniqueStrings([
     ...priority,
+    ...plan.keywords.slice(0, 3),
+    ...researchEvidenceAspects(direct).flatMap((terms) => terms.slice(0, 2)),
     ...plan.keywords,
     ...plan.expandedKeywords,
   ], MAX_QUERIES).filter((query) => query.length > 1 || direct.length === 1)
@@ -269,7 +278,7 @@ function searchEvidence(
   const warnings: string[] = []
   const expandedQueries = buildQueries(question, plan)
   const resultPool: EvidenceSearchResult[] = []
-  const limit = Math.max(options?.limit || DEFAULT_RESULT_LIMIT, DEFAULT_RESULT_LIMIT)
+  const limit = Math.min(EVIDENCE_CANDIDATE_LIMIT, Math.max(DEFAULT_RESULT_LIMIT * 4, Number(options?.limit) || 0))
 
   expandedQueries.forEach((query, index) => {
     try {
@@ -312,6 +321,37 @@ function searchEvidence(
   )
 
   return { results, expandedQueries, warnings }
+}
+
+async function addSemanticEvidence(question: string, docIds: string[] | undefined, keyword: EvidenceSearchOutcome): Promise<EvidenceSearchOutcome> {
+  const warnings = [...keyword.warnings]
+  let semantic: EvidenceSearchResult[] = []
+  try {
+    const result = await vectorSearch(extractCurrentQuestion(question), { docIds, limit: EVIDENCE_CANDIDATE_LIMIT, timeoutMs: 15_000 })
+    if (result.ok) {
+      semantic = result.hits.flatMap((hit): EvidenceSearchResult[] => {
+        const segment = queryOne<{ text: string; page_num: number | null; page_id: string | null; ordinal: number; source_type: string }>(
+          'SELECT text, page_num, page_id, ordinal, source_kind AS source_type FROM search_index_segments WHERE segment_id = ? AND doc_id = ?',
+          [hit.ref.segmentId, hit.documentId],
+        )
+        if (!segment?.text?.trim() || !segment.page_num) return []
+        const snippet = evidenceExcerpt(segment.text, keyword.expandedQueries, 900)
+        return [{
+          doc_id: hit.documentId, doc_title: hit.title || getDocTitle(hit.documentId), doc_author: hit.author || null,
+          doc_type: '', page_num: segment.page_num, snippet, rank: -hit.score, hit_field: 'semantic',
+          locator: { docId: hit.documentId, segmentId: hit.ref.segmentId, pageId: segment.page_id,
+            pageNum: segment.page_num, pageIndex: segment.page_num - 1, sourceType: segment.source_type,
+            segmentOrdinal: segment.ordinal, charStart: 0, charEnd: 0, matchText: '', queryTerm: '', occurrenceIndex: 0 },
+        }]
+      })
+      warnings.push('已结合关键词与向量检索；向量相似度不是史料真实性或结论可信度。')
+    } else if (result.code !== 'index_empty') {
+      warnings.push('向量检索暂不可用，本次保留关键词检索结果。')
+    }
+  } catch {
+    warnings.push('向量检索暂不可用，本次保留关键词检索结果。')
+  }
+  return { ...keyword, results: fuseEvidenceRanks(keyword.results, semantic), warnings }
 }
 
 function getRefinementDocumentIds(scope: EvidenceQaScope | undefined, docIds: string[] | undefined): string[] {
@@ -581,7 +621,7 @@ function getPageText(docId: string, pageNum: number): string {
   return String(page?.text || '').trim()
 }
 
-function getPageWindow(docId: string, pageNum: number, radius: number): EvidenceQaClusterPage[] {
+function getPageWindow(docId: string, pageNum: number, radius: number, anchors: string[] = []): EvidenceQaClusterPage[] {
   const start = Math.max(1, pageNum - radius)
   const end = pageNum + radius
   return queryAll<{ page_num: number; text: string }>(
@@ -590,14 +630,14 @@ function getPageWindow(docId: string, pageNum: number, radius: number): Evidence
   )
     .map((page) => ({
       page_num: Number(page.page_num),
-      text: truncateText(page.text || '', MAX_PAGE_TEXT_CHARS),
+      text: evidenceExcerpt(page.text || '', page.page_num === pageNum ? anchors : [], MAX_PAGE_TEXT_CHARS),
       role: page.page_num === pageNum ? 'hit' as const : page.page_num < pageNum ? 'before' as const : 'after' as const,
     }))
     .filter((page) => page.text)
 }
 
 function makeSourceFromResult(result: EvidenceSearchResult): EvidenceQaSource {
-  const snippet = stripSnippetMarkers(result.snippet || '')
+  const snippet = evidenceExcerpt(stripSnippetMarkers(result.snippet || ''), [result.locator?.matchText || '', result.matched_query || ''], 900)
   return {
     doc_id: result.doc_id,
     doc_title: result.doc_title || getDocTitle(result.doc_id),
@@ -624,12 +664,13 @@ function buildEvidenceClusters(results: EvidenceSearchResult[]): EvidenceQaClust
 
   const clusters = [...grouped.entries()]
     .map(([key, items]) => {
-      const [docId, pageText] = key.split(':')
-      const pageNum = Number(pageText)
+      const docId = items[0].doc_id
+      const pageNum = Number(items[0].page_num || items[0].locator?.pageNum)
       const docTitle = items[0]?.doc_title || getDocTitle(docId)
       const anchorText = getPageText(docId, pageNum)
       const radius = anchorText.length < MIN_TEXT_FOR_WIDE_RADIUS || items.length >= 3 ? 2 : 1
-      const pages = getPageWindow(docId, pageNum, radius)
+      const anchors = items.map((item) => item.locator?.matchText || item.matched_query || stripSnippetMarkers(item.snippet || '').slice(0, 80))
+      const pages = getPageWindow(docId, pageNum, radius, anchors)
       const sources = items.slice(0, 4).map(makeSourceFromResult)
       const pageNums = pages.map((page) => page.page_num)
       return {
@@ -638,7 +679,7 @@ function buildEvidenceClusters(results: EvidenceSearchResult[]): EvidenceQaClust
         doc_title: docTitle,
         anchor_page_num: pageNum,
         page_range: [Math.min(...pageNums, pageNum), Math.max(...pageNums, pageNum)] as [number, number],
-        score: items.reduce((sum, item) => sum + Number(item.relevance_score || 1), 0),
+        score: Math.max(...items.map((item) => Number(item.relevance_score || 0))),
         queries: uniqueStrings(items.map((item) => item.matched_query || item.locator?.queryTerm)),
         hit_count: items.length,
         pages,
@@ -647,7 +688,7 @@ function buildEvidenceClusters(results: EvidenceSearchResult[]): EvidenceQaClust
     })
     .filter((cluster) => cluster.pages.length > 0)
 
-  return diversifyClustersByDocument(clusters, MAX_CLUSTERS)
+  return diversifyClustersByDocument(clusters, EVIDENCE_CANDIDATE_LIMIT)
 }
 
 function isOverviewEvidence(plan: EvidenceQaPlan, expandedQueries: string[]): boolean {
@@ -656,27 +697,10 @@ function isOverviewEvidence(plan: EvidenceQaPlan, expandedQueries: string[]): bo
 
 function buildPrompt(question: string, clusters: EvidenceQaCluster[], plan: EvidenceQaPlan, expandedQueries: string[]): string {
   const overviewEvidence = isOverviewEvidence(plan, expandedQueries)
-  let usedChars = 0
-  const clusterText: string[] = []
-  for (let index = 0; index < clusters.length; index += 1) {
-    const cluster = clusters[index]
-    const sources = cluster.sources
-      .slice(0, 4)
-      .map((source, sourceIndex) => `S${index + 1}.${sourceIndex + 1} ${source.doc_title} 第 ${source.page_num || '?'} 页：${source.snippet}`)
-      .join('\n')
-    const pages = cluster.pages
-      .map((page) => `[${overviewEvidence ? '正文页' : page.role === 'hit' ? '命中页' : page.role === 'before' ? '前页' : '后页'} 第 ${page.page_num} 页]\n${page.text}`)
-      .join('\n\n')
-    const block = [
-      overviewEvidence
-        ? `【正文摘读 ${index + 1}】${cluster.doc_title}，取自第 ${cluster.page_range[0]}-${cluster.page_range[1]} 页，共 ${cluster.hit_count} 页可读 OCR，下面列出代表性页段`
-        : `【证据组 ${index + 1}】${cluster.doc_title}，第 ${cluster.page_range[0]}-${cluster.page_range[1]} 页，关键词：${cluster.queries.join('、')}`,
-      sources,
-      pages,
-    ].join('\n')
-    if (usedChars + block.length > MAX_CONTEXT_CHARS) break
-    usedChars += block.length
-    clusterText.push(block)
+  const clusterText = clusters.map(renderEvidenceCluster)
+  if (clusters.reduce((count, cluster) => count + cluster.sources.length, 0) > EVIDENCE_SOURCE_LIMIT
+    || Buffer.byteLength(clusterText.join('\n\n---\n\n'), 'utf8') > EVIDENCE_CONTEXT_BYTES) {
+    throw new Error('证据超出本次阅读预算，请重新检索；未追加模型请求。')
   }
 
   return [
@@ -689,8 +713,11 @@ function buildPrompt(question: string, clusters: EvidenceQaCluster[], plan: Evid
     ] : []),
     '如果问题要求“综述、总结、趋势、脉络、空白、难点、方向”，请先综合证据给出总体判断，再按主题或阶段归纳，不要按证据组、检索结果或文献顺序逐条复述。',
     '请把回答限定为“当前检索范围内的文献显示/提示”，不要把有限命中直接说成整个领域的完整结论。',
-    '优先输出可用于研究写作的结构：总体判断、主要主题/趋势、证据支撑、研究空白或下一步问题。',
+    '未在当前片段检索到证据，不等于整篇文献没有记载，更不等于历史上不存在。回答是否存在某关系时，严格区分共同出现、共同主张与原文明示的人际关系。',
+    '优先遵守用户指定的篇幅和文体；篇幅上限包含标题与引用，请留出余量，避免重复结论和无关数字。用户未指定时，再采用总体判断、主题、证据与待核查问题的结构。',
+    '涉及研究安排时，明确区分原文记载与据此提出的建议，建议必须具体可执行，不冒充作者结论。未进入当前证据的文献应明确说明未取得依据，不猜测其内容。',
     '每个具体结论都必须标注来源，格式为（《文献标题》，第 X 页）。',
+    '跨文献回答的每项引用都要明确文献名称和页码；可先约定简短书名，不能只列一串页码而无法区分文献。',
     '如果证据不足以回答，请先写“证据不足”，再说明已经检索的关键词和缺口。',
     '',
     `问题：${question}`,
@@ -730,7 +757,7 @@ function flattenSources(clusters: EvidenceQaCluster[]): EvidenceQaSource[] {
       sources.push(source)
     })
   })
-  return sources.slice(0, 16)
+  return sources
 }
 
 export async function buildEvidenceForQuestion(
@@ -777,8 +804,8 @@ export async function buildEvidenceForQuestion(
     }
   }
 
-  const { plan, warnings: planWarnings } = await buildEvidencePlan(trimmed)
-  const firstSearch = searchEvidence(trimmed, plan, docIds, options)
+  const { plan, warnings: planWarnings } = await buildEvidencePlan(trimmed, docIds)
+  const firstSearch = await addSemanticEvidence(trimmed, docIds, searchEvidence(trimmed, plan, docIds, options))
   const search = firstSearch.results.length > 0
     ? firstSearch
     : await refineSearchEvidence(trimmed, plan, docIds, scope, firstSearch, options)
@@ -798,14 +825,19 @@ export async function buildEvidenceForQuestion(
     }
   }
 
-  const clusters = buildEvidenceClusters(search.results)
+  const candidates = buildEvidenceClusters(search.results)
+  const selected = selectEvidenceClusters(candidates, researchEvidenceAspects(extractCurrentQuestion(trimmed)))
+  const clusters = selected.clusters
   return {
     trimmed,
     plan,
     expandedQueries: search.expandedQueries,
     clusters,
     sources: flattenSources(clusters),
-    warnings: [...planWarnings, ...search.warnings],
+    warnings: [...planWarnings, ...search.warnings,
+      `本次选用 ${selected.sourceCount} 条出处、${new Set(clusters.map((cluster) => cluster.doc_id)).size} 篇文献，证据正文 ${selected.bytes}/${EVIDENCE_CONTEXT_BYTES} 字节；最多 ${EVIDENCE_SOURCE_LIMIT} 条出处，不代表已读完所选文献。`,
+      ...(candidates.length && !clusters.length ? ['候选证据未能装入阅读预算，本次未交给模型分析。'] : []),
+    ],
   }
 }
 

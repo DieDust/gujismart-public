@@ -106,7 +106,7 @@ assertIncludes(app, 'title: state.selectedFolderName || VIEW_TITLES.folders', 'f
 assertIncludes(app, 'onAuxClick={(event) => {', 'tabs should support middle-click close')
 assertIncludes(app, 'if (event.button === 1 && closable) closeTab(tab.id)', 'middle click should close a tab')
 assertIncludes(app, "const SINGLETON_VIEW_KEYS = new Set<AppViewKey>(['library', 'excerpts', 'citation', 'tags', 'dashboard', 'settings'])", 'singleton views should be explicit')
-assertIncludes(app, "const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research'])", 'multi-instance views should be explicit')
+assertIncludes(app, "const MULTI_INSTANCE_VIEW_KEYS = new Set<AppViewKey>(['folders', 'search', 'research', 'knowledge'])", 'existing multi-instance views and the knowledge workspace should be explicit')
 assertIncludes(app, "openViewTab(view, { forceNew: MULTI_INSTANCE_VIEW_KEYS.has(view) })", 'sidebar should create new tabs for multi-instance views')
 assertIncludes(app, 'if (nextTabs.length === 0)', 'closing the last tab should recover a home tab')
 assertIncludes(app, 'return [createHomeTab()]', 'last-tab close should recreate home')

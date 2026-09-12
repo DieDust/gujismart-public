@@ -9,12 +9,14 @@ interface LlmProfileSelectorProps {
   size?: 'small' | 'middle' | 'large'
   width?: number
   className?: string
+  disabled?: boolean
 }
 
 export default function LlmProfileSelector({
   size = 'small',
   width = 180,
   className,
+  disabled = false,
 }: LlmProfileSelectorProps) {
   const [profiles, setProfiles] = useState<LlmProviderProfile[]>([])
   const [activeId, setActiveId] = useState('')
@@ -78,7 +80,7 @@ export default function LlmProfileSelector({
         label: `${profile.name} · ${profile.model}`,
       }))}
       onChange={(value) => void handleSwitch(value)}
-      disabled={profiles.length === 0}
+      disabled={disabled || profiles.length === 0}
     />
   )
 }

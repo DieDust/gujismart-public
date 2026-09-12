@@ -25,7 +25,9 @@ export interface PagePayloadCleanupResult {
 }
 
 export function setPayloadDataDir(dataDir: string): void {
-  payloadDataDirOverride = resolve(dataDir)
+  const next = resolve(dataDir)
+  if (payloadDataDirOverride !== next) invalidatePagePayloadReadCache()
+  payloadDataDirOverride = next
 }
 
 function getStableAppRoot(): string {
@@ -84,15 +86,26 @@ export function pagePayloadRefExists(ref: string | null | undefined): boolean {
 // Hot-path cache: open/proof/search repeatedly hydrate the same page payload refs.
 // Completeness is unchanged — this only avoids re-reading and gunzipping identical files.
 const PAGE_PAYLOAD_READ_CACHE_MAX = 256
-const pagePayloadReadCache = new Map<string, string | null>()
+const PAGE_PAYLOAD_READ_CACHE_BYTES = 32 * 1024 * 1024
+const pagePayloadReadCache = new Map<string, string>()
+let pagePayloadReadCacheBytes = 0
+
+function forgetPagePayloadRead(key: string): void {
+  const previous = pagePayloadReadCache.get(key)
+  if (previous !== undefined) pagePayloadReadCacheBytes -= previous.length * 2
+  pagePayloadReadCache.delete(key)
+}
 
 function rememberPagePayloadRead(cacheKey: string, value: string | null): string | null {
-  if (pagePayloadReadCache.has(cacheKey)) pagePayloadReadCache.delete(cacheKey)
+  forgetPagePayloadRead(cacheKey)
+  // Retry restored files; return oversized values in full without retaining them.
+  if (value === null || value.length * 2 > PAGE_PAYLOAD_READ_CACHE_BYTES) return value
   pagePayloadReadCache.set(cacheKey, value)
-  while (pagePayloadReadCache.size > PAGE_PAYLOAD_READ_CACHE_MAX) {
+  pagePayloadReadCacheBytes += value.length * 2
+  while (pagePayloadReadCache.size > PAGE_PAYLOAD_READ_CACHE_MAX || pagePayloadReadCacheBytes > PAGE_PAYLOAD_READ_CACHE_BYTES) {
     const oldest = pagePayloadReadCache.keys().next().value
     if (oldest === undefined) break
-    pagePayloadReadCache.delete(oldest)
+    forgetPagePayloadRead(oldest)
   }
   return value
 }
@@ -100,11 +113,12 @@ function rememberPagePayloadRead(cacheKey: string, value: string | null): string
 export function invalidatePagePayloadReadCache(ref?: string | null): void {
   if (!ref) {
     pagePayloadReadCache.clear()
+    pagePayloadReadCacheBytes = 0
     return
   }
   const absolutePath = resolvePayloadPath(ref)
   if (!absolutePath) return
-  pagePayloadReadCache.delete(absolutePath)
+  forgetPagePayloadRead(absolutePath)
 }
 
 export function buildPagePayloadRef(docId: string, pageId: string, field: string, value: string): string {
@@ -130,7 +144,7 @@ export function writePagePayloadRef(docId: string, pageId: string, field: string
     })))
   }
   // New writes supersede any prior cached value for this path.
-  pagePayloadReadCache.delete(absolutePath)
+  forgetPagePayloadRead(absolutePath)
   return ref
 }
 
@@ -163,7 +177,7 @@ export async function writePagePayloadRefAsync(docId: string, pageId: string, fi
       if (!existsSync(absolutePath)) throw error
     }
   }
-  pagePayloadReadCache.delete(absolutePath)
+  forgetPagePayloadRead(absolutePath)
   return ref
 }
 
@@ -171,8 +185,8 @@ export function readPagePayloadValue(ref: string | null | undefined): string | n
   if (!ref) return null
   const absolutePath = resolvePayloadPath(ref)
   if (!absolutePath) return null
-  if (pagePayloadReadCache.has(absolutePath)) {
-    const cached = pagePayloadReadCache.get(absolutePath) ?? null
+  const cached = pagePayloadReadCache.get(absolutePath)
+  if (cached !== undefined) {
     // LRU bump
     pagePayloadReadCache.delete(absolutePath)
     pagePayloadReadCache.set(absolutePath, cached)

@@ -1,5 +1,97 @@
 # 更新日志 / Changelog
 
+## Unreleased / 待发布
+
+## 1.2.34 - 2026-09-12
+
+### 中文
+
+- 正式发布安装版 Setup 与便携版 Portable（Windows x64）。升级前请备份资料库；沿用原有应用标识和数据目录，不删除旧文献、引用快照或研究任务。安装包尚未数字签名，Windows 可能提示未知发布者。
+- 汇总 beta 阶段的启动、文件导入、OCR 队列与保存性能改进，以及版式校对、编辑撤销、真实页码、引注和导出联动修复；普通全文检索不缩减文献与正文范围。
+- 全范围研究新增带原文定位的实体与别名抽取、同名候选核对、人工归并/分离及可撤销的核对记录。自动归组不跨文献猜测同名身份；保留旧任务、引注和原始资料，不自动启动付费重跑。
+- 新增独立于快速问答的全范围专题研究入口：按正文分块保存处理状态、失败项和原文发现，支持确认请求预算、暂停续跑、失败重试及相同输入的成功结果复用；不自动启动付费任务。
+- 新增可搜索、全范围排序和分页的文献研究表，保留完整原文摘句及稳定定位。专题综合分批保存中间结果，报告失败不重跑成功抽取；明确区分阶段结果、完整处理和待人工核验的结论。
+- 知识问答接通所选范围内的关键词与向量混合检索；本地融合排名、去重并兼顾文献多样性，最终最多 8 条主出处、18 KB 证据正文。统一模型输入与界面出处，保留未向量化文献的全文检索，向量请求失败可退回关键词。
+- 修复同一研究目标更换字段或任务类型后误用旧数据集的问题；统计批次不再自动合并，旧的不兼容任务停止写入并保留原有记录。
+- CI 与发布流程新增八组隔离交互检查，覆盖校对编辑、知识问答、全范围研究及实体核对、报告失败重试、图谱缩放与大图显示及专题证据操作。
+- 取消启动维护中自动调用付费 AI 重新分类旧文献的路径，保留用户主动触发的分析流程。
+- 发布交互测试改为后台窗口，避免视口尺寸测试抢占桌面；补充研究历史抽屉在真实窗口边界内的检查。
+- 修正报告提示词将少量命中误称为证据压缩的问题；用户指定短摘要时优先遵守篇幅，不再强制附加完整报告结构。
+- 修复知识问答完成事件晚于 IPC 回复时停留在保存中的问题；必要时读取已保存历史确认，不重复调用模型。问答更明确地区分原文证据、研究建议及未取得依据的文献。
+- AI 使用边界：已有小批量真实模型测试；新增全范围研究与实体整理主要经过隔离模拟回归，尚未完成真实千篇馆藏质量验收。自动整理、共现线索和模型结论均不等于已核实的历史事实，旧统计图谱不会自动重建。
+
+### English
+
+- Published Setup and Portable builds for Windows x64. Back up the library before upgrading. Application identity and data-directory rules remain unchanged, preserving documents, citation snapshots and research jobs. Installers are not digitally signed; Windows may display an unknown-publisher warning.
+- Includes beta-stage startup, import, OCR queue/save performance improvements and fixes linking facsimile editing, undo, printed page numbers, citations and exports. Ordinary full-text search retains its complete document and text scope.
+- Added source-anchored entity and alias extraction to full-scope research, homonym review, manual grouping/separation and reversible review history. Automatic grouping does not infer identity from matching names across documents. Legacy jobs, citations and original sources remain intact, without automatic paid reruns.
+- Added an opt-in full-scope research workflow alongside quick questions, with persisted text-unit coverage, failures and source findings, confirmed request budgets, pause/resume, failed-stage retries and reuse of successful identical inputs. Paid work never starts automatically.
+- Added searchable, globally sortable and paginated document research results with full quotations and stable source locators. Synthesis checkpoints survive report failures without repeating successful extraction; partial coverage and claims requiring human review remain explicit.
+- Added scoped keyword/vector retrieval for document questions, with local rank fusion, deduplication and document diversity. Final evidence is limited to eight primary sources and 18 KB of serialized UTF-8 text, shared by the model prompt and visible citations. Unvectorized documents retain keyword retrieval, with fallback on embedding failures.
+- Prevented dataset reuse across incompatible research fields or task types. Statistical batches no longer merge automatically; incompatible legacy tasks stop without overwriting existing records.
+- Added eight isolated interaction checks to CI and release workflows, covering proofreading, document questions, full-scope research and entity review, report failure recovery, graph zoom and large graphs, and topic evidence workflows.
+- Removed automatic paid AI reclassification of legacy documents from startup maintenance; user-initiated analysis remains available.
+- Release UI fixtures now run in background windows instead of taking over the desktop during viewport tests, with an additional native-window history-drawer bounds check.
+- Corrected report instructions that misattributed sparse hits to evidence compression. Requested short summaries now take precedence over the default full report outline.
+- Fixed question completion getting stuck when stream events arrive after the IPC reply, recovering committed history without repeating model calls. Evidence-based answers now distinguish source claims, research recommendations, and documents without retrieved evidence more explicitly.
+- AI limitations: small live-model tests exist, while the new full-scope research and entity workflow primarily passed isolated simulated regressions, not a real thousand-document quality evaluation. Automated grouping, co-occurrence and model claims are not verified historical facts. Legacy statistical graphs are not automatically rebuilt.
+
+## 1.2.34-beta.2 - 2026-09-10
+
+### 中文
+
+- 本地测试安装包，未公开发布；保留原有应用标识和数据目录规则。升级测试前请先备份资料库。
+- 修复版式还原校对首次打开时模式重置、文字及表格编辑撤销缺失、保存失败误报成功等问题，补齐页面重做。
+- 校准文献页码不再改动前面页面；校对保存后刷新当前全文命中，索引准备中能够继续等待并显示失败状态。
+- 修复摘录原文可用性混用文献页码与自然页码的问题；新生成引注和专题 Markdown 导出读取当前校准页码，保留历史摘录和引用快照。
+- 复制引用不再使用旧显示缓存，批量复制引用去重并限制最多 4 路并发；保留完整摘录和检索范围。
+- 包含 beta.1 之后的知识图谱与专题工作流调整，以及编辑、导入和跨功能联动修复。
+
+### English
+
+- Local test installers, not a public release. Application identity and data-directory rules are unchanged. Back up your library before upgrading.
+- Fixed facsimile proofreading mode resets on first open, missing undo for text and table edits, and false save-success feedback; added page redo.
+- Printed-page calibration leaves earlier pages unchanged. Saved proofreading refreshes current full-text hits, with index-wait and failure handling.
+- Fixed confusion between printed citation pages and physical source pages in excerpt availability. Newly generated citations and project Markdown exports use current calibrated pages, preserving historical excerpts and citation snapshots.
+- Copying citations no longer uses stale display caches. Bulk citation copying deduplicates requests with at most four concurrent calls, preserving all excerpts and search coverage.
+- Includes knowledge-graph and topic workflow changes since beta.1, plus editing, import, and cross-feature integration fixes.
+
+## 1.2.34-beta.1 - 2026-09-09
+
+### 中文
+
+- 本地测试版：尚未公开发布。升级前请使用软件备份功能备份资料库；安装版沿用现有应用标识和安装目录规则。
+- 数据库公共读写增加有界 SQL 编译缓存，减少文献记录入库、队列状态更新和重复查询的编译开销；不缓存查询结果，不减少搜索文献、正文或结果覆盖范围。
+- OCR 批量保存将大字段压缩移出数据库写事务，写回前重新核对页面；当前页与版本记录复用同一份已准备正文和布局，保留校对稿与历史记录。
+- 正文解压缓存增加 32MiB 字符存储预算，超大正文仍完整读取；缺失或损坏的旧版正文文件恢复后可重新读取，不再被失败缓存遮挡。
+
+- 新增独立“知识图谱”工作台：跨专题材料集、网络/实体/关系/时间记录视图、字段和有向关系定义、关联路径、证据考证修订及 JSON/CSV 导出；明确区分共现候选与材料陈述。
+- 图谱支持鼠标位置锚定的平滑滚轮缩放、悬停提示、单击证据、双击聚焦和右键菜单；筛选时保留拖动位置与视角，新增节点固定、缩放比例和显式重新布局。
+- 考察表按人物、地点、事件、关系考证和时间线索组织，补充原文关联、出处和待核验材料数；支持表头排序、即时搜索与核验筛选，并可从对象进入关联网络或限定文献的 AI 考证。
+- MCP 新增图谱材料集、图谱查询和证据检索三个只读工具，保留项目隔离、来源与覆盖范围。
+- 图谱按需加载，分页读取已有研究数据，对大数据集明确提示展示范围；不改变旧数据库与向量格式，不自动调用付费 AI。
+- 修复研究专题切换时旧请求覆盖新内容、部分刷新动作被缓存标记拦截的问题；减少研究数据集列表的重复数据库查询。
+- 缩小向量缓存扫描的连续计算批次，并防止并发索引修改后重新发布失效缓存。
+- 更新兼容范围内的 XML/YAML 等间接依赖，修复已知安全漏洞。
+- 修复并发启动时目录探测文件互相删除引发的“目录不可写”误报；后台 MCP/测试模式不再显示该系统弹窗，前台提示按真实错误代码区分原因。数据位置和目录权限不变。
+
+### English
+
+- Local beta for testing, not a public release. Back up the library using the application before upgrading; the installer retains the existing application identity and installation-directory rules.
+- Added a bounded compiled-SQL cache to reduce repeated preparation during document insertion, queue updates, and queries. Query results are not cached and search scope/content coverage is unchanged.
+- Batch OCR compresses large payloads outside write transactions and rechecks pages before committing. Current pages and version records reuse prepared text/layout payloads while preserving proofreading and history.
+- Added a 32MiB character-storage budget to the decompressed-text cache. Oversized text is still read completely; restored legacy missing/corrupt payloads are retried instead of being hidden by cached failures.
+
+- Added a standalone Knowledge Graph workspace with cross-topic datasets, network/entity/relation/time views, directed-relation definitions, association paths, evidence review and revisions, and JSON/CSV exports. Co-occurrence candidates and source assertions remain distinct.
+- Added smooth cursor-anchored wheel zoom, hover previews, click-to-evidence, double-click focus, and context menus. Filtering retains dragged positions and viewport; nodes can be pinned, with zoom percentage and explicit relayout controls.
+- Organized study tables around people, places, events, relation review, and original time expressions, with same-record context, sources, and pending-review counts. Added column sorting, live search, review filters, and links to focused networks or document-scoped AI review.
+- Added three read-only MCP tools for graph sources, queries, and evidence, preserving project isolation, provenance, and coverage.
+- Graph data loads on demand in bounded pages with explicit partial-view notices. Existing database/vector formats remain unchanged and no paid AI request is triggered automatically.
+- Fixed stale responses overwriting a newly selected research project and refresh actions being skipped by cache markers; reduced redundant dataset-list database queries.
+- Shortened uninterrupted vector-cache scan batches and prevented invalidated in-flight scans from republishing their cache.
+- Updated compatible XML/YAML and other transitive dependencies to address known security vulnerabilities.
+- Fixed false directory-writability errors caused by concurrent startups deleting the same probe file. Headless MCP/test launches no longer show this modal; interactive errors distinguish actual error codes. Data locations and permissions are unchanged.
+
 ## 1.2.33 - 2026-08-20
 
 ### 中文
@@ -2135,3 +2227,4 @@
 ### English
 
 - Initial open-source release.
+- 知识图谱新增“选择文献并提取”入口：分析范围复用文献库的题名/作者搜索、文献类型、标签和文件夹筛选，支持单本、多本及拖拽框选；确认后才进入研究提取流程，既有图谱材料集与历史数据保持不变。

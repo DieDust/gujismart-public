@@ -6,7 +6,7 @@ const path = require('path')
 const LABELS = {
   welcomeTitle: '\u6587\u732e\u7ba1\u7406',
   library: '\u6587\u732e\u5e93',
-  research: '\u7814\u7a76',
+  knowledge: '\u77e5\u8bc6\u56fe\u8c31',
   search: '\u68c0\u7d22',
   citation: '\u5f15\u7528\u683c\u5f0f',
   tags: '\u6807\u7b7e',
@@ -254,6 +254,66 @@ async function verifyCitationStyles(window) {
 }
 
 let capabilityInputSequence = 0
+
+async function verifyFacsimileSaveRefreshesSearch(window, userDataDir) {
+  const { PDFDocument } = require('pdf-lib')
+  const pdf = await PDFDocument.create()
+  pdf.addPage([600, 800]).drawText('Original evidence', { x: 40, y: 720 })
+  const samplePath = path.join(userDataDir, 'zz-smoke-facsimile-search.pdf')
+  fs.writeFileSync(samplePath, await pdf.save())
+  const results = await importFilesWithCapabilities(window, [samplePath])
+  if (!results[0]?.success) throw new Error('Facsimile search fixture import failed')
+  const docId = results[0].id
+  await window.waitForFunction(async id => (await window.api.getDocument(id))?.pages?.length > 0, docId)
+  await window.evaluate(async id => {
+    const doc = await window.api.getDocument(id)
+    const first = doc.pages[0]
+    await window.api.updatePage(first.id, {
+      ocr_result: { layout_result: [{ label: 'text', words: 'Original evidence', orientation: 'horizontal', reading_order: 0, location: { left: 40, top: 40, width: 500, height: 80 } }] },
+      ocr_text: 'Original evidence', proofed_text: 'Original evidence', ocr_status: 'completed',
+    })
+    await window.api.applyLiteraturePageAnchor(id, first.page_num, 101)
+    await window.api.saveReaderState(id, { document_mode: 'proof', location_key: 'page:1', progress: 0 })
+    window.__smokeOpenDocument?.({ docId: id, pageIndex: 0, keyword: 'replacement' })
+  }, docId)
+  await window.locator('label.ant-segmented-item').filter({ hasText: /^校对模式 · 实验$/ }).click({ timeout: 15000 })
+  await window.locator('label.ant-segmented-item').filter({ hasText: /^版式还原$/ }).click({ timeout: 15000 })
+  const block = window.locator('[data-guji-block-index="0"]')
+  await block.waitFor({ state: 'visible', timeout: 15000 })
+  // Complete the queued index deterministically; the reader must leave its waiting state by itself.
+  await window.evaluate(id => window.api.reindexDocumentSearch(id), docId)
+  await window.waitForFunction(() => (document.querySelector('main')?.textContent || '').includes('无命中'), null, { timeout: 15000 })
+  await block.dblclick()
+  await window.locator('[data-manual-block-inspector="true"]').getByRole('textbox').fill('replacement evidence')
+  await window.waitForFunction(() => Array.from(document.querySelectorAll('[data-reader-search-counter="true"]')).some(node => /1\s*\/\s*1/.test(node.textContent || '')), null, { timeout: 15000 })
+  const state = await window.evaluate(async id => {
+    const doc = await window.api.getDocument(id)
+    const hits = await window.api.getDocumentSearchHits(id, 'replacement', { resultMode: 'all' })
+    return { hits: hits.hits, page: doc.pages[0] }
+  }, docId)
+  if (state.hits.length !== 1 || state.hits[0].locator.pageNum !== 1 || state.page.literature_page_num !== 101) {
+    throw new Error('Edited search must keep physical navigation page 1 separate from printed page 101')
+  }
+  console.log('[smoke] Facsimile editing refreshed current search; printed page 101 retained with physical locator 1.')
+  await window.evaluate(async ({ id, locator }) => {
+    const project = await window.api.createResearchProject({ name: 'Page citation smoke' })
+    const style = await window.api.createCitationStyle({ name: 'Page citation smoke' })
+    await window.api.createCitationTemplate({ style_id: style.id, name: 'Page fixture', format_type: 'Custom', template_text: '{{title}} | {{cite_pages}}' })
+    const note = await window.api.createResearchNote({
+      project_id: project.id, doc_id: id, page_num: 101, excerpt: 'replacement evidence',
+      source_id: JSON.stringify({ pageNum: 1, citationPageNum: 101, locator }), locator,
+    })
+    const notes = await window.api.listResearchNotes(project.id)
+    if (notes.find(item => item.id === note.id)?.source_available !== 1) throw new Error('Printed-page excerpt source must remain available')
+    await window.api.applyLiteraturePageAnchor(id, 1, 201)
+    const citation = await window.api.generateCitationByStyle(id, style.id, '', { pageNum: 101, sourcePageId: locator.pageId, sourcePageNum: 1 })
+    const exported = await window.api.exportResearchProject(project.id, { format: 'markdown', citationStyleId: style.id, includeReferences: false })
+    if (!citation.endsWith('| 201') || !exported.content.includes('| 201')) throw new Error('Compiled citation/export pipeline must use the recalibrated printed page')
+    const saved = (await window.api.listResearchNotes(project.id)).find(item => item.id === note.id)
+    if (saved.page_num !== 101 || saved.excerpt !== 'replacement evidence') throw new Error('Citation refresh must preserve the original excerpt snapshot')
+  }, { id: docId, locator: state.hits[0].locator })
+  console.log('[smoke] Excerpt availability, recalibrated citations and project exports agree; original evidence snapshot retained.')
+}
 
 async function importFilesWithCapabilities(window, filePaths) {
   const inputId = `smoke-capability-input-${++capabilityInputSequence}`
@@ -537,6 +597,15 @@ async function verifySearchReaderRoundTrip(window, userDataDir) {
   }
 
   const docId = importResults[0].id
+  const importedMetadata = await window.evaluate(async (id) => {
+    const doc = await window.api.getDocument(id)
+    return JSON.parse(doc.metadata || '{}')
+  }, docId)
+  const sourceBytes = fs.readFileSync(samplePath)
+  if (importedMetadata.file_sha256 !== require('node:crypto').createHash('sha256').update(sourceBytes).digest('hex')
+    || importedMetadata.file_size_bytes !== sourceBytes.length) {
+    throw new Error('Streamed ebook import must retain the exact file checksum and byte count')
+  }
   const groupedHits = await window.evaluate(async (id) => {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const payload = await window.api.querySearchV2('roundtrip-keyword', { docIds: [id], limit: 10 })
@@ -1716,6 +1785,7 @@ async function run() {
   try {
     const startupStartedAt = Date.now()
     const window = await app.firstWindow({ timeout: 20000 })
+    window.on('console', message => { if (message.type() === 'error') console.error('[renderer]', message.text()) })
     await window.waitForLoadState('domcontentloaded')
 
     const title = await window.title()
@@ -1732,8 +1802,16 @@ async function run() {
     }
     await verifyMainText(window, LABELS.welcomeTitle)
 
-    await clickMenu(window, LABELS.research)
-    await verifyMainText(window, '\u7814\u7a76\u5de5\u4f5c\u53f0')
+    if (process.argv.includes('--facsimile-only')) {
+      await verifyFacsimileSaveRefreshesSearch(window, userDataDir)
+      console.log('Facsimile compiled-app smoke passed.')
+      return
+    }
+
+    await clickMenu(window, LABELS.knowledge)
+    await window.getByRole('textbox', { name: '\u60f3\u7814\u7a76\u7684\u95ee\u9898' }).waitFor({ state: 'visible' })
+    await window.locator('.knowledge-workspace-header').getByText('\u4e13\u9898\u7814\u7a76', { exact: true }).click()
+    await window.locator('.knowledge-research-host').getByRole('tab', { name: /\u8bc1\u636e\u6458\u5f55/ }).waitFor({ state: 'visible' })
 
     await clickMenu(window, LABELS.search)
     await verifyMainText(window, '\u6587\u732e\u68c0\u7d22')
@@ -1761,6 +1839,7 @@ async function run() {
     await verifyReaderSearchSyncsAfterManualPageFlip(window, userDataDir)
     await verifyReaderSearchKeepsActiveVisibleInLongSection(window, userDataDir)
     await verifyReaderSearchRendersHtmlTables(window, userDataDir)
+    await verifyFacsimileSaveRefreshesSearch(window, userDataDir)
     await verifyReaderNormalizesInlineMathMarkers(window, userDataDir)
 
     const smokeDbPath = path.join(smokeDbDir, 'db', 'gujismart.db')
@@ -1769,6 +1848,11 @@ async function run() {
     }
 
     console.log('Electron smoke test passed.')
+  } catch (error) {
+    const window = await app.firstWindow()
+    await window.screenshot({ path: path.join(userDataDir, 'failure.png') }).catch(() => {})
+    console.error('Smoke fixture: ' + userDataDir)
+    throw error
   } finally {
     await app.close()
   }

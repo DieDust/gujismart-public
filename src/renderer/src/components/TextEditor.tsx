@@ -39,7 +39,8 @@ const LABEL_NAMES: Record<string, string> = {
 interface TextEditorProps {
   ocrResult: TextEditorOcrResult | null | undefined
   pageId: string
-  onSave: (pageId: string, data: PageUpdatePayload) => Promise<boolean>
+  onSave: (pageId: string, data: PageUpdatePayload, echoToken?: string) => Promise<boolean>
+  saveEchoToken?: string
   onReset: (pageId: string) => void
   onModeChange?: (mode: 'markdown' | 'translation' | 'region') => void
   onTextSelectionChange?: (text: string) => void
@@ -149,7 +150,10 @@ export default function TextEditor({
   switchToRegion,
   onSwitchToRegionConsumed,
   searchKeyword = '',
+  saveEchoToken,
 }: TextEditorProps) {
+  const editorSession = useRef(crypto.randomUUID())
+  const initializedPage = useRef<string>()
   const [viewMode, setViewMode] = useState<'markdown' | 'translation' | 'region'>('region')
   const [editingIndex, setEditingIndex] = useState(-1)
   const [editValue, setEditValue] = useState('')
@@ -169,6 +173,9 @@ export default function TextEditor({
   const hasLayout = layoutResult.length > 0
 
   useEffect(() => {
+    const samePage = initializedPage.current === pageId
+    initializedPage.current = pageId
+    if (samePage && saveEchoToken === editorSession.current) return
     if (hasLayout) {
       const nextLayout = layoutResult.map((box) => {
         const rawWords = getRawOcrBlockText(box)
@@ -189,7 +196,7 @@ export default function TextEditor({
     setDragPreview(null)
     setDragInsertIndex(-1)
     setLocalActiveBoxIndex(null)
-  }, [hasLayout, layoutResult, wordsResult])
+  }, [hasLayout, layoutResult, wordsResult, pageId, saveEchoToken])
 
   const effectiveActiveBoxIndex = localActiveBoxIndex ?? activeBoxIndex
 
@@ -253,7 +260,7 @@ export default function TextEditor({
     const nextText = normalizedData.map((box) => getOcrBlockText(box) || '').join('\n')
     // Bursts of proofreading actions merge into one debounced full-page save.
     return debouncedSaver.schedule(() => (
-      onSave(pageId, { ocr_result: nextOcrResult, ocr_text: nextText, proofed_text: nextText })
+      onSave(pageId, { ocr_result: nextOcrResult, ocr_text: nextText, proofed_text: nextText }, editorSession.current)
     ))
   }, [debouncedSaver, ocrResult, onSave, pageId])
 

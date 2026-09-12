@@ -10,6 +10,7 @@ export type WorkspaceViewKey =
   | 'citation'
   | 'tags'
   | 'research'
+  | 'knowledge'
   | 'excerpts'
 
 export type WorkspaceFoldersState = {
@@ -105,6 +106,7 @@ const VIEW_KEYS = new Set<WorkspaceViewKey>([
   'citation',
   'tags',
   'research',
+  'knowledge',
   'excerpts',
 ])
 const SINGLETON_VIEW_KEYS = new Set<WorkspaceViewKey>([
@@ -123,7 +125,8 @@ const VIEW_TITLES: Record<WorkspaceViewKey, string> = {
   search: '检索',
   citation: '引用格式',
   tags: '标签',
-  research: '研究',
+  research: '知识图谱',
+  knowledge: '知识图谱',
   excerpts: '摘录',
 }
 
@@ -315,7 +318,8 @@ function sanitizeTab(value: unknown, allowedGroupIds: Set<string>): WorkspaceApp
   if (kind === 'view') {
     const view = cleanString(value.view, 80) as WorkspaceViewKey
     if (!VIEW_KEYS.has(view)) return null
-    const title = cleanString(value.title, MAX_TITLE_LENGTH) || VIEW_TITLES[view]
+    const savedTitle = cleanString(value.title, MAX_TITLE_LENGTH)
+    const title = view === 'research' && (savedTitle === '研究' || savedTitle === '研究工作台') ? VIEW_TITLES.knowledge : savedTitle || VIEW_TITLES[view]
     const initialSearchKeyword = cleanString(value.initialSearchKeyword, MAX_KEYWORD_LENGTH)
     return withSanitizedTabGroup({
       id,

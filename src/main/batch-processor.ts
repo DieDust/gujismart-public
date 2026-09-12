@@ -14,7 +14,7 @@ import {
 } from './ocr'
 import { globalOcrDocumentWindow } from './ocr-document-window'
 import { markSearchIndexStaleForPages, notifySearchContentChanged } from './semantic-search'
-import { preparePagePayloadUpdate } from './page-payload-store'
+import { preparePagePayloadUpdateAsync } from './page-payload-store'
 import {
   cancelLegacyBatchTask,
   completeLegacyBatchItem,
@@ -321,6 +321,24 @@ class BatchProcessor {
     const changedPageIds: string[] = []
     for (let index = 0; index < pageResults.length; index += BATCH_RESULT_SAVE_CHUNK_SIZE) {
       const chunk = pageResults.slice(index, index + BATCH_RESULT_SAVE_CHUNK_SIZE)
+      const ids = chunk.map((item) => item.pageId).filter(Boolean)
+      const sourcePages = new Map((ids.length
+        ? queryAll<Pick<BatchPageRow, 'id' | 'doc_id'>>(`SELECT id, doc_id FROM pages WHERE id IN (${ids.map(() => '?').join(',')})`, ids)
+        : []).map((page) => [page.id, page]))
+      const preparedWrites: Array<{
+        pageResult: OcrPageResult
+        docId: string
+        preparedResult: Awaited<ReturnType<typeof preparePagePayloadUpdateAsync>>
+        preparedText: Awaited<ReturnType<typeof preparePagePayloadUpdateAsync>>
+      }> = []
+      // Compress before acquiring the write transaction; keep preparation concurrency bounded.
+      for (const pageResult of chunk) {
+        const page = sourcePages.get(pageResult.pageId)
+        if (!page) continue
+        const preparedResult = await preparePagePayloadUpdateAsync(page.doc_id, pageResult.pageId, 'ocr_result', pageResult.result ? JSON.stringify(pageResult.result) : null)
+        const preparedText = await preparePagePayloadUpdateAsync(page.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
+        preparedWrites.push({ pageResult, docId: page.doc_id, preparedResult, preparedText })
+      }
       transaction(() => {
         const pageIds = chunk.map((pageResult) => pageResult.pageId).filter(Boolean)
         const placeholders = pageIds.map(() => '?').join(', ')
@@ -328,19 +346,12 @@ class BatchProcessor {
           ? queryAll<Pick<BatchPageRow, 'id' | 'doc_id'>>(`SELECT id, doc_id FROM pages WHERE id IN (${placeholders})`, pageIds)
           : []
         ).map((page) => [page.id, page]))
-        chunk.forEach((pageResult) => {
+        preparedWrites.forEach(({ pageResult, docId, preparedResult, preparedText }) => {
           if (pageResult.status === 'error') {
             console.error(`[Batch] Page OCR failed: ${pageResult.pageId}`, pageResult.error)
           }
           const page = pageById.get(pageResult.pageId)
-          if (!page) return
-          const preparedResult = preparePagePayloadUpdate(
-            page.doc_id,
-            pageResult.pageId,
-            'ocr_result',
-            pageResult.result ? JSON.stringify(pageResult.result) : null,
-          )
-          const preparedText = preparePagePayloadUpdate(page.doc_id, pageResult.pageId, 'ocr_text', pageResult.text)
+          if (!page || page.doc_id !== docId) return
 
           run(
             `UPDATE pages SET ocr_result = ?, ocr_result_ref = ?, ocr_text = ?, ocr_text_ref = ?, ocr_status = ?,

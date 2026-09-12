@@ -1651,6 +1651,7 @@ export default function DocumentView({
   compactHeader = false,
 }: DocumentViewProps) {
   const openContextKey = getDocumentOpenContextKey(documentId, locator, stableLocator, initialPageIndex, searchKeyword, sourceId, highlightExcerpt, revealToc, searchSession)
+  const initializedOpenContextRef = useRef<string | null>(null)
   const [doc, setDoc] = useState<DocumentViewDocument | null>(null)
   const [loading, setLoading] = useState(true)
   const [ocrProcessing, setOcrProcessing] = useState(false)
@@ -1771,6 +1772,7 @@ export default function DocumentView({
   const intendedDocumentModeRef = useRef<DocumentMode>('proof')
   const documentModeSwitchSerialRef = useRef(0)
   const readerSaveTimerRef = useRef<number | null>(null)
+  const pageSaveEchoRef = useRef<{ pageId: string; ocrResult: string | null; token?: string }>()
   const readerPreferencesLoadedRef = useRef(false)
   const readerPreferencesSaveTimerRef = useRef<number | null>(null)
   const latestReaderPreferencesRef = useRef<ReaderGlobalPreferences>(DEFAULT_READER_GLOBAL_PREFERENCES)
@@ -1780,6 +1782,8 @@ export default function DocumentView({
   const incomingSearchSessionKeyRef = useRef('')
   /** Prevents re-fetch loops when a focused open expands to 0–1 fulltext hits. */
   const documentSearchFetchedKeyRef = useRef('')
+  const [savedSearchRevision, setSavedSearchRevision] = useState<{ docId: string; revision: number } | null>(null)
+  const refreshSavedSearchRef = useRef<() => void>(() => undefined)
   /** Doc-scoped vector expand (in-document semantic hits). */
   const documentVectorExpandKeyRef = useRef('')
   const searchAutoNavigationKeyRef = useRef('')
@@ -2952,6 +2956,10 @@ export default function DocumentView({
   }, [canUseManualFacsimileLayout, proofViewMode])
 
   useLayoutEffect(() => {
+    // Suspense can replay layout effects after a lazy editor becomes visible.
+    // Reinitialize only for a new open request, not for that visibility replay.
+    if (initializedOpenContextRef.current === openContextKey) return
+    initializedOpenContextRef.current = openContextKey
     activeDocumentIdRef.current = documentId
     documentModeSwitchSerialRef.current += 1
     const targetDocId = documentId
@@ -3207,6 +3215,48 @@ export default function DocumentView({
         setCurrentMatchIndex(-1)
       })
   }, [currentPageIndex, documentId, documentMode])
+
+  refreshSavedSearchRef.current = () => {
+    if (readerSearchEngine === 'fulltext' && effectiveSearchKeyword.trim()) {
+      runInDocumentSearch(effectiveSearchKeyword, 'fulltext')
+    }
+  }
+  useEffect(() => {
+    if (savedSearchRevision?.docId !== documentId) return
+    const timer = window.setTimeout(() => refreshSavedSearchRef.current(), 450)
+    return () => window.clearTimeout(timer)
+  }, [savedSearchRevision, documentId])
+
+  useEffect(() => {
+    if (readerSearchEngine !== 'fulltext' || documentSearchSession?.status !== 'searching'
+      || documentSearchSession.phase !== 'verifying') return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout>
+    let delay = 1000
+    const checkIndex = async () => {
+      try {
+        const statuses = await window.api.getSearchIndexStatus(documentId)
+        if (cancelled) return
+        const status = statuses.find((item) => item.doc_id === documentId)
+        if (status?.status === 'ready') {
+          refreshSavedSearchRef.current()
+          return
+        }
+        if (status?.status === 'error' || status?.status === 'failed') {
+          setDocumentSearchSession((previous) => previous ? { ...previous, status: 'error' } : previous)
+          message.warning(status.error_message || '检索索引构建失败，请重试检索')
+          return
+        }
+      } catch (error) {
+        if (cancelled) return
+        console.warn('Failed to check document search index status', error)
+      }
+      delay = Math.min(5000, delay * 2)
+      timer = setTimeout(() => { void checkIndex() }, delay)
+    }
+    timer = setTimeout(() => { void checkIndex() }, delay)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [documentId, readerSearchEngine, documentSearchSession?.query, documentSearchSession?.status, documentSearchSession?.phase])
 
   // Open / prop keyword: seed multi-hit FTS once, otherwise kick off search if not already claimed.
   useEffect(() => {
@@ -4286,10 +4336,15 @@ export default function DocumentView({
     await loadDocument()
   }
 
-  const handleSavePage = async (pageId: string, data: PageUpdatePayload): Promise<boolean> => {
+  const handleSavePage = async (pageId: string, data: PageUpdatePayload, echoToken?: string): Promise<boolean> => {
+    const targetDocId = doc?.id
     const previousPageOcrStatus = doc?.pages?.find((page) => page.id === pageId)?.ocr_status
     try {
-      await window.api.updatePage(pageId, data)
+      const saved = await window.api.updatePage(pageId, data)
+      if (saved === false) throw new Error('Page update was not saved')
+      const savedOcrResult = data.ocr_result === undefined ? undefined
+        : typeof data.ocr_result === 'string' ? data.ocr_result : JSON.stringify(data.ocr_result)
+      if (savedOcrResult !== undefined) pageSaveEchoRef.current = { pageId, ocrResult: savedOcrResult, token: echoToken }
       if (data.ocr_result !== undefined || data.ocr_text !== undefined || data.proofed_text !== undefined) {
         setPageTranslations((current) => {
           const next = { ...current }
@@ -4308,15 +4363,11 @@ export default function DocumentView({
         })
       }
       setDoc((previous) => {
-        if (!previous?.pages) return previous
+        if (!previous?.pages || previous.id !== targetDocId) return previous
 
         const nextPages = previous.pages.map((page) => {
           if (page.id !== pageId) return page
-          const nextOcrResult = data.ocr_result === undefined
-            ? page.ocr_result
-            : typeof data.ocr_result === 'string'
-              ? data.ocr_result
-              : JSON.stringify(data.ocr_result)
+          const nextOcrResult = savedOcrResult === undefined ? page.ocr_result : savedOcrResult
           return {
             ...page,
             ocr_result: nextOcrResult,
@@ -4359,6 +4410,10 @@ export default function DocumentView({
         window.dispatchEvent(new CustomEvent(LIBRARY_RELATIONS_CHANGED_EVENT, {
           detail: { source: 'ocr-page-content-saved' },
         }))
+      }
+      if (targetDocId && activeDocumentIdRef.current === targetDocId
+        && ('ocr_text' in data || 'proofed_text' in data || 'ocr_result' in data)) {
+        setSavedSearchRevision((previous) => ({ docId: targetDocId, revision: (previous?.revision || 0) + 1 }))
       }
       return true
     } catch (error) {
@@ -6975,7 +7030,7 @@ export default function DocumentView({
                 <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>检索中</span>
               ) : null}
               {effectiveSearchKeyword && documentSearchSession?.status !== 'searching' && searchMatches.length === 0 ? (
-                <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>无命中</span>
+                <span style={{ fontSize: 12, color: 'var(--gs-text-tertiary)' }}>{documentSearchSession?.status === 'error' ? '检索失败，请重新检索' : '无命中'}</span>
               ) : null}
             </Space>
           </div>
@@ -7037,6 +7092,7 @@ export default function DocumentView({
                 ocrResult={proofingOcrResultObj}
                 pageId={currentPage?.id || ''}
                 onSave={handleSavePage}
+                saveEchoToken={pageSaveEchoRef.current?.pageId === currentPage.id && pageSaveEchoRef.current?.ocrResult === currentPage.ocr_result ? pageSaveEchoRef.current.token : undefined}
                 onReset={handleResetPage}
                 onModeChange={(mode) => {
                   if (mode === 'region' && needsPdfAssetRestore) {

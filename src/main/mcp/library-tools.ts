@@ -21,6 +21,8 @@ import { querySearchV2 } from '../semantic-search'
 import { getEmbeddingIndexStats, vectorSearch } from '../embedding-index'
 import { getActiveLibraryProjectId } from '../library-projects'
 import { VECTOR_SEARCH_MAX_LIMIT } from '../../shared/vector-search'
+import { getKnowledgeGraphData, getKnowledgeGraphEvidence, listKnowledgeGraphSources } from '../knowledge-graph'
+import { buildKnowledgeGraph, filterResearchGraph, normalizeKnowledgeGraphConfigs } from '../../shared/research-graph'
 
 const MAX_SEARCH_LIMIT = VECTOR_SEARCH_MAX_LIMIT
 const MAX_LIST_LIMIT = 50
@@ -109,6 +111,33 @@ const DETAIL_PROP = {
 } as const
 
 export const MCP_TOOL_DEFINITIONS: McpToolDefinition[] = [
+  {
+    name: 'knowledge_graph_sources',
+    description: 'List research datasets and field schemas available to the knowledge graph in the active library project. Read-only; no AI calls or vector rebuild.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'knowledge_graph_query',
+    description: 'Query a bounded evidence-linked graph from explicitly selected datasets. event links are record associations; cooccurrence is not a factual relation. relation links require config with mapping/sourceField/targetField/relationField. Entity identities are same-name candidates. Paths ignore direction and do not imply causation. Returns record IDs for knowledge_graph_evidence.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        datasetIds: { type: 'array', items: { type: 'string' }, maxItems: 20 },
+        kind: { type: 'string', enum: ['event', 'relation', 'cooccurrence'] },
+        confirmedOnly: { type: 'boolean' },
+        minEvidence: { type: 'integer', minimum: 1, maximum: 2000 },
+        focusId: { type: 'string', description: 'Entity id returned by a previous graph query' },
+        targetId: { type: 'string', description: 'Optional shortest-path endpoint; requires focusId' },
+        configs: { type: 'object', description: 'Dataset-id keyed field mappings and explicit relationship field definitions, same schema as the desktop JSON export.' },
+      },
+      required: ['datasetIds'],
+    },
+  },
+  {
+    name: 'knowledge_graph_evidence',
+    description: 'Read up to 50 graph evidence records in the active library project, including review status, field values, and document/page references. Source quotes still require scholarly verification. No mutations.',
+    inputSchema: { type: 'object', properties: { recordIds: { type: 'array', items: { type: 'string' }, maxItems: 50 } }, required: ['recordIds'] },
+  },
   {
     name: 'library_search',
     description:
@@ -316,6 +345,45 @@ export async function callLibraryTool(
   const input = args && typeof args === 'object' ? args : {}
 
   switch (name) {
+    case 'knowledge_graph_sources':
+      return { ok: true, sources: listKnowledgeGraphSources().map((source) => ({
+        id: source.id, name: source.name, researchProjectId: source.project_id, fields: source.fieldSchema, recordCount: source.record_count,
+      })) }
+    case 'knowledge_graph_query': {
+      if (!Array.isArray(input.datasetIds) || input.datasetIds.some((id) => typeof id !== 'string')) return toolError('invalid_args', 'datasetIds must be a string array')
+      const data = await getKnowledgeGraphData({ datasetIds: input.datasetIds as string[] })
+      const built = buildKnowledgeGraph(data, normalizeKnowledgeGraphConfigs(input.configs), input.confirmedOnly === true)
+      const kind = input.kind === 'relation' || input.kind === 'cooccurrence' ? input.kind : 'event'
+      const minEvidence = clampLimit(input.minEvidence, 2000, 1)
+      let graph = { ...built, edges: built.edges.filter((edge) => edge.kind === kind && edge.recordIds.length >= minEvidence) }
+      const focusId = typeof input.focusId === 'string' ? input.focusId : undefined
+      const targetId = typeof input.targetId === 'string' ? input.targetId : undefined
+      const path = focusId && targetId
+        ? (await import('../../shared/research-graph-path')).findResearchGraphPath(graph, focusId, targetId)
+        : undefined
+      if (path) graph = { ...graph, nodes: graph.nodes.filter((node) => path.includes(node.id)), edges: graph.edges.filter((edge) => path.includes(edge.id)) }
+      const visible = filterResearchGraph(graph, { kinds: ['person', 'place', 'time', 'event'], minEvidence, focusId: targetId ? undefined : focusId })
+      const nodes = visible.nodes.slice(0, 60)
+      const ids = new Set(nodes.map((node) => node.id))
+      const edges = visible.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)).slice(0, 120)
+      return {
+        ok: true, libraryProjectId: data.libraryProjectId, datasetIds: data.datasets.map((dataset) => dataset.id),
+        semantics: { kind, identity: 'same-name candidates, not verified identity', pathDirected: false },
+        coverage: { totalRecords: data.totalRecords, loadedRecords: data.records.length, truncated: data.truncated, hiddenNodes: visible.hiddenNodes + visible.nodes.length - nodes.length, hiddenEdges: visible.hiddenEdges + visible.edges.length - edges.length, omittedValues: graph.omittedValues },
+        nodes: nodes.map((node) => ({ ...node, recordCount: node.recordIds.length, recordIds: node.recordIds.slice(0, 20) })),
+        edges: edges.map((edge) => ({ ...edge, recordCount: edge.recordIds.length, recordIds: edge.recordIds.slice(0, 20) })),
+        path: path === undefined ? undefined : { found: path !== null, elementIds: path, basis: 'loaded records only' },
+      }
+    }
+    case 'knowledge_graph_evidence': {
+      if (!Array.isArray(input.recordIds) || input.recordIds.some((id) => typeof id !== 'string')) return toolError('invalid_args', 'recordIds must be a string array')
+      const records = getKnowledgeGraphEvidence(input.recordIds as string[])
+      return { ok: true, records: records.map((record) => ({
+        id: record.id, datasetId: record.dataset_id, title: record.doc_title, status: record.status, note: record.note,
+        values: record.values, excerpt: record.excerpt.slice(0, 2000), excerptTruncated: record.excerpt.length > 2000,
+        ref: { docId: record.doc_id, pageNum: record.page_num },
+      })) }
+    }
     case 'library_search': {
       const query = String(input.query || '').trim()
       if (!query) return toolError('invalid_args', 'query is required')

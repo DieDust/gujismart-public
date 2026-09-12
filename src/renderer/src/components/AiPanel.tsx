@@ -1,4 +1,5 @@
 ﻿import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import ResearchRunStatus, { type ResearchRunFailure } from './ResearchRunStatus'
 import {
   Alert,
   Button,
@@ -31,7 +32,7 @@ import {
   SendOutlined,
   TagOutlined,
 } from '@ant-design/icons'
-import type { AiChatSession, AiChatTurn, AiQuestionResponse, AiResearchDataset, AiResearchEvidencePack, AiResearchPlan, AiResearchRecord, AiResearchRetrievalStats, AiResearchTask, AiStreamEvent, AiSynthesisResult, AiSynthesisTemplate, AiTaskType, LibraryAiScope, LibraryAiScopePreview, LibraryAiTab, OpenDocumentTarget, ResearchProject, SearchHit, SearchHitLocator } from '@shared/types'
+import type { AiChatSession, AiChatTurn, AiQuestionResponse, AiResearchDataset, AiResearchEvidencePack, AiResearchPlan, AiResearchRecord, AiResearchRetrievalStats, AiResearchTask, AiResearchTaskStep, AiStreamEvent, AiSynthesisResult, AiSynthesisTemplate, AiTaskType, LibraryAiScope, LibraryAiScopePreview, LibraryAiTab, OpenDocumentTarget, ResearchProject, SearchHit, SearchHitLocator } from '@shared/types'
 import type { EvidenceQaCluster, EvidenceQaPlan, EvidenceQaSource } from '@shared/types'
 import AiMarkdown, { sourceToTarget } from './AiMarkdown'
 import LlmProfileSelector from './LlmProfileSelector'
@@ -141,9 +142,10 @@ function isResearchExtractionPrompt(value: string): boolean {
   return /(?:数据抽取|抽取|提取|抓取|统计|有多少|多少(?:篇|页|次|段|条|份)|出现(?:次数|频率|分布)|提及(?:次数|频率|分布)|篇幅|归类|分类|时空|时间线|证据表|数据集|字段|表格|规律总结)/.test(text)
 }
 
-function emitResearchWorkspaceUpdated(projectId?: string | null) {
-  if (!projectId) return
-  window.dispatchEvent(new CustomEvent('gujismart:research-workspace-updated', { detail: { projectId } }))
+function emitResearchWorkspaceUpdated(projectId?: string | null, datasetId?: string | null) {
+  window.dispatchEvent(new CustomEvent('gujismart:research-workspace-updated', {
+    detail: { projectId: projectId || null, datasetId: datasetId || null },
+  }))
 }
 
 function normalizeScope(scope?: LibraryAiScope): LibraryAiScope {
@@ -458,6 +460,7 @@ export default function AiPanel({
   const [researchGoal, setResearchGoal] = useState('')
   const [researchPlan, setResearchPlan] = useState<AiResearchPlan | null>(null)
   const [researchTask, setResearchTask] = useState<AiResearchTask | null>(null)
+  const [researchTaskSteps, setResearchTaskSteps] = useState<AiResearchTaskStep[]>([])
   const [researchDataset, setResearchDataset] = useState<AiResearchDataset | null>(null)
   const [researchRecords, setResearchRecords] = useState<AiResearchRecord[]>([])
   const [researchRetrievalStats, setResearchRetrievalStats] = useState<AiResearchRetrievalStats | null>(null)
@@ -467,6 +470,10 @@ export default function AiPanel({
   const [researchPreviewLoading, setResearchPreviewLoading] = useState(false)
   const [researchRunning, setResearchRunning] = useState(false)
   const [researchReportLoading, setResearchReportLoading] = useState(false)
+  const [researchFailure, setResearchFailure] = useState<ResearchRunFailure | null>(null)
+  const [researchStartedAt, setResearchStartedAt] = useState<number | null>(null)
+  const [researchPollError, setResearchPollError] = useState('')
+  const researchWorkflowLock = useRef(false)
   const [researchProjects, setResearchProjects] = useState<ResearchProject[]>([])
   const [researchProjectId, setResearchProjectId] = useState<string | null>(initialResearchProjectId)
   const [chatSessions, setChatSessions] = useState<AiChatSession[]>([])
@@ -475,6 +482,31 @@ export default function AiPanel({
   const [hasOlderTurns, setHasOlderTurns] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const activeStreamsRef = useRef<Record<string, string>>({})
+
+  useEffect(() => {
+    const taskId = researchTask?.id
+    if (!taskId) {
+      setResearchTaskSteps([])
+      return
+    }
+    let active = true
+    let timer: number | undefined
+    const refresh = async () => {
+      try {
+        const steps = await window.api.listAiResearchTaskSteps(taskId)
+        if (active) { setResearchTaskSteps(steps); setResearchPollError('') }
+      } catch (error) {
+        if (active) setResearchPollError(getErrorMessage(error, '无法读取任务进度'))
+        console.warn('Failed to refresh AI research task steps', error)
+      }
+      if (active && (researchTask?.status === 'running' || researchReportLoading)) timer = window.setTimeout(refresh, 700)
+    }
+    void refresh()
+    return () => {
+      active = false
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [researchTask?.id, researchTask?.status, researchReportLoading])
 
   useEffect(() => {
     setQuestion(initialQuestion)
@@ -1045,6 +1077,10 @@ export default function AiPanel({
       return null
     }
     setResearchPlanning(true)
+    setResearchStartedAt(Date.now())
+    setResearchFailure(null)
+    setResearchTaskSteps([])
+    setResearchPollError('')
     setResearchReport('')
     try {
       const plan = await window.api.planAiResearchTask({
@@ -1062,6 +1098,7 @@ export default function AiPanel({
       if (!options.quiet) message.success('已生成结构化抽取方案')
       return plan
     } catch (error: unknown) {
+      setResearchFailure({ stage: '生成抽取方案', message: getErrorMessage(error, '生成研究任务方案失败') })
       message.error(getErrorMessage(error, '生成研究任务方案失败'))
       return null
     } finally {
@@ -1081,6 +1118,7 @@ export default function AiPanel({
       return null
     }
     setResearchPreviewLoading(true)
+    setResearchFailure(null)
     try {
       const stats = await window.api.previewAiResearchRetrieval({
         goal,
@@ -1093,14 +1131,17 @@ export default function AiPanel({
       setResearchRetrievalStats(stats)
       setResearchEvidencePack(null)
       if (stats.readableSegmentCount === 0) {
+        setResearchFailure({ stage: '检索准备', message: '当前范围没有可读取 OCR 正文，尚未执行 AI 抽取。' })
         message.warning('当前范围没有可读取 OCR 正文')
       } else if (stats.totalHitCount === 0) {
+        setResearchFailure({ stage: '检索准备', message: '关键词未命中，尚未执行 AI 抽取。请调整查询或文献范围。' })
         message.warning('当前范围有 OCR 正文，但关键词未命中')
       } else if (!options.quiet) {
         message.success(`已完成本地统计：累计命中 ${stats.totalHitCount} 次，涉及 ${stats.totalDocumentCount} 篇文献`)
       }
       return stats
     } catch (error: unknown) {
+      setResearchFailure({ stage: '检索准备', message: getErrorMessage(error, '预览检索统计失败') })
       message.error(getErrorMessage(error, '预览检索统计失败'))
       return null
     } finally {
@@ -1109,33 +1150,29 @@ export default function AiPanel({
   }
 
   const runResearchEndToEnd = async (goalOverride?: string) => {
+    if (researchWorkflowLock.current || researchPlanning || researchPreviewLoading || researchRunning || researchReportLoading) return
     const goal = (goalOverride || question || researchGoal).trim()
     if (!goal) {
       message.info('请输入研究任务目标')
       return
     }
-    setActiveTab('research')
-    setResearchGoal(goal)
-    setResearchTask(null)
-    setResearchDataset(null)
-    setResearchRecords([])
-    setResearchReport('')
-    setResearchRetrievalStats(null)
-    setResearchEvidencePack(null)
-
-    const plan = await planResearchTask(goal, { quiet: true })
-    if (!plan) return
-
-    const stats = await previewResearchRetrieval(goal, plan, { quiet: true })
-    if (!stats || stats.readableSegmentCount === 0 || stats.totalHitCount === 0) return
-
-    await runResearchTask({
-      goalOverride: goal,
-      planOverride: plan,
-      autoGenerateReport: true,
-      quiet: true,
-    })
-    setQuestion('')
+    researchWorkflowLock.current = true
+    try {
+      setActiveTab('research')
+      setResearchGoal(goal)
+      setResearchTask(null)
+      setResearchDataset(null)
+      setResearchRecords([])
+      setResearchReport('')
+      setResearchRetrievalStats(null)
+      setResearchEvidencePack(null)
+      const plan = await planResearchTask(goal, { quiet: true })
+      if (!plan) return
+      const stats = await previewResearchRetrieval(goal, plan, { quiet: true })
+      if (!stats || stats.readableSegmentCount === 0 || stats.totalHitCount === 0) return
+      await runResearchTask({ goalOverride: goal, planOverride: plan, autoGenerateReport: true, quiet: true })
+      setQuestion('')
+    } finally { researchWorkflowLock.current = false }
   }
 
   const prepareResearchFromUnifiedPrompt = async (goalOverride?: string) => {
@@ -1188,6 +1225,10 @@ export default function AiPanel({
       return
     }
     setResearchRunning(true)
+    setResearchFailure(null)
+    setResearchTaskSteps([])
+    setResearchPollError('')
+    setResearchStartedAt((previous) => researchWorkflowLock.current && previous ? previous : Date.now())
     setResearchReport('')
     try {
       const task = await window.api.createAiResearchTask({
@@ -1199,21 +1240,26 @@ export default function AiPanel({
         fields,
         suggestedQueries: activePlan?.suggestedQueries || [goal],
       })
-      setResearchTask(task)
+      setResearchTask({ ...task, status: 'running' })
       const result = await window.api.runAiResearchTask(task.id)
       setResearchTask(result.task)
       setResearchDataset(result.dataset)
       setResearchRecords(result.records)
       setResearchRetrievalStats(result.retrievalStats || null)
       setResearchEvidencePack(result.evidencePack || null)
-      emitResearchWorkspaceUpdated(result.dataset?.project_id || researchProjectId)
+      emitResearchWorkspaceUpdated(result.dataset?.project_id || researchProjectId, result.dataset?.id)
+      let reportGenerated = false
       if (options.autoGenerateReport && result.dataset?.id && result.records.length > 0) {
-        await generateResearchReportForDataset(result.dataset.id, goal, { quiet: true })
+        reportGenerated = await generateResearchReportForDataset(result.dataset.id, goal, { quiet: true })
+        if (!reportGenerated) return
       }
-      message.success(options.autoGenerateReport
+      message.success(reportGenerated
         ? `已完成研究分析：生成 ${result.records.length} 条记录和一份报告`
         : `已生成 ${result.records.length} 条结构化研究记录`)
     } catch (error: unknown) {
+      const detail = getErrorMessage(error, '运行研究任务失败')
+      setResearchFailure({ stage: '结构化抽取', message: detail })
+      setResearchTask((previous) => previous ? { ...previous, status: 'error', error_message: detail } : previous)
       message.error(getErrorMessage(error, '运行研究任务失败'))
     } finally {
       setResearchRunning(false)
@@ -1222,6 +1268,7 @@ export default function AiPanel({
 
   const generateResearchReportForDataset = async (datasetId: string, goal: string, options: { quiet?: boolean } = {}) => {
     setResearchReportLoading(true)
+    setResearchFailure(null)
     try {
       const result = await window.api.generateAiResearchReport({
         datasetId,
@@ -1231,8 +1278,11 @@ export default function AiPanel({
       setResearchReport(result.content)
       emitResearchWorkspaceUpdated(researchProjectId)
       if (!options.quiet) message.success(result.outputId ? '报告已生成并保存到研究专题' : '报告已生成')
+      return true
     } catch (error: unknown) {
+      setResearchFailure({ stage: '生成报告', message: getErrorMessage(error, '生成数据报告失败') })
       message.error(getErrorMessage(error, '生成数据报告失败'))
+      return false
     } finally {
       setResearchReportLoading(false)
     }
@@ -1643,8 +1693,30 @@ export default function AiPanel({
 
       {researchTask ? (
         <div style={{ color: 'var(--gs-text-secondary)', fontSize: 13 }}>
-          任务状态：<Tag color={researchTask.status === 'completed' ? 'green' : researchTask.status === 'error' ? 'red' : 'blue'}>{researchTask.status}</Tag>
-          {researchTask.error_message ? <Text type="danger">{researchTask.error_message}</Text> : null}
+          <Space wrap>
+            <span>抽取任务状态：</span>
+            <Tag color={researchTask.status === 'completed' ? 'green' : researchTask.status === 'error' ? 'red' : 'blue'}>
+              {researchTask.status === 'running' ? '处理中' : researchTask.status === 'completed' ? '已完成' : researchTask.status === 'error' ? '失败' : researchTask.status}
+            </Tag>
+            {researchTask.status === 'error' ? (
+              <Button size="small" onClick={() => void runResearchTask({ quiet: true })}>重试任务</Button>
+            ) : null}
+          </Space>
+          {researchTask.error_message ? <Text type="danger" style={{ display: 'block', marginTop: 6 }}>{researchTask.error_message}</Text> : null}
+          {researchTaskSteps.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <Steps
+                size="small"
+                direction="vertical"
+                current={Math.max(0, researchTaskSteps.findIndex((step) => step.status === 'running'))}
+                items={researchTaskSteps.map((step) => ({
+                  title: `${step.title} ${Math.round(Math.max(0, Math.min(1, step.progress)) * 100)}%`,
+                  description: step.message,
+                  status: step.status === 'completed' ? 'finish' : step.status === 'error' ? 'error' : step.status === 'running' ? 'process' : 'wait',
+                }))}
+              />
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -1888,7 +1960,12 @@ export default function AiPanel({
         )}
       </div>
 
-      <div style={{ flex: 1, overflowY: 'auto', padding: mode === 'library' ? '0 16px 16px' : '20px 16px' }} ref={scrollRef}>
+      <ResearchRunStatus planning={researchPlanning} previewing={researchPreviewLoading}
+        running={researchRunning} reporting={researchReportLoading} startedAt={researchStartedAt}
+        steps={researchTaskSteps} failure={researchFailure} recordCount={researchRecords.length}
+        completed={researchTask?.status === 'completed'} reportReady={!!researchReport} pollError={researchPollError}
+        onRetryReport={researchDataset ? () => void generateResearchReport() : undefined} />
+      <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: mode === 'library' ? '0 16px 16px' : '20px 16px' }} ref={scrollRef}>
         {mode === 'library' || mode === 'document' ? (
           <div className="ai-panel-tabs-sticky">
             <Tabs

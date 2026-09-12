@@ -1,8 +1,9 @@
 import type { CitationGenerateOptions, ResearchKnowledgeKind, ResearchNote } from '@shared/types'
+import { getResearchNoteCitationPage, getResearchNotePageSource } from '@shared/research-note-pages'
 
 type CitationNote = Pick<ResearchNote,
   'id' | 'doc_id' | 'page_num' | 'excerpt' | 'note' | 'tags' | 'kind' | 'citation_text' | 'source_id' | 'doc_title' | 'doc_author' | 'doc_type'
->
+> & { locator_json?: string | null }
 
 type JsonRecord = Record<string, unknown>
 
@@ -90,19 +91,7 @@ function getSourceCitation(note: CitationNote): string {
 }
 
 function getSourceCitationPageNum(note: CitationNote): number | null {
-  const source = parseJson(note.source_id)
-  const candidates = [
-    source?.citationPageNum,
-    source?.originalPageNum,
-    source?.displayPageNum,
-    source?.sourcePageNum,
-  ]
-  for (const candidate of candidates) {
-    const pageNum = Number(candidate || 0)
-    if (Number.isFinite(pageNum) && pageNum > 0) return pageNum
-  }
-  const fallbackPageNum = Number(note.page_num || 0)
-  return Number.isFinite(fallbackPageNum) && fallbackPageNum > 0 ? fallbackPageNum : null
+  return getResearchNoteCitationPage(note)
 }
 
 export function buildResearchNoteFallbackCitation(note: CitationNote): string {
@@ -131,7 +120,7 @@ export async function resolveDocumentCitation(docId: string, options: ResolveCit
     docId,
     styleId,
     options.docType || undefined,
-    { pageNum: options.pageNum ?? null, fieldOverrides: options.fieldOverrides },
+    { pageNum: options.pageNum ?? null, sourcePageId: options.sourcePageId, sourcePageNum: options.sourcePageNum, fieldOverrides: options.fieldOverrides },
   )
   const citation = cleanupCitation(generated)
   return citation || null
@@ -140,6 +129,7 @@ export async function resolveDocumentCitation(docId: string, options: ResolveCit
 export async function resolveResearchNoteCitation(note: CitationNote, options: ResolveCitationOptions = {}): Promise<string> {
   try {
     const citation = await resolveDocumentCitation(note.doc_id, {
+      ...(options.pageNum == null ? getResearchNotePageSource(note) : {}),
       ...options,
       docType: options.docType || note.doc_type,
       pageNum: options.pageNum ?? getSourceCitationPageNum(note),
@@ -155,8 +145,34 @@ export async function resolveResearchNoteCitationMap(
   notes: CitationNote[],
   options: ResolveCitationOptions = {},
 ): Promise<Record<string, string>> {
+  if (notes.length === 0) return {}
   const styleId = options.styleId || await resolveDefaultCitationStyleId()
-  const entries = await Promise.all(notes.map(async (note) => [note.id, await resolveResearchNoteCitation(note, { ...options, styleId })] as const))
+  if (!styleId) return Object.fromEntries(notes.map((note) => [note.id, buildResearchNoteFallbackCitation(note)]))
+  // Cache only generated citations for this operation, never note-specific fallbacks.
+  const generated = new Map<string, Promise<string | null>>()
+  const entries: Array<readonly [string, string]> = new Array(notes.length)
+  let nextIndex = 0
+  const worker = async () => {
+    while (nextIndex < notes.length) {
+      const index = nextIndex++
+      const note = notes[index]
+      const docType = options.docType || note.doc_type
+      const pageNum = options.pageNum ?? getSourceCitationPageNum(note)
+      const source = options.pageNum == null ? getResearchNotePageSource(note) : {}
+      const key = JSON.stringify([note.doc_id, docType || null, pageNum, source.sourcePageId, source.sourcePageNum])
+      let pending = generated.get(key)
+      if (!pending) {
+        pending = resolveDocumentCitation(note.doc_id, { ...source, ...options, styleId, docType, pageNum }).catch((error: unknown) => {
+          console.warn('Failed to generate citation from active style, falling back to stored citation.', error)
+          return null
+        })
+        generated.set(key, pending)
+      }
+      const citation = await pending
+      entries[index] = [note.id, citation || buildResearchNoteFallbackCitation(note)]
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, notes.length) }, () => worker()))
   return Object.fromEntries(entries)
 }
 

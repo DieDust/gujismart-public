@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   Button,
   Card,
@@ -15,6 +15,8 @@ import {
   Tooltip,
   Typography,
   message,
+  Spin,
+  Alert,
 } from 'antd'
 import {
   BookOutlined,
@@ -47,6 +49,8 @@ import type {
 } from '@shared/types'
 import { getErrorMessage } from '@shared/errors'
 import { legacySearchLocatorFromUnknown } from '@shared/stable-reader-locator'
+import { getResearchNotePageSource } from '@shared/research-note-pages'
+import AiMarkdown from '../components/AiMarkdown'
 import { DEFAULT_HIGHLIGHT_COLOR, normalizeHighlightColor } from '../utils/highlightColors'
 import {
   buildResearchNoteFallbackCitation,
@@ -60,6 +64,11 @@ const { Text, Title, Paragraph } = Typography
 const { TextArea } = Input
 
 interface ResearchViewProps {
+  embedded?: boolean
+  onBrowseMaterials?: () => void
+  requestedTab?: { key: 'evidence' | 'ai'; revision: number }
+  projectId?: string
+  onSelectedProjectChange?: (project: ResearchProject) => void
   onOpenDocument?: (target: OpenDocumentTarget) => void
   onOpenLibraryAi?: (payload?: string | LibraryAiOpenPayload) => void
   onActiveProjectChange?: (projectId: string | null) => void
@@ -121,12 +130,6 @@ function cleanResearchPreviewText(value: string, maxLength = 240): string {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized
 }
 
-function getSourceNumber(source: JsonRecord | null | undefined, key: string): number | undefined {
-  const value = source?.[key]
-  const numberValue = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
-  return Number.isFinite(numberValue) ? numberValue : undefined
-}
-
 function asSearchHitLocator(value: unknown): SearchHitLocator | undefined {
   return legacySearchLocatorFromUnknown(value) || undefined
 }
@@ -168,7 +171,7 @@ function getNoteSourceLabel(note: ResearchNote): string {
   const type = getSourceString(source, 'sourceType') || note.source_type
   if (type === 'search') return '检索'
   if (type === 'ai_research') return 'AI研究'
-  if (type === 'ai') return 'AI'
+  if (type === 'ai' || type === 'ai_evidence_qa') return 'AI'
   if (type === 'reader' || type === 'manual') return '阅读器'
   return '摘录'
 }
@@ -235,9 +238,10 @@ function renderPreview(
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
 }
 
-export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActiveProjectChange }: ResearchViewProps) {
+export default function ResearchView({ embedded, projectId, requestedTab, onBrowseMaterials, onSelectedProjectChange, onOpenDocument, onOpenLibraryAi, onActiveProjectChange }: ResearchViewProps) {
   const [projects, setProjects] = useState<ResearchProject[]>([])
-  const [selectedProjectId, setSelectedProjectId] = useState('')
+  const [selectedProjectId, setSelectedProjectId] = useState(projectId || '')
+  useEffect(() => { if (embedded || projectId) setSelectedProjectId(projectId || '') }, [embedded, projectId])
   const [outline, setOutline] = useState<ResearchOutlineItem[]>([])
   const [selectedOutlineId, setSelectedOutlineId] = useState<string | null>(null)
   const [notes, setNotes] = useState<ResearchNote[]>([])
@@ -247,7 +251,24 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   const [selectedDatasetId, setSelectedDatasetId] = useState('')
   const [aiRecords, setAiRecords] = useState<AiResearchRecord[]>([])
   const [aiReportLoading, setAiReportLoading] = useState(false)
-  const [activeTabKey, setActiveTabKey] = useState<ResearchTabKey>('overview')
+  const [activeTabKey, setActiveTabKey] = useState<ResearchTabKey>(embedded ? 'evidence' : 'overview')
+  useEffect(() => { if (requestedTab) setActiveTabKey(requestedTab.key) }, [requestedTab])
+  const [outputQuery, setOutputQuery] = useState('')
+  const [viewingOutput, setViewingOutput] = useState<ResearchOutput | null>(null)
+  const [outputLoading, setOutputLoading] = useState(false)
+  const [outputError, setOutputError] = useState('')
+  const outputRequest = useRef(0)
+  const closeOutput = () => { outputRequest.current += 1; setViewingOutput(null); setOutputLoading(false); setOutputError('') }
+  useEffect(() => { closeOutput(); setOutputQuery('') }, [selectedProjectId])
+  const openOutput = async (output: ResearchOutput) => {
+    const request = ++outputRequest.current
+    setViewingOutput({ ...output, content: '' }); setOutputLoading(true); setOutputError('')
+    try {
+      const content = await window.api.getResearchOutputContent(output.id)
+      if (request === outputRequest.current) setViewingOutput({ ...output, content })
+    } catch (reason: unknown) { if (request === outputRequest.current) setOutputError(getErrorMessage(reason, '读取完整研究结果失败')) }
+    finally { if (request === outputRequest.current) setOutputLoading(false) }
+  }
   const [loadedProjectData, setLoadedProjectData] = useState<{
     evidenceProjectId: string
     evidenceScope: NoteScope
@@ -284,11 +305,32 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   const [projectForm] = Form.useForm()
   const [outlineForm] = Form.useForm()
   const [noteForm] = Form.useForm()
+  const requestScope = useRef({ projectId: selectedProjectId, generation: 0 })
+  const requestVersions = useRef<Record<string, number>>({})
+  useLayoutEffect(() => {
+    requestScope.current = { projectId: selectedProjectId, generation: requestScope.current.generation + 1 }
+    return () => { requestScope.current.generation += 1 }
+  }, [selectedProjectId])
+
+  const loadScoped = async <T,>(key: string, projectId: string, load: () => Promise<T>, apply: (value: T) => void) => {
+    if (requestScope.current.projectId !== projectId) return
+    const generation = requestScope.current.generation
+    const version = (requestVersions.current[key] || 0) + 1
+    requestVersions.current[key] = version
+    const current = () => generation === requestScope.current.generation && requestVersions.current[key] === version
+    try {
+      const result = await load()
+      if (current()) apply(result)
+    } catch (error: unknown) {
+      if (current()) message.error(getErrorMessage(error, '读取研究数据失败，请重试'))
+    }
+  }
 
   const selectedProject = useMemo(
     () => projects.find((item) => item.id === selectedProjectId) || null,
     [projects, selectedProjectId],
   )
+  useEffect(() => { if (!embedded && selectedProject) onSelectedProjectChange?.(selectedProject) }, [embedded, selectedProject, onSelectedProjectChange])
 
   const outlineById = useMemo(() => new Map(outline.map((item) => [item.id, item])), [outline])
   const outlineOptions = useMemo(
@@ -308,7 +350,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
         if (noteSourceFilter === 'reader') {
           if (!['reader', 'manual'].includes(sourceType)) return false
         } else if (noteSourceFilter === 'ai') {
-          if (!['ai', 'ai_research'].includes(sourceType)) return false
+          if (!['ai', 'ai_research', 'ai_evidence_qa'].includes(sourceType)) return false
         } else if (sourceType !== noteSourceFilter) {
           return false
         }
@@ -369,13 +411,14 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   const selectedProjectOutlineCount = Number(selectedProject?.outline_count || outline.length || 0)
 
   const loadProjects = async () => {
-    const items = await window.api.listResearchProjects()
-    setProjects(items)
-    if (!selectedProjectId && items.length > 0) setSelectedProjectId(items[0].id)
+    await loadScoped('projects', selectedProjectId, () => window.api.listResearchProjects(), (items) => {
+      setProjects(items)
+      if (!embedded) setSelectedProjectId((current) => current || items[0]?.id || '')
+    })
   }
 
   const loadDashboard = async () => {
-    setDashboard(await window.api.getResearchDashboard())
+    await loadScoped('dashboard', selectedProjectId, () => window.api.getResearchDashboard(), setDashboard)
   }
 
   const resetProjectScopedData = () => {
@@ -399,48 +442,51 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   }
 
   const loadProjectData = async (projectId: string) => {
+    if (requestScope.current.projectId !== projectId) return
+    setOutline([])
+    setSelectedOutlineId(null)
+    resetProjectScopedData()
     if (!projectId) {
-      setOutline([])
-      resetProjectScopedData()
       return
     }
-    const nextOutline = await window.api.listResearchOutline(projectId)
-    setOutline(nextOutline)
-    resetProjectScopedData()
+    await loadScoped('outline', projectId, () => window.api.listResearchOutline(projectId), setOutline)
   }
 
-  const loadDocumentsData = async (projectId: string) => {
-    if (!projectId || loadedProjectData.documentsProjectId === projectId) return
-    const nextDocs = await window.api.listResearchProjectDocuments(projectId)
-    setDocuments(nextDocs)
-    setLoadedProjectData((state) => ({ ...state, documentsProjectId: projectId }))
+  const loadDocumentsData = async (projectId: string, force = false) => {
+    if (!projectId || (!force && loadedProjectData.documentsProjectId === projectId)) return
+    await loadScoped('documents', projectId, () => window.api.listResearchProjectDocuments(projectId), (nextDocs) => {
+      setDocuments(nextDocs)
+      setLoadedProjectData((state) => ({ ...state, documentsProjectId: projectId }))
+    })
   }
 
-  const loadEvidenceData = async (projectId: string, scope: NoteScope = noteScope) => {
+  const loadEvidenceData = async (projectId: string, scope: NoteScope = noteScope, force = false) => {
     if (!projectId) return
-    if (loadedProjectData.evidenceProjectId === projectId && loadedProjectData.evidenceScope === scope) return
-    const nextNotes = await window.api.listResearchNotes(scope === 'all' ? null : projectId)
-    setNotes(nextNotes)
-    setLoadedProjectData((state) => ({ ...state, evidenceProjectId: projectId, evidenceScope: scope }))
+    if (!force && loadedProjectData.evidenceProjectId === projectId && loadedProjectData.evidenceScope === scope) return
+    await loadScoped('evidence', projectId, () => window.api.listResearchNotes(scope === 'all' ? null : projectId), (nextNotes) => {
+      setNotes(nextNotes)
+      setLoadedProjectData((state) => ({ ...state, evidenceProjectId: projectId, evidenceScope: scope }))
+    })
   }
 
-  const loadAiDatasetsData = async (projectId: string) => {
-    if (!projectId || loadedProjectData.aiDatasetsProjectId === projectId) return
-    const nextDatasets = await window.api.listAiResearchDatasets(projectId)
-    setAiDatasets(nextDatasets)
-    const nextDatasetId = selectedDatasetId && nextDatasets.some((dataset) => dataset.id === selectedDatasetId)
-      ? selectedDatasetId
-      : nextDatasets[0]?.id || ''
-    setSelectedDatasetId(nextDatasetId)
-    setAiRecords(nextDatasetId ? await window.api.listAiResearchRecords(nextDatasetId, { limit: AI_RECORD_PREVIEW_LIMIT }) : [])
-    setLoadedProjectData((state) => ({ ...state, aiDatasetsProjectId: projectId }))
+  const loadAiDatasetsData = async (projectId: string, force = false) => {
+    if (!projectId || (!force && loadedProjectData.aiDatasetsProjectId === projectId)) return
+    await loadScoped('datasets', projectId, () => window.api.listAiResearchDatasets(projectId), (nextDatasets) => {
+      setAiDatasets(nextDatasets)
+      const nextDatasetId = selectedDatasetId && nextDatasets.some((dataset) => dataset.id === selectedDatasetId)
+        ? selectedDatasetId
+        : nextDatasets[0]?.id || ''
+      void loadAiRecords(nextDatasetId)
+      setLoadedProjectData((state) => ({ ...state, aiDatasetsProjectId: projectId }))
+    })
   }
 
-  const loadAiOutputsData = async (projectId: string) => {
-    if (!projectId || loadedProjectData.aiOutputsProjectId === projectId) return
-    const nextOutputs = await window.api.listResearchOutputs(projectId)
-    setOutputs(nextOutputs)
-    setLoadedProjectData((state) => ({ ...state, aiOutputsProjectId: projectId }))
+  const loadAiOutputsData = async (projectId: string, force = false) => {
+    if (!projectId || (!force && loadedProjectData.aiOutputsProjectId === projectId)) return
+    await loadScoped('outputs', projectId, () => window.api.listResearchOutputs(projectId), (nextOutputs) => {
+      setOutputs(nextOutputs)
+      setLoadedProjectData((state) => ({ ...state, aiOutputsProjectId: projectId }))
+    })
   }
 
   const openAiDatasetsMode = (force = false) => {
@@ -449,7 +495,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
       setAiDatasets([])
       setAiRecords([])
       setSelectedDatasetId('')
-      void loadAiDatasetsData(selectedProjectId)
+      void loadAiDatasetsData(selectedProjectId, force)
     }
   }
 
@@ -457,16 +503,16 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
     setAiResultMode('reports')
     if (selectedProjectId && (force || loadedProjectData.aiOutputsProjectId !== selectedProjectId)) {
       setOutputs([])
-      void loadAiOutputsData(selectedProjectId)
+      void loadAiOutputsData(selectedProjectId, force)
     }
   }
 
   useEffect(() => {
     void loadProjects()
-    void loadDashboard()
-  }, [])
+  }, [projectId])
 
   useEffect(() => {
+    if (!embedded) void loadDashboard()
     void loadProjectData(selectedProjectId)
   }, [selectedProjectId])
 
@@ -483,14 +529,18 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
     if (activeTabKey === 'writing') {
       void loadEvidenceData(selectedProjectId, 'current')
     }
+    if (embedded && activeTabKey === 'ai') void loadAiOutputsData(selectedProjectId)
   }, [activeTabKey, selectedProjectId, noteScope])
 
   const loadWritingReferences = async () => {
     if (!selectedProjectId || referencesLoadedProjectId === selectedProjectId) return
-    const citationStyleId = await resolveDefaultCitationStyleId()
-    const nextReferences = await window.api.exportResearchReferences(selectedProjectId, 'gbt7714', citationStyleId)
-    setReferences(nextReferences)
-    setReferencesLoadedProjectId(selectedProjectId)
+    await loadScoped('references', selectedProjectId, async () => {
+      const citationStyleId = await resolveDefaultCitationStyleId()
+      return window.api.exportResearchReferences(selectedProjectId, 'gbt7714', citationStyleId)
+    }, (nextReferences) => {
+      setReferences(nextReferences)
+      setReferencesLoadedProjectId(selectedProjectId)
+    })
   }
 
   useEffect(() => {
@@ -507,7 +557,9 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
       const projectId = getResearchWorkspaceUpdatedProjectId(event)
       if (!projectId || projectId !== selectedProjectId) return
       void loadProjects()
+      setLoadedProjectData((state) => ({ ...state, aiOutputsProjectId: '', evidenceProjectId: '', documentsProjectId: '' }))
       if (activeTabKey === 'ai') {
+        if (embedded) void loadAiOutputsData(selectedProjectId, true)
         if (aiResultMode === 'datasets') {
           openAiDatasetsMode(true)
         }
@@ -516,14 +568,14 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
         }
       }
       if (activeTabKey === 'evidence') {
-        setLoadedProjectData((state) => ({ ...state, evidenceProjectId: '', documentsProjectId: '' }))
-        void loadDocumentsData(selectedProjectId)
-        void loadEvidenceData(selectedProjectId, noteScope)
+        void loadDocumentsData(selectedProjectId, true)
+        void loadEvidenceData(selectedProjectId, noteScope, true)
       }
+      if (activeTabKey === 'outline' || activeTabKey === 'writing') void loadEvidenceData(selectedProjectId, 'current', true)
     }
     window.addEventListener('gujismart:research-workspace-updated', handleResearchWorkspaceUpdated)
     return () => window.removeEventListener('gujismart:research-workspace-updated', handleResearchWorkspaceUpdated)
-  }, [activeTabKey, aiResultMode, selectedProjectId, noteScope])
+  }, [activeTabKey, aiResultMode, selectedProjectId, noteScope, embedded])
 
   useEffect(() => {
     let active = true
@@ -546,27 +598,28 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   }, [activeTabKey, projectNotes])
 
   const refreshAll = async () => {
+    const generation = requestScope.current.generation
     await Promise.all([loadProjects(), loadDashboard()])
-    if (!selectedProjectId) return
+    if (!selectedProjectId || generation !== requestScope.current.generation) return
     if (activeTabKey === 'evidence') {
       setLoadedProjectData((state) => ({ ...state, evidenceProjectId: '', documentsProjectId: '' }))
-      await Promise.all([loadDocumentsData(selectedProjectId), loadEvidenceData(selectedProjectId, noteScope)])
+      await Promise.all([loadDocumentsData(selectedProjectId, true), loadEvidenceData(selectedProjectId, noteScope, true)])
     } else if (activeTabKey === 'outline') {
       await loadProjectData(selectedProjectId)
       setLoadedProjectData((state) => ({ ...state, evidenceProjectId: '' }))
-      await loadEvidenceData(selectedProjectId, 'current')
+      await loadEvidenceData(selectedProjectId, 'current', true)
     } else if (activeTabKey === 'ai') {
       if (aiResultMode === 'datasets') {
         setLoadedProjectData((state) => ({ ...state, aiDatasetsProjectId: '' }))
-        await loadAiDatasetsData(selectedProjectId)
+        await loadAiDatasetsData(selectedProjectId, true)
       }
       if (aiResultMode === 'reports') {
         setLoadedProjectData((state) => ({ ...state, aiOutputsProjectId: '' }))
-        await loadAiOutputsData(selectedProjectId)
+        await loadAiOutputsData(selectedProjectId, true)
       }
     } else if (activeTabKey === 'writing') {
       setLoadedProjectData((state) => ({ ...state, evidenceProjectId: '' }))
-      await loadEvidenceData(selectedProjectId, 'current')
+      await loadEvidenceData(selectedProjectId, 'current', true)
     } else {
       await loadProjectData(selectedProjectId)
     }
@@ -693,9 +746,11 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
 
   const openCurrentProjectAi = async (initialTab: 'qa' | 'analysis' | 'research' = 'research') => {
     if (!onOpenLibraryAi || !selectedProjectId) return
+    const generation = requestScope.current.generation
     const projectDocs = loadedProjectData.documentsProjectId === selectedProjectId
       ? documents
       : await window.api.listResearchProjectDocuments(selectedProjectId)
+    if (generation !== requestScope.current.generation) return
     if (loadedProjectData.documentsProjectId !== selectedProjectId) {
       setDocuments(projectDocs)
       setLoadedProjectData((state) => ({ ...state, documentsProjectId: selectedProjectId }))
@@ -711,12 +766,14 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
 
   const loadAiRecords = async (datasetId: string) => {
     setSelectedDatasetId(datasetId)
-    setAiRecords(datasetId ? await window.api.listAiResearchRecords(datasetId, { limit: AI_RECORD_PREVIEW_LIMIT }) : [])
+    setAiRecords([])
+    await loadScoped('records', selectedProjectId, async () =>
+      datasetId ? window.api.listAiResearchRecords(datasetId, { limit: AI_RECORD_PREVIEW_LIMIT }) : [], setAiRecords)
   }
 
   const handleExcludeAiRecord = async (recordId: string) => {
     await window.api.excludeAiResearchRecord(recordId)
-    if (selectedDatasetId) setAiRecords(await window.api.listAiResearchRecords(selectedDatasetId, { limit: AI_RECORD_PREVIEW_LIMIT }))
+    setAiRecords((previous) => previous.map((record) => record.id === recordId ? { ...record, status: 'excluded' } : record))
     message.success('已从数据集中排除这条记录')
   }
 
@@ -799,7 +856,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   const openNoteSource = (note: ResearchNote) => {
     const legacySource = parseJson(note.source_id)
     const locator = asSearchHitLocator(parseJson(note.locator_json)) || asSearchHitLocator(legacySource?.['locator'])
-    const legacyPageNum = getSourceNumber(legacySource, 'pageNum')
+    const legacyPageNum = getResearchNotePageSource(note).sourcePageNum
     const sourceKeyword = getSourceString(legacySource, 'searchKeyword') || getSourceString(legacySource, 'matchedQuery')
     const highlightText = getNoteHighlightText(note, locator, legacySource)
     const keyword = highlightText || normalizeHighlightCandidate(sourceKeyword || locator?.queryTerm || note.excerpt, 120)
@@ -840,12 +897,12 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
   }
 
   return (
-    <div className="research-workbench gs-view-container">
-      <div className="research-header">
-        <div>
+    <div className={`research-workbench gs-view-container${embedded ? ' research-integrated' : ''}`}>
+      {!embedded && <><div className="research-header">
+        {!embedded && <div>
           <Title level={3} className="gs-view-title">研究工作台</Title>
           <Text type="secondary">把摘录整理成专题证据、论点结构和可导出的写作草稿。</Text>
-        </div>
+        </div>}
         <Space wrap>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setProjectModalOpen(true)}>
             新建专题
@@ -861,6 +918,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无专题" />
             ) : (
               <Select
+                aria-label="专题研究项目"
                 value={selectedProjectId || undefined}
                 onChange={(value) => {
                   setSelectedProjectId(value)
@@ -935,7 +993,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
             <Statistic title="引用信息待补" value={dashboard.citationMissingCount} />
           </div>
         ) : null}
-      </Card>
+      </Card></>}
 
       <Tabs
         className="research-workbench-tabs"
@@ -1080,7 +1138,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
             key: 'outline',
             label: '大纲整理',
             children: (
-              <div className="research-tab-layout">
+              <div className="research-tab-layout research-outline-layout">
                 <Card size="small" title="写作大纲" className="research-panel" extra={(
                   <Space>
                     <Button size="small" icon={<PlusOutlined />} disabled={!selectedProjectId} onClick={() => openOutlineModal()}>
@@ -1123,7 +1181,18 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
                   )}
                 </Card>
 
-                <Card size="small" title="入纲状态" className="research-panel">
+                {embedded ? <Card size="small" title={selectedOutlineId ? `${outlineById.get(selectedOutlineId)?.title || '大纲'}的论证材料` : '全部论证材料'} className="research-panel research-outline-evidence"
+                  extra={<Text type="secondary">已入纲 {projectEvidenceStats.assigned} · 待整理 {projectEvidenceStats.unassigned}</Text>}>
+                  <List dataSource={projectNotes.filter((note) => !selectedOutlineId || note.outline_id === selectedOutlineId)} pagination={{ pageSize: 8, showSizeChanger: false }}
+                    locale={{ emptyText: '暂无归入此处的证据' }} renderItem={(note) => <List.Item actions={[
+                      <Button key="source" type="link" size="small" onClick={() => openNoteSource(note)}>原文</Button>,
+                      <Button key="assign" type="link" size="small" onClick={() => openEditNote(note)}>归入大纲</Button>,
+                    ]}>
+                      <List.Item.Meta title={<Space wrap><Text strong>{note.doc_title || '未命名文献'}</Text>{note.page_num ? <Text type="secondary">第 {note.page_num} 页</Text> : null}
+                        {note.outline_id && <Tag>{outlineById.get(note.outline_id)?.title || '大纲'}</Tag>}</Space>}
+                        description={<><Paragraph ellipsis={{ rows: 4, expandable: true, symbol: '展开' }}>{note.excerpt}</Paragraph>{note.note && <Text type="secondary">{note.note}</Text>}</>} />
+                    </List.Item>} />
+                </Card> : <Card size="small" title="入纲状态" className="research-panel">
                   <div className="research-focus-strip single-column">
                     <div className="research-focus-item">
                       <span>已归入大纲</span>
@@ -1138,15 +1207,31 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
                       <strong>{projectEvidenceStats.unavailable}</strong>
                     </div>
                   </div>
-                </Card>
+                </Card>}
               </div>
             ),
           },
           {
             key: 'ai',
-            label: `研究结果 ${selectedProjectAiDatasetCount + selectedProjectOutputCount}`,
+            label: `研究结果 ${embedded ? selectedProjectOutputCount : selectedProjectAiDatasetCount + selectedProjectOutputCount}`,
             children: (
-              aiResultMode === 'summary' ? (
+              embedded ? <section className="research-saved-results" aria-label="专题研究结果">
+                <div className="research-results-toolbar">
+                  <Input.Search aria-label="搜索专题研究结果" placeholder="搜索结果标题" allowClear value={outputQuery} onChange={(event) => setOutputQuery(event.target.value)} />
+                  <Button icon={<FileSearchOutlined />} onClick={onBrowseMaterials}>结构化资料 ({selectedProjectAiDatasetCount})</Button>
+                  <Select aria-label="报告类型" value={templateType} options={ANALYSIS_TEMPLATES} onChange={setTemplateType} />
+                  <Button icon={<RobotOutlined />} loading={synthesizing} disabled={!selectedProjectId} onClick={() => void handleSynthesize()}>生成报告</Button>
+                </div>
+                {templateType === 'custom' && <TextArea rows={3} aria-label="报告要求" placeholder="研究分析要求" value={customPrompt} onChange={(event) => setCustomPrompt(event.target.value)} />}
+                <List dataSource={outputs.filter((output) => !outputQuery.trim() || output.title.toLocaleLowerCase().includes(outputQuery.trim().toLocaleLowerCase()))}
+                  pagination={{ pageSize: 8, showSizeChanger: false }} locale={{ emptyText: '暂无已保存的回答或报告' }} renderItem={(output) => <List.Item actions={[
+                    <Button key="open" type="link" onClick={() => void openOutput(output)}>查看全文</Button>,
+                    <Button key="copy" type="text" icon={<CopyOutlined />} aria-label="复制研究结果" onClick={() => void handleCopyResearchOutput(output)} />,
+                  ]}>
+                    <List.Item.Meta title={<Button type="link" className="research-result-title" onClick={() => void openOutput(output)}>{output.title}</Button>}
+                      description={<Paragraph ellipsis={{ rows: 2 }}>{cleanResearchPreviewText(output.content, 360)}</Paragraph>} />
+                  </List.Item>} />
+              </section> : aiResultMode === 'summary' ? (
                 <div className="research-result-summary">
                   <Card size="small" title="提取结果" className="research-panel">
                     <Space direction="vertical" style={{ width: '100%' }}>
@@ -1314,6 +1399,7 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
 
                 <Card size="small" title="参考文献与导出" className="research-panel">
                   <Space direction="vertical" style={{ width: '100%' }}>
+                    <Button icon={<ExportOutlined />} disabled={!selectedProjectId} onClick={() => void handleExportProject('markdown')} block>导出 Markdown 草稿</Button>
                     <Button icon={<CopyOutlined />} onClick={() => void handleExportReferences('gbt7714')} block>复制 GB/T 7714</Button>
                     <Button icon={<CopyOutlined />} onClick={() => void handleExportReferences('bibtex')} block>复制 BibTeX</Button>
                     <Button icon={<CopyOutlined />} onClick={() => void handleExportReferences('ris')} block>复制 RIS</Button>
@@ -1323,9 +1409,13 @@ export default function ResearchView({ onOpenDocument, onOpenLibraryAi, onActive
               </div>
             ),
           },
-        ]}
+        ].filter((item) => !embedded || item.key !== 'overview')}
       />
 
+      <Modal title={viewingOutput?.title || '研究结果'} open={!!viewingOutput} onCancel={closeOutput} footer={null} width={900}>
+        {outputError && <Alert type="error" message={outputError} action={<Button onClick={() => { if (viewingOutput) void openOutput(viewingOutput) }}>重试</Button>} />}
+        <Spin spinning={outputLoading}><div className="research-output-full"><AiMarkdown content={viewingOutput?.content || ''} onOpenDocument={onOpenDocument} /></div></Spin>
+      </Modal>
       <Modal title="新建研究专题" open={projectModalOpen} onCancel={() => setProjectModalOpen(false)} onOk={() => void handleCreateProject()} okText="创建" cancelText="取消">
         <Form form={projectForm} layout="vertical">
           <Form.Item name="name" label="专题名称" rules={[{ required: true, message: '请输入专题名称' }]}>

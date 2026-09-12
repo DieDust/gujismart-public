@@ -5841,7 +5841,10 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
   const startedAt = Date.now()
   const changedPageIds: string[] = []
   const tocDirtyDocIds = new Set<string>()
-  const versionWrites: OcrVersionWrite[] = []
+  const versionWrites: Array<OcrVersionWrite & {
+    preparedText: { value: string | null; ref: string | null }
+    preparedResult: { value: string | null; ref: string | null }
+  }> = []
 
   // Phase 1 — read/hydrate + gzip payload files outside any SQL transaction.
   // Holding a write transaction while doing disk I/O is the main freeze source.
@@ -5929,6 +5932,8 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
         result: resultPayload,
         text: resultText,
         status: pageResult.status,
+        preparedText,
+        preparedResult,
       })
     }
   }
@@ -5936,13 +5941,8 @@ function savePageOcrResults(pageResults: OcrPageResult[], engine: OcrEngine = 'p
   // Phase 1b — prepare version payload files outside the transaction as well.
   const preparedVersionWrites = versionWrites.flatMap((item) => {
     if (!item.page) return []
-    const preparedText = preparePagePayloadUpdate(item.page.doc_id, item.pageId, 'ocr_text', item.text || '')
-    const preparedResult = preparePagePayloadUpdate(
-      item.page.doc_id,
-      item.pageId,
-      'ocr_result',
-      item.result ? JSON.stringify(item.result) : null,
-    )
+    // The version and current page contain identical content-addressed payloads.
+    const { preparedText, preparedResult } = item
     return [{ item: { ...item, page: item.page }, preparedText, preparedResult }]
   })
 

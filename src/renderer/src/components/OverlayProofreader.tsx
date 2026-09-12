@@ -52,7 +52,8 @@ interface OverlayProofreaderProps {
   viewport?: ViewerViewport
   onViewportChange?: (viewport: ViewerViewport) => void
   onSelectBox?: (index: number) => void
-  onSave: (pageId: string, data: PageUpdatePayload) => void
+  onSave: (pageId: string, data: PageUpdatePayload, echoToken?: string) => void | boolean | Promise<void | boolean>
+  saveEchoToken?: string
 }
 
 interface VerticalColumnSlice {
@@ -583,7 +584,10 @@ export default function OverlayProofreader({
   onViewportChange,
   onSelectBox,
   onSave,
+  saveEchoToken,
 }: OverlayProofreaderProps) {
+  const editorSession = useRef(crypto.randomUUID())
+  const initializedPage = useRef<string>()
   const containerRef = useRef<HTMLDivElement>(null)
   const [viewportState, setViewportState] = useState<ViewerViewport>(DEFAULT_VIEWPORT)
   const [blocks, setBlocks] = useState<OverlayBlock[]>([])
@@ -669,13 +673,16 @@ export default function OverlayProofreader({
   }, [updateViewport])
 
   useEffect(() => {
+    const samePage = initializedPage.current === pageId
+    initializedPage.current = pageId
+    if (samePage && saveEchoToken === editorSession.current) return
     const nextBlocks = sortGujiBlocks(ocrResult?.layout_result || [])
     setBlocks(nextBlocks)
     setHistory([nextBlocks.map((block) => ({ ...block }))])
     setHistoryIndex(0)
     setEditingIndex(-1)
     setEditValue('')
-  }, [ocrResult])
+  }, [ocrResult, pageId, saveEchoToken])
 
   useEffect(() => {
     if (!src) return
@@ -765,9 +772,7 @@ export default function OverlayProofreader({
   const persistBlocks = useCallback((nextBlocks: OverlayBlock[]) => {
     const payload = buildOcrPayload(ocrResult, nextBlocks, pageProofStatus)
     // Bursts of proofreading actions merge into one debounced full-page save.
-    void debouncedSaver.schedule(() => {
-      onSave(pageId, payload)
-    })
+    void debouncedSaver.schedule(() => onSave(pageId, payload, editorSession.current))
   }, [debouncedSaver, ocrResult, onSave, pageId, pageProofStatus])
 
   const commitBlocks = useCallback((nextBlocks: OverlayBlock[], nextActiveIndex?: number) => {

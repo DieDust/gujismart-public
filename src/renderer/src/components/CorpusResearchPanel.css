@@ -1,0 +1,26 @@
+/* Reserve the fixed import/AI controls' right-hand lane outside study content. */
+.corpus-research { box-sizing: border-box; padding: 18px 68px 18px 0; border-bottom: 1px solid var(--gs-glass-border); min-width: 0; overflow-wrap: anywhere; letter-spacing: 0; }
+.corpus-research-heading, .corpus-research-table-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.corpus-research h5.ant-typography { margin: 0; font-size: 16px; }
+.corpus-task-select { width: 260px; max-width: 100%; }
+.corpus-research-status { padding: 8px 0; }
+.corpus-research-actions { margin: 12px 0; }
+.corpus-research-report { padding: 12px 0 20px; }
+.corpus-research-report table { display: block; max-width: 100%; overflow-x: auto; }
+.corpus-research-table-heading .ant-input-search { width: 260px; max-width: 100%; }
+.corpus-research .ant-table-wrapper { min-width: 0; }
+.corpus-research .ant-table-cell { overflow-wrap: anywhere; }
+.corpus-research .ant-tag { max-width: 100%; white-space: normal; }
+.corpus-findings article { width: 100%; min-width: 0; }
+.corpus-findings blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--gs-glass-border); white-space: pre-wrap; overflow-wrap: anywhere; }
+.corpus-findings .ant-btn { max-width: 100%; height: auto; min-height: 24px; white-space: normal; text-align: left; }
+.corpus-budget { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0; }
+@media (max-width: 1100px) {
+  .corpus-research { padding-right: 76px; }
+}
+@media (max-width: 600px) {
+  .corpus-research-heading > .ant-space { width: 100%; }
+  .corpus-research-heading > .ant-space > .ant-space-item:first-child { flex: 1; min-width: 0; }
+  .corpus-task-select { width: 100%; }
+  .corpus-research .ant-pagination { flex-wrap: wrap; }
+}

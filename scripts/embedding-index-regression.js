@@ -92,6 +92,10 @@ assert.ok(
   embedding.includes('SCOPED_VECTOR_SCAN_MAX_DOCS') && embedding.includes('ec.doc_id IN ('),
   'folder/tag-scoped vector search should fetch by indexed doc_id instead of scanning the whole table',
 )
+assert.ok(embedding.includes('scanGeneration === vectorScanGeneration'), 'an invalidated scan must not republish its cache')
+assert.ok(/CACHE_SCAN_YIELD_EVERY_ROWS\s*=\s*256/.test(embedding), 'warm vector scans must yield in bounded batches')
+const cachedLoop = embedding.slice(embedding.indexOf('if (cacheUsable && cachedScan)'))
+assert.ok(cachedLoop.indexOf('await new Promise') < cachedLoop.indexOf('if (allowedDocs'), 'scope filtering must not bypass event-loop yields')
 const documentsIpc = read('src', 'main', 'ipc', 'documents.ts')
 assert.ok(
   (documentsIpc.match(/invalidateVectorSearchCache\(\)/g) || []).length >= 3,

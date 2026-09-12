@@ -14,6 +14,7 @@ import {
   ReloadOutlined,
   SettingOutlined,
   UndoOutlined,
+  RedoOutlined,
 } from '@ant-design/icons'
 import { getErrorMessage } from '@shared/errors'
 import { buildDirectQuoteCitationText, resolveDocumentCitation } from '../utils/citations'
@@ -1938,6 +1939,8 @@ export default function GujiFacsimileProofreader({
   }
   const [history, setHistory] = useState<LayoutBlock[][]>([])
   const [historyIndex, setHistoryIndex] = useState(-1)
+  const historyRef = useRef<{ entries: LayoutBlock[][]; index: number }>({ entries: [], index: -1 })
+  const historyEditGroupRef = useRef<{ blockId: string; at: number } | null>(null)
   const [tableDraftRows, setTableDraftRows] = useState<string[][]>([['']])
   const [tableDraftMerges, setTableDraftMerges] = useState<FacsimileTableMerge[]>([])
   const [tableDraftRowHeights, setTableDraftRowHeights] = useState<number[]>([])
@@ -2071,6 +2074,8 @@ export default function GujiFacsimileProofreader({
       blocksRef.current = incomingBlocks
       setHistory([incomingBlocks.map((block) => ({ ...block }))])
       setHistoryIndex(0)
+      historyRef.current = { entries: [incomingBlocks], index: 0 }
+      historyEditGroupRef.current = null
       setTableDraftRows([['']])
       setTableDraftMerges([])
       setTableDraftRowHeights([])
@@ -2138,6 +2143,8 @@ export default function GujiFacsimileProofreader({
     const initialHistory = (manualLayoutDraft.state.blocks as LayoutBlock[]).map((block) => ({ ...block }))
     setHistory([initialHistory])
     setHistoryIndex(0)
+    historyRef.current = { entries: [initialHistory], index: 0 }
+    historyEditGroupRef.current = null
   }, [manualLayoutDraft.state.blocks, manualLayoutDraft.state.pageId])
 
   useEffect(() => {
@@ -2355,6 +2362,7 @@ export default function GujiFacsimileProofreader({
   const visualFrameWidth = rotatedQuarterTurns ? visualPageHeight : visualPageWidth
   const visualFrameHeight = rotatedQuarterTurns ? visualPageWidth : visualPageHeight
   const canUndo = historyIndex > 0
+  const canRedo = historyIndex >= 0 && historyIndex < history.length - 1
   const getPageTransform = useCallback((zoom: number, rotation: number) => (
     `translate(-50%, -50%) rotate(${rotation}deg) scale(${zoom})`
   ), [])
@@ -2531,13 +2539,35 @@ export default function GujiFacsimileProofreader({
     setTableDraftColumnWidths([])
   }, [manualLayoutDraft.setActiveBlockId])
 
+  const pushHistory = useCallback((nextBlocks: LayoutBlock[], textBlockId?: string) => {
+    const current = historyRef.current
+    const group = historyEditGroupRef.current
+    const now = Date.now()
+    const mergeTyping = !!textBlockId && group?.blockId === textBlockId
+      && now - group.at < 600 && current.index > 0 && current.index === current.entries.length - 1
+    const base = current.entries.slice(0, current.index + (mergeTyping ? 0 : 1))
+    base.push(nextBlocks.map((block) => ({ ...block })))
+    const entries = base.slice(-50)
+    historyRef.current = { entries, index: entries.length - 1 }
+    historyEditGroupRef.current = textBlockId ? { blockId: textBlockId, at: now } : null
+    setHistory(entries)
+    setHistoryIndex(entries.length - 1)
+  }, [])
+
+  const updateBlockWithHistory = useCallback((blockId: string, changes: Record<string, unknown>, typing = false) => {
+    if (layoutEditingLocked) return
+    const next = manualLayoutDraft.updateBlock(blockId, changes)
+    blocksRef.current = next.blocks as LayoutBlock[]
+    pushHistory(next.blocks as LayoutBlock[], typing ? next.activeBlockId || blockId : undefined)
+  }, [layoutEditingLocked, manualLayoutDraft.updateBlock, pushHistory])
+
   const stageTextBlockChange = useCallback((value: string) => {
     if (layoutEditingLocked) return
     if (!editingBlockId) return
-    manualLayoutDraft.updateBlock(editingBlockId, {
+    updateBlockWithHistory(editingBlockId, {
       words: value,
-    })
-  }, [editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
+    }, true)
+  }, [editingBlockId, layoutEditingLocked, updateBlockWithHistory])
 
   const stageTableBlockChange = useCallback((
     rows: string[][],
@@ -2558,8 +2588,8 @@ export default function GujiFacsimileProofreader({
     setTableDraftRowHeights(snapshot.rowHeights)
     setTableDraftColumnWidths(snapshot.columnWidths)
     if (!editingBlockId || !editingBlock) return
-    manualLayoutDraft.updateBlock(editingBlockId, stagedBlock)
-  }, [editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
+    updateBlockWithHistory(editingBlockId, stagedBlock)
+  }, [editingBlock, editingBlockId, layoutEditingLocked, updateBlockWithHistory])
 
   const applyInspectorTypeChange = useCallback((nextKind: ManualLayoutBlockKind, confirmed: boolean) => {
     if (!editingBlock || !editingBlockId || layoutEditingLocked) return
@@ -2583,8 +2613,8 @@ export default function GujiFacsimileProofreader({
     } else if ((nextKind === 'image' || nextKind === 'seal') && !String(convertedBlock.caption || '').trim()) {
       convertedBlock = { ...convertedBlock, caption: getBlockText(editingBlock), alt_text: String(convertedBlock.alt_text || '') }
     }
-    manualLayoutDraft.updateBlock(editingBlockId, convertedBlock)
-  }, [editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.updateBlock])
+    updateBlockWithHistory(editingBlockId, convertedBlock)
+  }, [editingBlock, editingBlockId, layoutEditingLocked, updateBlockWithHistory])
 
   const handleInspectorTypeChange = useCallback((nextKind: ManualLayoutBlockKind) => {
     if (!editingBlock || !editingBlockId || layoutEditingLocked || getLabel(editingBlock) === nextKind) return
@@ -2601,15 +2631,6 @@ export default function GujiFacsimileProofreader({
       onOk: () => applyInspectorTypeChange(nextKind, true),
     })
   }, [applyInspectorTypeChange, editingBlock, editingBlockId, layoutEditingLocked])
-
-  const pushHistory = useCallback((nextBlocks: LayoutBlock[]) => {
-    setHistory((previous) => {
-      const base = previous.slice(0, historyIndex + 1)
-      base.push(nextBlocks.map((block) => ({ ...block })))
-      return base.slice(-50)
-    })
-    setHistoryIndex((previous) => Math.min(previous + 1, 49))
-  }, [historyIndex])
 
   const commitBlocks = useCallback((
     nextBlocks: LayoutBlock[],
@@ -2648,13 +2669,15 @@ export default function GujiFacsimileProofreader({
       commitBlocks(nextBlocks, { activeBlockId: editingBlockId })
       return
     }
-    manualLayoutDraft.updateBlock(editingBlockId, changes)
-  }, [blocks, commitBlocks, editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.state.pageId, manualLayoutDraft.updateBlock, stageTextBlockChange])
+    updateBlockWithHistory(editingBlockId, changes)
+  }, [blocks, commitBlocks, editingBlock, editingBlockId, layoutEditingLocked, manualLayoutDraft.state.pageId, updateBlockWithHistory, stageTextBlockChange])
 
   const handleUndo = useCallback(() => {
     if (!canUndo || layoutEditingLocked) return
     const nextBlocks = history[historyIndex - 1].map((block) => ({ ...block }))
     setHistoryIndex(historyIndex - 1)
+    historyRef.current.index = historyIndex - 1
+    historyEditGroupRef.current = null
     blocksRef.current = nextBlocks
     manualLayoutDraft.replaceBlocks(nextBlocks, null)
     setTableDraftRows([['']])
@@ -2662,6 +2685,16 @@ export default function GujiFacsimileProofreader({
     setTableDraftRowHeights([])
     setTableDraftColumnWidths([])
   }, [canUndo, history, historyIndex, layoutEditingLocked, manualLayoutDraft.replaceBlocks])
+
+  const handleRedo = useCallback(() => {
+    if (!canRedo || layoutEditingLocked) return
+    const nextBlocks = history[historyIndex + 1].map((block) => ({ ...block }))
+    setHistoryIndex(historyIndex + 1)
+    historyRef.current.index = historyIndex + 1
+    historyEditGroupRef.current = null
+    blocksRef.current = nextBlocks
+    manualLayoutDraft.replaceBlocks(nextBlocks, null)
+  }, [canRedo, history, historyIndex, layoutEditingLocked, manualLayoutDraft.replaceBlocks])
 
   const enterLayoutEditForBlock = useCallback((sourceIndex?: number) => {
     if (layoutEditingLocked) return
@@ -3432,7 +3465,10 @@ export default function GujiFacsimileProofreader({
           ) : null}
           {layoutEditMode ? <span style={{ color: 'var(--gs-text-secondary)', fontSize: 12 }}>{layoutEditingLocked ? '正在等待旧保存结束并恢复数据库基准，编辑已暂时锁定' : '空白处拖拽新建；拖动框移动或缩放；Alt 临时看清底图；Ctrl+S 立即保存'}</span> : null}
         </Space>
-        <Button size="small" icon={<UndoOutlined />} disabled={!canUndo || layoutEditingLocked} onClick={handleUndo}>撤销</Button>
+        <Space size={4} style={{ flexShrink: 0 }}>
+          <Button size="small" title="撤销" aria-label="撤销" icon={<UndoOutlined />} disabled={!canUndo || layoutEditingLocked} onClick={handleUndo} />
+          <Button size="small" title="重做" aria-label="重做" icon={<RedoOutlined />} disabled={!canRedo || layoutEditingLocked} onClick={handleRedo} />
+        </Space>
       </div>
 
       {layoutEditMode ? (

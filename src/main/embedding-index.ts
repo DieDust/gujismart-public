@@ -129,7 +129,7 @@ const SCOPED_VECTOR_SCAN_MAX_DOCS = 128
 /** How many doc ids per IN (...) batch for scoped scans. */
 const SCOPED_VECTOR_SCAN_DOC_BATCH = 32
 /** Yield cadence for the in-memory cache scan (rows between event-loop yields). */
-const CACHE_SCAN_YIELD_EVERY_ROWS = 8192
+const CACHE_SCAN_YIELD_EVERY_ROWS = 256
 
 export type EmbeddingDocStatus = 'pending' | 'queued' | 'processing' | 'ready' | 'error' | 'skipped'
 
@@ -736,9 +736,11 @@ interface VectorScanCache {
  * query against the live project-scoped row count and a TTL.
  */
 let vectorScanCache: VectorScanCache | null = null
+let vectorScanGeneration = 0
 
 /** Drop the in-memory scan cache after any write that changes vectors, page numbers, or scope. */
 export function invalidateVectorSearchCache(): void {
+  vectorScanGeneration += 1
   vectorScanCache = null
 }
 
@@ -1502,7 +1504,7 @@ function formatEmbeddingsApiError(status: number, body: string): string {
   return `Embeddings API ${status}${snippet ? `：${snippet}` : ''}`
 }
 
-async function fetchEmbeddingsOnce(texts: string[]): Promise<number[][]> {
+async function fetchEmbeddingsOnce(texts: string[], timeoutMs = EMBEDDINGS_FETCH_TIMEOUT_MS): Promise<number[][]> {
   const apiKey = getEmbeddingApiKey()
   if (!apiKey) {
     throw new Error('未配置 Embeddings API Key。请在设置 → 向量索引选择已保存 Key 的服务商（如通义）。')
@@ -1519,10 +1521,10 @@ async function fetchEmbeddingsOnce(texts: string[]): Promise<number[][]> {
   }
   if (dimensions > 0) body.dimensions = dimensions
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), EMBEDDINGS_FETCH_TIMEOUT_MS)
-  let response: Response
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  let payload: { data?: Array<{ embedding?: number[]; index?: number }> }
   try {
-    response = await fetch(`${baseUrl.replace(/\/+$/, '')}/embeddings`, {
+    const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/embeddings`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1531,20 +1533,18 @@ async function fetchEmbeddingsOnce(texts: string[]): Promise<number[][]> {
       body: JSON.stringify(body),
       signal: controller.signal,
     })
+    if (!response.ok) {
+      const errBody = await response.text()
+      throw new Error(formatEmbeddingsApiError(response.status, errBody))
+    }
+    payload = await response.json() as typeof payload
   } catch (error) {
     if (error instanceof Error && (error.name === 'AbortError' || /aborted/i.test(error.message))) {
-      throw new Error(`Embeddings 请求超时（>${Math.round(EMBEDDINGS_FETCH_TIMEOUT_MS / 1000)}s），请检查网络或减小批次`)
+      throw new Error(`Embeddings 请求超时（>${Math.round(timeoutMs / 1000)}s），请检查网络或减小批次`)
     }
     throw error
   } finally {
     clearTimeout(timeout)
-  }
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => '')
-    throw new Error(formatEmbeddingsApiError(response.status, errBody))
-  }
-  const payload = (await response.json()) as {
-    data?: Array<{ embedding?: number[]; index?: number }>
   }
   const rows = Array.isArray(payload.data) ? payload.data : []
   const sorted = [...rows].sort((a, b) => Number(a.index || 0) - Number(b.index || 0))
@@ -1565,19 +1565,19 @@ async function fetchEmbeddingsOnce(texts: string[]): Promise<number[][]> {
  * Call /embeddings, splitting when the provider rejects oversized batches.
  * DashScope text-embedding-v* hard-caps at 10 inputs per request.
  */
-async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
+async function fetchEmbeddings(texts: string[], timeoutMs = EMBEDDINGS_FETCH_TIMEOUT_MS): Promise<number[][]> {
   if (texts.length === 0) return []
   const cap = getProviderBatchCap()
   if (texts.length > cap) {
     const out: number[][] = []
     for (let i = 0; i < texts.length; i += cap) {
-      const part = await fetchEmbeddingsOnce(texts.slice(i, i + cap))
+      const part = await fetchEmbeddingsOnce(texts.slice(i, i + cap), timeoutMs)
       out.push(...part)
     }
     return out
   }
   try {
-    return await fetchEmbeddingsOnce(texts)
+    return await fetchEmbeddingsOnce(texts, timeoutMs)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const maxMatch = message.match(/最多\s*(\d+)\s*条/) || message.match(/larger than\s*(\d+)/i)
@@ -1587,7 +1587,7 @@ async function fetchEmbeddings(texts: string[]): Promise<number[][]> {
       setSetting(EMBEDDING_BATCH_SIZE_KEY, String(forcedMax))
       const out: number[][] = []
       for (let i = 0; i < texts.length; i += forcedMax) {
-        const part = await fetchEmbeddingsOnce(texts.slice(i, i + forcedMax))
+        const part = await fetchEmbeddingsOnce(texts.slice(i, i + forcedMax), timeoutMs)
         out.push(...part)
       }
       return out
@@ -1854,7 +1854,7 @@ async function processEmbeddingQueue(): Promise<void> {
 
 export async function vectorSearch(
   query: string,
-  options?: { limit?: number; limitIsAll?: boolean; allowLargeLimit?: boolean; folderId?: string; tagId?: string; docId?: string },
+  options?: { limit?: number; limitIsAll?: boolean; allowLargeLimit?: boolean; folderId?: string; tagId?: string; docId?: string; docIds?: string[]; timeoutMs?: number },
 ): Promise<VectorSearchResult | VectorSearchError> {
   const q = String(query || '').trim()
   if (!q) return { ok: false, code: 'invalid_args', message: 'query is required' }
@@ -1863,6 +1863,20 @@ export async function vectorSearch(
   const dimMeta = getMeta('dim')
   const modelId = dimMeta ? `${modelName}@${dimMeta}` : getMeta('model_id') || modelName
   const activeProjectId = getActiveLibraryProjectId()
+  const scopeIds = options?.docIds ? [...new Set(options.docIds.map((id) => String(id).trim()).filter(Boolean))] : undefined
+  if (scopeIds) {
+    let available = false
+    for (let index = 0; index < scopeIds.length && !available; index += 400) {
+      const batch = scopeIds.slice(index, index + 400)
+      available = !!queryOne<{ available: number }>(
+        `SELECT 1 AS available FROM embedding_chunks ec
+         WHERE ec.model_id = ? AND ec.doc_id IN (${batch.map(() => '?').join(',')})
+         AND EXISTS (SELECT 1 FROM library_project_documents p WHERE p.document_id = ec.doc_id AND p.project_id = ?) LIMIT 1`,
+        [modelId, ...batch, activeProjectId],
+      )
+    }
+    if (!available) return { ok: false, code: 'index_empty', message: '所选范围没有可用向量索引。' }
+  }
   const totalChunks = Number(
     queryOne<{ c: number }>(
       `SELECT COUNT(*) as c
@@ -1881,7 +1895,8 @@ export async function vectorSearch(
 
   let queryVec: Float32Array
   try {
-    const [raw] = await fetchEmbeddings([clipEmbedText(q)])
+    const timeoutMs = Math.min(EMBEDDINGS_FETCH_TIMEOUT_MS, Math.max(1000, Number(options?.timeoutMs) || EMBEDDINGS_FETCH_TIMEOUT_MS))
+    const [raw] = await fetchEmbeddings([clipEmbedText(q)], timeoutMs)
     queryVec = l2Normalize(raw)
   } catch (error) {
     return {
@@ -1891,10 +1906,10 @@ export async function vectorSearch(
     }
   }
 
-  let allowedDocs: Set<string> | null = null
+  let allowedDocs: Set<string> | null = scopeIds ? new Set(scopeIds) : null
   const scopedDocId = String(options?.docId || '').trim()
   if (scopedDocId) {
-    allowedDocs = new Set([scopedDocId])
+    allowedDocs = allowedDocs ? new Set([...allowedDocs].filter((id) => id === scopedDocId)) : new Set([scopedDocId])
   }
   if (options?.folderId) {
     const folderIds = resolveFolderAndDescendantIds([String(options.folderId)])
@@ -1959,6 +1974,7 @@ export async function vectorSearch(
   }
 
   const retainCandidate = (candidate: Cand): void => {
+    if (!Number.isFinite(candidate.score)) return
     if (bestHeap.length < limit) {
       bestHeap.push(candidate)
       siftHeapUp(bestHeap.length - 1)
@@ -2006,6 +2022,7 @@ export async function vectorSearch(
   }
 
   const cachedScan = vectorScanCache
+  const scanGeneration = vectorScanGeneration
   const cacheUsable = Boolean(
     cachedScan
     && cachedScan.projectId === activeProjectId
@@ -2020,6 +2037,10 @@ export async function vectorSearch(
     // cache holds the full project+model row set.
     const { vectors, dim, docIds, segmentIds, pageIds, pageNums, count } = cachedScan
     for (let i = 0; i < count; i += 1) {
+      // Yield even when a restrictive scope skips every row in this batch.
+      if (i > 0 && i % CACHE_SCAN_YIELD_EVERY_ROWS === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
       if (allowedDocs && !allowedDocs.has(docIds[i])) continue
       retainCandidate({
         segmentId: segmentIds[i],
@@ -2028,9 +2049,6 @@ export async function vectorSearch(
         pageNum: pageNums[i],
         score: dotAtOffset(queryVec, vectors, i * dim),
       })
-      if ((i + 1) % CACHE_SCAN_YIELD_EVERY_ROWS === 0) {
-        await new Promise<void>((resolve) => setImmediate(resolve))
-      }
     }
   } else if (scopedDocId) {
     // In-document search: query only this doc's chunks (SQL-level), never leak other docs.
@@ -2156,7 +2174,7 @@ export async function vectorSearch(
       if (rows.length < SCAN_CHUNK_ROWS) break
     }
 
-    if (cacheBuild && cacheBuild.nextIndex === totalChunks) {
+    if (cacheBuild && cacheBuild.nextIndex === totalChunks && scanGeneration === vectorScanGeneration) {
       vectorScanCache = {
         projectId: activeProjectId,
         modelId,

@@ -60,6 +60,9 @@ jobs:
       - name: Check
         run: npm run check
 
+      - name: Check release interactions
+        run: npm run check:release-ui
+
       - name: Build Windows packages
         run: npm run build:win
 

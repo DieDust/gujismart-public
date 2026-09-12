@@ -3,11 +3,10 @@ import { join, resolve } from 'path'
 import { is } from '@electron-toolkit/utils'
 import { closeDatabase, initDatabase, isLargeLibraryForAutomaticMaintenance, listStoredLocalResourcePaths, resolveProfileDir, runDeferredStartupDatabaseMaintenance } from './database'
 import { registerAllIpcHandlers } from './ipc'
-import { createReadStream, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'fs'
+import { createReadStream, statSync } from 'fs'
 import { Readable } from 'stream'
 import { startAutoBackupScheduler, stopAutoBackupScheduler } from './backup'
 import { backfillLibraryFileFingerprints, shutdownPdfAssetRuntime } from './pdf-assets'
-import { scheduleStartupMetadataReclassification } from './metadata-reclassifier'
 import { allowManagedFileAccessPaths, assertAllowedLocalResourceUrl, assertHttpUrl } from './file-access'
 import { fileCapabilityService } from './file-capabilities'
 import { importSelectionService } from './import-selections'
@@ -31,6 +30,7 @@ import { batchProcessor } from './batch-processor'
 import { initializeSettingsSecurity } from './settings-security'
 import { assertMcpTokenAllowed, parseMcpCliArgs } from './mcp/connection'
 import { runMcpStdioServer } from './mcp/stdio-server'
+import { assertDirectoryWritable, describeDirectoryAccessFailure, shouldShowDirectoryFailureDialog } from './directory-access'
 
 const mcpLaunch = parseMcpCliArgs(process.argv.slice(1))
 if (mcpLaunch.dataDir) {
@@ -159,21 +159,14 @@ const profileRoot = process.env.GUJISMART_PROFILE_DIR
     : resolveProfileDir()
 
 try {
-  if (!existsSync(profileRoot)) {
-    mkdirSync(profileRoot, { recursive: true })
-  }
-  const profileWriteProbe = join(profileRoot, '.write-test')
-  writeFileSync(profileWriteProbe, 'ok')
-  unlinkSync(profileWriteProbe)
+  assertDirectoryWritable(profileRoot)
 } catch (error) {
-  const softwareDir = is.dev ? process.cwd() : resolve(profileRoot, '..', '..')
-  dialog.showErrorBox(
-    '无法打开文献库数据目录',
-    `当前软件目录不可写，GujiSmart 无法在当前目录保存数据库和缓存。\n\n请把软件目录移动到可写位置，或调整目录权限后重试。\n\n软件目录：${softwareDir}`,
-  )
-  console.error('[App] Failed to prepare profile directory', error)
+  const details = describeDirectoryAccessFailure(profileRoot, error)
+  console.error('[App] Failed to prepare profile directory', details, error)
+  if (shouldShowDirectoryFailureDialog(mcpLaunch.isMcp, process.env)) {
+    dialog.showErrorBox('无法准备应用缓存目录', details)
+  }
   app.exit(1)
-  throw error
 }
 
 app.setPath('userData', profileRoot)
@@ -181,6 +174,8 @@ app.commandLine.appendSwitch('disable-logging')
 app.commandLine.appendSwitch('log-level', '3')
 
 const enableGpuOnWindows = process.env.GUJISMART_ENABLE_GPU === '1'
+const backgroundUiTest = process.env.GUJISMART_SMOKE === '1'
+  && process.env.GUJISMART_TEST_BACKGROUND === '1'
 const forceDisableGpu = process.env.GUJISMART_SMOKE === '1'
   || process.env.GUJISMART_DISABLE_GPU === '1'
   || (process.platform === 'win32' && !enableGpuOnWindows)
@@ -211,6 +206,8 @@ function createWindow(): void {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: !backgroundUiTest,
+      offscreen: backgroundUiTest,
       sandbox: false
     }
   })
@@ -220,6 +217,7 @@ function createWindow(): void {
   let rendererRecoveryAttempts = 0
   let rendererRecoveryResetTimer: NodeJS.Timeout | null = null
   const showWindowIfNeeded = (win: BrowserWindow): void => {
+    if (backgroundUiTest) return
     if (!win.isVisible()) {
       win.show()
       win.focus()
@@ -488,8 +486,7 @@ function scheduleStartupMaintenance(): void {
           console.warn('[Main] Failed to reconcile metadata tag bindings', error)
         }
 
-        scheduleStartupMetadataReclassification()
-        markStartupEvent('startup-maintenance.metadata-reclassification-scheduled')
+        // Legacy classification needs an explicit user action, not a paid startup migration.
       } finally {
         endMaintenance()
         logStartupTimingSummary('startup-maintenance-done', true)
@@ -541,6 +538,7 @@ if (mcpLaunch.isMcp) {
     app.quit()
   } else {
     app.on('second-instance', () => {
+      if (backgroundUiTest) return
       if (!mainWindow || mainWindow.isDestroyed()) return
       if (mainWindow.isMinimized()) mainWindow.restore()
       mainWindow.show()

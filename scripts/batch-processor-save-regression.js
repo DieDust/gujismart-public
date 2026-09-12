@@ -25,6 +25,12 @@ const savePageResultsBody = sliceBetween(
   'private async postProcessPdfResultsBatched',
   'batch page result save body',
 )
+assert(
+  savePageResultsBody.includes('await preparePagePayloadUpdateAsync')
+    && savePageResultsBody.indexOf('await preparePagePayloadUpdateAsync') < savePageResultsBody.indexOf('transaction(() => {')
+    && savePageResultsBody.includes('if (!page || page.doc_id !== docId) return'),
+  'Payload compression must finish before acquiring a transaction, and deleted pages must be rechecked before writing.',
+)
 const postProcessPdfResultsBatchedBody = sliceBetween(
   batchSource,
   'private async postProcessPdfResultsBatched',

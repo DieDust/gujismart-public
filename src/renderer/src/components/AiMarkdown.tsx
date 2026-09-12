@@ -54,6 +54,7 @@ function sourceToTarget(source: EvidenceQaSource, sources: EvidenceQaSource[] | 
     sourceId: `ai-cite-${index + 1}`,
     sourceLabel: `[${index + 1}] ${source.doc_title || '原文'}`,
     locator: source.locator,
+    stableLocator: source.stableLocator,
     searchSession: buildSourceSearchSession(sources, index, keyword),
     revealToc: true,
   }

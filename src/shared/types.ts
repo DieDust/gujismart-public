@@ -2397,6 +2397,9 @@ export type CitationPageFieldOverrides = Partial<Record<'pages' | 'page_referenc
 
 export interface CitationGenerateOptions {
   pageNum?: string | number | null
+  // Optional physical provenance; resolve the current printed label without changing stored excerpts.
+  sourcePageId?: string
+  sourcePageNum?: number
   fieldOverrides?: CitationPageFieldOverrides
 }
 
@@ -3953,6 +3956,8 @@ export interface SearchExportResult {
   maxExportRecords?: SearchExportCount
 }
 
+export type { KnowledgeGraphData, KnowledgeGraphDataQuery, KnowledgeGraphDatasetConfig } from './research-graph'
+
 /** Result returned immediately after a large export is queued in the main process. */
 export interface SearchExportTaskStartResult {
   taskId: string | null
@@ -4031,6 +4036,121 @@ export interface DocumentDetail extends Document {
 
 export interface DocumentLightDetail extends Omit<DocumentDetail, 'pages'> {
   pages: DocumentLightPage[]
+}
+
+export type CorpusEntityKind = 'person' | 'place' | 'organization' | 'time' | 'event'
+export interface CorpusEntityExtraction {
+  name: string
+  kind: CorpusEntityKind
+  aliases: { name: string; quote: string }[]
+}
+export interface CorpusEntityMention {
+  id: string
+  groupId: string
+  findingId: string
+  name: string
+  kind: CorpusEntityKind
+  aliases: string[]
+  suggestedAliases: string[]
+  candidateCount: number
+  groupSize: number
+  reviewed: boolean
+  source: CorpusResearchFinding
+}
+export interface CorpusEntityPage {
+  history: { id: string; action: CorpusEntityReview['action']; reason: string }[]
+  items: CorpusEntityMention[]
+  total: number
+  revision: number
+  canUndo: boolean
+  unprocessedFindings: number
+}
+export interface CorpusEntityQuery {
+  candidateOfId?: string
+  search?: string
+  offset?: number
+  limit?: number
+  candidatesOnly?: boolean
+  groupId?: string
+}
+export interface CorpusEntityReview {
+  revision: number
+  action: 'merge' | 'split' | 'undo'
+  mentionIds: string[]
+  reason: string
+}
+
+export interface CorpusResearchCreatePayload {
+  scope: LibraryAiScope
+  question: string
+  projectId?: string
+  requestKey: string
+  maxRequests: number
+  reuseCompleted?: boolean
+}
+
+export interface CorpusResearchStatus {
+  id: string
+  question: string
+  projectId: string | null
+  status: TaskStatus
+  phase: string
+  totalDocuments: number
+  totalUnits: number
+  completedUnits: number
+  failedUnits: number
+  pendingUnits: number
+  findings: number
+  requests: number
+  maxRequests: number
+  inputTokens: number
+  outputTokens: number
+  measuredRequests: number
+  reservedInputBytes: number
+  active: boolean
+  error: string
+  report: string
+  reportSources: EvidenceQaSource[]
+  createdAt: number
+  updatedAt: number
+}
+
+export interface CorpusResearchDocumentRow {
+  docId: string
+  title: string
+  totalUnits: number
+  completedUnits: number
+  failedUnits: number
+  findings: number
+  error: string
+}
+
+export interface CorpusResearchFinding {
+  entities?: CorpusEntityExtraction[]
+  id: string
+  docId: string
+  title: string
+  pageId: string
+  pageNum: number
+  claim: string
+  quote: string
+  stance: 'support' | 'challenge' | 'context'
+  dimension: string
+  uncertainty: string
+  sourceHash: string
+  start: number
+  end: number
+  stableLocator?: StableReaderLocator
+  sourceStatus?: 'current' | 'stale' | 'missing'
+}
+
+export interface CorpusResearchPageOptions {
+  offset?: number
+  limit?: number
+  search?: string
+  docId?: string
+  sort?: 'title' | 'completed' | 'findings' | 'failed'
+  descending?: boolean
 }
 
 export type BatchItemStatus = BatchQueueItem['status']

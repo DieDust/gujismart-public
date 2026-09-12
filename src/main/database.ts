@@ -1,5 +1,7 @@
 ﻿import { app } from 'electron'
 import { randomUUID } from 'crypto'
+import { assertDirectoryWritable, describeDirectoryAccessFailure } from './directory-access'
+import { clearPreparedStatements, prepareCachedStatement } from './database-statements'
 import { basename, dirname, join, normalize, resolve } from 'path'
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import Database from 'better-sqlite3'
@@ -117,19 +119,6 @@ function checkpointDatabase(options?: { retryBusy?: boolean; mode?: 'PASSIVE' | 
   }
 }
 
-function canWriteToDirectory(dir: string): boolean {
-  try {
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
-    }
-    const probePath = join(dir, '.write-test')
-    writeFileSync(probePath, 'ok')
-    unlinkSync(probePath)
-    return true
-  } catch {
-    return false
-  }
-}
 
 function copyDirRecursive(src: string, dest: string): void {
   if (!existsSync(dest)) mkdirSync(dest, { recursive: true })
@@ -262,14 +251,12 @@ export function resolvePreferredDataDir(): string {
     ? resolve(process.cwd(), 'data')
     : getStableAppRoot()
 
-  if (canWriteToDirectory(preferredDir)) {
+  try {
+    assertDirectoryWritable(preferredDir)
     return preferredDir
+  } catch (error) {
+    throw new Error(describeDirectoryAccessFailure(preferredDir, error), { cause: error })
   }
-
-  const softwareDir = dirname(app.getPath('exe'))
-  throw new Error(
-    `当前软件目录不可写，无法创建或更新文献库数据。请把软件目录移动到可写位置，或调整目录权限后重试。\n软件目录：${softwareDir}`,
-  )
 }
 
 export function getDataDir(): string {
@@ -389,7 +376,7 @@ export function isSearchSegmentsFtsRebuildNeeded(): boolean {
 function runOn(sqlite: NativeDatabase, sql: string, params?: unknown[]): void {
   runWithBusyRetry(() => {
     if (params) {
-      sqlite.prepare(sql).run(...params)
+      prepareCachedStatement(sqlite, sql).run(...params)
       return
     }
 
@@ -788,10 +775,15 @@ CREATE TABLE IF NOT EXISTS task_artifacts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_task_jobs_idempotency ON task_jobs(kind, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_task_jobs_queue ON task_jobs(status, priority DESC, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_task_items_claim ON task_items(job_id, status, ordinal, id);
+CREATE INDEX IF NOT EXISTS idx_task_items_domain ON task_items(job_id, domain_type, domain_ref, status) WHERE domain_type = 'corpus.unit';
 CREATE INDEX IF NOT EXISTS idx_task_items_lease ON task_items(status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_task_attempts_item ON task_attempts(item_id, attempt_no DESC);
 CREATE INDEX IF NOT EXISTS idx_task_events_job_cursor ON task_events(job_id, id);
+CREATE INDEX IF NOT EXISTS idx_task_events_kind ON task_events(job_id, event_type, id);
 CREATE INDEX IF NOT EXISTS idx_task_artifacts_job_cursor ON task_artifacts(job_id, seq);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_kind_cursor ON task_artifacts(job_id, kind, seq);
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_content_cache ON task_artifacts(kind, sha256) WHERE sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_task_artifacts_document ON task_artifacts(job_id, kind, json_extract(metadata_json, '$.docId')) WHERE kind = 'corpus.finding';
 
 CREATE TABLE IF NOT EXISTS citation_templates (
   id TEXT PRIMARY KEY,
@@ -2472,6 +2464,21 @@ function ensureSearchGenerationTriggers(sqlite: NativeDatabase): void {
   `)
 }
 
+function ensureCorpusContentGeneration(sqlite: NativeDatabase): void {
+  sqlite.exec("INSERT OR IGNORE INTO search_generation_state (scope, generation, updated_at) VALUES ('corpus-content', 0, 0)")
+  const bump = "UPDATE search_generation_state SET generation = generation + 1 WHERE scope = 'corpus-content';"
+  const pageFields = ['doc_id', 'page_num', 'ocr_text', 'ocr_text_ref', 'proofed_text', 'proofed_text_ref',
+    'proof_status', 'active_ocr_artifact_id', 'proof_base_artifact_id']
+  for (const table of ['pages', 'page_ocr_versions', 'ocr_page_active_artifacts', 'ocr_artifact_versions', 'library_project_documents']) {
+    for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
+      const condition = table === 'pages' && event === 'UPDATE'
+        ? `WHEN ${pageFields.map((field) => `NEW.${field} IS NOT OLD.${field}`).join(' OR ')}` : ''
+      sqlite.exec(`CREATE TRIGGER IF NOT EXISTS trg_corpus_content_${table}_${event.toLowerCase()}
+        AFTER ${event} ON ${table} ${condition} BEGIN ${bump} END;`)
+    }
+  }
+}
+
 function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'pages', 'ocr_text_ref TEXT', 'ocr_text_ref')
   addColumnIfMissing(sqlite, 'pages', 'ocr_result_ref TEXT', 'ocr_result_ref')
@@ -2484,6 +2491,7 @@ function migrateExistingSchema(sqlite: NativeDatabase): void {
   addColumnIfMissing(sqlite, 'pages', 'literature_page_source TEXT', 'literature_page_source')
   addColumnIfMissing(sqlite, 'pages', 'ocr_page_label INTEGER', 'ocr_page_label')
   ensureSearchGenerationTriggers(sqlite)
+  ensureCorpusContentGeneration(sqlite)
 
   addColumnIfMissing(sqlite, 'documents', 'is_favorite INTEGER DEFAULT 0', 'is_favorite')
   addColumnIfMissing(sqlite, 'documents', 'favorite_at TEXT', 'favorite_at')
@@ -3766,6 +3774,7 @@ export function closeDatabase(): void {
   }
 
   if (db) {
+    clearPreparedStatements(db)
     db.close()
     db = null
   }
@@ -3795,7 +3804,7 @@ export function queryAll<T = Record<string, unknown>>(sql: string, params?: unkn
   const database = getDatabase()
   let rows: T[] = []
   runWithBusyRetry(() => {
-    const stmt = database.prepare(sql)
+    const stmt = prepareCachedStatement(database, sql)
     rows = params ? stmt.all(...params) as T[] : stmt.all() as T[]
   })
   return rows
@@ -3811,7 +3820,7 @@ export async function queryAllAsync<T = Record<string, unknown>>(
   const deadline = Date.now() + maxWaitMs
   while (true) {
     try {
-      const stmt = database.prepare(sql)
+      const stmt = prepareCachedStatement(database, sql)
       return params ? stmt.all(...params) as T[] : stmt.all() as T[]
     } catch (error) {
       if (!isDatabaseBusyError(error) || Date.now() >= deadline) throw error
@@ -3824,7 +3833,7 @@ export function queryOne<T = Record<string, unknown>>(sql: string, params?: unkn
   const database = getDatabase()
   let row: T | undefined
   runWithBusyRetry(() => {
-    const stmt = database.prepare(sql)
+    const stmt = prepareCachedStatement(database, sql)
     row = params ? stmt.get(...params) as T | undefined : stmt.get() as T | undefined
   })
   return (row as T | undefined) || null
@@ -3861,7 +3870,7 @@ export async function runAsync(
     while (true) {
       try {
         if (params) {
-          database.prepare(sql).run(...params)
+          prepareCachedStatement(database, sql).run(...params)
         } else {
           database.exec(sql)
         }

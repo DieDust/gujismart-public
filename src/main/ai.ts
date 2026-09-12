@@ -36,14 +36,6 @@ import type {
 type AiDocumentBriefRow = Pick<Document, 'id' | 'title' | 'author' | 'metadata'>
 type JsonRecord = Record<string, unknown>
 
-interface LlmResponse extends JsonRecord {
-  error?: unknown
-  choices?: Array<{
-    message?: { content?: unknown }
-    delta?: { content?: unknown }
-  }>
-}
-
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
@@ -1052,11 +1044,79 @@ function getCompatibleRetryBody(body: JsonRecord, errorMessage: string): JsonRec
   return changed ? next : null
 }
 
-export async function callLLM(messages: ChatMessage[]): Promise<string> {
-  const apiKey = readProtectedSetting('llm_api_key').trim()
-  const baseUrl = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_base_url'")?.value || 'https://api.deepseek.com/v1').replace(/\/+$/, '')
+export class LlmRequestError extends Error {
+  constructor(message: string, readonly retryable: boolean, readonly code?: 'truncated' | 'configuration') { super(message) }
+}
+
+export interface LlmConfigIdentity {
+  provider: string
+  baseUrl: string
+  model: string
+}
+
+export interface LlmUsage {
+  inputTokens: number
+  outputTokens: number
+  cachedInputTokens: number
+  totalTokens: number
+}
+
+export interface LlmCallOptions {
+  timeoutMs?: number
+  maxOutputTokens?: number
+  expectedConfig?: LlmConfigIdentity
+  onUsage?: (usage: LlmUsage) => void
+  // Synchronous reservation; throwing prevents this fetch, including a compatibility retry.
+  onRequest?: () => void
+  rejectTruncated?: boolean
+}
+
+function normalizeLlmConfigIdentity(config: LlmConfigIdentity): LlmConfigIdentity {
+  return {
+    provider: config.provider.trim(),
+    baseUrl: config.baseUrl.trim().replace(/\/+$/, ''),
+    model: config.model.trim(),
+  }
+}
+
+export function getLlmConfigIdentity(): LlmConfigIdentity {
+  const baseUrl = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_base_url'")?.value || 'https://api.deepseek.com/v1')
   const model = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_model'")?.value || 'deepseek-chat').trim()
   const provider = String(queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'llm_provider'")?.value || 'AI').trim()
+  return normalizeLlmConfigIdentity({ provider, baseUrl, model })
+}
+
+function readTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+}
+
+function getLlmUsage(data: unknown): LlmUsage | undefined {
+  const usage = readRecordValue(data, 'usage')
+  const inputTokens = readTokenCount(readRecordValue(usage, 'prompt_tokens'))
+  const outputTokens = readTokenCount(readRecordValue(usage, 'completion_tokens'))
+  // Missing or malformed usage is not a measured zero-token response.
+  if (inputTokens === undefined || outputTokens === undefined) return undefined
+  const cachedInputTokens = readTokenCount(getPathValue(usage, ['prompt_tokens_details', 'cached_tokens']))
+    ?? readTokenCount(readRecordValue(usage, 'prompt_cache_hit_tokens'))
+    ?? 0
+  const totalTokens = readTokenCount(readRecordValue(usage, 'total_tokens')) ?? inputTokens + outputTokens
+  return { inputTokens, outputTokens, cachedInputTokens, totalTokens }
+}
+
+export async function callLLM(messages: ChatMessage[], options: LlmCallOptions = {}): Promise<string> {
+  const { provider, baseUrl, model } = getLlmConfigIdentity()
+  if (options.expectedConfig) {
+    const expected = normalizeLlmConfigIdentity(options.expectedConfig)
+    if (expected.provider !== provider || expected.baseUrl !== baseUrl || expected.model !== model) {
+      throw new LlmRequestError('LLM configuration mismatch: selected settings changed. Recheck the provider, base URL and model before reserving a budget.', false, 'configuration')
+    }
+  }
+  if (options.maxOutputTokens !== undefined && (
+    !Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens <= 0
+  )) {
+    throw new LlmRequestError('maxOutputTokens must be a positive safe integer.', false)
+  }
+  const apiKey = readProtectedSetting('llm_api_key').trim()
 
   if (!apiKey) {
     throw new Error(`未配置 ${provider} API Key，请在设置中填写或切换 AI 服务商。`)
@@ -1066,11 +1126,15 @@ export async function callLLM(messages: ChatMessage[]): Promise<string> {
     model,
     messages,
     temperature: getLlmTemperature(provider, model, baseUrl),
+    ...(options.maxOutputTokens === undefined ? {} : { max_tokens: options.maxOutputTokens }),
   }
 
-  const requestOnce = async (body: JsonRecord): Promise<{ response: Response; data: LlmResponse }> => {
+  const requestOnce = async (body: JsonRecord): Promise<{ response: Response; data: JsonRecord }> => {
+    const serializedBody = JSON.stringify(body)
+    options.onRequest?.()
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 120_000)
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1000, Math.min(600_000, options.timeoutMs!)) : 120_000
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
@@ -1078,21 +1142,23 @@ export async function callLLM(messages: ChatMessage[]): Promise<string> {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
         },
-        body: JSON.stringify(body),
+        body: serializedBody,
         signal: controller.signal,
       })
       const text = await response.text()
-      let data: LlmResponse = {}
+      let data: JsonRecord = {}
       try {
         const parsed = text ? JSON.parse(text) as unknown : {}
-        data = isJsonRecord(parsed) ? parsed as LlmResponse : {}
+        data = isJsonRecord(parsed) ? parsed : {}
       } catch {
         data = { error: { message: text || response.statusText } }
       }
+      const usage = getLlmUsage(data)
+      if (usage) options.onUsage?.(usage)
       return { response, data }
     } catch (error: unknown) {
       if (isAbortError(error)) {
-        throw new Error(`${provider} AI 请求超时，请稍后重试或切换到更快的 AI 服务商。`)
+        throw new LlmRequestError(`${provider} AI 请求超时（等待 ${Math.round(timeoutMs / 1000)} 秒），请稍后重试。`, true)
       }
       throw error
     } finally {
@@ -1111,10 +1177,14 @@ export async function callLLM(messages: ChatMessage[]): Promise<string> {
   }
 
   if (!response.ok || data.error) {
-    throw new Error(`${provider} LLM 请求失败: ${getLlmErrorMessage(data, response)}`)
+    throw new LlmRequestError(`${provider} LLM 请求失败（HTTP ${response.status}）: ${getLlmErrorMessage(data, response)}`, response.status === 408 || response.status === 429 || response.status >= 500)
   }
 
-  return String(data.choices?.[0]?.message?.content || '')
+  if (options.rejectTruncated && getPathValue(data, ['choices', '0', 'finish_reason']) === 'length') {
+    throw new LlmRequestError('LLM response was truncated (finish_reason=length): increase maxOutputTokens or shorten the input before retrying.', false, 'truncated')
+  }
+
+  return String(getPathValue(data, ['choices', '0', 'message', 'content']) || '')
 }
 
 export async function callLLMStream(

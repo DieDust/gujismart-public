@@ -658,7 +658,8 @@ assert(
 assert(
   ocrIpcSource.includes('function markPageOcrVersionsInactive')
     && ocrIpcSource.includes('UPDATE page_ocr_versions SET is_active = 0 WHERE page_id IN')
-    && savePageOcrResultsBody.includes('const versionWrites: OcrVersionWrite[] = []')
+    && savePageOcrResultsBody.includes('const versionWrites: Array<OcrVersionWrite & {')
+    && savePageOcrResultsBody.includes('const { preparedText, preparedResult } = item')
     && savePageOcrResultsBody.includes('const shouldWriteOcrVersion = resultPayload && (')
     && savePageOcrResultsBody.includes("pageResult.status === 'error' && isOcrQualityFailureMessage(pageResult.error)")
     && savePageOcrResultsBody.includes('versionWrites.push({')

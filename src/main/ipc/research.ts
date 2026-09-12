@@ -4,6 +4,9 @@ import { nanoid } from 'nanoid'
 import { callLLM, synthesizeDocumentIds } from '../ai'
 import { queryAll, queryOne, run, saveDatabase, transaction } from '../database'
 import { buildCitationByStyle } from './citation'
+import { findCitationSourcePage, resolveCitationPageOptions } from '../citation-page-source'
+import { getResearchNoteCitationPage, getResearchNotePageSource } from '../../shared/research-note-pages'
+import { resolveDisplayPageNum } from '../literature-page-map'
 import type {
   AiSynthesisTemplate,
   CursorPage,
@@ -323,10 +326,11 @@ function buildReferenceCitation(
 }
 
 function buildNoteFallbackCitation(note: NoteRow): string {
-  const page = note.page_num ? `第 ${note.page_num} 页` : '页码待补'
+  const pageNum = getResearchNoteCitationPage(note)
+  const page = pageNum ? `第 ${pageNum} 页` : '页码待补'
   const base = cleanupCitation(note.citation_text)
     || [cleanupCitation(note.doc_author), cleanupCitation(note.doc_title) || '未命名文献'].filter(Boolean).join('，')
-  return appendPageToCitation(base, note.page_num) || `${cleanupCitation(note.doc_title) || '未命名文献'}，${page}`
+  return appendPageToCitation(base, pageNum) || `${cleanupCitation(note.doc_title) || '未命名文献'}，${page}`
 }
 
 function buildNoteCitation(note: NoteRow, citationByNoteId: Map<string, string>): string {
@@ -335,10 +339,18 @@ function buildNoteCitation(note: NoteRow, citationByNoteId: Map<string, string>)
 
 function buildNoteCitationMap(notes: NoteRow[], citationStyleId?: string | null): Map<string, string> {
   const styleId = String(citationStyleId || '').trim()
+    || queryOne<{ id: string }>('SELECT id FROM citation_styles ORDER BY is_default DESC, name ASC LIMIT 1')?.id
   const citations = new Map<string, string>()
   if (!styleId) return citations
+  const generatedBySource = new Map<string, string>()
   for (const note of notes) {
-    const generated = cleanupCitation(buildCitationByStyle(note.doc_id, styleId, note.doc_type || '', { pageNum: note.page_num || null }))
+    const options = { ...getResearchNotePageSource(note), pageNum: getResearchNoteCitationPage(note) }
+    const key = JSON.stringify([note.doc_id, note.doc_type, options])
+    let generated = generatedBySource.get(key)
+    if (generated === undefined) {
+      generated = cleanupCitation(buildCitationByStyle(note.doc_id, styleId, note.doc_type || '', options))
+      generatedBySource.set(key, generated)
+    }
     if (generated) citations.set(note.id, generated)
   }
   return citations
@@ -433,7 +445,7 @@ function listNotes(projectId?: string | null): NoteRow[] {
   if (projectId) requireResearchProjectInActiveLibrary(projectId)
   const params: unknown[] = [getActiveLibraryProjectId()]
   if (projectId) params.push(projectId)
-  return queryAll<NoteRow>(
+  return resolveNoteSourceAvailability(queryAll<NoteRow>(
     `SELECT rn.*,
        d.title as doc_title,
        d.author as doc_author,
@@ -448,7 +460,22 @@ function listNotes(projectId?: string | null): NoteRow[] {
      ${projectId ? 'AND rn.project_id = ?' : ''}
      ORDER BY COALESCE(rn.sort_order, 0) ASC, rn.updated_at DESC`,
     params,
-  )
+  ))
+}
+
+function resolveNoteSourceAvailability(notes: NoteRow[]): NoteRow[] {
+  const availability = new Map<string, boolean>()
+  return notes.map((note) => {
+    const source = getResearchNotePageSource(note)
+    if (!source.sourcePageId && !source.sourcePageNum) return note
+    const key = JSON.stringify([note.doc_id, source])
+    let available = availability.get(key)
+    if (available === undefined) {
+      available = !!findCitationSourcePage(note.doc_id, source)
+      availability.set(key, available)
+    }
+    return { ...note, source_available: available ? 1 : 0 }
+  })
 }
 
 const RESEARCH_NOTE_PAGE_SIZE = 200
@@ -611,7 +638,7 @@ function listNotesPage(options: ListResearchNotesOptions = {}): ResearchNoteList
     ).map((row) => row.doc_id)
     : undefined
   return {
-    items,
+    items: resolveNoteSourceAvailability(items),
     total,
     limit,
     offset,
@@ -823,6 +850,7 @@ function getProjectSynthesisTexts(projectId: string, citationStyleId?: string | 
   if (notes.length > 0) {
     const grouped = new Map<string, { title: string; text: string; sources: SynthesisSource[] }>()
     const citationByNoteId = buildNoteCitationMap(notes, citationStyleId)
+    const citationPages = new Map<string, number | null>()
     for (const item of notes) {
       const current =
         grouped.get(item.doc_id) ||
@@ -832,11 +860,15 @@ function getProjectSynthesisTexts(projectId: string, citationStyleId?: string | 
           sources: [] as SynthesisSource[],
         }
 
-      const pageLabel = item.page_num ? `第 ${item.page_num} 页` : '未标页码'
+      const pageOptions = { ...getResearchNotePageSource(item), pageNum: getResearchNoteCitationPage(item) }
+      const pageKey = JSON.stringify([item.doc_id, pageOptions])
+      if (!citationPages.has(pageKey)) citationPages.set(pageKey, Number(resolveCitationPageOptions(item.doc_id, pageOptions)?.pageNum) || null)
+      const citationPage = citationPages.get(pageKey)
+      const pageLabel = citationPage ? `第 ${citationPage} 页` : '未标页码'
       const citation = buildNoteCitation(item, citationByNoteId)
       current.text += `[${KIND_LABELS[item.kind] || '摘录'}][${pageLabel}] ${item.excerpt}${item.note ? `\n研究备注：${item.note}` : ''}\n\n`
       current.sources.push({
-        page_num: Number(item.page_num || 0),
+        page_num: Number(citationPage || 0),
         snippet: item.excerpt,
         citation,
       })
@@ -847,20 +879,20 @@ function getProjectSynthesisTexts(projectId: string, citationStyleId?: string | 
 
   const docs = getProjectDocs(projectId)
   return docs.map((doc) => {
-    const pages = queryAll<{ page_num: number; text: string }>(
-      "SELECT page_num, COALESCE(proofed_text, ocr_text, '') as text FROM pages WHERE doc_id = ? ORDER BY page_num",
+    const pages = queryAll<{ page_num: number; literature_page_num: number | null; text: string }>(
+      "SELECT page_num, literature_page_num, COALESCE(proofed_text, ocr_text, '') as text FROM pages WHERE doc_id = ? ORDER BY page_num",
       [doc.id],
     )
     return {
       title: doc.title || '未命名文献',
-      text: pages.map((page) => `[第 ${page.page_num} 页]\n${page.text}`).join('\n\n').trim(),
+      text: pages.map((page) => `[第 ${resolveDisplayPageNum(page)} 页]\n${page.text}`).join('\n\n').trim(),
       sources: pages
         .filter((page) => page.text)
         .slice(0, 5)
         .map((page) => ({
-          page_num: page.page_num,
+          page_num: resolveDisplayPageNum(page),
           snippet: page.text.slice(0, 180),
-          citation: buildReferenceCitation(doc, 'gbt7714', citationStyleId, page.page_num),
+          citation: buildReferenceCitation(doc, 'gbt7714', citationStyleId, resolveDisplayPageNum(page)),
         })),
     }
   }).filter((item) => item.text)
