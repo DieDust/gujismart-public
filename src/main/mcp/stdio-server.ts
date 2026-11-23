@@ -46,7 +46,7 @@ function parseIncoming(chunk: string): JsonRpcRequest[] {
   return []
 }
 
-async function handleRequest(message: JsonRpcRequest): Promise<void> {
+async function handleRequest(message: JsonRpcRequest, beforeLibraryTool?: () => Promise<void>): Promise<void> {
   const id = message.id ?? null
   const method = String(message.method || '')
   const params = (message.params || {}) as Record<string, unknown>
@@ -97,6 +97,9 @@ async function handleRequest(message: JsonRpcRequest): Promise<void> {
       const args = (params.arguments && typeof params.arguments === 'object'
         ? params.arguments
         : {}) as Record<string, unknown>
+      if (MCP_TOOL_DEFINITIONS.some((tool) => tool.name === name)) {
+        await beforeLibraryTool?.()
+      }
       const result = await callLibraryTool(name, args)
       // Compact JSON (no pretty-print) — AI clients still parse structuredContent;
       // text payload is for models that only read content[].text.
@@ -127,7 +130,7 @@ async function handleRequest(message: JsonRpcRequest): Promise<void> {
  * MCP over stdio: supports both Content-Length framing and newline JSON.
  * Returns a Promise that resolves when stdin ends (keeps the process alive).
  */
-export function runMcpStdioServer(): Promise<void> {
+export function runMcpStdioServer(beforeLibraryTool: () => Promise<void>): Promise<void> {
   // Prevent accidental logging from corrupting the MCP stream.
   const originalLog = console.log
   const originalInfo = console.info
@@ -166,7 +169,7 @@ export function runMcpStdioServer(): Promise<void> {
         buffer = buffer.slice(bodyEnd)
         try {
           const message = JSON.parse(body) as JsonRpcRequest
-          await handleRequest(message)
+          await handleRequest(message, beforeLibraryTool)
         } catch (error) {
           process.stderr.write(`[gujismart-mcp] bad frame: ${error}\n`)
         }
@@ -179,29 +182,51 @@ export function runMcpStdioServer(): Promise<void> {
       const line = buffer.slice(0, nl)
       buffer = buffer.slice(nl + 1)
       for (const message of parseIncoming(line)) {
-        await handleRequest(message)
+        await handleRequest(message, beforeLibraryTool)
       }
     }
   }
 
-  return new Promise((resolve) => {
-    process.stdin.on('data', (chunk: string) => {
-      buffer += chunk
-      void processBuffer()
-    })
-
-    process.stdin.on('end', () => {
-      console.log = originalLog
-      console.info = originalInfo
-      console.warn = originalWarn
-      resolve()
-    })
-
-    process.stdin.on('error', (error) => {
-      process.stderr.write(`[gujismart-mcp] stdin error: ${error}\n`)
-      resolve()
-    })
-
+  return new Promise<void>((resolve, reject) => {
+    let draining = Promise.resolve()
+    let finishing = false
+    const onData = (chunk: string): void => {
+      if (finishing) return
+      draining = draining.then(async () => {
+        buffer += chunk
+        await processBuffer()
+      })
+      void draining.catch(finish)
+    }
+    const onSignal = (): void => finish()
+    function finish(error?: unknown): void {
+      if (finishing) return
+      finishing = true
+      process.stdin.off('data', onData)
+      process.stdin.off('end', finish)
+      process.stdin.off('close', finish)
+      const cleanup = (): void => {
+        process.stdin.off('error', finish)
+        process.stdout.off('error', finish)
+        process.off('SIGINT', onSignal)
+        process.off('SIGTERM', onSignal)
+        console.log = originalLog
+        console.info = originalInfo
+        console.warn = originalWarn
+      }
+      void draining.then(
+        () => { cleanup(); if (error !== undefined) reject(error); else resolve() },
+        (cause: unknown) => { cleanup(); reject(cause) },
+      )
+    }
+    process.stdin.on('data', onData)
+    process.stdin.once('end', finish)
+    process.stdin.once('close', finish)
+    process.stdin.once('error', finish)
+    process.stdout.once('error', finish)
+    process.once('SIGINT', onSignal)
+    process.once('SIGTERM', onSignal)
+    if (process.stdin.readableEnded || process.stdin.destroyed) finish()
     process.stderr.write('[gujismart-mcp] ready (stdio MCP, read-only library tools)\n')
   })
 }

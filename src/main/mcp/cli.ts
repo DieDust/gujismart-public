@@ -11,9 +11,9 @@
 import { app } from 'electron'
 import { resolve } from 'path'
 import { closeDatabase, initDatabase } from '../database'
-import { initializeSettingsSecurity } from '../settings-security'
 import { assertMcpTokenAllowed, parseMcpCliArgs } from './connection'
 import { runMcpStdioServer } from './stdio-server'
+import { runMcpDatabaseSession } from './session'
 
 function redirectConsoleToStderr(): void {
   // MCP uses stdout for JSON-RPC; never print app logs there.
@@ -48,55 +48,28 @@ async function main(): Promise<void> {
 
   await app.whenReady()
 
-  try {
-    initializeSettingsSecurity()
-  } catch (error) {
-    process.stderr.write(`[gujismart-mcp] settings security init skipped: ${error}\n`)
-  }
-
-  await initDatabase()
-  // End-user configs always carry a token. Local npm debugging can set GUJISMART_MCP_DEV=1.
-  if (mcpArgs.token || process.env.GUJISMART_MCP_DEV !== '1') {
-    try {
-      assertMcpTokenAllowed(mcpArgs.token)
-    } catch (error) {
-      // Dev convenience: allow open data-dir without settings when explicitly opted in.
-      if (process.env.GUJISMART_MCP_DEV === '1') {
-        process.stderr.write(`[gujismart-mcp] warning: ${error instanceof Error ? error.message : String(error)}\n`)
-      } else {
-        throw error
+  const devBypass = process.env.GUJISMART_MCP_DEV === '1' && !app.isPackaged
+  await runMcpDatabaseSession({
+    runTransport: runMcpStdioServer,
+    checkCredentialsPresent: () => {
+      if (!mcpArgs.token?.trim() && !devBypass) {
+        throw new Error('AI 工具连接令牌无效。请在软件设置中重新复制配置到你的 AI 客户端。')
       }
-    }
-  }
-  process.stderr.write(
-    `[gujismart-mcp] database ready (dataDir=${process.env.GUJISMART_DATA_DIR || '(default)'})\n`,
-  )
-
-  const shutdown = () => {
-    try {
-      closeDatabase()
-    } catch {
-      // ignore
-    }
-    try {
-      app.exit(0)
-    } catch {
-      process.exit(0)
-    }
-  }
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
-
-  await runMcpStdioServer()
-  shutdown()
+    },
+    openDatabase: initDatabase,
+    authorize: () => {
+      if (devBypass) return
+      assertMcpTokenAllowed(mcpArgs.token)
+    },
+    prepareAuthorizedTools: () => {},
+    closeDatabase: () => closeDatabase({ checkpoint: false }),
+  })
 }
 
-main().catch((error) => {
-  process.stderr.write(`[gujismart-mcp] fatal: ${error instanceof Error ? error.stack || error.message : String(error)}\n`)
-  try {
-    closeDatabase()
-  } catch {
-    // ignore
-  }
-  app.exit(1)
-})
+main().then(
+  () => app.exit(0),
+  (error: unknown) => {
+    process.stderr.write(`[gujismart-mcp] fatal: ${error instanceof Error ? error.message : String(error)}\n`)
+    app.exit(1)
+  },
+)

@@ -3762,15 +3762,17 @@ export function scheduleDatabaseSave(options?: { minDelayMs?: number }): void {
   deferredDatabaseSaveTimer.unref?.()
 }
 
-export function closeDatabase(): void {
-  try {
-    // Prefer shrinking WAL on clean exit so the next cold start opens quickly.
-    // Fall back to passive checkpoint if truncate is busy.
-    if (!checkpointDatabase({ retryBusy: true, mode: 'TRUNCATE' })) {
-      checkpointDatabase({ retryBusy: true, mode: 'PASSIVE' })
+export function closeDatabase(options: { checkpoint?: boolean } = {}): void {
+  if (options.checkpoint !== false) {
+    try {
+      // Prefer shrinking WAL on clean exit so the next cold start opens quickly.
+      // Fall back to passive checkpoint if truncate is busy.
+      if (!checkpointDatabase({ retryBusy: true, mode: 'TRUNCATE' })) {
+        checkpointDatabase({ retryBusy: true, mode: 'PASSIVE' })
+      }
+    } catch (error) {
+      console.error('[Database] Close checkpoint failed', error)
     }
-  } catch (error) {
-    console.error('[Database] Close checkpoint failed', error)
   }
 
   if (db) {
