@@ -24,6 +24,11 @@ buildSync({
   platform: 'node',
   format: 'cjs',
   outfile,
+  // The installed stdio host is outside app.asar. Resolve its native dependency
+  // from this same application, including clients with an existing launch config.
+  banner: {
+    js: "if (process.env.GUJISMART_MCP_PACKAGED === '1') module.paths.unshift(require('node:path').join(__dirname, '..', 'app.asar', 'node_modules'));",
+  },
   external: ['better-sqlite3', '@napi-rs/canvas', 'playwright'],
   alias: {
     electron: join(root, 'scripts', 'stubs', 'electron-app-shim.js'),

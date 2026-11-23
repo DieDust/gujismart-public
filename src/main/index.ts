@@ -30,6 +30,7 @@ import { batchProcessor } from './batch-processor'
 import { initializeSettingsSecurity } from './settings-security'
 import { assertMcpTokenAllowed, parseMcpCliArgs } from './mcp/connection'
 import { runMcpStdioServer } from './mcp/stdio-server'
+import { runMcpDatabaseSession } from './mcp/session'
 import { assertDirectoryWritable, describeDirectoryAccessFailure, shouldShowDirectoryFailureDialog } from './directory-access'
 
 const mcpLaunch = parseMcpCliArgs(process.argv.slice(1))
@@ -518,18 +519,24 @@ if (mcpLaunch.isMcp) {
   console.warn = toErr
   console.debug = toErr
 
-  app.whenReady()
-    .then(async () => {
-      await initDatabase()
-      initializeSettingsSecurity()
-      assertMcpTokenAllowed(mcpLaunch.token)
-      process.stderr.write('[Main] GujiSmart MCP mode (no UI)\n')
-      await runMcpStdioServer()
-    })
-    .catch((error) => {
+  void app.whenReady().then(() => runMcpDatabaseSession({
+    runTransport: runMcpStdioServer,
+    checkCredentialsPresent: () => {
+      if (!mcpLaunch.token?.trim() && (app.isPackaged || process.env.GUJISMART_MCP_DEV !== '1')) {
+        throw new Error('AI 工具连接令牌无效。请在软件设置中重新复制配置到你的 AI 客户端。')
+      }
+    },
+    openDatabase: initDatabase,
+    authorize: () => assertMcpTokenAllowed(mcpLaunch.token),
+    prepareAuthorizedTools: initializeSettingsSecurity,
+    closeDatabase: () => closeDatabase({ checkpoint: false }),
+  })).then(
+    () => app.exit(0),
+    (error: unknown) => {
       process.stderr.write(`[Main] MCP failed: ${error instanceof Error ? error.message : String(error)}\n`)
       app.exit(1)
-    })
+    },
+  )
 } else {
   const hasSingleInstanceLock = app.requestSingleInstanceLock()
   if (!hasSingleInstanceLock) {
