@@ -1,5 +1,21 @@
 # 更新日志 / Changelog
 
+## 1.2.36 - 2026-11-23
+
+### 中文
+
+- 下载：`GujiSmart-1.2.36-Setup-x64.exe` 为安装版，`GujiSmart-1.2.36-Portable-x64.exe` 为便携版。
+- 修复 AI 工具连接尚未使用文献库时就打开 SQLite 的问题。握手、列工具及空闲重连不会打开文献库；断开时会关闭本次连接打开的数据库并退出。
+- 修复 Windows 安装版的专用 MCP 宿主找不到 SQLite 原生依赖的问题。已经使用 `mcp-host.cjs` 的用户装回原位置无需重新配置；仍使用旧 `--mcp` 命令的用户，请升级后在「AI 工具连接」重新生成配置。未使用 MCP 的用户无需操作。
+- 本次更新不会主动清理数据库日志。升级前请备份文献库，不要手动删除 `-wal` 或 `-shm` 文件。安装包未数字签名，Windows 可能提示未知发布者。
+
+### English
+
+- Downloads: `GujiSmart-1.2.36-Setup-x64.exe` is the installer; `GujiSmart-1.2.36-Portable-x64.exe` is the portable build.
+- MCP initialization, tool discovery and idle reconnects no longer open the library. When a connection ends, its opened database is closed and the host exits.
+- Fix native SQLite dependency lookup in the dedicated Windows MCP host. Existing `mcp-host.cjs` configurations still work after upgrading to the same location. If you still use the legacy `--mcp` command, regenerate the configuration from AI Tool Connection after upgrading. No action is required if you do not use MCP.
+- This update does not proactively clear existing database logs. Back up your library before upgrading, and do not manually delete `-wal` or `-shm` files. Windows may show an unknown publisher because the builds are unsigned.
+
 ## 1.2.35 - 2026-09-12
 
 ### 中文
